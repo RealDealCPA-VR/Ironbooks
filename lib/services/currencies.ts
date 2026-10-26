@@ -18,10 +18,10 @@
 import { and, eq, ne } from 'drizzle-orm';
 import Decimal from 'decimal.js';
 import { currencies, accounts, journalEntryLines } from '@/lib/db/schema';
-import { Money, allocate, toAmountString } from '@/lib/money';
+import { Money, MoneyParseError, allocate, toAmountString } from '@/lib/money';
 import { postJournalEntry } from './posting';
-import { type ServiceContext, ServiceError, validation, notFound, writeAudit } from './_base';
-import { assertForeignCurrencyAllowed } from './multiCurrency';
+import { type ServiceContext, ServiceError, inTransaction, validation, notFound, writeAudit } from './_base';
+import { assertForeignCurrencyAllowed, hasForeignCurrencyData } from './multiCurrency';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -64,6 +64,45 @@ export interface RecordFxAdjustmentInput {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/**
+ * review5 fx: a currency code as the currency list stores it - three letters (ISO 4217), upper
+ * case. Anything else (digits, symbols, a number in the JSON body) is a plain validation error,
+ * never a TypeError / database error (500).
+ */
+function currencyCodeOf(code: unknown): string {
+  const c = typeof code === 'string' ? code.trim().toUpperCase() : '';
+  if (!/^[A-Z]{3}$/.test(c)) throw validation('Enter the currency as its 3-letter code (for example EUR, GBP or CAD).');
+  return c;
+}
+
+/** review5 fx: the currency's name (required, at most the column's 100 characters). */
+function currencyNameOf(name: unknown): string {
+  const n = typeof name === 'string' ? name.trim() : '';
+  if (!n) throw validation('Currency name is required.');
+  if (n.length > 100) throw validation('The currency name is too long (100 characters at most).');
+  return n;
+}
+
+/**
+ * review5 fx: an exchange rate for the currency list (home units per 1 unit): a number above zero,
+ * at most 1,000,000 (the bounds every transaction's rate has, exchangeRates.parseRate) and not so
+ * small that it rounds to 0 at the list's 8 decimals.
+ */
+function listRateOf(v: unknown): Decimal {
+  let r: Decimal;
+  try {
+    r = Money.of(v as string | number);
+  } catch (err) {
+    if (err instanceof MoneyParseError) throw validation('The exchange rate is not a number.');
+    throw err;
+  }
+  if (!r.isFinite() || !r.greaterThan(0)) throw validation('The exchange rate must be greater than zero.');
+  if (r.greaterThan(1_000_000)) throw validation('The exchange rate is too large.');
+  const rounded = new Decimal(r.toFixed(8));
+  if (!rounded.greaterThan(0)) throw validation('The exchange rate is too small (it rounds to 0 at 8 decimals).');
+  return rounded;
+}
+
 /** Resolve a GL account by code, scoped to the company. Throws NOT_FOUND if missing. */
 async function resolveAccountByCode(ctx: ServiceContext, code: string): Promise<string> {
   const [row] = await ctx.db
@@ -92,57 +131,84 @@ export async function listCurrencies(ctx: ServiceContext): Promise<CurrencyRow[]
  * Set (or replace) the base currency for a company.
  * - If a base already exists its isBase flag is cleared.
  * - The new base is inserted/updated with rateToBase = 1.
+ * - review5 fx: the home currency is the unit of the whole ledger. Once the company has
+ *   foreign-currency accounts, names or transactions it can no longer change (QB: the home currency
+ *   is fixed once multicurrency is in use) - the foreign documents would silently become home ones
+ *   and A/R / A/P aging would stop agreeing with the GL. Before that, a change rebases the other
+ *   currencies' rates onto the new home currency (they were in units of the old one).
+ * - One transaction: two concurrent saves can't leave the list with no base or two.
  */
 export async function setBaseCurrency(
   ctx: ServiceContext,
   input: SetBaseCurrencyInput,
 ): Promise<CurrencyRow> {
-  const { code, name } = input;
-  if (!code || code.length > 3) throw validation('Currency code must be 1–3 characters.');
-  if (!name) throw validation('Currency name is required.');
+  const code = currencyCodeOf(input.code);
+  const name = currencyNameOf(input.name);
 
-  // Clear any existing base flag
-  await ctx.db
-    .update(currencies)
-    .set({ isBase: false, updatedAt: new Date() })
-    .where(and(eq(currencies.companyId, ctx.companyId), eq(currencies.isBase, true)));
+  return inTransaction(ctx, async (tx) => {
+    const rows = await tx.db.select().from(currencies).where(eq(currencies.companyId, tx.companyId));
+    const oldBase = rows.find((r) => r.isBase) ?? null;
+    const changing = !!oldBase && oldBase.code.trim().toUpperCase() !== code;
+    if (changing && (await hasForeignCurrencyData(tx.db, tx.companyId))) {
+      throw new ServiceError(
+        'CONFLICT',
+        `Your home currency is ${oldBase!.code}. This company already has foreign-currency accounts, names or transactions, so the home currency can no longer be changed (QuickBooks works the same way).`,
+      );
+    }
 
-  // Upsert the new base
-  const [existing] = await ctx.db
-    .select()
-    .from(currencies)
-    .where(and(eq(currencies.companyId, ctx.companyId), eq(currencies.code, code.toUpperCase())));
+    // Rates of the other currencies are in units of the old home currency: rebase them onto the
+    // new one (rate / rate of the new home currency) so the list's default rates stay right.
+    const newBaseOld = rows.find((r) => !r.isBase && r.code === code);
+    const pivot = changing && newBaseOld ? Money.of(newBaseOld.rateToBase) : null;
+    if (pivot && pivot.greaterThan(0)) {
+      for (const r of rows) {
+        if (r.code === code) continue;
+        const rate = (r.isBase ? Money.of(1) : Money.of(r.rateToBase)).dividedBy(pivot).toFixed(8);
+        if (!Money.of(rate).greaterThan(0)) continue; // would round to 0: keep the user's rate
+        await tx.db.update(currencies).set({ rateToBase: rate, updatedAt: new Date() }).where(eq(currencies.id, r.id));
+      }
+    }
 
-  let row: CurrencyRow;
-  if (existing) {
-    const [updated] = await ctx.db
+    // Clear any existing base flag
+    await tx.db
       .update(currencies)
-      .set({ name, rateToBase: '1', isBase: true, updatedAt: new Date() })
-      .where(eq(currencies.id, existing.id))
-      .returning();
-    row = updated as CurrencyRow;
-  } else {
-    const [inserted] = await ctx.db
-      .insert(currencies)
-      .values({
-        companyId: ctx.companyId,
-        code: code.toUpperCase(),
-        name,
-        rateToBase: '1',
-        isBase: true,
-      })
-      .returning();
-    row = inserted as CurrencyRow;
-  }
+      .set({ isBase: false, updatedAt: new Date() })
+      .where(and(eq(currencies.companyId, tx.companyId), eq(currencies.isBase, true)));
 
-  await writeAudit(ctx, {
-    action: 'update',
-    entityType: 'currency',
-    entityId: row.id,
-    newValues: { code: row.code, name: row.name, isBase: true },
+    // Upsert the new base
+    const existing = rows.find((r) => r.code === code);
+    let row: CurrencyRow;
+    if (existing) {
+      const [updated] = await tx.db
+        .update(currencies)
+        .set({ name, rateToBase: '1', isBase: true, updatedAt: new Date() })
+        .where(eq(currencies.id, existing.id))
+        .returning();
+      row = updated as CurrencyRow;
+    } else {
+      const [inserted] = await tx.db
+        .insert(currencies)
+        .values({
+          companyId: tx.companyId,
+          code,
+          name,
+          rateToBase: '1',
+          isBase: true,
+        })
+        .returning();
+      row = inserted as CurrencyRow;
+    }
+
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'currency',
+      entityId: row.id,
+      oldValues: oldBase ? { base: oldBase.code } : undefined,
+      newValues: { code: row.code, name: row.name, isBase: true },
+    });
+
+    return row;
   });
-
-  return row;
 }
 
 /**
@@ -154,56 +220,57 @@ export async function upsertCurrency(
   ctx: ServiceContext,
   input: UpsertCurrencyInput,
 ): Promise<CurrencyRow> {
-  const { code, name, rateToBase } = input;
-  if (!code || code.length > 3) throw validation('Currency code must be 1–3 characters.');
-  if (!name) throw validation('Currency name is required.');
-
-  const rate = Money.of(rateToBase);
-  if (!rate.greaterThan(0)) throw validation('rateToBase must be greater than zero.');
+  const code = currencyCodeOf(input.code);
+  const name = currencyNameOf(input.name);
+  const rate = listRateOf(input.rateToBase);
   await assertForeignCurrencyAllowed(ctx, code); // A2: Multiple Currencies off
 
-  const [existing] = await ctx.db
-    .select()
-    .from(currencies)
-    .where(and(eq(currencies.companyId, ctx.companyId), eq(currencies.code, code.toUpperCase())));
+  // review5 fx: read and write in one transaction - two saves of a new currency at once (a double
+  // click) must not both find no row and add the currency twice.
+  return inTransaction(ctx, async (tx) => {
+    const [existing] = await tx.db
+      .select()
+      .from(currencies)
+      .where(and(eq(currencies.companyId, tx.companyId), eq(currencies.code, code)));
 
-  let row: CurrencyRow;
-  if (existing) {
-    if (existing.isBase) {
-      throw new ServiceError(
-        'CONFLICT',
-        `${code.toUpperCase()} is the base currency. Use setBaseCurrency to change the base.`,
-      );
+    let row: CurrencyRow;
+    if (existing) {
+      if (existing.isBase) {
+        throw new ServiceError(
+          'CONFLICT',
+          `${code} is the base currency. Use setBaseCurrency to change the base.`,
+        );
+      }
+      const [updated] = await tx.db
+        .update(currencies)
+        .set({ name, rateToBase: rate.toFixed(8), updatedAt: new Date() })
+        .where(eq(currencies.id, existing.id))
+        .returning();
+      row = updated as CurrencyRow;
+    } else {
+      const [inserted] = await tx.db
+        .insert(currencies)
+        .values({
+          companyId: tx.companyId,
+          code,
+          name,
+          rateToBase: rate.toFixed(8),
+          isBase: false,
+        })
+        .returning();
+      row = inserted as CurrencyRow;
     }
-    const [updated] = await ctx.db
-      .update(currencies)
-      .set({ name, rateToBase: rate.toFixed(8), updatedAt: new Date() })
-      .where(eq(currencies.id, existing.id))
-      .returning();
-    row = updated as CurrencyRow;
-  } else {
-    const [inserted] = await ctx.db
-      .insert(currencies)
-      .values({
-        companyId: ctx.companyId,
-        code: code.toUpperCase(),
-        name,
-        rateToBase: rate.toFixed(8),
-        isBase: false,
-      })
-      .returning();
-    row = inserted as CurrencyRow;
-  }
 
-  await writeAudit(ctx, {
-    action: existing ? 'update' : 'create',
-    entityType: 'currency',
-    entityId: row.id,
-    oldValues: existing ? { rateToBase: existing.rateToBase } : undefined,
-    newValues: { code: row.code, name: row.name, rateToBase: row.rateToBase },
+    await writeAudit(tx, {
+      action: existing ? 'update' : 'create',
+      entityType: 'currency',
+      entityId: row.id,
+      oldValues: existing ? { rateToBase: existing.rateToBase } : undefined,
+      newValues: { code: row.code, name: row.name, rateToBase: row.rateToBase },
+    });
+
+    return row;
   });
-
-  return row;
 }
 
 /**
@@ -254,15 +321,29 @@ export async function recordFxAdjustment(
 ): Promise<{ entryId: string }> {
   const { accountId, amount, gain, date, memo } = input;
 
-  const absAmount = Money.abs(amount);
+  let absAmount: Decimal;
+  try {
+    absAmount = Money.abs(amount);
+  } catch (err) {
+    if (err instanceof MoneyParseError) throw validation('The FX adjustment amount is not a number.');
+    throw err;
+  }
+  if (!absAmount.isFinite()) throw validation('The FX adjustment amount is not a number.');
   if (absAmount.isZero()) throw validation('FX adjustment amount must be non-zero.');
+  if (!(date instanceof Date) || isNaN(date.getTime())) throw validation('Enter a valid date for the FX adjustment.');
 
   // Verify the target account belongs to this company
   const [targetAcct] = await ctx.db
-    .select({ id: accounts.id })
+    .select({ id: accounts.id, currency: accounts.currency })
     .from(accounts)
     .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, accountId)));
   if (!targetAcct) throw notFound(`Account ${accountId}`);
+  // review5 fx: the adjustment is a home-currency amount. On a foreign-currency bank / card account
+  // it revalues the home value only (foreign amount 0, like a Home Currency Adjustment line), so
+  // the account's balance in its own currency - its register and reconciliation - is untouched.
+  const targetCur = (targetAcct.currency ?? '').trim().toUpperCase();
+  const homeOnly = targetCur !== '' && targetCur !== ((await getHomeCurrencyCode(ctx)) ?? '').toUpperCase();
+  const subjectFx = homeOnly ? { foreignAmount: '0' } : {};
 
   const otherIncomeId = await resolveAccountByCode(ctx, '4900');
   const bankFeesId = await resolveAccountByCode(ctx, '6100');
@@ -270,19 +351,19 @@ export async function recordFxAdjustment(
   const amtStr = toAmountString(absAmount);
   const description = memo ?? (gain ? 'FX gain adjustment' : 'FX loss adjustment');
 
-  let lines: Array<{ accountId: string; debit?: string; credit?: string; memo?: string }>;
+  let lines: Array<{ accountId: string; debit?: string; credit?: string; memo?: string; foreignAmount?: string }>;
 
   if (gain) {
     // Gain: Dr the subject account / Cr Other Income (4900)
     lines = [
-      { accountId, debit: amtStr, memo: description },
+      { accountId, debit: amtStr, memo: description, ...subjectFx },
       { accountId: otherIncomeId, credit: amtStr, memo: description },
     ];
   } else {
     // Loss: Dr Bank & Merchant Fees (6100) / Cr the subject account
     lines = [
       { accountId: bankFeesId, debit: amtStr, memo: description },
-      { accountId, credit: amtStr, memo: description },
+      { accountId, credit: amtStr, memo: description, ...subjectFx },
     ];
   }
 
@@ -379,7 +460,8 @@ export async function resolveDocumentCurrency(
 
   let rate: Decimal;
   if (hasText(input.exchangeRate)) {
-    rate = Money.of(input.exchangeRate);
+    // review5 fx: a typed rate that is not a number, too large or rounds to 0 is a plain 400.
+    rate = listRateOf(input.exchangeRate);
   } else {
     const [row] = await ctx.db
       .select({ rateToBase: currencies.rateToBase })

@@ -1390,6 +1390,16 @@ export async function payCreditCardBalance(
   reconciliationId: string,
   input: PayCreditCardBalanceInput,
 ) {
+  // review5 fx: the "already paid for this reconciliation" check and the payment run in ONE
+  // transaction, so a double-submitted Pay Now posts the card payment once.
+  return inTransaction(ctx, (tx) => payCreditCardBalanceInTx(tx, reconciliationId, input));
+}
+
+async function payCreditCardBalanceInTx(
+  ctx: ServiceContext,
+  reconciliationId: string,
+  input: PayCreditCardBalanceInput,
+) {
   const recon = await loadReconciliation(ctx, reconciliationId);
   if (recon.status !== 'completed') {
     throw validation('Pay Credit Card is only available after the reconciliation is completed.');

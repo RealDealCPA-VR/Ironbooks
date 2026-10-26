@@ -62,6 +62,7 @@ import { type AppliedPricing, resolveLinePricing } from './pricing';
 import { applyCustomerShipToDefault, applyCustomerTaxDefaults } from './customerDefaults';
 import { allocateDocNumber, docRef, renumberDoc } from './docNumbers';
 import { shippingColumns } from './invoices';
+import { assertHomeCurrencyAccounts } from './currencies';
 import { type SalesLineKind, SalesLineTotals, salesLineKind } from './salesLineKinds';
 
 // ---------------------------------------------------------------------------
@@ -235,6 +236,9 @@ async function prepareSalesReceipt(ctx: ServiceContext, input: CreateSalesReceip
       throw validation('Deposit account must be a bank account or Undeposited Funds.');
     }
     assertNotControlAccount(acct, 'Deposit to');
+    // review5 fx: a sales receipt is in home currency; a foreign-currency bank would book the
+    // home amount as a list-rate conversion in its own currency.
+    await assertHomeCurrencyAccounts(ctx, [acct.id], 'Sales receipts');
     depositAccountId = acct.id;
   } else {
     depositAccountId = await getOrCreateAccountByCode(ctx, '1050', {

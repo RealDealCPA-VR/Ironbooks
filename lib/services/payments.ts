@@ -781,6 +781,18 @@ async function postPayment(
   if (depAcct.subtype === 'accounts_receivable' || depAcct.subtype === 'inventory') {
     throw validation('Deposit account must be a bank account or Undeposited Funds.');
   }
+  // review5 fx: QB lists only accounts in the payment's currency or the home currency under
+  // "Deposit to". A payment banked in a third currency (or a home payment in a foreign bank)
+  // would post a list-rate conversion of the home amount as that account's own-currency amount.
+  {
+    const [depCur] = await tx.db.select({ currency: accounts.currency }).from(accounts).where(eq(accounts.id, depositAccountId));
+    const depCode = await normalizeCurrency(tx, depCur?.currency ?? null);
+    if (depCode && depCode !== paymentCurrency) {
+      throw validation(
+        `"${depAcct.name}" is a ${depCode} account. Deposit this ${paymentCurrency ?? 'home-currency'} payment into ${paymentCurrency ? `a ${paymentCurrency} account or ` : ''}a home-currency account (or Undeposited Funds).`,
+      );
+    }
+  }
 
   // --- Discount account (only when a discount is taken) ---
   let discountAccountId: string | null = null;
@@ -2212,6 +2224,17 @@ async function refundPaymentInTx(ctx: ServiceContext, input: RefundPaymentInput)
   // Bank accounts, Undeposited Funds or another cash-like current asset (lib/accountTypes.ts).
   if (!isDepositTargetAccount(bankAcct)) {
     throw validation('Refunds must be paid from a bank/cash account.');
+  }
+  // review5 fx: refund from an account in the payment's currency or the home currency (a third
+  // currency - or a home payment from a foreign bank - would book a list-rate conversion).
+  {
+    const bankCode = await normalizeCurrency(ctx, bankAcct.currency ?? null);
+    const payCode = await normalizeCurrency(ctx, payment.currency ?? null);
+    if (bankCode && bankCode !== payCode) {
+      throw validation(
+        `This is a ${bankCode} account. Refund this ${payCode ?? 'home-currency'} payment from ${payCode ? `a ${payCode} account or ` : ''}a home-currency account.`,
+      );
+    }
   }
 
   const arAccountId = await getArAccountId(ctx);

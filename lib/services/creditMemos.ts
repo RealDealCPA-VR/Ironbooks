@@ -66,7 +66,7 @@ import { Money, allocate, toAmountString } from '@/lib/money';
 import { assertNotControlLineAccount, postJournalEntry, voidJournalEntry } from '@/lib/services/posting';
 import { markPaidAmount } from './invoices';
 import { assertPeriodOpen, recordClosingDateException, type PeriodCheck } from './fiscalPeriods';
-import { getHomeCurrencyCode } from './currencies';
+import { assertHomeCurrencyAccounts, getHomeCurrencyCode } from './currencies';
 import { layerRoundingTolerance, takeFromDocumentLayers } from './fifo';
 import {
   type InventoryLineDetail,
@@ -1089,6 +1089,8 @@ async function refundCreditMemoInTx(ctx: ServiceContext, input: RefundCreditMemo
   if (!isDepositTargetAccount(bankAcct)) {
     throw validation('Refunds must be paid from a bank/cash account.');
   }
+  // review5 fx: credit memos are in home currency; refund them from a home-currency account.
+  await assertHomeCurrencyAccounts(ctx, [bankAcct.id], 'Credit memo refunds');
 
   const arAccountId = await accountIdByCode(ctx, '1200');
   const refundDate = input.date ?? new Date();

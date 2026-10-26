@@ -129,7 +129,13 @@ export async function withAccountCurrency(
     eq(journalEntries.status, 'posted'),
   ];
   if (opts.from) conds.push(sql`${journalEntries.date} >= ${opts.from}`);
-  if (opts.to) conds.push(sql`${journalEntries.date} <= ${opts.to}`);
+  // review5 fx: the same range as accountRegister — `to` is the whole calendar day (onOrBeforeDay),
+  // or lines dated later on the last day had no account-currency columns and were missing from
+  // the closing balance in the account's currency.
+  if (opts.to) {
+    const to = new Date(opts.to);
+    conds.push(lt(journalEntries.date, new Date(Date.UTC(to.getUTCFullYear(), to.getUTCMonth(), to.getUTCDate() + 1))));
+  }
   const all = await ctx.db
     .select({
       id: journalEntryLines.id,

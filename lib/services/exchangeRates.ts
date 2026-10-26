@@ -41,7 +41,11 @@ export function parseRate(v: string | number | Decimal | null | undefined, label
   }
   if (!r.isFinite() || !r.greaterThan(0)) throw validation(`${label} must be greater than zero.`);
   if (r.greaterThan(1_000_000)) throw validation(`${label} is too large.`);
-  return new Decimal(r.toFixed(8));
+  // review5 fx: a rate that rounds to 0 at 8 decimals would post 0 home amounts (and divide by 0
+  // converting back), so it is refused like 0 itself.
+  const rounded = new Decimal(r.toFixed(8));
+  if (!rounded.greaterThan(0)) throw validation(`${label} is too small (it rounds to 0 at 8 decimals).`);
+  return rounded;
 }
 
 /**
