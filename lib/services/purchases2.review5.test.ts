@@ -394,6 +394,19 @@ describe('review5 purchases (second pass)', { timeout: 180_000 }, () => {
     expect(await layerValue(x.item.id)).toBe(await glBalance(x.invAcct));
   });
 
+  it('H: two vendors renamed to the same name at once — only one rename is kept', async () => {
+    const { updateVendor } = await import('./vendors');
+    for (let i = 0; i < 3; i++) {
+      const a = await newVendor();
+      const b = await newVendor();
+      const name = `Same Name ${seq}-${i}`;
+      const res = await Promise.allSettled([updateVendor(ctx, a.id, { displayName: name }), updateVendor(ctx, b.id, { displayName: name })]);
+      const rows = await db.select().from(vendors).where(and(eq(vendors.companyId, ctx.companyId), eq(vendors.displayName, name)));
+      expect(rows).toHaveLength(1);
+      expect(res.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+    }
+  });
+
   it('Z: sanity — the helpers see the seeded accounts', async () => {
     expect(acct['1000']).toBeTruthy();
     expect(acct['5000']).toBeTruthy();

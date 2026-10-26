@@ -189,6 +189,12 @@ export async function updateVendor(
   id: string,
   patch: UpdateVendorInput,
 ) {
+  // The unique-name check, the update and its audit row in ONE transaction (as createVendor):
+  // two vendors renamed to the same name at once both passed the check and both kept the name.
+  return inTransaction(ctx, (tx) => updateVendorInTx(tx, id, patch));
+}
+
+async function updateVendorInTx(ctx: ServiceContext, id: string, patch: UpdateVendorInput) {
   const before = await loadVendor(ctx, id);
   await assertAccountantListEdit(ctx, 'vendor', before as Record<string, unknown>, patch as Record<string, unknown>); // I1
 
