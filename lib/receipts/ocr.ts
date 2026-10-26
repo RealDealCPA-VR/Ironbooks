@@ -109,6 +109,12 @@ export async function getOcrEngine(): Promise<OcrEngine | null> {
   return {
     recognize(image: Buffer): Promise<string> {
       const job = queue.then(async () => {
+        // The worker is busy from here on: the idle shutdown the previous job scheduled must not
+        // fire mid-read (a slow page used to be cut off after 60 s by the last page's timer).
+        if (idleTimer) {
+          clearTimeout(idleTimer);
+          idleTimer = null;
+        }
         const worker = await getWorker(tess, langPath);
         let timer: ReturnType<typeof setTimeout> | undefined;
         try {
