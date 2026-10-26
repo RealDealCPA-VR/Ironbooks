@@ -14,6 +14,7 @@ import { getServerContext } from '@/lib/context';
 import { resolveDataDir } from '@/lib/db';
 import { dataDirOf } from '@/lib/db/txHooks';
 import { queryTransactionLog } from '@/lib/services/transactionLog';
+import { redactSecretsDeep } from '@/lib/services/company';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus } from '@/lib/routeErrors';
 
@@ -56,7 +57,9 @@ export async function GET(req: NextRequest) {
       limit,
       offset,
     });
-    return NextResponse.json(page);
+    // Records written by older builds can carry the closing-date password hash in a settings
+    // snapshot: the file keeps them (hash chain), the response never does.
+    return NextResponse.json({ ...page, rows: page.rows.map((r) => ({ ...r, data: redactSecretsDeep(r.data) })) });
   } catch (err) {
     return errorResponse(err);
   }

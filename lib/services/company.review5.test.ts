@@ -28,6 +28,9 @@ import {
 let ctx: ServiceContext;
 vi.mock('@/lib/context', () => ({ getServerContext: vi.fn(async () => ctx) }));
 import { GET as companyGET, PATCH as companyPATCH } from '@/app/api/company/route';
+import { GET as txLogGET } from '@/app/api/transaction-log/route';
+import { writeAudit } from './_base';
+import { getAuditLog } from './auditTrail';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-review5-company');
 let db: DB;
@@ -117,6 +120,35 @@ describe('company settings (review round 5)', () => {
     const after = (await getCompany(ctx))!.settings as Record<string, unknown>;
     expect(after.phone).toBe('(555) 010-3030');
     expect(after.closingDate).toBe('2026-04-30');
+  });
+
+  it('A2: audit rows and transaction-log records written before the fix do not hand the hash out', async () => {
+    // What an older build wrote for a Preferences save: the whole settings object, hash included.
+    const legacy = { name: 'Review5 Co', settings: { phone: '1', closingDate: '2025-12-31', closingDatePasswordHash: '$2a$10$legacyhashlegacyhashlegacyha' } };
+    await writeAudit(ctx, { action: 'update', entityType: 'company', entityId: ctx.companyId, oldValues: legacy, newValues: legacy });
+    const [row] = await db
+      .select({ id: auditLogs.id })
+      .from(auditLogs)
+      .where(and(eq(auditLogs.companyId, ctx.companyId), eq(auditLogs.entityType, 'company')))
+      .orderBy(desc(auditLogs.createdAt))
+      .limit(1);
+    const detail = await getAuditLog(ctx, row.id);
+    expect(hasHash(detail.oldValues)).toBe(false);
+    expect(hasHash(detail.newValues)).toBe(false);
+    expect((detail.newValues as typeof legacy).settings.closingDate).toBe('2025-12-31');
+
+    const owner: ServiceContext = { ...ctx, role: 'owner' };
+    const saved = ctx;
+    ctx = owner;
+    try {
+      const res = await txLogGET(new NextRequest('http://localhost/api/transaction-log?entityType=company&limit=50'));
+      expect(res.status).toBe(200);
+      const page = await res.json();
+      expect(page.rows.length).toBeGreaterThan(0);
+      expect(hasHash(page.rows)).toBe(false);
+    } finally {
+      ctx = saved;
+    }
   });
 
   it('C: a closing date that is not a real day is refused (400), not stored', async () => {

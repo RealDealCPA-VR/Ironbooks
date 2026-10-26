@@ -67,6 +67,24 @@ export function redactCompanySettings<T>(settings: T): T {
   return out as T;
 }
 
+/**
+ * A deep copy of arbitrary stored data (audit-trail snapshots, transaction-log records) with
+ * every secret settings key removed at any depth. Older builds wrote the whole settings object,
+ * closing-date password hash included, into the audit trail and the transaction log; those rows
+ * are kept (they are the history), but the hash is never handed out when they are read.
+ */
+export function redactSecretsDeep<T>(value: T, depth = 0): T {
+  if (depth > 32 || !value || typeof value !== 'object') return value;
+  if (Array.isArray(value)) return value.map((v) => redactSecretsDeep(v, depth + 1)) as unknown as T;
+  if (value instanceof Date) return value;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    if ((SECRET_SETTINGS_KEYS as readonly string[]).includes(k)) continue;
+    out[k] = redactSecretsDeep(v, depth + 1);
+  }
+  return out as T;
+}
+
 /** A company row as it may be returned to a client: settings without secret keys. */
 export function redactCompany<T extends { settings?: unknown } | null | undefined>(row: T): T {
   if (!row || typeof row !== 'object') return row;
