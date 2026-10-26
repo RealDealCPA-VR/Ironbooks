@@ -386,6 +386,13 @@
       "when": 1781400062000,
       "tag": "0062_user_challenge",
       "breakpoints": true
+    },
+    {
+      "idx": 68,
+      "version": "7",
+      "when": 1781400068000,
+      "tag": "0068_r5_payroll",
+      "breakpoints": true
     }
   ]
 }

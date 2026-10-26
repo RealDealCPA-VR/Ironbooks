@@ -15,6 +15,7 @@
 import { and, asc, between, desc, eq, gte, lte, sql } from 'drizzle-orm';
 import { Money, toAmountString } from '@/lib/money';
 import { mileageLogs, customers, employees, jobs, vehicles } from '@/lib/db/schema';
+import { irsMileageRateFor } from './mileageRates';
 import {
   type ServiceContext,
   ServiceError,
@@ -24,7 +25,13 @@ import {
   writeAudit,
 } from './_base';
 
-// IRS standard mileage rate for 2024 / 2025 (cents/mile expressed as a dollar amount).
+/**
+ * Default rate when a trip has none: the IRS business mileage rate for the TRIP's year
+ * (lib/services/mileageRates.ts) — 2024 67¢, 2025 70¢, 2026 72.5¢. A single hard-coded 67¢ logged
+ * every 2025 / 2026 trip below the IRS rate.
+ */
+export { irsMileageRateFor } from './mileageRates';
+/** @deprecated The 2024 rate; use irsMileageRateFor(date). */
 export const DEFAULT_RATE_PER_MILE = '0.67';
 
 // ---------------------------------------------------------------------------
@@ -96,9 +103,10 @@ export interface MileageSummary {
 
 export async function listMileage(
   ctx: ServiceContext,
-  opts: { customerId?: string; vehicleId?: string } = {},
+  opts: { customerId?: string; vehicleId?: string; id?: string } = {},
 ): Promise<MileageLog[]> {
   const conds = [eq(mileageLogs.companyId, ctx.companyId)];
+  if (opts.id) conds.push(eq(mileageLogs.id, opts.id));
   if (opts.customerId) conds.push(eq(mileageLogs.customerId, opts.customerId));
   if (opts.vehicleId) conds.push(eq(mileageLogs.vehicleId, opts.vehicleId));
 
@@ -151,7 +159,12 @@ export async function logMiles(ctx: ServiceContext, input: LogMilesInput): Promi
     throw validation('miles must be greater than zero.');
   }
 
-  const rate = Money.of(input.ratePerMile ?? DEFAULT_RATE_PER_MILE);
+  if (!(input.date instanceof Date) || isNaN(input.date.getTime())) {
+    throw validation('A valid trip date is required.');
+  }
+  const rate = Money.of(
+    input.ratePerMile != null && input.ratePerMile !== '' ? input.ratePerMile : irsMileageRateFor(input.date),
+  );
   if (rate.lessThan(0)) {
     throw validation('ratePerMile cannot be negative.');
   }
@@ -222,9 +235,8 @@ export async function logMiles(ctx: ServiceContext, input: LogMilesInput): Promi
     newValues: { miles: row.miles, ratePerMile: row.ratePerMile, date: row.date },
   });
 
-  // Fetch with joins for the return value.
-  const list = await listMileage(ctx, {});
-  const created = list.find((l) => l.id === row.id);
+  // Fetch the new row with its joins (only that row — not the company's whole mileage log).
+  const [created] = await listMileage(ctx, { id: row.id });
   if (!created) throw new ServiceError('INTERNAL', 'Failed to reload mileage log after insert.');
   return created;
 }

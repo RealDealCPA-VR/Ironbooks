@@ -291,6 +291,15 @@ export async function updatePayrollItem(
   if (input.name !== undefined) {
     const name = input.name.trim();
     if (!name) throw validation('Payroll item name is required.');
+    // Names stay unique per company (case-insensitive), as on create: pickers, paycheck lines and
+    // liability payments find an item by its name.
+    const others = await ctx.db
+      .select({ id: payrollItems.id, name: payrollItems.name })
+      .from(payrollItems)
+      .where(eq(payrollItems.companyId, ctx.companyId));
+    if (others.some((o) => o.id !== id && o.name.trim().toLowerCase() === name.toLowerCase())) {
+      throw validation(`A payroll item named "${name}" already exists.`);
+    }
     updates.name = name;
   }
   if (input.pretax !== undefined) {

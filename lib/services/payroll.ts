@@ -67,9 +67,10 @@ import {
   type TaxTracking,
 } from './payrollTaxTracking';
 import { sickVacationBalances } from './payrollReports';
-import { PAYROLL_PAID_TAG, markTimeEntriesPaidInPayroll } from './timeTracking';
+import { PAYROLL_PAID_TAG, markTimeEntriesPaidInPayroll, releaseTimeEntriesFromPaycheck } from './timeTracking';
 import { getPreferences } from './preferences';
 import { type PrefAccountKind, assertPreferenceAccount } from './prefAccounts';
+import { PAY_PERIODS_PER_YEAR } from '@/lib/preferences';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -208,6 +209,34 @@ export interface RunPaycheckInput {
   periodsPerYear?: number;
   /** Batch pay run this check belongs to (stamped on paychecks.pay_run_id). */
   payRunId?: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Pay frequency
+// ---------------------------------------------------------------------------
+
+/**
+ * Pay periods per year for a check: the caller's value, else the check's stored frequency (an
+ * edit), else the company's payroll pay period (Preferences > Payroll & Employees; biweekly = 26
+ * by default). A value that is not a whole number from 1 to 365 is refused — it would divide
+ * the annualized withholding by zero or by nonsense.
+ */
+async function resolvePeriodsPerYear(
+  ctx: ServiceContext,
+  requested: number | null | undefined,
+  stored?: number | null,
+): Promise<number> {
+  let periods: number;
+  if (requested !== undefined && requested !== null) periods = requested;
+  else if (stored !== undefined && stored !== null) periods = stored;
+  else {
+    const prefs = await getPreferences(ctx);
+    periods = PAY_PERIODS_PER_YEAR[prefs.payrollPayPeriod] ?? 26;
+  }
+  if (typeof periods !== 'number' || !Number.isInteger(periods) || periods < 1 || periods > 365) {
+    throw validation('Pay periods per year must be a whole number from 1 to 365 (52 weekly, 26 every two weeks, 24 twice a month, 12 monthly).');
+  }
+  return periods;
 }
 
 // ---------------------------------------------------------------------------
@@ -534,6 +563,10 @@ export async function voidPaycheck(ctx: ServiceContext, paycheckId: string) {
       .where(eq(paychecks.id, paycheckId))
       .returning();
 
+    // The hours this check paid were never paid after all: release the time entries it pulled in
+    // (their [payroll:<id>] tag) so the corrected check can pay them again.
+    await releaseTimeEntriesFromPaycheck(tx, paycheckId);
+
     await writeAudit(tx, {
       action: 'void',
       entityType: 'paycheck',
@@ -807,6 +840,8 @@ interface PreparedPaycheck {
   /** Plain-language notes about the calculation (state not set up, nearest-year tables, local taxes). */
   notes: string[];
   accountsUsed: { payrollExpenseId: string; payrollTaxExpenseId: string; payrollLiabId: string; checkingId: string };
+  /** Pay periods per year the withholding was calculated with (stored on the check). */
+  periodsPerYear: number;
 }
 
 /**
@@ -816,7 +851,7 @@ interface PreparedPaycheck {
 async function preparePaycheck(
   ctx: ServiceContext,
   input: RunPaycheckInput,
-  opts: { excludePaycheckId?: string | null; allowInactive?: boolean } = {},
+  opts: { excludePaycheckId?: string | null; allowInactive?: boolean; storedPeriodsPerYear?: number | null } = {},
 ): Promise<PreparedPaycheck> {
   // --- Validate employee ---
   const employee = await getEmployee(ctx, input.employeeId);
@@ -826,6 +861,7 @@ async function preparePaycheck(
   if (!(input.payDate instanceof Date) || isNaN(input.payDate.getTime())) {
     throw validation('A valid pay date is required.');
   }
+  const periodsPerYear = await resolvePeriodsPerYear(ctx, input.periodsPerYear, opts.storedPeriodsPerYear);
 
   // --- Compute gross from itemized earnings (or the legacy single amount) ---
   const earningsInput = input.earnings ?? [];
@@ -1044,7 +1080,7 @@ async function preparePaycheck(
     const withholding = computeWithholding({
       grossPerPeriod: incomeTaxWages.toNumber(),
       ficaWagesPerPeriod: ficaWages.toNumber(),
-      periodsPerYear: input.periodsPerYear ?? 26,
+      periodsPerYear,
       filingStatus: input.filingStatus ?? normalizeFilingStatus(w4.filingStatus),
       ytdGrossBefore: ytdFicaBefore,
       year,
@@ -1077,7 +1113,7 @@ async function preparePaycheck(
           wagesPerPeriod: incomeTaxWages,
           ficaWagesPerPeriod: ficaWages,
           ficaTaxPerPeriod: Money.of(withholding.socialSecurity).plus(Money.of(withholding.medicare)),
-          periodsPerYear: input.periodsPerYear ?? 26,
+          periodsPerYear,
           stateW4: (w4 as Record<string, unknown>).stateW4 as StateW4 | undefined,
         });
       } catch (err) {
@@ -1207,6 +1243,7 @@ async function preparePaycheck(
     itemFor,
     notes,
     accountsUsed: { payrollExpenseId, payrollTaxExpenseId, payrollLiabId, checkingId },
+    periodsPerYear,
   };
 }
 
@@ -1392,6 +1429,7 @@ export async function runPaycheck(ctx: ServiceContext, input: RunPaycheckInput) 
         netPay: toAmountString(prep.netPay),
         payRunId: input.payRunId ?? null,
         entryType: 'paycheck',
+        periodsPerYear: prep.periodsPerYear,
         // postedEntryId set below
       })
       .returning();
@@ -1460,10 +1498,12 @@ export async function editPaycheck(ctx: ServiceContext, paycheckId: string, inpu
     throw validation('This is a payroll adjustment, not a paycheck. Edit it from the adjustments list.');
   }
 
+  // Recalculate at the check's OWN pay frequency (a monthly check must not be re-withheld as if
+  // it were biweekly) unless the edit names a new one.
   const prep = await preparePaycheck(
     ctx,
     { ...input, employeeId: existing.employeeId, payRunId: existing.payRunId },
-    { excludePaycheckId: paycheckId, allowInactive: true },
+    { excludePaycheckId: paycheckId, allowInactive: true, storedPeriodsPerYear: existing.periodsPerYear },
   );
 
   return inTransaction(ctx, async (tx) => {
@@ -1500,6 +1540,7 @@ export async function editPaycheck(ctx: ServiceContext, paycheckId: string, inpu
         totalTaxes: toAmountString(prep.totalTaxes),
         totalDeductions: toAmountString(prep.totalDeductions),
         netPay: toAmountString(prep.netPay),
+        periodsPerYear: prep.periodsPerYear,
         postedEntryId: entry.id,
       })
       .where(eq(paychecks.id, paycheckId))
@@ -1676,7 +1717,8 @@ export async function createPayRun(ctx: ServiceContext, input: CreatePayRunInput
     }
     seen.add(e.employeeId);
   }
-  const periodsPerYear = input.periodsPerYear ?? 26;
+  // Salary defaults and withholding use the run's frequency, else the company pay period.
+  const periodsPerYear = await resolvePeriodsPerYear(ctx, input.periodsPerYear);
 
   // The header row is created inside the FIRST employee transaction that posts a paycheck, so it
   // commits (or rolls back) with that check: a run where every check is refused leaves no empty
