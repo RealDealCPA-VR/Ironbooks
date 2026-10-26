@@ -840,6 +840,25 @@ describe('review5 inventory', () => {
     expect((await verifySiteInvariants(ctx)).allOk).toBe(true);
   });
 
+  it('physical count dated before later sales compares the count with the quantity on hand AT that date', async () => {
+    const a = await invItem('Month-end count widget');
+    await adjustQuantityAtSite(ctx, { itemId: a.id, quantityChange: '10', unitCost: '2.00', date: d('2026-01-02') });
+    const c = await createCustomer(ctx, { displayName: 'February buyer' } as never);
+    await createInvoice(ctx, { customerId: c.id, date: d('2026-02-10'), lines: [{ itemId: a.id, quantity: 3, rate: '5.00' }] } as never);
+    // The January 31 count (entered in February) found the 10 units that were there on Jan 31.
+    const res = await physicalCount(ctx, { itemId: a.id, countedQty: 10, date: d('2026-01-31') });
+    expect(res.previousQty).toBe('10.0000');
+    expect(res.delta).toBe('0.0000');
+    expect(res.journalEntryId).toBeNull();
+    expect((await itemRow(a.id)).quantityOnHand).toBe('7.0000');
+    // A count that does find a difference posts just that difference.
+    const short = await physicalCount(ctx, { itemId: a.id, countedQty: 9, date: d('2026-01-31') });
+    expect(short.delta).toBe('-1.0000');
+    expect((await itemRow(a.id)).quantityOnHand).toBe('6.0000');
+    expect(await gl('1300')).toBe('12.00');
+    expect((await inventoryValuation(ctx)).grandTotal).toBe('12.00');
+  });
+
   it('Transactions by Serial/Lot Number names checks and vendor credits (label and number)', async () => {
     const v = await createVendor(ctx, { displayName: 'Lot supplier' } as never);
     const lot = await invItem('Lot glue', { trackingMode: 'lot' });

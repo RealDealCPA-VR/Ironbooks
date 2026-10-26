@@ -14,12 +14,13 @@
  * default as inventory.adjustInventory / fifo.ts), with optional Class and Customer:Job on the
  * adjustment line.
  */
-import { and, asc, eq, inArray, isNotNull, sql } from 'drizzle-orm';
+import { and, asc, eq, gte, inArray, isNotNull, notInArray, sql } from 'drizzle-orm';
 import Decimal from 'decimal.js';
 import {
   accounts,
   items,
   inventoryLayers,
+  inventoryMovements,
   inventorySites,
   itemSiteSettings,
   purchaseOrderLines,
@@ -65,6 +66,28 @@ async function accountIdByCode(ctx: ServiceContext, code: string): Promise<strin
     .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, code)));
   if (!row) throw notFound(`Account with code ${code}`);
   return row.id;
+}
+
+/**
+ * Net quantity of an item moved by transactions dated AFTER `date`'s calendar day (sales, receipts,
+ * returns, adjustments, builds: their site movements, reversals included — a voided document
+ * nets to zero). Transfers and default-site rebalances move stock between sites, not in or out.
+ * Used to put a back-dated count against the quantity on hand at its date.
+ */
+async function netMovedAfter(ctx: ServiceContext, itemId: string, date: Date): Promise<Decimal> {
+  const nextDay = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate() + 1));
+  const [row] = await ctx.db
+    .select({ qty: sql<string>`COALESCE(SUM(${inventoryMovements.quantity}), 0)` })
+    .from(inventoryMovements)
+    .where(
+      and(
+        eq(inventoryMovements.companyId, ctx.companyId),
+        eq(inventoryMovements.itemId, itemId),
+        gte(inventoryMovements.date, nextDay),
+        notInArray(inventoryMovements.sourceType, ['transfer', 'site_rebalance']),
+      ),
+    );
+  return Money.of(row?.qty ?? '0');
 }
 
 /** Load an inventory-type item scoped to the company. Throws NOT_FOUND. */
@@ -263,10 +286,13 @@ export interface PhysicalCountResult {
 /**
  * Record a physical inventory count adjustment.
  *
- * delta = countedQty - currentQty
+ * delta = countedQty - quantity on hand AT the count date (today's quantity less what
+ * transactions dated after the count moved — see netMovedAfter); today's quantity moves by delta.
  *   - delta < 0 (shrinkage): Dr adjustmentAccount, Cr Inventory Asset
  *   - delta > 0 (overage):   Dr Inventory Asset, Cr adjustmentAccount
  *   - delta = 0: no GL posted, qty unchanged
+ * (A $0 count posts no entry but still answers to the closing date.) Counts and opening stock
+ * write no site movement, so a later-dated count entered first is not subtracted.
  */
 export async function physicalCount(
   ctx: ServiceContext,
@@ -309,13 +335,24 @@ async function physicalCountInTx(
   const currentQty = Money.of(item.quantityOnHand ?? '0');
   const avgCost = Money.of(item.averageCost ?? '0');
 
-  const delta = counted.minus(currentQty);
+  // The count is compared with the quantity on hand AT its date, as QB's Adjust Quantity window
+  // does: a month-end count entered after the next month's sales / receipts must not book those
+  // as shrinkage / overage. Quantity at the date = today's less what later-dated transactions
+  // moved (their site movements; reversals carry the original's date and cancel out).
+  const qtyAtDate = currentQty.minus(await netMovedAfter(ctx, item.id, input.date));
+  const delta = counted.minus(qtyAtDate);
+  const newQty = currentQty.plus(delta);
+  if (newQty.isNegative()) {
+    throw validation(
+      `Counting ${counted.toFixed(4)} "${item.name}" on ${input.date.toISOString().slice(0, 10)} would leave ${newQty.toFixed(4)} on hand today, because transactions dated after the count took more than that out. Check the count date and those transactions.`,
+    );
+  }
 
-  // No change — update qty to match counted (no-op if equal) and return early
+  // No change — the count agrees with the books at its date.
   if (delta.isZero()) {
     return {
       itemId: item.id,
-      previousQty: currentQty.toFixed(4),
+      previousQty: qtyAtDate.toFixed(4),
       countedQty: counted.toFixed(4),
       delta: '0.0000',
       glAmount: '0.00',
@@ -327,8 +364,8 @@ async function physicalCountInTx(
 
   // Book value before minus after (telescopes: counting to zero clears the item's value exactly);
   // counting to zero also takes the value remainder the GL still carries (0061), like a sell-out.
-  const atBook = bookValueRelief(currentQty, counted, avgCost);
-  const sellOut = delta.isNegative() ? sellOutRelief(item, counted, atBook) : { relief: atBook, remainderRelieved: false };
+  const atBook = bookValueRelief(currentQty, newQty, avgCost);
+  const sellOut = delta.isNegative() ? sellOutRelief(item, newQty, atBook) : { relief: atBook, remainderRelieved: false };
   const glAmount = sellOut.relief.abs();
 
   return inTransaction(ctx, async (tx) => {
@@ -385,11 +422,12 @@ async function physicalCountInTx(
           sourceRef: `item:${input.itemId}`,
         });
 
-    // Update the item's quantityOnHand to the counted qty
+    // Apply the count's difference to today's quantity (= the counted quantity when nothing
+    // dated after the count moved the item).
     await tx.db
       .update(items)
       .set({
-        quantityOnHand: counted.toFixed(4),
+        quantityOnHand: newQty.toFixed(4),
         ...(sellOut.remainderRelieved ? { valueRemainder: '0.00', valueRemainderAvg: avgCost.toFixed(4) } : {}),
         updatedAt: new Date(),
       })
@@ -404,7 +442,9 @@ async function physicalCountInTx(
       entityId: input.itemId,
       oldValues: { quantityOnHand: item.quantityOnHand },
       newValues: {
-        quantityOnHand: counted.toFixed(4),
+        quantityOnHand: newQty.toFixed(4),
+        countedQty: counted.toFixed(4),
+        quantityAtCountDate: qtyAtDate.toFixed(4),
         physicalCountDate: input.date.toISOString(),
         postedEntryId: entry?.id ?? null,
       },
@@ -412,13 +452,13 @@ async function physicalCountInTx(
 
     return {
       itemId: item.id,
-      previousQty: currentQty.toFixed(4),
+      previousQty: qtyAtDate.toFixed(4),
       countedQty: counted.toFixed(4),
       delta: delta.toFixed(4),
       glAmount: toAmountString(glAmount),
       journalEntryId: entry?.id ?? null,
       adjustmentAccountId,
-      updatedQty: counted.toFixed(4),
+      updatedQty: newQty.toFixed(4),
     };
   });
 }
