@@ -7,6 +7,9 @@
  *     so the year's profit landed in Opening Balance Equity.
  *  B. The Year-End Close window names the account the profit went to (it always said
  *     "Retained Earnings (3900)", also when that was another account).
+ *  C. A year-end closing entry can be voided from the journal window, not reversed: the reversal
+ *     (an ordinary entry dated Jan 1) was counted by the next year's Profit & Loss, which then
+ *     showed the whole closed year's income and expenses again.
  */
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import { NextRequest } from 'next/server';
@@ -18,6 +21,9 @@ import type { ServiceContext } from './_base';
 import { createAccount, findOrCreateOpeningBalanceEquity, getAccount } from './accounts';
 import { postJournalEntry } from './posting';
 import { yearEndClose } from './fiscalClose';
+import { reverseEntry, voidEntry } from './journal';
+import { profitAndLoss } from './reports';
+import { isJournalScreenEntry } from '@/lib/journalScreen';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-review5-fiscal-close');
 let db: DB;
@@ -96,5 +102,27 @@ describe('year-end close (review round 5)', () => {
     const body = (await res.json()) as { netIncome: string; retainedEarnings?: { code: string; name: string } };
     expect(body.netIncome).toBe('40.00');
     expect(body.retainedEarnings).toEqual({ code: '3200', name: 'Retained Earnings' });
+  });
+
+  it("C: a year-end closing entry can be voided but not reversed (the reversal landed in next year's P&L)", async () => {
+    const [bank] = await db.query.accounts.findMany({ where: (a, { and, eq }) => and(eq(a.companyId, ctx.companyId), eq(a.code, '1000')) });
+    const [sales] = await db.query.accounts.findMany({ where: (a, { and, eq }) => and(eq(a.companyId, ctx.companyId), eq(a.code, '4000')) });
+    await postJournalEntry(ctx, {
+      date: new Date('2023-05-01T00:00:00Z'),
+      description: 'Cash sale',
+      lines: [
+        { accountId: bank.id, debit: '70.00' },
+        { accountId: sales.id, credit: '70.00' },
+      ],
+    });
+    const closed = await yearEndClose(ctx, { fiscalYear: 2023 });
+    expect(isJournalScreenEntry(closed.entry.sourceRef, 'reverse')).toBe(false);
+    expect(isJournalScreenEntry(closed.entry.sourceRef, 'void')).toBe(true);
+    await expect(reverseEntry(ctx, closed.entry.id)).rejects.toMatchObject({ code: 'CONFLICT' });
+    // 2024's P&L is untouched by 2023's close.
+    const pl2024 = await profitAndLoss(ctx, { from: new Date('2024-01-01T00:00:00Z'), to: new Date('2024-12-31T00:00:00Z') });
+    expect(pl2024.netIncome).toBe('300.00');
+    // Voiding the closing entry still works (the way to take a year-end close back).
+    await voidEntry(ctx, closed.entry.id);
   });
 });

@@ -768,6 +768,12 @@ export function defaultReversalDate(entryDate: Date): Date {
 /** Refuse to void / reverse a document-posted entry from the journal screen (lib/journalScreen.ts). */
 function assertJournalScreenEntry(sourceRef: string | null | undefined, op: 'void' | 'reverse'): void {
   if (isJournalScreenEntry(sourceRef, op)) return;
+  if (op === 'reverse' && sourceRef?.startsWith('fiscal-close:')) {
+    throw new ServiceError(
+      'CONFLICT',
+      "A year-end closing entry can't be reversed: the reversal would count in next year's Profit & Loss. Void the closing entry instead to take the year-end close back.",
+    );
+  }
   throw new ServiceError(
     'CONFLICT',
     op === 'void'
