@@ -20,6 +20,7 @@ import { GL_LIMITS, endOfToday, resolveDateMacro } from './reportEngine';
 import { createCustomer } from './customers';
 import { createInvoice } from './invoices';
 import { createTransfer } from './transfers';
+import { createExpense } from './expenses';
 import { createBankAccount } from './bankAccounts';
 import { completeReconciliation, startReconciliation, toggleCleared, undoLastReconciliation } from './reconcile';
 import { runStandardReport } from './reportRegistry';
@@ -240,5 +241,19 @@ describe('cleared status after Undo Last Reconciliation', () => {
     expect(after?.cells.clr).toBe('');
     expect((await run('cleared')).rows.filter((x) => x.kind === 'data').length).toBe(0);
     expect((await run('uncleared')).rows.filter((x) => x.kind === 'data').length).toBe(1);
+  });
+});
+
+describe('detail reports grouped by name', () => {
+  it('checks to different free-text payees are not lumped under the first payee', async () => {
+    vi.useRealTimers();
+    await createExpense(ctx, { payeeName: "Joe's Diner", date: d('2026-07-01'), method: 'check', paymentAccountId: A['1000'], lines: [{ accountId: A['6000'], amount: '12.00' }] });
+    await createExpense(ctx, { payeeName: 'Shell Gas', date: d('2026-07-02'), method: 'check', paymentAccountId: A['1000'], lines: [{ accountId: A['6000'], amount: '30.00' }] });
+    const r = await runStandardReport(ctx, 'expenses-by-vendor-detail', { from: '2026-07-01', to: '2026-07-31' });
+    const groups = r.rows.filter((x) => x.kind === 'section').map((x) => x.cells.label);
+    expect(groups).toEqual(expect.arrayContaining(["Joe's Diner", 'Shell Gas']));
+    const total = (label: string) => r.rows.find((x) => x.kind === 'subtotal' && x.cells.label === `Total ${label}`)?.cells.amount;
+    expect(total("Joe's Diner")).toBe('12.00');
+    expect(total('Shell Gas')).toBe('30.00');
   });
 });

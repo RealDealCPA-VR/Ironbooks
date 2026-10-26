@@ -1764,7 +1764,9 @@ function groupKeyOf(l: GlLine, g: GroupKey): { key: string; label: string; sort:
     case 'account':
       return { key: l.accountId, label: l.account.fullName, sort: `${l.account.code}|${l.account.fullName}` };
     case 'name':
-      return { key: l.nameId ?? '', label: l.name || '(no name)', sort: blankLast(l.name) };
+      // A name with no list entry (a check to a free-text payee) is grouped by the name itself:
+      // keyed '' they all fell into ONE group labelled with whichever payee came first.
+      return { key: l.nameId ?? (l.name ? `payee:${l.name.toLowerCase()}` : ''), label: l.name || '(no name)', sort: blankLast(l.name) };
     case 'type':
       return { key: l.txnType, label: l.type, sort: l.type };
     case 'month': {
