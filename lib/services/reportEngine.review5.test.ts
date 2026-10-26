@@ -16,7 +16,9 @@ import { accounts, users } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
 import { createCompany } from './company';
 import { postJournalEntry } from './posting';
-import { endOfToday, resolveDateMacro } from './reportEngine';
+import { GL_LIMITS, endOfToday, resolveDateMacro } from './reportEngine';
+import { createCustomer } from './customers';
+import { createInvoice } from './invoices';
 import { runStandardReport } from './reportRegistry';
 import { arAging, collectionsReport } from './reportsExtra';
 import { createReportSchedule, listReportSchedules, nextRunAfter, runDueSchedules, saveMemorizedReport } from './memorizedReports';
@@ -148,5 +150,47 @@ describe('scheduled reports run on the local calendar day', () => {
     expect([nov.getMonth(), nov.getDate(), nov.getHours()]).toEqual([10, 30, 0]); // Nov 30 midnight (PST)
     const daily = nextRunAfter(new Date(2026, 10, 1, 0, 0, 0), 'daily');
     expect([daily.getMonth(), daily.getDate(), daily.getHours()]).toEqual([10, 2, 0]);
+  });
+});
+
+describe('name-filtered detail reports on a large file', () => {
+  it("Customer Balance Detail shows a customer's newest transactions when the file has more lines than the read cap", async () => {
+    vi.useRealTimers();
+    const old = await createCustomer(ctx, { displayName: 'Old Customer' } as never);
+    const recent = await createCustomer(ctx, { displayName: 'Recent Customer' } as never);
+    // Many older A/R lines for one customer (named General Journal lines)...
+    for (let i = 0; i < 6; i++) {
+      await postJournalEntry(ctx, {
+        date: d(`2026-03-0${i + 1}`),
+        description: 'old charge',
+        lines: [
+          { accountId: A['1200'], debit: '10.00', entityType: 'customer', entityId: old.id },
+          { accountId: A['4000'], credit: '10.00' },
+        ],
+      });
+    }
+    // ...then the other customer's invoice (named by its document) and a named journal line.
+    await createInvoice(ctx, { customerId: recent.id, date: d('2026-04-01'), lines: [{ accountId: A['4000'], quantity: 1, rate: '25.00', taxable: false }] } as never);
+    await postJournalEntry(ctx, {
+      date: d('2026-04-02'),
+      description: 'recent charge',
+      lines: [
+        { accountId: A['1200'], debit: '5.00', entityType: 'customer', entityId: recent.id },
+        { accountId: A['4000'], credit: '5.00' },
+      ],
+    });
+    const cap = GL_LIMITS.postFilterScan;
+    GL_LIMITS.postFilterScan = 5; // stands in for the 50,000-line read on a big company file
+    try {
+      const r = await runStandardReport(ctx, 'customer-balance-detail', { customerId: recent.id, asOf: '2026-12-31' });
+      const total = r.rows.find((x) => x.id.endsWith(':total'));
+      expect(total?.cells.amount).toBe('30.00');
+      expect(r.truncated).toBeFalsy();
+      // A read that does hit the cap says so instead of showing a short report.
+      const all = await runStandardReport(ctx, 'customer-balance-detail', { customerId: old.id, asOf: '2026-12-31' });
+      expect(all.truncated).toBe(true);
+    } finally {
+      GL_LIMITS.postFilterScan = cap;
+    }
   });
 });

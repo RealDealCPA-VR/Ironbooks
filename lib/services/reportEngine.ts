@@ -1190,6 +1190,40 @@ export function glFilterFromParams(
 
 export const DEFAULT_LINE_LIMIT = 10000;
 
+/** Read caps of fetchGlLines (mutable for tests only). */
+export const GL_LIMITS = {
+  /** Most raw lines a name / number-filtered read scans before filtering. */
+  postFilterScan: 50000,
+};
+
+/**
+ * Lines that can resolve to the name `nameId` (fetchGlLines then checks the resolved name): a
+ * line named on the line itself (General Journal A/R / A/P lines), or an unnamed line of an entry
+ * whose source document belongs to that name, or whose sourceRef names it directly
+ * ('customer:<id>', 'vendor:<id>', 'tax_agency:<id>'). Covers every document type
+ * resolveEntryNames reads, so it is a superset of the exact match.
+ */
+function nameCandidates(companyId: string, nameId: string): SQL {
+  const c = companyId;
+  const docIds = sql.join(
+    [
+      sql`SELECT ${invoices.id}::text FROM ${invoices} WHERE ${invoices.companyId} = ${c} AND ${invoices.customerId} = ${nameId}`,
+      sql`SELECT ${paymentsReceived.id}::text FROM ${paymentsReceived} WHERE ${paymentsReceived.companyId} = ${c} AND ${paymentsReceived.customerId} = ${nameId}`,
+      sql`SELECT ${salesReceipts.id}::text FROM ${salesReceipts} WHERE ${salesReceipts.companyId} = ${c} AND ${salesReceipts.customerId} = ${nameId}`,
+      sql`SELECT ${creditMemos.id}::text FROM ${creditMemos} WHERE ${creditMemos.companyId} = ${c} AND ${creditMemos.customerId} = ${nameId}`,
+      sql`SELECT ${bills.id}::text FROM ${bills} WHERE ${bills.companyId} = ${c} AND ${bills.vendorId} = ${nameId}`,
+      sql`SELECT ${vendorCredits.id}::text FROM ${vendorCredits} WHERE ${vendorCredits.companyId} = ${c} AND ${vendorCredits.vendorId} = ${nameId}`,
+      sql`SELECT ${expenses.id}::text FROM ${expenses} WHERE ${expenses.companyId} = ${c} AND (${expenses.vendorId} = ${nameId} OR ${expenses.otherNameId} = ${nameId})`,
+      sql`SELECT ${itemReceipts.id}::text FROM ${itemReceipts} WHERE ${itemReceipts.companyId} = ${c} AND ${itemReceipts.vendorId} = ${nameId}`,
+      sql`SELECT ${paychecks.id}::text FROM ${paychecks} WHERE ${paychecks.companyId} = ${c} AND ${paychecks.employeeId} = ${nameId}`,
+      sql`SELECT ${expenseReports.id}::text FROM ${expenseReports} WHERE ${expenseReports.companyId} = ${c} AND ${expenseReports.employeeId} = ${nameId}`,
+    ],
+    sql` UNION ALL `,
+  );
+  const docOf = sql`split_part(${journalEntries.sourceRef}, ':', 2)`;
+  return sql`(${journalEntryLines.entityId} = ${nameId} OR (${journalEntryLines.entityId} IS NULL AND (${docOf} = ${nameId} OR ${docOf} IN (${docIds}))))`;
+}
+
 /**
  * Posted journal lines with QB detail columns, filtered. Returns at most `limit` lines (default
  * 10,000) and flags truncation.
@@ -1229,10 +1263,15 @@ export async function fetchGlLines(
   const clearedExpr = sql<boolean>`EXISTS (SELECT 1 FROM reconciliation_items ri WHERE ri.journal_entry_line_id = ${journalEntryLines.id} AND ri.is_cleared = true)`;
   if (f.cleared === 'cleared') conds.push(sql`${clearedExpr}`);
   if (f.cleared === 'uncleared') conds.push(sql`NOT ${clearedExpr}`);
+  // A name filter narrows the read in SQL to the lines that can carry that name; the exact name
+  // is checked after resolution. Without it the read took the company's FIRST 50,000 lines (oldest
+  // first) and filtered those, so on a large file a customer's newer transactions silently fell
+  // off Customer Balance Detail and every other name-filtered detail report.
+  if (f.nameId) conds.push(nameCandidates(ctx.companyId, f.nameId));
 
   // Name / number filters are applied after resolution, so read a larger window first.
   const postFilter = !!(f.nameId || f.number);
-  const fetchCap = postFilter ? 50000 : limit + 1;
+  const fetchCap = postFilter ? GL_LIMITS.postFilterScan : limit + 1;
 
   const raw = await ctx.db
     .select({
@@ -1322,8 +1361,10 @@ export async function fetchGlLines(
       (l) => l.num.toLowerCase().includes(needle) || String(l.entryNumber) === f.number,
     );
   }
-  const truncated = lines.length > limit;
-  if (truncated) lines = lines.slice(0, limit);
+  // A post-filtered read that hit its scan cap may have left matching lines unread: say so
+  // (the report shows its "only the first … lines" note) instead of a silently short report.
+  const truncated = lines.length > limit || (postFilter && raw.length >= fetchCap);
+  if (lines.length > limit) lines = lines.slice(0, limit);
 
   // Split column: the other account(s) of each entry.
   const entryIds = [...new Set(lines.map((l) => l.entryId))];
