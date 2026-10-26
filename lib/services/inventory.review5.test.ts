@@ -37,7 +37,8 @@ import { createBin, createSite, listBins, updateBin } from './inventorySites';
 import { handleBulkPost } from '@/lib/lists/bulkRoute';
 import { builtinRole, unionRoles } from '@/lib/permissions/model';
 import { createEntry, listEntries, updateEntry } from './lists/simpleLists';
-import { createType, listTypes, updateType } from './typeLists';
+import { createType, deleteType, listTypes, updateType } from './typeLists';
+import { createPriceRule } from './pricing';
 import { createUomSet, listUomSets, updateUomSet } from './lists/uom';
 import { createBillingRateLevel, listBillingRateLevels } from './lists/billingRates';
 import { auditLogs, companies, customers as customersTable } from '@/lib/db/schema';
@@ -878,6 +879,23 @@ describe('review5 inventory', () => {
     expect((await listSiteReorderPoints(ctx, { itemId: a.id })).find((r) => r.siteId === def.id)?.reorderPoint).toBe('2.0000');
     expect((await reorderReport(ctx)).rows.map((r) => r.id)).not.toContain(a.id);
     expect((await reorderBySite(ctx)).rows.map((r) => r.itemId)).not.toContain(a.id);
+  });
+
+  it('lists: a customer type a price rule uses is made inactive on delete, not removed (the rule keeps working)', async () => {
+    const t = await createType(ctx, 'customer', { name: 'Contractor' });
+    await createPriceRule(ctx, {
+      name: 'Contractor discount',
+      conditions: { customerTypeIds: [t.id] },
+      adjustment: { basis: 'price', method: 'percent', direction: 'decrease', value: '10' },
+    } as never);
+    const res = await deleteType(ctx, 'customer', t.id);
+    expect(res).toEqual({ deleted: false, deactivated: true });
+    expect((await listTypes(ctx, 'customer')).find((x) => x.id === t.id)?.isActive).toBe(false);
+    // An unused type is still deleted, and its subtypes move up to its parent (QB).
+    const parent = await createType(ctx, 'customer', { name: 'Retail' });
+    const child = await createType(ctx, 'customer', { name: 'Walk-in', parentId: parent.id });
+    expect(await deleteType(ctx, 'customer', parent.id)).toEqual({ deleted: true, deactivated: false });
+    expect((await listTypes(ctx, 'customer')).find((x) => x.id === child.id)?.parentId).toBeNull();
   });
 
   it('Transactions by Serial/Lot Number names checks and vendor credits (label and number)', async () => {
