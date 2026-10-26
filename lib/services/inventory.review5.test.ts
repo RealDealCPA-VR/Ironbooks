@@ -349,9 +349,33 @@ describe('review5 inventory', () => {
     const item = await invItem('Named gadget');
     await receiveStock(ctx, { itemId: item.id, quantity: 2, unitCost: '3.00', date: d('2026-01-01') });
     const res = await consumeStock(ctx, { itemId: item.id, quantity: 1, date: d('2026-01-02') });
-    const [je] = await db.select().from(journalEntries).where(eq(journalEntries.id, res.entryId));
+    const [je] = await db.select().from(journalEntries).where(eq(journalEntries.id, res.entryId!));
     expect(je.description).toContain('Named gadget');
     expect(je.description).not.toContain(item.id);
+  });
+
+  // ---- zero-cost stock ----
+
+  it('Adjust Quantity: stock with no cost can be added and removed (no $0 journal entry refused)', async () => {
+    const avg = await invItem('Free sample');
+    const added = await adjustQuantityAtSite(ctx, { itemId: avg.id, quantityChange: '5', unitCost: '0', date: d('2026-01-02') });
+    expect(added.quantityOnHand).toBe('5.0000');
+    const removed = await adjustQuantityAtSite(ctx, { itemId: avg.id, quantityChange: '-2', date: d('2026-01-03') });
+    expect(removed.quantityOnHand).toBe('3.0000');
+    // FIFO the same way.
+    const fifo = await invItem('Free FIFO sample');
+    await adjustQuantityAtSite(ctx, { itemId: fifo.id, quantityChange: '4', unitCost: '0', date: d('2026-01-02'), costing: 'fifo' });
+    const out = await adjustQuantityAtSite(ctx, { itemId: fifo.id, quantityChange: '-4', date: d('2026-01-03') });
+    expect(out.quantityOnHand).toBe('0.0000');
+    expect(await gl('1300')).toBe('0.00');
+    expect((await inventoryValuation(ctx)).grandTotal).toBe('0.00');
+    // Selling FIFO units that carry no cost is refused with a plain message (not "a line must
+    // have a debit or a credit"), like an average-cost item with no average.
+    await adjustQuantityAtSite(ctx, { itemId: fifo.id, quantityChange: '2', unitCost: '0', date: d('2026-01-04') });
+    const c = await createCustomer(ctx, { displayName: 'Free buyer' } as never);
+    await expect(
+      createInvoice(ctx, { customerId: c.id, date: d('2026-01-05'), lines: [{ itemId: fifo.id, quantity: 1, rate: '5.00' }] } as never),
+    ).rejects.toThrow(/has no cost/);
   });
 
   // ---- valuation includes inactive items that still hold stock ----

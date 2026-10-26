@@ -237,7 +237,7 @@ describe('P1 purchases — vendor credits and inventory adjustments', () => {
       expect(adj?.type).toBe('expense');
       expect(await balanceOf(ctx, acct['3000'])).toBe(0);
       expect(await balanceOf(ctx, adj!.id)).toBe(-10);
-      const lines = await db.select().from(journalEntryLines).where(eq(journalEntryLines.journalEntryId, res.entry.id));
+      const lines = await db.select().from(journalEntryLines).where(eq(journalEntryLines.journalEntryId, res.entry!.id));
       const adjLine = lines.find((l) => l.accountId === adj!.id)!;
       expect(adjLine).toMatchObject({ classId: cls, entityType: 'customer', entityId: cust, memo: 'Found in back room' });
 
@@ -263,7 +263,7 @@ describe('P1 purchases — vendor credits and inventory adjustments', () => {
       const site = await adjustQuantityAtSite(ctx, { itemId: it, quantityChange: '-2', date: d('2026-05-02'), classId: cls, memo: 'Damaged' });
       const adj = (await db.select().from(accounts).where(eq(accounts.companyId, ctx.companyId))).find((a) => a.name === 'Inventory Adjustments')!;
       expect(await balanceOf(ctx, adj.id)).toBe(6);
-      const siteLines = await db.select().from(journalEntryLines).where(eq(journalEntryLines.journalEntryId, site.entryId));
+      const siteLines = await db.select().from(journalEntryLines).where(eq(journalEntryLines.journalEntryId, site.entryId!));
       expect(siteLines.find((l) => l.accountId === adj.id)?.classId).toBe(cls);
 
       await consumeStock(ctx, { itemId: it, quantity: '1', date: d('2026-05-03') });

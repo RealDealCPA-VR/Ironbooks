@@ -1239,7 +1239,7 @@ async function postInvoiceCOGS(
         memo: cogsMemo,
         classId: cl.classId, // COGS carries the sale's class (P&L by Class)
       });
-      cogsEntryId = res.entryId;
+      cogsEntryId = res.entryId!; // a sale always posts COGS (consumeStock refuses a $0 sale)
     } else {
       // Guard: a zero-average-cost sale would produce a $0 (unpostable) COGS entry
       // and an irreversible stock decrement — block it with a clear message.

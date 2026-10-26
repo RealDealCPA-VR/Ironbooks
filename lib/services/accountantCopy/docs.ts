@@ -886,7 +886,8 @@ export async function createDoc(tx: ServiceContext, type: DocType, p: P): Promis
       return row.id;
     }
     case 'inventory_adjustment':
-      return (await adjustQuantityAtSite(tx, asInput<SiteAdjustmentInput>(input))).entryId;
+      // An accountant's adjustment always moved value (a $0 one is refused in the copy).
+      return (await adjustQuantityAtSite(tx, asInput<SiteAdjustmentInput>(input))).entryId!;
   }
 }
 

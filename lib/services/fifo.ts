@@ -43,6 +43,7 @@ import {
   inventoryNumber,
   resolveAdjustmentAccount,
   todayCalendarDay,
+  zeroValueAdjustment,
 } from './inventory';
 
 // ---------------------------------------------------------------------------
@@ -192,7 +193,8 @@ export interface ReceiveStockResult {
   quantity: string;
   unitCost: string;
   totalCost: string;
-  entryId: string;
+  /** Null when the stock was received at $0 (nothing posted). */
+  entryId: string | null;
 }
 
 /**
@@ -223,25 +225,27 @@ export async function receiveStock(
 
     await seedOpeningLayer(tx, input.itemId, input.date);
 
-    // Post GL: Dr Inventory, Cr Adjustment Account
-    const entry = await postJournalEntry(tx, {
-      date: input.date,
-      description: input.memo ?? `Inventory adjustment — ${item.name}`,
-      lines: [
-        {
-          accountId: inventoryAccountId,
-          debit: toAmountString(totalCost),
-          memo: input.memo ?? 'FIFO stock receipt',
-        },
-        {
-          accountId: offsetAccountId,
-          credit: toAmountString(totalCost),
-          memo: input.memo ?? 'Inventory adjustment',
-          ...dims,
-        },
-      ],
-      sourceRef: `item:${input.itemId}`,
-    });
+    // Post GL: Dr Inventory, Cr Adjustment Account (stock received at $0 posts nothing).
+    const entry = totalCost.isZero()
+      ? await zeroValueAdjustment(tx, input.date, input.itemId, `Inventory adjustment — ${item.name}`)
+      : await postJournalEntry(tx, {
+          date: input.date,
+          description: input.memo ?? `Inventory adjustment — ${item.name}`,
+          lines: [
+            {
+              accountId: inventoryAccountId,
+              debit: toAmountString(totalCost),
+              memo: input.memo ?? 'FIFO stock receipt',
+            },
+            {
+              accountId: offsetAccountId,
+              credit: toAmountString(totalCost),
+              memo: input.memo ?? 'Inventory adjustment',
+              ...dims,
+            },
+          ],
+          sourceRef: `item:${input.itemId}`,
+        });
 
     // Insert the inventory cost layer(s): worth exactly what the entry posted.
     const [layer] = await insertLayersWorth(tx, { itemId: input.itemId, date: input.date, qty, value: totalCost });
@@ -264,7 +268,7 @@ export async function receiveStock(
         quantity: qty.toFixed(4),
         unitCost: unitCost.toFixed(4),
         totalCost: toAmountString(totalCost),
-        entryId: entry.id,
+        entryId: entry?.id ?? null,
       },
     });
 
@@ -274,7 +278,7 @@ export async function receiveStock(
       quantity: qty.toFixed(4),
       unitCost: unitCost.toFixed(4),
       totalCost: toAmountString(totalCost),
-      entryId: entry.id,
+      entryId: entry?.id ?? null,
     };
   });
 }
@@ -605,7 +609,8 @@ export interface ConsumeStockResult {
   quantityConsumed: string;
   totalCOGS: string;
   layers: ConsumedLayer[];
-  entryId: string;
+  /** Null when an adjustment removed units that carry no cost (nothing posted). */
+  entryId: string | null;
 }
 
 /**
@@ -627,6 +632,13 @@ export async function consumeStock(
   return inTransaction(ctx, async (tx) => {
     // Deplete layers FIFO (oldest first) for the exact cost.
     const { cost: cogsAmount, layers: consumedLayers } = await takeFromLayers(tx, input.itemId, needQty);
+    if (cogsAmount.isZero() && input.purpose !== 'adjustment') {
+      // A sale is reversed through its COGS entry (void / edit put the units back from it), so a
+      // sale of units that carry no cost is refused plainly, as for average-cost items.
+      throw validation(
+        `Inventory item "${item.name}" has no cost in the units it would sell. Receive stock with a unit cost (bill or inventory adjustment) before selling it.`,
+      );
+    }
 
     // Post GL: Dr COGS (sales) / Adjustment Account (adjustments), Cr Inventory
     const inventoryAccountId = item.assetAccountId ?? (await accountIdByCode(tx, '1300'));
@@ -637,24 +649,27 @@ export async function consumeStock(
       : await cogsAccountForItem(tx, item);
     const dims = isAdjustment ? await adjustmentPostingFields(tx, input) : input.classId ? { classId: input.classId } : {};
 
-    const entry = await postJournalEntry(tx, {
-      date: input.date,
-      description: input.memo ?? (isAdjustment ? `Inventory adjustment — ${item.name}` : `Cost of goods sold — ${item.name}`),
-      lines: [
-        {
-          accountId: cogsAccountId,
-          debit: toAmountString(cogsAmount),
-          memo: input.memo ?? (isAdjustment ? 'Inventory adjustment' : 'FIFO COGS'),
-          ...dims,
-        },
-        {
-          accountId: inventoryAccountId,
-          credit: toAmountString(cogsAmount),
-          memo: input.memo ?? 'FIFO inventory reduction',
-        },
-      ],
-      sourceRef: `item:${input.itemId}`,
-    });
+    // Removing units that carry no cost (an adjustment) posts nothing; a sale was refused above.
+    const entry = cogsAmount.isZero()
+      ? await zeroValueAdjustment(tx, input.date, input.itemId, `Inventory adjustment — ${item.name}`)
+      : await postJournalEntry(tx, {
+          date: input.date,
+          description: input.memo ?? (isAdjustment ? `Inventory adjustment — ${item.name}` : `Cost of goods sold — ${item.name}`),
+          lines: [
+            {
+              accountId: cogsAccountId,
+              debit: toAmountString(cogsAmount),
+              memo: input.memo ?? (isAdjustment ? 'Inventory adjustment' : 'FIFO COGS'),
+              ...dims,
+            },
+            {
+              accountId: inventoryAccountId,
+              credit: toAmountString(cogsAmount),
+              memo: input.memo ?? 'FIFO inventory reduction',
+            },
+          ],
+          sourceRef: `item:${input.itemId}`,
+        });
 
     // Keep item.quantityOnHand in sync
     await tx.db
@@ -672,7 +687,7 @@ export async function consumeStock(
       newValues: {
         quantityConsumed: needQty.toFixed(4),
         totalCOGS: toAmountString(cogsAmount),
-        entryId: entry.id,
+        entryId: entry?.id ?? null,
         layers: consumedLayers,
       },
     });
@@ -682,7 +697,7 @@ export async function consumeStock(
       quantityConsumed: needQty.toFixed(4),
       totalCOGS: toAmountString(cogsAmount),
       layers: consumedLayers,
-      entryId: entry.id,
+      entryId: entry?.id ?? null,
     };
   });
 }

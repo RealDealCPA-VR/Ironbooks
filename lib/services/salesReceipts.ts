@@ -506,7 +506,7 @@ async function postSalesReceiptDocument(
         memo,
         classId, // COGS carries the receipt's class (P&L by Class)
       });
-      entryId = res.entryId;
+      entryId = res.entryId!; // a sale always posts COGS (consumeStock refuses a $0 sale)
       cogs = res.totalCOGS;
     } else {
       const res = await recordCOGS(tx, {

@@ -119,6 +119,8 @@ export async function assertNotFifoTracked(ctx: ServiceContext, itemId: string):
   }
 }
 import { assertNotControlLineAccount, postJournalEntry } from './posting';
+import { assertPeriodOpen, recordClosingDateException } from './fiscalPeriods';
+import { activeCopy } from './accountantCopy/guard';
 import { averageAfter, takeAccountantCost } from './accountantCopy/inventoryCost';
 
 // ---------------------------------------------------------------------------
@@ -421,6 +423,33 @@ export function sellOutRelief(
   return { relief: withRemainder, remainderRelieved: true };
 }
 
+/**
+ * The ledger side of an inventory movement worth $0: no entry (postJournalEntry refuses $0
+ * lines), but the closing date / closed periods / Accountant's Copy dividing date still apply,
+ * and a closing-date password override is recorded, as for a posted adjustment. Returns null.
+ */
+export async function zeroValueAdjustment(tx: ServiceContext, date: Date, itemId: string, description: string): Promise<null> {
+  // An Accountant's Copy sends inventory adjustments back as their journal entries: one that
+  // posts nothing would never reach the client's file.
+  const copy = await activeCopy(tx.db, tx.companyId);
+  if (copy?.side === 'accountant') {
+    throw new ServiceError(
+      'FORBIDDEN',
+      "A quantity change with no value can't be sent back to your client from an Accountant's Copy. Enter it with a unit cost, or let your client enter it.",
+      { accountantCopy: true, side: copy.side },
+    );
+  }
+  const check = await assertPeriodOpen(tx, date, { sourceRef: `item:${itemId}` });
+  await recordClosingDateException(tx, check, {
+    entryId: itemId,
+    operation: 'post',
+    transactionDate: date,
+    description,
+    sourceRef: `item:${itemId}`,
+  });
+  return null;
+}
+
 export async function adjustInventory(ctx: ServiceContext, input: AdjustInventoryInput) {
   const qtyChange = inventoryNumber(input.quantityChange, 'Quantity');
   if (qtyChange.isZero()) throw validation('quantityChange cannot be zero.');
@@ -540,12 +569,17 @@ export async function adjustInventory(ctx: ServiceContext, input: AdjustInventor
       ];
     }
 
-    const entry = await postJournalEntry(tx, {
-      date: input.date,
-      description: input.memo ?? `Inventory adjustment — ${item.name}`,
-      lines: postingLines,
-      sourceRef: `item:${input.itemId}`,
-    });
+    // A quantity change that moves no value (stock received at $0, or removed at a $0 average)
+    // posts no journal entry (a $0 entry cannot be posted); its date is still checked against
+    // the closing date and closed periods like any inventory adjustment.
+    const entry = glAmount.isZero()
+      ? await zeroValueAdjustment(tx, input.date, input.itemId, `Inventory adjustment — ${item.name}`)
+      : await postJournalEntry(tx, {
+          date: input.date,
+          description: input.memo ?? `Inventory adjustment — ${item.name}`,
+          lines: postingLines,
+          sourceRef: `item:${input.itemId}`,
+        });
 
     // Update item quantities and average cost
     await tx.db
@@ -569,12 +603,13 @@ export async function adjustInventory(ctx: ServiceContext, input: AdjustInventor
       newValues: {
         quantityOnHand: newQty.toFixed(4),
         averageCost: newAvgCost.toFixed(4),
-        postedEntryId: entry.id,
+        postedEntryId: entry?.id ?? null,
       },
     });
 
     return {
       item: { id: input.itemId, quantityOnHand: newQty.toFixed(4), averageCost: newAvgCost.toFixed(4) },
+      /** Null for a quantity change that moved no value ($0 cost): nothing was posted. */
       entry,
       glAmount: toAmountString(glAmount),
     };

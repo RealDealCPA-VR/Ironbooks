@@ -81,7 +81,8 @@ export async function adjustQuantityAtSite(ctx: ServiceContext, input: SiteAdjus
       jobId: input.jobId ?? null,
     };
 
-    let entryId: string;
+    // Null when the change moved no value (stock at $0 cost): nothing was posted.
+    let entryId: string | null;
     let glAmount: string;
     if (layer || input.costing === 'fifo') {
       if (qty.greaterThan(0)) {
@@ -122,7 +123,7 @@ export async function adjustQuantityAtSite(ctx: ServiceContext, input: SiteAdjus
         memo,
         ...dims,
       });
-      entryId = res.entry.id;
+      entryId = res.entry?.id ?? null;
       glAmount = res.glAmount;
     }
 
