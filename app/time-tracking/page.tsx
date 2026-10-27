@@ -215,7 +215,7 @@ export default function TimeTrackingPage() {
         title="Time Tracking"
         icon={Timer}
         action={
-          <Button onClick={() => { setForm(emptyForm()); setShowLog(true); }}>
+          <Button data-shortcut="new" onClick={() => { setForm(emptyForm()); setShowLog(true); }}>
             <Plus className="h-4 w-4" />
             Log Time
           </Button>
@@ -296,7 +296,7 @@ export default function TimeTrackingPage() {
             title="No time entries yet"
             message="Log your first time entry to start tracking billable hours."
             action={
-              <Button onClick={() => { setForm(emptyForm()); setShowLog(true); }}>
+              <Button data-shortcut="new" onClick={() => { setForm(emptyForm()); setShowLog(true); }}>
                 <Plus className="h-4 w-4" />
                 Log Time
               </Button>
@@ -373,7 +373,7 @@ export default function TimeTrackingPage() {
             <Button variant="secondary" onClick={() => setShowLog(false)}>
               Cancel
             </Button>
-            <Button type="submit" form="log-time-form" loading={saving}>
+            <Button type="submit" form="log-time-form" loading={saving} data-shortcut="save">
               Log Time
             </Button>
           </>

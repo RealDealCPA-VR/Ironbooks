@@ -8,6 +8,7 @@
  *    the page could not be loaded and offer Try again; Multi-user notes a failed refresh once,
  *    on the page.
  *  - Time Tracking dated new entries with the day the page was first loaded (stale after midnight).
+ *  - Ctrl+N / Ctrl+S did nothing on Time Tracking, Mileage and in Add user (unrecognised labels).
  */
 import { describe, expect, it } from 'vitest';
 import fs from 'node:fs';
@@ -15,6 +16,7 @@ import path from 'node:path';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import LoadFailed from '@/components/LoadFailed';
+import { pickShortcutButton, type ShortcutButton } from '@/lib/shortcuts';
 
 const src = (f: string) => fs.readFileSync(f, 'utf8');
 
@@ -105,5 +107,49 @@ describe('date defaults are worked out when a form opens', () => {
     const s = src('app/time-tracking/page.tsx');
     expect(s).toContain('const emptyForm = (): LogTimeForm => ({');
     expect(s).not.toMatch(/setForm\(emptyForm\)/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Ctrl+N / Ctrl+S on Time Tracking, Mileage and Users
+// ---------------------------------------------------------------------------
+//
+// The form keys find buttons by label (New…/Add…, Save/Record/Post/Create…). "Log Time", "Log
+// Miles" and "Add user" (in its dialog) matched neither, so Ctrl+N on Time Tracking and Mileage and
+// Ctrl+S / Alt+A / Ctrl+Enter in their forms did nothing. The buttons now say what they are
+// (data-shortcut).
+
+
+/** The buttons of rendered markup as the shortcut logic sees them (label + data-shortcut). */
+function buttonsOf(html: string): ShortcutButton[] {
+  return [...html.matchAll(/<button([^>]*)>([\s\S]*?)<\/button>/g)].map(([, attrs, inner]) => ({
+    label: inner.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim(),
+    shortcut: /data-shortcut="([^"]+)"/.exec(attrs)?.[1] ?? null,
+    disabled: /\sdisabled(=|\s|$)/.test(attrs),
+  }));
+}
+
+describe('the form keys find these pages’ buttons', () => {
+  it('Ctrl+N on Time Tracking opens Log Time; on Mileage, Log Miles', async () => {
+    const { default: TimeTrackingPage } = await import('@/app/time-tracking/page');
+    const { default: MileagePage } = await import('@/app/mileage/page');
+    for (const [Page, label] of [
+      [TimeTrackingPage, 'Log Time'],
+      [MileagePage, 'Log Miles'],
+    ] as const) {
+      const buttons = buttonsOf(renderToStaticMarkup(createElement(Page)));
+      const i = pickShortcutButton(buttons, 'new');
+      expect(i, label).toBeGreaterThanOrEqual(0);
+      expect(buttons[i].label).toBe(label);
+    }
+  });
+
+  it('Ctrl+S in their forms and in Add user presses the form’s button', () => {
+    expect(src('app/time-tracking/page.tsx')).toMatch(/form="log-time-form" loading=\{saving\} data-shortcut="save"/);
+    expect(src('app/mileage/page.tsx')).toMatch(/onClick=\{handleLog\} loading=\{logSaving\} data-shortcut="save"/);
+    expect(src('app/users/page.tsx')).toMatch(/roleKeys\.length === 0\} data-shortcut="save"/);
+    // And what the label alone would have given:
+    expect(pickShortcutButton([{ label: 'Cancel' }, { label: 'Log Time' }], 'save')).toBe(-1);
+    expect(pickShortcutButton([{ label: 'Cancel' }, { label: 'Add user' }], 'save')).toBe(-1);
   });
 });
