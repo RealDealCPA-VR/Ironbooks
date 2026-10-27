@@ -43,7 +43,6 @@ import { unappliedCustomerPayments } from './customerCredits';
 import { vendorCreditHomeByBill, vendorCreditRefundsAfter } from './vendorCreditsFx';
 import { foreignInvoiceHomeOpen } from './fxSubledger';
 import { foreignCode, homeCode } from './fxLines';
-import { getHomeCurrencyCode } from './currencies';
 
 /**
  * Credit-memo refunds dated AFTER the cutoff, per memo id. creditMemos.unapplied is today's
@@ -621,16 +620,13 @@ async function vendorCreditActivityAfter(ctx: ServiceContext, cutoff: Date) {
     byCredit.set(id, { foreign: c.foreign.plus(foreign), home: c.home.plus(home) });
   };
 
-  const home = ((await getHomeCurrencyCode(ctx)) ?? '').trim().toUpperCase();
+  const home = await homeCode(ctx); // review5 fx: also without a base row
   const credits = await ctx.db
     .select({ id: vendorCredits.id, date: vendorCredits.date, currency: vendorCredits.currency })
     .from(vendorCredits)
     .where(eq(vendorCredits.companyId, ctx.companyId));
   const creditById = new Map(credits.map((c) => [c.id, c] as const));
-  const isForeign = (id: string) => {
-    const cur = (creditById.get(id)?.currency ?? '').trim().toUpperCase();
-    return cur !== '' && cur !== home;
-  };
+  const isForeign = (id: string) => foreignCode(creditById.get(id)?.currency ?? null, home) !== null;
 
   // 1) Foreign credits: dated application rows.
   const appRows = await ctx.db
@@ -716,11 +712,11 @@ async function vendorCreditsOpenAsOf(
         lte(vendorCredits.date, cutoff),
       ),
     );
-  const home = ((await getHomeCurrencyCode(ctx)) ?? '').trim().toUpperCase();
+  const home = await homeCode(ctx); // review5 fx: also without a base row
   const out: Array<(typeof rows)[number] & { foreignOpen: Dec; homeOpen: Dec }> = [];
   for (const r of rows) {
-    const cur = (r.currency ?? '').trim().toUpperCase();
-    const foreign = cur !== '' && cur !== home;
+    const cur = foreignCode(r.currency, home);
+    const foreign = cur !== null;
     const l = later.get(r.id);
     const foreignOpen = Money.round2(Money.of(r.unapplied).plus(l?.foreign ?? Money.zero()));
     if (!foreignOpen.greaterThan(0)) continue;

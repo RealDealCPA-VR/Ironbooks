@@ -51,11 +51,9 @@ import {
 } from './_base';
 import { postJournalEntry, voidJournalEntry, type PostingLine } from './posting';
 import { allocateCheckNumber, assertCheckNumberAvailable } from './checkNumbers';
-import {
-  getHomeCurrencyCode,
-  getOrCreateExchangeGainLossAccount,
-  resolveDocumentCurrency,
-} from './currencies';
+import { getOrCreateExchangeGainLossAccount, resolveDocumentCurrency } from './currencies';
+import { effectiveHomeCurrency } from './multiCurrency';
+import { foreignCode } from './fxLines';
 import { assertClosedPeriodEdit, entryHasReconciledLines } from './postedEdit';
 import { assertPeriodOpen } from './fiscalPeriods';
 import { applyToBill } from './vendorCredits';
@@ -246,11 +244,9 @@ async function preparePayment(ctx: ServiceContext, input: PayBillsInput): Promis
   const billRows: Array<{ bill: BillRow; applied: Decimal; discount: Decimal }> = [];
   // A bill's Currency column may hold the home code in any case (imported / upgraded data):
   // that is a home bill. Normalise once so the FX path only ever sees genuinely foreign bills.
-  const homeCode = ((await getHomeCurrencyCode(ctx)) ?? '').trim().toUpperCase();
-  const billCurrencyOf = (code: string | null): string | null => {
-    const v = (code ?? '').trim().toUpperCase();
-    return v === '' || v === homeCode ? null : v;
-  };
+  // review5 fx: the home code as bills resolve it (also without a base row in the currency list).
+  const home = await effectiveHomeCurrency(ctx);
+  const billCurrencyOf = (code: string | null): string | null => foreignCode(code, home);
   for (const [appIdx, app] of input.applications.entries()) {
     const applied = Money.of(app.amountApplied);
     const discount = Money.of(app.discountTaken ?? 0);
@@ -326,9 +322,9 @@ async function preparePayment(ctx: ServiceContext, input: PayBillsInput): Promis
       accountCurrency: payAcct.currency ?? null,
     });
   } else {
-    const home = await getHomeCurrencyCode(ctx);
-    const acctCur = (payAcct.currency ?? '').toUpperCase();
-    if (acctCur && acctCur !== home) {
+    // review5 fx: a bank tagged with the home code is a home account (pays home bills).
+    const acctCur = foreignCode(payAcct.currency, home);
+    if (acctCur) {
       throw validation(
         `The selected account is a ${acctCur} account. Pay home-currency bills from a home-currency account.`,
       );

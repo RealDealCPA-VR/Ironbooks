@@ -66,7 +66,9 @@ import { Money, allocate, toAmountString } from '@/lib/money';
 import { assertNotControlLineAccount, postJournalEntry, voidJournalEntry } from '@/lib/services/posting';
 import { markPaidAmount } from './invoices';
 import { assertPeriodOpen, recordClosingDateException, type PeriodCheck } from './fiscalPeriods';
-import { assertHomeCurrencyAccounts, getHomeCurrencyCode } from './currencies';
+import { assertHomeCurrencyAccounts } from './currencies';
+import { effectiveHomeCurrency } from './multiCurrency';
+import { foreignCode } from './fxLines';
 import { layerRoundingTolerance, takeFromDocumentLayers } from './fifo';
 import {
   type InventoryLineDetail,
@@ -870,10 +872,10 @@ async function applyToInvoiceInTx(ctx: ServiceContext, input: ApplyToInvoiceInpu
   // Same rule as vendorCredits.applyToBill on the A/P side.
   // The invoice Currency field is free text: blank or the home code (any case) means home currency,
   // the same normalisation Receive Payments uses — only a genuinely foreign code is refused.
-  const invoiceCurrency = (invoice.currency ?? '').trim().toUpperCase();
-  if (invoiceCurrency) {
-    const home = ((await getHomeCurrencyCode(ctx)) ?? '').trim().toUpperCase();
-    if (invoiceCurrency !== home) {
+  // review5 fx: the home code as invoices resolve it (also without a base row).
+  if ((invoice.currency ?? '').trim()) {
+    const invoiceCurrency = foreignCode(invoice.currency, await effectiveHomeCurrency(ctx));
+    if (invoiceCurrency) {
       throw validation(
         `This invoice is in ${invoiceCurrency}. Home-currency credits can't be applied to it — settle it with Receive Payments instead.`,
       );

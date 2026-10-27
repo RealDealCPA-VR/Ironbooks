@@ -135,6 +135,89 @@ describe('review5 fx', () => {
     expect(await foreignBalance(bank)).toBe('-100.00');
   });
 
+  it('without a base row, a list rate of exactly 1 cannot turn a foreign currency into the home currency (currency list or Home Currency Adjustment)', async () => {
+    const { createExpense } = await import('./expenses');
+    const { effectiveHomeCurrency, getMultiCurrencyStatus } = await import('./multiCurrency');
+    await db.delete(currencies).where(and(eq(currencies.companyId, ctx.companyId), eq(currencies.isBase, true)));
+    await db.update(accounts).set({ currency: null }).where(eq(accounts.id, acct['1020']));
+    // The auditor's state: an older build listed USD at 1.30 (no base row), a bank tagged USD, a check of 100 posted at 130.
+    await db.insert(currencies).values({ companyId: ctx.companyId, code: 'USD', name: 'US Dollar', rateToBase: '1.30000000', isBase: false, updatedAt: d('2026-01-01') });
+    const bank = (await createAccount(ctx, { code: '1030', name: 'USD Bank', type: 'asset' as never, subtype: 'checking' })).id;
+    await setAccountCurrency(ctx, bank, 'USD');
+    await createExpense(ctx, { payeeName: 'Office Depot', date: d('2026-03-10'), method: 'check', paymentAccountId: bank, lines: [{ accountId: acct['6000'], amount: '100.00' }] } as never);
+    expect(await foreignBalance(bank)).toBe('-100.00');
+    const usdRate = async () => Money.of((await listCurrencies(ctx)).find((c) => c.code === 'USD')!.rateToBase).toFixed(4);
+    const homeBalance = async () => Money.of((await db.select().from(accounts).where(eq(accounts.id, bank)))[0].balance).toFixed(2);
+    // Step 1: USD at exactly 1 would make USD the home currency (the check would read as a home check of 130).
+    await expect(upsertCurrency(ctx, { code: 'USD', name: 'US Dollar', rateToBase: '1' })).rejects.toMatchObject({
+      code: 'CONFLICT',
+      details: { homeCurrencyLocked: true },
+      message: expect.stringContaining('USD is a foreign currency in your currency list (exchange rate 1.3)'),
+    });
+    // Step 2: "Set as home currency" on USD therefore stays a change, and is refused.
+    await expect(setBaseCurrency(ctx, { code: 'USD', name: 'US Dollar' })).rejects.toMatchObject({ code: 'CONFLICT' });
+    expect(await getHomeCurrencyCode(ctx)).toBeNull();
+    expect(await effectiveHomeCurrency(ctx)).toBeNull();
+    expect(await usdRate()).toBe('1.3000');
+    expect((await getMultiCurrencyStatus(ctx)).hasForeignData).toBe(true); // Multiple Currencies stays locked on
+    expect(await foreignBalance(bank)).toBe('-100.00');
+    // The same through a Home Currency Adjustment that saves its rates to the currency list.
+    await expect(createHomeCurrencyAdjustment(ctx, { date: midnight('2026-03-31'), rates: { USD: '1' } })).rejects.toMatchObject({
+      code: 'CONFLICT',
+      details: { homeCurrencyLocked: true },
+    });
+    expect(await usdRate()).toBe('1.3000');
+    expect(await effectiveHomeCurrency(ctx)).toBeNull();
+    expect(await homeBalance()).toBe('-130.00');
+    expect(await foreignBalance(bank)).toBe('-100.00');
+    // Any other rate for USD is an ordinary foreign-rate change.
+    await expect(upsertCurrency(ctx, { code: 'USD', name: 'US Dollar', rateToBase: '1.35' })).resolves.toMatchObject({ code: 'USD' });
+    expect(await effectiveHomeCurrency(ctx)).toBeNull();
+  });
+
+  it('without a base row, a bank tagged with the home code (USD listed at 1 by an older build) pays and receives home documents, and its tag can be cleared', async () => {
+    const { payBills } = await import('./billPayments');
+    const { getBill } = await import('./bills');
+    const { createVendorCredit, refundVendorCredit } = await import('./vendorCredits');
+    await db.delete(currencies).where(and(eq(currencies.companyId, ctx.companyId), eq(currencies.isBase, true)));
+    await db.insert(currencies).values({ companyId: ctx.companyId, code: 'USD', name: 'US Dollar', rateToBase: '1.00000000', isBase: false });
+    const bank = (await createAccount(ctx, { code: '1030', name: 'USD Bank', type: 'asset' as never, subtype: 'checking' })).id;
+    await db.update(accounts).set({ currency: 'USD' }).where(eq(accounts.id, bank));
+    // A bill typed USD is a home bill, and the USD-tagged bank (a home account) pays it.
+    const v = await createVendor(ctx, { displayName: `Home supplier ${seq}` } as never);
+    const bill = await createBill(ctx, { vendorId: v.id, date: d('2026-03-01'), currency: 'USD', lines: [{ accountId: acct['6000'], amount: '100.00' }] } as never);
+    expect((await getBill(ctx, bill.id)).currency ?? null).toBeNull();
+    await expect(
+      payBills(ctx, { vendorId: v.id, date: d('2026-03-10'), method: 'check', paymentAccountId: bank, applications: [{ billId: bill.id, amountApplied: '100.00' }] } as never),
+    ).resolves.toBeTruthy();
+    // Receive Payments deposits a home payment into it.
+    const c = await createCustomer(ctx, { displayName: `Home buyer ${seq}` } as never);
+    const inv = await createInvoice(ctx, { customerId: c.id, date: d('2026-03-01'), lines: [{ accountId: acct['4000'], quantity: 1, rate: '50.00' }] } as never);
+    await expect(
+      receivePayment(ctx, { customerId: c.id, date: d('2026-03-05'), amount: '50.00', method: 'ach', depositAccountId: bank, applications: [{ invoiceId: inv.id, amountApplied: '50.00' }] } as never),
+    ).resolves.toBeTruthy();
+    // A home vendor credit is refunded into it.
+    const vc = await createVendorCredit(ctx, { vendorId: v.id, date: d('2026-03-12'), lines: [{ accountId: acct['6000'], amount: '20.00' }] } as never);
+    await expect(refundVendorCredit(ctx, { vendorCreditId: vc.id, bankAccountId: bank, amount: '20.00', date: d('2026-03-15') })).resolves.toBeTruthy();
+    // Its register is a home register too (no USD column beside the home one): -100 + 50 + 20.
+    expect(await foreignBalance(bank)).toBe('home');
+    const balanceOf = async (id: string) => (await db.select().from(accounts).where(eq(accounts.id, id)))[0];
+    expect(Money.of((await balanceOf(bank)).balance).toFixed(2)).toBe('-30.00');
+    expect((await trialBalance(ctx)).balanced).toBe(true);
+    // An unused bank tagged with the home code: clearing the tag clears the column.
+    const spare = (await createAccount(ctx, { code: '1035', name: 'Spare USD Bank', type: 'asset' as never, subtype: 'checking' })).id;
+    await db.update(accounts).set({ currency: 'USD' }).where(eq(accounts.id, spare));
+    await expect(setAccountCurrency(ctx, spare, null)).resolves.toMatchObject({ currency: null });
+    expect((await balanceOf(spare)).currency).toBeNull();
+    // The used bank is already a home account: choosing home (or USD) again is no change, not a conflict.
+    await expect(setAccountCurrency(ctx, bank, null)).resolves.toMatchObject({ id: bank });
+    await expect(setAccountCurrency(ctx, bank, 'USD')).resolves.toMatchObject({ id: bank });
+    expect(await foreignBalance(bank)).toBe('home');
+    // A real currency change of the used bank is still refused.
+    await upsertCurrency(ctx, { code: 'GBP', name: 'Pound', rateToBase: '1.50' });
+    await expect(setAccountCurrency(ctx, bank, 'GBP')).rejects.toMatchObject({ code: 'CONFLICT' });
+  });
+
   it('an older file whose list holds the default currency as a foreign one (CAD home, USD at 1.36) can still set its real home currency', async () => {
     const { updateCompany } = await import('./company');
     const { getInvoice } = await import('./invoices');

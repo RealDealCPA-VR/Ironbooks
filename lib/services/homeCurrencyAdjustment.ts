@@ -29,6 +29,7 @@ import { foreignCode, homeCode, parseRate } from './exchangeRates';
 import { foreignAccountBalances } from './fxLedger';
 import { foreignOpenPayables, foreignOpenReceivables } from './fxSubledger';
 import { getLoan, voidOrphanLoanFx } from './loans';
+import { assertListRatesKeepHomeCurrency } from './multiCurrency';
 
 export interface HcaLine {
   kind: 'account' | 'customer' | 'vendor' | 'loan';
@@ -362,6 +363,27 @@ export async function createHomeCurrencyAdjustment(ctx: ServiceContext, input: H
         );
       }
     }
+    // review5 fx: the currency list holds ONE rate per currency — the current one new
+    // transactions default to. An adjustment dated before that rate was last set (a late
+    // year-end revaluation) records the old date's rate on the adjustment only; it used to
+    // replace today's rate with it, so every new transaction defaulted to last year's rate.
+    const listUpdates: Array<{ id: string; code: string; rate: string }> = [];
+    if (input.updateCurrencyList !== false) {
+      const listed = await tx.db
+        .select({ id: currencies.id, code: currencies.code, updatedAt: currencies.updatedAt })
+        .from(currencies)
+        .where(and(eq(currencies.companyId, tx.companyId), eq(currencies.isBase, false)));
+      for (const [code, rate] of Object.entries(preview.rates)) {
+        const listedRow = listed.find((c) => c.code === code);
+        // updatedAt is a real instant: its LOCAL calendar day (the day the user set the rate);
+        // the adjustment's date is a calendar day stored at UTC midnight.
+        if (!listedRow || localDateISO(listedRow.updatedAt) > ymdOf(date)) continue;
+        listUpdates.push({ id: listedRow.id, code, rate });
+      }
+      // review5 fx: with no base row a list rate can change the home currency (USD listed at 1.30
+      // and saved at 1 becomes it) - refused like the Currencies page refuses it, before posting.
+      await assertListRatesKeepHomeCurrency(tx, listUpdates);
+    }
     const [row] = await tx.db
       .insert(homeCurrencyAdjustments)
       .values({
@@ -394,22 +416,8 @@ export async function createHomeCurrencyAdjustment(ctx: ServiceContext, input: H
       .set({ entryId: entry?.id ?? null, reversalEntryId: reversal?.id ?? null })
       .where(eq(homeCurrencyAdjustments.id, row.id))
       .returning();
-    if (input.updateCurrencyList !== false) {
-      // review5 fx: the currency list holds ONE rate per currency — the current one new
-      // transactions default to. An adjustment dated before that rate was last set (a late
-      // year-end revaluation) records the old date's rate on the adjustment only; it used to
-      // replace today's rate with it, so every new transaction defaulted to last year's rate.
-      const listed = await tx.db
-        .select({ id: currencies.id, code: currencies.code, updatedAt: currencies.updatedAt })
-        .from(currencies)
-        .where(and(eq(currencies.companyId, tx.companyId), eq(currencies.isBase, false)));
-      for (const [code, rate] of Object.entries(preview.rates)) {
-        const row = listed.find((c) => c.code === code);
-        // updatedAt is a real instant: its LOCAL calendar day (the day the user set the rate);
-        // the adjustment's date is a calendar day stored at UTC midnight.
-        if (!row || localDateISO(row.updatedAt) > ymdOf(date)) continue;
-        await tx.db.update(currencies).set({ rateToBase: rate, updatedAt: new Date() }).where(eq(currencies.id, row.id));
-      }
+    for (const u of listUpdates) {
+      await tx.db.update(currencies).set({ rateToBase: u.rate, updatedAt: new Date() }).where(eq(currencies.id, u.id));
     }
     await writeAudit(tx, {
       action: 'create',

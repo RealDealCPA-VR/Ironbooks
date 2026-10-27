@@ -21,7 +21,13 @@ import { currencies, accounts, billLines, bills, journalEntryLines } from '@/lib
 import { Money, MoneyParseError, allocate, toAmountString } from '@/lib/money';
 import { postJournalEntry } from './posting';
 import { type ServiceContext, ServiceError, inTransaction, validation, notFound, writeAudit } from './_base';
-import { assertForeignCurrencyAllowed, assertHomeCurrencyChangeAllowed, effectiveHomeCurrency } from './multiCurrency';
+import {
+  assertForeignCurrencyAllowed,
+  assertHomeCurrencyChangeAllowed,
+  assertListRatesKeepHomeCurrency,
+  effectiveHomeCurrency,
+} from './multiCurrency';
+import { foreignCode } from './fxLines';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -249,6 +255,10 @@ export async function upsertCurrency(
         `${code} is your home currency. Set it as the home currency instead of adding it with an exchange rate. (If your books are kept in another currency, set that one as the home currency first.)`,
       );
     }
+    // review5 fx: nor may the rate itself change the home currency (with no base row, the default
+    // listed at exactly 1 IS the home currency): USD listed at 1.30 and re-saved at 1 would turn its
+    // documents booked at 1.30 into home ones, and "Set as home currency" would then pass as no change.
+    await assertListRatesKeepHomeCurrency(tx, [{ code, rate: rate.toFixed(8) }]);
     if (existing) {
       const [updated] = await tx.db
         .update(currencies)
@@ -350,8 +360,7 @@ export async function recordFxAdjustment(
   // review5 fx: the adjustment is a home-currency amount. On a foreign-currency bank / card account
   // it revalues the home value only (foreign amount 0, like a Home Currency Adjustment line), so
   // the account's balance in its own currency - its register and reconciliation - is untouched.
-  const targetCur = (targetAcct.currency ?? '').trim().toUpperCase();
-  const homeOnly = targetCur !== '' && targetCur !== ((await getHomeCurrencyCode(ctx)) ?? '').toUpperCase();
+  const homeOnly = foreignCode(targetAcct.currency, await effectiveHomeCurrency(ctx)) !== null;
   const subjectFx = homeOnly ? { foreignAmount: '0' } : {};
 
   // review5 fx: the other side is the Exchange Gain/Loss account, where every other realized and
@@ -404,7 +413,13 @@ export async function recordFxAdjustment(
 // (largest remainder), exactly like invoices do. For rate = 1 the amounts are used as-is, so
 // home-currency documents post exactly as before.
 
-/** The company's home (base) currency code, or null when multi-currency was never set up. */
+/**
+ * The currency list's base (home) row's code, or null while the list has none (multi-currency
+ * never set up, or an older file - migration 0056). review5 fx: only for "is the home currency set
+ * up in the list"; whether a document, name or account is in a foreign currency is decided with
+ * foreignCode(code, await effectiveHomeCurrency(ctx)), which also knows the home currency of a
+ * list without a base row.
+ */
 export async function getHomeCurrencyCode(ctx: ServiceContext): Promise<string | null> {
   const [row] = await ctx.db
     .select({ code: currencies.code })
@@ -522,7 +537,7 @@ export async function billLineHomeShares(ctx: ServiceContext, billIds: ReadonlyA
   const out = new Map<string, Decimal>();
   const ids = [...new Set(billIds.filter(Boolean))];
   if (ids.length === 0) return out;
-  const home = ((await getHomeCurrencyCode(ctx)) ?? '').trim().toUpperCase();
+  const home = await effectiveHomeCurrency(ctx);
   for (let i = 0; i < ids.length; i += 2000) {
     const part = ids.slice(i, i + 2000);
     const docs = await ctx.db
@@ -535,8 +550,7 @@ export async function billLineHomeShares(ctx: ServiceContext, billIds: ReadonlyA
       .where(inArray(billLines.billId, docs.map((b) => b.id)));
     for (const b of docs) {
       const mine = lines.filter((l) => l.billId === b.id).sort((x, y) => x.lineOrder - y.lineOrder);
-      const cur = (b.currency ?? '').trim().toUpperCase();
-      const foreign = cur !== '' && cur !== home;
+      const foreign = foreignCode(b.currency, home) !== null;
       const h = homeAmounts(mine.map((l) => Money.of(l.amount)), foreign ? (b.rate ?? 1) : 1);
       mine.forEach((l, j) => out.set(l.id, h.lines[j]));
     }
@@ -616,8 +630,7 @@ export async function setAccountCurrency(
     throw validation('Only bank and credit card accounts can have their own currency.');
   }
   const home = await effectiveHomeCurrency(ctx); // review5 fx: also without a base row
-  let next: string | null = (code ?? '').trim().toUpperCase() || null;
-  if (next && home && next === home) next = null;
+  const next = foreignCode(code, home);
   if (next) {
     await assertForeignCurrencyAllowed(ctx, next); // A2: Multiple Currencies off
     const [cur] = await ctx.db
@@ -626,14 +639,21 @@ export async function setAccountCurrency(
       .where(and(eq(currencies.companyId, ctx.companyId), eq(currencies.code, next)));
     if (!cur) throw validation(`${next} is not in your currency list. Add it under Currencies first.`);
   }
-  // An account tagged with the home code (saved before the file had a home currency) is already home.
-  const stored = (acct.currency ?? '').trim().toUpperCase() || null;
-  if ((stored && home && stored === home ? null : stored) === next) return { id: acct.id, currency: next };
+  // review5 fx: nothing to do only when the column already holds exactly `next`. An account tagged
+  // with the home code (saved before the file had a home currency) or in another spelling (' eur')
+  // is the same currency in effect, but its column is still rewritten while the account is unused,
+  // so the answer never claims a value the column does not hold.
+  if ((acct.currency ?? null) === next) return { id: acct.id, currency: next };
   const [used] = await ctx.db
     .select({ id: journalEntryLines.id })
     .from(journalEntryLines)
     .where(eq(journalEntryLines.accountId, accountId))
     .limit(1);
+  if (used && foreignCode(acct.currency, home) === next) {
+    // Already that currency in effect (a used bank tagged with the home code is a home account):
+    // no change - its stored tag stays with its history, and the answer says what it holds.
+    return { id: acct.id, currency: acct.currency ?? null };
+  }
   if (used) {
     throw new ServiceError(
       'CONFLICT',
@@ -674,11 +694,12 @@ export async function assertLineAccountsInDocumentCurrency(
     .from(accounts)
     .where(and(eq(accounts.companyId, ctx.companyId), inArray(accounts.id, ids), sql`${accounts.currency} IS NOT NULL`));
   if (rows.length === 0) return;
-  const home = ((await getHomeCurrencyCode(ctx)) ?? '').trim().toUpperCase();
-  const doc = (documentCurrency ?? '').trim().toUpperCase() || null;
+  // review5 fx: the home code also without a base row (a bank tagged with it is a home account).
+  const home = await effectiveHomeCurrency(ctx);
+  const doc = foreignCode(documentCurrency, home);
   for (const a of rows) {
-    const cur = (a.currency ?? '').trim().toUpperCase();
-    if (!cur || cur === home || cur === doc) continue;
+    const cur = foreignCode(a.currency, home);
+    if (!cur || cur === doc) continue;
     throw validation(
       `"${a.name}" is a ${cur} account, but this transaction is in ${doc ?? (home || 'your home currency')}. Use Transfer Funds or Pay credit card (where you enter the exchange rate), or enter it in ${cur}.`,
     );
@@ -727,10 +748,11 @@ export async function assertHomeCurrencyAccounts(
       .select({ name: accounts.name, currency: accounts.currency })
       .from(accounts)
       .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, id)));
-    const cur = (a?.currency ?? '').trim().toUpperCase();
+    if (!(a?.currency ?? '').trim()) continue;
+    // review5 fx: the home code also without a base row (a bank tagged with it is a home account).
+    if (home === undefined) home = await effectiveHomeCurrency(ctx);
+    const cur = foreignCode(a!.currency, home);
     if (!cur) continue;
-    if (home === undefined) home = await getHomeCurrencyCode(ctx);
-    if (home && cur === home) continue;
     throw validation(
       `"${a!.name}" is a ${cur} account. ${what} can only use home-currency accounts for now.`,
     );

@@ -53,9 +53,10 @@ import { createInvoice, markPaidAmount } from './invoices';
 import { applyToInvoice, unapplyCreditApplication } from './creditMemos';
 import { docRef } from './docNumbers';
 import { removePaymentFromDeposit } from './deposits';
-import { assertForeignCurrencyAllowed } from './multiCurrency';
+import { assertForeignCurrencyAllowed, effectiveHomeCurrency } from './multiCurrency';
+import { foreignCode } from './fxLines';
 import { computeDiscount, findTermsRef, type TermsLike, type TermsRow } from './lists/terms';
-import { getHomeCurrencyCode, getOrCreateExchangeGainLossAccount } from './currencies';
+import { getOrCreateExchangeGainLossAccount } from './currencies';
 import {
   type JournalCreditToInvoiceInput,
   type JournalItemPaymentInput,
@@ -526,12 +527,14 @@ async function applyEarlierPayments(
   return last;
 }
 
-/** Normalise a currency code: upper case; the home currency (or blank) becomes null. */
+/**
+ * Normalise a currency code: upper case; the home currency (or blank) becomes null. review5 fx: the
+ * home code as invoices resolve it (also without a base row), so a bank tagged with the home code
+ * takes home payments and a payment typed in the home code is a home payment.
+ */
 async function normalizeCurrency(ctx: ServiceContext, code: string | null | undefined): Promise<string | null> {
-  const v = (code ?? '').trim().toUpperCase();
-  if (!v) return null;
-  const home = ((await getHomeCurrencyCode(ctx)) ?? '').toUpperCase();
-  return v === home ? null : v;
+  if (!(code ?? '').trim()) return null;
+  return foreignCode(code, await effectiveHomeCurrency(ctx));
 }
 
 /**

@@ -46,7 +46,8 @@ import { type ServiceContext, ServiceError, inTransaction, notFound, validation,
 import { isSubledgerSource } from './posting';
 import { assertPeriodOpen } from './fiscalPeriods';
 import { assertAccountantDatesOpen } from './accountantCopy/guard';
-import { getHomeCurrencyCode } from './currencies';
+import { effectiveHomeCurrency } from './multiCurrency';
+import { foreignCode } from './fxLines';
 import { journalOpenItems, resolveEntityNames } from './journal';
 import { markPaidAmount } from './invoices';
 
@@ -270,10 +271,9 @@ async function validateItems(
 }
 
 export async function isForeignCurrency(ctx: ServiceContext, code: string | null | undefined): Promise<boolean> {
-  const v = (code ?? '').trim().toUpperCase();
-  if (!v) return false;
-  const home = (await getHomeCurrencyCode(ctx)) ?? '';
-  return v !== home.toUpperCase();
+  if (!(code ?? '').trim()) return false;
+  // review5 fx: the home code also without a base row in the currency list.
+  return foreignCode(code, await effectiveHomeCurrency(ctx)) !== null;
 }
 
 // ---------------------------------------------------------------------------

@@ -21,6 +21,7 @@ import { companies, currencies } from '@/lib/db/schema';
 import type { DB } from '@/lib/db';
 import { Money } from '@/lib/money';
 import { ServiceError, validation, type ServiceContext } from './_base';
+import { homeCode, homeCodeFromList, type CurrencyListRow } from './fxLines';
 
 type Settings = Record<string, unknown> | null | undefined;
 
@@ -40,35 +41,28 @@ async function settingsOf(db: DB, companyId: string): Promise<Settings> {
   return (row?.settings ?? {}) as Settings;
 }
 
-/**
- * The company's home currency code: the currency list's base, else the Preferences currency, else
- * USD. review5 fx: in a list with no base row (older files, migration 0056) that holds the
- * Preferences / USD default as a FOREIGN currency (a rate other than 1, e.g. USD at 1.36 in a
- * Canadian file), the list's rates are in units of a home currency the file never recorded, so the
- * default is not the home currency and the code is unknown: null.
- */
-async function homeCodeOf(db: DB, companyId: string, settings: Settings): Promise<string | null> {
-  const rows = await db
+function listRowsOf(db: DB, companyId: string): Promise<CurrencyListRow[]> {
+  return db
     .select({ code: currencies.code, rateToBase: currencies.rateToBase, isBase: currencies.isBase })
     .from(currencies)
     .where(eq(currencies.companyId, companyId));
-  const base = rows.find((r) => r.isBase);
-  if (base) return base.code.trim().toUpperCase();
-  const fromSettings = typeof settings?.currency === 'string' ? settings.currency.trim() : '';
-  const fallback = (fromSettings || 'USD').toUpperCase();
-  const listed = rows.find((r) => r.code.trim().toUpperCase() === fallback);
-  return listed && !Money.of(listed.rateToBase).equals(1) ? null : fallback;
+}
+
+/** The company's home currency code with these settings (fxLines.homeCodeFromList). */
+async function homeCodeOf(db: DB, companyId: string, settings: Settings): Promise<string | null> {
+  return homeCodeFromList(await listRowsOf(db, companyId), settings?.currency);
 }
 
 /**
  * review5 fx: the company's home currency code even before a currency list exists (the currency
  * list's base, else the Preferences currency, else USD) — so the home code typed on a document
  * (any case) is never taken for a foreign currency in a company that never set up currencies.
- * Null when a list without a base row holds that default as a foreign currency (see homeCodeOf):
- * every code is then foreign, as the list's rates say.
+ * Null when a list without a base row holds that default as a foreign currency (homeCodeFromList):
+ * every code is then foreign, as the list's rates say. The same code as fxLines.homeCode, which
+ * the ledger (posting, registers, revaluation) uses, so documents and accounts always agree.
  */
 export async function effectiveHomeCurrency(ctx: Pick<ServiceContext, 'db' | 'companyId'>): Promise<string | null> {
-  return homeCodeOf(ctx.db, ctx.companyId, await settingsOf(ctx.db, ctx.companyId));
+  return homeCode(ctx);
 }
 
 /**
@@ -122,6 +116,52 @@ async function currencyDataExists(db: DB, companyId: string, test: (col: string)
 export const HOME_CURRENCY_LOCKED_MESSAGE = (home: string) =>
   `Your home currency is ${home}. This company already has foreign-currency accounts, names or transactions, so the home currency can no longer be changed (QuickBooks works the same way).`;
 
+/** No base row: one of the currency list's foreign currencies can't become the home currency. */
+export const LISTED_FOREIGN_HOME_LOCKED_MESSAGE = (code: string, rate: string | number) =>
+  `${code} is a foreign currency in your currency list (exchange rate ${Money.of(rate).toString()}), and this company already has foreign-currency accounts, names or transactions, so ${code} can no longer become the home currency (QuickBooks works the same way). Set the currency your books are kept in as the home currency instead.`;
+
+/**
+ * review5 fx: with no base row the home currency also depends on the list's RATES - the Preferences
+ * / USD default is the home currency unless the list holds it at a rate other than 1
+ * (homeCodeFromList). So writing a rate could change the home currency without "Set as home
+ * currency": USD listed at 1.30 and re-saved at 1 became the home currency (its documents, booked
+ * at 1.30, silently home ones - and "Set as home currency" then passed as "no change"); USD listed
+ * at 1 and saved at 1.30 stops being it. Every write of list rates (the Currencies page, a Home
+ * Currency Adjustment that updates the list) calls this first, in its transaction: a write that
+ * would change the home currency is refused like any other home-currency change once data carries
+ * a currency. `changes` are the rates about to be written for non-base codes.
+ */
+export async function assertListRatesKeepHomeCurrency(
+  ctx: Pick<ServiceContext, 'db' | 'companyId'>,
+  changes: ReadonlyArray<{ code: string; rate: string | number | { toString(): string } }>,
+): Promise<void> {
+  if (changes.length === 0) return;
+  const rows = await listRowsOf(ctx.db, ctx.companyId);
+  if (rows.some((r) => r.isBase)) return; // the base row is the home currency whatever the rates
+  const settings = await settingsOf(ctx.db, ctx.companyId);
+  const before = homeCodeFromList(rows, settings?.currency);
+  const next = rows.map((r) => ({ ...r }));
+  for (const c of changes) {
+    const code = c.code.trim().toUpperCase();
+    const row = next.find((r) => r.code.trim().toUpperCase() === code);
+    if (row) row.rateToBase = String(c.rate);
+    else next.push({ code, rateToBase: String(c.rate), isBase: false });
+  }
+  const after = homeCodeFromList(next, settings?.currency);
+  if (before === after) return;
+  // Nothing recorded in any currency yet: nothing would be re-denominated.
+  if (
+    !(await hasCurrencyDataOtherThan(ctx.db, ctx.companyId, before)) &&
+    !(await hasCurrencyDataOtherThan(ctx.db, ctx.companyId, after))
+  ) {
+    return;
+  }
+  const locked = (message: string) => new ServiceError('CONFLICT', message, { homeCurrencyLocked: true });
+  if (before !== null) throw locked(HOME_CURRENCY_LOCKED_MESSAGE(before));
+  const listed = rows.find((r) => r.code.trim().toUpperCase() === after)!;
+  throw locked(LISTED_FOREIGN_HOME_LOCKED_MESSAGE(after!, listed.rateToBase));
+}
+
 /**
  * review5 fx: the home currency is the unit of the whole ledger. Changing it from the current one
  * (the currency list's base, else the Preferences currency, else USD — so a list with no base row,
@@ -158,9 +198,7 @@ export async function assertHomeCurrencyChangeAllowed(
     // rebased onto it), refused like any other once data carries a currency - its documents were
     // booked at their rates and would silently become home ones.
     if (await hasCurrencyDataOtherThan(ctx.db, ctx.companyId, null)) {
-      throw locked(
-        `${code} is a foreign currency in your currency list (exchange rate ${Money.of(row.rateToBase).toString()}), and this company already has foreign-currency accounts, names or transactions, so ${code} can no longer become the home currency (QuickBooks works the same way). Set the currency your books are kept in as the home currency instead.`,
-      );
+      throw locked(LISTED_FOREIGN_HOME_LOCKED_MESSAGE(code, row.rateToBase));
     }
     return true;
   }

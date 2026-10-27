@@ -18,8 +18,8 @@ import {
   vendors,
 } from '@/lib/db/schema';
 import { type ServiceContext, ServiceError, validation } from './_base';
-import { assertForeignCurrencyAllowed } from './multiCurrency';
-import { getHomeCurrencyCode } from './currencies';
+import { assertForeignCurrencyAllowed, effectiveHomeCurrency } from './multiCurrency';
+import { foreignCode } from './fxLines';
 import { currencies } from '@/lib/db/schema';
 
 export interface VendorPurchaseFieldsInput {
@@ -105,9 +105,9 @@ export async function resolveVendorPurchaseFields(
   if (input.accountNumber !== undefined) out.accountNumber = input.accountNumber?.trim() || null;
 
   if (input.currency !== undefined) {
-    const home = await getHomeCurrencyCode(ctx);
-    let next = (input.currency ?? '').trim().toUpperCase() || null;
-    if (next && home && next === home) next = null;
+    // review5 fx: the home code as documents resolve it (also without a base row).
+    const home = await effectiveHomeCurrency(ctx);
+    const next = foreignCode(input.currency, home);
     if (next) {
       await assertForeignCurrencyAllowed(ctx, next); // A2: Multiple Currencies off
       const [cur] = await ctx.db
@@ -117,12 +117,17 @@ export async function resolveVendorPurchaseFields(
       if (!cur) throw validation(`${next} is not in your currency list. Add it under Currencies first.`);
     }
     if (existing && (existing.currency ?? null) !== next && (await vendorHasTransactions(ctx, existing.id))) {
-      throw new ServiceError(
-        'CONFLICT',
-        "This vendor already has transactions, so its currency can't change. Create a new vendor for the other currency.",
-      );
+      // A vendor tagged with the home code (or another spelling of its currency) is already in
+      // that currency: no change - its stored tag stays with its transactions.
+      if (foreignCode(existing.currency, home) !== next) {
+        throw new ServiceError(
+          'CONFLICT',
+          "This vendor already has transactions, so its currency can't change. Create a new vendor for the other currency.",
+        );
+      }
+    } else {
+      out.currency = next;
     }
-    out.currency = next;
   }
   return out;
 }

@@ -39,7 +39,8 @@ import {
 } from './_base';
 import { createExpense, voidExpense } from './expenses';
 import { createBill, voidBill } from './bills';
-import { getHomeCurrencyCode, homeAmounts } from './currencies';
+import { homeAmounts } from './currencies';
+import { effectiveHomeCurrency } from './multiCurrency';
 import { postJournalEntry, voidJournalEntry } from './posting';
 import { currencyRate, exchangeGainLossLine, foreignCode, toHome } from './exchangeRates';
 
@@ -224,7 +225,7 @@ async function validateLoanInput(
     throw validation('Pick an escrow account for the escrow part of each payment.');
   }
   let lenderCurrency: string | null = null;
-  const home = await getHomeCurrencyCode(ctx);
+  const home = await effectiveHomeCurrency(ctx); // review5 fx: also without a base row
   if (input.lenderVendorId) {
     const [v] = await ctx.db
       .select({ id: vendors.id, currency: vendors.currency })
@@ -479,7 +480,7 @@ async function assertLoanPaymentCurrency(
   loanCurrency: string | null,
   refs: { lenderVendorId: string | null; paymentAccountId: string | null },
 ) {
-  const home = await getHomeCurrencyCode(ctx);
+  const home = await effectiveHomeCurrency(ctx); // review5 fx: also without a base row
   const loanLabel = loanCurrency ?? home ?? 'your home currency';
   if (refs.lenderVendorId) {
     const [v] = await ctx.db

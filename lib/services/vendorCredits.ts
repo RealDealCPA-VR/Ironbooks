@@ -53,7 +53,8 @@ import { takeFromLayers } from './fifo';
 import { bookValueRelief, sellOutRelief } from './inventory';
 import { postDocumentInventory, reverseDocumentInventory } from './inventorySites';
 import { assertClosedPeriodEdit, planPostedEdit, retitleEntry } from './postedEdit';
-import { getHomeCurrencyCode } from './currencies';
+import { effectiveHomeCurrency } from './multiCurrency';
+import { foreignCode } from './fxLines';
 import {
   applyForeignVendorCredit,
   refundForeignVendorCredit,
@@ -487,10 +488,9 @@ function lineSignature(
  * line accounts get home amounts. A home credit can't be refunded into a foreign account.
  */
 async function foreignCurrencyOf(ctx: ServiceContext, code: string | null | undefined): Promise<string | null> {
-  const v = (code ?? '').trim().toUpperCase();
-  if (!v) return null;
-  const home = await getHomeCurrencyCode(ctx);
-  return home && v === home ? null : v;
+  if (!(code ?? '').trim()) return null;
+  // review5 fx: the home code also without a base row (a bank tagged with it is a home account).
+  return foreignCode(code, await effectiveHomeCurrency(ctx));
 }
 
 export async function createVendorCredit(ctx: ServiceContext, input: CreateVendorCreditInput) {
