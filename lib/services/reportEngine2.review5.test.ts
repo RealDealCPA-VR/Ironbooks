@@ -102,3 +102,27 @@ describe('Num column never shows internal ids', () => {
     expect(JSON.stringify(nums)).not.toContain(unprinted.id.slice(0, 8));
   });
 });
+
+/**
+ * Fix pass 2: a categorized feed line's memo showed in the Num column (bankCategorize writes the
+ * memo into the entry's reference). In QuickBooks Num is the check / document number — blank for
+ * a feed line, which carries no check number — and the memo stays in the Memo column.
+ */
+describe('bank-feed lines: the memo is not the Num', () => {
+  it('Num is blank and the memo shows under Memo', async () => {
+    const { bankAccounts } = await import('@/lib/db/schema');
+    const [ba] = await db.select().from(bankAccounts).where(eq(bankAccounts.companyId, ctx.companyId));
+    const [t] = await db
+      .insert(bankTransactions)
+      .values({ companyId: ctx.companyId, bankAccountId: ba.id, date: d('2026-07-02'), amount: '-30.00', payee: 'Shell', description: 'SHELL OIL 9876' })
+      .returning();
+    await categorize(ctx, { bankTransactionId: t.id, accountId: A['6000'], payee: 'Shell', memo: 'Fuel for truck' });
+    const r = await runStandardReport(ctx, 'transaction-detail-by-account', { accountId: A['1000'], from: '2026-07-01', to: '2026-07-31' });
+    const rows = r.rows.filter((x) => x.entryId).map((x) => [x.cells.type, x.cells.num, x.cells.memo, x.cells.amount]);
+    expect(rows).toEqual([['Check', '', 'Fuel for truck', '-30.00']]);
+    const gl = await runStandardReport(ctx, 'general-ledger', { from: '2026-07-01', to: '2026-07-31' });
+    const glNums = gl.rows.filter((x) => x.entryId).map((x) => x.cells.num);
+    expect(glNums.length).toBeGreaterThan(0);
+    expect(glNums.every((n) => n === '')).toBe(true);
+  });
+});

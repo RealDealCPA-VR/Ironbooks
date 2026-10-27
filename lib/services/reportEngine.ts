@@ -1186,8 +1186,12 @@ export async function resolveEntryNames(
           if (id) res = { nameType: 'other', nameId: id, name: agencyNames.get(id) ?? '', num: e.reference };
           break;
         case 'bank_transaction': {
+          // Num stays blank: a feed line carries no check number, and the entry's reference is the
+          // memo typed when it was added (bankCategorize) — that shows under Memo, not Num.
           const f = id ? feed.get(id) : undefined;
-          if (f) res = { nameType: null, nameId: null, name: f.payee?.trim() ?? '', num: e.reference, txnType: f.out ? 'check' : 'deposit' };
+          res = f
+            ? { nameType: null, nameId: null, name: f.payee?.trim() ?? '', num: '', txnType: f.out ? 'check' : 'deposit' }
+            : { ...res, num: '' };
           break;
         }
       }
