@@ -391,7 +391,7 @@ export async function currentMoves(ctx: Ctx, source: string, id: string): Promis
 const DETAIL_KEYS = ['siteId', 'binId', 'serialNumbers', 'lotNumber', 'lotExpiration'];
 
 /** Documents whose edits keep a line's stored site / bin / serial / lot when the line carries none. */
-const CARRY_FORWARD = new Set(['bill', 'invoice', 'expense', 'item_receipt']);
+const CARRY_FORWARD = new Set(['bill', 'invoice', 'expense', 'item_receipt', 'vendor_credit']);
 
 /**
  * What a version of a record (the file's payload) moves in (+) or out (-) of stock, line by line
@@ -435,9 +435,10 @@ export async function versionMoves(ctx: Ctx, type: string, p: Row, places: Stock
     if (typeof l.itemId !== 'string' || !places.isInventory(l.itemId) || !moving(l)) return;
     const qty = dec(l.quantity ?? '1').abs();
     if (qty.isZero()) return;
-    // A vendor credit's return carries no site (it leaves the default site).
-    let detail: Row = type === 'vendor_credit' ? {} : l;
-    if (type !== 'vendor_credit' && DETAIL_KEYS.every((key) => l[key] === undefined)) {
+    // A vendor credit's return leaves the site / bin / serial numbers / lot on its line (P1
+    // purchases; the default site when the line names none), like every other form.
+    let detail: Row = l;
+    if (DETAIL_KEYS.every((key) => l[key] === undefined)) {
       const prev = stored.get(i);
       detail = prev && prev.itemId === l.itemId ? prev : {};
     }

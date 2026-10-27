@@ -652,7 +652,7 @@ export const DOC_SHAPES: Record<DocType, Shape> = {
     lines: {
       arr: {
         accountId: 'id?', itemId: 'id?', quantity: 'dec?', unitCost: 'dec?', description: 'str?', amount: 'dec?',
-        classId: 'id?', customerId: 'id?', jobId: 'id?',
+        classId: 'id?', customerId: 'id?', jobId: 'id?', ...INV,
       },
     },
   },
