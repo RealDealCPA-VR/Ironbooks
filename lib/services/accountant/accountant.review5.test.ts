@@ -20,6 +20,9 @@
  *     balance comparison showed the change but nothing explained it.
  *  H  Write Off Invoices shows and records the invoice number on the form (a typed ref number such
  *     as INV-1001), not the internal sequence number nobody sees elsewhere.
+ *  I  Closing Date Exception report: entries made while the period was open again (closing date moved
+ *     back, then closed again) are not exceptions; the books count as closed from the LAST time the
+ *     closing date was set to its current value (a password-only change does not move that).
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
@@ -41,7 +44,9 @@ import { trialBalance } from '../reports';
 import { reclassifyLines } from './reclassify';
 import { findMisrecordedSalesTax, reclassifySalesTaxPayment } from './salesTaxTools';
 import { autoApplyCustomerCredit, autoApplyVendorCredit, clientDataReview, takeReviewSnapshot } from './clientDataReview';
-import { voidedDeletedTransactions } from './auditReports';
+import { closingDateExceptionReport, voidedDeletedTransactions } from './auditReports';
+import { setClosingDate } from '../company';
+import { createManualEntry } from '../journal';
 import { listWriteOffCandidates, writeOffInvoices } from './writeOff';
 import { listListChanges } from './listChanges';
 import { updateCompany } from '../company';
@@ -343,5 +348,41 @@ describe('H: Write Off Invoices names invoices by the number on the form', () =>
     expect(memo.memo).toContain('INV-R5-901');
     // Writing it off again: the refusal names the invoice the same way.
     await expect(writeOffInvoices(ctx, { invoiceIds: [inv.id], date: D('2026-09-30'), badDebtAccountId: acct.e3 })).rejects.toThrow(/INV-R5-901/);
+  });
+});
+
+describe('I: Closing Date Exception report after reopening the period', () => {
+  it('measures "entered after close" from the last time the books were closed on that date', async () => {
+    await setClosingDate(ctx, { closingDate: '2025-01-31' });
+    await new Promise((r) => setTimeout(r, 15));
+    // Reopen January to fix it, post the fix, then close January again.
+    await setClosingDate(ctx, { closingDate: '2024-12-31' });
+    const fix = await createManualEntry(ctx, {
+      date: D('2025-01-15'),
+      description: 'R5 January fix while open',
+      lines: [
+        { accountId: acct.e1, debit: '12.00' },
+        { accountId: acct['1000'], credit: '12.00' },
+      ],
+    });
+    await new Promise((r) => setTimeout(r, 15));
+    await setClosingDate(ctx, { closingDate: '2025-01-31' });
+    await new Promise((r) => setTimeout(r, 15));
+    // A late entry slipped in after the re-close (e.g. an import), then only the password changed.
+    const late = await createManualEntry({ ...ctx, closingDateOverride: true }, {
+      date: D('2025-01-20'),
+      description: 'R5 late January entry',
+      lines: [
+        { accountId: acct.e1, debit: '7.00' },
+        { accountId: acct['1000'], credit: '7.00' },
+      ],
+    });
+    await new Promise((r) => setTimeout(r, 15));
+    await setClosingDate(ctx, { closingDate: '2025-01-31', password: 'r5-close' });
+
+    const rows = (await closingDateExceptionReport(ctx)).rows;
+    expect(rows.filter((r) => r.entryId === fix.id)).toEqual([]);
+    expect(rows.some((r) => r.entryId === late.id)).toBe(true);
+    await setClosingDate(ctx, { closingDate: null });
   });
 });

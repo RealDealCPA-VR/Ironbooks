@@ -84,13 +84,20 @@ export async function closingDateExceptionReport(
   // Entries dated on/before the CURRENT closing date but created after it was set.
   if (cd) {
     const setLogs = await ctx.db
-      .select({ createdAt: auditLogs.createdAt, newValues: auditLogs.newValues })
+      .select({ createdAt: auditLogs.createdAt, oldValues: auditLogs.oldValues, newValues: auditLogs.newValues })
       .from(auditLogs)
       .where(and(eq(auditLogs.companyId, ctx.companyId), eq(auditLogs.entityType, 'company')))
       .orderBy(asc(auditLogs.createdAt));
-    const setAt = setLogs
-      .filter((s) => ((s.newValues ?? {}) as Record<string, unknown>).closingDate === cd)
-      .map((s) => s.createdAt)[0];
+    const toCd = setLogs.filter((s) => ((s.newValues ?? {}) as Record<string, unknown>).closingDate === cd);
+    // The books count as closed on `cd` from the LAST time the closing date became `cd`: entries
+    // made while the period was open again (closing date moved back or cleared, then set again)
+    // are not exceptions. A save that kept the same date (a password change) moves nothing.
+    // Older audit rows without the previous value fall back to the first time `cd` was set.
+    const changedTo = toCd.filter((s) => {
+      const old = (s.oldValues ?? null) as Record<string, unknown> | null;
+      return old !== null && 'closingDate' in old && old.closingDate !== cd;
+    });
+    const setAt = changedTo.length ? changedTo[changedTo.length - 1].createdAt : toCd[0]?.createdAt;
     if (setAt) {
       const seen = new Set(rows.map((r) => r.entryId));
       const late = await ctx.db
