@@ -26,6 +26,13 @@ const RESULT_AREA: Record<string, Area> = {
   Employee: 'payroll',
   'Journal Entry': 'accounting',
   Expense: 'banking',
+  // Numbered sales / purchase forms found by their typed number (results.ts DOC_KIND_LABEL).
+  // Without these every one of them was dropped, for everyone.
+  Estimate: 'customers',
+  'Sales Order': 'customers',
+  'Sales Receipt': 'customers',
+  'Credit Memo': 'customers',
+  'Purchase Order': 'vendors',
 };
 
 export async function GET(req: NextRequest) {

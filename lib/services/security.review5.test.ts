@@ -56,6 +56,10 @@ import { POST as portalLoginPOST } from '@/app/api/portal/login/route';
 import { POST as workersCompPOST } from '@/app/api/payroll/workers-comp/route';
 import { POST as stateSettingsPOST } from '@/app/api/payroll/state-settings/route';
 import { createVendor } from './vendors';
+import { createCustomer } from './customers';
+import { createEstimate } from './estimates';
+import { createPurchaseOrder } from './purchaseOrders';
+import { GET as searchGET } from '@/app/api/search/route';
 
 let db: DB;
 let owner: string;
@@ -288,5 +292,42 @@ describe('review5: text longer than its column is a 400, not a 500', () => {
     const body = await res.json();
     expect(body.code).toBe('VALIDATION');
     expect(body.error).toMatch(/too long/i);
+  });
+});
+
+describe('review5: global search (Ctrl+K) shows the numbered sales and purchase forms', () => {
+  it('an estimate and a purchase order found by their typed number, each only for people who may see it', async () => {
+    const ownerCtx = { db, companyId, userId: owner, access: fullAccess(), role: 'owner' as const };
+    const cust = await createCustomer(ownerCtx, { displayName: 'Search Customer' });
+    const vend = await createVendor(ownerCtx, { displayName: 'Search Vendor' });
+    const [expense] = await db
+      .select({ id: accounts.id })
+      .from(accounts)
+      .where(and(eq(accounts.companyId, companyId), eq(accounts.type, 'expense')));
+    await createEstimate(ownerCtx, {
+      customerId: cust.id,
+      date: new Date('2026-05-04T12:00:00Z'),
+      refNumber: 'QX-5501',
+      lines: [{ description: 'Quote', quantity: 1, rate: 10 }],
+    });
+    await createPurchaseOrder(ownerCtx, {
+      vendorId: vend.id,
+      date: new Date('2026-05-04T12:00:00Z'),
+      refNumber: 'QX-5502',
+      lines: [{ accountId: expense.id, quantity: 1, rate: 5 }],
+    });
+    const search = async (userId: string) => {
+      as(userId, 'GET', '/api/search');
+      const res = await searchGET(req('GET', '/api/search?q=QX-55'));
+      expect(res.status).toBe(200);
+      return ((await res.json()).results as { type: string; label: string }[]).map((r) => `${r.type}: ${r.label}`);
+    };
+    const mine = await search(owner);
+    expect(mine).toContain('Estimate: Estimate #QX-5501');
+    expect(mine).toContain('Purchase Order: Purchase Order #QX-5502');
+    // The A/R clerk has Customers but not Vendors.
+    const clerks = await search(clerk);
+    expect(clerks).toContain('Estimate: Estimate #QX-5501');
+    expect(clerks).not.toContain('Purchase Order: Purchase Order #QX-5502');
   });
 });
