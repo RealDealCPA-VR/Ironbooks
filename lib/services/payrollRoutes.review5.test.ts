@@ -176,7 +176,7 @@ describe('portal password', () => {
     const row = rows.find((r) => r.id === emp.id)!;
     expect(row).toBeTruthy();
     expect('portalPasswordHash' in row).toBe(false);
-    expect(row.hasPortalAccess).toBe(true);
+    expect(row.hasPortalPassword).toBe(true);
     asOwner('GET', `/api/employees/${emp.id}`);
     const one = (await (await employeeGET(req('GET', `/api/employees/${emp.id}`), { params: Promise.resolve({ id: emp.id }) })).json()) as Record<string, unknown>;
     expect('portalPasswordHash' in one).toBe(false);
