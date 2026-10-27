@@ -553,8 +553,8 @@ export function ListImport() {
               {(result.openingStock.unposted ?? 0) > 0 && (
                 <>
                   {' '}
-                  For {result.openingStock.unposted} of them the file already brings in the inventory asset balance, so
-                  their stock was set up without a journal entry.
+                  For {result.openingStock.unposted} of them the inventory asset balance is already in the books (this file
+                  or your General Ledger import brings it in), so their stock was set up without a journal entry.
                 </>
               )}
             </p>

@@ -48,7 +48,7 @@
  */
 import { createHash } from 'node:crypto';
 import Papa from 'papaparse';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, like } from 'drizzle-orm';
 import { csvUnsafeText } from '@/lib/csv';
 import { withPlannerStats } from '@/lib/db/plannerStats';
 import {
@@ -59,6 +59,7 @@ import {
   items as itemsTable,
   jobs as jobsTable,
   journalEntries,
+  journalEntryLines,
   priceLevels,
   salesReps,
   taxRates,
@@ -1525,8 +1526,9 @@ async function importIIFRows(
 
   // ---- Items (INVITEM) + group / assembly components ----
   // Inventory asset accounts whose balance this file already brings in (opening balance or
-  // transactions): item QNTY on those accounts is not posted again (it would double the stock).
-  const carriedAccountIds = new Set<string>();
+  // transactions), or a General Ledger import already brought: item QNTY on those accounts is
+  // not posted again (it would double the stock).
+  const carriedAccountIds = await glImportedAssetAccountIds(ctx);
   for (const a of parsed.accounts) {
     const ob = parseIifAmount(a.obAmount);
     if (!ob || Money.of(ob).isZero()) continue;
@@ -2299,8 +2301,9 @@ async function importItemRow(
           name,
           reason: 'note',
           message:
-            'Quantity on hand imported without a journal entry: this file already brings in the balance of the inventory asset account, ' +
-            'so posting the stock again would count it twice. Check that the item values add up to that balance.',
+            'Quantity on hand imported without a journal entry: the balance of the inventory asset account is already in the books ' +
+            '(this file or your General Ledger import brings it in), so posting the stock again would count it twice. ' +
+            'Check that the item values add up to that balance.',
         });
       }
     }
@@ -2945,6 +2948,9 @@ export interface ItemsCsvMapping {
 async function importItemRows(ctx: ServiceContext, rows: Row[], mapping: ItemsCsvMapping): Promise<ImportCounts> {
   const counts = emptyCounts();
   const lookup = await loadAccountLookup(ctx);
+  // Inventory asset accounts a General Ledger import already filled: quantities on hand for
+  // items on them come in without a journal entry (posting them would double the inventory).
+  const carriedAccountIds = await glImportedAssetAccountIds(ctx);
   const col = (key: keyof ItemsCsvMapping, row: Row): string => (mapping[key] ? (row[mapping[key]!] ?? '').trim() : '');
   const now = new Date();
   const today = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
@@ -2970,6 +2976,7 @@ async function importItemRows(ctx: ServiceContext, rows: Row[], mapping: ItemsCs
       assetAccountRef: col('assetAccount', row) || undefined,
       // G1: opening quantity on hand / value (or cost) / as-of date.
       opening: openingFromRow(col('quantityOnHand', row), col('totalValue', row), purchaseCost, col('asOfDate', row), today),
+      carriedAccountIds,
     });
   }
   return counts;
@@ -3119,6 +3126,28 @@ export async function importListXlsx(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Asset accounts holding postings of a QuickBooks General Ledger import (qbgl:* entries). That
+ * import brings each account's whole history — the Inventory Asset balance included — so an item
+ * list imported afterwards with quantities on hand must not post the same value again.
+ */
+async function glImportedAssetAccountIds(ctx: ServiceContext): Promise<Set<string>> {
+  const rows = await ctx.db
+    .selectDistinct({ id: journalEntryLines.accountId })
+    .from(journalEntryLines)
+    .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+    .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
+    .where(
+      and(
+        eq(journalEntries.companyId, ctx.companyId),
+        eq(journalEntries.status, 'posted'),
+        like(journalEntries.sourceRef, 'qbgl:%'),
+        eq(accounts.type, 'asset'),
+      ),
+    );
+  return new Set(rows.map((r) => r.id));
+}
 
 /** Convert an account name to a short alphanumeric code (max 20 chars). */
 function sanitiseCode(name: string): string {

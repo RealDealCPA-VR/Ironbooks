@@ -14,13 +14,13 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { and, eq, like } from 'drizzle-orm';
 import { getDb, closeDb, type DB } from '@/lib/db';
-import { accounts, bills, invoices, journalEntries, users } from '@/lib/db/schema';
+import { accounts, bills, invoices, items, journalEntries, users } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
 import { createCompany } from './company';
-import { importIIF } from './qbImport';
+import { importIIF, importItemsCSV } from './qbImport';
 import { importOpenItems } from './openItemsImport';
 import { runGlImport } from './qbGlImport';
-import { glCsv, upload, SAMPLE_GL } from '@/test/fixtures/qbGlFixtures';
+import { glCsv, upload, SAMPLE_GL, type GlFixture } from '@/test/fixtures/qbGlFixtures';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-qbimport-review5');
 let db: DB;
@@ -111,6 +111,51 @@ describe('IIF transactions on accounts the books do not have yet', () => {
     expect(inv.balanceDue).toBe('60.00');
     const [kassa] = await db.select().from(accounts).where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.name, 'Касса')));
     expect(kassa.balance).toBe('40.00');
+  });
+});
+
+describe('item quantities after the General Ledger import', () => {
+  const INV_GL: GlFixture = {
+    company: 'Stock Co',
+    periodLabel: 'January 1 through January 31, 2024',
+    accounts: [
+      { number: '10100', name: 'Checking', type: 'Bank', begin: '500.00' },
+      { number: '13000', name: 'Inventory Asset', type: 'Other Current Asset', begin: '1000.00' },
+      { number: '30000', name: 'Opening Balance Equity', type: 'Equity', begin: '-1500.00' },
+      { number: '60000', name: 'Rent', type: 'Expense', begin: '0.00' },
+    ],
+    txns: [
+      { type: 'Check', date: '01/04/2024', num: '1', name: 'Landlord', lines: [
+        { acct: '10100', amount: '-100.00' },
+        { acct: '60000', amount: '100.00' },
+      ] },
+    ],
+  };
+  const inventoryBalance = async (ctx: ServiceContext) =>
+    (await db.select().from(accounts).where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, '1300'))))[0].balance;
+
+  it('a CSV item list with quantities on hand does not post the inventory a second time', async () => {
+    const ctx = await newCo('Stock CSV Co');
+    const gl = await runGlImport(ctx, { file: upload('gl.csv', glCsv(INV_GL)) });
+    expect(gl.ok).toBe(true);
+    expect(await inventoryBalance(ctx)).toBe('1000.00');
+    const csv = ['Name,Type,Cost,Qty,Value,Asset', 'Widget,inventory,25.00,40,1000.00,1300'].join('\n');
+    const r = await importItemsCSV(ctx, csv, { name: 'Name', type: 'Type', purchaseCost: 'Cost', quantityOnHand: 'Qty', totalValue: 'Value', assetAccount: 'Asset' });
+    expect(r.items).toBe(1);
+    expect(r.openingStock).toMatchObject({ items: 1, value: '1000.00', unposted: 1 });
+    // The General Ledger import already holds the 1,000.00: the stock comes in without a journal entry.
+    expect(await inventoryBalance(ctx)).toBe('1000.00');
+    const [w] = await db.select().from(items).where(and(eq(items.companyId, ctx.companyId), eq(items.name, 'Widget')));
+    expect(Number(w.quantityOnHand)).toBe(40);
+  });
+
+  it('an IIF item list with QNTY imported after the General Ledger does not either', async () => {
+    const ctx = await newCo('Stock IIF Co');
+    expect((await runGlImport(ctx, { file: upload('gl.csv', glCsv(INV_GL)) })).ok).toBe(true);
+    const iif = ['!INVITEM\tNAME\tINVITEMTYPE\tCOST\tASSETACCNT\tQNTY\tVALUE', 'INVITEM\tGadget\tPART\t10.00\tInventory Asset\t100\t1000.00'].join('\r\n');
+    const r = await importIIF(ctx, iif);
+    expect(r.items).toBe(1);
+    expect(await inventoryBalance(ctx)).toBe('1000.00');
   });
 });
 
