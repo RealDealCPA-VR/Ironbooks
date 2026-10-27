@@ -10,6 +10,7 @@ import { ClipboardList } from 'lucide-react';
 import { Button, Card, Input, Label, PageHeader, Select, Table, Td, Th, Tr, toast } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { todayISO } from '@/lib/dates';
+import { lastCompletedQuarter } from '@/lib/formPeriods';
 
 type ReportKey = 'earnings-summary' | 'item-detail' | 'transactions-by-payee' | 'workers-comp' | 'state-wage';
 
@@ -61,8 +62,9 @@ export default function PayrollReportsPage() {
   const [from, setFrom] = useState(`${year}-01-01`);
   const [to, setTo] = useState(todayISO());
   const [state, setState] = useState('');
-  const [quarter, setQuarter] = useState(String(Math.floor(new Date().getMonth() / 3) + 1));
-  const [wyear, setWyear] = useState(String(year));
+  // State wage worksheet: the last finished quarter (the one the state report is due for).
+  const [quarter, setQuarter] = useState(String(lastCompletedQuarter().quarter));
+  const [wyear, setWyear] = useState(String(lastCompletedQuarter().year));
   const [data, setData] = useState<unknown>(null);
   const [loading, setLoading] = useState(false);
 

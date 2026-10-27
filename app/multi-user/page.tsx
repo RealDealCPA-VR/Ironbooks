@@ -11,6 +11,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { Users, Server, Lock, Unlock, LogOut, Link2, Copy } from 'lucide-react';
 import { Badge, Button, Card, PageHeader, PageSkeleton, ConfirmDialog, toast } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import LoadFailed from '@/components/LoadFailed';
 
 interface Session {
   id: string;
@@ -77,16 +78,29 @@ export default function MultiUserPage() {
   const [busy, setBusy] = useState<string | null>(null);
   const [confirmOthers, setConfirmOthers] = useState(false);
   const [confirmSingle, setConfirmSingle] = useState(false);
+  // The list refreshes every 30 s: a failure says so once on the page (no toast every 30 s), and a
+  // failed first load shows "could not be loaded / Try again" instead of an endless skeleton.
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [retrying, setRetrying] = useState(false);
 
   const load = useCallback(async () => {
     try {
       setData(await api.get<SessionsResponse>('/api/sessions'));
+      setLoadError(null);
     } catch (err) {
-      toast(err instanceof ApiError ? err.message : 'Could not load sessions.', 'danger');
+      setLoadError(err instanceof ApiError ? err.message : 'Could not load who is signed in.');
     }
     const h = bridge()?.hosting;
     if (h) h.status().then(setHosting).catch(() => {});
   }, []);
+  const retry = async () => {
+    setRetrying(true);
+    try {
+      await load();
+    } finally {
+      setRetrying(false);
+    }
+  };
 
   useEffect(() => {
     load();
@@ -117,7 +131,7 @@ export default function MultiUserPage() {
     return (
       <div className="p-8 max-w-4xl mx-auto w-full">
         <PageHeader title="Multi-user" icon={Users} />
-        <PageSkeleton rows={6} />
+        {loadError ? <LoadFailed message={loadError} onRetry={() => void retry()} retrying={retrying} /> : <PageSkeleton rows={6} />}
       </div>
     );
   }
@@ -136,6 +150,12 @@ export default function MultiUserPage() {
   return (
     <div className="p-8 max-w-4xl mx-auto w-full">
       <PageHeader title="Multi-user" icon={Users} />
+      {loadError && (
+        <p role="status" className="mb-4 rounded-lg bg-gold/15 px-3 py-2 text-sm text-yellow-900">
+          Could not refresh this page ({loadError}). It shows what was true a moment ago and tries again
+          every 30 seconds.
+        </p>
+      )}
 
       {/* ---- Hosting (desktop only) ---- */}
       {hosting && hosting.remoteHost && (

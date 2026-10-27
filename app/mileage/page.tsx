@@ -423,7 +423,7 @@ export default function MileagePage() {
         title="Mileage"
         icon={Car}
         action={
-          <Button onClick={openLogModal}>
+          <Button data-shortcut="new" onClick={openLogModal}>
             <Plus className="h-4 w-4" />
             Log Miles
           </Button>
@@ -445,7 +445,7 @@ export default function MileagePage() {
             title="No mileage logs yet"
             message="Log your business miles to track your deduction."
             action={
-              <Button onClick={openLogModal}>
+              <Button data-shortcut="new" onClick={openLogModal}>
                 <Plus className="h-4 w-4" /> Log Miles
               </Button>
             }
@@ -524,7 +524,7 @@ export default function MileagePage() {
             <Button variant="secondary" onClick={() => setLogOpen(false)} disabled={logSaving}>
               Cancel
             </Button>
-            <Button onClick={handleLog} loading={logSaving}>
+            <Button onClick={handleLog} loading={logSaving} data-shortcut="save">
               Log Miles
             </Button>
           </>

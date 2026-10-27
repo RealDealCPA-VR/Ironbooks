@@ -23,6 +23,7 @@ import { Download, RefreshCw, X } from 'lucide-react';
 import { Button, toast, toastError } from '@/components/ui';
 import { startSandbox } from '@/lib/sandboxClient';
 import { savePortableCompanyFile, saveShareableLedger } from '@/lib/companyFileClient';
+import { navigateGuarded } from '@/lib/shortcuts';
 
 type Unsubscribe = (() => void) | void;
 /** Mirrors updateState in electron/main.js. */
@@ -149,11 +150,12 @@ export default function DesktopBridge() {
           .catch((err) => toast(err instanceof Error ? err.message : 'Export failed.', 'danger'));
         return;
       }
+      // Like the QuickBooks keys: an open form with typed work asks before it is left.
       const route = MENU_ROUTES[action];
-      if (route) router.push(route);
+      if (route) navigateGuarded(route, (href) => router.push(href));
     });
     const offNavigate = b.onNavigate?.((route) => {
-      if (route) router.push(route);
+      if (route) navigateGuarded(route, (href) => router.push(href));
     });
 
     return () => {

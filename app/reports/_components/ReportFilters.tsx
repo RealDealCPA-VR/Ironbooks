@@ -33,15 +33,23 @@ export interface FilterOptions {
 
 const NEEDS_OPTIONS: ReportControl[] = ['account', 'customer', 'vendor', 'class', 'item', 'employee', 'job', 'budget', 'vehicle'];
 
-let cache: Promise<FilterOptions> | null = null;
-export function loadFilterOptions(): Promise<FilterOptions> {
-  if (!cache) {
-    cache = api.get<FilterOptions>('/api/reports/filter-options').catch((e) => {
-      cache = null;
+/**
+ * How long one load of the filter lists is shared. Long enough for the several filter rows of one
+ * screen, short enough that a customer, vendor, account or class added a moment ago is in the
+ * lists the next time a report or Find (Ctrl+F) opens — they used to stay missing until a reload.
+ */
+export const FILTER_OPTIONS_TTL_MS = 5_000;
+
+let cache: { at: number; promise: Promise<FilterOptions> } | null = null;
+export function loadFilterOptions(now: number = Date.now()): Promise<FilterOptions> {
+  if (!cache || now - cache.at > FILTER_OPTIONS_TTL_MS || now < cache.at) {
+    const promise: Promise<FilterOptions> = api.get<FilterOptions>('/api/reports/filter-options').catch((e) => {
+      if (cache?.promise === promise) cache = null;
       throw e;
     });
+    cache = { at: now, promise };
   }
-  return cache;
+  return cache.promise;
 }
 
 export const TXN_TYPES: [string, string][] = [

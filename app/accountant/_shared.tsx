@@ -64,3 +64,17 @@ export function monthsAgo(n: number): string {
   d.setMonth(d.getMonth() - n);
   return localDateISO(d);
 }
+
+/**
+ * January 1 of the current LOCAL calendar year. (new Date().getUTCFullYear() turns over at UTC
+ * midnight: on a December 31 evening in the Americas it is already next year.)
+ */
+export function thisYearStart(now: Date = new Date()): string {
+  return `${now.getFullYear()}-01-01`;
+}
+
+/** Last LOCAL calendar year, January 1 – December 31. */
+export function lastCalendarYear(now: Date = new Date()): { from: string; to: string } {
+  const y = now.getFullYear() - 1;
+  return { from: `${y}-01-01`, to: `${y}-12-31` };
+}

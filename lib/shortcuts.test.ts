@@ -94,7 +94,7 @@ describe('formatAmountResult', () => {
     expect(formatAmountResult(47.5)).toBe('47.5');
     expect(formatAmountResult(10 / 3)).toBe('3.33');
     expect(formatAmountResult(1.005)).toBe('1.01');
-    expect(formatAmountResult(-2.555)).toBe('-2.55'); // EPSILON rounding, half-up toward +inf
+    expect(formatAmountResult(-2.555)).toBe('-2.56'); // half away from zero, like Money.round2
   });
 });
 

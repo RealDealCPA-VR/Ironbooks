@@ -4,7 +4,8 @@
  * - Configure date range, account type checkboxes, and groupBy dimension.
  * - "Run" fetches POST /api/report-builder and displays a result table with totals.
  * - "Save" prompts for a name, POSTs to /api/memorized-reports.
- * - "Load Saved" lists memorized reports from GET /api/memorized-reports and re-runs one.
+ * - "Load Saved" lists memorized reports from GET /api/memorized-reports and re-runs one; the
+ *   Memorized Report List opens one directly with ?mem=<id>.
  * - "Download CSV" exports the visible table.
  */
 import { useState, useEffect, useCallback } from 'react';
@@ -27,6 +28,7 @@ import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import type { ReportConfig, ReportResult } from '@/lib/services/reportBuilder';
 import { csvMinimal, withCsvBom } from '@/lib/csv';
+import { memorizedIdFrom } from '../_components/memorizedHref';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -106,17 +108,27 @@ export default function ReportBuilderPage() {
   const [saveName, setSaveName] = useState('');
 
   // Load saved reports
-  const loadSaved = useCallback(async () => {
+  const loadSaved = useCallback(async (): Promise<MemorizedReport[]> => {
     try {
-      const rows = await api.get<MemorizedReport[]>('/api/memorized-reports');
-      setSaved(rows.filter((r) => r.reportType === 'custom'));
+      const rows = (await api.get<MemorizedReport[]>('/api/memorized-reports')).filter((r) => r.reportType === 'custom');
+      setSaved(rows);
+      return rows;
     } catch {
       // non-fatal
+      return [];
     }
   }, []);
 
   useEffect(() => {
-    loadSaved();
+    void loadSaved().then((rows) => {
+      // Opened from the Memorized Report List (?mem=<id>): load and run that saved report.
+      const memId = memorizedIdFrom(window.location.search);
+      const hit = memId ? rows.find((r) => r.id === memId) : undefined;
+      if (hit) void handleLoadSaved(hit);
+      else if (memId) toast('That saved report could not be found. It may have been deleted.', 'danger');
+    });
+    // Once, on open (handleLoadSaved only sets state and runs the saved setup).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loadSaved]);
 
   // Toggle account type checkbox

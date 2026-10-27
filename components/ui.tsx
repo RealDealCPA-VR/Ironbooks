@@ -9,7 +9,7 @@ import * as React from 'react';
 import { cn } from '@/lib/utils';
 import {
   adjustDateForKey,
-  evaluateAmountExpression,
+  evaluateAmountDecimal,
   formatAmountResult,
   isMathExpression,
   stepDocNumber,
@@ -203,7 +203,7 @@ export const AmountInput = React.forwardRef<HTMLInputElement, AmountInputProps>(
       if (!el) return false;
       const raw = el.value;
       if (!isMathExpression(raw)) return false; // plain numbers untouched
-      const result = evaluateAmountExpression(raw);
+      const result = evaluateAmountDecimal(raw);
       if (result === null) return false; // invalid: leave as typed
       const next = formatAmountResult(result);
       if (next !== raw) setNativeInputValue(el, next);

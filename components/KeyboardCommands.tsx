@@ -122,8 +122,18 @@ function forwardToList(e: KeyboardEvent, target: HTMLElement | null, dialog: HTM
   if (!list) return;
   e.preventDefault();
   list.focus({ preventScroll: true });
+  // Same modifiers as the key pressed (Ctrl+PgDn is "last row", plain PgDn "a page down").
   list.dispatchEvent(
-    new KeyboardEvent('keydown', { key: e.key, code: e.code, shiftKey: e.shiftKey, bubbles: true, cancelable: true }),
+    new KeyboardEvent('keydown', {
+      key: e.key,
+      code: e.code,
+      shiftKey: e.shiftKey,
+      ctrlKey: e.ctrlKey,
+      metaKey: e.metaKey,
+      altKey: e.altKey,
+      bubbles: true,
+      cancelable: true,
+    }),
   );
 }
 

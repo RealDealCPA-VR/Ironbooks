@@ -28,6 +28,7 @@ import { filterActions, canOpenHref, type PermissionMap } from '@/lib/commands/a
 import { PREFILL_EVENT, stashPrefill, type FormPrefill } from '@/lib/commands/prefill';
 import type { Area } from '@/lib/permissions/model';
 import { toast } from '@/components/ui';
+import { navigateGuarded } from '@/lib/shortcuts';
 
 /** Fired on window to open the command bar from anywhere (e.g. the header button). */
 export const OPEN_COMMAND_BAR_EVENT = 'ironbooks:open-command-bar';
@@ -197,7 +198,8 @@ export default function CommandPalette({
   const go = useCallback(
     (href: string) => {
       setOpen(false);
-      router.push(href);
+      // Like the QuickBooks keys: a form left open behind the bar asks before it is discarded.
+      navigateGuarded(href, (h) => router.push(h));
     },
     [router],
   );

@@ -212,7 +212,7 @@ function UsersTab({
           People who can sign in to this company file. A user can hold several roles — they get
           everything any of their roles allows.
         </p>
-        <Button onClick={() => setEditing('new')}>
+        <Button data-shortcut="new" onClick={() => setEditing('new')}>
           <Plus className="h-4 w-4" /> Add user
         </Button>
       </div>
@@ -405,7 +405,7 @@ function UserEditor({
           <Button variant="secondary" onClick={onClose}>
             Cancel
           </Button>
-          <Button onClick={save} loading={busy} disabled={!name.trim() || !login.trim() || roleKeys.length === 0}>
+          <Button onClick={save} loading={busy} disabled={!name.trim() || !login.trim() || roleKeys.length === 0} data-shortcut="save">
             {user ? 'Save' : 'Add user'}
           </Button>
         </>

@@ -1,0 +1,182 @@
+/**
+ * Review round 5 (team uib): QuickBooks keys and the shell.
+ *
+ *  - QuickMath (amount fields) evaluated and rounded with float math: "1234567.89/2" became
+ *    617283.94 and "-5.11/2" became -2.55, where the books (lib/money Money.round2, half away from
+ *    zero) say 617283.95 and -2.56. It now evaluates in exact decimals.
+ *  - Choosing a page from the desktop menu bar or the command bar discarded an open form without
+ *    the "Leave this form?" question the QuickBooks keys ask (navigateGuarded).
+ *  - Ctrl+PgUp / Ctrl+PgDn (first / last entry of a QB list or register) did nothing.
+ *  - F5 (QB: refresh) reloaded the desktop window and silently discarded an open form.
+ */
+import { describe, expect, it } from 'vitest';
+import {
+  LIST_KEY_HELP,
+  NAVIGATE_REQUEST_EVENT,
+  type KeyLike,
+  evaluateAmountDecimal,
+  evaluateAmountExpression,
+  formatAmountResult,
+  isReloadKey,
+  listKeyAction,
+  mightLoseWork,
+  navigateGuarded,
+  nextListIndex,
+} from './shortcuts';
+import { Money } from './money';
+
+/** What an amount field shows after QuickMath commits (components/ui.tsx AmountInput). */
+const quickMath = (raw: string) => {
+  const v = evaluateAmountDecimal(raw);
+  return v === null ? null : formatAmountResult(v);
+};
+
+describe('QuickMath rounds like the books', () => {
+  it('a half cent rounds up, not down (float 50.024999…)', () => {
+    expect(quickMath('100.05/2')).toBe('50.03');
+    expect(quickMath('1.115+2.23')).toBe('3.35');
+    expect(quickMath('0.285*100/100')).toBe('0.29');
+  });
+
+  it('negative half cents round away from zero, like Money.round2', () => {
+    expect(quickMath('-5.11/2')).toBe(Money.round2('-2.555').toFixed(2));
+    expect(quickMath('0-1.005')).toBe('-1.01');
+  });
+
+  it('agrees with Money.round2 on every split of a few awkward totals', () => {
+    for (const total of ['100.05', '33.35', '0.05', '1234567.89', '10.01']) {
+      for (const parts of [2, 3, 4, 6, 8]) {
+        const exact = Money.round2(Money.div(total, parts));
+        expect(quickMath(`${total}/${parts}`), `${total}/${parts}`).toBe(Number(exact.toFixed(2)) === 0 ? '0' : exact.toFixed(2).replace(/\.?0+$/, ''));
+      }
+    }
+  });
+
+  it('never shows -0 or exponent notation', () => {
+    expect(quickMath('0*-1')).toBe('0');
+    expect(quickMath('-0.001+0')).toBe('0');
+    expect(quickMath('99999999999*100')).toBe('9999999999900');
+    expect(quickMath('0.1+0.2')).toBe('0.3');
+  });
+
+  it('keeps the existing answers and refusals', () => {
+    expect(quickMath('12.5*3+10')).toBe('47.5');
+    expect(quickMath('10/3')).toBe('3.33');
+    expect(evaluateAmountExpression('$1,200 + 300')).toBe(1500);
+    expect(quickMath('1/0')).toBeNull();
+    expect(quickMath('5+')).toBeNull();
+    expect(quickMath('(2+3')).toBeNull();
+    expect(quickMath('-(2')).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Leaving an open form from the desktop menus or the command bar
+// ---------------------------------------------------------------------------
+//
+// Ctrl+W / Ctrl+I / … asked "Leave this form?" before discarding typed work, but choosing the same
+// item from the desktop menu bar (Banking > Write Checks, File > Back Up…) or a page from the
+// command bar (Ctrl+K) pushed the new page straight away: the open invoice was silently lost.
+
+/** A stand-in for document.querySelectorAll('[role="dialog"][data-modal]'). */
+const docWith = (dialogs: Array<{ hasField: boolean }>) => ({
+  querySelectorAll: () =>
+    dialogs.map((d) => ({ querySelector: () => (d.hasField ? {} : null) })) as unknown as NodeListOf<HTMLElement>,
+});
+/** A stand-in for a focused element. */
+const el = (tagName: string, opts: { inMain?: boolean; type?: string } = {}) =>
+  ({ tagName, type: opts.type ?? 'text', isContentEditable: false, closest: (sel: string) => (sel === 'main' && opts.inMain ? {} : null) }) as unknown as EventTarget;
+
+describe('mightLoseWork', () => {
+  it('an open form dialog with fields could lose work, wherever the focus is', () => {
+    expect(mightLoseWork(null, docWith([{ hasField: true }]))).toBe(true);
+    expect(mightLoseWork(el('BUTTON'), docWith([{ hasField: false }, { hasField: true }]))).toBe(true);
+  });
+
+  it('a field on the page could; a search box, a button or nothing focused could not', () => {
+    expect(mightLoseWork(el('INPUT', { inMain: true }), docWith([]))).toBe(true);
+    expect(mightLoseWork(el('TEXTAREA', { inMain: true }), docWith([]))).toBe(true);
+    expect(mightLoseWork(el('INPUT', { inMain: true, type: 'search' }), docWith([]))).toBe(false);
+    expect(mightLoseWork(el('INPUT', { inMain: false }), docWith([]))).toBe(false); // the command bar's own box
+    expect(mightLoseWork(el('BUTTON', { inMain: true }), docWith([{ hasField: false }]))).toBe(false);
+    expect(mightLoseWork(null, docWith([]))).toBe(false);
+  });
+});
+
+describe('navigateGuarded (desktop menus, command bar)', () => {
+  it('hands the page to the app shell, which asks before leaving a form', () => {
+    const shell = new EventTarget();
+    const asked: string[] = [];
+    shell.addEventListener(NAVIGATE_REQUEST_EVENT, (e) => {
+      e.preventDefault();
+      asked.push((e as CustomEvent<{ href: string }>).detail.href);
+    });
+    const pushed: string[] = [];
+    expect(navigateGuarded('/expenses?new=1', (h) => pushed.push(h), shell)).toBe(true);
+    expect(asked).toEqual(['/expenses?new=1']);
+    expect(pushed).toEqual([]); // the shell decides (confirm first when work could be lost)
+  });
+
+  it('goes straight there when no app shell is listening (sign-in screens)', () => {
+    const pushed: string[] = [];
+    expect(navigateGuarded('/backup', (h) => pushed.push(h), new EventTarget())).toBe(false);
+    expect(pushed).toEqual(['/backup']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// QB list keys: Ctrl+PgUp / Ctrl+PgDn
+// ---------------------------------------------------------------------------
+//
+// QuickBooks' lists and registers go to the first / last entry with Ctrl+Page Up / Ctrl+Page Down
+// (Intuit's keyboard-shortcut list); the app only knew Home / End, and the Ctrl combinations did
+// nothing.
+
+describe('Ctrl+PgUp / Ctrl+PgDn in a list', () => {
+  const key = (k: string, mods: Partial<KeyLike> = {}): KeyLike => ({ key: k, ctrlKey: false, metaKey: false, altKey: false, shiftKey: false, ...mods });
+
+  it('go to the first / last row', () => {
+    expect(listKeyAction(key('PageUp', { ctrlKey: true }))).toBe('home');
+    expect(listKeyAction(key('PageDown', { ctrlKey: true }))).toBe('end');
+    expect(listKeyAction(key('PageDown', { metaKey: true }))).toBe('end');
+    expect(nextListIndex('end', 2, 40, 10)).toBe(39);
+  });
+
+  it('plain PgUp / PgDn still move a page; other Ctrl keys are left alone', () => {
+    expect(listKeyAction(key('PageDown'))).toBe('page-down');
+    expect(listKeyAction(key('PageUp'))).toBe('page-up');
+    expect(listKeyAction(key('Enter', { ctrlKey: true }))).toBeNull(); // Save & New
+    expect(listKeyAction(key('ArrowDown', { ctrlKey: true }))).toBeNull();
+    expect(listKeyAction(key('PageDown', { ctrlKey: true, shiftKey: true }))).toBeNull();
+  });
+
+  it('the shortcuts help lists them', () => {
+    expect(LIST_KEY_HELP.map((r) => r.keys).join(' | ')).toContain('Ctrl+PgUp / Ctrl+PgDn');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F5
+// ---------------------------------------------------------------------------
+//
+// QuickBooks users press F5 to refresh a list (multi-user mode). In the desktop app F5 is View >
+// Reload, which restarted the page and silently threw away an invoice being typed. The shell now
+// asks first when work could be lost (the same check as the QuickBooks navigation keys).
+
+describe('F5 with typed work on screen', () => {
+  const key = (k: string, mods: Partial<KeyLike> = {}): KeyLike => ({ key: k, ctrlKey: false, metaKey: false, altKey: false, shiftKey: false, ...mods });
+
+  it('is recognised as the reload key (plain F5 only)', () => {
+    expect(isReloadKey(key('F5'))).toBe(true);
+    expect(isReloadKey(key('F5', { ctrlKey: true }))).toBe(false);
+    expect(isReloadKey(key('F5', { shiftKey: true }))).toBe(false);
+    expect(isReloadKey(key('F1'))).toBe(false);
+  });
+
+  it('the app shell asks before reloading when work could be lost', async () => {
+    const fs = await import('node:fs');
+    const shell = fs.readFileSync('components/AppShell.tsx', 'utf8');
+    expect(shell).toMatch(/isReloadKey\(e\) && !e\.repeat && mightLoseWork\(e\.target\)\) \{\s*e\.preventDefault\(\);\s*setReloadAsk\(true\)/);
+    expect(shell).toContain('title="Reload this window?"');
+  });
+});

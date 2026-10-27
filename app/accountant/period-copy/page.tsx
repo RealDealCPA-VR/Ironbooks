@@ -9,7 +9,7 @@ import { CalendarRange, FileDown } from 'lucide-react';
 import { Button, Card, DateInput, Label, PageHeader, toast, toastError } from '@/components/ui';
 import { niceDate, postAndSave } from '@/lib/accountantCopyClient';
 import { formatCurrency } from '@/lib/money';
-import { BackToCenter } from '../_shared';
+import { BackToCenter, lastCalendarYear } from '../_shared';
 
 interface Summary {
   from: string;
@@ -25,14 +25,9 @@ interface Summary {
   };
 }
 
-function lastYear(): { from: string; to: string } {
-  const y = new Date().getUTCFullYear() - 1;
-  return { from: `${y}-01-01`, to: `${y}-12-31` };
-}
-
 export default function PeriodCopyPage() {
-  const [from, setFrom] = useState(lastYear().from);
-  const [to, setTo] = useState(lastYear().to);
+  const [from, setFrom] = useState(lastCalendarYear().from);
+  const [to, setTo] = useState(lastCalendarYear().to);
   const [busy, setBusy] = useState(false);
   const [summary, setSummary] = useState<Summary | null>(null);
   const invalid = !from || !to || from > to;

@@ -16,6 +16,7 @@ import {
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency, Money } from '@/lib/money';
+import { lastCompletedYear } from '@/lib/formPeriods';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -47,9 +48,9 @@ function buildYearOptions(): number[] {
 
 export default function Form1099EfilePage() {
   const yearOptions = buildYearOptions();
-  const currentYear = new Date().getFullYear();
 
-  const [selectedYear, setSelectedYear] = useState(String(currentYear));
+  // The e-file is for the last finished calendar year (QB: "Last Calendar Year").
+  const [selectedYear, setSelectedYear] = useState(String(lastCompletedYear()));
   const [rows, setRows] = useState<Vendor1099Row[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [downloading, setDownloading] = useState(false);

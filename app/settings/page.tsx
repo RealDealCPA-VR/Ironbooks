@@ -128,9 +128,6 @@ interface Account {
   isActive?: boolean;
 }
 
-interface InvoiceRow {
-  invoiceNumber?: number;
-}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -349,7 +346,8 @@ export default function SettingsPage() {
   const patch = (p: Partial<CompanySettings>) => setS((prev) => ({ ...prev, ...p }));
 
   const [accounts, setAccounts] = useState<Account[]>([]);
-  const [nextInvoiceNumber, setNextInvoiceNumber] = useState<number | null>(null);
+  // The number the next invoice gets (Document Numbers: prefix, padding, starting number).
+  const [nextInvoiceNumber, setNextInvoiceNumber] = useState<string | null>(null);
 
   // Closing date (books protection)
   const [closingDate, setClosingDate] = useState('');
@@ -418,12 +416,11 @@ export default function SettingsPage() {
 
     api.get<Member[]>('/api/users').then(setMembers).catch(() => {});
     api.get<Account[]>('/api/accounts').then(setAccounts).catch(() => {});
+    // Ask the numbering service (lib/services/docNumbers.ts) rather than guessing from the whole
+    // invoice list: invoice numbers can carry letters (INV-0099) and a starting number.
     api
-      .get<InvoiceRow[]>('/api/invoices')
-      .then((rows) => {
-        const max = rows.reduce((m, r) => Math.max(m, Number(r.invoiceNumber ?? 0)), 0);
-        setNextInvoiceNumber(max + 1);
-      })
+      .get<{ nextNumber: string }>('/api/doc-numbers?docType=invoice')
+      .then((r) => setNextInvoiceNumber(r.nextNumber))
       .catch(() => {});
   }, []);
 
@@ -810,8 +807,13 @@ export default function SettingsPage() {
                     </div>
                     <div>
                       <Label>Next Invoice Number</Label>
-                      <Input value={nextInvoiceNumber !== null ? `#${nextInvoiceNumber}` : 'N/A'} disabled readOnly />
-                      <p className="mt-1 text-xs text-navy/50">Assigned automatically and sequentially — display only.</p>
+                      <Input value={nextInvoiceNumber ?? 'N/A'} disabled readOnly />
+                      <p className="mt-1 text-xs text-navy/50">
+                        Assigned automatically.{' '}
+                        <Link href="/doc-numbers" className="text-electric hover:underline">
+                          Change the starting number
+                        </Link>
+                      </p>
                     </div>
                     <div className="col-span-2">
                       <Label htmlFor="invoice-memo">Default Invoice Memo</Label>

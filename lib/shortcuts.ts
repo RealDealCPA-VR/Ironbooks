@@ -2,9 +2,9 @@
  * Desktop-ergonomics primitives shared by the UI kit and the app shell. The keys are QuickBooks
  * Desktop's, so 30 years of muscle memory carry over:
  *
- *  - evaluateAmountExpression / isMathExpression: the safe QuickMath parser behind
- *    <AmountInput> (components/ui.tsx). No eval — a tiny recursive-descent parser
- *    supporting + - * / and parentheses.
+ *  - evaluateAmountDecimal / evaluateAmountExpression / isMathExpression / formatAmountResult:
+ *    the safe QuickMath parser behind <AmountInput> (components/ui.tsx). No eval — a tiny
+ *    recursive-descent parser supporting + - * / and parentheses, in decimal arithmetic.
  *  - adjustDateForKey: QuickBooks date-entry keys (+ - T W K M H Y R [ ] ; ') for date inputs.
  *  - stepDocNumber: + / - in check and invoice number fields (<DocNumberInput>).
  *  - GLOBAL_SHORTCUTS / globalShortcutFor and the *_KEY_HELP tables: the single source of truth
@@ -18,6 +18,7 @@
  *    Home / End, PgUp / PgDn, Enter, type-ahead) for every list, center and register.
  */
 import * as React from 'react';
+import Decimal from 'decimal.js';
 import {
   addDays,
   addMonths,
@@ -55,22 +56,36 @@ function normalizeAmountText(raw: string): string {
   return raw.replace(/[$,\s]/g, '');
 }
 
+/** QuickMath's own decimal context (not the app-wide one): exact enough for any amount. */
+const QDecimal = Decimal.clone({ precision: 40, rounding: Decimal.ROUND_HALF_UP });
+
 /**
- * Safely evaluate an arithmetic expression with + - * / and parentheses.
- * Returns the numeric result, or null when the expression is invalid
- * (syntax error, division by zero, empty input). Never uses eval.
+ * Safely evaluate an arithmetic expression with + - * / and parentheses, in exact decimal
+ * arithmetic (like lib/money — never JS floats, so "1234567.89/2" is exactly 617283.945).
+ * Returns the result, or null when the expression is invalid (syntax error, division by zero,
+ * empty input). Never uses eval.
  *
- *   evaluateAmountExpression('12.5*3+10') === 47.5
+ *   evaluateAmountDecimal('12.5*3+10')?.toString() === '47.5'
  */
-export function evaluateAmountExpression(raw: string): number | null {
+export function evaluateAmountDecimal(raw: string): Decimal | null {
   const s = normalizeAmountText(raw);
   if (!s) return null;
   const state = { src: s, pos: 0, failed: false };
 
   const value = parseExpr(state);
-  if (state.failed || state.pos !== state.src.length) return null;
-  if (!Number.isFinite(value)) return null;
+  if (state.failed || state.pos !== state.src.length || !value || !value.isFinite()) return null;
   return value;
+}
+
+/**
+ * evaluateAmountDecimal as a plain number (for callers that only need the magnitude). Money
+ * fields use evaluateAmountDecimal + formatAmountResult so the cents are rounded exactly.
+ *
+ *   evaluateAmountExpression('12.5*3+10') === 47.5
+ */
+export function evaluateAmountExpression(raw: string): number | null {
+  const value = evaluateAmountDecimal(raw);
+  return value === null ? null : value.toNumber();
 }
 
 interface ParseState {
@@ -84,36 +99,39 @@ function peek(st: ParseState): string {
 }
 
 /** expr := term (('+' | '-') term)* */
-function parseExpr(st: ParseState): number {
+function parseExpr(st: ParseState): Decimal | null {
   let left = parseTerm(st);
-  while (!st.failed) {
+  while (!st.failed && left) {
     const op = peek(st);
     if (op !== '+' && op !== '-') break;
     st.pos++;
     const right = parseTerm(st);
-    left = op === '+' ? left + right : left - right;
+    if (!right) return null;
+    left = op === '+' ? left.plus(right) : left.minus(right);
   }
-  return left;
+  return st.failed ? null : left;
 }
 
 /** term := factor (('*' | '/') factor)* */
-function parseTerm(st: ParseState): number {
+function parseTerm(st: ParseState): Decimal | null {
   let left = parseFactor(st);
-  while (!st.failed) {
+  while (!st.failed && left) {
     const op = peek(st);
     if (op !== '*' && op !== '/') break;
     st.pos++;
     const right = parseFactor(st);
-    if (op === '*') left = left * right;
-    else if (right === 0) {
+    if (!right) return null;
+    if (op === '*') left = left.times(right);
+    else if (right.isZero()) {
       st.failed = true; // division by zero -> invalid expression
-    } else left = left / right;
+      return null;
+    } else left = left.dividedBy(right);
   }
-  return left;
+  return st.failed ? null : left;
 }
 
 /** factor := ('+' | '-') factor | '(' expr ')' | number */
-function parseFactor(st: ParseState): number {
+function parseFactor(st: ParseState): Decimal | null {
   const c = peek(st);
   if (c === '+') {
     st.pos++;
@@ -121,14 +139,15 @@ function parseFactor(st: ParseState): number {
   }
   if (c === '-') {
     st.pos++;
-    return -parseFactor(st);
+    const v = parseFactor(st);
+    return v ? v.negated() : null;
   }
   if (c === '(') {
     st.pos++;
     const v = parseExpr(st);
-    if (peek(st) !== ')') {
+    if (!v || peek(st) !== ')') {
       st.failed = true;
-      return NaN;
+      return null;
     }
     st.pos++;
     return v;
@@ -137,7 +156,7 @@ function parseFactor(st: ParseState): number {
 }
 
 /** number := digits ['.' digits] | '.' digits */
-function parseNumber(st: ParseState): number {
+function parseNumber(st: ParseState): Decimal | null {
   const start = st.pos;
   while (/[0-9]/.test(peek(st))) st.pos++;
   if (peek(st) === '.') {
@@ -148,14 +167,19 @@ function parseNumber(st: ParseState): number {
   // Must contain at least one digit ('.', '' are invalid).
   if (!/[0-9]/.test(text)) {
     st.failed = true;
-    return NaN;
+    return null;
   }
-  return Number(text);
+  return new QDecimal(text);
 }
 
-/** Round an evaluated amount to cents for display in money fields. */
-export function formatAmountResult(n: number): string {
-  return String(Math.round((n + Number.EPSILON) * 100) / 100);
+/**
+ * Round an evaluated amount to cents for a money field the way the books round (lib/money
+ * Money.round2: half away from zero), without trailing zeros, -0 or exponent notation:
+ * 47.5 → '47.5', 617283.945 → '617283.95', -2.555 → '-2.56'.
+ */
+export function formatAmountResult(n: number | string | Decimal): string {
+  const cents = new QDecimal(n).toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
+  return cents.isZero() ? '0' : cents.toFixed();
 }
 
 // ---------------------------------------------------------------------------
@@ -377,7 +401,7 @@ export const GRID_KEY_HELP: { keys: string; description: string }[] = [
 /** Display-only rows for the help modal: lists, centers, registers and reports (useListKeys). */
 export const LIST_KEY_HELP: { keys: string; description: string }[] = [
   { keys: 'Up / Down', description: 'Move the highlight' },
-  { keys: 'Home / End', description: 'First / last row' },
+  { keys: 'Home / End, Ctrl+PgUp / Ctrl+PgDn', description: 'First / last row' },
   { keys: 'PgUp / PgDn', description: 'A page up / down' },
   { keys: 'Type a name', description: 'Jump to the first row that starts with it' },
   { keys: 'Enter', description: 'Open the highlighted row (QuickZoom on reports)' },
@@ -409,6 +433,48 @@ export function isEditableTarget(target: EventTarget | null): boolean {
     tag === 'SELECT' ||
     el.isContentEditable === true
   );
+}
+
+// ---------------------------------------------------------------------------
+// Leaving a form: the app shows one page at a time where QB would open a second window
+// ---------------------------------------------------------------------------
+
+/**
+ * Leaving the page now could drop typed work: a form dialog (with fields) is open, or the cursor
+ * is in a field on the page (not a search box). `root` is the document (a stand-in in tests).
+ */
+export function mightLoseWork(target: EventTarget | null, root: Pick<ParentNode, 'querySelectorAll'> = document): boolean {
+  const dialogs = Array.from(root.querySelectorAll<HTMLElement>('[role="dialog"][data-modal]'));
+  if (dialogs.some((d) => d.querySelector('input:not([type="hidden"]), select, textarea'))) return true;
+  const el = target as HTMLElement | null;
+  return isEditableTarget(el) && !!el?.closest?.('main') && (el as HTMLInputElement).type !== 'search';
+}
+
+/**
+ * F5 (no modifiers): the desktop app's View > Reload. QuickBooks users press it to refresh a list
+ * (QB's F5); here it reloads the whole window, so with typed work on screen the shell asks first.
+ */
+export function isReloadKey(e: KeyLike): boolean {
+  return e.key === 'F5' && !ctrlOrCmd(e) && !e.altKey && !e.shiftKey;
+}
+
+/**
+ * Asks the app shell (components/AppShell.tsx GlobalShortcuts) to open a page: it asks "Leave
+ * this form?" first when typed work could be lost, exactly like the QuickBooks keys (Ctrl+W, …).
+ */
+export const NAVIGATE_REQUEST_EVENT = 'ironbooks:navigate';
+
+/**
+ * Open `href` the way the QuickBooks keys do — through the app shell's leave-this-form check —
+ * for the desktop menus and the command bar. Falls back to `push` when no app shell is listening
+ * (sign-in screens, which have no work to lose). Returns whether the shell took it.
+ */
+export function navigateGuarded(href: string, push: (href: string) => void, target: EventTarget = window): boolean {
+  const ev = new CustomEvent(NAVIGATE_REQUEST_EVENT, { detail: { href }, cancelable: true });
+  target.dispatchEvent(ev);
+  if (ev.defaultPrevented) return true;
+  push(href);
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -892,9 +958,13 @@ const LIST_KEYS: Readonly<Record<string, ListKeyAction>> = {
   Enter: 'open',
 };
 
-/** Up / Down / Home / End / PgUp / PgDn move the highlight, Enter opens the row (no modifiers). */
+/**
+ * Up / Down / Home / End / PgUp / PgDn move the highlight, Enter opens the row (no modifiers);
+ * Ctrl+PgUp / Ctrl+PgDn go to the first / last row, as in QB's lists and registers.
+ */
 export function listKeyAction(e: KeyLike): ListKeyAction | null {
-  if (ctrlOrCmd(e) || e.altKey || e.shiftKey) return null;
+  if (e.altKey || e.shiftKey) return null;
+  if (ctrlOrCmd(e)) return e.key === 'PageUp' ? 'home' : e.key === 'PageDown' ? 'end' : null;
   return LIST_KEYS[e.key] ?? null;
 }
 

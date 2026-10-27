@@ -37,9 +37,12 @@ import {
   GLOBAL_SHORTCUTS,
   GRID_KEY_HELP,
   LIST_KEY_HELP,
+  NAVIGATE_REQUEST_EVENT,
   NUMBER_KEY_HELP,
   globalShortcutFor,
   isEditableTarget,
+  isReloadKey,
+  mightLoseWork,
 } from '@/lib/shortcuts';
 import { ConfirmDialog, Modal, toast } from '@/components/ui';
 import { Briefcase, Building2, ChevronDown, ChevronRight, LogOut, Search, Sparkles } from 'lucide-react';
@@ -318,33 +321,46 @@ function ShortcutGroup({ title, rows }: { title: string; rows: { keys: string; d
 }
 
 /**
- * Leaving the page now could drop typed work: a form dialog (with fields) is open, or the
- * cursor is in a field on the page. The app shows one page at a time where QB would open a
- * second window, so navigation shortcuts ask first.
- */
-function mightLoseWork(target: EventTarget | null): boolean {
-  const dialogs = Array.from(document.querySelectorAll<HTMLElement>('[role="dialog"][data-modal]'));
-  if (dialogs.some((d) => d.querySelector('input:not([type="hidden"]), select, textarea'))) return true;
-  const el = target as HTMLElement | null;
-  return isEditableTarget(el) && !!el?.closest('main') && (el as HTMLInputElement).type !== 'search';
-}
-
-/**
  * App-wide keyboard shortcuts (QB Desktop's keys, GLOBAL_SHORTCUTS in lib/shortcuts.ts):
  * Ctrl+W Write Checks, Ctrl+I Create Invoices, Ctrl+J Customer Center, Ctrl+A Chart of
  * Accounts, Ctrl+R Use Register, Ctrl+T Memorized Transactions, Ctrl+F Find — from inside
  * fields too, as in QB (except Ctrl+A, which selects a field's text) — and "?" opens the
  * shortcuts help. The other commands (Ctrl+E / D / P / Y / H / Q / L, F1) are
  * components/KeyboardCommands.tsx; Ctrl+K is CommandPalette; Ctrl+M is MemorizeButton.
+ *
+ * The app shows one page at a time where QB would open a second window, so leaving a form with
+ * typed work asks first (mightLoseWork) — for these keys and for the desktop menus and the
+ * command bar, which ask through NAVIGATE_REQUEST_EVENT (navigateGuarded).
  */
 function GlobalShortcuts() {
   const router = useRouter();
   const [helpOpen, setHelpOpen] = React.useState(false);
   const [leaveTo, setLeaveTo] = React.useState<string | null>(null);
+  const [reloadAsk, setReloadAsk] = React.useState(false);
+
+  React.useEffect(() => {
+    function onNavigateRequest(e: Event) {
+      const href = (e as CustomEvent<{ href?: string }>).detail?.href;
+      if (typeof href !== 'string' || !href) return;
+      e.preventDefault();
+      setHelpOpen(false);
+      if (mightLoseWork(document.activeElement)) setLeaveTo(href);
+      else router.push(href);
+    }
+    window.addEventListener(NAVIGATE_REQUEST_EVENT, onNavigateRequest);
+    return () => window.removeEventListener(NAVIGATE_REQUEST_EVENT, onNavigateRequest);
+  }, [router]);
 
   React.useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if (e.defaultPrevented || e.isComposing) return;
+      // F5 reloads the desktop window (View > Reload) — QB users press it to refresh a list. With
+      // typed work on screen, ask first instead of wiping the open form.
+      if (isReloadKey(e) && !e.repeat && mightLoseWork(e.target)) {
+        e.preventDefault();
+        setReloadAsk(true);
+        return;
+      }
       const editable = isEditableTarget(e.target);
       const sc = globalShortcutFor(e, editable);
       if (sc?.href) {
@@ -392,6 +408,17 @@ function GlobalShortcuts() {
           if (href) router.push(href);
         }}
         onClose={() => setLeaveTo(null)}
+      />
+      <ConfirmDialog
+        open={reloadAsk}
+        title="Reload this window?"
+        message="Reloading starts this page over. Anything typed here and not saved will be lost."
+        confirmLabel="Reload"
+        onConfirm={() => {
+          setReloadAsk(false);
+          window.location.reload();
+        }}
+        onClose={() => setReloadAsk(false)}
       />
     </>
   );

@@ -13,6 +13,7 @@ import { Bookmark, FileSpreadsheet, FolderPlus, Pencil, Play, Trash2 } from 'luc
 import { Badge, Button, Card, ConfirmDialog, EmptyState, Input, Label, Modal, PageHeader, Select, Spinner, toast } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { CATALOG_BY_KEY } from '@/lib/reports/catalog';
+import { memorizedReportHref } from '../_components/memorizedHref';
 
 interface MemorizedRow {
   id: string;
@@ -33,12 +34,8 @@ interface Processed {
   error?: string;
 }
 
-function reportHref(r: MemorizedRow): string {
-  if (r.reportType === 'custom') return '/reports/builder';
-  const params = new URLSearchParams(r.config?.params ?? {});
-  params.set('mem', r.id);
-  return `/reports/std/${r.reportType}?${params.toString()}`;
-}
+/** Standard reports open with their saved settings; Report Builder reports open in the builder. */
+const reportHref = (r: MemorizedRow): string => memorizedReportHref(r);
 
 export default function MemorizedReportsPage() {
   const [reports, setReports] = useState<MemorizedRow[]>([]);

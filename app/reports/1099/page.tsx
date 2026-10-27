@@ -19,6 +19,7 @@ import {
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency, Money, toAmountString } from '@/lib/money';
 import { csvQuoted, withCsvBom } from '@/lib/csv';
+import { lastCompletedYear } from '@/lib/formPeriods';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -394,10 +395,10 @@ function MiscTable({ rows, threshold }: { rows: WorksheetRow[]; threshold?: stri
 // ---------------------------------------------------------------------------
 
 export default function Report1099Page() {
-  const currentYear = new Date().getFullYear();
   const yearOptions = buildYearOptions();
 
-  const [selectedYear, setSelectedYear] = useState(String(currentYear));
+  // 1099s are prepared for the last finished calendar year (QB: "Last Calendar Year").
+  const [selectedYear, setSelectedYear] = useState(String(lastCompletedYear()));
   const [worksheet, setWorksheet] = useState<Worksheet | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
