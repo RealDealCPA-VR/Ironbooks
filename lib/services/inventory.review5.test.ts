@@ -1277,4 +1277,69 @@ describe('review5 inventory', () => {
     expect((await itemRow(b.item.id)).quantityOnHand).toBe('5.0000');
     expect(await gl('1300')).toBe((await inventoryValuation(ctx)).grandTotal);
   });
+// ---- round 5 final review: two receipt lines for one FIFO item, and the variance COGS account ----
+
+  async function receiptLinesByCost(receiptId: string) {
+    const ls = await db.select().from(itemReceiptLines).where(eq(itemReceiptLines.itemReceiptId, receiptId));
+    return new Map(ls.map((l) => [Money.of(l.unitCost).toFixed(2), l.id]));
+  }
+
+  it("FIFO: a bill on one of two receipt lines for the item never re-costs the other line's units", async () => {
+    const item = await invItem("Two-line receipt item");
+    await receiveStock(ctx, { itemId: item.id, quantity: 1, unitCost: "1.00", date: d("2026-01-01") });
+    const v = await createVendor(ctx, { displayName: "Two-line vendor" } as never);
+    const r = await createItemReceipt(ctx, {
+      vendorId: v.id,
+      date: d("2026-01-02"),
+      lines: [
+        { itemId: item.id, quantity: 10, unitCost: "1.00" },
+        { itemId: item.id, quantity: 10, unitCost: "2.00" },
+      ],
+    } as never);
+    const lineByCost = await receiptLinesByCost(r.id);
+    await consumeStock(ctx, { itemId: item.id, quantity: 11, date: d("2026-01-03") });
+    // Which receipt line was sold depends on FIFO order within the day; find the one left.
+    const left = await openLayers(item.id);
+    expect(left.length).toBe(1);
+    const keptCost = left[0].endsWith("@1.0000") ? "1.00" : "2.00";
+    const soldCost = keptCost === "1.00" ? "2.00" : "1.00";
+    const sold = await enterBillForReceivedItems(ctx, {
+      vendorId: v.id,
+      date: d("2026-01-04"),
+      lines: [{ receiptLineId: lineByCost.get(soldCost)!, quantity: 10, unitCost: Money.of(soldCost).plus("0.50").toFixed(2) }],
+    });
+    // Its units are gone: the whole $5.00 is cost of sales; the kept line's units keep their cost.
+    expect(sold.preview.lines[0].inventoryVariance).toBe("0.00");
+    expect(sold.preview.lines[0].expensedVariance).toBe("5.00");
+    expect(await openLayers(item.id)).toEqual([`10@${Money.of(keptCost).toFixed(4)}`]);
+    const kept = await enterBillForReceivedItems(ctx, {
+      vendorId: v.id,
+      date: d("2026-01-05"),
+      lines: [{ receiptLineId: lineByCost.get(keptCost)!, quantity: 10, unitCost: Money.of(keptCost).plus("0.10").toFixed(2) }],
+    });
+    expect(kept.preview.lines[0].inventoryVariance).toBe("1.00");
+    expect(kept.preview.lines[0].expensedVariance).toBe("0.00");
+    const value = Money.round2(Money.of(keptCost).plus("0.10").times(10)).toFixed(2);
+    expect(await gl("1300")).toBe(value);
+    expect((await inventoryValuation(ctx)).grandTotal).toBe(value);
+  });
+
+  it("FIFO: the price variance on received units already sold goes to the item's own COGS account", async () => {
+    const own = await createAccount(ctx, { code: "5010", name: "COGS - Gadgets", type: "expense" as never, subtype: "cost_of_goods_sold" });
+    const item = await invItem("Own-COGS receipt item", { expenseAccountId: own.id });
+    await receiveStock(ctx, { itemId: item.id, quantity: 1, unitCost: "1.00", date: d("2026-01-01") });
+    const v = await createVendor(ctx, { displayName: "Own-COGS vendor" } as never);
+    const r = await createItemReceipt(ctx, { vendorId: v.id, date: d("2026-01-02"), lines: [{ itemId: item.id, quantity: 10, unitCost: "1.00" }] } as never);
+    await consumeStock(ctx, { itemId: item.id, quantity: 11, date: d("2026-01-03") });
+    expect(await gl("5010")).toBe("11.00");
+    const bill = await enterBillForReceivedItems(ctx, {
+      vendorId: v.id,
+      date: d("2026-01-04"),
+      lines: [{ receiptLineId: await receiptLineId(r.id), quantity: 10, unitCost: "1.50" }],
+    });
+    expect(bill.preview.lines[0].expensedVariance).toBe("5.00");
+    expect(await gl("5010")).toBe("16.00");
+    expect(await gl("5000")).toBe("0.00");
+  });
 });
+

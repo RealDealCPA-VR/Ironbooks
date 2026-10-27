@@ -47,7 +47,7 @@ import {
 } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { postJournalEntry } from './posting';
-import { fifoLayerValue, valueRemainderAfter } from './inventory';
+import { cogsAccountForItem, fifoLayerValue, valueRemainderAfter } from './inventory';
 import { layersWorth } from './fifo';
 import { ITEM_RECEIPT_ACCRUAL_CODE, getOrCreateAccrualAccount } from './itemReceipts';
 import {
@@ -456,6 +456,21 @@ async function planReceiptBill(ctx: ServiceContext, input: EnterReceiptBillInput
     : [];
   const itemById = new Map(itemRows.map((i) => [i.id, i]));
 
+  // Receipts with more than one line for the same item: their own layers at another line's cost
+  // belong to that other line, so a bill on one line must never re-cost them.
+  const receiptIds = [...new Set(rows.map((r) => r.receipt.id))];
+  const linesPerReceiptItem = new Map<string, number>();
+  if (receiptIds.length) {
+    const all = await ctx.db
+      .select({ receiptId: itemReceiptLines.itemReceiptId, itemId: itemReceiptLines.itemId })
+      .from(itemReceiptLines)
+      .where(inArray(itemReceiptLines.itemReceiptId, receiptIds));
+    for (const l of all) {
+      const key = `${l.receiptId}|${l.itemId}`;
+      linesPerReceiptItem.set(key, (linesPerReceiptItem.get(key) ?? 0) + 1);
+    }
+  }
+
   // Previously relieved accrual per line (for exact-cent relief on the final bill).
   const prior = await ctx.db
     .select({ lineId: itemReceiptBillLines.itemReceiptLineId, accrual: itemReceiptBillLines.accrualAmount })
@@ -481,7 +496,6 @@ async function planReceiptBill(ctx: ServiceContext, input: EnterReceiptBillInput
 
   const settings = await getReceivingSettings(ctx);
   let ppvAccountId: string | null = null;
-  let cogsAccountId: string | null = null;
   let defaultInventoryAcctId: string | null = null;
   // FIFO layer quantity already planned by earlier rows of this bill (same item, same layer).
   const layerTaken = new Map<string, Dec>();
@@ -554,8 +568,9 @@ async function planReceiptBill(ctx: ServiceContext, input: EnterReceiptBillInput
       } else {
         varianceMode = 'inventory';
         inventoryAccountId = item.assetAccountId ?? (defaultInventoryAcctId ??= await accountIdByCode(ctx, '1300'));
-        cogsAccountId ??= await accountIdByCode(ctx, '5000');
-        varianceAccountId = cogsAccountId;
+        // The part on units already sold is cost of sales of THIS item: its own COGS account, as
+        // its sales post (cogsAccountForItem), not 5000.
+        varianceAccountId = await cogsAccountForItem(ctx, item);
         // How much of the touched quantity is still in stock at the receipt's cost?
         let covered = Money.zero();
         if (await isFifoTracked(ctx, item.id)) {
@@ -580,7 +595,10 @@ async function planReceiptBill(ctx: ServiceContext, input: EnterReceiptBillInput
           const recosted = await recostedReceiptLayers(ctx, receipt.id, item.id);
           const ownOpen = open.filter((l) => l.sourceRef === ownRef && !recosted.has(l.id));
           const atLineCost = (l: (typeof layers)[number]) => ownCosts.has(Money.of(l.unitCost).toFixed(4));
-          const own = [...ownOpen.filter(atLineCost), ...ownOpen.filter((l) => !atLineCost(l))];
+          // Layers at another cost (raised by landed cost) are this line's only when the receipt has
+          // no other line for the item; otherwise they may be the other line's units.
+          const soleLine = (linesPerReceiptItem.get(`${receipt.id}|${item.id}`) ?? 0) <= 1;
+          const own = [...ownOpen.filter(atLineCost), ...(soleLine ? ownOpen.filter((l) => !atLineCost(l)) : [])];
           // Receipts recorded before layers were tagged: older (untagged) layers at the receipt's
           // cost, same date first, newest first. Never when the receipt has layers of its own (its
           // units were sold, or are re-costed already): other stock is not the receipt's.
