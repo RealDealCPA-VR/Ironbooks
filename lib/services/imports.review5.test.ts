@@ -591,3 +591,35 @@ describe('K. a large IIF file', () => {
     expect(ob.date.toISOString().slice(0, 10)).toBe('2023-12-31');
   }, 300_000);
 });
+
+// ---------------------------------------------------------------------------
+// L. Open items: two identical open items in one report are two documents
+// ---------------------------------------------------------------------------
+
+describe('L. identical open items', () => {
+  it('two same-day $50 statement charges (no number) both come in, once; a re-import adds nothing', async () => {
+    const co = await createCompany(db, { name: 'Twin Charges Co', ownerId: userId });
+    const ctx: ServiceContext = { db, companyId: co.id, userId };
+    const csv = [
+      '"Open Invoices"',
+      '"As of December 31, 2025"',
+      ',Type,Date,Num,Due Date,Open Balance',
+      'Twin Customer,,,,,',
+      ',Statement Charge,12/01/2025,,12/31/2025,50.00',
+      ',Statement Charge,12/01/2025,,12/31/2025,50.00',
+      ',Payment,12/03/2025,,,-20.00',
+      ',Payment,12/03/2025,,,-20.00',
+      'Total Twin Customer,,,,,60.00',
+    ].join('\r\n');
+    const f = { name: 'open.csv', data: Buffer.from(csv).toString('base64') };
+    const preview = await previewOpenItems(ctx, { file: f });
+    expect(preview.items.length).toBe(4);
+    const r = await importOpenItems(ctx, { file: f, alreadyInGl: false });
+    expect([r.invoices, r.credits, r.skipped]).toEqual([2, 2, 0]);
+    expect(r.reconciliation.ar.aging).toBe('60.00');
+    expect(r.reconciliation.ar.inBalance).toBe(true);
+    const again = await importOpenItems(ctx, { file: f, alreadyInGl: false });
+    expect([again.invoices, again.credits, again.skipped]).toEqual([0, 0, 4]);
+    expect(again.reconciliation.ar.aging).toBe('60.00');
+  });
+});

@@ -104,6 +104,12 @@ export interface OpenItem {
   qbTotal?: string | null;
   /** Date of the newest payment / credit / charge in this file applied to the item. */
   changeDate?: string | null;
+  /**
+   * 1, 2, … for the 2nd, 3rd, … item of a file identical to an earlier one (same kind, name,
+   * number, date and amount: two same-day statement charges, two unapplied payments). Part of
+   * the duplicate tag, so each is brought in once, and only once on a re-import.
+   */
+  occurrence?: number;
 }
 
 export interface ParsedOpenItems {
@@ -359,7 +365,7 @@ export async function loadOpenItems(input: Pick<OpenItemsInput, 'file' | 'items'
     const side: LedgerSide = input.side ?? (rows.every((i) => i.kind === 'bill' || i.kind === 'vendor_credit') ? 'ap' : 'ar');
     const okKind = side === 'ar' ? ['invoice', 'credit_memo'] : ['bill', 'vendor_credit'];
     if (rows.some((it) => !okKind.includes(it.kind))) throw validation('Mixing customer and vendor balances in one import is not allowed.');
-    return { side, items: rows, warnings: [] };
+    return { side, items: numberOccurrences(side, rows), warnings: [] };
   }
   if (!input.file) throw validation('Choose a report file or enter the balances.');
   const bytes = decodeFile(input.file);
@@ -370,7 +376,9 @@ export async function loadOpenItems(input: Pick<OpenItemsInput, 'file' | 'items'
   let lastErr: unknown = null;
   for (const sheet of loaded.sheets) {
     try {
-      return parseOpenItemsGrid(sheet.rows, input.side);
+      const parsed = parseOpenItemsGrid(sheet.rows, input.side);
+      numberOccurrences(parsed.side, parsed.items);
+      return parsed;
     } catch (err) {
       lastErr = err;
     }
@@ -509,9 +517,27 @@ async function ensureName(ctx: ServiceContext, side: LedgerSide, index: Map<stri
 // Duplicate tags
 // ---------------------------------------------------------------------------
 
+function itemKey(side: LedgerSide, it: OpenItem): string {
+  return [side, it.kind, canonicalName(it.name).toLowerCase(), it.number ?? '', it.date, toAmountString(it.openBalance)].join('|');
+}
+
 function itemTag(side: LedgerSide, it: OpenItem): string {
-  const key = [side, it.kind, canonicalName(it.name).toLowerCase(), it.number ?? '', it.date, toAmountString(it.openBalance)].join('|');
+  // The first of identical items keeps the original tag (files imported before still match).
+  const key = itemKey(side, it) + (it.occurrence ? `|#${it.occurrence}` : '');
   return `qbopen:${createHash('sha256').update(key).digest('hex').slice(0, 16)}`;
+}
+
+/** Number identical items in file order (see OpenItem.occurrence). */
+function numberOccurrences(side: LedgerSide, items: OpenItem[]): OpenItem[] {
+  const seen = new Map<string, number>();
+  for (const it of items) {
+    if (it.docKey) continue;
+    const k = itemKey(side, it);
+    const n = seen.get(k) ?? 0;
+    seen.set(k, n + 1);
+    if (n > 0) it.occurrence = n;
+  }
+  return items;
 }
 
 async function tagExists(ctx: ServiceContext, kind: OpenItemKind, tag: string): Promise<boolean> {
