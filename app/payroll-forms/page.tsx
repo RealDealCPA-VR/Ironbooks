@@ -23,6 +23,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { lastCompletedQuarter } from '@/lib/formPeriods';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -59,8 +60,9 @@ export default function PayrollFormsPage() {
   const [w2Year, setW2Year]             = useState(String(currentYear - 1));
 
   // 941 form state
-  const [q941Quarter, setQ941Quarter] = useState('1');
-  const [q941Year, setQ941Year]       = useState(String(currentYear));
+  // 941 form state (quarterly — defaults to the last finished quarter, the one due next)
+  const [q941Quarter, setQ941Quarter] = useState(String(lastCompletedQuarter().quarter));
+  const [q941Year, setQ941Year]       = useState(String(lastCompletedQuarter().year));
   const [q941Schedule, setQ941Schedule] = useState<'monthly' | 'semiweekly'>('monthly');
   const [q941Deposits, setQ941Deposits] = useState('');
   const [f940Deposits, setF940Deposits] = useState('');
