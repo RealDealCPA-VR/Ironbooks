@@ -401,7 +401,7 @@ export const GRID_KEY_HELP: { keys: string; description: string }[] = [
 /** Display-only rows for the help modal: lists, centers, registers and reports (useListKeys). */
 export const LIST_KEY_HELP: { keys: string; description: string }[] = [
   { keys: 'Up / Down', description: 'Move the highlight' },
-  { keys: 'Home / End', description: 'First / last row' },
+  { keys: 'Home / End, Ctrl+PgUp / Ctrl+PgDn', description: 'First / last row' },
   { keys: 'PgUp / PgDn', description: 'A page up / down' },
   { keys: 'Type a name', description: 'Jump to the first row that starts with it' },
   { keys: 'Enter', description: 'Open the highlighted row (QuickZoom on reports)' },
@@ -950,9 +950,13 @@ const LIST_KEYS: Readonly<Record<string, ListKeyAction>> = {
   Enter: 'open',
 };
 
-/** Up / Down / Home / End / PgUp / PgDn move the highlight, Enter opens the row (no modifiers). */
+/**
+ * Up / Down / Home / End / PgUp / PgDn move the highlight, Enter opens the row (no modifiers);
+ * Ctrl+PgUp / Ctrl+PgDn go to the first / last row, as in QB's lists and registers.
+ */
 export function listKeyAction(e: KeyLike): ListKeyAction | null {
-  if (ctrlOrCmd(e) || e.altKey || e.shiftKey) return null;
+  if (e.altKey || e.shiftKey) return null;
+  if (ctrlOrCmd(e)) return e.key === 'PageUp' ? 'home' : e.key === 'PageDown' ? 'end' : null;
   return LIST_KEYS[e.key] ?? null;
 }
 

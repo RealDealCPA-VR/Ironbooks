@@ -6,15 +6,20 @@
  *    zero) say 617283.95 and -2.56. It now evaluates in exact decimals.
  *  - Choosing a page from the desktop menu bar or the command bar discarded an open form without
  *    the "Leave this form?" question the QuickBooks keys ask (navigateGuarded).
+ *  - Ctrl+PgUp / Ctrl+PgDn (first / last entry of a QB list or register) did nothing.
  */
 import { describe, expect, it } from 'vitest';
 import {
+  LIST_KEY_HELP,
   NAVIGATE_REQUEST_EVENT,
+  type KeyLike,
   evaluateAmountDecimal,
   evaluateAmountExpression,
   formatAmountResult,
+  listKeyAction,
   mightLoseWork,
   navigateGuarded,
+  nextListIndex,
 } from './shortcuts';
 import { Money } from './money';
 
@@ -114,5 +119,36 @@ describe('navigateGuarded (desktop menus, command bar)', () => {
     const pushed: string[] = [];
     expect(navigateGuarded('/backup', (h) => pushed.push(h), new EventTarget())).toBe(false);
     expect(pushed).toEqual(['/backup']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// QB list keys: Ctrl+PgUp / Ctrl+PgDn
+// ---------------------------------------------------------------------------
+//
+// QuickBooks' lists and registers go to the first / last entry with Ctrl+Page Up / Ctrl+Page Down
+// (Intuit's keyboard-shortcut list); the app only knew Home / End, and the Ctrl combinations did
+// nothing.
+
+describe('Ctrl+PgUp / Ctrl+PgDn in a list', () => {
+  const key = (k: string, mods: Partial<KeyLike> = {}): KeyLike => ({ key: k, ctrlKey: false, metaKey: false, altKey: false, shiftKey: false, ...mods });
+
+  it('go to the first / last row', () => {
+    expect(listKeyAction(key('PageUp', { ctrlKey: true }))).toBe('home');
+    expect(listKeyAction(key('PageDown', { ctrlKey: true }))).toBe('end');
+    expect(listKeyAction(key('PageDown', { metaKey: true }))).toBe('end');
+    expect(nextListIndex('end', 2, 40, 10)).toBe(39);
+  });
+
+  it('plain PgUp / PgDn still move a page; other Ctrl keys are left alone', () => {
+    expect(listKeyAction(key('PageDown'))).toBe('page-down');
+    expect(listKeyAction(key('PageUp'))).toBe('page-up');
+    expect(listKeyAction(key('Enter', { ctrlKey: true }))).toBeNull(); // Save & New
+    expect(listKeyAction(key('ArrowDown', { ctrlKey: true }))).toBeNull();
+    expect(listKeyAction(key('PageDown', { ctrlKey: true, shiftKey: true }))).toBeNull();
+  });
+
+  it('the shortcuts help lists them', () => {
+    expect(LIST_KEY_HELP.map((r) => r.keys).join(' | ')).toContain('Ctrl+PgUp / Ctrl+PgDn');
   });
 });
