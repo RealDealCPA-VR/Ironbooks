@@ -41,16 +41,15 @@ export async function GET(req: NextRequest) {
   try {
     const ctx = await getServerContext();
     const asOfParam = req.nextUrl.searchParams.get('asOf');
-    if (asOfParam && !/^\d{4}-\d{2}-\d{2}$/.test(asOfParam)) {
+    // A real calendar day ("2026-02-30" passed the pattern and became March 2).
+    const asOf = asOfParam && /^\d{4}-\d{2}-\d{2}$/.test(asOfParam) ? parseDateInput(asOfParam) : null;
+    if (asOfParam && !asOf) {
       return NextResponse.json(
-        { error: 'asOf must be YYYY-MM-DD', code: 'VALIDATION' },
+        { error: 'asOf must be a real calendar day (YYYY-MM-DD)', code: 'VALIDATION' },
         { status: 400 },
       );
     }
-    const balances = await payrollLiabilityBalances(
-      ctx,
-      asOfParam ? { asOf: new Date(asOfParam) } : undefined,
-    );
+    const balances = await payrollLiabilityBalances(ctx, asOf ? { asOf } : undefined);
     return NextResponse.json(balances);
   } catch (err) {
     return serviceError(err);

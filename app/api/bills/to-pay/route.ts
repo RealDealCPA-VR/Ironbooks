@@ -7,22 +7,19 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { listBillsToPay } from '@/lib/services/bills';
 import { routeError } from '@/lib/routeErrors';
-
-function dateParam(v: string | null): Date | undefined {
-  if (!v) return undefined;
-  const d = new Date(v);
-  return Number.isNaN(d.getTime()) ? undefined : d;
-}
+import { queryDate } from '@/lib/validation/helpers';
 
 export async function GET(req: NextRequest) {
   try {
     const ctx = await getServerContext();
     const q = req.nextUrl.searchParams;
+    // Real calendar days only: `new Date('2026-02-30')` rolled over to March 2 (bills due by then
+    // were listed, and the discount was offered as of a day the user never picked).
     const rows = await listBillsToPay(ctx, {
       vendorId: q.get('vendorId') ?? undefined,
-      dueOnOrBefore: dateParam(q.get('dueOnOrBefore')),
+      dueOnOrBefore: queryDate(q, 'dueOnOrBefore'),
       discountAvailableOnly: q.get('discountOnly') === 'true',
-      asOf: dateParam(q.get('asOf')),
+      asOf: queryDate(q, 'asOf'),
     });
     return NextResponse.json({ bills: rows });
   } catch (err) {

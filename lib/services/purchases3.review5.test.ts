@@ -38,6 +38,8 @@ let ctx: ServiceContext;
 vi.mock('@/lib/context', () => ({ getServerContext: vi.fn(async () => ctx) }));
 import { GET as billPaymentsGET } from '@/app/api/bill-payments/route';
 import { GET as expensesGET } from '@/app/api/expenses/route';
+import { GET as salesTaxLiabilityGET } from '@/app/api/pay-liabilities/sales-tax/route';
+import { GET as liabilitiesByItemGET } from '@/app/api/pay-liabilities/by-item/route';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-review5-purchases3');
 let db: DB;
@@ -475,6 +477,19 @@ describe('review5 purchases (third pass)', { timeout: 180_000 }, () => {
     // Before: a $20.00 bill for the 10 units that are no longer on the receipt.
     expect((bill as { total: string }).total).toBe('16.00');
     expect(await glBalance(accrual)).toBe(accrualBefore); // the accrual nets to zero
+  });
+
+  it('O: Pay Liabilities date filters refuse a day that does not exist instead of rolling it over', async () => {
+    const withUrl = (url: string) =>
+      Object.assign(new Request(`http://localhost${url}`), { nextUrl: new URL(`http://localhost${url}`) }) as never;
+    // Before: 200 with the liability through March 2.
+    expect((await salesTaxLiabilityGET(withUrl('/api/pay-liabilities/sales-tax?to=2026-02-30'))).status).toBe(400);
+    expect((await salesTaxLiabilityGET(withUrl('/api/pay-liabilities/sales-tax?from=2026-01-01&to=2026-02-28'))).status).toBe(200);
+    expect((await liabilitiesByItemGET(withUrl('/api/pay-liabilities/by-item?asOf=2026-02-30'))).status).toBe(400);
+    expect((await liabilitiesByItemGET(withUrl('/api/pay-liabilities/by-item?asOf=2026-02-28'))).status).toBe(200);
+    const { GET: billsToPayGET } = await import('@/app/api/bills/to-pay/route');
+    expect((await billsToPayGET(withUrl('/api/bills/to-pay?asOf=2026-02-30'))).status).toBe(400);
+    expect((await billsToPayGET(withUrl('/api/bills/to-pay?asOf=2026-02-28&dueOnOrBefore='))).status).toBe(200);
   });
 
   it('I: making a vendor inactive does not hand a restricted user the full tax ID', async () => {

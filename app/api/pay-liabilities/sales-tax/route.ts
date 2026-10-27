@@ -17,6 +17,7 @@ import { getServerContext } from '@/lib/context';
 import { salesTaxLiabilityByAgency } from '@/lib/services/liabilityPayments';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus } from '@/lib/routeErrors';
+import { queryDate } from '@/lib/validation/helpers';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -34,22 +35,12 @@ export async function GET(req: NextRequest) {
 
     const range: { from?: Date; to?: Date; basis?: 'accrual' | 'cash' } = {};
     if (searchParams.get('basis') === 'cash') range.basis = 'cash';
-    const fromStr = searchParams.get('from');
-    const toStr = searchParams.get('to');
-    if (fromStr) {
-      const d = new Date(fromStr);
-      if (isNaN(d.getTime())) {
-        return NextResponse.json({ error: 'Invalid `from` date', code: 'VALIDATION' }, { status: 400 });
-      }
-      range.from = d;
-    }
-    if (toStr) {
-      const d = new Date(toStr);
-      if (isNaN(d.getTime())) {
-        return NextResponse.json({ error: 'Invalid `to` date', code: 'VALIDATION' }, { status: 400 });
-      }
-      range.to = d;
-    }
+    // A real calendar day: `new Date('2026-02-30')` silently became March 2, so the liability was
+    // shown for a range the user never asked for. queryDate refuses it with a 400.
+    const from = queryDate(searchParams, 'from');
+    const to = queryDate(searchParams, 'to');
+    if (from) range.from = from;
+    if (to) range.to = to;
 
     return NextResponse.json(await salesTaxLiabilityByAgency(ctx, range));
   } catch (err) {
