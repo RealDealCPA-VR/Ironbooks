@@ -16,8 +16,10 @@
  */
 import { transactionDateWarning, type CompanyPreferences, type MyPreferences } from '@/lib/preferences';
 
-/** Transaction APIs (collection = create, /<id> = edit). */
+/** Transaction APIs (collection = create, /<id> = edit). More specific paths come first. */
 export const TRANSACTION_APIS = [
+  // Customer register statement charges (before /api/invoices, which would take them for an edit).
+  '/api/invoices/statement-charges',
   '/api/invoices',
   '/api/bills',
   '/api/expenses',
@@ -37,7 +39,18 @@ export const TRANSACTION_APIS = [
   // Paychecks: pay runs first (more specific), then single paychecks.
   '/api/payroll/pay-runs',
   '/api/payroll',
+  // Accountant tools that enter a transaction (a Working Trial Balance adjusting entry; PUT there
+  // saves a workpaper note, which is not one) and Sales Tax Adjustments.
+  '/api/accountant/working-trial-balance',
+  '/api/accountant/sales-tax/adjustments',
 ] as const;
+
+/**
+ * APIs where a POST to `<base>/<id>` ENTERS a new transaction into that record: typing into an
+ * account register's blank row (POST /api/registers/<accountId>) saves a new check, deposit,
+ * transfer or journal entry. Edits of those transactions go through their own forms' APIs.
+ */
+export const ENTER_INTO_RECORD_APIS = ['/api/registers'] as const;
 
 /**
  * Forms that already ask about past/future dates themselves (lib/formPrefs.ts
@@ -54,6 +67,11 @@ export const FORMS_WITH_OWN_DATE_WARNING = new Set<string>([
 /** Split a transaction API path into its collection and whether it targets one record. */
 export function transactionTarget(path: string): { base: string; record: boolean } | null {
   const clean = path.replace(/\/+$/, '');
+  for (const base of ENTER_INTO_RECORD_APIS) {
+    const rest = clean.startsWith(base + '/') ? clean.slice(base.length + 1) : null;
+    // A new transaction entered into the record (a create, not an edit of the record).
+    if (rest && !rest.includes('/')) return { base, record: false };
+  }
   for (const base of TRANSACTION_APIS) {
     if (clean === base) return { base, record: false };
     const rest = clean.startsWith(base + '/') ? clean.slice(base.length + 1) : null;
