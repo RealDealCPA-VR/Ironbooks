@@ -547,6 +547,49 @@ describe('review5 purchases (third pass)', { timeout: 180_000 }, () => {
     expect(same.status).toBe(200);
   });
 
+  it("R: item receipts never post their accrual to the user's own account numbered 2050", async () => {
+    // A separate company: a chart converted from QuickBooks that already uses 2050.
+    const [u] = await db.insert(users).values({ email: `r5c-2050-${++seq}@test.local`, name: 'R5C', passwordHash: 'x' }).returning();
+    const company = await createCompany(db, { name: `R5C 2050 Co ${seq}`, ownerId: u.id });
+    const c2: ServiceContext = { db, companyId: company.id, userId: u.id };
+    const a2: Record<string, string> = {};
+    for (const r of await db.select().from(accounts).where(eq(accounts.companyId, company.id))) if (r.code) a2[r.code] = r.id;
+    const loan = await createAccount(c2, { code: '2050', name: 'Equipment Loan', type: 'liability' as never, subtype: 'long_term_liability' });
+    const [v] = await db.insert(vendors).values({ companyId: company.id, displayName: 'R5C Supplier' }).returning();
+    const item = await createItem(c2, {
+      name: 'R5C Gadget',
+      type: 'inventory',
+      assetAccountId: a2['1300'],
+      incomeAccountId: a2['4000'] ?? a2['4100'],
+      cogsAccountId: a2['5000'],
+    } as never);
+    const { createItemReceipt, convertToBill: convertReceipt, getOrCreateAccrualAccount } = await import('./itemReceipts');
+    const receipt = await createItemReceipt(c2, { vendorId: v.id, date: d('2026-08-01'), lines: [{ itemId: item.id, quantity: 5, unitCost: '4.00' }] });
+    const loanLines = () =>
+      db
+        .select({ id: journalEntryLines.id })
+        .from(journalEntryLines)
+        .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+        .where(and(eq(journalEntries.companyId, company.id), eq(journalEntryLines.accountId, loan.id)));
+    // Before: Cr 2050 Equipment Loan 20.00 — the receipt "paid down" the user's loan account.
+    expect(await loanLines()).toHaveLength(0);
+    const accrual = await getOrCreateAccrualAccount(c2);
+    expect(accrual).not.toBe(loan.id);
+    const [acc] = await db.select().from(accounts).where(eq(accounts.id, accrual));
+    expect(acc.name).toBe('Item Receipts Accrual');
+    expect(acc.code).toBe('2051');
+    await convertReceipt(c2, receipt.id);
+    expect(await loanLines()).toHaveLength(0);
+    // The same accrual account is found again (no second one), and it nets to zero once billed.
+    expect(await getOrCreateAccrualAccount(c2)).toBe(accrual);
+    const rows = await db
+      .select({ d: journalEntryLines.debit, c: journalEntryLines.credit })
+      .from(journalEntryLines)
+      .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+      .where(and(eq(journalEntries.status, 'posted'), eq(journalEntryLines.accountId, accrual)));
+    expect(rows.reduce((s, r) => s + Number(r.d ?? 0) - Number(r.c ?? 0), 0)).toBe(0);
+  });
+
   it('I: making a vendor inactive does not hand a restricted user the full tax ID', async () => {
     const { BUILTIN_ROLES, unionRoles } = await import('@/lib/permissions/model');
     const restricted: ServiceContext = { ...ctx, access: unionRoles(BUILTIN_ROLES.filter((r) => r.key === 'purchasing')) };

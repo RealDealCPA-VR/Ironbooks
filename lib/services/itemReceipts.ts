@@ -33,7 +33,7 @@
  *   claimed PO quantities (PO can return to 'open').
  */
 import { assertAccountantMayConvert } from './accountantCopy/guard';
-import { and, asc, desc, eq, inArray } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, or, sql } from 'drizzle-orm';
 import {
   accounts,
   inventoryLayers,
@@ -131,24 +131,57 @@ async function accountIdByCode(ctx: ServiceContext, code: string): Promise<strin
   return row.id;
 }
 
-/** Find-or-create the 2050 Item Receipts Accrual liability account. */
-export async function getOrCreateAccrualAccount(ctx: ServiceContext): Promise<string> {
-  const [row] = await ctx.db
-    .select({ id: accounts.id })
+const ITEM_RECEIPT_ACCRUAL_DESCRIPTION = 'Received-not-billed clearing account for item receipts (QB Receive Items).';
+
+/**
+ * The Item Receipts Accrual account if it exists (null otherwise; nothing is created). It used to be
+ * "whatever account has code 2050": on a chart converted from QuickBooks that is often the user's
+ * own liability ("2050 Accrued Vacation", a second A/P account), and every item receipt then
+ * credited — and every bill for received items debited — that account. The accrual is the account
+ * this app created: code 2050 with its name or description (a rename keeps the description), or
+ * the account named "Item Receipts Accrual" (created under another code because 2050 was taken).
+ */
+export async function findAccrualAccount(ctx: ServiceContext): Promise<string | null> {
+  const rows = await ctx.db
+    .select({ id: accounts.id, code: accounts.code, name: accounts.name, description: accounts.description, type: accounts.type })
     .from(accounts)
     .where(
-      and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, ITEM_RECEIPT_ACCRUAL_CODE)),
+      and(
+        eq(accounts.companyId, ctx.companyId),
+        or(
+          eq(accounts.code, ITEM_RECEIPT_ACCRUAL_CODE),
+          sql`lower(${accounts.name}) = lower(${ITEM_RECEIPT_ACCRUAL_NAME})`,
+        ),
+      ),
     );
-  if (row) return row.id;
+  const ours = (r: (typeof rows)[number]) =>
+    r.type === 'liability' &&
+    (r.name.trim().toLowerCase() === ITEM_RECEIPT_ACCRUAL_NAME.toLowerCase() || r.description === ITEM_RECEIPT_ACCRUAL_DESCRIPTION);
+  const byCode = rows.find((r) => r.code === ITEM_RECEIPT_ACCRUAL_CODE && ours(r));
+  return (byCode ?? rows.find(ours))?.id ?? null;
+}
+
+/** Find-or-create the Item Receipts Accrual liability account (code 2050 unless that is taken). */
+export async function getOrCreateAccrualAccount(ctx: ServiceContext): Promise<string> {
+  const found = await findAccrualAccount(ctx);
+  if (found) return found;
+  // 2050 belongs to another account of the user's chart: the accrual takes the next free code.
+  const used = new Set(
+    (await ctx.db.select({ code: accounts.code }).from(accounts).where(eq(accounts.companyId, ctx.companyId))).map((a) => a.code),
+  );
+  let n = Number(ITEM_RECEIPT_ACCRUAL_CODE);
+  while (used.has(String(n)) && n < 2099) n++;
+  let code = String(n);
+  for (let k = 1; used.has(code); k++) code = `${ITEM_RECEIPT_ACCRUAL_CODE}-${k}`;
   const [created] = await ctx.db
     .insert(accounts)
     .values({
       companyId: ctx.companyId,
-      code: ITEM_RECEIPT_ACCRUAL_CODE,
+      code,
       name: ITEM_RECEIPT_ACCRUAL_NAME,
       type: 'liability',
       subtype: 'other_current_liability',
-      description: 'Received-not-billed clearing account for item receipts (QB Receive Items).',
+      description: ITEM_RECEIPT_ACCRUAL_DESCRIPTION,
     })
     .returning();
   return created.id;

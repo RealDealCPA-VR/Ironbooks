@@ -47,7 +47,7 @@ import { Money, toAmountString } from '@/lib/money';
 import { postJournalEntry } from './posting';
 import { fifoLayerValue, valueRemainderAfter } from './inventory';
 import { dueDateFromTermsList } from './lists/terms';
-import { ITEM_RECEIPT_ACCRUAL_CODE, getOrCreateAccrualAccount } from './itemReceipts';
+import { findAccrualAccount, getOrCreateAccrualAccount } from './itemReceipts';
 import {
   type ReceivingSettings,
   adjustPoReceivedUnbilled,
@@ -370,13 +370,9 @@ export async function getOrCreatePpvAccount(
   return created.id;
 }
 
-/** Look up the 2050 accrual account without creating it (placeholder when missing). */
-async function findAccrualAccount(ctx: ServiceContext): Promise<string> {
-  const [row] = await ctx.db
-    .select({ id: accounts.id })
-    .from(accounts)
-    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, ITEM_RECEIPT_ACCRUAL_CODE)));
-  return row?.id ?? ACCRUAL_PLACEHOLDER;
+/** Look up the Item Receipts Accrual account without creating it (placeholder when missing). */
+async function findAccrualAccountOrPlaceholder(ctx: ServiceContext): Promise<string> {
+  return (await findAccrualAccount(ctx)) ?? ACCRUAL_PLACEHOLDER;
 }
 
 async function isFifoTracked(ctx: ServiceContext, itemId: string): Promise<boolean> {
@@ -637,7 +633,7 @@ async function planReceiptBill(ctx: ServiceContext, input: EnterReceiptBillInput
   }
 
   // Previews are read-only: never create the 2050 account from one (a receipt already did).
-  const accrualAccountId = dryRun ? await findAccrualAccount(ctx) : await getOrCreateAccrualAccount(ctx);
+  const accrualAccountId = dryRun ? await findAccrualAccountOrPlaceholder(ctx) : await getOrCreateAccrualAccount(ctx);
   const [apRow] = await ctx.db
     .select({ id: accounts.id })
     .from(accounts)
