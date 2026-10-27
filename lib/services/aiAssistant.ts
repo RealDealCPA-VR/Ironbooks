@@ -26,6 +26,8 @@ import { assertBalanced } from './posting';
 import { createManualEntry, followMergedNames } from './journal';
 import { buildRouter, type BuildRouterOptions } from './aiSettings';
 import { companyToday } from './preferences';
+import { requirePermission } from './access';
+import type { Area } from '@/lib/permissions/model';
 import { AiError } from '@/lib/ai/types';
 
 // ---------------------------------------------------------------------------
@@ -54,6 +56,11 @@ interface ToolDef {
   description: string;
   args: z.ZodType<Record<string, unknown>, z.ZodTypeDef, unknown>;
   argsHelp: string;
+  /**
+   * The report area whose View right the tool's answer needs — the same right the matching
+   * report screen asks for (default Reports — Financial, the assistant route's own right).
+   */
+  area?: Area;
   run(ctx: ServiceContext, args: Record<string, unknown>): Promise<unknown>;
 }
 
@@ -98,6 +105,7 @@ export const TOOLS: Record<string, ToolDef> = {
   ar_aging: {
     description: 'Accounts receivable aging by customer (who owes us, how overdue).',
     argsHelp: '{"asOf"?: "YYYY-MM-DD"}',
+    area: 'reports_sales',
     args: z.object({ asOf: zDateStr.optional() }),
     async run(ctx, a) {
       const r = await arAging(ctx, parseDate(a.asOf as string, true));
@@ -109,6 +117,7 @@ export const TOOLS: Record<string, ToolDef> = {
   ap_aging: {
     description: 'Accounts payable aging by vendor (what we owe, how overdue).',
     argsHelp: '{"asOf"?: "YYYY-MM-DD"}',
+    area: 'reports_purchases',
     args: z.object({ asOf: zDateStr.optional() }),
     async run(ctx, a) {
       const r = await apAging(ctx, parseDate(a.asOf as string, true));
@@ -242,6 +251,9 @@ async function searchTransactions(ctx: ServiceContext, a: SearchArgs) {
 export async function runTool(ctx: ServiceContext, name: string, rawArgs: unknown): Promise<unknown> {
   const tool = TOOLS[name];
   if (!tool) throw validation(`Unknown tool "${name}".`);
+  // The assistant answers only from reports the member may open themselves (the route guarantees
+  // Reports — Financial; A/R and A/P aging need the customer / vendor report rights).
+  requirePermission(ctx, tool.area ?? 'reports_financial', 'view');
   const parsed = tool.args.safeParse(rawArgs ?? {});
   if (!parsed.success) throw validation(`Invalid arguments for ${name}: ${parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')}`);
   return tool.run(ctx, parsed.data);
@@ -783,6 +795,18 @@ export function periodFromText(text: string, today: Date): { from: string; to: s
 }
 
 async function offlineAnswer(ctx: ServiceContext, q: string, today: Date): Promise<AssistantReply> {
+  try {
+    return await offlineAnswerInner(ctx, q, today);
+  } catch (err) {
+    // A question about a report this member may not open: say so instead of failing the request.
+    if (err instanceof ServiceError && err.code === 'FORBIDDEN') {
+      return { answer: err.message, toolCalls: [], proposals: [], unverifiedNumbers: [], mode: 'offline' };
+    }
+    throw err;
+  }
+}
+
+async function offlineAnswerInner(ctx: ServiceContext, q: string, today: Date): Promise<AssistantReply> {
   const t = q.toLowerCase();
   const toolCalls: ToolCallRecord[] = [];
   const call = async (tool: string, args: Record<string, unknown>) => {
