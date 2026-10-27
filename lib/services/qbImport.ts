@@ -89,6 +89,7 @@ import * as L from './qbIifLists';
 import { assignJobType } from './lists/jobTypes';
 import type { IifControlRow } from './openItemsImport';
 import { importRowError } from './qbImportErrors';
+import { withImportLock } from './importLock';
 
 // ---------------------------------------------------------------------------
 // IIF type+subtype mapping
@@ -1482,7 +1483,9 @@ export async function importIIF(
   opts: ImportIifOptions = {},
 ): Promise<ImportCounts> {
   // A bulk load: fresh planner statistics afterwards (PGlite has no autovacuum; best-effort).
-  return withPlannerStats(ctx.db, 'IIF import', () => importIIFRows(ctx, content, opts));
+  // One import at a time per company: two runs of the same file at once both passed the
+  // "already imported?" checks and posted every transaction / open bill twice (importLock.ts).
+  return withImportLock(ctx, () => withPlannerStats(ctx.db, 'IIF import', () => importIIFRows(ctx, content, opts)));
 }
 
 async function importIIFRows(
@@ -2810,7 +2813,7 @@ async function importCustomerRows(ctx: ServiceContext, rows: Row[], mapping: Csv
 
 /** Parse a CSV string and insert customers using the supplied column mapping. */
 export async function importCustomersCSV(ctx: ServiceContext, content: string, mapping: CsvColumnMapping): Promise<ImportCounts> {
-  return withPlannerStats(ctx.db, 'customer import', () => importCustomerRows(ctx, parseCsvRows(content), mapping));
+  return withImportLock(ctx, () => withPlannerStats(ctx.db, 'customer import', () => importCustomerRows(ctx, parseCsvRows(content), mapping)));
 }
 
 async function importVendorRows(ctx: ServiceContext, rows: Row[], mapping: CsvColumnMapping): Promise<ImportCounts> {
@@ -2865,7 +2868,7 @@ async function importVendorRows(ctx: ServiceContext, rows: Row[], mapping: CsvCo
 
 /** Parse a CSV string and insert vendors using the supplied column mapping. */
 export async function importVendorsCSV(ctx: ServiceContext, content: string, mapping: CsvColumnMapping): Promise<ImportCounts> {
-  return withPlannerStats(ctx.db, 'vendor import', () => importVendorRows(ctx, parseCsvRows(content), mapping));
+  return withImportLock(ctx, () => withPlannerStats(ctx.db, 'vendor import', () => importVendorRows(ctx, parseCsvRows(content), mapping)));
 }
 
 /**
@@ -2928,7 +2931,7 @@ async function importItemRows(ctx: ServiceContext, rows: Row[], mapping: ItemsCs
 
 /** Parse a CSV string and insert items using the supplied column mapping. */
 export async function importItemsCSV(ctx: ServiceContext, content: string, mapping: ItemsCsvMapping): Promise<ImportCounts> {
-  return withPlannerStats(ctx.db, 'item import', () => importItemRows(ctx, parseCsvRows(content), mapping));
+  return withImportLock(ctx, () => withPlannerStats(ctx.db, 'item import', () => importItemRows(ctx, parseCsvRows(content), mapping)));
 }
 
 export interface AccountsCsvMapping {
@@ -3006,7 +3009,7 @@ async function importAccountRows(ctx: ServiceContext, rows: Row[], mapping: Acco
  * silently dropped.
  */
 export async function importAccountsCSV(ctx: ServiceContext, content: string, mapping: AccountsCsvMapping): Promise<ImportCounts> {
-  return withPlannerStats(ctx.db, 'account import', () => importAccountRows(ctx, parseCsvRows(content), mapping));
+  return withImportLock(ctx, () => withPlannerStats(ctx.db, 'account import', () => importAccountRows(ctx, parseCsvRows(content), mapping)));
 }
 
 // ---------------------------------------------------------------------------
@@ -3064,7 +3067,7 @@ export async function importListXlsx(
         throw new ServiceError('VALIDATION', `Unknown list "${kind as string}".`);
     }
   };
-  return withPlannerStats(ctx.db, `${kind} import`, run);
+  return withImportLock(ctx, () => withPlannerStats(ctx.db, `${kind} import`, run));
 }
 
 // ---------------------------------------------------------------------------

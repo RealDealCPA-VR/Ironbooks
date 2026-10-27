@@ -69,6 +69,7 @@ import { type GridRow, loadGrid } from './qbGlFiles';
 import { parseAmount, parseQbDate } from './qbGlParse';
 import type { IIFTransaction, ImportIssue } from './qbImport';
 import { importRowError } from './qbImportErrors';
+import { withImportLock } from './importLock';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -992,7 +993,9 @@ async function runConversion(ctx: ServiceContext, side: LedgerSide, items: OpenI
 export async function importOpenItems(ctx: ServiceContext, input: OpenItemsInput): Promise<OpenItemsResult> {
   const parsed = await loadOpenItems(input);
   if (!parsed.items.length) throw validation('No open balances were found in this file.');
-  const result = await runConversion(ctx, parsed.side, parsed.items, input);
+  // One import at a time per company (importLock.ts): two runs at once both created Opening
+  // Balance Equity / the clearing account, and could both pass the duplicate-tag check.
+  const result = await withImportLock(ctx, () => runConversion(ctx, parsed.side, parsed.items, input));
   for (const w of parsed.warnings) result.issues.push({ entity: parsed.side === 'ar' ? 'invoice' : 'bill', name: 'Report', reason: 'note', message: w });
   // A bulk load: fresh planner statistics (PGlite has no autovacuum; best-effort).
   await refreshPlannerStats(ctx.db, 'open items import');

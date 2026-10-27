@@ -45,6 +45,7 @@ import { createVendor } from './vendors';
 import { controlSideOfAccount, loadQbNameResolver, type QbNameRole } from './qbNameResolver';
 import { loadGrid } from './qbGlFiles';
 import { dataExceptionMessage, isDataException } from './qbImportErrors';
+import { withImportLock } from './importLock';
 import {
   QB_ACCOUNT_TYPES,
   analyzeGl,
@@ -463,9 +464,12 @@ export async function runGlImport(
   input: GlImportInput,
   opts: { dryRun?: boolean } = {},
 ): Promise<GlImportResult> {
-  if (opts.dryRun) return runGlImportUnanalyzed(ctx, input, opts);
+  // One import at a time per company (importLock.ts): a second run of the same report started
+  // while the first was posting read the chart of accounts before the first committed, then
+  // failed on "Account code … already exists" instead of finding everything already imported.
+  if (opts.dryRun) return withImportLock(ctx, () => runGlImportUnanalyzed(ctx, input, opts));
   // A bulk load: fresh planner statistics afterwards (PGlite has no autovacuum; best-effort).
-  return withPlannerStats(ctx.db, 'GL import', () => runGlImportUnanalyzed(ctx, input, opts));
+  return withImportLock(ctx, () => withPlannerStats(ctx.db, 'GL import', () => runGlImportUnanalyzed(ctx, input, opts)));
 }
 
 async function runGlImportUnanalyzed(
