@@ -43,6 +43,11 @@ export const users = pgTable('users', {
   challengeQuestion: text('challenge_question'),
   /** 0062: bcrypt of the normalized challenge answer. */
   challengeAnswerHash: text('challenge_answer_hash'),
+  /**
+   * 0079 prefsperms: one-time two-factor RECOVERY codes (lib/services/recoveryCodes.ts) — SHA-256
+   * hashes only, with when each was used. Null while two-factor sign-in is off.
+   */
+  totpRecoveryCodes: jsonb('totp_recovery_codes').$type<Array<{ hash: string; usedAt: string | null }>>(),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });

@@ -1,4 +1,7 @@
-/** POST /api/auth/2fa/disable — turn off 2FA (requires a valid current code). */
+/**
+ * POST /api/auth/2fa/disable — turn off 2FA (requires a valid current code, or one of the user's
+ * one-time recovery codes). The recovery codes go with it.
+ */
 import { NextRequest, NextResponse } from 'next/server';
 import { eq } from 'drizzle-orm';
 import { users } from '@/lib/db/schema';
@@ -6,6 +9,7 @@ import { getSessionGate } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
 import { verifyTotp } from '@/lib/totp';
 import { logTransaction } from '@/lib/services/transactionLog';
+import { consumeRecoveryCode, looksLikeRecoveryCode } from '@/lib/services/recoveryCodes';
 import { originFromHeaders } from '@/lib/net/requestInfo';
 import { GLOBAL_KEY_WEIGHT, attemptKeys, loginLimiter, tooManyAttempts } from '@/lib/net/rateLimit';
 
@@ -37,7 +41,12 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(body, { status: 429, headers: { 'Retry-After': retryAfter } });
     }
     try {
-      if (!verifyTotp(user.totpSecret, String(token ?? ''), Date.now())) {
+      // prefsperms: a one-time recovery code also works (the authenticator is lost).
+      const typed = String(token ?? '');
+      if (
+        !verifyTotp(user.totpSecret, typed, Date.now()) &&
+        !(looksLikeRecoveryCode(typed) && (await consumeRecoveryCode(db, userId, typed)))
+      ) {
         limiter.recordFailure(keys, Date.now(), weights);
         return NextResponse.json({ error: 'Invalid code', code: 'FORBIDDEN' }, { status: 400 });
       }
@@ -46,7 +55,7 @@ export async function POST(req: NextRequest) {
       gate.release();
     }
   }
-  await db.update(users).set({ totpEnabled: false, totpSecret: null }).where(eq(users.id, userId));
+  await db.update(users).set({ totpEnabled: false, totpSecret: null, totpRecoveryCodes: null }).where(eq(users.id, userId));
   await logTransaction(db, {
     userId,
     action: 'update',

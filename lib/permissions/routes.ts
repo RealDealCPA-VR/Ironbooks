@@ -75,6 +75,7 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/auth/2fa/setup': kind('self', 'POST'),
   '/api/auth/2fa/enable': kind('self', 'POST'),
   '/api/auth/2fa/disable': kind('self', 'POST'),
+  '/api/auth/2fa/recovery-codes': kind('self', 'GET POST'), // prefsperms: own one-time recovery codes
   '/api/auth/change-password': kind('self', 'POST'), // gapsb K: change own password (also when expired)
   '/api/auth/password-policy': kind('public', 'GET'), // gapsb K: the file's password rules for the forms
   '/api/auth/challenge': kind('self', 'GET POST'), // own challenge question for "I forgot my password"

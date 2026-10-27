@@ -69,6 +69,14 @@ export interface CompanyUserDetail extends CompanyUser {
   access: EffectiveAccess;
 }
 
+/** addUser's answer: the user, plus (prefsperms) a plain notice when an existing login was attached. */
+export interface AddedUser extends CompanyUser {
+  attachedExistingLogin?: boolean;
+  /** A password was typed but not used: the attached login keeps its own. */
+  passwordNotUsed?: boolean;
+  notice?: string;
+}
+
 export interface RoleSummary extends RoleDefinition {
   /** Number of members (active or not) holding the role. */
   userCount: number;
@@ -316,7 +324,7 @@ export async function addUser(
     /** gapsb K: the new user must choose their own password at first sign-in. */
     requireChange?: boolean;
   },
-): Promise<CompanyUser> {
+): Promise<AddedUser> {
   requirePermission(ctx, 'users', 'create');
   const login = normLogin(input.login);
   if (!login) throw validation('Login is required.');
@@ -324,7 +332,7 @@ export async function addUser(
   if (!defs.length) throw validation('Assign at least one role.');
   assertCanGrant(ctx, unionRoles(defs), 'add a user');
 
-  const userId = await inTransaction(ctx, async (tx) => {
+  const result = await inTransaction(ctx, async (tx) => {
     const [existing] = await tx.db.select().from(users).where(eq(users.email, login));
     let id: string;
     if (existing) {
@@ -363,9 +371,22 @@ export async function addUser(
         attachedExistingLogin: Boolean(existing),
       },
     });
-    return id;
+    return { id, attached: Boolean(existing) };
   });
-  return (await listUsers({ ...ctx, access: undefined })).find((u) => u.userId === userId)!;
+  const added = (await listUsers({ ...ctx, access: undefined })).find((u) => u.userId === result.id)!;
+  if (!result.attached) return added;
+  // prefsperms (review 5 leftover): the login already signs in to another company of this file,
+  // so it keeps ITS password (changing it from here would let an Admin of this company take over
+  // the other company's account). Say so instead of silently ignoring what was typed.
+  const typed = typeof input.password === 'string' && input.password.length > 0;
+  return {
+    ...added,
+    attachedExistingLogin: true,
+    ...(typed ? { passwordNotUsed: true } : {}),
+    notice: `${added.name} already signs in to another company in this file, so they keep their own password${
+      typed ? ' (the password you typed was not used)' : ''
+    }. They sign in here with the same user name and password.`,
+  };
 }
 
 /** Edit name/login, replace roles, and/or deactivate/reactivate a user. */
@@ -478,6 +499,22 @@ export async function resetUserPassword(
   if (!(await getMembership(ctx, userId))) throw notFound('User');
   await assertCanManageUser(ctx, userId);
   await assertCanChangeSharedLogin(ctx, userId);
+  if (opts.turnOffTwoFactor === true && ctx.access) {
+    // prefsperms (review 5 leftover): this is the way back for SOMEONE ELSE who lost their
+    // authenticator. Your own second factor is only turned off with a code from it (Security
+    // (2FA)) or a recovery code at sign-in — otherwise a stolen session cookie could strip it.
+    if (ctx.userId && ctx.userId === userId) {
+      throw new ServiceError(
+        'FORBIDDEN',
+        'You cannot turn off your own two-factor sign-in here. Use Security (2FA): it asks for a code from your authenticator app. Lost it? Sign in with one of your recovery codes.',
+      );
+    }
+    // A same-access peer could otherwise strip a colleague's 2FA, reset their password and sign
+    // in as them: only an Admin may do it.
+    if (!ctx.access.isAdmin) {
+      throw new ServiceError('FORBIDDEN', "Only an Admin can turn off another user's two-factor sign-in.");
+    }
+  }
   if (typeof password !== 'string') throw validation('A new password is required.');
   // gapsb K: the file's password policy, including "don't reuse the last N passwords".
   await assertPasswordAllowed(ctx.db, password, { userId });
@@ -487,7 +524,7 @@ export async function resetUserPassword(
     if (opts.turnOffTwoFactor === true) {
       const off = await tx.db
         .update(users)
-        .set({ totpEnabled: false, totpSecret: null, updatedAt: new Date() })
+        .set({ totpEnabled: false, totpSecret: null, totpRecoveryCodes: null, updatedAt: new Date() })
         .where(and(eq(users.id, userId), eq(users.totpEnabled, true)))
         .returning({ id: users.id });
       twoFactorTurnedOff = off.length > 0;

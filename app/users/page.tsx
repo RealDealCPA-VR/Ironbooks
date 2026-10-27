@@ -79,10 +79,14 @@ export default function UsersAndRolesPage() {
   const [tab, setTab] = useState<'users' | 'roles' | 'passwords'>('users');
   // gapsb K: the password-rules editor is for Admins only (the server checks too).
   const [isAdmin, setIsAdmin] = useState(false);
+  const [meId, setMeId] = useState<string | null>(null);
   useEffect(() => {
     api
-      .get<{ isAdmin?: boolean } | null>('/api/auth/me')
-      .then((m) => setIsAdmin(Boolean(m?.isAdmin)))
+      .get<{ id?: string; isAdmin?: boolean } | null>('/api/auth/me')
+      .then((m) => {
+        setIsAdmin(Boolean(m?.isAdmin));
+        setMeId(m?.id ?? null);
+      })
       .catch(() => setIsAdmin(false));
   }, []);
   const [users, setUsers] = useState<CompanyUser[] | null>(null);
@@ -145,7 +149,7 @@ export default function UsersAndRolesPage() {
       ) : users === null || !catalog ? (
         error ? null : <PageSkeleton />
       ) : tab === 'users' ? (
-        <UsersTab users={users} roles={roles} catalog={catalog} reload={load} />
+        <UsersTab users={users} roles={roles} catalog={catalog} reload={load} isAdmin={isAdmin} meId={meId} />
       ) : (
         <RolesTab roles={roles} catalog={catalog} reload={load} />
       )}
@@ -162,17 +166,22 @@ function UsersTab({
   roles,
   catalog,
   reload,
+  isAdmin,
+  meId,
 }: {
   users: CompanyUser[];
   roles: Role[];
   catalog: Catalog;
   reload: () => Promise<void>;
+  isAdmin: boolean;
+  meId: string | null;
 }) {
   const [editing, setEditing] = useState<CompanyUser | 'new' | null>(null);
   const [resetting, setResetting] = useState<CompanyUser | null>(null);
   const [toggling, setToggling] = useState<CompanyUser | null>(null);
   const [viewing, setViewing] = useState<UserDetail | null>(null);
   const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
 
   async function toggleActive() {
     if (!toggling) return;
@@ -199,6 +208,14 @@ function UsersTab({
 
   return (
     <Card className="p-0">
+      {notice && (
+        <div role="status" className="m-4 mb-0 flex items-start justify-between gap-3 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-navy">
+          <span>{notice}</span>
+          <button type="button" className="text-xs font-semibold text-electric hover:underline" onClick={() => setNotice(null)}>
+            OK
+          </button>
+        </div>
+      )}
       <div className="flex items-center justify-between p-4">
         <p className="text-sm text-navy/60">
           People who can sign in to this company file. A user can hold several roles — they get
@@ -268,13 +285,22 @@ function UsersTab({
           user={editing === 'new' ? null : editing}
           roles={roles}
           onClose={() => setEditing(null)}
-          onSaved={async () => {
+          onSaved={async (n) => {
             setEditing(null);
+            // prefsperms: an existing login of another company was attached (keeps its password).
+            setNotice(n ?? null);
             await reload();
           }}
         />
       )}
-      {resetting && <ResetPassword user={resetting} onClose={() => setResetting(null)} />}
+      {resetting && (
+        <ResetPassword
+          user={resetting}
+          onClose={() => setResetting(null)}
+          // Only an Admin may turn off SOMEONE ELSE's two-factor sign-in (lib/services/users.ts).
+          canTurnOffTwoFactor={isAdmin && resetting.userId !== meId}
+        />
+      )}
       <ConfirmDialog
         open={!!toggling}
         title={toggling?.isActive ? 'Deactivate user' : 'Reactivate user'}
@@ -349,7 +375,8 @@ function UserEditor({
   user: CompanyUser | null;
   roles: Role[];
   onClose: () => void;
-  onSaved: () => Promise<void>;
+  /** `notice`: a plain message to keep on screen (an existing login was attached). */
+  onSaved: (notice?: string) => Promise<void>;
 }) {
   const [name, setName] = useState(user?.name ?? '');
   const [login, setLogin] = useState(user?.login ?? '');
@@ -367,20 +394,22 @@ function UserEditor({
     }
     setBusy(true);
     try {
+      let notice: string | undefined;
       if (user) {
         await api.patch(`/api/users/${user.userId}`, { name, login, roleKeys });
         toast('User updated.', 'success');
       } else {
-        await api.post('/api/users', {
+        const added = await api.post<{ notice?: string }>('/api/users', {
           name,
           login,
           password: password || undefined,
           roleKeys,
           ...(password ? { requireChange } : {}),
         });
+        notice = added?.notice;
         toast('User added.', 'success');
       }
-      await onSaved();
+      await onSaved(notice);
     } catch (e) {
       toast(errMsg(e), 'danger');
     } finally {
@@ -429,6 +458,10 @@ function UserEditor({
                 aria-describedby="u-pw-rules"
               />
               <PasswordRulesHint id="u-pw-rules" password={password} policy={policy} />
+              <p className="mt-1 text-xs text-navy/50">
+                Someone who already signs in to another company in this file keeps their own password; leave this blank for
+                them.
+              </p>
             </div>
             <div>
               <Label htmlFor="u-pw2">Confirm password</Label>
@@ -455,7 +488,15 @@ function UserEditor({
   );
 }
 
-function ResetPassword({ user, onClose }: { user: CompanyUser; onClose: () => void }) {
+function ResetPassword({
+  user,
+  onClose,
+  canTurnOffTwoFactor,
+}: {
+  user: CompanyUser;
+  onClose: () => void;
+  canTurnOffTwoFactor: boolean;
+}) {
   const [password, setPassword] = useState('');
   const [confirm, setConfirm] = useState('');
   const [requireChange, setRequireChange] = useState(true);
@@ -472,7 +513,7 @@ function ResetPassword({ user, onClose }: { user: CompanyUser; onClose: () => vo
       await api.post(`/api/users/${user.userId}/reset-password`, {
         password,
         requireChange,
-        ...(user.twoFactor && turnOffTwoFactor ? { turnOffTwoFactor: true } : {}),
+        ...(user.twoFactor && canTurnOffTwoFactor && turnOffTwoFactor ? { turnOffTwoFactor: true } : {}),
       });
       toast(`Password reset for ${user.name}.`, 'success');
       onClose();
@@ -520,11 +561,17 @@ function ResetPassword({ user, onClose }: { user: CompanyUser; onClose: () => vo
           <input type="checkbox" checked={requireChange} onChange={(e) => setRequireChange(e.target.checked)} />
           Ask {user.name} to choose a new password at their next sign-in
         </label>
-        {user.twoFactor && (
+        {user.twoFactor && canTurnOffTwoFactor && (
           <label className="flex items-center gap-2 text-sm text-navy">
             <input type="checkbox" checked={turnOffTwoFactor} onChange={(e) => setTurnOffTwoFactor(e.target.checked)} />
             Also turn off two-factor sign-in (they lost their phone or authenticator app)
           </label>
+        )}
+        {user.twoFactor && !canTurnOffTwoFactor && (
+          <p className="text-xs text-navy/60">
+            {user.name} keeps two-factor sign-in. Only an Admin can turn off another person&apos;s; your own is turned off
+            under Security (2FA) with a code from your authenticator app, or by signing in with a recovery code.
+          </p>
         )}
       </div>
     </Modal>

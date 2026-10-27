@@ -15,6 +15,7 @@ import { Button, Card, Input, Label, toast } from '@/components/ui';
 import { AccessKeyText } from '@/components/AccessKey';
 import { api } from '@/lib/client';
 import { safeNext } from '@/lib/safeNext';
+import { afterFailedSignIn } from '@/lib/loginForm';
 
 interface FileInfo {
   companyName: string | null;
@@ -52,6 +53,7 @@ export default function LoginPage() {
   const [error, setError] = useState('');
   const userRef = useRef<HTMLInputElement>(null);
   const passRef = useRef<HTMLInputElement>(null);
+  const codeRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     let alive = true;
@@ -103,6 +105,8 @@ export default function LoginPage() {
         mustChangePassword?: boolean;
         passwordChangeReason?: string;
         challengeMissing?: boolean;
+        recoveryCodeUsed?: boolean;
+        recoveryCodesLeft?: number;
       }>('/api/auth/login', {
         email: userName,
         password,
@@ -132,6 +136,12 @@ export default function LoginPage() {
           '/change-password?next=' + encodeURIComponent(next) + '&reason=' + encodeURIComponent(res.passwordChangeReason ?? 'required');
         return;
       }
+      // A one-time recovery code got them in: set up the new authenticator and new codes first.
+      if (res?.recoveryCodeUsed) {
+        window.location.href =
+          '/security?recovered=' + encodeURIComponent(String(res.recoveryCodesLeft ?? 0)) + '&next=' + encodeURIComponent(next);
+        return;
+      }
       // No challenge question yet: offer to set one (once per computer and file), then continue.
       if (res?.challengeMissing && info?.fileId) {
         let asked = false;
@@ -149,10 +159,14 @@ export default function LoginPage() {
       window.location.href = next;
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Sign-in failed';
-      setError(/invalid email or password/i.test(msg) ? 'The user name or password is not correct. Passwords are case-sensitive.' : msg);
-      setPassword('');
+      // A wrong authenticator code keeps the (right) password (lib/loginForm.ts).
+      const next = afterFailedSignIn(msg, needs2fa);
+      setError(next.error);
+      if (next.clearPassword) setPassword('');
+      if (next.clearCode) setTotp('');
+      setNeeds2fa(next.keepCodeStep);
       setBusy(false);
-      setTimeout(() => passRef.current?.focus(), 0);
+      setTimeout(() => (next.focus === 'code' ? codeRef.current : passRef.current)?.focus(), 0);
     }
   }
 
@@ -220,13 +234,19 @@ export default function LoginPage() {
               <Label htmlFor="login-totp">Authentication code</Label>
               <Input
                 id="login-totp"
+                ref={codeRef}
                 value={totp}
                 onChange={(e) => setTotp(e.target.value)}
                 placeholder="6-digit code"
-                inputMode="numeric"
+                autoComplete="one-time-code"
+                spellCheck={false}
+                aria-describedby="login-totp-hint"
                 autoFocus
                 required
               />
+              <p id="login-totp-hint" className="mt-1 text-xs text-navy/50">
+                Lost your phone? Type one of your recovery codes (like ABCDE-12345) instead.
+              </p>
             </div>
           )}
           {error && (

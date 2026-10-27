@@ -1,4 +1,7 @@
-/** POST /api/auth/2fa/enable — verify a code against the pending secret and turn 2FA on. */
+/**
+ * POST /api/auth/2fa/enable — verify a code against the pending secret and turn 2FA on. The answer
+ * carries the user's ten one-time recovery codes (the only time they can be read).
+ */
 import { NextRequest, NextResponse } from 'next/server';
 import { eq } from 'drizzle-orm';
 import { users } from '@/lib/db/schema';
@@ -6,6 +9,7 @@ import { getSessionGate } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
 import { verifyTotp } from '@/lib/totp';
 import { logTransaction } from '@/lib/services/transactionLog';
+import { issueRecoveryCodes } from '@/lib/services/recoveryCodes';
 
 export async function POST(req: NextRequest) {
   // File lock, file-bound session and deactivation checks (lib/context.ts getSessionGate).
@@ -29,6 +33,8 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Invalid code', code: 'FORBIDDEN' }, { status: 400 });
   }
   await db.update(users).set({ totpEnabled: true }).where(eq(users.id, userId));
+  // prefsperms: ten one-time recovery codes, shown this once (lib/services/recoveryCodes.ts).
+  const recoveryCodes = await issueRecoveryCodes(db, userId);
   await logTransaction(db, {
     userId,
     action: 'update',
@@ -37,5 +43,5 @@ export async function POST(req: NextRequest) {
     summary: `Turned on two-factor sign-in for user "${user.name}"`,
     data: { old: { totpEnabled: false }, new: { totpEnabled: true } },
   });
-  return NextResponse.json({ ok: true, enabled: true });
+  return NextResponse.json({ ok: true, enabled: true, recoveryCodes });
 }
