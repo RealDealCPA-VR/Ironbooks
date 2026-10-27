@@ -100,8 +100,9 @@ describe('P1 report page wiring', () => {
     for (const k of ['ar-aging-summary', 'ar-aging-detail', 'ap-aging-summary', 'ap-aging-detail']) expect(CATALOG_BY_KEY[k].controls, k).toContain('aging');
   });
 
-  it('the legacy Sales Tax page links to the std Sales Tax Liability with its dates and basis', () => {
+  it('the legacy Sales Tax page opens the std Sales Tax Liability / Revenue Summary with its dates and basis', () => {
     const src = read(REPORTS, 'sales-tax', 'page.tsx');
     expect(src).toContain('/reports/std/sales-tax-liability?from=${fromStr}&to=${toStr}&basis=${basis}');
+    expect(src).toContain('/reports/std/sales-tax-revenue-summary?from=${fromStr}&to=${toStr}&basis=${basis}');
   });
 });

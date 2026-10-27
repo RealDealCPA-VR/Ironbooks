@@ -26,18 +26,33 @@ export async function salesTaxLiabilityStd(ctx: ServiceContext, p: ReportParams)
     if (a.unattributed && !Money.of(a.unattributed).isZero()) c.adjustments = toAmountString(Money.of(a.adjustments).plus(Money.of(a.unattributed)));
     return c;
   };
-  const rows: StdRow[] = r.agencies
+  const rows: StdRow[] = [];
+  for (const a of r.agencies
     .filter((a) => keys.some((k) => !Money.of(a[k]).isZero()) || !Money.of(a.unattributed).isZero())
-    .sort((a, b) => (a.agencyName ?? '~').localeCompare(b.agencyName ?? '~'))
-    .map((a) => ({
-      id: `stl:${a.agencyId ?? 'none'}`,
+    .sort((a, b) => (a.agencyName ?? '~').localeCompare(b.agencyName ?? '~'))) {
+    const id = `stl:${a.agencyId ?? 'none'}`;
+    const comps = (a.components ?? []).filter((c) => !Money.of(c.collected).isZero() || !Money.of(c.credited).isZero());
+    rows.push({
+      id,
       depth: 0,
       kind: 'data' as const,
       cells: cells(a.agencyName ?? 'Not linked to an agency', a),
       href: a.liabilityAccountId
         ? stdHref('transaction-detail-by-account', { accountId: a.liabilityAccountId, from: dayStr(from), to: dayStr(to) })
         : stdHref('transaction-detail-by-account', { section: 'other_current_liability', from: dayStr(from), to: dayStr(to) }),
-    }));
+      ...(comps.length ? { collapsedCells: cells(a.agencyName ?? 'Not linked to an agency', a), collapseKind: 'group' as const } : {}),
+    });
+    // The agency's tax components (combined rates split over their agencies), as in QB.
+    for (const c of comps) {
+      rows.push({
+        id: `${id}:c:${c.taxRateId ?? 'none'}:${c.componentName}`,
+        parentId: id,
+        depth: 1,
+        kind: 'data' as const,
+        cells: { label: c.componentName, collected: toAmountString(Money.of(c.collected)), credited: toAmountString(Money.of(c.credited)) },
+      });
+    }
+  }
   rows.push({ id: 'stl:grand', depth: 0, kind: 'grand', cells: cells('TOTAL', r.totals) });
   return {
     key: 'sales-tax-liability',
@@ -54,6 +69,10 @@ export async function salesTaxLiabilityStd(ctx: ServiceContext, p: ReportParams)
     ],
     rows,
     balanced: basis === 'accrual' ? r.tiesToGl : undefined,
-    notes: ['Collected tax counts on the sale date on an accrual basis, and when the customer pays on a cash basis.'],
+    notes: [
+      'Collected tax counts on the sale date on an accrual basis, and when the customer pays on a cash basis.',
+      ...(basis === 'accrual' ? [`Sales Tax Payable is the balance of your sales tax liability accounts (${toAmountString(Money.of(r.glBalance))} on ${dayStr(to)}).`] : []),
+      ...(!Money.of(r.totals.unattributed ?? '0').isZero() ? ['Some sales tax was recorded outside the sales tax screens. Use Fix Incorrectly Recorded Sales Tax to assign it to an agency.'] : []),
+    ],
   };
 }

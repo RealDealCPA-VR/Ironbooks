@@ -1904,6 +1904,8 @@ export interface CheckDetailRow {
   homeAmount?: string;
   voided: boolean;
   lines: CheckDetailLine[];
+  /** The posted journal entry (QuickZoom opens its source form). */
+  entryId?: string | null;
 }
 
 export interface CheckDetailReport {
@@ -1939,6 +1941,7 @@ export async function checkDetail(
       total: expenses.total,
       rate: expenses.exchangeRate,
       voidedAt: expenses.voidedAt,
+      entryId: expenses.postedEntryId,
     })
     .from(expenses)
     .innerJoin(accounts, eq(expenses.paymentAccountId, accounts.id))
@@ -1988,6 +1991,7 @@ export async function checkDetail(
       amount: billPayments.amount,
       rate: billPayments.exchangeRate,
       voidedAt: billPayments.voidedAt,
+      entryId: billPayments.postedEntryId,
     })
     .from(billPayments)
     .innerJoin(accounts, eq(billPayments.paymentAccountId, accounts.id))
@@ -2029,6 +2033,7 @@ export async function checkDetail(
       homeAmount: toAmountString(homeValue(r.total, r.rate)),
       voided: r.voidedAt !== null,
       lines: expLinesById.get(r.id) ?? [],
+      entryId: r.entryId,
     })),
     ...bpRows.map((r): CheckDetailRow => ({
       source: 'bill_payment',
@@ -2042,6 +2047,7 @@ export async function checkDetail(
       homeAmount: toAmountString(homeValue(r.amount, r.rate)),
       voided: r.voidedAt !== null,
       lines: bpLinesById.get(r.id) ?? [],
+      entryId: r.entryId,
     })),
     ...(await paymentCheckDetailRows(ctx, range)),
     ...(await paycheckDetailRows(ctx, range)),
@@ -2057,6 +2063,7 @@ export async function checkDetail(
       homeAmount: toAmountString(f.homeAmount),
       voided: f.voided,
       lines: f.lines.map((l) => ({ description: l.memo, detail: l.accountName, amount: toAmountString(l.amount) })),
+      entryId: f.entryId,
     })),
   ];
   rows.sort(
@@ -2151,6 +2158,7 @@ async function paycheckDetailRows(ctx: ServiceContext, range?: { from?: Date; to
     bankAccountName: p.bankAccountName,
     amount: toAmountString(p.netPay),
     voided: p.voidedAt !== null,
+    entryId: p.entryId,
     // Every line but the bank side; together they add up to the net pay.
     lines: (linesByEntry.get(p.entryId ?? '') ?? [])
       .filter((l) => l.accountId !== p.bankAccountId)
@@ -2188,6 +2196,7 @@ async function paymentCheckDetailRows(
     amount: toAmountString(r.c.amount),
     voided: r.c.voidedAt !== null || r.entryStatus === 'void',
     lines: [{ description: r.c.memo, detail: label[r.c.kind] ?? 'Check', amount: toAmountString(r.c.amount) }],
+    entryId: r.c.postedEntryId,
   }));
 }
 
@@ -2213,8 +2222,12 @@ export interface DepositDetailRow {
   accountName: string;
   memo: string | null;
   total: string;
+  /** Home-currency total (a deposit to a foreign bank account is in its own currency). */
+  homeTotal?: string;
   voided: boolean;
   lines: DepositDetailLine[];
+  /** The posted journal entry (QuickZoom opens its source form). */
+  entryId?: string | null;
 }
 
 export interface DepositDetailReport {
@@ -2248,6 +2261,7 @@ export async function depositDetail(
       homeTotal: deposits.homeTotal,
       rate: deposits.exchangeRate,
       voidedAt: deposits.voidedAt,
+      entryId: deposits.postedEntryId,
     })
     .from(deposits)
     .innerJoin(accounts, eq(deposits.depositAccountId, accounts.id))
@@ -2324,7 +2338,8 @@ export async function depositDetail(
   const rows: DepositDetailRow[] = depRows.map((r) => {
     const voided = r.voidedAt !== null;
     // Home currency: a deposit to a foreign bank account counts at the home value it posted.
-    if (!voided) total = total.plus(r.homeTotal != null ? Money.of(r.homeTotal) : homeValue(r.total, r.rate));
+    const home = r.homeTotal != null ? Money.of(r.homeTotal) : homeValue(r.total, r.rate);
+    if (!voided) total = total.plus(home);
     return {
       source: 'deposit' as const,
       id: r.id,
@@ -2333,8 +2348,10 @@ export async function depositDetail(
       accountName: r.accountName,
       memo: r.memo,
       total: toAmountString(r.total),
+      homeTotal: toAmountString(home),
       voided,
       lines: linesById.get(r.id) ?? [],
+      entryId: r.entryId,
     };
   });
 
@@ -2350,8 +2367,10 @@ export async function depositDetail(
       accountName: f.bankAccountName,
       memo: f.memo,
       total: toAmountString(f.amount),
+      homeTotal: toAmountString(f.homeAmount),
       voided: f.voided,
       lines: f.lines.map((l) => ({ description: l.memo, customerName: f.payee, amount: toAmountString(l.amount.negated()), accountName: l.accountName })),
+      entryId: f.entryId,
     });
   }
   rows.sort((a, b) => a.date.localeCompare(b.date));

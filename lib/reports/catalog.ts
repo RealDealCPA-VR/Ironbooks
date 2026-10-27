@@ -5,6 +5,7 @@
  * lib/services/reportRegistry.ts and must cover exactly these keys (reportRegistry.test.ts).
  */
 import type { Area } from '@/lib/permissions/model';
+import type { FeatureKey } from '@/lib/preferences';
 
 export type ReportControl =
   /** From / To dates (defaults to fiscal year to date). */
@@ -37,7 +38,13 @@ export type ReportControl =
   /** Aging reports: Interval (days), Through (days past due), aging from due / transaction date. */
   | 'aging'
   /** Open-item reports: only items more than N days past due (cmdbar). */
-  | 'overdue';
+  | 'overdue'
+  /** Sales by Rep: one sales rep. */
+  | 'rep'
+  /** Inventory site reports: one inventory site. */
+  | 'site'
+  /** Cash Flow Forecast: weeks or months. */
+  | 'period';
 
 export type ReportGroup =
   | 'Company & Financial'
@@ -46,6 +53,9 @@ export type ReportGroup =
   | 'Jobs, Time & Mileage'
   | 'Vendors & Payables'
   | 'Purchases'
+  | 'Inventory'
+  | 'Employees & Payroll'
+  | 'Banking'
   | 'Accountant & Taxes'
   | 'Budgets & Forecasts'
   | 'Lists'
@@ -67,6 +77,11 @@ export interface CatalogEntry {
    * Reports preference ("Summary reports basis") decides; memorized reports save the basis.
    */
   basis?: boolean;
+  /**
+   * Preferences feature switch the report belongs to (QB hides inventory reports while inventory
+   * is off, payroll reports without payroll). Off = not listed and refused by the runner.
+   */
+  feature?: FeatureKey;
 }
 
 const DETAIL_FILTERS: ReportControl[] = ['account', 'customer', 'vendor', 'txnType', 'amount', 'cleared', 'class', 'memo', 'number', 'sort', 'subtotal'];
@@ -86,6 +101,7 @@ export const REPORT_CATALOG: CatalogEntry[] = [
   { key: 'balance-sheet-summary', title: 'Balance Sheet Summary', description: 'The balance sheet by section totals only.', group: 'Company & Financial', area: 'reports_financial', controls: ['asOf'], basis: true },
   { key: 'balance-sheet-detail', title: 'Balance Sheet Detail', description: 'Beginning balance, transactions and ending balance for each balance sheet account.', group: 'Company & Financial', area: 'reports_financial', controls: ['range', ...DETAIL_FILTERS], basis: true },
   { key: 'balance-sheet-by-period', title: 'Balance Sheet by Period', description: 'Balance sheet at the end of each month, quarter or year.', group: 'Company & Financial', area: 'reports_financial', controls: ['range', 'periodColumns'], defaults: { columns: 'month' }, basis: true },
+  { key: 'cash-flow-forecast', title: 'Cash Flow Forecast', description: 'The cash you can expect week by week from open invoices, bills and bank transactions.', group: 'Company & Financial', area: 'reports_financial', controls: ['range', 'period'] },
   { key: 'statement-of-cash-flows', title: 'Statement of Cash Flows', description: 'Where your cash came from and went: operating, investing and financing.', group: 'Company & Financial', area: 'reports_financial', controls: ['range'] },
   { key: 'trial-balance', title: 'Trial Balance', description: 'Debit and credit balance of every account.', group: 'Accountant & Taxes', area: 'reports_financial', controls: ['asOf'], basis: true },
   { key: 'transaction-detail-by-account', title: 'Transaction Detail by Account', description: 'Every transaction by account, with all report filters.', group: 'Accountant & Taxes', area: 'reports_financial', controls: ['range', ...DETAIL_FILTERS], basis: true },
@@ -110,6 +126,8 @@ export const REPORT_CATALOG: CatalogEntry[] = [
   { key: 'sales-by-item-summary', title: 'Sales by Item Summary', description: 'Quantity, sales, cost and gross margin per item.', group: 'Sales', area: 'reports_sales', controls: ['range', 'customer', 'item', 'class'], basis: true },
   { key: 'sales-by-customer-detail', title: 'Sales by Customer Detail', description: 'Every item sold, grouped by customer.', group: 'Sales', area: 'reports_sales', controls: ['range', 'customer', 'item', 'class'], basis: true },
   { key: 'sales-by-item-detail', title: 'Sales by Item Detail', description: 'Every sale, grouped by item.', group: 'Sales', area: 'reports_sales', controls: ['range', 'customer', 'item', 'class'], basis: true },
+  { key: 'sales-by-rep-summary', title: 'Sales by Rep Summary', description: 'Sales and commission per sales rep.', group: 'Sales', area: 'reports_sales', controls: ['range', 'rep', 'customer', 'item', 'class'], basis: true },
+  { key: 'sales-by-rep-detail', title: 'Sales by Rep Detail', description: 'Every sale, grouped by sales rep.', group: 'Sales', area: 'reports_sales', controls: ['range', 'rep', 'customer', 'item', 'class'], basis: true },
   { key: 'open-sales-orders-by-customer', title: 'Open Sales Orders by Customer', description: 'Sales orders not yet invoiced, by customer.', group: 'Sales', area: 'reports_sales', controls: ['customer', 'item'] },
   { key: 'open-sales-orders-by-item', title: 'Open Sales Orders by Item', description: 'Sales orders not yet invoiced, by item.', group: 'Sales', area: 'reports_sales', controls: ['customer', 'item'] },
   { key: 'customer-contact-list', title: 'Customer Contact List', description: 'Name, phone, email, address and balance.', group: 'Lists', area: 'reports_sales', controls: [] },
@@ -132,7 +150,8 @@ export const REPORT_CATALOG: CatalogEntry[] = [
   // ---- Vendors & Payables / Purchases ----
   { key: 'ap-aging-summary', title: 'A/P Aging Summary', description: 'What you owe each vendor, by how many days past due.', group: 'Vendors & Payables', area: 'reports_purchases', controls: ['asOf', 'aging', 'vendor', 'class'] },
   { key: 'ap-aging-detail', title: 'A/P Aging Detail', description: 'Each open bill and credit under its aging column.', group: 'Vendors & Payables', area: 'reports_purchases', controls: ['asOf', 'aging', 'vendor', 'class'] },
-  { key: 'sales-tax-liability', title: 'Sales Tax Liability', description: 'Sales tax collected, paid and still owed, by tax agency.', group: 'Vendors & Payables', area: 'sales_tax', controls: ['range'] },
+  { key: 'sales-tax-liability', title: 'Sales Tax Liability', description: 'Sales tax collected, paid and still owed, by tax agency.', group: 'Vendors & Payables', area: 'sales_tax', controls: ['range'], feature: 'salesTaxEnabled' },
+  { key: 'sales-tax-revenue-summary', title: 'Sales Tax Revenue Summary', description: 'Total, non-taxable and taxable sales and the tax on them, per sales tax item.', group: 'Vendors & Payables', area: 'sales_tax', controls: ['range'], feature: 'salesTaxEnabled' },
   { key: 'vendor-balance-summary', title: 'Vendor Balance Summary', description: 'What you owe each vendor.', group: 'Vendors & Payables', area: 'reports_purchases', controls: ['asOf'] },
   { key: 'vendor-balance-detail', title: 'Vendor Balance Detail', description: 'Every bill and payment behind each vendor balance.', group: 'Vendors & Payables', area: 'reports_purchases', controls: ['optionalRange', 'vendor', 'sort'] },
   { key: 'unpaid-bills-detail', title: 'Unpaid Bills Detail', description: 'Open bills and credits by vendor, with days past due.', group: 'Vendors & Payables', area: 'reports_purchases', controls: ['asOf', 'vendor', 'overdue'] },
@@ -151,6 +170,36 @@ export const REPORT_CATALOG: CatalogEntry[] = [
   { key: 'budget-overview', title: 'Budget Overview', description: 'Your budgeted amounts month by month.', group: 'Budgets & Forecasts', area: 'reports_financial', controls: ['budget', 'customer', 'class'] },
   { key: 'budget-vs-actual-report', title: 'Budget vs. Actual', description: 'Actual results against the budget — by company, class or customer:job, or balance sheet budgets.', group: 'Budgets & Forecasts', area: 'reports_financial', controls: ['budget', 'periodColumns', 'customer', 'class'] },
   { key: 'forecast-overview', title: 'Forecast Overview', description: 'Your forecast month by month.', group: 'Budgets & Forecasts', area: 'reports_financial', controls: ['budget', 'customer'] },
+
+  // ---- Inventory ----
+  { key: 'inventory-valuation-summary', title: 'Inventory Valuation Summary', description: 'On hand, average cost, asset value and retail value per item.', group: 'Inventory', area: 'reports_inventory', controls: ['asOf', 'item'], feature: 'inventoryEnabled' },
+  { key: 'inventory-valuation-detail', title: 'Inventory Valuation Detail', description: 'Every change in the value of each item, with a running asset value.', group: 'Inventory', area: 'reports_inventory', controls: ['range', 'item'], feature: 'inventoryEnabled' },
+  { key: 'inventory-stock-status-by-item', title: 'Inventory Stock Status by Item', description: 'On hand, on sales order, available, on purchase order and when to reorder.', group: 'Inventory', area: 'reports_inventory', controls: ['range', 'item', 'vendor'], feature: 'inventoryEnabled' },
+  { key: 'inventory-stock-status-by-vendor', title: 'Inventory Stock Status by Vendor', description: 'Stock status grouped by the preferred vendor of each item.', group: 'Inventory', area: 'reports_inventory', controls: ['range', 'item', 'vendor'], feature: 'inventoryEnabled' },
+  { key: 'physical-inventory-worksheet', title: 'Physical Inventory Worksheet', description: 'A count sheet: every item with its quantity on hand and a blank count column.', group: 'Inventory', area: 'reports_inventory', controls: ['item'], feature: 'inventoryEnabled' },
+  { key: 'quantity-on-hand-by-site', title: 'Quantity on Hand by Site', description: 'How many of each item are at each inventory site.', group: 'Inventory', area: 'reports_inventory', controls: ['site', 'item'], feature: 'inventoryEnabled' },
+  { key: 'inventory-stock-status-by-site', title: 'Inventory Stock Status by Site', description: 'Stock status for each item at each site.', group: 'Inventory', area: 'reports_inventory', controls: ['site', 'item'], feature: 'inventoryEnabled' },
+  { key: 'inventory-reorder-by-site', title: 'Inventory Reorder Report by Site', description: 'Items at or below their reorder point, by site.', group: 'Inventory', area: 'reports_inventory', controls: ['site'], feature: 'inventoryEnabled' },
+  { key: 'serial-lot-in-stock', title: 'Serial/Lot Numbers in Stock', description: 'Serial and lot numbers on hand, by site and bin.', group: 'Inventory', area: 'reports_inventory', controls: ['site', 'item'], feature: 'inventoryEnabled' },
+  { key: 'transactions-by-serial-lot', title: 'Transactions by Serial/Lot Number', description: 'Every transaction that moved one serial or lot number.', group: 'Inventory', area: 'reports_inventory', controls: ['number', 'item'], feature: 'inventoryEnabled' },
+
+  // ---- Employees & Payroll ----
+  { key: 'payroll-summary', title: 'Payroll Summary', description: 'Wages, taxes, deductions and net pay per employee.', group: 'Employees & Payroll', area: 'reports_payroll', controls: ['range', 'employee'], feature: 'payrollEnabled' },
+  { key: 'employee-earnings-summary', title: 'Employee Earnings Summary', description: 'One line per employee: gross, each tax and deduction, net pay.', group: 'Employees & Payroll', area: 'reports_payroll', controls: ['range', 'employee'], feature: 'payrollEnabled' },
+  { key: 'payroll-detail', title: 'Payroll Detail', description: 'Every paycheck with its gross, taxes, deductions and net pay.', group: 'Employees & Payroll', area: 'reports_payroll', controls: ['range', 'employee'], feature: 'payrollEnabled' },
+  { key: 'payroll-item-detail', title: 'Payroll Item Detail', description: 'Every paycheck line, grouped by payroll item.', group: 'Employees & Payroll', area: 'reports_payroll', controls: ['range', 'employee'], feature: 'payrollEnabled' },
+  { key: 'payroll-liability-balances', title: 'Payroll Liability Balances', description: 'Payroll taxes and deductions owed, by payroll item.', group: 'Employees & Payroll', area: 'reports_payroll', controls: ['asOf'], feature: 'payrollEnabled' },
+  { key: 'employee-contact-list', title: 'Employee Contact List', description: 'Employees with SS No. (last four digits), phone, email and address.', group: 'Lists', area: 'reports_payroll', controls: ['employee'] },
+
+  // ---- Banking ----
+  { key: 'check-detail', title: 'Check Detail', description: 'Every check written, with the accounts and bills it paid.', group: 'Banking', area: 'reports_financial', controls: ['range', 'account'] },
+  { key: 'deposit-detail', title: 'Deposit Detail', description: 'Every deposit with the payments and lines in it.', group: 'Banking', area: 'reports_financial', controls: ['range', 'account'] },
+  { key: 'missing-checks', title: 'Missing Checks', description: 'Gaps in the check numbers of each bank account.', group: 'Banking', area: 'reports_financial', controls: ['account'] },
+
+  // ---- Accountant & Taxes (audit) ----
+  { key: 'voided-deleted-summary', title: 'Voided/Deleted Transactions Summary', description: 'Every transaction voided or deleted, who did it and when.', group: 'Accountant & Taxes', area: 'reports_financial', controls: ['optionalRange'] },
+  { key: 'voided-deleted-detail', title: 'Voided/Deleted Transactions Detail', description: 'The same list with the original values of each transaction.', group: 'Accountant & Taxes', area: 'reports_financial', controls: ['optionalRange'] },
+  { key: 'closing-date-exceptions', title: 'Closing Date Exception Report', description: 'Changes made on or before the closing date with the closing date password.', group: 'Accountant & Taxes', area: 'closing', controls: ['optionalRange'] },
 
   // ---- Multiple companies ----
   { key: 'combined-trial-balance', title: 'Combined Trial Balance', description: 'Trial balance for every company in this file side by side.', group: 'Multiple Companies', area: 'reports_financial', controls: ['asOf'] },
@@ -173,11 +222,46 @@ export const REPORT_GROUPS: ReportGroup[] = [
   'Jobs, Time & Mileage',
   'Vendors & Payables',
   'Purchases',
+  'Inventory',
+  'Employees & Payroll',
+  'Banking',
   'Accountant & Taxes',
   'Budgets & Forecasts',
   'Lists',
   'Multiple Companies',
 ];
+
+/**
+ * Families of reports that used to share one page (payroll, inventory, sites, banking, audit,
+ * sales tax, sales by rep): each report links to the others in its family.
+ */
+export const REPORT_FAMILIES: string[][] = [
+  ['payroll-summary', 'employee-earnings-summary', 'payroll-detail', 'payroll-item-detail', 'payroll-liability-balances', 'employee-contact-list'],
+  ['inventory-valuation-summary', 'inventory-valuation-detail', 'inventory-stock-status-by-item', 'inventory-stock-status-by-vendor', 'physical-inventory-worksheet'],
+  ['quantity-on-hand-by-site', 'inventory-stock-status-by-site', 'inventory-reorder-by-site', 'serial-lot-in-stock', 'transactions-by-serial-lot'],
+  ['check-detail', 'deposit-detail', 'missing-checks'],
+  ['voided-deleted-summary', 'voided-deleted-detail', 'closing-date-exceptions'],
+  ['sales-tax-liability', 'sales-tax-revenue-summary'],
+  ['sales-by-rep-summary', 'sales-by-rep-detail'],
+  ['cash-flow-forecast', 'statement-of-cash-flows'],
+];
+
+/** The other reports in a report's family (catalog entries, in family order). */
+export function relatedReports(key: string): CatalogEntry[] {
+  const fam = REPORT_FAMILIES.find((f) => f.includes(key));
+  return fam ? fam.filter((k) => k !== key && CATALOG_BY_KEY[k]).map((k) => CATALOG_BY_KEY[k]) : [];
+}
+
+/** Things to do from a report (QB's buttons next to the report), shown beside it. */
+export const REPORT_ACTIONS: Record<string, { href: string; label: string }[]> = {
+  'sales-tax-liability': [
+    { href: '/sales-tax', label: 'Pay sales tax' },
+    { href: '/accountant/sales-tax-adjustment', label: 'Adjust sales tax due' },
+    { href: '/accountant/fix-sales-tax', label: 'Fix incorrectly recorded sales tax' },
+  ],
+  'physical-inventory-worksheet': [{ href: '/inventory-ops', label: 'Adjust quantity on hand' }],
+  'missing-checks': [{ href: '/print-checks', label: 'Print checks' }],
+};
 
 /** Href of a standard report with optional parameters. */
 export function stdReportHref(key: string, params: Record<string, string | undefined | null> = {}): string {

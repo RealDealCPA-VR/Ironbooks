@@ -86,6 +86,12 @@ export const reportParamsSchema = z
     customerJobId: zId.optional(),
     classId: zId.optional(),
     budgetId: zId.optional(),
+    /** Sales by Rep: one sales rep ('none' = sales without a rep). */
+    repId: z.union([zId, z.literal('none')]).optional(),
+    /** Inventory site reports: one site. */
+    siteId: zId.optional(),
+    /** Cash Flow Forecast: periods of a week (QB default) or a month. */
+    period: z.enum(['week', 'month']).optional(),
     txnType: z.enum(TXN_TYPE_KEYS).optional(),
     amountMin: zAmount.optional(),
     amountMax: zAmount.optional(),

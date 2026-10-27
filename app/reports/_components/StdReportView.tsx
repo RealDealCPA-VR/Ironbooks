@@ -15,7 +15,7 @@ import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import { BarChart2, Bookmark, ChevronsDownUp, ChevronsUpDown, Filter, Type } from 'lucide-react';
 import { Button, Card, Input, Label, Modal, PageHeader, Select, Spinner, toast } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
-import { CATALOG_BY_KEY } from '@/lib/reports/catalog';
+import { CATALOG_BY_KEY, REPORT_ACTIONS, relatedReports } from '@/lib/reports/catalog';
 import { reportToTable, type StdReport } from '@/lib/reports/types';
 import ReportToolbar, { type ExportTable } from './ReportToolbar';
 import StdReportTable, { useCollapse } from './StdReportTable';
@@ -47,6 +47,8 @@ const PARAM_KEYS = [
   'classId', 'budgetId', 'txnType', 'amountMin', 'amountMax', 'cleared', 'memo', 'number', 'sortBy', 'sortDir',
   'subtotalBy', 'columns', 'compare', 'basis', 'view', 'vehicle', 'dates', 'interval', 'through', 'agingFrom',
   'overDays',
+  // Report gaps round: Sales by Rep, inventory sites, Cash Flow Forecast periods.
+  'repId', 'siteId', 'period',
 ];
 
 function paramsFromSearch(sp: URLSearchParams | null): Params {
@@ -215,6 +217,22 @@ export default function StdReportView({
         action={report?.subtitle ? <span className="text-sm text-navy/60">{report.subtitle}</span> : undefined}
       />
       <p className="text-sm text-navy/60 -mt-4 mb-4 print-hidden">{entry.description}</p>
+      {(relatedReports(reportKey).length > 0 || (REPORT_ACTIONS[reportKey] ?? []).length > 0) && (
+        <nav aria-label="Related reports" className="-mt-2 mb-4 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm print-hidden">
+          {relatedReports(reportKey).length > 0 && <span className="text-navy/50">Related:</span>}
+          {relatedReports(reportKey).map((r) => (
+            <Link key={r.key} href={`/reports/std/${r.key}`} className="text-electric hover:underline">
+              {r.title}
+            </Link>
+          ))}
+          {(REPORT_ACTIONS[reportKey] ?? []).length > 0 && <span className="text-navy/50 ml-2">Next steps:</span>}
+          {(REPORT_ACTIONS[reportKey] ?? []).map((a) => (
+            <Link key={a.href} href={a.href} className="text-electric hover:underline">
+              {a.label}
+            </Link>
+          ))}
+        </nav>
+      )}
 
       <ReportToolbar
         table={table}
