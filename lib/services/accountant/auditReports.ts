@@ -138,14 +138,19 @@ export async function closingDateExceptionReport(
 }
 
 async function entryAmounts(ctx: ServiceContext, ids: string[]): Promise<Map<string, string>> {
-  if (ids.length === 0) return new Map();
-  const rows = await ctx.db
-    .select({ id: journalEntryLines.journalEntryId, total: sql<string>`COALESCE(SUM(${journalEntryLines.debit}), 0)` })
-    .from(journalEntryLines)
-    .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
-    .where(and(eq(journalEntries.companyId, ctx.companyId), inArray(journalEntryLines.journalEntryId, ids)))
-    .groupBy(journalEntryLines.journalEntryId);
-  return new Map(rows.map((r) => [r.id, toAmountString(r.total)]));
+  const out = new Map<string, string>();
+  // In chunks: entries posted after the books were closed can be a whole imported history, more
+  // ids than the database accepts bound parameters in one statement (65,535).
+  for (let i = 0; i < ids.length; i += 1000) {
+    const rows = await ctx.db
+      .select({ id: journalEntryLines.journalEntryId, total: sql<string>`COALESCE(SUM(${journalEntryLines.debit}), 0)` })
+      .from(journalEntryLines)
+      .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+      .where(and(eq(journalEntries.companyId, ctx.companyId), inArray(journalEntryLines.journalEntryId, ids.slice(i, i + 1000))))
+      .groupBy(journalEntryLines.journalEntryId);
+    for (const r of rows) out.set(r.id, toAmountString(r.total));
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
