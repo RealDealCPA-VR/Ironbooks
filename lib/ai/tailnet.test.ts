@@ -24,9 +24,11 @@ describe('classifyHost', () => {
     ['172.16.4.2', 'lan'],
     ['172.32.0.1', 'public'],
     ['192.168.1.20', 'lan'],
-    ['169.254.1.1', 'lan'],
-    ['gpu-box', 'lan'],
-    ['printer.local', 'lan'],
+    // Same classes as the network policy (review round 5): link-local is never called, and a
+    // short or .local name could resolve anywhere, so it is not trusted with unredacted data.
+    ['169.254.1.1', 'invalid'],
+    ['gpu-box', 'public'],
+    ['printer.local', 'public'],
     ['api.anthropic.com', 'public'],
     ['8.8.8.8', 'public'],
     ['', 'invalid'],
