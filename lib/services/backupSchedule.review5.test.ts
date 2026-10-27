@@ -89,3 +89,32 @@ describe('the backup folder chosen on another computer', () => {
     }
   });
 });
+
+describe('a versioned backup cut short by a crash', () => {
+  it('leaves a .partial file that the next backup clears away', async () => {
+    const { runVersionedBackup } = await import('./backupSchedule');
+    const data = path.join(ROOT, 'data-partial');
+    fs.mkdirSync(data, { recursive: true });
+    fs.writeFileSync(path.join(data, 'PG_VERSION'), '17\n');
+    const folder = path.join(ROOT, 'partial-backups');
+    fs.mkdirSync(folder, { recursive: true });
+    const stale = path.join(folder, 'auto-backup-partial-co-2026-10-01T10-00-00-000.bka.partial');
+    fs.writeFileSync(stale, Buffer.alloc(100));
+    const longAgo = new Date(Date.now() - 2 * 60 * 60_000);
+    fs.utimesSync(stale, longAgo, longAgo);
+    const someoneElses = path.join(folder, 'my-own-file.partial');
+    fs.writeFileSync(someoneElses, 'x');
+    fs.utimesSync(someoneElses, longAgo, longAgo);
+    const prev = process.env.BKA_BACKUP_DIR;
+    process.env.BKA_BACKUP_DIR = folder;
+    try {
+      const r = await runVersionedBackup('scheduled', { dataDir: data, companyName: 'Partial Co' });
+      expect(r.status).toBe('created');
+      expect(fs.existsSync(stale)).toBe(false);
+      expect(fs.existsSync(someoneElses)).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env.BKA_BACKUP_DIR;
+      else process.env.BKA_BACKUP_DIR = prev;
+    }
+  });
+});

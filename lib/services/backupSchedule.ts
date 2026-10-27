@@ -82,6 +82,31 @@ function versionFilename(source: VersionedSource, companyName: string | null, at
   return `${prefix}${slug}-${ts}.bka`;
 }
 
+/** A partial backup file this old is not being written any more: the write was cut short. */
+const STALE_PARTIAL_MS = 60 * 60 * 1000;
+
+/**
+ * Remove versioned backups whose write was cut short (a crash or power cut left
+ * "<name>.bka.partial", as big as a backup, never listed or rotated). Only our own file names.
+ */
+function removeStalePartials(folder: string, now = Date.now()): void {
+  let names: string[] = [];
+  try {
+    names = fs.readdirSync(folder);
+  } catch {
+    return;
+  }
+  for (const n of names) {
+    if (!/^(auto-)?backup-.*.bka.partial$/.test(n)) continue;
+    const p = path.join(folder, n);
+    try {
+      if (now - fs.statSync(p).mtimeMs > STALE_PARTIAL_MS) fs.rmSync(p, { force: true });
+    } catch {
+      /* in use or gone */
+    }
+  }
+}
+
 /**
  * Delete versioned backups beyond `keep` (oldest first), and "Back up now" copies beyond
  * MANUAL_VERSIONS_KEEP. Only files this company file recorded
@@ -150,6 +175,7 @@ async function doVersionedBackup(source: VersionedSource, opts: VersionedBackupO
   const tmp = `${outPath}.partial`;
   fs.writeFileSync(tmp, buffer);
   fs.renameSync(tmp, outPath);
+  removeStalePartials(folder);
 
   const record = recordBackup(
     {
