@@ -488,3 +488,25 @@ export function searchPages(
   ranked.filter((s) => s.score < 50).forEach(pushPage);
   return out.slice(0, limit);
 }
+
+// ---------------------------------------------------------------------------
+// ?next= targets
+// ---------------------------------------------------------------------------
+
+const APP_BASE = 'http://ironbooks.invalid';
+
+/**
+ * A ?next= value as a path inside this app, else `fallback` — never another site. Resolved the way
+ * the browser will resolve it, so "/\evil.com", "/<tab>/evil.com" and "//evil.com" (which a
+ * browser opens as https://evil.com) are refused, not just a literal "//" prefix.
+ */
+export function safeAppPath(raw: string | null | undefined, fallback = '/dashboard'): string {
+  if (!raw || !raw.startsWith('/')) return fallback;
+  try {
+    const u = new URL(raw, APP_BASE);
+    if (u.origin !== APP_BASE) return fallback;
+    return `${u.pathname}${u.search}${u.hash}`;
+  } catch {
+    return fallback;
+  }
+}

@@ -5,6 +5,7 @@ import { QRCodeSVG } from 'qrcode.react';
 import { Button, Card, Input, Label, PageHeader, Spinner, toast } from '@/components/ui';
 import { ChallengeQuestionCard } from '@/components/ChallengeQuestionCard';
 import { api } from '@/lib/client';
+import { safeAppPath } from '@/lib/nav';
 
 interface Me {
   id: string;
@@ -13,9 +14,9 @@ interface Me {
   totpEnabled: boolean;
 }
 
-/** Only same-app paths for ?next= (never an open redirect). */
+/** Only same-app paths for ?next= (never an open redirect, "/\evil.com" included). */
 function safeNext(raw: string | null): string {
-  return raw && raw.startsWith('/') && !raw.startsWith('//') ? raw : '/dashboard';
+  return safeAppPath(raw, '/dashboard');
 }
 
 export default function SecurityPage() {
