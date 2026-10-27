@@ -32,6 +32,7 @@ import {
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import { decodeText } from '@/lib/textDecode';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -73,17 +74,24 @@ interface ImportCounts {
   issues: ImportIssue[];
 }
 
+/**
+ * Text of a picked IIF / CSV file. QuickBooks Desktop writes these in the Windows code page
+ * (ANSI), not UTF-8: FileReader.readAsText decoded them as UTF-8 and every accented name
+ * ("Société", "Müller") arrived as "�", beyond repair. The bytes are decoded like the server
+ * decodes report files (lib/textDecode.ts): UTF-16 / UTF-8 when they are, else Windows-1252.
+ */
+export async function readImportText(file: Blob): Promise<string> {
+  return decodeText(new Uint8Array(await file.arrayBuffer()));
+}
+
 /** Read a picked file as text, or as base64 for Excel workbooks. */
 function readFile(file: File, asBase64: boolean): Promise<string> {
+  if (!asBase64) return readImportText(file).catch(() => Promise.reject(new Error('Could not read the file.')));
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onerror = () => reject(new Error('Could not read the file.'));
-    reader.onload = () => {
-      const result = String(reader.result ?? '');
-      resolve(asBase64 ? result.replace(/^data:[^,]*,/, '') : result);
-    };
-    if (asBase64) reader.readAsDataURL(file);
-    else reader.readAsText(file);
+    reader.onload = () => resolve(String(reader.result ?? '').replace(/^data:[^,]*,/, ''));
+    reader.readAsDataURL(file);
   });
 }
 

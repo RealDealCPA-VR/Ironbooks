@@ -22,6 +22,7 @@ import AdmZip from 'adm-zip';
 import { XMLParser } from 'fast-xml-parser';
 import Papa from 'papaparse';
 import { csvUnsafeText } from '@/lib/csv';
+import { decodeText } from '@/lib/textDecode';
 import { ServiceError } from './_base';
 
 export interface GridRow {
@@ -44,26 +45,12 @@ const fail = (msg: string) => new ServiceError('VALIDATION', msg);
 // ---------------------------------------------------------------------------
 
 /**
- * Decode report text exported by QuickBooks / Excel. Handles UTF-8 (with or without BOM),
- * UTF-16 LE/BE ("Unicode Text" exports), and falls back to Windows-1252 — the encoding QB
- * Desktop uses for CSV, where the account-number separator "·" is byte 0xB7.
+ * Decode report text exported by QuickBooks / Excel: UTF-8 (with or without BOM), UTF-16 LE/BE
+ * ("Unicode Text" exports), else Windows-1252 — the encoding QB Desktop uses for CSV and IIF,
+ * where the account-number separator "·" is byte 0xB7. Shared with the browser's list import
+ * (app/qb-import/ListImport.tsx) in lib/textDecode.ts.
  */
-export function decodeText(bytes: Uint8Array): string {
-  if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) {
-    return new TextDecoder('utf-16le').decode(bytes.subarray(2));
-  }
-  if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
-    return new TextDecoder('utf-16be').decode(bytes.subarray(2));
-  }
-  let start = 0;
-  if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) start = 3;
-  const body = bytes.subarray(start);
-  try {
-    return new TextDecoder('utf-8', { fatal: true }).decode(body);
-  } catch {
-    return new TextDecoder('windows-1252').decode(body);
-  }
-}
+export { decodeText };
 
 // ---------------------------------------------------------------------------
 // CSV
