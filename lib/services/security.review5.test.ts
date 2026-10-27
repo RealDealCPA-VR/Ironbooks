@@ -1,0 +1,193 @@
+/**
+ * Security review round 5 — route-level regressions:
+ *  1. POST /api/auth/2fa/setup replaced the secret of a user whose two-factor sign-in was ON:
+ *     the person was locked out of their authenticator app, and a stolen session cookie could
+ *     mint a fresh secret, make a valid code from it and switch 2FA off (/2fa/disable).
+ *  2. Registers: Banking view opened EVERY account's register (payroll liabilities and wages by
+ *     employee, A/R by customer, A/P by vendor, equity). The account's own area now applies.
+ *  3. Doc Center: a document with a long file name (> ~218 characters) could not be stored
+ *     (the on-disk name passed the 255-character limit → HTTP 500), and a stored MIME type that
+ *     is not a valid header value made the download answer 500.
+ *  4. Text longer than its column (a 300-character customer name) answered HTTP 500
+ *     (Postgres 22001 was not translated); it is a plain 400 now.
+ */
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
+import { and, eq } from 'drizzle-orm';
+import { NextRequest } from 'next/server';
+
+const h = vi.hoisted(() => ({
+  cookies: new Map<string, string>(),
+  headers: new Map<string, string>(),
+}));
+vi.mock('next/headers', () => ({
+  cookies: async () => ({
+    get: (n: string) => (h.cookies.has(n) ? { name: n, value: h.cookies.get(n)! } : undefined),
+  }),
+  headers: async () => new Headers([...h.headers.entries()]),
+}));
+
+const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-review5-security');
+process.env.BKA_DATA_DIR = TEST_DIR;
+process.env.BKA_AUTH_SECRET = 'review5-security-secret';
+delete process.env.BKA_INTERNAL_TOKEN;
+
+import { closeDb, getDb, type DB } from '@/lib/db';
+import { accounts, attachments, users } from '@/lib/db/schema';
+import { createSessionToken, hashPassword, SESSION_COOKIE } from '@/lib/auth';
+import { COMPANY_COOKIE } from '@/lib/context';
+import { ROUTE_METHOD_HEADER, ROUTE_PATH_HEADER } from '@/lib/permissions/routes';
+import { fullAccess } from '@/lib/permissions/model';
+import { generateSecret } from '@/lib/totp';
+import { createCompany } from './company';
+import { addUser } from './users';
+import { POST as setup2faPOST } from '@/app/api/auth/2fa/setup/route';
+import { GET as registersGET } from '@/app/api/registers/route';
+import { GET as registerGET } from '@/app/api/registers/[accountId]/route';
+import { POST as attachmentsPOST } from '@/app/api/attachments/route';
+import { GET as attachmentGET } from '@/app/api/attachments/[id]/route';
+import { POST as customersPOST } from '@/app/api/customers/route';
+
+let db: DB;
+let owner: string;
+let clerk: string;
+let companyId: string;
+let bankId: string;
+let liabilityId: string;
+let arId: string;
+
+function as(userId: string, method: string, routePath: string) {
+  h.headers.clear();
+  h.headers.set(ROUTE_PATH_HEADER, routePath);
+  h.headers.set(ROUTE_METHOD_HEADER, method);
+  h.cookies.clear();
+  h.cookies.set(SESSION_COOKIE, createSessionToken(userId));
+  h.cookies.set(COMPANY_COOKIE, companyId);
+}
+function req(method: string, url: string, body?: unknown) {
+  return new NextRequest(`http://127.0.0.1${url}`, {
+    method,
+    headers: { 'content-type': 'application/json' },
+    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+  });
+}
+const params = <T extends Record<string, string>>(p: T) => ({ params: Promise.resolve(p) });
+
+beforeAll(async () => {
+  fs.rmSync(TEST_DIR, { recursive: true, force: true });
+  db = await getDb(TEST_DIR);
+  const [u] = await db
+    .insert(users)
+    .values({ email: 'owner@review5.local', name: 'Owner', passwordHash: await hashPassword('ownerPass123') })
+    .returning();
+  owner = u.id;
+  companyId = (await createCompany(db, { name: 'Review5 Security Co', ownerId: owner })).id;
+  const ownerCtx = { db, companyId, userId: owner, access: fullAccess(), role: 'owner' as const };
+  clerk = (await addUser(ownerCtx, { name: 'AR Clerk', login: 'arclerk', password: 'clerkPass123', roleKeys: ['ar_clerk'] })).userId;
+  const all = await db.select().from(accounts).where(eq(accounts.companyId, companyId));
+  bankId = all.find((a) => a.type === 'asset' && a.subtype === 'checking')!.id;
+  arId = all.find((a) => a.subtype === 'accounts_receivable')!.id;
+  liabilityId = all.find((a) => a.type === 'liability' && a.subtype !== 'accounts_payable' && a.subtype !== 'credit_card')!.id;
+});
+
+afterAll(async () => {
+  await closeDb(TEST_DIR);
+  fs.rmSync(TEST_DIR, { recursive: true, force: true });
+});
+
+describe('review5: two-factor setup never replaces a live secret', () => {
+  it('refuses setup while 2FA is on and keeps the secret', async () => {
+    const live = generateSecret();
+    await db.update(users).set({ totpSecret: live, totpEnabled: true }).where(eq(users.id, owner));
+    as(owner, 'POST', '/api/auth/2fa/setup');
+    const res = await setup2faPOST();
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.secret).toBeUndefined();
+    const [row] = await db.select().from(users).where(eq(users.id, owner));
+    expect(row.totpSecret).toBe(live);
+    expect(row.totpEnabled).toBe(true);
+  });
+
+  it('still sets up a new authenticator while 2FA is off', async () => {
+    await db.update(users).set({ totpSecret: null, totpEnabled: false }).where(eq(users.id, owner));
+    as(owner, 'POST', '/api/auth/2fa/setup');
+    const res = await setup2faPOST();
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    const [row] = await db.select().from(users).where(eq(users.id, owner));
+    expect(row.totpSecret).toBe(body.secret);
+    expect(row.totpEnabled).toBe(false);
+  });
+});
+
+describe('review5: a register needs the area of its account, not just Banking', () => {
+  it('an A/R clerk (Banking view, no Sensitive Accounting) sees bank and A/R registers only', async () => {
+    as(clerk, 'GET', '/api/registers');
+    const res = await registersGET();
+    expect(res.status).toBe(200);
+    const ids = ((await res.json()).accounts as { id: string }[]).map((a) => a.id);
+    expect(ids).toContain(bankId);
+    expect(ids).toContain(arId);
+    expect(ids).not.toContain(liabilityId);
+  });
+
+  it('opening a liability register by id is refused for the clerk, allowed for the owner', async () => {
+    as(clerk, 'GET', `/api/registers/${liabilityId}`);
+    const denied = await registerGET(req('GET', `/api/registers/${liabilityId}`), params({ accountId: liabilityId }));
+    expect(denied.status).toBe(403);
+    as(clerk, 'GET', `/api/registers/${bankId}`);
+    const bank = await registerGET(req('GET', `/api/registers/${bankId}`), params({ accountId: bankId }));
+    expect(bank.status).toBe(200);
+    as(owner, 'GET', `/api/registers/${liabilityId}`);
+    const ok = await registerGET(req('GET', `/api/registers/${liabilityId}`), params({ accountId: liabilityId }));
+    expect(ok.status).toBe(200);
+  });
+});
+
+describe('review5: Doc Center file names and types', () => {
+  it('stores and serves a document with a very long file name', async () => {
+    const filename = `${'Bank statement for checking account ending 4321 '.repeat(5)}.pdf`.slice(-250);
+    as(owner, 'POST', '/api/attachments');
+    const res = await attachmentsPOST(
+      req('POST', '/api/attachments', { filename, mimeType: 'application/pdf', base64: Buffer.from('%PDF-1.4 test').toString('base64') }),
+    );
+    expect(res.status).toBe(201);
+    const row = await res.json();
+    expect(row.filename).toBe(filename);
+    expect(path.basename(row.storagePath).length).toBeLessThanOrEqual(200);
+    expect(row.storagePath.endsWith('.pdf')).toBe(true);
+    as(owner, 'GET', `/api/attachments/${row.id}`);
+    const dl = await attachmentGET(req('GET', `/api/attachments/${row.id}`), params({ id: row.id }));
+    expect(dl.status).toBe(200);
+    expect(Buffer.from(await dl.arrayBuffer()).toString()).toBe('%PDF-1.4 test');
+  });
+
+  it('a stored MIME type that is not a valid header value downloads as a plain file', async () => {
+    as(owner, 'POST', '/api/attachments');
+    const res = await attachmentsPOST(
+      req('POST', '/api/attachments', { filename: 'note.txt', mimeType: 'text/plain', base64: Buffer.from('hello').toString('base64') }),
+    );
+    const row = await res.json();
+    // e.g. a row restored from a crafted backup.
+    await db.update(attachments).set({ mimeType: 'text/html\r\nX-Injected: 1' }).where(and(eq(attachments.id, row.id)));
+    as(owner, 'GET', `/api/attachments/${row.id}`);
+    const dl = await attachmentGET(req('GET', `/api/attachments/${row.id}?inline=1`), params({ id: row.id }));
+    expect(dl.status).toBe(200);
+    expect(dl.headers.get('content-type')).toBe('application/octet-stream');
+    expect(dl.headers.get('x-injected')).toBeNull();
+    expect(dl.headers.get('content-disposition')).toMatch(/^attachment;/);
+  });
+});
+
+describe('review5: text longer than its column is a 400, not a 500', () => {
+  it('a 300-character customer name', async () => {
+    as(owner, 'POST', '/api/customers');
+    const res = await customersPOST(req('POST', '/api/customers', { displayName: 'A'.repeat(300) }));
+    expect(res.status).toBe(400);
+    const body = await res.json();
+    expect(body.code).toBe('VALIDATION');
+    expect(body.error).toMatch(/too long/i);
+  });
+});

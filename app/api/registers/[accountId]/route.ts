@@ -21,21 +21,40 @@
  * allowDuplicateNumber is true.
  */
 import { NextRequest, NextResponse } from 'next/server';
+import { and, eq } from 'drizzle-orm';
 import { getServerContext } from '@/lib/context';
-import { ServiceError } from '@/lib/services/_base';
+import { accounts } from '@/lib/db/schema';
+import { ServiceError, type ServiceContext } from '@/lib/services/_base';
+import { permissionDenied } from '@/lib/services/access';
 import { accountRegister } from '@/lib/services/journal';
 import { withAccountCurrency } from '@/lib/services/fxLedger';
 import { enterRegisterTransaction } from '@/lib/services/registerEntry';
+import { canViewRegister, registerViewAreas } from '@/lib/permissions/registers';
 import { queryDate, zodErrorBody } from '@/lib/validation/helpers';
 import { registerEntrySchema } from '@/lib/validation/registers';
 import { serviceErrorStatus } from '@/lib/routeErrors';
 
 type Params = { params: Promise<{ accountId: string }> };
 
+/**
+ * The route map only asks for Banking; the register of an A/R, A/P, payroll or other account also
+ * needs that account's own area (lib/permissions/registers.ts). An unknown id is left to the
+ * service (404).
+ */
+async function assertCanOpenRegister(ctx: ServiceContext, accountId: string): Promise<void> {
+  if (!ctx.access) return;
+  const [acct] = await ctx.db
+    .select({ type: accounts.type, subtype: accounts.subtype })
+    .from(accounts)
+    .where(and(eq(accounts.id, accountId), eq(accounts.companyId, ctx.companyId)));
+  if (acct && !canViewRegister(ctx.access, acct)) throw permissionDenied(registerViewAreas(acct)[0], 'view');
+}
+
 export async function GET(req: NextRequest, { params }: Params) {
   try {
     const { accountId } = await params;
     const ctx = await getServerContext();
+    await assertCanOpenRegister(ctx, accountId);
     const sp = req.nextUrl.searchParams;
 
     const from = queryDate(sp, 'from');
@@ -66,6 +85,7 @@ export async function POST(req: NextRequest, { params }: Params) {
   try {
     const { accountId } = await params;
     const ctx = await getServerContext();
+    await assertCanOpenRegister(ctx, accountId);
     const body = await req.json().catch(() => ({}));
     const parsed = registerEntrySchema.safeParse(body);
     if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });

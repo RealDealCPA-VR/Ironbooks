@@ -43,6 +43,16 @@ export function translatePgError(err: unknown): unknown {
       { sqlstate: code },
     );
   }
+  if (code === '22001') {
+    // string_data_right_truncation (review round 5): text longer than its column, e.g. a
+    // 300-character name in varchar(255) — routes whose schema has no length limit used to 500.
+    const max = /character varying\((\d+)\)/i.exec(message)?.[1];
+    return new ServiceError(
+      'VALIDATION',
+      max ? `That text is too long: use at most ${max} characters.` : 'That text is too long for this field.',
+      { sqlstate: code, ...(max ? { maxLength: Number(max) } : {}) },
+    );
+  }
   return err;
 }
 
