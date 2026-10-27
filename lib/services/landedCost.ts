@@ -54,6 +54,7 @@ import {
 } from './_base';
 import { postJournalEntry, voidJournalEntry } from './posting';
 import { valueRemainderAfter } from './inventory';
+import { billLineHomeShares } from './currencies';
 
 export type LandedCostMethod = 'quantity' | 'value' | 'weight';
 
@@ -320,10 +321,14 @@ export async function listLandedCostSources(
 
   const eligible = rows.filter((r) => r.itemType !== 'inventory');
   const allocated = await allocatedByBillLine(ctx, eligible.map((r) => r.billLineId));
+  // review5 fx: a charge is allocated at what it cost in home currency (a EUR freight line's home
+  // share), the amount its expense account was debited with.
+  const homeShare = await billLineHomeShares(ctx, [...new Set(eligible.map((r) => r.billId))]);
   return eligible
     .map((r) => {
       const done = allocated.get(r.billLineId) ?? Money.zero();
-      const remaining = Money.of(r.amount).minus(done);
+      const amount = homeShare.get(r.billLineId) ?? Money.of(r.amount);
+      const remaining = amount.minus(done);
       return {
         billId: r.billId,
         billNumber: r.billNumber,
@@ -333,7 +338,7 @@ export async function listLandedCostSources(
         description: r.description,
         accountId: r.accountId,
         accountName: r.accountName,
-        amount: toAmountString(r.amount),
+        amount: toAmountString(amount),
         allocated: toAmountString(done),
         remaining: toAmountString(remaining),
       };
@@ -398,7 +403,10 @@ async function computeAllocation(ctx: ServiceContext, input: AllocateLandedCostI
   }
 
   const already = (await allocatedByBillLine(ctx, [billLine.id])).get(billLine.id) ?? Money.zero();
-  const remaining = Money.of(billLine.amount).minus(already);
+  // review5 fx: in home currency — the charge's home share on a foreign bill (allocations are
+  // posted, and stored, in home currency).
+  const lineHome = (await billLineHomeShares(ctx, [bill.id])).get(billLine.id) ?? Money.of(billLine.amount);
+  const remaining = lineHome.minus(already);
   let amount = remaining;
   if (input.amount != null && input.amount !== '') {
     try {

@@ -262,4 +262,30 @@ describe('review5 fx (second batch)', () => {
     expect(Money.of(supplies.balance).toFixed(2)).toBe('0.00');
     expect(bill.id).toBeTruthy();
   });
+
+  it('landed cost from a foreign freight bill moves its home cost into inventory', async () => {
+    const { createBill, getBill } = await import('./bills');
+    const { createItemReceipt } = await import('./itemReceipts');
+    const { listLandedCostSources, allocateLandedCost } = await import('./landedCost');
+    const { items } = await import('@/lib/db/schema');
+    const freightIn = (await createAccount(ctx, { code: '6150', name: 'Freight In', type: 'expense' as never, subtype: 'operating_expenses' })).id;
+    const [widget] = await db
+      .insert(items)
+      .values({ companyId: ctx.companyId, name: `Widget ${seq}`, type: 'inventory', quantityOnHand: '0', averageCost: '0' } as never)
+      .returning();
+    const supplier = await createVendor(ctx, { displayName: `Home supplier ${seq}` } as never);
+    const receipt = await createItemReceipt(ctx, { vendorId: supplier.id, date: d('2026-05-02'), lines: [{ itemId: widget.id, quantity: 10, unitCost: 10 }] } as never);
+    // EUR 100 of freight at 1.20: USD 120 on Freight In.
+    const forwarder = await eurVendor('EUR forwarder');
+    const bill = await createBill(ctx, { vendorId: forwarder.id, date: d('2026-05-03'), currency: 'EUR', exchangeRate: '1.20', lines: [{ accountId: freightIn, description: 'Freight', amount: '100.00' }] } as never);
+    const line = (await getBill(ctx, bill.id)).lines[0];
+    const src = (await listLandedCostSources(ctx, { billId: bill.id }))[0];
+    expect(src.remaining).toBe('120.00');
+    await allocateLandedCost(ctx, { billId: bill.id, billLineId: line.id, method: 'quantity', itemReceiptIds: [receipt.id] } as never);
+    const [fi] = await db.select().from(accounts).where(eq(accounts.id, freightIn));
+    expect(Money.of(fi.balance).toFixed(2)).toBe('0.00');
+    const [w] = await db.select().from(items).where(eq(items.id, widget.id));
+    expect(Money.of(w.averageCost!).toFixed(2)).toBe('22.00'); // (100 + 120) / 10
+    expect((await trialBalance(ctx)).balanced).toBe(true);
+  });
 });

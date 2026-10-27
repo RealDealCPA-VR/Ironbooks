@@ -17,7 +17,7 @@
  */
 import { and, eq, inArray, ne, sql } from 'drizzle-orm';
 import Decimal from 'decimal.js';
-import { currencies, accounts, journalEntryLines } from '@/lib/db/schema';
+import { currencies, accounts, billLines, bills, journalEntryLines } from '@/lib/db/schema';
 import { Money, MoneyParseError, allocate, toAmountString } from '@/lib/money';
 import { postJournalEntry } from './posting';
 import { type ServiceContext, ServiceError, inTransaction, validation, notFound, writeAudit } from './_base';
@@ -490,6 +490,37 @@ export function homeAmounts(
   }
   const anchor = Money.round2(totalTxn.times(r));
   return { total: anchor, lines: allocate(anchor, lineAmounts.map((v) => Money.of(v))) };
+}
+
+/**
+ * review5 fx: the HOME amount each line of these bills was posted at — the bill's home total
+ * penny-allocated over its lines in line order (homeAmounts, exactly as bills.ts posts it); a
+ * home-currency bill's lines are their own amounts. Keyed by bill line id.
+ */
+export async function billLineHomeShares(ctx: ServiceContext, billIds: ReadonlyArray<string>): Promise<Map<string, Decimal>> {
+  const out = new Map<string, Decimal>();
+  const ids = [...new Set(billIds.filter(Boolean))];
+  if (ids.length === 0) return out;
+  const home = ((await getHomeCurrencyCode(ctx)) ?? '').trim().toUpperCase();
+  for (let i = 0; i < ids.length; i += 2000) {
+    const part = ids.slice(i, i + 2000);
+    const docs = await ctx.db
+      .select({ id: bills.id, currency: bills.currency, rate: bills.exchangeRate })
+      .from(bills)
+      .where(and(eq(bills.companyId, ctx.companyId), inArray(bills.id, part)));
+    const lines = await ctx.db
+      .select({ id: billLines.id, billId: billLines.billId, amount: billLines.amount, lineOrder: billLines.lineOrder })
+      .from(billLines)
+      .where(inArray(billLines.billId, docs.map((b) => b.id)));
+    for (const b of docs) {
+      const mine = lines.filter((l) => l.billId === b.id).sort((x, y) => x.lineOrder - y.lineOrder);
+      const cur = (b.currency ?? '').trim().toUpperCase();
+      const foreign = cur !== '' && cur !== home;
+      const h = homeAmounts(mine.map((l) => Money.of(l.amount)), foreign ? (b.rate ?? 1) : 1);
+      mine.forEach((l, j) => out.set(l.id, h.lines[j]));
+    }
+  }
+  return out;
 }
 
 /** Find-or-create the Exchange Gain/Loss account (code 6900) used for realized FX. */
