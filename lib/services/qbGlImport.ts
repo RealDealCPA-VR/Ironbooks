@@ -42,7 +42,7 @@ import { createClass } from './dimensions';
 import { createEmployee } from './payroll';
 import { postJournalEntry, type PostingLine } from './posting';
 import { createVendor } from './vendors';
-import { controlSideOfAccount, loadQbNameResolver, type QbNameRole } from './qbNameResolver';
+import { controlSideOfAccount, customerKey, customerKeyIndex, loadQbNameResolver, type QbNameRole } from './qbNameResolver';
 import { loadGrid } from './qbGlFiles';
 import { dataExceptionMessage, isDataException } from './qbImportErrors';
 import { withImportLock } from './importLock';
@@ -585,7 +585,7 @@ async function runGlImportUnanalyzed(
 
       // ---- 3. Names → customers / vendors / employees ----------------------------
       const custRows = await tx.db
-        .select({ id: customersTable.id, name: customersTable.displayName })
+        .select({ id: customersTable.id, name: customersTable.displayName, parentId: customersTable.parentId })
         .from(customersTable)
         .where(eq(customersTable.companyId, tx.companyId));
       const vendRows = await tx.db
@@ -596,9 +596,12 @@ async function runGlImportUnanalyzed(
         .select({ first: employeesTable.firstName, last: employeesTable.lastName })
         .from(employeesTable)
         .where(eq(employeesTable.companyId, tx.companyId));
-      const custByName = new Map(custRows.map((c) => [c.name.toLowerCase(), c.id]));
+      // Customers by display name AND full "Customer:Job" path: a job set up in Ironbooks ("Job 1"
+      // under "Acme Corp") is the GL's "Acme Corp:Job 1", never a second customer.
+      const custByName = customerKeyIndex(custRows.map((c) => ({ id: c.id, displayName: c.name, parentId: c.parentId })));
+      const custKey = customerKey;
       const vendSet = new Set(vendRows.map((v) => v.name.toLowerCase()));
-      const anyList = new Set([...custRows.map((c) => c.name.toLowerCase()), ...vendSet]);
+      const anyList = new Set([...custRows.map((c) => c.name.toLowerCase()), ...custByName.keys(), ...vendSet]);
       const empKey = (f: string, l: string) => `${f} ${l}`.toLowerCase();
       const empSet = new Set(empRows.map((e) => empKey(e.first, e.last)));
       const tryCreate = async (label: string, fn: () => Promise<unknown>): Promise<boolean> => {
@@ -614,7 +617,7 @@ async function runGlImportUnanalyzed(
         }
       };
       const ensureCustomer = async (full: string): Promise<string | null> => {
-        const existingId = custByName.get(full.toLowerCase());
+        const existingId = custByName.get(custKey(full));
         if (existingId) return existingId;
         const segs = full.split(':').map((s) => s.trim()).filter(Boolean);
         const parentId = segs.length > 1 ? await ensureCustomer(segs.slice(0, -1).join(':')) : null;
@@ -624,7 +627,7 @@ async function runGlImportUnanalyzed(
           id = row.id;
         });
         if (ok && id) {
-          custByName.set(full.toLowerCase(), id);
+          custByName.set(custKey(full), id);
           anyList.add(full.toLowerCase());
           counts.customersCreated++;
         }
@@ -662,7 +665,7 @@ async function runGlImportUnanalyzed(
         }
       }
       for (const c of controlNames.values()) {
-        if (c.ar && !custByName.has(c.name.toLowerCase())) await ensureCustomer(c.name);
+        if (c.ar && !custByName.has(custKey(c.name))) await ensureCustomer(c.name);
         if (c.ap) await ensureVendor(c.name);
       }
       for (const n of analysis.names) {

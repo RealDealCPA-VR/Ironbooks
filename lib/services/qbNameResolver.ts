@@ -144,6 +144,42 @@ export async function loadQbNameResolver(ctx: ServiceContext): Promise<QbNameRes
   };
 }
 
+/**
+ * Customers by every name QuickBooks prints for them (lowercase, whitespace-normalised): a
+ * top-level customer by its display name, a sub-customer / job by its full "Customer:Job" path
+ * (and by its display name when that already is the path). The importers look names up here
+ * before creating one: by display name alone, a job set up in Ironbooks ("Job 1" under "Acme
+ * Corp") was not found as "Acme Corp:Job 1" and was created a second time — and the duplicate
+ * made the name ambiguous, so the A/R line lost it. A key two customers share is left out.
+ */
+export function customerKeyIndex(rows: Array<{ id: string; displayName: string; parentId: string | null }>): Map<string, string> {
+  const byId = new Map(rows.map((c) => [c.id, c]));
+  const path = (id: string, seen = new Set<string>()): string => {
+    const c = byId.get(id);
+    if (!c) return '';
+    if (!c.parentId || c.displayName.includes(':') || seen.has(id)) return c.displayName;
+    seen.add(id);
+    const p = path(c.parentId, seen);
+    return p ? `${p}:${c.displayName}` : c.displayName;
+  };
+  const out = new Map<string, string | null>();
+  const put = (key: string, id: string) => {
+    const k = norm(key);
+    if (!k) return;
+    const cur = out.get(k);
+    if (cur === undefined) out.set(k, id);
+    else if (cur !== id) out.set(k, null);
+  };
+  for (const c of rows) {
+    put(path(c.id), c.id);
+    if (!c.parentId || c.displayName.includes(':')) put(c.displayName, c.id);
+  }
+  return new Map([...out].filter((e): e is [string, string] => e[1] !== null));
+}
+
+/** Lowercase lookup key for customerKeyIndex ("Acme Corp : Job 1" → "acme corp:job 1"). */
+export const customerKey = (name: string) => norm(name);
+
 /** A/R or A/P side of an account (null for every other account). */
 export function controlSideOfAccount(acct: { type: string; subtype: string | null } | null | undefined): 'ar' | 'ap' | null {
   if (!acct) return null;

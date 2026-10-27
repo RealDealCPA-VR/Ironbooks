@@ -12,13 +12,17 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import path from 'node:path';
 import fs from 'node:fs';
 import Papa from 'papaparse';
+import { and, eq, like } from 'drizzle-orm';
 import { getDb, closeDb, type DB } from '@/lib/db';
-import { companies, users } from '@/lib/db/schema';
+import { accounts, companies, customers, journalEntries, journalEntryLines, users } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
 import { previewGlImport, runGlImport } from './qbGlImport';
-import { previewOpenItems } from './openItemsImport';
+import { importOpenItems, previewOpenItems } from './openItemsImport';
+import { importIIF } from './qbImport';
 import { parseAmount } from './qbGlParse';
-import { glGrid, upload, SAMPLE_GL } from '@/test/fixtures/qbGlFixtures';
+import { createCompany } from './company';
+import { createCustomer } from './customers';
+import { glCsv, glGrid, upload, SAMPLE_GL, type GlFixture } from '@/test/fixtures/qbGlFixtures';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-qbglimport-review5');
 let db: DB;
@@ -43,6 +47,52 @@ afterAll(async () => {
 
 /** "2,700.00" → "2 700,00" (what a French-Canadian Excel writes). */
 const commaDecimal = (cell: string) => (/^-?[\d,]+\.\d{2}$/.test(cell) ? cell.replace(/,/g, ' ').replace('.', ',') : cell);
+
+describe('jobs set up in Ironbooks before the General Ledger import', () => {
+  it('"Acme Corp:Job 1" on an A/R line is the existing job — no duplicate customer, the line keeps its name', async () => {
+    const co = await createCompany(db, { name: 'Existing Job Co', ownerId: ctx.userId! });
+    const c: ServiceContext = { db, companyId: co.id, userId: ctx.userId };
+    const parent = await createCustomer(c, { displayName: 'Acme Corp' });
+    const job = await createCustomer(c, { displayName: 'Job 1', parentId: parent.id });
+    const fx: GlFixture = {
+      company: 'Existing Job Co',
+      periodLabel: 'January 1 through January 31, 2024',
+      accounts: [
+        { number: '11000', name: 'Accounts Receivable', type: 'Accounts Receivable', begin: '0.00' },
+        { number: '40000', name: 'Sales', type: 'Income', begin: '0.00' },
+      ],
+      txns: [
+        { type: 'Invoice', date: '01/05/2024', num: '10', name: 'Acme Corp:Job 1', lines: [
+          { acct: '11000', amount: '110.00' },
+          { acct: '40000', amount: '-110.00' },
+        ] },
+      ],
+    };
+    const r = await runGlImport(c, { file: upload('gl.csv', glCsv(fx)) });
+    expect(r.ok).toBe(true);
+    expect(r.counts.customersCreated).toBe(0);
+    expect((await db.select().from(customers).where(eq(customers.companyId, c.companyId))).length).toBe(2);
+    const [arLine] = await db
+      .select({ entityType: journalEntryLines.entityType, entityId: journalEntryLines.entityId })
+      .from(journalEntryLines)
+      .innerJoin(journalEntries, eq(journalEntries.id, journalEntryLines.journalEntryId))
+      .innerJoin(accounts, eq(accounts.id, journalEntryLines.accountId))
+      .where(and(eq(journalEntries.companyId, c.companyId), eq(accounts.subtype, 'accounts_receivable'), like(journalEntries.sourceRef, 'qbgl:%')));
+    expect(arLine).toEqual({ entityType: 'customer', entityId: job.id });
+  });
+
+  it('the IIF and open-items imports find the existing job by its full name too', async () => {
+    const co = await createCompany(db, { name: 'Existing Job IIF Co', ownerId: ctx.userId! });
+    const c: ServiceContext = { db, companyId: co.id, userId: ctx.userId };
+    const parent = await createCustomer(c, { displayName: 'Acme Corp' });
+    await createCustomer(c, { displayName: 'Job 1', parentId: parent.id });
+    const iif = await importIIF(c, ['!CUST\tNAME', 'CUST\tAcme Corp:Job 1'].join('\r\n'));
+    expect(iif.customers).toBe(0);
+    const oi = await importOpenItems(c, { side: 'ar', alreadyInGl: false, items: [{ kind: 'invoice', name: 'Acme Corp:Job 1', date: '2024-02-01', openBalance: '50.00' }] });
+    expect(oi.invoices).toBe(1);
+    expect((await db.select().from(customers).where(eq(customers.companyId, c.companyId))).length).toBe(2);
+  });
+});
 
 describe('reports re-saved with a decimal comma', () => {
   it('parseAmount never reads "2 700,00" as 270000', () => {

@@ -70,6 +70,7 @@ import { isDecimalCommaAmount, parseAmount, parseQbDate } from './qbGlParse';
 import type { IIFTransaction, ImportIssue } from './qbImport';
 import { importRowError } from './qbImportErrors';
 import { withImportLock } from './importLock';
+import { customerKey, customerKeyIndex } from './qbNameResolver';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -484,13 +485,33 @@ export async function ensureConversionAccount(ctx: ServiceContext, alreadyInGl: 
 // Names
 // ---------------------------------------------------------------------------
 
-async function nameIndex(ctx: ServiceContext, side: LedgerSide) {
+/** A name → id map whose keys are normalised on every get / has / set. */
+class NameMap extends Map<string, string> {
+  constructor(private readonly keyOf: (name: string) => string) {
+    super();
+  }
+  override get(name: string) {
+    return super.get(this.keyOf(name));
+  }
+  override has(name: string) {
+    return super.has(this.keyOf(name));
+  }
+  override set(name: string, id: string) {
+    return super.set(this.keyOf(name), id);
+  }
+}
+
+async function nameIndex(ctx: ServiceContext, side: LedgerSide): Promise<Map<string, string>> {
   if (side === 'ar') {
     const rows = await ctx.db
-      .select({ id: customersTable.id, name: customersTable.displayName })
+      .select({ id: customersTable.id, displayName: customersTable.displayName, parentId: customersTable.parentId })
       .from(customersTable)
       .where(eq(customersTable.companyId, ctx.companyId));
-    return new Map(rows.map((r) => [r.name.trim().toLowerCase(), r.id]));
+    // By display name and full "Customer:Job" path: a job set up in Ironbooks ("Job 1" under "Acme
+    // Corp") is "Acme Corp:Job 1" on the QuickBooks report, never a second customer.
+    const map = new NameMap(customerKey);
+    for (const [k, id] of customerKeyIndex(rows)) map.set(k, id);
+    return map;
   }
   const rows = await ctx.db
     .select({ id: vendorsTable.id, name: vendorsTable.displayName })

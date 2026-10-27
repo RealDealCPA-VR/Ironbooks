@@ -78,7 +78,7 @@ import { setBom } from './assemblies';
 import { createJob } from './jobs';
 import { createEmployee, updateEmployee } from './payroll';
 import { assertBalanced, postJournalEntry, type PostingLine } from './posting';
-import { controlSideOfAccount, loadQbNameResolver, type QbNameRole } from './qbNameResolver';
+import { controlSideOfAccount, customerKey, customerKeyIndex, loadQbNameResolver, type QbNameRole } from './qbNameResolver';
 import { assertPeriodOpen } from './fiscalPeriods';
 import { createType } from './typeLists';
 import { createSalesRep } from './salesReps';
@@ -1664,10 +1664,13 @@ const toCustomerAddress = (a: IIFAddress | null | undefined): CustomerAddress | 
 
 async function importIifCustomers(ctx: ServiceContext, counts: ImportCounts, rows: IIFCustomer[]) {
   const existing = await ctx.db
-    .select({ id: customersTable.id, name: customersTable.displayName })
+    .select({ id: customersTable.id, displayName: customersTable.displayName, parentId: customersTable.parentId })
     .from(customersTable)
     .where(eq(customersTable.companyId, ctx.companyId));
-  const idByName = new Map(existing.map((c) => [c.name.toLowerCase(), c.id]));
+  // By display name and full "Customer:Job" path: a job set up in Ironbooks ("Job 1" under "Acme
+  // Corp") is the file's "Acme Corp:Job 1", not a new customer.
+  const index = customerKeyIndex(existing);
+  const idByName = { get: (n: string) => index.get(customerKey(n)), has: (n: string) => index.has(customerKey(n)), set: (n: string, id: string) => index.set(customerKey(n), id) };
   const ctypes = await typeIdMap(ctx, 'customer');
   const levels = await nameMap(ctx, priceLevels);
   const lists = await L.listIdMaps(ctx);
