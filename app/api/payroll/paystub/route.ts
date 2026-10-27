@@ -145,7 +145,8 @@ export async function GET(req: NextRequest) {
       pdfBytes.byteOffset + pdfBytes.byteLength,
     ) as ArrayBuffer;
 
-    const empSlug = `${employee.lastName}-${employee.firstName}`.replace(/\s+/g, '-').toLowerCase();
+    // Header-safe file name: a name like "O’Brien" or "Žagar" is not a valid header value (HTTP 500).
+    const empSlug = `${employee.lastName}-${employee.firstName}`.replace(/[^A-Za-z0-9_-]+/g, '-').toLowerCase();
     const filename = `paystub-${empSlug}-${fmtDate(paycheck.payDate)}.pdf`;
 
     return new NextResponse(arrayBuf, {

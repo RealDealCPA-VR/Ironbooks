@@ -42,7 +42,8 @@ export async function GET(req: NextRequest) {
     const data = maskSensitive(await w2Data(ctx, { employeeId, year }), ctx.access);
     const pdfBytes = await renderW2Pdf(data);
 
-    const filename = `W2_${data.employee.lastName}_${data.employee.firstName}_${year}.pdf`;
+    // Header-safe file name: a name like "O’Brien" or "Žagar" is not a valid header value (HTTP 500).
+    const filename = `W2_${data.employee.lastName}_${data.employee.firstName}_${year}.pdf`.replace(/[^A-Za-z0-9._-]+/g, '_');
 
     return new NextResponse(pdfBytes.buffer.slice(pdfBytes.byteOffset, pdfBytes.byteOffset + pdfBytes.byteLength) as ArrayBuffer, {
       status: 200,

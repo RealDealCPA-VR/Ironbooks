@@ -34,7 +34,7 @@ process.env.BKA_AUTH_SECRET = 'review5-security-secret';
 delete process.env.BKA_INTERNAL_TOKEN;
 
 import { closeDb, getDb, type DB } from '@/lib/db';
-import { accounts, attachments, users } from '@/lib/db/schema';
+import { accounts, attachments, employees, users } from '@/lib/db/schema';
 import { createSessionToken, hashPassword, SESSION_COOKIE } from '@/lib/auth';
 import { COMPANY_COOKIE } from '@/lib/context';
 import { ROUTE_METHOD_HEADER, ROUTE_PATH_HEADER } from '@/lib/permissions/routes';
@@ -48,6 +48,9 @@ import { GET as registerGET } from '@/app/api/registers/[accountId]/route';
 import { POST as attachmentsPOST } from '@/app/api/attachments/route';
 import { GET as attachmentGET } from '@/app/api/attachments/[id]/route';
 import { POST as customersPOST } from '@/app/api/customers/route';
+import { GET as transactionLogGET } from '@/app/api/transaction-log/route';
+import { GET as w2GET } from '@/app/api/payroll/w2/route';
+import { createVendor } from './vendors';
 
 let db: DB;
 let owner: string;
@@ -178,6 +181,36 @@ describe('review5: Doc Center file names and types', () => {
     expect(dl.headers.get('content-type')).toBe('application/octet-stream');
     expect(dl.headers.get('x-injected')).toBeNull();
     expect(dl.headers.get('content-disposition')).toMatch(/^attachment;/);
+  });
+});
+
+describe('review5: the transaction log masks sensitive fields like the audit trail', () => {
+  it('a Banking user (financial reports, no sensitive-data rights) sees a vendor tax id masked', async () => {
+    const ownerCtx = { db, companyId, userId: owner, access: fullAccess(), role: 'owner' as const };
+    const banker = (await addUser(ownerCtx, { name: 'Banker', login: 'banker', password: 'bankerPass123', roleKeys: ['banking'] })).userId;
+    await createVendor(ownerCtx, { displayName: 'Solo Contractor', taxId: '123-45-6789', accountNumber: '000987654321' } as never);
+    as(banker, 'GET', '/api/transaction-log');
+    const res = await transactionLogGET(req('GET', '/api/transaction-log?entityType=vendor'));
+    expect(res.status).toBe(200);
+    const text = JSON.stringify(await res.json());
+    expect(text).toContain('Solo Contractor');
+    expect(text).not.toContain('123-45-6789');
+    expect(text).not.toContain('000987654321');
+    expect(text).toContain('***-**-6789');
+    // The owner (all sensitive-data rights) still sees the full values.
+    as(owner, 'GET', '/api/transaction-log');
+    const full = JSON.stringify(await (await transactionLogGET(req('GET', '/api/transaction-log?entityType=vendor'))).json());
+    expect(full).toContain('123-45-6789');
+  });
+});
+
+describe('review5: payroll PDF downloads with names that are not plain ASCII', () => {
+  it('a W-2 for "Seán O’Brien" (typographic apostrophe, e.g. imported from QuickBooks) is served', async () => {
+    const [emp] = await db.insert(employees).values({ companyId, firstName: 'Seán', lastName: 'O’Brien' }).returning();
+    as(owner, 'GET', '/api/payroll/w2');
+    const res = await w2GET(req('GET', `/api/payroll/w2?employeeId=${emp.id}&year=2026`));
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-disposition')).toMatch(/^inline; filename="W2_O_Brien_Se_n_2026\.pdf"$/);
   });
 });
 

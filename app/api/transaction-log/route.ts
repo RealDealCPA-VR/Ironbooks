@@ -15,6 +15,7 @@ import { resolveDataDir } from '@/lib/db';
 import { dataDirOf } from '@/lib/db/txHooks';
 import { queryTransactionLog } from '@/lib/services/transactionLog';
 import { ServiceError } from '@/lib/services/_base';
+import { maskForContext } from '@/lib/services/access';
 import { serviceErrorStatus } from '@/lib/routeErrors';
 
 function errorResponse(err: unknown) {
@@ -56,7 +57,9 @@ export async function GET(req: NextRequest) {
       limit,
       offset,
     });
-    return NextResponse.json(page);
+    // The records carry the same before/after snapshots as the audit trail (vendor tax ids, bank
+    // and account numbers, …): mask them for the caller's roles exactly like /api/audit-trail.
+    return NextResponse.json({ ...page, rows: page.rows.map((r) => ({ ...r, data: maskForContext(ctx, r.data) })) });
   } catch (err) {
     return errorResponse(err);
   }
