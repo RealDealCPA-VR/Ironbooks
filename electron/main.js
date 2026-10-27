@@ -140,8 +140,8 @@ if (!app.requestSingleInstanceLock()) {
 //  - macOS: the 'open-file' app event (fires before 'ready' on cold start, so register early)
 //  - Windows/Linux: a .bka path in process.argv (first launch) or in the second instance's
 //    argv (forwarded to us via 'second-instance' thanks to the single-instance lock above)
-// The path is delivered to the renderer as /backup?file=<path> so the backup/restore page
-// can prefill the restore flow.
+// The Backup page is opened with a one-time token (/backup?restore=<token>) and asks for the file
+// by it (backup:takePending), then shows the backup's preview and the usual restore confirmation.
 // ---------------------------------------------------------------------------
 
 function extractBkaPath(argv) {
@@ -153,6 +153,9 @@ function extractBkaPath(argv) {
   return null;
 }
 
+/** A backup to restore into the open company file, until the Backup page takes it (once). */
+let backupToRestore = null;
+
 function deliverPendingBka() {
   if (!pendingBkaPath || !mainWindow) return;
   const filePath = pendingBkaPath;
@@ -162,8 +165,24 @@ function deliverPendingBka() {
     restoreBackupAsNewFileFlow(filePath).catch((err) => console.error('[restore] backup:', err));
     return;
   }
-  navigate(`/backup?file=${encodeURIComponent(filePath)}`);
+  // Only this one file, and only once: the page names it by a token, never by a path.
+  backupToRestore = { token: crypto.randomBytes(12).toString('hex'), path: filePath };
+  navigate(`/backup?restore=${backupToRestore.token}`);
 }
+
+// The Backup page picks up the backup chosen in File > Open or Restore Company (or double-clicked):
+// { name, data } (or { name, error }) for the token deliverPendingBka gave it; null otherwise.
+ipcMain.handle('backup:takePending', (e, token) => {
+  if (!fromLocalApp(e) || !backupToRestore || typeof token !== 'string' || token !== backupToRestore.token) return null;
+  const filePath = backupToRestore.path;
+  backupToRestore = null;
+  try {
+    const buf = fs.readFileSync(filePath);
+    return { name: path.basename(filePath), data: buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) };
+  } catch (err) {
+    return { name: path.basename(filePath), error: openErrorText(err) };
+  }
+});
 
 pendingBkaPath = extractBkaPath(process.argv);
 
@@ -1782,6 +1801,9 @@ async function setHosting(enable, { quiet = false, lan = false } = {}) {
     hostingError = null;
     saveConfig({ hosting: { ...cfg, enabled: false } });
   }
+  // Tell the shared drive right away (not at the next heartbeat): after switching back to
+  // single-user mode, other computers must stop being offered "Join" to a host that is gone.
+  if (openFile && !openFile.lost) lockHeartbeat().catch(() => {});
   buildMenu();
   mainWindow?.webContents.send('menu', 'hosting-changed');
   return hostingStatus();

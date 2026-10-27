@@ -152,3 +152,31 @@ describe('switching or closing company files (source pins)', () => {
     expect(ready.slice(0, 900)).toMatch(/try \{\s*await createWindow\(\);\s*\} catch \(err\) \{[\s\S]*dialog\.showErrorBox\([\s\S]*app\.quit\(\);/);
   });
 });
+
+describe('switching back to single-user mode (source pins)', () => {
+  const main = fs.readFileSync(path.resolve(__dirname, '..', 'electron', 'main.js'), 'utf8');
+  it('updates the lock on the shared drive at once, so nobody is offered "Join" to a host that stopped', () => {
+    const fn = main.slice(main.indexOf('async function setHosting('));
+    const end = fn.indexOf('\n}\n');
+    expect(fn.slice(0, end)).toMatch(/if \(openFile && !openFile\.lost\) lockHeartbeat\(\)\.catch\(\(\) => \{\}\);/);
+    // …and the heartbeat drops the join details when not on the office network.
+    expect(main).toMatch(/mode: lan \? 'multi' : 'single',\s*host: lan \? \{ urls: hostingState\.urls, fingerprint: hostingState\.fingerprint \} : null,/);
+  });
+});
+
+describe('restoring a backup into the open company file from File > Open or Restore Company (source pins)', () => {
+  const main = fs.readFileSync(path.resolve(__dirname, '..', 'electron', 'main.js'), 'utf8');
+  const preload = fs.readFileSync(path.resolve(__dirname, '..', 'electron', 'preload.js'), 'utf8');
+  const page = fs.readFileSync(path.resolve(__dirname, '..', 'app', 'backup', 'page.tsx'), 'utf8');
+  it('the chosen backup reaches the Backup page (it used to be dropped: the page never read ?file=)', () => {
+    expect(main).not.toMatch(/\/backup\?file=/);
+    expect(main).toMatch(/backupToRestore = \{ token: crypto\.randomBytes\(12\)\.toString\('hex'\), path: filePath \};\s*navigate\(`\/backup\?restore=\$\{backupToRestore\.token\}`\);/);
+    const ipc = main.slice(main.indexOf("ipcMain.handle('backup:takePending'"));
+    expect(ipc.slice(0, 400)).toMatch(/!fromLocalApp\(e\) \|\| !backupToRestore \|\| typeof token !== 'string' \|\| token !== backupToRestore\.token\) return null;/);
+    expect(ipc.slice(0, 500)).toMatch(/backupToRestore = null;/); // once
+    expect(preload).toMatch(/takePending: \(token\) => ipcRenderer\.invoke\('backup:takePending', String\(token\)\)/);
+    expect(page).toMatch(/<Suspense fallback=\{null\}>\s*<PendingBackupRestore onFile=\{startFromFile\} \/>/);
+    expect(page).toMatch(/useSearchParams\(\)\.get\('restore'\)/);
+    expect(page).toMatch(/onFile\(new File\(\[r\.data\], r\.name\)\)/);
+  });
+});
