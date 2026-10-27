@@ -468,6 +468,8 @@ export default function BankingPage() {
   const [csvCheckCol, setCsvCheckCol] = useState('');
   // Statement PDF / scan read on the server, waiting for review (lib/services/statementImport.ts).
   const [statementExtract, setStatementExtract] = useState<StatementExtract | null>(null);
+  /** The account the statement under review was read for (its sign convention is that account's). */
+  const [statementAccountId, setStatementAccountId] = useState('');
   const [extracting, setExtracting] = useState(false);
 
   // CSV preview (server-side dry run via /api/import/csv-preview)
@@ -640,6 +642,7 @@ export default function BankingPage() {
       } else {
         setImportFileType('statement');
         setImportFilename(file.name);
+        setStatementAccountId(importBankAccountId);
         setStatementExtract(result);
       }
     } catch (err) {
@@ -650,11 +653,12 @@ export default function BankingPage() {
   }
 
   async function importStatement(reviewed: ReviewedStatement) {
-    if (!statementExtract) return;
+    if (!statementExtract || !statementAccountId) return;
     setImporting(true);
     try {
       const summary = await api.post<ImportSummary>('/api/import', {
-        bankAccountId: importBankAccountId,
+        // The account the statement was read for (picking another account clears the review).
+        bankAccountId: statementAccountId,
         fileType: 'rows',
         rows: reviewed.rows,
         filename: importFilename || 'statement.pdf',
@@ -722,6 +726,9 @@ export default function BankingPage() {
 
   async function handleImport(e: React.FormEvent) {
     e.preventDefault();
+    // A statement / Excel file is imported from its own review (Enter in a review field submits
+    // this form too; it must not post the pasted-file content instead).
+    if (BINARY_KINDS.includes(importFileType)) return;
     if (!importBankAccountId) {
       toast('Select a bank account first.', 'danger');
       return;
@@ -874,7 +881,13 @@ export default function BankingPage() {
               <Select
                 id="import-bank-account"
                 value={importBankAccountId}
-                onChange={(e) => setImportBankAccountId(e.target.value)}
+                onChange={(e) => {
+                  setImportBankAccountId(e.target.value);
+                  // A statement read for another account has that account's sign convention (a
+                  // card's purchases are negative): read the file again for this account.
+                  setStatementExtract(null);
+                  setStatementAccountId('');
+                }}
                 required
               >
                 <option value="">Select bank account…</option>

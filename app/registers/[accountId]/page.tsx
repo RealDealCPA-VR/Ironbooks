@@ -43,6 +43,7 @@ import { formatDate } from '@/lib/dates';
 import EntryDetailModal, { sourceRefLink } from '@/components/EntryDetailModal';
 import { RegisterEntryRow } from '@/components/RegisterEntryRow';
 import WhyChanged from '@/components/WhyChanged';
+import { registerBody, showEntryRow } from './registerView';
 
 // ---------------------------------------------------------------------------
 // Types (mirror GET /api/registers/[accountId])
@@ -247,6 +248,9 @@ function RegisterPageInner() {
   const [result, setResult] = useState<RegisterResult | null>(null);
   /** The 'from' the current result was loaded with (drives the opening-balance row). */
   const [resultFrom, setResultFrom] = useState('');
+  /** The 'to' and search the current result was loaded with (the entry row and its reload). */
+  const [resultTo, setResultTo] = useState('');
+  const [resultSearch, setResultSearch] = useState('');
   const [loading, setLoading] = useState(true);
   const [detailId, setDetailId] = useState<string | null>(null);
   /** Show every row instead of the newest REGISTER_PAGE_ROWS (large registers open fast). */
@@ -272,6 +276,8 @@ function RegisterPageInner() {
         );
         setResult(data.register);
         setResultFrom(fromDate);
+        setResultTo(toDate);
+        setResultSearch(q);
       } catch (err) {
         toast(err instanceof ApiError ? err.message : 'Failed to load register.', 'danger');
       } finally {
@@ -385,13 +391,13 @@ function RegisterPageInner() {
 
       {/* Register grid */}
       <Card className="p-0 overflow-hidden">
-        {loading && (
+        {registerBody(loading, !!result) === 'spinner' && (
           <div className="py-16 flex justify-center">
             <Spinner className="text-electric" />
           </div>
         )}
 
-        {!loading && !result && (
+        {registerBody(loading, !!result) === 'unavailable' && (
           <div className="py-16 text-center text-navy/40">
             Could not load this register.{' '}
             <Link href="/registers" className="text-electric font-medium hover:underline">
@@ -400,7 +406,7 @@ function RegisterPageInner() {
           </div>
         )}
 
-        {!loading && result && (
+        {result && (
           <>
             <div {...listKeys} className="max-h-[60vh] overflow-y-auto">
               <table className="w-full border-collapse">
@@ -534,12 +540,12 @@ function RegisterPageInner() {
                       </tr>
                     );
                   })}
-                  {!search.trim() && (
+                  {showEntryRow(resultSearch) && (
                     <RegisterEntryRow
                       register={result.account}
                       columns={config.columns}
                       colSpanAfter={fxCur ? 2 : 1}
-                      onSaved={() => load(from, to, search)}
+                      onSaved={() => load(resultFrom, resultTo, resultSearch)}
                     />
                   )}
                 </tbody>
@@ -550,7 +556,7 @@ function RegisterPageInner() {
             <div className="flex items-center justify-between px-4 py-3 border-t-2 border-navy/20 bg-slate-50">
               <span className="text-xs text-navy/50">
                 {result.totalRows} transaction{result.totalRows === 1 ? '' : 's'}
-                {search.trim() ? ' (filtered)' : ''}
+                {resultSearch.trim() ? ' (filtered)' : ''}
               </span>
               <span className="font-bold text-navy">
                 Ending Balance:{' '}

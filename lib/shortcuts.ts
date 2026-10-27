@@ -182,6 +182,33 @@ export function formatAmountResult(n: number | string | Decimal): string {
   return cents.isZero() ? '0' : cents.toFixed();
 }
 
+/** A plain amount once $ and spaces are gone: digits with real thousands groups ("1,250.50"). */
+const GROUPED_AMOUNT_RE = /^-?(\d{1,3}(,\d{3})+|\d+)(\.\d*)?$/;
+
+/**
+ * What an amount field holds once the user commits it (blur, or Enter in the field):
+ *  - QuickMath ("12.5*3+10") is worked out in exact decimals and rounded to cents half-up, as
+ *    lib/money rounds on the server ("8.03*1.5" → "12.05"; the old float math kept 12.04);
+ *  - a plain amount typed with a $ sign, spaces or thousands separators ("$1,250.50") becomes the
+ *    bare number ("1250.50"). The forms add amounts with Number(), which reads "1,250.50" as NaN:
+ *    a payment applied as "1,250.00" was silently dropped, and the API (zMoney) refuses commas.
+ * Null when there is nothing to change (a plain number, or text that is not an amount — the
+ * page's own validation reports that).
+ */
+export function committedAmountText(raw: string): string | null {
+  if (isMathExpression(raw)) {
+    const d = evaluateAmountDecimal(raw);
+    if (d === null) return null;
+    const next = formatAmountResult(d);
+    return next === raw ? null : next;
+  }
+  const s = normalizeAmountText(raw);
+  if (!s || s === raw) return null;
+  // Only real thousands groups: a decimal comma ("12,50") is left as typed for validation to flag.
+  if (!GROUPED_AMOUNT_RE.test(raw.replace(/[\s$]/g, ''))) return null;
+  return s;
+}
+
 // ---------------------------------------------------------------------------
 // QuickBooks date-entry keys
 // ---------------------------------------------------------------------------

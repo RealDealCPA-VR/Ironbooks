@@ -36,6 +36,7 @@ import {
   inventoryLinePayload,
   useAdvancedInventory,
 } from '@/components/inventory/AdvancedInventory';
+import { creditItems, rowsOf } from './lists';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -219,11 +220,11 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId, n
       soft(api.get<Named[]>('/api/customers'), []),
       soft(api.get<Named[]>('/api/jobs'), []),
     ]).then(([it, cl, cu, jb]) => {
-      const itemRows = Array.isArray(it?.items) ? it.items : [];
-      setItemList(itemRows.filter((i) => !['subtotal', 'discount', 'payment', 'sales_tax', 'group'].includes(i.type ?? '')));
-      setClassList(Array.isArray(cl) ? cl : []);
-      setCustomerList(Array.isArray(cu) ? cu : []);
-      setJobList(Array.isArray(jb) ? jb : []);
+      // lists.ts reads a bare list or the wrapped one; creditItems leaves out what cannot be returned.
+      setItemList(creditItems<Named>(it));
+      setClassList(rowsOf<Named>(cl, 'classes'));
+      setCustomerList(rowsOf<Named>(cu, 'customers'));
+      setJobList(rowsOf<Named>(jb, 'jobs'));
     });
   }, [open]);
 

@@ -31,6 +31,7 @@ import {
   BarcodeScanInput,
   InventoryLineFields,
   type InvDetail,
+  invFromLine,
   inventoryLinePayload,
   useAdvancedInventory,
 } from '@/components/inventory/AdvancedInventory';
@@ -133,6 +134,12 @@ interface SalesReceiptDetail extends SalesReceipt {
     quantity: string;
     rate: string;
     taxable: boolean;
+    // Advanced Inventory detail (present only when stored for the line)
+    siteId?: string | null;
+    binId?: string | null;
+    serialNumbers?: string[] | null;
+    lotNumber?: string | null;
+    lotExpiration?: string | null;
   }>;
 }
 
@@ -265,6 +272,9 @@ function NewReceiptModal({
           rate: String(Number(l.rate)),
           taxable: l.taxable,
           rateManual: true,
+          // The site / bin / serials / lot the stock left from: an edit re-posts the receipt, and
+          // a line sent without them went back to the default site with its serials dropped.
+          inv: invFromLine(l),
         })),
       );
       return;

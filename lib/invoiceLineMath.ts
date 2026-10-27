@@ -88,3 +88,95 @@ export function liveLineTotals(lines: LiveLineInput[]): LiveLineTotals {
   }
   return { amounts, subtotal, taxableSubtotal, payments, manualTax };
 }
+
+/**
+ * A billable cost as the invoice bills it: the cost at cost, round2(amount), plus its own markup
+ * line round2(cost × markup% / 100) when that is more than zero (lib/services/billables.ts).
+ */
+export function billableCostTotal(amount: string, markupPercent: string): Decimal {
+  const base = Money.round2(typedNumber(amount));
+  const markup = Money.round2(base.times(typedNumber(markupPercent)).dividedBy(100));
+  return markup.greaterThan(0) ? base.plus(markup) : base;
+}
+
+/** Unbilled billable time & costs picked on a new invoice (GET /api/billables). */
+export interface LiveBillables {
+  /** Bill / expense costs, passed through at cost plus the markup. */
+  costs: Array<{ amount: string }>;
+  /** Time entries, billed hours × rate. */
+  time: Array<{ hours: string; rate: string }>;
+  /** Markup % on the costs as typed ('' = none). */
+  markupPercent: string;
+}
+
+export interface InvoiceFormTotalsInput {
+  lines: LiveLineInput[];
+  /** Header discount as typed: dollars, or a percent of the subtotal. */
+  discount: string;
+  discountType: 'amount' | 'percent';
+  /** The tax item's rate as a fraction ("0.0825"); '' / 0 = no tax. */
+  taxRate: string | number;
+  billables?: LiveBillables | null;
+  /** Retainage % held back as typed ('' = none). */
+  retainagePercent?: string;
+}
+
+export interface InvoiceFormTotals extends LiveLineTotals {
+  /** What the selected billables add to the subtotal (cost lines + markup lines + time). */
+  billables: Decimal;
+  /** The header discount in dollars. */
+  discount: Decimal;
+  tax: Decimal;
+  total: Decimal;
+  /** Held back as retainage (part of the total, not due yet). */
+  retainage: Decimal;
+  /** total − retainage: what is due now, before payment lines (the server's dueNow). */
+  dueNow: Decimal;
+  /** dueNow − payment lines. */
+  balanceDue: Decimal;
+}
+
+/**
+ * The invoice form's totals exactly as lib/services/invoices.ts prepareInvoice (and
+ * lib/services/billables.ts for picked billables) will save them — every step rounded where the
+ * server rounds it, in Decimal:
+ *  - billables: each cost round2(amount) plus its own markup line round2(cost × markup%), each
+ *    time entry round2(hours × rate) — all non-taxable income lines;
+ *  - header discount: round2(the typed amount), or round2(subtotal × round2(percent) / 100);
+ *  - tax: round2(taxable base × rate) (a negative base is not taxed) + manual sales-tax lines;
+ *  - total: round2(subtotal − discount + tax); retainage round2(total × round2(percent) / 100);
+ *  - due now: total − retainage; balance due: due now − payment lines.
+ * The float version showed a 15% discount of $10.10 as $1.51 while the invoice saved $1.52.
+ */
+export function invoiceFormTotals(input: InvoiceFormTotalsInput): InvoiceFormTotals {
+  const live = liveLineTotals(input.lines);
+  let billables = Money.zero();
+  const b = input.billables;
+  if (b) {
+    for (const c of b.costs) billables = billables.plus(billableCostTotal(c.amount, b.markupPercent));
+    for (const t of b.time) {
+      billables = billables.plus(Money.round2(typedNumber(t.hours).toDecimalPlaces(4).times(typedNumber(t.rate).toDecimalPlaces(4))));
+    }
+  }
+  const subtotal = live.subtotal.plus(billables);
+  const typedDiscount = Money.round2(typedNumber(input.discount));
+  const discount =
+    input.discountType === 'percent'
+      ? Money.round2(subtotal.times(Decimal.min(typedDiscount, 100)).dividedBy(100))
+      : typedDiscount;
+  const rate = typedNumber(String(input.taxRate ?? ''));
+  const base = live.taxableSubtotal.lessThan(0) ? Money.zero() : live.taxableSubtotal;
+  let tax = Money.round2(base.times(rate)).plus(live.manualTax);
+  if (tax.lessThan(0)) tax = Money.zero();
+  let total = Money.round2(subtotal.minus(discount).plus(tax));
+  if (total.lessThan(0)) total = Money.zero(); // the server refuses it; the form shows 0.00
+  const retPct = Money.round2(typedNumber(input.retainagePercent ?? ''));
+  const retainage = retPct.greaterThan(0)
+    ? Money.round2(total.times(Decimal.min(retPct, 100)).dividedBy(100))
+    : Money.zero();
+  // lib/services/invoices.ts: dueNow = round2(total − retainage); the balance = dueNow − payments.
+  const dueNow = Money.round2(total.minus(retainage));
+  let balanceDue = dueNow.minus(live.payments);
+  if (balanceDue.lessThan(0)) balanceDue = Money.zero();
+  return { ...live, subtotal, billables, discount, tax, total, retainage, dueNow, balanceDue };
+}

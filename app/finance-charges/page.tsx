@@ -17,6 +17,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { assessBody, previewForDate } from './assessDate';
 import { todayISO } from '@/lib/dates';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
@@ -81,7 +82,10 @@ export default function FinanceChargesPage() {
 
   // Preview / assess
   const [asOf, setAsOf] = useState(today);
-  const [preview, setPreview] = useState<FinanceChargePreview | null>(null);
+  const [loadedPreview, setPreview] = useState<FinanceChargePreview | null>(null);
+  // Shown and assessed only while it is for the date in the field (a preview for an earlier date
+  // answering late is not shown): app/finance-charges/assessDate.ts.
+  const preview = previewForDate(loadedPreview, asOf);
   const [loadingPreview, setLoadingPreview] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -123,6 +127,10 @@ export default function FinanceChargesPage() {
   }
 
   async function loadPreview() {
+    if (!asOf) {
+      toast('Enter the assessment date first.', 'danger');
+      return;
+    }
     setLoadingPreview(true);
     setPreview(null);
     try {
@@ -150,10 +158,9 @@ export default function FinanceChargesPage() {
     if (!preview || selected.size === 0) return;
     setAssessing(true);
     try {
-      const result = await api.post<AssessResult>('/api/finance-charges', {
-        asOf,
-        customerIds: [...selected],
-      });
+      // The date the charges on screen were worked out for (the preview's), never a date typed
+      // since: the charges assessed are the ones the user reviewed and ticked.
+      const result = await api.post<AssessResult>('/api/finance-charges', assessBody(preview, selected));
       const n = result.assessed.length;
       toast(
         n > 0
@@ -266,7 +273,10 @@ export default function FinanceChargesPage() {
               id="asOf"
               type="date"
               value={asOf}
-              onChange={(e) => setAsOf(e.target.value)}
+              onChange={(e) => {
+                setAsOf(e.target.value);
+                setPreview(null); // the charges shown were for the old date: preview again
+              }}
               className="w-48"
             />
           </div>

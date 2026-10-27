@@ -15,7 +15,7 @@
  */
 import { isPaymentSourceAccount } from '@/lib/accountTypes';
 import { methodForPaymentAccount } from '@/lib/billPaymentMethod';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { HandCoins, Pencil, Trash2 } from 'lucide-react';
 import {
   Badge,
@@ -41,6 +41,7 @@ import { localDateISO, todayISO } from '@/lib/dates';
 import { useErrorFixes, type FixContext } from '@/components/ErrorFixPanel';
 import { getPath, parseLinePath, type ErrorFix } from '@/lib/errorFixes';
 import { formatCurrency } from '@/lib/money';
+import { carryAmounts, carryRows, payBillsHasWork } from '@/lib/paymentApply';
 import { formatDate } from '@/lib/utils';
 // wave2 prefs: Checking > default account for Pay Bills
 import { usePreferences } from '@/lib/usePreferences';
@@ -218,8 +219,19 @@ export default function PayBillsPage() {
     init();
   }, []);
 
-  const loadVendorData = useCallback(async (vid: string) => {
+  /** The vendor whose bills are on screen (a reload for the same vendor keeps the selections). */
+  const loadedVendor = useRef('');
+  /** Latest load: an earlier, slower answer (another vendor picked meanwhile) is ignored. */
+  const loadSeq = useRef(0);
+  /**
+   * Read the vendor's open bills, credits and General Journal items. `keep`: the same vendor's
+   * list is being refreshed for a new payment date / filter, so ticked bills and typed amounts
+   * stay (lib/paymentApply.ts carryRows); after a save, or for another vendor, rows start fresh.
+   */
+  const loadVendorData = useCallback(async (vid: string, keep = false) => {
+    const mine = ++loadSeq.current;
     if (!vid) {
+      loadedVendor.current = '';
       setBills([]);
       setCredits([]);
       setRows({});
@@ -242,26 +254,32 @@ export default function PayBillsPage() {
           .get<{ charges: JournalOpenRow[]; credits: JournalOpenRow[] }>(`/api/bill-payments/journal-items?vendorId=${vid}`)
           .catch(() => ({ charges: [], credits: [] })),
       ]);
+      // Another vendor (or date) was picked while this was loading: its own load shows instead,
+      // so this vendor's bills never appear under the other vendor's name.
+      if (mine !== loadSeq.current) return;
       setJournalPayables(journalData.charges ?? []);
       setJournalCredits(journalData.credits ?? []);
-      setJournalPay({});
-      setJournalCreditUse({});
+      const chargeIds = (journalData.charges ?? []).map((j) => j.journalLineId);
+      setJournalPay((prev) => carryAmounts(prev, chargeIds, keep));
+      setJournalCreditUse((prev) => carryAmounts(prev, chargeIds, keep));
       setPayments(payData.payments.filter((p) => !p.voidedAt));
       const open = billData.bills.filter(
         (b) => (b.status === 'open' || b.status === 'partial') && Number(b.balanceDue) > 0,
       );
       setBills(open);
       setCredits(creditData.filter((c) => c.status !== 'void' && Number(c.unapplied) > 0));
-      setRows(Object.fromEntries(open.map((b) => [b.id, emptyRow()])));
+      setRows((prev) => carryRows(prev, open.map((b) => b.id), emptyRow, keep));
+      loadedVendor.current = vid;
     } catch (err) {
-      toastError(err, 'Failed to load vendor bills');
+      if (mine === loadSeq.current) toastError(err, 'Failed to load vendor bills');
     } finally {
-      setLoadingBills(false);
+      if (mine === loadSeq.current) setLoadingBills(false);
     }
   }, [date, dueFilterOn, dueOnOrBefore, discountOnly]);
 
   useEffect(() => {
-    loadVendorData(vendorId);
+    // A new date or filter for the vendor already on screen keeps what was ticked and typed.
+    loadVendorData(vendorId, loadedVendor.current === vendorId);
   }, [vendorId, loadVendorData]);
 
   // Deep link (Needs attention > Pay): ?vendor=<id>&bill=<id> opens that vendor with the bill
@@ -378,7 +396,7 @@ export default function PayBillsPage() {
       toast('Select a vendor first.', 'danger');
       return;
     }
-    if (selected.length === 0 && journalItems.length === 0 && journalCreditOnJournal === 0) {
+    if (!payBillsHasWork({ billsSelected: selected.length, journalPaid: journalItems.length, journalCreditOnJournal })) {
       toast('Check at least one bill to pay.', 'danger');
       return;
     }
@@ -1111,7 +1129,11 @@ export default function PayBillsPage() {
             <Button
               onClick={handlePay}
               loading={submitting}
-              disabled={(selected.length === 0 && journalItems.length === 0) || rowErrors.length > 0 || journalOverpaid}
+              disabled={
+                !payBillsHasWork({ billsSelected: selected.length, journalPaid: journalItems.length, journalCreditOnJournal }) ||
+                rowErrors.length > 0 ||
+                journalOverpaid
+              }
             >
               {journalItems.length > 0
                 ? `Pay ${selected.length + journalItems.length} Item${selected.length + journalItems.length !== 1 ? 's' : ''}`

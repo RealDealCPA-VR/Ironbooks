@@ -110,6 +110,8 @@ export default function PaySalesTaxPage() {
   const [picked, setPicked] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
   const [voidingId, setVoidingId] = useState<string | null>(null);
+  /** Bumped after checks are written or voided, so the next check number is looked up again. */
+  const [numberTick, setNumberTick] = useState(0);
 
   const banks = useMemo(() => accounts.filter((a) => isBankAccount(a)), [accounts]);
 
@@ -141,11 +143,17 @@ export default function PaySalesTaxPage() {
 
   useEffect(() => {
     if (!payFrom || toPrint) return;
+    let live = true;
     api
       .get<{ next: string }>(`/api/check-numbers/next?paymentAccountId=${payFrom}`)
-      .then((r) => setFirstNumber(r.next))
+      .then((r) => live && setFirstNumber(r.next))
       .catch(() => {});
-  }, [payFrom, toPrint]);
+    return () => {
+      live = false;
+    };
+    // numberTick: the checks just written used the numbers shown, so look the next one up again
+    // (the field kept the used number and the next payment was refused as a duplicate).
+  }, [payFrom, toPrint, numberTick]);
 
   const payable = (screen?.rows ?? []).filter((r) => r.agencyId);
   const selectedTotal = Object.values(picked).reduce((t, v) => {
@@ -206,6 +214,7 @@ export default function PaySalesTaxPage() {
         'success',
       );
       setMemo('');
+      setNumberTick((n) => n + 1);
       await load(dueThrough);
     } catch (err) {
       toastError(err, 'Could not record the sales tax payment.');
@@ -220,6 +229,7 @@ export default function PaySalesTaxPage() {
     try {
       await api.post(`/api/sales-tax/payments/${p.id}`, { action: 'void' });
       toast('Sales tax payment voided.', 'success');
+      setNumberTick((n) => n + 1);
       await load(dueThrough);
     } catch (err) {
       toastError(err, 'Could not void the payment.');

@@ -1,8 +1,21 @@
 /**
- * Make Deposits window (app/deposits/page.tsx): the shapes the page works with and how a saved
- * deposit is loaded back into the form for editing. Pure (no React, no I/O) so it is unit-tested.
+ * Make Deposits window (app/deposits/page.tsx): the shapes the page works with, how a saved
+ * deposit is loaded back into the form for editing, and which accounts "Deposit To" offers.
+ * Pure (no React, no I/O) so it is unit-tested (lib/depositEdit.review5.test.ts,
+ * lib/ui.review5.test.ts).
  */
 import { Money, toAmountString } from '@/lib/money';
+import { isDepositTargetAccount, isUndepositedFunds } from '@/lib/accountTypes';
+
+export interface DepositAccount {
+  id: string;
+  code: string;
+  name: string;
+  type: string;
+  subtype?: string | null;
+  /** p1 fx: bank account currency (null = home). */
+  currency?: string | null;
+}
 
 export interface UndepositedItem {
   id: string;
@@ -164,4 +177,20 @@ export function depositListHomeTotal(deposits: ReadonlyArray<Pick<Deposit, 'tota
     }
   }
   return toAmountString(sum);
+}
+
+/**
+ * Accounts offered in "Deposit To": bank accounts and other current assets (lib/accountTypes.ts
+ * isDepositTargetAccount, as on Receive Payments), never Undeposited Funds itself. The list used to
+ * hold every asset account — Accounts Receivable, Inventory Asset, fixed assets — so a deposit
+ * could be put "into" A/R or inventory, moving the GL without the customer or stock records.
+ * `keepIds`: the account a saved deposit being edited already uses stays listed (as Transfer
+ * Funds keeps its saved accounts), so the select shows it and its currency is known.
+ */
+export function depositToAccounts<T extends DepositAccount>(accounts: T[], keepIds: Array<string | null | undefined> = []): T[] {
+  return accounts.filter((a) => {
+    if (keepIds.includes(a.id)) return true;
+    const like = { type: a.type, subtype: a.subtype ?? null };
+    return isDepositTargetAccount(like) && !isUndepositedFunds(like) && a.code !== '1050';
+  });
 }

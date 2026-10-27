@@ -162,11 +162,34 @@ export function isDamagedFileMessage(message: string | null | undefined): boolea
 /** Pages that still work with a damaged file (restore / back it up), so no redirect from them. */
 const DAMAGED_FILE_PAGES = ['/damaged-file', '/backup', '/login', '/unlock'];
 
+/** Message when a response body is not the JSON the API always sends (a proxy or crash page). */
+export const UNREADABLE_RESPONSE_MESSAGE =
+  'The app got an answer it could not read, so it is not certain this was saved. Reload the page to check before you try again.';
+
+/**
+ * The parsed JSON body, or `undefined` when the body is not JSON. Every API route answers with
+ * JSON, but a crash page, a proxy in front of a hosted company file or a gateway error does not —
+ * JSON.parse then threw "Unexpected token '<'…", which reached the user as the error message.
+ */
+function parseBody(text: string): unknown {
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+}
+
 async function handle<T>(res: Response): Promise<T> {
   const text = await res.text();
-  const data = text ? JSON.parse(text) : null;
+  const parsed = parseBody(text);
+  if (parsed === undefined && res.ok) {
+    throw new ApiError(res.status, UNREADABLE_RESPONSE_MESSAGE, 'BAD_RESPONSE');
+  }
+  const data = (parsed ?? null) as { error?: string; code?: string; details?: unknown; fixes?: unknown } | null;
   if (!res.ok) {
-    const message = data?.error || res.statusText;
+    const message =
+      (typeof data?.error === 'string' && data.error) || res.statusText || `The request failed (error ${res.status}).`;
     // Stale unlock cookie: after an app relaunch the 12h bka_unlock cookie is still present
     // (so middleware's presence-only check renders pages) but its token no longer matches the
     // fresh per-launch nonce, so EVERY API call 403s. Send the user back to /unlock to re-enter

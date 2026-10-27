@@ -37,6 +37,7 @@ import { todayISO } from '@/lib/dates';
 // wave2 prefs: Memorize (Ctrl+M)
 import MemorizeButton from '@/components/MemorizeButton';
 import { formatCurrency } from '@/lib/money';
+import { billItemLineAmount, poLineAmount, sumLineAmounts } from '@/lib/purchaseLineMath';
 import { formatDate } from '@/lib/utils';
 import {
   DocNumberField,
@@ -130,14 +131,9 @@ function statusLabel(status: PoStatus): string {
   return 'Void';
 }
 
-function computeLineAmount(line: LineRow): number {
-  const qty = parseFloat(line.quantity) || 0;
-  const rate = parseFloat(line.rate) || 0;
-  return qty * rate;
-}
-
+/** The PO total as lib/services/purchaseOrders.ts saves it: the sum of round2(qty × rate) lines. */
 function computeTotal(lines: LineRow[]): number {
-  return lines.reduce((sum, l) => sum + computeLineAmount(l), 0);
+  return sumLineAmounts(lines.map((line) => poLineAmount(line.quantity, line.rate))).toNumber();
 }
 
 function lineRemaining(line: PoLine): number {
@@ -590,11 +586,9 @@ function ReceiveBillModal({ po, onClose, onBilled, accounts, items }: ReceiveBil
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [po?.id]);
 
+  // The bill the conversion creates: each line round2(qty × the PO's rate) (convertToBill).
   const billTotal = detail
-    ? detail.lines.reduce((sum, l) => {
-        const qty = parseFloat(qtyInputs[l.id] ?? '') || 0;
-        return sum + qty * (parseFloat(l.rate) || 0);
-      }, 0)
+    ? sumLineAmounts(detail.lines.map((l) => billItemLineAmount(qtyInputs[l.id] ?? '', l.rate))).toNumber()
     : 0;
 
   async function handleBill() {

@@ -39,10 +39,12 @@ import { TransactionNav, useAdjacentTransactions } from '@/components/Transactio
 
 import {
   depositListHomeTotal,
+  depositToAccounts,
   depositToEdit,
   emptyExtraLine,
   itemsForDepositCurrency,
   type Deposit,
+  type DepositAccount,
   type DepositEdit,
   type ExtraLine,
   type UndepositedItem,
@@ -59,14 +61,7 @@ type DepositBody = Record<string, unknown> & {
 // Types
 // ---------------------------------------------------------------------------
 
-interface Account {
-  id: string;
-  code: string;
-  name: string;
-  type: string;
-  /** p1 fx: bank account currency (null = home). */
-  currency?: string | null;
-}
+type Account = DepositAccount;
 
 // ---------------------------------------------------------------------------
 // Make Deposit Modal
@@ -752,8 +747,9 @@ function DepositsPageContent() {
     }
   }
 
-  // Bank accounts for the "Deposit To" picker (asset accounts excluding UF).
-  const bankAccounts = accounts.filter((a) => a.type === 'asset' && a.code !== '1050');
+  // "Deposit To": bank accounts and other current assets — never UF, A/R, inventory or fixed assets
+  // (a deposit being edited keeps the account it was saved to, so the select can show it).
+  const bankAccounts = depositToAccounts(accounts, [editing?.depositAccountId]);
 
   return (
     <main className="min-h-screen bg-offwhite p-8 font-sans">
