@@ -63,9 +63,9 @@ import {
   writeAudit,
 } from './_base';
 import { postJournalEntry, voidJournalEntry, type PostingLine } from './posting';
-import { allocateCheckNumber, assertCheckNumberAvailable, nextCheckNumber } from './checkNumbers';
+import { allocateCheckNumber, assertCheckNumberAvailable } from './checkNumbers';
 import { homeAmounts, resolveDocumentCurrency } from './currencies';
-import { receivePurchasedStock, reversePurchasedStock } from './bills';
+import { purchaseUnitCost, receivePurchasedStock, reversePurchasedStock } from './bills';
 import {
   type InventoryLineDetail,
   attachInventoryDetails,
@@ -290,8 +290,11 @@ async function prepareExpense(
       if (!amount.greaterThan(0)) {
         throw validation(`Line ${i + 1}: item line amounts must be greater than zero.`);
       }
-      const unitCost = line.unitCost != null ? Money.of(line.unitCost) : amount.dividedBy(qty);
-      if (unitCost.isNegative()) throw validation(`Line ${i + 1}: unit cost cannot be negative.`);
+      // The units are stocked at what the line posts (QB recalculates the cost from a typed-over amount).
+      const unitCost = purchaseUnitCost(qty, line.unitCost, amount);
+      if (unitCost.isNegative() || (line.unitCost != null && Money.of(line.unitCost).isNegative())) {
+        throw validation(`Line ${i + 1}: unit cost cannot be negative.`);
+      }
       const isInventory = item.type === 'inventory';
       let accountId: string;
       if (isInventory) {
@@ -488,6 +491,8 @@ async function receiveExpenseStock(
       isInventory: l.isInventory,
       quantity: l.quantity ?? '0',
       unitCost: l.unitCostHome,
+      // The amount the check debited to the inventory account (value remainder, as bills do).
+      homeAmount: l.homeAmount,
     })),
     `${opts.reason}:${expenseId}`,
   );
@@ -651,24 +656,35 @@ export async function updateExpense(ctx: ServiceContext, id: string, input: Crea
   // An inactive Other Names payee already on this check may stay on it.
   const prep = await prepareExpense(ctx, input, { keepOtherNameId: existing.otherNameId });
 
-  // Check number: keep the saved one unless the user typed another; print-later clears it.
   const toPrint = Boolean(input.toPrint) && input.method === 'check';
-  let reference = input.reference?.trim() || null;
-  if (input.method === 'check') {
-    if (toPrint) reference = null;
-    else if (!reference) reference = existing.reference ?? (await nextCheckNumber(ctx, input.paymentAccountId));
-    if (reference && input.checkDuplicateNumber && reference !== (existing.reference ?? '').trim()) {
-      await assertCheckNumberAvailable(ctx, {
-        paymentAccountId: input.paymentAccountId,
-        number: reference,
-        exclude: { source: 'expense', id },
-      });
-    }
-  }
 
   return inTransaction(ctx, async (tx) => {
     const [cur] = await tx.db.select().from(expenses).where(eq(expenses.id, id));
     if (!cur || cur.voidedAt) throw new ServiceError('CONFLICT', 'This transaction is void and cannot be edited.');
+    // Check number: keep the saved one unless the user typed another; print-later clears it; a
+    // check taken out of the print queue gets the account's next number. Numbered and
+    // duplicate-checked inside the transaction (as createExpense does), so a check written at the
+    // same moment can't take the same next number.
+    let reference = input.reference?.trim() || null;
+    if (input.method === 'check') {
+      if (toPrint) reference = null;
+      else if (!reference) {
+        reference =
+          (cur.method === 'check' ? cur.reference?.trim() : null) ||
+          (await allocateCheckNumber(tx, { paymentAccountId: input.paymentAccountId, exclude: { source: 'expense', id }, allowDuplicate: true }));
+      }
+      // A number already on this check is only re-checked when it lands on another bank account:
+      // check 1005 moved from Checking to Payroll Checking, where a check 1005 already exists, was
+      // saved as a silent duplicate (the account's register then had two checks 1005).
+      const sameCheck = reference === (cur.reference ?? '').trim() && cur.paymentAccountId === input.paymentAccountId;
+      if (reference && input.checkDuplicateNumber && !sameCheck) {
+        await assertCheckNumberAvailable(tx, {
+          paymentAccountId: input.paymentAccountId,
+          number: reference,
+          exclude: { source: 'expense', id },
+        });
+      }
+    }
     const oldLines = await tx.db
       .select()
       .from(expenseLines)

@@ -33,7 +33,7 @@
  *   claimed PO quantities (PO can return to 'open').
  */
 import { assertAccountantMayConvert } from './accountantCopy/guard';
-import { and, asc, desc, eq, inArray } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, or, sql } from 'drizzle-orm';
 import {
   accounts,
   inventoryLayers,
@@ -41,6 +41,8 @@ import {
   itemReceiptLines,
   itemReceipts,
   items,
+  journalEntries,
+  journalEntryLines,
   vendors,
 } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
@@ -53,10 +55,12 @@ import {
 import {
   type InventoryLineDetail,
   attachInventoryDetails,
+  loadDocumentInventoryDetails,
   postDocumentInventory,
   reverseDocumentInventory,
 } from './inventorySites';
 import { assertNoActiveLandedCost } from './landedCost';
+import { assertClosedPeriodEdit, retitleEntry } from './postedEdit';
 import { layerRoundingTolerance, takeFromDocumentLayers } from './fifo';
 import { valueRemainderAfter } from './inventory';
 import {
@@ -128,27 +132,95 @@ async function accountIdByCode(ctx: ServiceContext, code: string): Promise<strin
   return row.id;
 }
 
-/** Find-or-create the 2050 Item Receipts Accrual liability account. */
-export async function getOrCreateAccrualAccount(ctx: ServiceContext): Promise<string> {
-  const [row] = await ctx.db
-    .select({ id: accounts.id })
+const ITEM_RECEIPT_ACCRUAL_DESCRIPTION = 'Received-not-billed clearing account for item receipts (QB Receive Items).';
+
+/**
+ * The Item Receipts Accrual account if it exists (null otherwise; nothing is created). It used to be
+ * "whatever account has code 2050": on a chart converted from QuickBooks that is often the user's
+ * own liability ("2050 Accrued Vacation", a second A/P account), and every item receipt then
+ * credited — and every bill for received items debited — that account. The accrual is the account
+ * this app created: code 2050 with its name or description (a rename keeps the description), or
+ * the account named "Item Receipts Accrual" (created under another code because 2050 was taken).
+ */
+export async function findAccrualAccount(ctx: ServiceContext): Promise<string | null> {
+  const rows = await ctx.db
+    .select({ id: accounts.id, code: accounts.code, name: accounts.name, description: accounts.description, type: accounts.type })
     .from(accounts)
     .where(
-      and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, ITEM_RECEIPT_ACCRUAL_CODE)),
+      and(
+        eq(accounts.companyId, ctx.companyId),
+        or(
+          eq(accounts.code, ITEM_RECEIPT_ACCRUAL_CODE),
+          sql`lower(${accounts.name}) = lower(${ITEM_RECEIPT_ACCRUAL_NAME})`,
+        ),
+      ),
     );
-  if (row) return row.id;
+  const ours = (r: (typeof rows)[number]) =>
+    r.type === 'liability' &&
+    (r.name.trim().toLowerCase() === ITEM_RECEIPT_ACCRUAL_NAME.toLowerCase() || r.description === ITEM_RECEIPT_ACCRUAL_DESCRIPTION);
+  const byCode = rows.find((r) => r.code === ITEM_RECEIPT_ACCRUAL_CODE && ours(r));
+  return (byCode ?? rows.find(ours))?.id ?? null;
+}
+
+/** Find-or-create the Item Receipts Accrual liability account (code 2050 unless that is taken). */
+export async function getOrCreateAccrualAccount(ctx: ServiceContext): Promise<string> {
+  const found = await findAccrualAccount(ctx);
+  if (found) return found;
+  // 2050 belongs to another account of the user's chart: the accrual takes the next free code.
+  const used = new Set(
+    (await ctx.db.select({ code: accounts.code }).from(accounts).where(eq(accounts.companyId, ctx.companyId))).map((a) => a.code),
+  );
+  let n = Number(ITEM_RECEIPT_ACCRUAL_CODE);
+  while (used.has(String(n)) && n < 2099) n++;
+  let code = String(n);
+  for (let k = 1; used.has(code); k++) code = `${ITEM_RECEIPT_ACCRUAL_CODE}-${k}`;
   const [created] = await ctx.db
     .insert(accounts)
     .values({
       companyId: ctx.companyId,
-      code: ITEM_RECEIPT_ACCRUAL_CODE,
+      code,
       name: ITEM_RECEIPT_ACCRUAL_NAME,
       type: 'liability',
       subtype: 'other_current_liability',
-      description: 'Received-not-billed clearing account for item receipts (QB Receive Items).',
+      description: ITEM_RECEIPT_ACCRUAL_DESCRIPTION,
     })
     .returning();
   return created.id;
+}
+
+/**
+ * The account each receipt's own posted entry credited (its accrual), by receipt id. Billing a
+ * receipt must debit THAT account: receipts saved before findAccrualAccount stopped taking any
+ * account numbered 2050 credited the user's own 2050 (e.g. "2050 Equipment Loan"); billing them
+ * against the Item Receipts Accrual created now left the loan with the receipt's credit and the
+ * accrual with the bill's debit, both for good. A receipt has one credit line (Cr accrual total).
+ * Receipts with no posted entry are left out (the caller falls back to the accrual account).
+ */
+export async function receiptAccrualAccounts(ctx: ServiceContext, receiptIds: string[]): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  if (receiptIds.length === 0) return out;
+  const rows = await ctx.db
+    .select({ receiptId: itemReceipts.id, accountId: journalEntryLines.accountId, credit: journalEntryLines.credit })
+    .from(itemReceipts)
+    .innerJoin(journalEntries, eq(journalEntries.id, itemReceipts.postedEntryId))
+    .innerJoin(journalEntryLines, eq(journalEntryLines.journalEntryId, journalEntries.id))
+    .where(
+      and(
+        eq(itemReceipts.companyId, ctx.companyId),
+        inArray(itemReceipts.id, [...new Set(receiptIds)]),
+        eq(journalEntries.companyId, ctx.companyId),
+        eq(journalEntries.status, 'posted'),
+        sql`${journalEntryLines.credit} > 0`,
+      ),
+    );
+  const best = new Map<string, { accountId: string; credit: ReturnType<typeof Money.zero> }>();
+  for (const r of rows) {
+    const credit = Money.of(r.credit ?? 0);
+    const prev = best.get(r.receiptId);
+    if (!prev || credit.greaterThan(prev.credit)) best.set(r.receiptId, { accountId: r.accountId, credit });
+  }
+  for (const [id, b] of best) out.set(id, b.accountId);
+  return out;
 }
 
 /** True when the item has ever had FIFO cost layers (mirrors bills.ts/inventory). */
@@ -378,6 +450,117 @@ export async function createItemReceipt(ctx: ServiceContext, input: CreateItemRe
  * stock pulled back out, site movements reversed, PO quantities released) and the new version
  * is posted on the SAME receipt (same id, so FIFO layers / landed-cost links keep pointing at it).
  */
+/** Inventory detail of a line as the comparison key (null/undefined/empty treated alike). */
+function receiptDetailKey(d: Partial<InventoryLineDetail> | null | undefined): string {
+  const serials = [...(d?.serialNumbers ?? [])].map((s) => String(s).trim()).filter(Boolean).sort();
+  const exp = d?.lotExpiration ? new Date(d.lotExpiration).toISOString().slice(0, 10) : '';
+  return [d?.siteId ?? '', d?.binId ?? '', serials.join(','), (d?.lotNumber ?? '').trim(), exp].join('|');
+}
+
+/**
+ * A reference / memo / line-description edit of a saved receipt changes nothing in the ledger or
+ * the stock (same vendor, date, PO link, items, quantities, costs and receiving site / bin /
+ * serials / lot). QB allows it on any receipt, also once its items were sold or it was billed, so
+ * it must not go through the void + repost path, which refuses when the received units are gone.
+ */
+async function isLedgerNeutralReceiptEdit(
+  ctx: ServiceContext,
+  receipt: typeof itemReceipts.$inferSelect,
+  input: CreateItemReceiptInput,
+): Promise<boolean> {
+  if (!receipt.postedEntryId || receipt.vendorId !== input.vendorId) return false;
+  if ((receipt.purchaseOrderId ?? null) !== (input.purchaseOrderId ?? null)) return false;
+  if (new Date(receipt.date).toISOString().slice(0, 10) !== new Date(input.date).toISOString().slice(0, 10)) return false;
+  const oldLines = await ctx.db
+    .select()
+    .from(itemReceiptLines)
+    .where(eq(itemReceiptLines.itemReceiptId, receipt.id))
+    .orderBy(asc(itemReceiptLines.lineOrder));
+  if (!input.lines || oldLines.length !== input.lines.length) return false;
+  const details = await loadDocumentInventoryDetails(ctx, 'item_receipt', receipt.id);
+  for (const [i, n] of input.lines.entries()) {
+    const o = oldLines[i];
+    let qty: Dec;
+    let cost: Dec;
+    try {
+      qty = Money.of(Money.of(n.quantity).toFixed(4));
+      cost = Money.of(Money.of(n.unitCost).toFixed(4));
+    } catch {
+      return false;
+    }
+    if (o.itemId !== n.itemId || !qty.equals(Money.of(o.quantity)) || !cost.equals(Money.of(o.unitCost))) return false;
+    const given =
+      n.siteId !== undefined ||
+      n.binId !== undefined ||
+      n.serialNumbers !== undefined ||
+      n.lotNumber !== undefined ||
+      n.lotExpiration !== undefined;
+    if (given && receiptDetailKey(n) !== receiptDetailKey(details.get(o.lineOrder))) return false;
+  }
+  const [entry] = await ctx.db
+    .select({ status: journalEntries.status })
+    .from(journalEntries)
+    .where(and(eq(journalEntries.id, receipt.postedEntryId), eq(journalEntries.companyId, ctx.companyId)));
+  return entry?.status === 'posted';
+}
+
+/** Ledger-neutral receipt edit (see isLedgerNeutralReceiptEdit): reference, memo, descriptions. */
+async function updateReceiptHeaderInTx(tx: ServiceContext, id: string, input: CreateItemReceiptInput) {
+  const [cur] = await tx.db.select().from(itemReceipts).where(and(eq(itemReceipts.id, id), eq(itemReceipts.companyId, tx.companyId)));
+  if (!cur || cur.status === 'void' || !(await isLedgerNeutralReceiptEdit(tx, cur, input))) {
+    throw new ServiceError('CONFLICT', 'This item receipt was changed by someone else while you edited it. Reload it and try again.');
+  }
+  // Closing date: even a memo change to a closed-period receipt needs the password.
+  await assertClosedPeriodEdit(tx, { entryId: cur.postedEntryId, what: 'item receipt', date: cur.date });
+  const [vendor] = await tx.db.select({ name: vendors.displayName }).from(vendors).where(eq(vendors.id, cur.vendorId));
+  const [updated] = await tx.db
+    .update(itemReceipts)
+    .set({ reference: input.reference ?? null, memo: input.memo ?? null })
+    .where(eq(itemReceipts.id, id))
+    .returning();
+  const oldLines = await tx.db
+    .select()
+    .from(itemReceiptLines)
+    .where(eq(itemReceiptLines.itemReceiptId, id))
+    .orderBy(asc(itemReceiptLines.lineOrder));
+  const names = new Map(
+    (
+      await tx.db
+        .select({ id: items.id, name: items.name })
+        .from(items)
+        .where(and(eq(items.companyId, tx.companyId), inArray(items.id, oldLines.map((l) => l.itemId))))
+    ).map((r) => [r.id, r.name] as const),
+  );
+  for (const [i, o] of oldLines.entries()) {
+    await tx.db
+      .update(itemReceiptLines)
+      .set({ description: input.lines[i].description ?? names.get(o.itemId) ?? null })
+      .where(eq(itemReceiptLines.id, o.id));
+  }
+  await retitleEntry(tx, cur.postedEntryId, {
+    description: `Item receipt ${input.reference ? `#${input.reference}` : id} - ${vendor?.name ?? ''}`.trim(),
+    reference: input.reference ?? null,
+  });
+  await writeAudit(tx, {
+    action: 'update',
+    entityType: 'item_receipt',
+    entityId: id,
+    oldValues: { reference: cur.reference, memo: cur.memo, lines: oldLines.map((l) => ({ description: l.description })) },
+    newValues: {
+      reference: input.reference ?? null,
+      memo: input.memo ?? null,
+      ledger: 'unchanged',
+      lines: input.lines.map((l) => ({ description: l.description ?? null })),
+    },
+  });
+  const lines = await tx.db
+    .select()
+    .from(itemReceiptLines)
+    .where(eq(itemReceiptLines.itemReceiptId, id))
+    .orderBy(asc(itemReceiptLines.lineOrder));
+  return { ...updated, lines };
+}
+
 export async function updateItemReceipt(ctx: ServiceContext, id: string, input: CreateItemReceiptInput) {
   const [receipt] = await ctx.db
     .select()
@@ -385,6 +568,12 @@ export async function updateItemReceipt(ctx: ServiceContext, id: string, input: 
     .where(and(eq(itemReceipts.id, id), eq(itemReceipts.companyId, ctx.companyId)));
   if (!receipt) throw notFound('Item receipt');
   if (receipt.status === 'void') throw new ServiceError('CONFLICT', 'Cannot edit a voided item receipt.');
+  // Reference / memo / description only: allowed on any receipt and never reposts (see above) —
+  // except while landed cost is allocated onto it (locked until the allocation is voided).
+  if (await isLedgerNeutralReceiptEdit(ctx, receipt, input)) {
+    await assertNoActiveLandedCost(ctx, { itemReceiptId: id });
+    return inTransaction(ctx, (tx) => updateReceiptHeaderInTx(tx, id, input));
+  }
   if (receipt.status !== 'open') {
     throw new ServiceError(
       'CONFLICT',
@@ -444,18 +633,30 @@ async function saveItemReceipt(
 
   for (const [i, line] of input.lines.entries()) {
     const item = itemMap.get(line.itemId)!;
-    const qty = Money.of(line.quantity);
+    // Quantity and unit cost are stored at 4 places (item_receipt_lines, FIFO layers); the amount
+    // is worked out from the stored values (as purchase orders do). A cost typed past 4 decimals
+    // (0.33333 x 1000) used to post 333.33 while the stored cost / FIFO layer valued 333.30, so
+    // the inventory GL drifted from the stock valuation and a void left the cents behind.
+    let qty: Dec;
+    let unitCost: Dec;
+    try {
+      qty = Money.of(Money.of(line.quantity).toFixed(4));
+      unitCost = Money.of(Money.of(line.unitCost).toFixed(4));
+    } catch {
+      throw validation(`Line ${i + 1}: enter the quantity and unit cost as numbers.`);
+    }
+    if (!qty.isFinite() || !unitCost.isFinite()) {
+      throw validation(`Line ${i + 1}: enter the quantity and unit cost as numbers.`);
+    }
     if (qty.lessThanOrEqualTo(0)) {
       throw validation(`Line ${i + 1}: quantity must be greater than zero.`);
     }
-    const unitCost = Money.of(line.unitCost);
     if (unitCost.isNegative()) {
       throw validation(`Line ${i + 1}: unit cost cannot be negative.`);
     }
+    // A $0 line (items received at no charge — a no-charge line of a purchase order) stocks the
+    // units at $0 and posts nothing; the receipt's total must still be more than zero (below).
     const amount = Money.round2(qty.times(unitCost));
-    if (!amount.greaterThan(0)) {
-      throw validation(`Line ${i + 1}: line amount (quantity x unit cost) must be greater than zero.`);
-    }
 
     const isInventory = item.type === 'inventory';
     let accountId: string;
@@ -486,12 +687,16 @@ async function saveItemReceipt(
     });
     total = total.plus(amount);
   }
+  if (!total.greaterThan(0)) {
+    throw validation('The item receipt total must be more than zero (quantity x unit cost on at least one line).');
+  }
   const totalStr = toAmountString(total);
 
-  // Find-or-create the accrual account before opening the transaction.
-  const accrualAccountId = await getOrCreateAccrualAccount(ctx);
-
   return inTransaction(ctx, async (tx) => {
+    // Find-or-create the accrual account INSIDE the transaction: PGlite serializes transactions,
+    // so two first receipts saved at once find one 2050 account instead of each creating one.
+    const accrualAccountId = await getOrCreateAccrualAccount(tx);
+
     // --- Edit: unwind the saved version first (mirrors voidItemReceipt, minus the status flip) ---
     let oldLines: Array<typeof itemReceiptLines.$inferSelect> = [];
     if (existing) {
@@ -574,11 +779,14 @@ async function saveItemReceipt(
       reference: input.reference ?? null,
       sourceRef: `item_receipt:${receipt.id}`,
       lines: [
-        ...resolved.map((l) => ({
-          accountId: l.accountId,
-          debit: l.amount,
-          memo: l.description,
-        })),
+        // A $0 no-charge line posts nothing.
+        ...resolved
+          .filter((l) => Money.gt(l.amount, 0))
+          .map((l) => ({
+            accountId: l.accountId,
+            debit: l.amount,
+            memo: l.description,
+          })),
         {
           accountId: accrualAccountId,
           credit: totalStr,
@@ -709,27 +917,22 @@ export async function convertToBill(
   if (receipt.status === 'void') {
     throw new ServiceError('CONFLICT', 'Cannot convert a voided item receipt to a bill.');
   }
+  // Partly billed through Enter Bill for Received Items: the claim below would refuse it with
+  // "converted or voided by another transaction. Reload and retry", which no reload fixes.
+  if (receipt.status === 'partial') {
+    throw new ServiceError(
+      'CONFLICT',
+      'Part of this item receipt was already billed. Bill the rest with Enter Bill for Received Items.',
+    );
+  }
   const [rv] = await ctx.db.select({ currency: vendors.currency }).from(vendors).where(eq(vendors.id, receipt.vendorId));
   await assertHomeCurrencyVendor(ctx, rv?.currency ?? null);
 
-  const lines = await ctx.db
-    .select()
-    .from(itemReceiptLines)
-    .where(eq(itemReceiptLines.itemReceiptId, receiptId))
-    .orderBy(asc(itemReceiptLines.lineOrder));
-  if (lines.length === 0) throw validation('Item receipt has no lines to bill.');
-
-  // Item names for readable bill-line descriptions.
-  const itemIds = [...new Set(lines.map((l) => l.itemId))];
-  const itemRows = await ctx.db
-    .select({ id: items.id, name: items.name })
-    .from(items)
-    .where(and(eq(items.companyId, ctx.companyId), inArray(items.id, itemIds)));
-  const nameById = new Map(itemRows.map((r) => [r.id, r.name]));
-
-  const accrualAccountId = await getOrCreateAccrualAccount(ctx);
-
   return inTransaction(ctx, async (tx) => {
+    // The bill relieves the account the receipt's own entry credited (an older receipt may have
+    // credited another account numbered 2050; see receiptAccrualAccounts).
+    const accrualAccountId =
+      (await receiptAccrualAccounts(tx, [receiptId])).get(receiptId) ?? (await getOrCreateAccrualAccount(tx));
     // Claim the receipt first (guarded conditional UPDATE) so a concurrent
     // conversion can never post a second bill against the same accrual.
     const claimed = await tx.db
@@ -749,6 +952,31 @@ export async function convertToBill(
         'This item receipt was converted or voided by another transaction. Reload and retry.',
       );
     }
+    // The lines (and the receipt's own fields) are read after the claim, in this transaction: an
+    // edit of the receipt saved between a read before it and the claim replaced the lines, and the
+    // bill was then built from the old quantities / costs (and linked to lines that no longer exist).
+    const [current] = await tx.db.select().from(itemReceipts).where(eq(itemReceipts.id, receiptId));
+    if (current.vendorId !== receipt.vendorId) {
+      throw new ServiceError('CONFLICT', 'This item receipt was changed by someone else. Reload it and try again.');
+    }
+    receipt.reference = current.reference;
+    receipt.memo = current.memo;
+    receipt.date = current.date;
+    receipt.purchaseOrderId = current.purchaseOrderId;
+    const lines = await tx.db
+      .select()
+      .from(itemReceiptLines)
+      .where(eq(itemReceiptLines.itemReceiptId, receiptId))
+      .orderBy(asc(itemReceiptLines.lineOrder));
+    if (lines.length === 0) throw validation('Item receipt has no lines to bill.');
+
+    // Item names for readable bill-line descriptions.
+    const itemIds = [...new Set(lines.map((l) => l.itemId))];
+    const itemRows = await tx.db
+      .select({ id: items.id, name: items.name })
+      .from(items)
+      .where(and(eq(items.companyId, tx.companyId), inArray(items.id, itemIds)));
+    const nameById = new Map(itemRows.map((r) => [r.id, r.name]));
 
     // Bill lines all debit the accrual: Dr 2050 / Cr 2000 A/P. No itemId on the
     // lines: stock was already received by the receipt (and voidBill must not

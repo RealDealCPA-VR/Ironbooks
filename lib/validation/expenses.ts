@@ -36,12 +36,12 @@ export const createExpenseSchema = z
     vendorId: zUuid.nullish(),
     /** B3: payee from the Other Names list (instead of a vendor). */
     otherNameId: zUuid.nullish(),
-    payeeName: z.string().nullish(),
+    payeeName: z.string().max(255, 'can be at most 255 characters').nullish(),
     date: zDate,
     method: z.enum(['check', 'cash', 'credit_card'], {
       errorMap: () => ({ message: "method must be 'check', 'cash', or 'credit_card'" }),
     }),
-    reference: z.string().nullish(),
+    reference: z.string().max(100, 'can be at most 100 characters').nullish(),
     paymentAccountId: zUuid,
     memo: z.string().nullish(),
     toPrint: z.boolean().optional(),

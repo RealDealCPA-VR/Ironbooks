@@ -147,6 +147,22 @@ async function accountIdByCode(ctx: ServiceContext, code: string): Promise<strin
   return row.id;
 }
 
+/**
+ * An apply / unapply / refund amount (2dp). Text that is not a number ('abc', an object) used to
+ * escape as a MoneyParseError (HTTP 500 from POST /api/vendor-credits/:id); NaN / Infinity are
+ * refused too.
+ */
+function parseCreditAmount(value: unknown, what: string): Decimal {
+  let amt: Decimal;
+  try {
+    amt = Money.round2(value as string | number);
+  } catch {
+    throw validation(`${what} must be a number.`);
+  }
+  if (!amt.isFinite()) throw validation(`${what} must be a number.`);
+  return amt;
+}
+
 /** One validated vendor-credit line. */
 interface PreparedLine {
   /** Account credited: the item's inventory asset for inventory returns. */
@@ -389,6 +405,9 @@ async function restoreCreditStock(tx: ServiceContext, credit: typeof vendorCredi
       isInventory: true,
       quantity: Money.of(l.quantity!).toFixed(4),
       unitCost: Money.of(l.costAmount!).dividedBy(Money.of(l.quantity!)),
+      // The voided entry puts exactly the relieved cost back on the inventory account: the
+      // restored layers (or average) must be worth that much, not quantity x a rounded cost.
+      homeAmount: l.costAmount!,
     })),
     `vendor_credit_reversed:${credit.id}`,
   );
@@ -757,7 +776,64 @@ export async function getVendorCredit(ctx: ServiceContext, id: string) {
     .where(eq(vendorCreditLines.vendorCreditId, id))
     .orderBy(asc(vendorCreditLines.lineOrder));
 
-  return { ...credit, lines };
+  return { ...credit, lines, applications: await listVendorCreditApplications(ctx, id) };
+}
+
+/** One bill a vendor credit is (still) applied to, with the net amount applied. */
+export interface VendorCreditApplicationRow {
+  billId: string;
+  billNumber: string | null;
+  billDate: Date;
+  amount: string;
+}
+
+/**
+ * The bills this credit is applied to now (applications minus unapplications per bill, from the
+ * audit trail applyToBill / unapplyFromBill write — home and foreign alike, as netAppliedToBill).
+ * The Vendor Credits screen lists them with an Unapply button: without one, a credit applied to
+ * the wrong bill could not be voided, edited or moved ("Unapply first" had no way to do it), and
+ * neither could the bill.
+ */
+export async function listVendorCreditApplications(
+  ctx: ServiceContext,
+  vendorCreditId: string,
+): Promise<VendorCreditApplicationRow[]> {
+  const rows = await ctx.db
+    .select({ newValues: auditLogs.newValues })
+    .from(auditLogs)
+    .where(
+      and(
+        eq(auditLogs.companyId, ctx.companyId),
+        eq(auditLogs.entityType, 'vendor_credit'),
+        eq(auditLogs.entityId, vendorCreditId),
+        sql`${auditLogs.newValues}->>'action' IN ('applied_to_bill', 'unapplied_from_bill')`,
+      ),
+    );
+  const net = new Map<string, Decimal>();
+  for (const r of rows) {
+    const nv = (r.newValues ?? {}) as { action?: string; billId?: string; amount?: string };
+    if (!nv.billId) continue;
+    let a: Decimal;
+    try {
+      a = Money.of(nv.amount ?? '0');
+    } catch {
+      continue;
+    }
+    net.set(nv.billId, (net.get(nv.billId) ?? Money.zero()).plus(nv.action === 'applied_to_bill' ? a : a.negated()));
+  }
+  const billIds = [...net.entries()].filter(([, v]) => Money.round2(v).greaterThan(0)).map(([k]) => k);
+  if (billIds.length === 0) return [];
+  const billRows = await ctx.db
+    .select({ id: bills.id, billNumber: bills.billNumber, date: bills.date })
+    .from(bills)
+    .where(and(eq(bills.companyId, ctx.companyId), inArray(bills.id, billIds)))
+    .orderBy(asc(bills.date));
+  return billRows.map((b) => ({
+    billId: b.id,
+    billNumber: b.billNumber,
+    billDate: b.date,
+    amount: toAmountString(Money.round2(net.get(b.id)!)),
+  }));
 }
 
 // ---------------------------------------------------------------------------
@@ -778,7 +854,7 @@ export async function applyToBill(ctx: ServiceContext, input: ApplyToBillInput) 
 }
 
 async function applyToBillInTx(ctx: ServiceContext, input: ApplyToBillInput) {
-  const applyAmount = Money.round2(input.amount);
+  const applyAmount = parseCreditAmount(input.amount, 'Apply amount');
 
   if (!applyAmount.greaterThan(0)) {
     throw validation('Apply amount must be greater than zero.');
@@ -952,7 +1028,7 @@ export async function unapplyFromBill(ctx: ServiceContext, input: UnapplyFromBil
 }
 
 async function unapplyFromBillInTx(ctx: ServiceContext, input: UnapplyFromBillInput) {
-  const unapplyAmount = Money.round2(input.amount);
+  const unapplyAmount = parseCreditAmount(input.amount, 'Unapply amount');
 
   if (!unapplyAmount.greaterThan(0)) {
     throw validation('Unapply amount must be greater than zero.');
@@ -1116,7 +1192,7 @@ async function refundVendorCreditInTx(ctx: ServiceContext, input: RefundVendorCr
     throw new ServiceError('CONFLICT', 'Cannot refund a voided vendor credit.');
   }
 
-  const amount = Money.round2(input.amount);
+  const amount = parseCreditAmount(input.amount, 'Refund amount');
   if (!amount.greaterThan(0)) throw validation('Refund amount must be greater than zero.');
   const unapplied = Money.of(credit.unapplied);
   if (amount.greaterThan(unapplied)) {
@@ -1235,9 +1311,17 @@ async function voidVendorCreditInTx(ctx: ServiceContext, id: string) {
     return credit;
   }
 
-  // Block voiding if the credit has been partially or fully applied.
-  const appliedAmount = Money.of(credit.total).minus(Money.of(credit.unapplied));
-  if (appliedAmount.greaterThan(0)) {
+  // Block voiding if the credit has been partially or fully applied — or refunded: the vendor's
+  // refund deposit is a separate entry (sourceRef refund:<id>) that must be voided first.
+  const usedAmount = Money.of(credit.total).minus(Money.of(credit.unapplied));
+  const refunded = Money.of(credit.refundedAmount ?? '0');
+  if (usedAmount.greaterThan(0)) {
+    if (refunded.greaterThan(0) && !usedAmount.greaterThan(refunded)) {
+      throw new ServiceError(
+        'CONFLICT',
+        `This vendor credit was refunded to you (${toAmountString(refunded)} deposited). Void that refund deposit first, then the credit.`,
+      );
+    }
     throw new ServiceError(
       'CONFLICT',
       'Cannot void a vendor credit that has been applied to a bill. Unapply first.',

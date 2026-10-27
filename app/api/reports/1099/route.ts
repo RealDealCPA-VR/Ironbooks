@@ -5,14 +5,17 @@
  *   year       (required) — 4-digit calendar year, e.g. 2025.
  *   worksheet  (optional) — when "1", returns the account-mapped NEC + MISC
  *               worksheet ({ year, mapped, rows }) instead of the legacy
- *               Vendor1099Row[] (NEC-only, >= $600) array.
+ *               Vendor1099Row[] (NEC-only, >= the year's threshold) array.
+ *   nec        (optional) — when "1", returns the 1099-NEC recipients (NEC box 1 per the
+ *               1099 account mapping, >= the year's threshold): exactly the e-file / PDF contents.
  *
- * The legacy array shape is kept as the default for existing consumers
- * (1099 e-file page, XML/PDF exports).
+ * The legacy array shape (all payments, mapping ignored) is kept as the default for existing
+ * consumers; the e-file page, the XML e-file and the NEC PDF use the mapped NEC list.
  */
 import { type NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { vendor1099Report, vendor1099Worksheet } from '@/lib/services/statements';
+import { nec1099Recipients } from '@/lib/services/form1099Xml';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus } from '@/lib/routeErrors';
 
@@ -43,6 +46,10 @@ export async function GET(req: NextRequest) {
     if (searchParams.get('worksheet') === '1') {
       const worksheet = await vendor1099Worksheet(ctx, { year });
       return NextResponse.json(worksheet);
+    }
+    // 1099-NEC recipients (NEC box 1 per the 1099 account mapping) — what the e-file contains.
+    if (searchParams.get('nec') === '1') {
+      return NextResponse.json(await nec1099Recipients(ctx, year));
     }
 
     const rows = await vendor1099Report(ctx, { year });

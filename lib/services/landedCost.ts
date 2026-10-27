@@ -54,6 +54,7 @@ import {
 } from './_base';
 import { postJournalEntry, voidJournalEntry } from './posting';
 import { valueRemainderAfter } from './inventory';
+import { homeAmounts } from './currencies';
 
 export type LandedCostMethod = 'quantity' | 'value' | 'weight';
 
@@ -66,7 +67,7 @@ export interface AllocateLandedCostInput {
   method: LandedCostMethod;
   /** Item receipts whose inventory lines share the charge. */
   itemReceiptIds: string[];
-  /** Posting date; defaults to the bill date. */
+  /** Posting date; defaults to the bill date, or the latest item receipt's date when that is later. */
   date?: Date | null;
   memo?: string | null;
 }
@@ -200,9 +201,60 @@ function signedLine(accountId: string, amount: Dec, memo: string) {
     : { accountId, debit: toAmountString(amount), memo };
 }
 
+/**
+ * The HOME amount each line of these bills posted to its account. A foreign-currency bill stores
+ * its line amounts in the bill's currency and posts one anchor round2(total x rate) penny-allocated
+ * over the lines (bills.ts prepareBill); landed cost moves that home amount out of the charge
+ * account, never the foreign figure. Home bills: the stored amount.
+ */
+async function billLineHomeAmounts(
+  ctx: ServiceContext,
+  billRows: ReadonlyArray<{ id: string; currency: string | null; exchangeRate: string | null }>,
+): Promise<Map<string, Dec>> {
+  const out = new Map<string, Dec>();
+  const foreign = billRows.filter((b) => (b.currency ?? '').trim() !== '');
+  if (foreign.length === 0) return out;
+  const byBill = new Map<string, Array<{ id: string; billId: string; amount: string }>>();
+  for (const ids of chunked(foreign.map((b) => b.id))) {
+    for (const l of await ctx.db
+      .select({ id: billLines.id, billId: billLines.billId, amount: billLines.amount })
+      .from(billLines)
+      .where(inArray(billLines.billId, ids))
+      .orderBy(asc(billLines.billId), asc(billLines.lineOrder))) {
+      const list = byBill.get(l.billId) ?? [];
+      list.push(l);
+      byBill.set(l.billId, list);
+    }
+  }
+  for (const b of foreign) {
+    const own = byBill.get(b.id) ?? [];
+    const home = homeAmounts(
+      own.map((l) => l.amount),
+      b.exchangeRate ?? 1,
+    );
+    own.forEach((l, i) => out.set(l.id, home.lines[i]));
+  }
+  return out;
+}
+
+/**
+ * Ids per IN (...) list: one query binding every bill line / bill of a large company file went past
+ * Postgres' 65,535 bind parameters ("bind message has N parameter formats") and the Landed Cost
+ * screen failed to load.
+ */
+const IN_CHUNK = 2000;
+function chunked<T>(xs: T[]): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < xs.length; i += IN_CHUNK) out.push(xs.slice(i, i + IN_CHUNK));
+  return out;
+}
+
 /** Sum of active (non-void) allocations per bill line. */
 async function allocatedByBillLine(ctx: ServiceContext, billLineIds: string[]): Promise<Map<string, Dec>> {
-  if (billLineIds.length === 0) return new Map();
+  const out = new Map<string, Dec>();
+  if (billLineIds.length === 0) return out;
+  const wanted = billLineIds.length > IN_CHUNK ? new Set(billLineIds) : null;
+  // Many lines: every posted allocation of the company (a short list) instead of an IN list.
   const rows = await ctx.db
     .select({
       billLineId: landedCostAllocations.billLineId,
@@ -213,11 +265,12 @@ async function allocatedByBillLine(ctx: ServiceContext, billLineIds: string[]): 
       and(
         eq(landedCostAllocations.companyId, ctx.companyId),
         eq(landedCostAllocations.status, 'posted'),
-        inArray(landedCostAllocations.billLineId, billLineIds),
+        ...(wanted ? [] : [inArray(landedCostAllocations.billLineId, billLineIds)]),
       ),
     )
     .groupBy(landedCostAllocations.billLineId);
-  return new Map(rows.map((r) => [r.billLineId, Money.of(r.total)]));
+  for (const r of rows) if (!wanted || wanted.has(r.billLineId)) out.set(r.billLineId, Money.of(r.total));
+  return out;
 }
 
 /**
@@ -302,6 +355,8 @@ export async function listLandedCostSources(
       billId: bills.id,
       billNumber: bills.billNumber,
       billDate: bills.date,
+      billCurrency: bills.currency,
+      billRate: bills.exchangeRate,
       vendorName: vendors.displayName,
       billLineId: billLines.id,
       description: billLines.description,
@@ -320,10 +375,14 @@ export async function listLandedCostSources(
 
   const eligible = rows.filter((r) => r.itemType !== 'inventory');
   const allocated = await allocatedByBillLine(ctx, eligible.map((r) => r.billLineId));
+  const billsById = new Map(eligible.map((r) => [r.billId, { id: r.billId, currency: r.billCurrency, exchangeRate: r.billRate }]));
+  const homeByLine = await billLineHomeAmounts(ctx, [...billsById.values()]);
   return eligible
     .map((r) => {
       const done = allocated.get(r.billLineId) ?? Money.zero();
-      const remaining = Money.of(r.amount).minus(done);
+      // Allocations are in home currency (what the charge line posted).
+      const lineHome = homeByLine.get(r.billLineId) ?? Money.of(r.amount);
+      const remaining = lineHome.minus(done);
       return {
         billId: r.billId,
         billNumber: r.billNumber,
@@ -333,7 +392,7 @@ export async function listLandedCostSources(
         description: r.description,
         accountId: r.accountId,
         accountName: r.accountName,
-        amount: toAmountString(r.amount),
+        amount: toAmountString(lineHome),
         allocated: toAmountString(done),
         remaining: toAmountString(remaining),
       };
@@ -360,6 +419,8 @@ interface TargetLine {
 
 interface ComputedAllocation {
   bill: typeof bills.$inferSelect;
+  /** The latest date of the selected item receipts (the goods are in stock from then on). */
+  latestReceiptDate: Date;
   billLine: typeof billLines.$inferSelect;
   amount: Dec;
   targets: TargetLine[];
@@ -398,7 +459,9 @@ async function computeAllocation(ctx: ServiceContext, input: AllocateLandedCostI
   }
 
   const already = (await allocatedByBillLine(ctx, [billLine.id])).get(billLine.id) ?? Money.zero();
-  const remaining = Money.of(billLine.amount).minus(already);
+  // p1 fx: the charge account carries the line's HOME amount (a foreign bill stores its currency).
+  const lineHome = (await billLineHomeAmounts(ctx, [bill])).get(billLine.id) ?? Money.of(billLine.amount);
+  const remaining = lineHome.minus(already);
   let amount = remaining;
   if (input.amount != null && input.amount !== '') {
     try {
@@ -475,7 +538,8 @@ async function computeAllocation(ctx: ServiceContext, input: AllocateLandedCostI
   if (!totalBasis.greaterThan(0)) throw validation('The allocation basis of the selected lines is zero.');
 
   const amounts = allocate(amount, bases);
-  return { bill, billLine, amount, targets, bases, amounts };
+  const latestReceiptDate = receipts.reduce((m, r) => (r.date > m ? r.date : m), receipts[0].date);
+  return { bill, billLine, amount, targets, bases, amounts, latestReceiptDate };
 }
 
 /**
@@ -577,7 +641,10 @@ export async function previewLandedCost(
 export async function allocateLandedCost(ctx: ServiceContext, input: AllocateLandedCostInput) {
   return inTransaction(ctx, async (tx) => {
     const c = await computeAllocation(tx, input);
-    const date = input.date ?? c.bill.date;
+    // Default: the bill's date, or the day the last of the goods arrived when the charge was billed
+    // first (freight forwarders bill before delivery) — capitalizing it earlier put value on the
+    // inventory account for days the stock was not there yet.
+    const date = input.date ?? (c.latestReceiptDate > c.bill.date ? c.latestReceiptDate : c.bill.date);
     const cogsAccountId = await accountIdByCode(tx, '5000');
     let defaultInventoryId: string | null = null;
 

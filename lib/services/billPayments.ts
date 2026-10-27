@@ -27,7 +27,7 @@
  */
 import { assertAccountantDatesOpen } from './accountantCopy/guard';
 import { overAppliedFixes } from '@/lib/errorFixes';
-import { isPaymentSourceAccount } from '@/lib/accountTypes';
+import { isBankAccount, isPaymentSourceAccount } from '@/lib/accountTypes';
 import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import type Decimal from 'decimal.js';
 import { Money, toAmountString } from '@/lib/money';
@@ -230,6 +230,13 @@ async function preparePayment(ctx: ServiceContext, input: PayBillsInput): Promis
   if (!isFundable) {
     throw validation('Payment account must be a bank/cash or credit-card account.');
   }
+  // QB Pay Bills: "Check" pays from a bank account (as Write Checks does). A "check" from a credit
+  // card account went into the Print Checks queue under the card and took a check number there.
+  if (input.method === 'check' && !isBankAccount(payAcct)) {
+    throw validation(
+      'A check is written on a bank account. Pick a bank account to pay from, or choose Credit Card as the payment method.',
+    );
+  }
 
   const apAccountId = await resolveApAccount(ctx);
 
@@ -270,6 +277,7 @@ async function preparePayment(ctx: ServiceContext, input: PayBillsInput): Promis
         currency: bills.currency,
         exchangeRate: bills.exchangeRate,
         date: bills.date,
+        billNumber: bills.billNumber,
       })
       .from(bills)
       .where(and(eq(bills.id, app.billId), eq(bills.companyId, ctx.companyId)));
@@ -285,6 +293,15 @@ async function preparePayment(ctx: ServiceContext, input: PayBillsInput): Promis
     }
     if (bill.status === 'paid') {
       throw new ServiceError('CONFLICT', `Bill ${app.billId} is already fully paid.`);
+    }
+    // A bill can't be paid before it exists (as a vendor credit can't be applied before it does):
+    // the payment's A/P debit would sit on dates the bill is not on, so A/P aging as of those dates
+    // no longer matched the A/P account.
+    if (new Date(input.date).toISOString().slice(0, 10) < new Date(bill.date).toISOString().slice(0, 10)) {
+      throw validation(
+        `A bill can't be paid before its date. Date the payment on or after ${new Date(bill.date).toISOString().slice(0, 10)}, the date of bill ${bill.billNumber ?? app.billId}.`,
+        { billId: app.billId, billDate: new Date(bill.date).toISOString().slice(0, 10) },
+      );
     }
     const balance = Money.of(bill.balanceDue);
     const settled = applied.plus(discount);
@@ -537,6 +554,16 @@ async function applyJournalRows(tx: ServiceContext, paymentId: string, input: Pa
   });
 }
 
+/** Checks are numbered only on a bank account (a card account has no check sequence). */
+async function isBankPayFrom(ctx: ServiceContext, paymentAccountId: string | null | undefined): Promise<boolean> {
+  if (!paymentAccountId) return false;
+  const [acct] = await ctx.db
+    .select({ type: accounts.type, subtype: accounts.subtype })
+    .from(accounts)
+    .where(and(eq(accounts.id, paymentAccountId), eq(accounts.companyId, ctx.companyId)));
+  return Boolean(acct && isBankAccount(acct));
+}
+
 function referenceFor(input: PayBillsInput): { reference: string | null; toPrint: boolean } {
   const toPrint = Boolean(input.toPrint) && input.method === 'check';
   return { reference: toPrint ? null : input.reference?.trim() || null, toPrint };
@@ -558,12 +585,20 @@ function referenceFor(input: PayBillsInput): { reference: string | null; toPrint
  *  4. Write audit log.
  */
 export async function payBills(ctx: ServiceContext, input: PayBillsInput) {
-  const { reference, toPrint } = referenceFor(input);
+  const { reference: typed, toPrint } = referenceFor(input);
 
   return inTransaction(ctx, async (tx) => {
-    // Duplicate-number check inside the transaction (two payments at once see each other).
-    if (reference && input.method === 'check' && input.checkDuplicateNumber) {
-      await assertCheckNumberAvailable(tx, { paymentAccountId: input.paymentAccountId, number: reference });
+    // A check that is not "To be printed" gets a number like Write Checks does: the one typed
+    // (duplicate-checked inside the transaction, so two payments at once see each other), else
+    // the account's next check number (QB "Let QuickBooks assign check numbers"). Without it the
+    // check had no number in the register, Missing Checks or the next-number sequence.
+    let reference = typed;
+    if (input.method === 'check' && !toPrint && (await isBankPayFrom(tx, input.paymentAccountId))) {
+      reference = await allocateCheckNumber(tx, {
+        paymentAccountId: input.paymentAccountId,
+        number: typed,
+        allowDuplicate: !typed || !input.checkDuplicateNumber,
+      });
     }
     const prep = await preparePayment(tx, input);
     const entry = await postJournalEntry(tx, {
@@ -735,23 +770,30 @@ export async function updateBillPayment(ctx: ServiceContext, id: string, input: 
     throw validation('A bill payment cannot be moved to another vendor. Void it and pay the other vendor’s bills instead.');
   }
 
-  const { reference, toPrint } = referenceFor(input);
-  if (
-    reference &&
-    input.method === 'check' &&
-    input.checkDuplicateNumber &&
-    reference !== (existing.reference ?? '').trim()
-  ) {
-    await assertCheckNumberAvailable(ctx, {
-      paymentAccountId: input.paymentAccountId,
-      number: reference,
-      exclude: { source: 'bill_payment', id },
-    });
-  }
+  const { reference: typed, toPrint } = referenceFor(input);
 
   return inTransaction(ctx, async (tx) => {
     const [cur] = await tx.db.select().from(billPayments).where(eq(billPayments.id, id));
     if (!cur || cur.voidedAt) throw new ServiceError('CONFLICT', 'This payment is void and cannot be edited.');
+    // A check keeps its number when the edit leaves it blank (as Write Checks does); a check that
+    // never had one (taken out of the print queue) gets the account's next number. Numbered and
+    // duplicate-checked INSIDE the transaction, like a new check: PGlite serializes transactions,
+    // so a check written at the same moment can't take the same next number.
+    const keep = cur.method === 'check' ? cur.reference?.trim() || null : null;
+    let reference = typed;
+    if (!reference && input.method === 'check' && !toPrint && (await isBankPayFrom(tx, input.paymentAccountId))) {
+      reference = keep ?? (await allocateCheckNumber(tx, { paymentAccountId: input.paymentAccountId, exclude: { source: 'bill_payment', id }, allowDuplicate: true }));
+    }
+    // The number already on this check is re-checked only when it moves to another bank account
+    // (a check 1005 moved onto an account that already has a 1005 was saved as a duplicate).
+    const sameCheck = reference === (cur.reference ?? '').trim() && cur.paymentAccountId === input.paymentAccountId;
+    if (reference && input.method === 'check' && input.checkDuplicateNumber && !sameCheck) {
+      await assertCheckNumberAvailable(tx, {
+        paymentAccountId: input.paymentAccountId,
+        number: reference,
+        exclude: { source: 'bill_payment', id },
+      });
+    }
     const oldApps = await tx.db
       .select()
       .from(billPaymentApplications)
@@ -813,6 +855,8 @@ export async function updateBillPayment(ctx: ServiceContext, id: string, input: 
       if (cur.postedEntryId) await voidJournalEntry(tx, cur.postedEntryId);
       await rollbackApplications(tx, id);
       await reverseJournalApplicationsForBillPayment(tx, id);
+      // The closing date on the NEW date is reported before anything about the bills.
+      await assertPeriodOpen(tx, input.date);
       const prep = await preparePayment(tx, input);
       const entry = await postJournalEntry(tx, {
         date: input.date,
@@ -1039,6 +1083,15 @@ export async function billIdsForPayments(ctx: ServiceContext, paymentIds: string
  *  4. Stamp voidedAt on the bill payment.
  */
 export async function voidBillPayment(ctx: ServiceContext, id: string) {
+  // Load + validate in the same transaction as the void (as voidBill / voidExpense do): a payment
+  // edited at the same moment gets a NEW journal entry, and a void working from the row it read
+  // before that edit voided the old (already void) entry — the payment ended up void, its bills
+  // open again, but the edited payment's entry stayed posted (A/P and the bank no longer matched
+  // the bills). A second, double-submitted void also sees the payment already void.
+  return inTransaction(ctx, (tx) => voidBillPaymentInTx(tx, id));
+}
+
+async function voidBillPaymentInTx(ctx: ServiceContext, id: string) {
   const [payment] = await ctx.db
     .select()
     .from(billPayments)

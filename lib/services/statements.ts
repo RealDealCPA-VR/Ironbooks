@@ -14,7 +14,7 @@
  *
  * vendor1099Report — sums payments to 1099-flagged vendors for a calendar year.
  *   Combines bill payments (via bill_payment_applications) and direct expenses.
- *   Only vendors with total >= $600 are included as eligible.
+ *   Only vendors at or above the year's 1099 threshold ($600; $2,000 from 2026) are included.
  */
 import { and, asc, eq, gt, gte, inArray, isNotNull, isNull, lt, ne, not, or, sql } from 'drizzle-orm';
 import {
@@ -35,11 +35,12 @@ import {
   items,
   journalEntries,
   journalEntryLines,
+  journalItemApplications,
   paymentsReceived,
   vendors,
 } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
-import { notFound, validation, writeAudit, type ServiceContext } from './_base';
+import { inTransaction, notFound, validation, writeAudit, type ServiceContext } from './_base';
 import { taxIdFor } from './access';
 import { journalOpenItems } from './journal';
 import { generalJournalSourceSql } from './posting';
@@ -1148,7 +1149,16 @@ export interface Vendor1099Row {
   total: string;
 }
 
-const THRESHOLD_1099 = Money.of('600');
+/**
+ * The amount at which a 1099-NEC / 1099-MISC (rents, other income) is required for payments made
+ * in `year`: $600 through 2025; $2,000 for payments made after December 31, 2025 (Public Law
+ * 119-21, sec. 70433 — inflation-adjusted after 2026, so $2,000 is the floor the IRS publishes
+ * from). The worksheet, the e-file and the NEC PDFs used $600 for every year, so for 2026 every
+ * contractor paid $600–$1,999.99 was flagged "Form required" and put in the e-file.
+ */
+export function threshold1099(year: number): ReturnType<typeof Money.zero> {
+  return Money.of(year >= 2026 ? '2000' : '600');
+}
 
 /**
  * Aggregate vendor payments for a calendar year (Jan 1 – Dec 31).
@@ -1160,7 +1170,7 @@ const THRESHOLD_1099 = Money.of('600');
  * by funding account being a credit-card liability): those amounts are reportable
  * on the card processor's 1099-K, not the payer's 1099-NEC — matching QB Desktop.
  *
- * Only vendors with total >= $600 are returned.
+ * Only vendors at or above the year's threshold (threshold1099) are returned.
  */
 /**
  * 1099s report cash paid. A bill payment application stores the FULL settlement of the bill
@@ -1248,6 +1258,73 @@ function home1099(amount: ReturnType<typeof Money.zero>, rate: string | null): R
   if (!rate) return amount;
   const r = Money.of(rate);
   return r.greaterThan(0) && !r.equals(1) ? Money.round2(amount.times(r)) : amount;
+}
+
+/**
+ * General Journal amounts owed to 1099 vendors (named A/P credits, e.g. a contractor's opening
+ * balance from a QB conversion) that a Pay Bills check paid in the year (QB I11: they are listed
+ * in Pay Bills next to the bills). Only the bill payments' applications to BILLS were counted, so
+ * that cash never reached the 1099. Home currency (journal items are paid in home currency only);
+ * card-settled payments are excluded as for bills. `accounts` = the journal entry's other (debit)
+ * lines, for the account → box mapping.
+ */
+async function journalItemsPaid1099(
+  ctx: ServiceContext,
+  yearStart: Date,
+  yearEnd: Date,
+): Promise<
+  Array<{
+    vendorId: string;
+    vendorName: string;
+    taxId: string | null;
+    amount: ReturnType<typeof Money.zero>;
+    accounts: Array<{ accountId: string; amount: string }>;
+  }>
+> {
+  const fundingAccountNotCreditCard = or(
+    isNull(accounts.id),
+    not(and(eq(accounts.type, 'liability'), eq(accounts.subtype, 'credit_card'))!),
+  );
+  const rows = await ctx.db
+    .select({
+      vendorId: vendors.id,
+      vendorName: vendors.displayName,
+      taxId: vendors.taxId,
+      journalEntryId: journalItemApplications.journalEntryId,
+      journalLineId: journalItemApplications.journalLineId,
+      amount: journalItemApplications.amount,
+    })
+    .from(journalItemApplications)
+    .innerJoin(billPayments, eq(journalItemApplications.billPaymentId, billPayments.id))
+    .innerJoin(vendors, eq(billPayments.vendorId, vendors.id))
+    .leftJoin(accounts, eq(billPayments.paymentAccountId, accounts.id))
+    .where(
+      and(
+        eq(journalItemApplications.companyId, ctx.companyId),
+        eq(journalItemApplications.kind, 'bill_payment'),
+        eq(vendors.is1099, true),
+        gte(billPayments.date, yearStart),
+        lt(billPayments.date, yearEnd),
+        isNull(billPayments.voidedAt),
+        ne(billPayments.method, 'credit_card'),
+        fundingAccountNotCreditCard,
+      ),
+    );
+  if (rows.length === 0) return [];
+  const entryIds = [...new Set(rows.map((r) => r.journalEntryId))];
+  const debitLines = await ctx.db
+    .select({ entryId: journalEntryLines.journalEntryId, id: journalEntryLines.id, accountId: journalEntryLines.accountId, debit: journalEntryLines.debit })
+    .from(journalEntryLines)
+    .where(and(inArray(journalEntryLines.journalEntryId, entryIds), sql`COALESCE(${journalEntryLines.debit}, 0) > 0`));
+  return rows.map((r) => ({
+    vendorId: r.vendorId,
+    vendorName: r.vendorName,
+    taxId: r.taxId ?? null,
+    amount: Money.of(r.amount),
+    accounts: debitLines
+      .filter((l) => l.entryId === r.journalEntryId && l.id !== r.journalLineId)
+      .map((l) => ({ accountId: l.accountId, amount: l.debit ?? '0' })),
+  }));
 }
 
 export async function vendor1099Report(
@@ -1342,11 +1419,15 @@ export async function vendor1099Report(
   for (const r of expenseRows) {
     accumulate(r.vendorId, r.vendorName, r.taxId ?? null, toAmountString(home1099(Money.of(r.total), r.rate)));
   }
+  // General Journal amounts owed paid in Pay Bills (home currency).
+  for (const j of await journalItemsPaid1099(ctx, yearStart, yearEnd)) {
+    accumulate(j.vendorId, j.vendorName, j.taxId, toAmountString(j.amount));
+  }
 
-  // --- Filter to >= $600 ---
+  // --- Filter to the year's 1099 threshold ($600; $2,000 from 2026) ---
   const result: Vendor1099Row[] = [];
   for (const [vendorId, { vendorName, taxId, total }] of totals) {
-    if (total.greaterThanOrEqualTo(THRESHOLD_1099)) {
+    if (total.greaterThanOrEqualTo(threshold1099(year))) {
       result.push({
         vendorId,
         vendorName,
@@ -1411,6 +1492,10 @@ export async function set1099Mapping(ctx: ServiceContext, mapping: Tax1099Mappin
   const seen = new Set<string>();
   const allAccountIds: string[] = [];
   for (const entry of mapping.boxes) {
+    // A request body's entry may be anything (null, a string): a 400, not a TypeError (HTTP 500).
+    if (!entry || typeof entry !== 'object') {
+      throw validation('Each 1099 box mapping needs a box and a list of accountIds.');
+    }
     if (!validBoxes.has(entry.box)) {
       throw validation(`Unknown 1099 box "${entry.box}". Valid: ${[...validBoxes].join(', ')}.`);
     }
@@ -1418,8 +1503,8 @@ export async function set1099Mapping(ctx: ServiceContext, mapping: Tax1099Mappin
       throw validation(`Duplicate 1099 box "${entry.box}" in mapping.`);
     }
     seen.add(entry.box);
-    if (!Array.isArray(entry.accountIds)) {
-      throw validation(`accountIds for box "${entry.box}" must be an array.`);
+    if (!Array.isArray(entry.accountIds) || entry.accountIds.some((id) => typeof id !== 'string')) {
+      throw validation(`accountIds for box "${entry.box}" must be a list of account ids.`);
     }
     allAccountIds.push(...entry.accountIds);
   }
@@ -1441,35 +1526,40 @@ export async function set1099Mapping(ctx: ServiceContext, mapping: Tax1099Mappin
     }
   }
 
-  const [company] = await ctx.db
-    .select()
-    .from(companies)
-    .where(eq(companies.id, ctx.companyId));
-  if (!company) throw notFound('Company');
+  // Read and write the settings JSON in ONE transaction: another settings save (preferences,
+  // receiving, ...) committed between the read and the write here was overwritten with the old
+  // copy of its keys.
+  return inTransaction(ctx, async (tx) => {
+    const [company] = await tx.db
+      .select()
+      .from(companies)
+      .where(eq(companies.id, tx.companyId));
+    if (!company) throw notFound('Company');
 
-  const oldSettings = (company.settings ?? {}) as Record<string, unknown>;
-  const cleaned: Tax1099Mapping = {
-    boxes: mapping.boxes
-      .map((b) => ({ box: b.box, accountIds: [...new Set(b.accountIds)] }))
-      .filter((b) => b.accountIds.length > 0),
-  };
-  const newSettings = { ...oldSettings, tax1099: cleaned };
+    const oldSettings = (company.settings ?? {}) as Record<string, unknown>;
+    const cleaned: Tax1099Mapping = {
+      boxes: mapping.boxes
+        .map((b) => ({ box: b.box, accountIds: [...new Set(b.accountIds)] }))
+        .filter((b) => b.accountIds.length > 0),
+    };
+    const newSettings = { ...oldSettings, tax1099: cleaned };
 
-  const [updated] = await ctx.db
-    .update(companies)
-    .set({ settings: newSettings, updatedAt: new Date() })
-    .where(eq(companies.id, ctx.companyId))
-    .returning();
+    const [updated] = await tx.db
+      .update(companies)
+      .set({ settings: newSettings, updatedAt: new Date() })
+      .where(eq(companies.id, tx.companyId))
+      .returning();
 
-  await writeAudit(ctx, {
-    action: 'update',
-    entityType: 'company',
-    entityId: ctx.companyId,
-    oldValues: { tax1099: oldSettings.tax1099 ?? null },
-    newValues: { tax1099: cleaned },
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'company',
+      entityId: tx.companyId,
+      oldValues: { tax1099: oldSettings.tax1099 ?? null },
+      newValues: { tax1099: cleaned },
+    });
+
+    return (updated.settings as Record<string, unknown>).tax1099 as Tax1099Mapping;
   });
-
-  return (updated.settings as Record<string, unknown>).tax1099 as Tax1099Mapping;
 }
 
 // ---------------------------------------------------------------------------
@@ -1488,9 +1578,9 @@ export interface Vendor1099WorksheetRow {
   misc3: string;
   /** Sum of all boxes. */
   total: string;
-  /** NEC form required (nec1 >= $600). */
+  /** NEC form required (nec1 >= the year's threshold: $600; $2,000 from 2026). */
   necEligible: boolean;
-  /** MISC form required (misc1 >= $600 or misc3 >= $600). */
+  /** MISC form required (misc1 or misc3 >= the year's threshold). */
   miscEligible: boolean;
 }
 
@@ -1498,6 +1588,8 @@ export interface Vendor1099Worksheet {
   year: number;
   /** True when an account mapping is configured (otherwise everything counts as NEC box 1). */
   mapped: boolean;
+  /** The amount at which a form is required for this year (threshold1099). */
+  threshold: string;
   rows: Vendor1099WorksheetRow[];
 }
 
@@ -1663,8 +1755,21 @@ export async function vendor1099Worksheet(
     add(l.vendorId, l.vendorName, l.taxId ?? null, boxFor(l.accountId), home1099(Money.of(l.amount), l.rate));
   }
 
+  // General Journal amounts owed paid in Pay Bills: prorated over the journal entry's other
+  // (debit) lines, so each account routes its share to its box (as bill lines do).
+  for (const j of await journalItemsPaid1099(ctx, yearStart, yearEnd)) {
+    const lineSum = j.accounts.reduce((s, l) => s.plus(Money.of(l.amount)), Money.zero());
+    if (j.accounts.length === 0 || lineSum.lessThanOrEqualTo(0)) {
+      add(j.vendorId, j.vendorName, j.taxId, mapped ? null : 'nec_1', j.amount);
+      continue;
+    }
+    for (const line of j.accounts) {
+      add(j.vendorId, j.vendorName, j.taxId, boxFor(line.accountId), j.amount.times(Money.of(line.amount)).dividedBy(lineSum));
+    }
+  }
+
   // --- Build rows + thresholds ---
-  const THRESHOLD = Money.of('600');
+  const THRESHOLD = threshold1099(year);
   const rows: Vendor1099WorksheetRow[] = [];
   for (const [vendorId, acc] of totals) {
     const nec1 = acc.boxes.nec_1;
@@ -1688,5 +1793,5 @@ export async function vendor1099Worksheet(
 
   rows.sort((a, b) => Money.of(b.total).comparedTo(Money.of(a.total)));
 
-  return { year, mapped, rows };
+  return { year, mapped, threshold: toAmountString(THRESHOLD), rows };
 }

@@ -77,26 +77,26 @@ describe('review3 fx aggregates', () => {
 
   it('1099 report / worksheet report foreign bill payments and checks in home currency', async () => {
     const v = await eurVendor('EUR contractor', true);
-    // EUR 300 bill paid at 1.20 = USD 360 cash; EUR 250 check at 1.20 = USD 300. Total USD 660 (>= 600).
-    const bill = await eurBill(v.id, '300.00', '2026-02-01');
-    await payBills(ctx, { vendorId: v.id, date: d('2026-02-10'), method: 'ach', paymentAccountId: acct['1020'], exchangeRate: '1.20', applications: [{ billId: bill.id, amountApplied: '300.00' }] });
-    await createExpense(ctx, { vendorId: v.id, date: d('2026-03-01'), method: 'check', paymentAccountId: acct['1020'], currency: 'EUR', exchangeRate: '1.20', lines: [{ accountId: acct['6000'], amount: '250.00' }] });
+    // EUR 300 bill paid at 1.20 = USD 360 cash; EUR 250 check at 1.20 = USD 300. Total USD 660 (>= 600; 2025, before the $2,000 threshold of 2026).
+    const bill = await eurBill(v.id, '300.00', '2025-02-01');
+    await payBills(ctx, { vendorId: v.id, date: d('2025-02-10'), method: 'ach', paymentAccountId: acct['1020'], exchangeRate: '1.20', applications: [{ billId: bill.id, amountApplied: '300.00' }] });
+    await createExpense(ctx, { vendorId: v.id, date: d('2025-03-01'), method: 'check', paymentAccountId: acct['1020'], currency: 'EUR', exchangeRate: '1.20', lines: [{ accountId: acct['6000'], amount: '250.00' }] });
 
-    const row = (await vendor1099Report(ctx, { year: 2026 })).find((r) => r.vendorId === v.id);
+    const row = (await vendor1099Report(ctx, { year: 2025 })).find((r) => r.vendorId === v.id);
     expect.soft(row?.total ?? 'omitted').toBe('660.00');
-    const wr = (await vendor1099Worksheet(ctx, { year: 2026 })).rows.find((r) => r.vendorId === v.id);
+    const wr = (await vendor1099Worksheet(ctx, { year: 2025 })).rows.find((r) => r.vendorId === v.id);
     expect.soft(wr?.nec1 ?? 'omitted').toBe('660.00');
     expect.soft(wr?.necEligible).toBe(true);
   });
 
   it('1099s: a foreign payment with an early-payment discount reports cash share x payment rate', async () => {
     const v = await eurVendor('EUR discount contractor', true);
-    const bill = await eurBill(v.id, '1000.00', '2026-02-01');
+    const bill = await eurBill(v.id, '1000.00', '2025-02-01');
     // EUR 980 cash + EUR 20 discount at 1.20: USD 1,176 left the bank.
-    await payBills(ctx, { vendorId: v.id, date: d('2026-02-10'), method: 'ach', paymentAccountId: acct['1020'], exchangeRate: '1.20', discountAccountId: acct['6000'], applications: [{ billId: bill.id, amountApplied: '980.00', discountTaken: '20.00' }] });
-    const row = (await vendor1099Report(ctx, { year: 2026 })).find((r) => r.vendorId === v.id);
+    await payBills(ctx, { vendorId: v.id, date: d('2025-02-10'), method: 'ach', paymentAccountId: acct['1020'], exchangeRate: '1.20', discountAccountId: acct['6000'], applications: [{ billId: bill.id, amountApplied: '980.00', discountTaken: '20.00' }] });
+    const row = (await vendor1099Report(ctx, { year: 2025 })).find((r) => r.vendorId === v.id);
     expect.soft(row?.total ?? 'omitted').toBe('1176.00');
-    const wr = (await vendor1099Worksheet(ctx, { year: 2026 })).rows.find((r) => r.vendorId === v.id);
+    const wr = (await vendor1099Worksheet(ctx, { year: 2025 })).rows.find((r) => r.vendorId === v.id);
     expect.soft(wr?.nec1 ?? 'omitted').toBe('1176.00');
   });
 

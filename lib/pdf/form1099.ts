@@ -17,14 +17,17 @@
 
 import { PDFDocument, PDFPage, PDFFont, StandardFonts, rgb, PageSizes } from 'pdf-lib';
 import { stampSandbox } from './sandboxStamp';
+import { pdfText } from './check';
 
 // ---------------------------------------------------------------------------
 // Data types
 // ---------------------------------------------------------------------------
 
 export interface Form1099NecPdfData {
-  company: { name: string; address?: string | null };
-  vendor: { name: string; taxId?: string | null };
+  /** Payer: name, single-line `address` (legacy) or `addressLines`, and the payer's TIN (EIN). */
+  company: { name: string; address?: string | null; addressLines?: string[] | null; tin?: string | null; phone?: string | null };
+  /** Recipient: name, TIN and mailing address lines. */
+  vendor: { name: string; taxId?: string | null; addressLines?: string[] | null };
   year: number;
   nonemployeeComp: string | number;
 }
@@ -115,7 +118,25 @@ const COLOR_BLACK  = rgb(0, 0, 0);
 // render1099NecPdf
 // ---------------------------------------------------------------------------
 
-export async function render1099NecPdf(data: Form1099NecPdfData): Promise<Uint8Array> {
+export async function render1099NecPdf(input: Form1099NecPdfData): Promise<Uint8Array> {
+  // Names / addresses the standard fonts cannot encode ("Łódź", "Nguyễn") failed the whole PDF.
+  const lines = (ls: string[] | null | undefined) => (ls ?? []).map((l) => pdfText(l)).filter((l) => l.trim());
+  const data: Form1099NecPdfData = {
+    ...input,
+    company: {
+      ...input.company,
+      name: pdfText(input.company.name),
+      address: input.company.address ? pdfText(input.company.address) : input.company.address,
+      addressLines: lines(input.company.addressLines),
+      tin: input.company.tin ? pdfText(input.company.tin) : null,
+      phone: input.company.phone ? pdfText(input.company.phone) : null,
+    },
+    vendor: {
+      name: pdfText(input.vendor.name),
+      taxId: input.vendor.taxId ? pdfText(input.vendor.taxId) : null,
+      addressLines: lines(input.vendor.addressLines),
+    },
+  };
   const pdfDoc = await PDFDocument.create();
   const regular = await pdfDoc.embedFont(StandardFonts.Helvetica);
   const bold    = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
@@ -185,8 +206,12 @@ export async function render1099NecPdf(data: Form1099NecPdfData): Promise<Uint8A
   });
   cursor -= 14;
 
-  if (data.company.address) {
-    page.drawText(data.company.address, {
+  const payerLines = [
+    ...(data.company.addressLines?.length ? data.company.addressLines : data.company.address ? [data.company.address] : []),
+    ...(data.company.phone ? [data.company.phone] : []),
+  ];
+  for (const line of payerLines) {
+    page.drawText(line, {
       x: ML,
       y: cursor,
       font: regular,
@@ -195,6 +220,15 @@ export async function render1099NecPdf(data: Form1099NecPdfData): Promise<Uint8A
     });
     cursor -= 14;
   }
+  // The payer's TIN is required on every 1099 (QB prints the company EIN from My Company).
+  page.drawText(`PAYER'S TIN: ${data.company.tin?.trim() || 'Not on file — enter the EIN in Company Information'}`, {
+    x: ML,
+    y: cursor,
+    font: regular,
+    size: 10,
+    color: data.company.tin?.trim() ? COLOR_BLACK : COLOR_GRAY,
+  });
+  cursor -= 14;
 
   cursor -= 10;
 
@@ -229,9 +263,21 @@ export async function render1099NecPdf(data: Form1099NecPdfData): Promise<Uint8A
   });
   cursor -= 14;
 
+  // Recipient's mailing address (QB prints it for window envelopes).
+  for (const line of data.vendor.addressLines ?? []) {
+    page.drawText(line, {
+      x: ML,
+      y: cursor,
+      font: regular,
+      size: 10,
+      color: COLOR_BLACK,
+    });
+    cursor -= 14;
+  }
+
   const taxIdDisplay = data.vendor.taxId
-    ? `TIN / Tax ID: ${data.vendor.taxId}`
-    : 'TIN / Tax ID: Not on file';
+    ? `RECIPIENT'S TIN: ${data.vendor.taxId}`
+    : "RECIPIENT'S TIN: Not on file";
   page.drawText(taxIdDisplay, {
     x: ML,
     y: cursor,

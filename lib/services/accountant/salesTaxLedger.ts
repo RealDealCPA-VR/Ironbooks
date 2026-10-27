@@ -56,6 +56,7 @@ import {
   taxRates,
 } from '@/lib/db/schema';
 import { Money, allocate, toAmountString } from '@/lib/money';
+import { localDateISO } from '@/lib/dates';
 import type { ServiceContext } from '../_base';
 
 type Dec = ReturnType<typeof Money.zero>;
@@ -1188,11 +1189,13 @@ const isoDay = (y: number, m0: number, d: number) =>
 /**
  * The last COMPLETE filing period before `today` for a filing frequency (calendar months,
  * quarters and years, as QB uses): on 2026-10-12 monthly → Sep 1–30, quarterly → Jul 1–Sep 30,
- * annually → 2025-01-01–2025-12-31. Dates are YYYY-MM-DD.
+ * annually → 2025-01-01–2025-12-31. Dates are YYYY-MM-DD. With no date, "today" is the LOCAL
+ * calendar day: the UTC one already ran into the next month from about 8 PM in New York on the
+ * last day of a period, so the Sales Tax Liability report defaulted to the period still running.
  */
 export function lastFilingPeriod(
   frequency: SalesTaxFrequency,
-  today: Date | string = new Date(),
+  today: Date | string = localDateISO(new Date()),
 ): { from: string; to: string } {
   const t = typeof today === 'string' ? new Date(`${today.slice(0, 10)}T12:00:00.000Z`) : today;
   const y = t.getUTCFullYear();

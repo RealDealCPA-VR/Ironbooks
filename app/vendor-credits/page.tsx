@@ -70,6 +70,14 @@ interface VendorCredit {
   refNumber?: string | null;
 }
 
+/** A bill this credit is applied to, with the amount applied (GET /api/vendor-credits/:id). */
+interface CreditApplication {
+  billId: string;
+  billNumber: string | null;
+  billDate: string;
+  amount: string;
+}
+
 interface CreditLine {
   accountId: string;
   description: string;
@@ -174,6 +182,9 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId, n
   const vendorCur = vendors.find((v) => v.id === vendorId)?.currency || null;
 
   const [loadingEdit, setLoadingEdit] = useState(false);
+  /** Bills this credit is applied to (editing): each can be unapplied (QB: unapply the credit). */
+  const [applications, setApplications] = useState<CreditApplication[]>([]);
+  const [unapplying, setUnapplying] = useState<string | null>(null);
   const [itemList, setItemList] = useState<Named[]>([]);
   const [classList, setClassList] = useState<Named[]>([]);
   const [customerList, setCustomerList] = useState<Named[]>([]);
@@ -207,6 +218,7 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId, n
     setLines([{ ...EMPTY_LINE }]);
     setItemLines([{ ...EMPTY_ITEM_LINE }]);
     setFxRate('');
+    setApplications([]);
     if (!editId) return;
     let cancelled = false;
     setLoadingEdit(true);
@@ -218,6 +230,7 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId, n
         refNumber: string | null;
         exchangeRate?: string | null;
         lines: SavedLine[];
+        applications?: CreditApplication[];
       }>(
         `/api/vendor-credits/${editId}`,
       )
@@ -228,6 +241,7 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId, n
         setMemo(c.memo ?? '');
         setRefNumber(c.refNumber ?? '');
         setFxRate(c.exchangeRate ? String(Number(c.exchangeRate)) : '');
+        setApplications(c.applications ?? []);
         const dims = (l: SavedLine) => ({ classId: l.classId ?? '', customerId: l.customerId ?? '', jobId: l.jobId ?? '' });
         const exp = c.lines.filter((l) => !l.itemId);
         const its = c.lines.filter((l) => l.itemId);
@@ -305,6 +319,22 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId, n
     ...expenseLinesFilled.map((l) => l.amount || 0),
     ...itemLinesFilled.map((l) => l.amount || 0),
   );
+
+  /** Take the credit off one bill (the bill's balance comes back; the credit is unapplied again). */
+  async function unapply(app: CreditApplication) {
+    if (!editId) return;
+    setUnapplying(app.billId);
+    try {
+      await api.post(`/api/vendor-credits/${editId}`, { action: 'unapply', billId: app.billId, amount: app.amount, date: todayISO() });
+      setApplications((prev) => prev.filter((x) => x.billId !== app.billId));
+      toast('Credit unapplied — the bill is open again.', 'success');
+      onCreated();
+    } catch (err) {
+      toastError(err, 'Could not unapply the credit.');
+    } finally {
+      setUnapplying(null);
+    }
+  }
 
   async function handleSubmit() {
     if (!vendorId) { toast('Please select a vendor.', 'danger'); return; }
@@ -435,6 +465,23 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId, n
         {loadingEdit && (
           <div className="flex items-center gap-2 text-sm text-navy/50">
             <Spinner className="h-4 w-4" /> Loading credit…
+          </div>
+        )}
+        {editId && applications.length > 0 && (
+          <div className="rounded-lg border border-slate-100 p-3 text-sm">
+            <p className="font-semibold text-navy mb-2">Applied to</p>
+            <ul className="space-y-1">
+              {applications.map((a) => (
+                <li key={a.billId} className="flex items-center justify-between">
+                  <span>
+                    {a.billNumber ? `Bill #${a.billNumber}` : 'Bill'} of {formatDate(a.billDate, 'MMM d, yyyy')} — {formatCurrency(a.amount)}
+                  </span>
+                  <Button variant="ghost" size="sm" loading={unapplying === a.billId} onClick={() => unapply(a)}>
+                    Unapply
+                  </Button>
+                </li>
+              ))}
+            </ul>
           </div>
         )}
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
@@ -628,12 +675,16 @@ interface ApplyModalProps {
 function ApplyModal({ open, credit, bills, onClose, onApplied }: ApplyModalProps) {
   const [billId, setBillId] = useState('');
   const [amount, setAmount] = useState('');
+  // The day the credit is applied (A/P aging as of a date follows it): today in the user's
+  // calendar by default — without it the server dated it with its UTC clock.
+  const [applyDate, setApplyDate] = useState(() => todayISO());
   const [applying, setApplying] = useState(false);
 
   useEffect(() => {
     if (open) {
       setBillId('');
       setAmount('');
+      setApplyDate(todayISO());
     }
   }, [open]);
 
@@ -658,6 +709,7 @@ function ApplyModal({ open, credit, bills, onClose, onApplied }: ApplyModalProps
         action: 'apply',
         billId,
         amount,
+        date: applyDate || undefined,
       });
       toast('Credit applied to bill.', 'success');
       onApplied();
@@ -712,6 +764,11 @@ function ApplyModal({ open, credit, bills, onClose, onApplied }: ApplyModalProps
         </div>
 
         <div>
+          <Label htmlFor="apply-date">Date *</Label>
+          <Input id="apply-date" type="date" value={applyDate} onChange={(e) => setApplyDate(e.target.value)} />
+        </div>
+
+        <div>
           <Label htmlFor="apply-amount">Amount to Apply *</Label>
           <Input
             id="apply-amount"
@@ -749,12 +806,16 @@ interface RefundModalProps {
 function RefundModal({ open, credit, accounts, onClose, onRefunded }: RefundModalProps) {
   const [bankAccountId, setBankAccountId] = useState('');
   const [amount, setAmount] = useState('');
+  // The deposit's date (today in YOUR calendar by default; the server's "now" is a UTC instant,
+  // which in the evening in the Americas is already tomorrow).
+  const [refundDate, setRefundDate] = useState(() => todayISO());
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     if (open && credit) {
       setBankAccountId('');
       setAmount(Number(credit.unapplied).toFixed(2));
+      setRefundDate(todayISO());
     }
   }, [open, credit]);
 
@@ -773,6 +834,7 @@ function RefundModal({ open, credit, accounts, onClose, onRefunded }: RefundModa
         action: 'refund',
         bankAccountId,
         amount,
+        date: refundDate || undefined,
       });
       toast('Vendor refund recorded.', 'success');
       onRefunded();
@@ -824,6 +886,11 @@ function RefundModal({ open, credit, accounts, onClose, onRefunded }: RefundModa
               </option>
             ))}
           </Select>
+        </div>
+
+        <div>
+          <Label htmlFor="vc-refund-date">Deposit Date *</Label>
+          <Input id="vc-refund-date" type="date" value={refundDate} onChange={(e) => setRefundDate(e.target.value)} />
         </div>
 
         <div>

@@ -23,7 +23,8 @@ export const billLineSchema = z.object({
 
 export const createBillSchema = z.object({
   vendorId: zUuid,
-  billNumber: z.string().nullish(),
+  /** Vendor's reference number (bills.bill_number is varchar(100)). */
+  billNumber: z.string().max(100, 'can be at most 100 characters').nullish(),
   date: zDate,
   dueDate: zDate.nullish(),
   /** Payment terms ('net_30', '2_10_net_30', …); default = the vendor's terms. */

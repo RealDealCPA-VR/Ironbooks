@@ -28,8 +28,21 @@
  * the NEW date), and re-receives stock — all inside one transaction.
  */
 import { and, asc, desc, eq, inArray, ne, notInArray, sql } from 'drizzle-orm';
-import type Decimal from 'decimal.js';
-import { accounts, bills, billLines, classes, customers, inventoryLayers, items, jobs, loanPayments, vendors } from '@/lib/db/schema';
+import Decimal from 'decimal.js';
+import {
+  accounts,
+  bills,
+  billLines,
+  classes,
+  customers,
+  inventoryLayers,
+  items,
+  jobs,
+  journalEntries,
+  journalEntryLines,
+  loanPayments,
+  vendors,
+} from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type DiscountInfo, discountFor, dueDateFromTerms } from './billTerms';
 import { computeDiscount, computeDueDate, dueDateFromTermsList, findTermsRef, type TermsLike, type TermsRow } from './lists/terms';
@@ -37,10 +50,12 @@ import { duplicateNumberFixes } from '@/lib/errorFixes';
 import { getPreferences } from './company';
 import { homeAmounts, resolveDocumentCurrency } from './currencies';
 import { postJournalEntry, voidJournalEntry } from '@/lib/services/posting';
+import { assertClosedPeriodEdit, retitleEntry, sameLedgerLines } from './postedEdit';
 import {
   type DocumentInventoryLine,
   type InventoryLineDetail,
   attachInventoryDetails,
+  loadDocumentInventoryDetails,
   postDocumentInventory,
   reverseDocumentInventory,
 } from './inventorySites';
@@ -182,6 +197,64 @@ async function accountIdByCode(ctx: ServiceContext, code: string): Promise<strin
     .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, code)));
   if (!row) throw notFound(`Account with code ${code}`);
   return row.id;
+}
+
+/**
+ * Per-unit cost an item line stocks its units at. QB recalculates the cost from the amount when
+ * the amount is typed over qty x cost, so a line whose amount differs from round2(qty x unit
+ * cost) is costed at amount / qty — the value its entry debits to the inventory account (the FIFO
+ * layer / average cost then equal the GL, and a void takes out exactly what the line added).
+ * A consistent line keeps the cost typed (more precise than amount / qty).
+ */
+export function purchaseUnitCost(
+  qty: Decimal,
+  typedUnitCost: string | number | null | undefined,
+  amount: Decimal,
+): Decimal {
+  if (typedUnitCost == null || (typeof typedUnitCost === 'string' && typedUnitCost.trim() === '')) {
+    return amount.dividedBy(qty);
+  }
+  const typed = Money.of(typedUnitCost);
+  return Money.round2(qty.times(typed)).equals(Money.round2(amount)) ? typed : amount.dividedBy(qty);
+}
+
+/**
+ * The FIFO cost layer(s) a purchase of `qty` units stocks so they are worth EXACTLY `posted`, the
+ * home amount the document debited to Inventory Asset. The valuation reports (and every sale)
+ * value a layer at round2(quantity x 4-decimal unit cost), so a single layer at the rounded cost
+ * drifts from the GL on bulk quantities: 1500 units for $50.00 is 1500 x 0.0333 = 49.95, and the
+ * 5 cents stayed on the inventory account after the last unit was sold. Such a line is split into
+ * two layers one hundredth of a cent apart (1000 @ 0.0333 + 500 @ 0.0334 = 50.00); when that
+ * cannot hit the cent, one unit carries the remainder (as landed cost does).
+ */
+export function purchaseLayers(
+  qty: Decimal,
+  unitCost: Decimal,
+  posted: Decimal,
+): Array<{ quantity: Decimal; unitCost: Decimal }> {
+  const target = Money.round2(posted);
+  const worth = (ls: Array<{ quantity: Decimal; unitCost: Decimal }>) =>
+    ls.reduce((s, l) => s.plus(Money.round2(l.quantity.times(l.unitCost))), Money.zero());
+  const one = [{ quantity: qty, unitCost: Money.of(unitCost.toFixed(4)) }];
+  if (!qty.greaterThan(1) || worth(one).equals(target) || target.isNegative()) return one;
+  const base = target.dividedBy(qty).toDecimalPlaces(4, Decimal.ROUND_DOWN);
+  if (qty.isInteger()) {
+    const up = target.minus(qty.times(base)).dividedBy('0.0001');
+    if (up.isInteger() && up.greaterThan(0) && up.lessThan(qty)) {
+      const two = [
+        { quantity: qty.minus(up), unitCost: base },
+        { quantity: up, unitCost: base.plus('0.0001') },
+      ];
+      if (worth(two).equals(target)) return two;
+    }
+  }
+  const rest = qty.minus(1);
+  const last = target.minus(Money.round2(rest.times(base)));
+  const split = [
+    { quantity: rest, unitCost: base },
+    { quantity: Money.of(1), unitCost: last },
+  ];
+  return !last.isNegative() && worth(split).equals(target) ? split : one;
 }
 
 /** True when the item has ever had FIFO cost layers (mirrors inventory.assertNotFifoTracked). */
@@ -327,12 +400,14 @@ async function prepareBill(ctx: ServiceContext, input: CreateBillInput): Promise
         line.amount != null
           ? Money.round2(line.amount)
           : Money.round2(qty.times(Money.of(line.unitCost!)));
-      if (!amount.greaterThan(0)) {
-        throw validation(`Line ${i + 1}: amount must be greater than zero.`);
+      // A $0 item line is allowed (QB: items received at no charge — a no-charge line of a
+      // purchase order): the units are stocked at $0 and the line posts nothing. The bill's total
+      // must still be more than zero (below).
+      if (amount.isNegative()) {
+        throw validation(`Line ${i + 1}: amount cannot be negative.`);
       }
-      const unitCost =
-        line.unitCost != null ? Money.of(line.unitCost) : amount.dividedBy(qty);
-      if (unitCost.isNegative()) {
+      const unitCost = purchaseUnitCost(qty, line.unitCost, amount);
+      if (unitCost.isNegative() || (line.unitCost != null && Money.of(line.unitCost).isNegative())) {
         throw validation(`Line ${i + 1}: unit cost cannot be negative.`);
       }
 
@@ -374,8 +449,10 @@ async function prepareBill(ctx: ServiceContext, input: CreateBillInput): Promise
       if (!line.accountId) {
         throw validation(`Line ${i + 1}: select an account or an item.`);
       }
-      const amt = Money.of(line.amount ?? 0);
-      if (!amt.greaterThan(0)) {
+      const amt = Money.round2(line.amount ?? 0);
+      // An explicit $0 account line (a no-charge line of a purchase order) is kept as a memo line
+      // and posts nothing; a line with no amount at all is a mistake.
+      if (amt.isNegative() || (amt.isZero() && (line.amount == null || String(line.amount).trim() === ''))) {
         throw validation(`Line ${i + 1}: amount must be greater than zero.`);
       }
       resolvedLines.push({
@@ -395,6 +472,10 @@ async function prepareBill(ctx: ServiceContext, input: CreateBillInput): Promise
     }
   }
 
+  if (!total.greaterThan(0)) {
+    throw validation('The bill total must be more than zero.');
+  }
+
   // Home-currency amounts: one anchor (round2(total x rate)) penny-allocated across the lines,
   // so the entry balances exactly. Inventory cost is carried in home currency.
   const home = homeAmounts(
@@ -403,7 +484,7 @@ async function prepareBill(ctx: ServiceContext, input: CreateBillInput): Promise
   );
   if (fx.currency) {
     resolvedLines.forEach((l, i) => {
-      if (!home.lines[i].greaterThan(0)) {
+      if (Money.of(l.amount).greaterThan(0) && !home.lines[i].greaterThan(0)) {
         throw validation(`Line ${i + 1}: the amount is too small to convert to your home currency.`);
       }
       l.homeAmount = toAmountString(home.lines[i]);
@@ -469,16 +550,21 @@ export async function receivePurchasedStock(
     const qty = Money.of(line.quantity);
     const currentQty = Money.of(item.quantityOnHand ?? '0');
     const newQty = currentQty.plus(qty);
+    // The HOME amount the document debited to the inventory account for this line.
+    const posted = line.homeAmount != null ? Money.of(line.homeAmount) : Money.round2(qty.times(line.unitCost));
 
     if (await isFifoTracked(tx, line.itemId)) {
-      await tx.db.insert(inventoryLayers).values({
-        companyId: tx.companyId,
-        itemId: line.itemId,
-        date,
-        quantityRemaining: qty.toFixed(4),
-        unitCost: line.unitCost.toFixed(4),
-        sourceRef,
-      });
+      // Layers worth exactly what the entry posted (inventory GL == FIFO valuation to the cent).
+      await tx.db.insert(inventoryLayers).values(
+        purchaseLayers(qty, line.unitCost, posted).map((l) => ({
+          companyId: tx.companyId,
+          itemId: line.itemId!,
+          date,
+          quantityRemaining: l.quantity.toFixed(4),
+          unitCost: l.unitCost.toFixed(4),
+          sourceRef,
+        })),
+      );
       await tx.db
         .update(items)
         .set({ quantityOnHand: newQty.toFixed(4), updatedAt: new Date() })
@@ -489,7 +575,6 @@ export async function receivePurchasedStock(
         ? line.unitCost
         : currentQty.times(currentAvg).plus(qty.times(line.unitCost)).dividedBy(newQty);
       // The cents the 4dp average cannot represent stay on record and leave with the last unit.
-      const posted = line.homeAmount != null ? Money.of(line.homeAmount) : Money.round2(qty.times(line.unitCost));
       await tx.db
         .update(items)
         .set({
@@ -725,13 +810,15 @@ function billInventoryLines(input: CreateBillInput, prep: PreparedBill): Documen
 /** Build the GL posting lines for a prepared bill: Dr per line, Cr A/P total. */
 function buildPostingLines(prep: PreparedBill, billNumber: string | null, billId: string) {
   return [
-    // Debit lines (one per bill line)
-    ...prep.resolvedLines.map((line) => ({
-      accountId: line.accountId,
-      debit: line.homeAmount,
-      memo: line.description,
-      classId: line.classId,
-    })),
+    // Debit lines (one per bill line; a $0 no-charge line posts nothing)
+    ...prep.resolvedLines
+      .filter((line) => Money.of(line.homeAmount).greaterThan(0))
+      .map((line) => ({
+        accountId: line.accountId,
+        debit: line.homeAmount,
+        memo: line.description,
+        classId: line.classId,
+      })),
     // Credit line — Accounts Payable (home currency)
     {
       accountId: prep.apAccountId,
@@ -749,9 +836,12 @@ function buildPostingLines(prep: PreparedBill, billNumber: string | null, billId
 export async function createBill(ctx: ServiceContext, input: CreateBillInput) {
   const prep = await prepareBill(ctx, input);
   const { resolvedLines, totalStr } = prep;
-  await assertBillNumberAvailable(ctx, input);
 
   return inTransaction(ctx, async (tx) => {
+    // Duplicate vendor-reference check INSIDE the transaction: PGlite serializes transactions, so
+    // a double-clicked Save (or two users entering the same bill) sees the first bill instead of
+    // both passing the check and saving the bill twice.
+    await assertBillNumberAvailable(tx, input);
     // --- Insert the bill header ---
     const [bill] = await tx.db
       .insert(bills)
@@ -862,6 +952,179 @@ async function assertNotLoanBill(ctx: ServiceContext, billId: string) {
   }
 }
 
+/** Inventory detail of a line as the comparison key (null/undefined/empty treated alike). */
+function detailKey(d: Partial<InventoryLineDetail> | null | undefined): string {
+  const serials = [...(d?.serialNumbers ?? [])].map((s) => String(s).trim()).filter(Boolean).sort();
+  const exp = d?.lotExpiration ? new Date(d.lotExpiration).toISOString().slice(0, 10) : '';
+  return [d?.siteId ?? '', d?.binId ?? '', serials.join(','), (d?.lotNumber ?? '').trim(), exp].join('|');
+}
+
+/**
+ * QB lets you fix the memo, the vendor's reference number, the terms / due date, a line's
+ * description or its billable Customer:Job on ANY saved bill: paid, credited, received against
+ * item receipts, or whose items were sold since. Such an edit changes nothing in the ledger, so the
+ * posted entry, the stock and every application stay as they are. True when `input` is that kind
+ * of edit of `bill`: same vendor, date, currency / rate, and the same lines (account, item,
+ * quantity, amount, class, inventory site / bin / serials / lot) posting the same entry.
+ */
+async function isLedgerNeutralBillEdit(
+  ctx: ServiceContext,
+  bill: typeof bills.$inferSelect,
+  input: CreateBillInput,
+  prep: PreparedBill,
+): Promise<boolean> {
+  if (!bill.postedEntryId || bill.vendorId !== input.vendorId) return false;
+  if (new Date(bill.date).toISOString().slice(0, 10) !== new Date(input.date).toISOString().slice(0, 10)) return false;
+  if ((bill.currency ?? null) !== (prep.currency ?? null)) return false;
+  if (prep.currency && !Money.of(bill.exchangeRate ?? 0).equals(prep.rate)) return false;
+  const oldLines = await ctx.db
+    .select()
+    .from(billLines)
+    .where(eq(billLines.billId, bill.id))
+    .orderBy(asc(billLines.lineOrder));
+  if (oldLines.length !== prep.resolvedLines.length) return false;
+  const details = await loadDocumentInventoryDetails(ctx, 'bill', bill.id);
+  for (const [i, n] of prep.resolvedLines.entries()) {
+    const o = oldLines[i];
+    if (
+      o.accountId !== n.accountId ||
+      (o.itemId ?? null) !== (n.itemId ?? null) ||
+      !Money.eq(o.quantity ?? 0, n.quantity) ||
+      !Money.eq(o.amount, n.amount) ||
+      (o.classId ?? null) !== (n.classId ?? null)
+    ) {
+      return false;
+    }
+    if (n.isInventory) {
+      const src = input.lines[i] ?? {};
+      const given =
+        src.siteId !== undefined ||
+        src.binId !== undefined ||
+        src.serialNumbers !== undefined ||
+        src.lotNumber !== undefined ||
+        src.lotExpiration !== undefined;
+      // Details not sent keep the saved ones; sent ones must match them.
+      if (given && detailKey(src) !== detailKey(details.get(o.lineOrder))) return false;
+    }
+  }
+  // The entry itself must be the one this bill would post (a bill entered against item receipts
+  // posts aggregated accrual / variance lines and is never ledger-neutral here).
+  const [entry] = await ctx.db
+    .select({ id: journalEntries.id, status: journalEntries.status })
+    .from(journalEntries)
+    .where(and(eq(journalEntries.id, bill.postedEntryId), eq(journalEntries.companyId, ctx.companyId)));
+  if (!entry || entry.status !== 'posted') return false;
+  const posted = await ctx.db
+    .select()
+    .from(journalEntryLines)
+    .where(eq(journalEntryLines.journalEntryId, entry.id));
+  return sameLedgerLines(
+    posted.map((l) => ({
+      accountId: l.accountId,
+      debit: l.debit,
+      credit: l.credit,
+      classId: l.classId,
+      entityType: (l.entityType ?? null) as never,
+      entityId: l.entityId ?? null,
+    })),
+    buildPostingLines(prep, input.billNumber ?? null, bill.id),
+  );
+}
+
+/**
+ * The Enter Bills form shows no quantity on an expense (account) line and re-sends it as
+ * { accountId, description, amount }, which prepareBill defaults to quantity 1. A saved account
+ * line keeps its own quantity unless one is sent: a P.O. account line billed for 3 hours stayed
+ * "3" on the bill, but any re-save (a date fix, even no change) turned it into 1, so the P.O.'s
+ * billed quantity dropped from 3 to 1 and the same hours could be billed again; and the re-save
+ * was never ledger-neutral (quantity 3 != 1). Lines map by position (as the edit does).
+ */
+function keepSavedAccountLineQuantities(
+  input: CreateBillInput,
+  prep: PreparedBill,
+  saved: ReadonlyArray<{ lineOrder: number; itemId: string | null; quantity: string | null }>,
+): void {
+  const byOrder = new Map(saved.map((l) => [l.lineOrder, l] as const));
+  prep.resolvedLines.forEach((n, i) => {
+    const src = input.lines[i];
+    if (!src || n.itemId || src.quantity != null) return;
+    const o = byOrder.get(i);
+    if (!o || o.itemId || o.quantity == null) return;
+    n.quantity = Money.of(o.quantity).toFixed(4);
+  });
+}
+
+/** Ledger-neutral bill edit (see isLedgerNeutralBillEdit): header and line text only. */
+async function updateBillHeaderInTx(tx: ServiceContext, id: string, input: CreateBillInput, prep: PreparedBill) {
+  const [bill] = await tx.db
+    .select()
+    .from(bills)
+    .where(and(eq(bills.id, id), eq(bills.companyId, tx.companyId)));
+  if (!bill) throw notFound('Bill');
+  if (bill.status === 'void') throw new ServiceError('CONFLICT', 'Cannot edit a voided bill.');
+  // Closing date: even a memo change to a closed-period bill needs the password (QB), and is
+  // recorded on the Closing Date Exception report.
+  await assertClosedPeriodEdit(tx, { entryId: bill.postedEntryId, what: 'bill', date: bill.date });
+  await assertBillNumberAvailable(tx, input, id);
+  const oldLines = await tx.db
+    .select()
+    .from(billLines)
+    .where(eq(billLines.billId, id))
+    .orderBy(asc(billLines.lineOrder));
+  const [updated] = await tx.db
+    .update(bills)
+    .set({
+      billNumber: input.billNumber ?? null,
+      dueDate: prep.dueDate,
+      terms: prep.terms,
+      memo: input.memo ?? null,
+      classId: input.classId ?? null,
+      updatedAt: new Date(),
+    })
+    .where(eq(bills.id, id))
+    .returning();
+  for (const [i, o] of oldLines.entries()) {
+    const n = prep.resolvedLines[i];
+    await tx.db
+      .update(billLines)
+      .set({
+        description: n.description,
+        // A line already billed to a customer keeps the Customer:Job it was billed to.
+        customerId: o.billedInvoiceId ? o.customerId : n.customerId,
+        jobId: o.billedInvoiceId ? o.jobId : n.jobId,
+      })
+      .where(eq(billLines.id, o.id));
+  }
+  await retitleEntry(tx, bill.postedEntryId, {
+    description: `Bill ${input.billNumber ? `#${input.billNumber}` : id}`,
+    reference: input.billNumber ?? null,
+  });
+  await writeAudit(tx, {
+    action: 'update',
+    entityType: 'bill',
+    entityId: id,
+    oldValues: {
+      billNumber: bill.billNumber,
+      dueDate: bill.dueDate,
+      terms: bill.terms,
+      memo: bill.memo,
+      classId: bill.classId,
+      lines: oldLines.map((l) => ({ description: l.description, customerId: l.customerId, jobId: l.jobId })),
+    },
+    newValues: {
+      billNumber: input.billNumber ?? null,
+      dueDate: prep.dueDate,
+      terms: prep.terms,
+      memo: input.memo ?? null,
+      classId: input.classId ?? null,
+      ledger: 'unchanged',
+      postedEntryId: bill.postedEntryId,
+      lines: prep.resolvedLines.map((l) => ({ description: l.description, customerId: l.customerId, jobId: l.jobId })),
+    },
+  });
+  return updated;
+}
+
 export async function updateBill(ctx: ServiceContext, id: string, input: CreateBillInput) {
   // Pre-check outside the transaction for a fast, friendly error.
   const [existing] = await ctx.db
@@ -871,6 +1134,36 @@ export async function updateBill(ctx: ServiceContext, id: string, input: CreateB
   if (!existing) throw notFound('Bill');
   if (existing.status === 'void') {
     throw new ServiceError('CONFLICT', 'Cannot edit a voided bill.');
+  }
+  // Loan Manager bills stay locked to the loan schedule (void and set the payment up again), and a
+  // bill with landed cost allocated from it stays locked until the allocation is voided.
+  await assertNotLoanBill(ctx, id);
+  await assertNoActiveLandedCost(ctx, { billId: id });
+  // A memo / number / terms / description edit never touches the ledger: allowed on any bill
+  // (paid, credited, received, items sold since), and re-saving an unchanged bill is a no-op for
+  // the books instead of a void + repost (which a sold-out stock line refused).
+  {
+    // An input the full edit would refuse anyway (e.g. the negative variance lines of a bill for
+    // received items) falls through to it, so its own checks give the usual message.
+    const neutralPrep = await prepareBill(ctx, input).catch(() => null);
+    if (neutralPrep) {
+      const saved = await ctx.db
+        .select({ lineOrder: billLines.lineOrder, itemId: billLines.itemId, quantity: billLines.quantity })
+        .from(billLines)
+        .where(eq(billLines.billId, id));
+      keepSavedAccountLineQuantities(input, neutralPrep, saved);
+    }
+    if (neutralPrep && (await isLedgerNeutralBillEdit(ctx, existing, input, neutralPrep))) {
+      return inTransaction(ctx, async (tx) => {
+        const [cur] = await tx.db.select().from(bills).where(and(eq(bills.id, id), eq(bills.companyId, tx.companyId)));
+        if (!cur) throw notFound('Bill');
+        // Re-check inside the transaction (a concurrent edit may have changed the ledger side).
+        if (!(await isLedgerNeutralBillEdit(tx, cur, input, neutralPrep))) {
+          throw new ServiceError('CONFLICT', 'This bill was changed by someone else while you edited it. Reload it and try again.');
+        }
+        return updateBillHeaderInTx(tx, id, input, neutralPrep);
+      });
+    }
   }
   if (existing.amountPaid && Money.gt(existing.amountPaid, 0)) {
     throw new ServiceError(
@@ -896,9 +1189,10 @@ export async function updateBill(ctx: ServiceContext, id: string, input: CreateB
 
   // Validate + resolve the new document (read-only).
   const prep = await prepareBill(ctx, input);
-  await assertBillNumberAvailable(ctx, input, id);
 
   return inTransaction(ctx, async (tx) => {
+    // Duplicate vendor-reference check in the same transaction as the save (see createBill).
+    await assertBillNumberAvailable(tx, input, id);
     // Re-load inside the transaction to close the read-then-write race.
     const [bill] = await tx.db
       .select()
@@ -930,6 +1224,9 @@ export async function updateBill(ctx: ServiceContext, id: string, input: CreateB
       .from(billLines)
       .where(eq(billLines.billId, id))
       .orderBy(asc(billLines.lineOrder));
+    // An account line sent without a quantity keeps the saved one (the P.O. sync below and the
+    // billed-line match compare quantities).
+    keepSavedAccountLineQuantities(input, prep, oldLines);
 
     // Billable lines already pulled onto a customer invoice keep that link (so they are not
     // offered for billing again) when the edit leaves them financially unchanged; changing one
@@ -958,6 +1255,17 @@ export async function updateBill(ctx: ServiceContext, id: string, input: CreateB
         billedLinkByNewIdx.set(idx, o.billedInvoiceId!);
       }
     }
+
+    // A bill made from a purchase order: the PO's billed quantities follow the edited lines (and
+    // its PO-linked lines must stay on the bill). Imported lazily: purchaseOrders.ts imports this
+    // module (createBill).
+    const { syncPoBillingForBillEdit } = await import('./purchaseOrders');
+    await syncPoBillingForBillEdit(tx, {
+      billId: id,
+      vendorChanged: bill.vendorId !== input.vendorId,
+      oldLines,
+      newLines: prep.resolvedLines,
+    });
 
     // 1) Void the original journal entry (assertPeriodOpen runs on its date).
     if (bill.postedEntryId) {

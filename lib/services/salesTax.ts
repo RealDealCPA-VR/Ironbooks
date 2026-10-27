@@ -8,6 +8,25 @@ import { accounts, creditMemos, taxAgencies, taxRateComponents, taxRates, invoic
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from './_base';
 
+/**
+ * A sales tax rate as a decimal fraction 0..1 (0.0825 = 8.25%). Text that is not a number used to
+ * throw a MoneyParseError (HTTP 500), and 'NaN' passed every range check and was STORED — every
+ * invoice taxed with it then computed NaN tax. Both are refused with a plain message.
+ */
+export function parseTaxRateFraction(value: unknown, label = 'Rate'): ReturnType<typeof Money.of> {
+  const bad = () =>
+    validation(`${label} must be a decimal fraction between 0 and 1 (e.g. 0.0825 for 8.25%).`);
+  if (typeof value !== 'string' && typeof value !== 'number') throw bad();
+  let r;
+  try {
+    r = Money.of(value);
+  } catch {
+    throw bad();
+  }
+  if (!r.isFinite() || r.isNegative() || r.greaterThan(1)) throw bad();
+  return r;
+}
+
 export async function listTaxAgencies(ctx: ServiceContext) {
   return ctx.db.select().from(taxAgencies).where(eq(taxAgencies.companyId, ctx.companyId));
 }
@@ -51,10 +70,7 @@ export async function createTaxRate(
   input: { name: string; rate: string | number; agencyId?: string | null },
 ) {
   if (!input.name?.trim()) throw validation('Rate name is required.');
-  const rate = Money.of(input.rate);
-  if (rate.isNegative() || rate.greaterThan(1)) {
-    throw validation('Rate must be a decimal fraction between 0 and 1 (e.g. 0.0825 for 8.25%).');
-  }
+  const rate = parseTaxRateFraction(input.rate);
   if (input.agencyId) {
     // Same company check as updateTaxRate: never link another company's tax agency.
     const [agency] = await ctx.db
@@ -91,18 +107,15 @@ export async function updateTaxRate(
   if (!name) throw validation('Rate name is required.');
   let rate = before.rate;
   if (patch.rate !== undefined) {
+    const r = parseTaxRateFraction(patch.rate);
     // A combined rate is the sum of its components — edit the components instead.
     const [component] = await ctx.db
       .select({ id: taxRateComponents.id })
       .from(taxRateComponents)
       .where(eq(taxRateComponents.taxRateId, id))
       .limit(1);
-    if (component && !Money.eq(patch.rate, before.rate)) {
+    if (component && !r.equals(Money.of(before.rate))) {
       throw validation('This rate is made of component rates. Change the components and the total updates itself.');
-    }
-    const r = Money.of(patch.rate);
-    if (r.isNegative() || r.greaterThan(1)) {
-      throw validation('Rate must be a decimal fraction between 0 and 1 (e.g. 0.0825 for 8.25%).');
     }
     rate = r.toFixed(6);
   }

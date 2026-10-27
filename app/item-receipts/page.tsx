@@ -346,10 +346,9 @@ function NewReceiptModal({ open, onClose, vendors, items, onCreated, editId }: N
       if (l.unitCost === '' || parseFloat(l.unitCost) < 0) {
         toast(`Line ${i + 1}: enter a unit cost (0 or more).`, 'danger'); return;
       }
-      if ((parseFloat(l.quantity) || 0) * (parseFloat(l.unitCost) || 0) <= 0) {
-        toast(`Line ${i + 1}: line amount must be greater than zero.`, 'danger'); return;
-      }
     }
+    // A $0 line (items received at no charge) is fine; the receipt as a whole must cost something.
+    if (liveTotal <= 0) { toast('The receipt total must be more than zero.', 'danger'); return; }
 
     setSaving(true);
     try {

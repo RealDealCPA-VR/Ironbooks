@@ -21,6 +21,7 @@ import { type ServiceContext, ServiceError, validation } from './_base';
 import { assertForeignCurrencyAllowed } from './multiCurrency';
 import { getHomeCurrencyCode } from './currencies';
 import { currencies } from '@/lib/db/schema';
+import { isMaskedValue } from '@/lib/permissions/mask';
 
 export interface VendorPurchaseFieldsInput {
   prefillAccountIds?: string[] | null;
@@ -102,7 +103,17 @@ export async function resolveVendorPurchaseFields(
     out.prefillAccountIds = ids.length > 0 ? ids : null;
   }
   if (input.printOnCheckAs !== undefined) out.printOnCheckAs = input.printOnCheckAs?.trim() || null;
-  if (input.accountNumber !== undefined) out.accountNumber = input.accountNumber?.trim() || null;
+  if (input.accountNumber !== undefined) {
+    // A user who may not see full account numbers gets "••••6789" in the vendor form, and the form
+    // sends it back on every save: it overwrote the real account number (then printed on every
+    // check memo as "Acct # ••••6789"). A masked value is never data — an edit keeps the saved
+    // number; a new vendor must be given the real one.
+    if (isMaskedValue(input.accountNumber)) {
+      if (!existing) throw validation('Enter the full account number; a masked value cannot be saved.');
+    } else {
+      out.accountNumber = input.accountNumber?.trim() || null;
+    }
+  }
 
   if (input.currency !== undefined) {
     const home = await getHomeCurrencyCode(ctx);

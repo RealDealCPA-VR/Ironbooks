@@ -14,6 +14,7 @@ import { taxRates, taxRateComponents, taxAgencies } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, notFound, validation, writeAudit, inTransaction } from './_base';
 import { salesTaxActivity } from './accountant/salesTaxLedger';
+import { parseTaxRateFraction } from './salesTax';
 
 // ---------------------------------------------------------------------------
 // listComponents
@@ -61,15 +62,19 @@ export async function setComponents(
 
   // Validate and convert each component rate.
   const parsed = components.map((c, i) => {
-    if (!c.name?.trim()) throw validation(`Component ${i + 1}: name is required.`);
-    const r = Money.of(c.rate);
-    if (r.isNegative() || r.greaterThan(1)) {
-      throw validation(
-        `Component ${i + 1}: rate must be a decimal fraction between 0 and 1 (e.g. 0.06 for 6%).`,
-      );
-    }
+    if (!c || typeof c !== 'object') throw validation(`Component ${i + 1}: enter a name and a rate.`);
+    if (typeof c.name !== 'string' || !c.name.trim()) throw validation(`Component ${i + 1}: name is required.`);
+    // NaN / Infinity / text are refused (NaN used to be stored and taxed every invoice NaN).
+    // Rounded to the 6 places the column stores BEFORE the combined rate is summed: the total was
+    // the sum of the unrounded rates, so components typed past 6 decimals (0.0000005 + 0.0000005)
+    // stored as 0.000001 each under a combined 0.000001 — the agencies' shares no longer added up
+    // to the rate the invoices charged.
+    const r = Money.of(parseTaxRateFraction(c.rate, `Component ${i + 1}: rate`).toFixed(6));
     return { name: c.name.trim(), agencyId: c.agencyId ?? null, rate: r };
   });
+  // The combined rate is the sum of its components and must itself be a valid rate.
+  const sum = parsed.reduce((s, c) => s.plus(c.rate), Money.zero());
+  if (sum.greaterThan(1)) throw validation('The component rates add up to more than 100%.');
 
   return inTransaction(ctx, async (tx) => {
     // Verify ownership.

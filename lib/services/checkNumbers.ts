@@ -6,7 +6,7 @@
  *   check number and returns the next one (lib/smartDefaults nextCheckNumberFrom: "1001A"
  *   counts as 1001, leading zeros are kept, gaps are not back-filled).
  *   Optionally filtered to a specific paymentAccountId so you get the next check number per
- *   bank account (paychecks are drawn on 1000 Checking, so they count for that account).
+ *   bank account (a paycheck counts for the bank account its entry paid the net pay from).
  *
  * reserveCheckNumber — alias for nextCheckNumber; returns the next available number without
  *   mutating any state (callers embed it in their own document as the reference field).
@@ -18,22 +18,22 @@
  *
  * These functions never write: storing the chosen number is the job of the owning service.
  */
-import { and, eq, isNull, ne, sql } from 'drizzle-orm';
-import { accounts, billPayments, expenses, journalEntries, paychecks, paymentChecks } from '@/lib/db/schema';
+import { type SQL, and, eq, isNull, ne, sql } from 'drizzle-orm';
+import { billPayments, expenses, journalEntries, paychecks, paymentChecks } from '@/lib/db/schema';
 import { type ServiceContext, ServiceError } from './_base';
 import { getPreferences } from './company';
 import { nextCheckNumberFrom } from '@/lib/smartDefaults';
 import { duplicateNumberFixes } from '@/lib/errorFixes';
 
 
-/** Paychecks are paid from 1000 Checking: they share that account's check sequence. */
-async function paychecksDrawOn(ctx: ServiceContext, paymentAccountId?: string): Promise<boolean> {
-  if (!paymentAccountId) return true;
-  const [row] = await ctx.db
-    .select({ code: accounts.code })
-    .from(accounts)
-    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, paymentAccountId)));
-  return row?.code === '1000';
+/**
+ * SQL: the paycheck was paid from this bank account — its journal entry credits the account (the
+ * net pay line). Paychecks are written on the Preferences > Payroll paycheck account (or the pay
+ * run's), not always 1000 Checking: a company paying payroll from "Payroll Checking" had its
+ * paychecks numbered, queued and duplicate-checked against 1000 Checking's check sequence.
+ */
+export function paycheckDrawnOnSql(paymentAccountId: string): SQL {
+  return sql`EXISTS (SELECT 1 FROM journal_entry_lines pc_jel WHERE pc_jel.journal_entry_id = ${paychecks.postedEntryId} AND pc_jel.account_id = ${paymentAccountId}::uuid AND COALESCE(pc_jel.credit, 0) > 0)`;
 }
 
 /**
@@ -89,13 +89,11 @@ export async function nextCheckNumber(
     ...payChkRefs.map((r) => r.reference),
   ];
 
-  if (await paychecksDrawOn(ctx, paymentAccountId)) {
-    const pcRefs = await ctx.db
-      .select({ reference: paychecks.checkNumber })
-      .from(paychecks)
-      .where(eq(paychecks.companyId, ctx.companyId));
-    allRefs.push(...pcRefs.map((r) => r.reference));
-  }
+  const pcRefs = await ctx.db
+    .select({ reference: paychecks.checkNumber })
+    .from(paychecks)
+    .where(and(eq(paychecks.companyId, ctx.companyId), ...(paymentAccountId ? [paycheckDrawnOnSql(paymentAccountId)] : [])));
+  allRefs.push(...pcRefs.map((r) => r.reference));
 
   return nextCheckNumberFrom(allRefs);
 }
@@ -181,20 +179,19 @@ export async function findDuplicateCheckNumbers(
     );
   out.push(...chkRows.map((r) => ({ source: 'payment_check' as const, ...r })));
 
-  if (await paychecksDrawOn(ctx, params.paymentAccountId)) {
-    const pcRows = await ctx.db
-      .select({ id: paychecks.id, date: paychecks.payDate, amount: paychecks.netPay })
-      .from(paychecks)
-      .where(
-        and(
-          eq(paychecks.companyId, ctx.companyId),
-          isNull(paychecks.voidedAt),
-          sql`trim(${paychecks.checkNumber}) = ${num}`,
-          ...(ex?.source === 'paycheck' ? [ne(paychecks.id, ex.id)] : []),
-        ),
-      );
-    out.push(...pcRows.map((r) => ({ source: 'paycheck' as const, ...r })));
-  }
+  const pcRows = await ctx.db
+    .select({ id: paychecks.id, date: paychecks.payDate, amount: paychecks.netPay })
+    .from(paychecks)
+    .where(
+      and(
+        eq(paychecks.companyId, ctx.companyId),
+        isNull(paychecks.voidedAt),
+        sql`trim(${paychecks.checkNumber}) = ${num}`,
+        paycheckDrawnOnSql(params.paymentAccountId),
+        ...(ex?.source === 'paycheck' ? [ne(paychecks.id, ex.id)] : []),
+      ),
+    );
+  out.push(...pcRows.map((r) => ({ source: 'paycheck' as const, ...r })));
   return out;
 }
 

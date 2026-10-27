@@ -4,13 +4,13 @@
 import { z } from 'zod';
 import { zUuid } from './helpers';
 
-const zEmail = z.union([z.literal(''), z.string().email('is not a valid email address')]).nullish();
+const zEmail = z.union([z.literal(''), z.string().max(255, 'can be at most 255 characters').email('is not a valid email address')]).nullish();
 
 export const createVendorSchema = z.object({
-  displayName: z.string().trim().min(1, 'displayName is required'),
-  companyName: z.string().nullish(),
+  displayName: z.string().trim().min(1, 'displayName is required').max(255, 'can be at most 255 characters'),
+  companyName: z.string().max(255, 'can be at most 255 characters').nullish(),
   email: zEmail,
-  phone: z.string().nullish(),
+  phone: z.string().max(50, 'can be at most 50 characters').nullish(),
   /** Free-form address map, e.g. { street, city, state, zip, country }. */
   address: z.record(z.string()).nullish(),
   terms: z.string().nullish(),

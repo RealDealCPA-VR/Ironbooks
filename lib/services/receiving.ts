@@ -45,8 +45,9 @@ import {
 } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { postJournalEntry } from './posting';
-import { valueRemainderAfter } from './inventory';
-import { ITEM_RECEIPT_ACCRUAL_CODE, getOrCreateAccrualAccount } from './itemReceipts';
+import { fifoLayerValue, valueRemainderAfter } from './inventory';
+import { dueDateFromTermsList } from './lists/terms';
+import { findAccrualAccount, getOrCreateAccrualAccount, receiptAccrualAccounts } from './itemReceipts';
 import {
   type ReceivingSettings,
   adjustPoReceivedUnbilled,
@@ -309,6 +310,10 @@ interface PlannedLine extends ReceiptBillLinePreview {
   varianceAccountId: string | null;
   inventoryAccountId: string | null;
   layerPlan: Array<{ layer: typeof inventoryLayers.$inferSelect; take: Dec }>;
+  /** FIFO: the 4-decimal unit-cost increment the layers in layerPlan get. */
+  layerUnitDelta: Dec | null;
+  /** The account the receipt's entry credited, which this bill relieves (set after planning). */
+  accrualAccountId: string;
 }
 
 async function accountIdByCode(ctx: ServiceContext, code: string): Promise<string> {
@@ -367,13 +372,9 @@ export async function getOrCreatePpvAccount(
   return created.id;
 }
 
-/** Look up the 2050 accrual account without creating it (placeholder when missing). */
-async function findAccrualAccount(ctx: ServiceContext): Promise<string> {
-  const [row] = await ctx.db
-    .select({ id: accounts.id })
-    .from(accounts)
-    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, ITEM_RECEIPT_ACCRUAL_CODE)));
-  return row?.id ?? ACCRUAL_PLACEHOLDER;
+/** Look up the Item Receipts Accrual account without creating it (placeholder when missing). */
+async function findAccrualAccountOrPlaceholder(ctx: ServiceContext): Promise<string> {
+  return (await findAccrualAccount(ctx)) ?? ACCRUAL_PLACEHOLDER;
 }
 
 async function isFifoTracked(ctx: ServiceContext, itemId: string): Promise<boolean> {
@@ -388,7 +389,7 @@ async function isFifoTracked(ctx: ServiceContext, itemId: string): Promise<boole
 /** Validate the request and compute every amount (read-only when `dryRun`). */
 async function planReceiptBill(ctx: ServiceContext, input: EnterReceiptBillInput, dryRun = false) {
   const [vendor] = await ctx.db
-    .select({ id: vendors.id, name: vendors.displayName })
+    .select({ id: vendors.id, name: vendors.displayName, terms: vendors.terms })
     .from(vendors)
     .where(and(eq(vendors.companyId, ctx.companyId), eq(vendors.id, input.vendorId)));
   if (!vendor) throw notFound('Vendor');
@@ -441,6 +442,9 @@ async function planReceiptBill(ctx: ServiceContext, input: EnterReceiptBillInput
   let defaultInventoryAcctId: string | null = null;
   // FIFO layer quantity already planned by earlier rows of this bill (same item, same layer).
   const layerTaken = new Map<string, Dec>();
+  // FIFO layers as the earlier rows of this bill leave them (remaining quantity, unit cost), to
+  // work out exactly what each row's re-costing does to the valuation.
+  const simLayer = new Map<string, { remaining: Dec; cost: Dec }>();
 
   const planned: PlannedLine[] = [];
   for (const [i, req] of input.lines.entries()) {
@@ -493,6 +497,7 @@ async function planReceiptBill(ctx: ServiceContext, input: EnterReceiptBillInput
     let inventoryVariance = Money.zero();
     let expensedVariance = Money.zero();
     let layerPlan: PlannedLine['layerPlan'] = [];
+    let layerUnitDelta: Dec | null = null;
 
     if (!totalVariance.isZero()) {
       if (!isInventory) {
@@ -550,8 +555,38 @@ async function planReceiptBill(ctx: ServiceContext, input: EnterReceiptBillInput
           const value = Money.of(item.quantityOnHand ?? '0').times(Money.of(item.averageCost ?? '0'));
           const floor = Money.round2(value).negated();
           if (inventoryVariance.lessThan(floor)) inventoryVariance = floor;
+        } else if (!inventoryVariance.isZero()) {
+          // FIFO: the layers take a 4-decimal unit-cost increment, so on bulk quantities they gain a
+          // few cents less (or more) than the variance (3000 units: +0.0003 each = 0.90 of 1.00).
+          // Capitalize exactly what the layers gain — the valuation reports' figure — and send the
+          // rest to the variance account with the share on sold units (inventory GL == valuation).
+          const coveredQty = layerPlan.reduce((s, p) => s.plus(p.take), Money.zero());
+          layerUnitDelta = inventoryVariance.dividedBy(coveredQty).toDecimalPlaces(4);
+          let change = Money.zero();
+          const after = new Map<string, { remaining: Dec; cost: Dec }>();
+          for (const { layer, take } of layerPlan) {
+            const cur = after.get(layer.id) ??
+              simLayer.get(layer.id) ?? { remaining: Money.of(layer.quantityRemaining), cost: Money.of(layer.unitCost) };
+            const newCost = cur.cost.plus(layerUnitDelta);
+            if (newCost.isNegative()) throw validation(`Price variance would make "${item.name}" cost negative.`);
+            const before = fifoLayerValue(cur.remaining, cur.cost);
+            if (take.equals(cur.remaining)) {
+              change = change.plus(fifoLayerValue(take, newCost).minus(before));
+              after.set(layer.id, { remaining: cur.remaining, cost: newCost });
+            } else {
+              const rest = cur.remaining.minus(take);
+              change = change.plus(fifoLayerValue(rest, cur.cost).plus(fifoLayerValue(take, newCost)).minus(before));
+              after.set(layer.id, { remaining: rest, cost: cur.cost });
+            }
+          }
+          inventoryVariance = Money.round2(change);
+          // Later rows of this bill see the layers as this one leaves them (only when it re-costs).
+          if (!inventoryVariance.isZero()) for (const [id, s] of after) simLayer.set(id, s);
         }
-        if (inventoryVariance.isZero()) layerPlan = [];
+        if (inventoryVariance.isZero()) {
+          layerPlan = [];
+          layerUnitDelta = null;
+        }
         expensedVariance = totalVariance.minus(inventoryVariance);
       }
     }
@@ -562,9 +597,11 @@ async function planReceiptBill(ctx: ServiceContext, input: EnterReceiptBillInput
       receipt,
       line,
       qtyTouched: touched,
+      accrualAccountId: '', // set once every row is planned (below)
       varianceAccountId,
       inventoryAccountId,
       layerPlan,
+      layerUnitDelta,
       receiptLineId: line.id,
       receiptId: receipt.id,
       itemId: item.id,
@@ -598,8 +635,21 @@ async function planReceiptBill(ctx: ServiceContext, input: EnterReceiptBillInput
     throw validation('The bill total must be greater than zero.');
   }
 
-  // Previews are read-only: never create the 2050 account from one (a receipt already did).
-  const accrualAccountId = dryRun ? await findAccrualAccount(ctx) : await getOrCreateAccrualAccount(ctx);
+  // Each receipt line relieves the account its receipt's own entry credited (an older receipt
+  // may have credited the user's own account numbered 2050; see receiptAccrualAccounts). Only a
+  // receipt with no posted entry falls back to the Item Receipts Accrual, and previews are
+  // read-only: they never create that account.
+  const creditedBy = await receiptAccrualAccounts(ctx, planned.map((l) => l.receiptId));
+  let fallbackAccrual: string | null = null;
+  for (const l of planned) {
+    const credited = creditedBy.get(l.receiptId);
+    if (credited) {
+      l.accrualAccountId = credited;
+      continue;
+    }
+    fallbackAccrual ??= dryRun ? await findAccrualAccountOrPlaceholder(ctx) : await getOrCreateAccrualAccount(ctx);
+    l.accrualAccountId = fallbackAccrual;
+  }
   const [apRow] = await ctx.db
     .select({ id: accounts.id })
     .from(accounts)
@@ -618,7 +668,7 @@ async function planReceiptBill(ctx: ServiceContext, input: EnterReceiptBillInput
     const prev = signed.get(accountId);
     signed.set(accountId, { amount: (prev?.amount ?? Money.zero()).plus(amount), memo: prev?.memo ?? memo });
   };
-  add(accrualAccountId, accrualRelieved, 'Item receipts accrual relieved');
+  for (const l of planned) add(l.accrualAccountId, Money.of(l.accrualAmount), 'Item receipts accrual relieved');
   for (const l of planned) {
     if (l.inventoryAccountId) add(l.inventoryAccountId, Money.of(l.inventoryVariance), `Price variance capitalized — ${l.itemName}`);
     if (l.varianceAccountId) {
@@ -655,10 +705,21 @@ async function planReceiptBill(ctx: ServiceContext, input: EnterReceiptBillInput
   return {
     vendor,
     planned,
-    accrualAccountId,
     apAccountId: apRow.id,
     preview: {
-      lines: planned.map(({ receipt: _r, line: _l, qtyTouched: _q, varianceAccountId: _v, inventoryAccountId: _i, layerPlan: _p, ...rest }) => rest),
+      lines: planned.map(
+        ({
+          receipt: _r,
+          line: _l,
+          qtyTouched: _q,
+          varianceAccountId: _v,
+          inventoryAccountId: _i,
+          layerPlan: _p,
+          layerUnitDelta: _u,
+          accrualAccountId: _a,
+          ...rest
+        }) => rest,
+      ),
       billTotal: toAmountString(billTotal),
       accrualRelieved: toAmountString(accrualRelieved),
       totalVariance: toAmountString(billTotal.minus(accrualRelieved)),
@@ -679,7 +740,11 @@ export async function previewReceiptBill(ctx: ServiceContext, input: EnterReceip
 export async function enterBillForReceivedItems(ctx: ServiceContext, input: EnterReceiptBillInput) {
   return inTransaction(ctx, async (tx) => {
     // Plan INSIDE the transaction so quantities/costs/layers cannot shift underneath us.
-    const { vendor, planned, preview, accrualAccountId, apAccountId } = await planReceiptBill(tx, input);
+    const { vendor, planned, preview, apAccountId } = await planReceiptBill(tx, input);
+    // QB fills the bill's terms and due date from the vendor (as Enter Bills does): without them
+    // A/P aging aged the bill from its own date and Pay Bills' "due on or before" ignored it.
+    const terms = vendor.terms?.trim() || null;
+    const dueDate = input.dueDate ?? (await dueDateFromTermsList(tx, terms, input.date));
 
     const [bill] = await tx.db
       .insert(bills)
@@ -688,7 +753,8 @@ export async function enterBillForReceivedItems(ctx: ServiceContext, input: Ente
         vendorId: input.vendorId,
         billNumber: input.billNumber ?? null,
         date: input.date,
-        dueDate: input.dueDate ?? null,
+        dueDate,
+        terms,
         memo:
           input.memo ??
           (Money.isZero(preview.billTotal)
@@ -711,7 +777,7 @@ export async function enterBillForReceivedItems(ctx: ServiceContext, input: Ente
       const memo = `${l.itemName} — ${Money.of(l.quantityBilled).toString()} @ ${Money.of(l.billUnitCost).toFixed(2)} (received @ ${Money.of(l.receiptUnitCost).toFixed(2)})`;
       lineRows.push({
         billId: bill.id,
-        accountId: accrualAccountId,
+        accountId: l.accrualAccountId,
         description: memo,
         quantity: l.quantityBilled,
         amount: l.accrualAmount,
@@ -787,8 +853,8 @@ export async function enterBillForReceivedItems(ctx: ServiceContext, input: Ente
       const invVariance = Money.of(l.inventoryVariance);
       if (!invVariance.isZero()) {
         if (l.layerPlan.length > 0) {
-          const coveredQty = l.layerPlan.reduce((s, p) => s.plus(p.take), Money.zero());
-          const unitDelta = invVariance.dividedBy(coveredQty).toDecimalPlaces(4);
+          // The increment planned with the variance (planReceiptBill capitalizes what it adds up to).
+          const unitDelta = l.layerUnitDelta ?? Money.zero();
           for (const { layer: planned0, take } of l.layerPlan) {
             // Re-read: an earlier row of this bill may already have split this layer.
             const [layer] = await tx.db.select().from(inventoryLayers).where(eq(inventoryLayers.id, planned0.id));
@@ -815,6 +881,9 @@ export async function enterBillForReceivedItems(ctx: ServiceContext, input: Ente
                   date: layer.date,
                   quantityRemaining: take.toFixed(4),
                   unitCost: newCost.toFixed(4),
+                  // Still the receipt's units: landed cost and the receipt's own void find its
+                  // layers by this tag (an untagged split made landed cost expense them as sold).
+                  sourceRef: layer.sourceRef,
                 })
                 .returning();
               layerAdjustments.push({

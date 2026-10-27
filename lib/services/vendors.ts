@@ -189,6 +189,12 @@ export async function updateVendor(
   id: string,
   patch: UpdateVendorInput,
 ) {
+  // The unique-name check, the update and its audit row in ONE transaction (as createVendor):
+  // two vendors renamed to the same name at once both passed the check and both kept the name.
+  return inTransaction(ctx, (tx) => updateVendorInTx(tx, id, patch));
+}
+
+async function updateVendorInTx(ctx: ServiceContext, id: string, patch: UpdateVendorInput) {
   const before = await loadVendor(ctx, id);
   await assertAccountantListEdit(ctx, 'vendor', before as Record<string, unknown>, patch as Record<string, unknown>); // I1
 
@@ -270,7 +276,9 @@ export async function deactivateVendor(ctx: ServiceContext, id: string) {
     newValues: { isActive: false },
   });
 
-  return row;
+  // Masked like every other vendor read: DELETE /api/vendors/:id returned the raw row, so a user
+  // whose role hides tax IDs / account numbers read the vendor's full SSN/EIN by making it inactive.
+  return maskForContext(ctx, row);
 }
 
 

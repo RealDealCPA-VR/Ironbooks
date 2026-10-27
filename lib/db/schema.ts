@@ -1,4 +1,4 @@
-import { pgTable, uuid, varchar, text, timestamp, boolean, decimal, integer, jsonb, pgEnum } from 'drizzle-orm/pg-core';
+import { pgTable, uuid, varchar, text, timestamp, boolean, decimal, integer, jsonb, pgEnum, index } from 'drizzle-orm/pg-core';
 import { relations } from 'drizzle-orm';
 
 // Enums
@@ -711,7 +711,7 @@ export const bills = pgTable('bills', {
   exchangeRate: decimal('exchange_rate', { precision: 18, scale: 8 }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
-});
+}, (t) => [index('bills_company_vendor_idx').on(t.companyId, t.vendorId)]);
 
 export const billLines = pgTable('bill_lines', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -727,7 +727,7 @@ export const billLines = pgTable('bill_lines', {
   /** Set when this billable line has been pulled onto a customer invoice. */
   billedInvoiceId: uuid('billed_invoice_id').references(() => invoices.id),
   lineOrder: integer('line_order').notNull().default(0),
-});
+}, (t) => [index('bill_lines_bill_idx').on(t.billId)]);
 
 // ---- Bill payments (A/P) ----
 export const billPayments = pgTable('bill_payments', {
@@ -748,7 +748,7 @@ export const billPayments = pgTable('bill_payments', {
   currency: varchar('currency', { length: 3 }),
   exchangeRate: decimal('exchange_rate', { precision: 18, scale: 8 }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
-});
+}, (t) => [index('bill_payments_company_account_idx').on(t.companyId, t.paymentAccountId)]);
 
 export const billPaymentApplications = pgTable('bill_payment_applications', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -757,7 +757,7 @@ export const billPaymentApplications = pgTable('bill_payment_applications', {
   amountApplied: decimal('amount_applied', { precision: 15, scale: 2 }).notNull(),
   /** wave2 purchases: home-currency A/P relieved by this application (null = amountApplied). */
   amountHome: decimal('amount_home', { precision: 15, scale: 2 }),
-});
+}, (t) => [index('bill_payment_applications_bill_idx').on(t.billId), index('bill_payment_applications_payment_idx').on(t.billPaymentId)]);
 
 // ---- Direct expenses / checks (non-bill spend) ----
 export const expenses = pgTable('expenses', {
@@ -783,7 +783,7 @@ export const expenses = pgTable('expenses', {
   currency: varchar('currency', { length: 3 }),
   exchangeRate: decimal('exchange_rate', { precision: 18, scale: 8 }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
-});
+}, (t) => [index('expenses_company_account_idx').on(t.companyId, t.paymentAccountId)]);
 
 export const expenseLines = pgTable('expense_lines', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -801,7 +801,7 @@ export const expenseLines = pgTable('expense_lines', {
   itemId: uuid('item_id').references(() => items.id),
   quantity: decimal('quantity', { precision: 15, scale: 4 }),
   unitCost: decimal('unit_cost', { precision: 15, scale: 4 }),
-});
+}, (t) => [index('expense_lines_expense_idx').on(t.expenseId)]);
 
 // ---- Bank transfers ----
 export const transfers = pgTable('transfers', {
@@ -1181,7 +1181,7 @@ export const vendorCreditLines = pgTable('vendor_credit_lines', {
   classId: uuid('class_id').references(() => classes.id),
   customerId: uuid('customer_id').references(() => customers.id),
   jobId: uuid('job_id').references((): any => jobs.id),
-});
+}, (t) => [index('vendor_credit_lines_credit_idx').on(t.vendorCreditId)]);
 
 // ---- Sales orders (convert to invoice) ----
 export const salesOrders = pgTable('sales_orders', {
@@ -1332,7 +1332,7 @@ export const purchaseOrderLines = pgTable('purchase_order_lines', {
     .notNull()
     .default('0'),
   lineOrder: integer('line_order').notNull().default(0),
-});
+}, (t) => [index('purchase_order_lines_po_idx').on(t.purchaseOrderId)]);
 
 // ---- Item receipts (QB "Receive Items" before the bill arrives) ----
 export const itemReceipts = pgTable('item_receipts', {
@@ -1365,7 +1365,7 @@ export const itemReceiptLines = pgTable('item_receipt_lines', {
   /** Enhanced receiving: quantity already vendor-billed (or written off) from this line. */
   quantityBilled: decimal('quantity_billed', { precision: 15, scale: 4 }).notNull().default('0'),
   lineOrder: integer('line_order').notNull().default(0),
-});
+}, (t) => [index('item_receipt_lines_receipt_idx').on(t.itemReceiptId)]);
 
 // ---- Pending assembly builds (QB "Pending Builds") ----
 export const pendingBuilds = pgTable('pending_builds', {

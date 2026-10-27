@@ -18,7 +18,7 @@ export const itemReceiptLineSchema = z.object({
 export const createItemReceiptSchema = z.object({
   vendorId: zUuid,
   date: zDate,
-  reference: z.string().nullish(),
+  reference: z.string().max(100, 'can be at most 100 characters').nullish(),
   memo: z.string().nullish(),
   purchaseOrderId: zUuid.nullish(),
   lines: zLines(itemReceiptLineSchema),
@@ -29,7 +29,7 @@ export type CreateItemReceiptBody = z.infer<typeof createItemReceiptSchema>;
 export const itemReceiptActionSchema = z.discriminatedUnion('action', [
   z.object({
     action: z.literal('convert'),
-    billNumber: z.string().nullish(),
+    billNumber: z.string().max(100, 'can be at most 100 characters').nullish(),
     date: zDate.optional(),
     dueDate: zDate.nullish(),
   }),

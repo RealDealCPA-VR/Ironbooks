@@ -20,7 +20,7 @@
  *  4. Quick Check — ad-hoc check PDF that is not recorded.
  */
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import { Printer, RefreshCw, Settings2, UserPlus } from 'lucide-react';
 import {
   Badge,
@@ -215,6 +215,8 @@ export default function PrintChecksPage() {
   const [queueLoading, setQueueLoading] = useState(true);
   const [nextNumber, setNextNumber] = useState('');
   const [printingId, setPrintingId] = useState<string | null>(null);
+  // QB Print Checks prints one bank account at a time (its check paper and number sequence).
+  const [bankFilter, setBankFilter] = useState('');
 
   // ── Paychecks not yet queued ──────────────────────────────────────────────
   const [unprinted, setUnprinted] = useState<UnprintedPaycheck[]>([]);
@@ -251,14 +253,12 @@ export default function PrintChecksPage() {
   const refreshQueue = useCallback(async () => {
     setQueueLoading(true);
     try {
-      const [queueData, nextData, pcData, refundData] = await Promise.all([
+      const [queueData, pcData, refundData] = await Promise.all([
         api.get<{ items: QueueItem[] }>('/api/print-queue'),
-        api.get<{ next: string }>('/api/check-numbers/next'),
         api.get<{ paychecks: UnprintedPaycheck[] }>('/api/print-queue/paychecks').catch(() => ({ paychecks: [] })),
         api.get<{ items: UnprintedRefund[] }>('/api/print-queue/refunds').catch(() => ({ items: [] })),
       ]);
       setQueue(queueData.items);
-      setNextNumber((prev) => prev || nextData.next);
       setUnprinted(pcData.paychecks);
       setRefunds(refundData.items);
       setPicked(new Set());
@@ -284,6 +284,34 @@ export default function PrintChecksPage() {
         /* defaults are fine */
       });
   }, [refreshQueue]);
+
+  // The bank accounts with checks waiting, and the one being printed (the first by default).
+  const queueAccounts = useMemo(() => {
+    const byId = new Map<string, string>();
+    for (const q of queue) {
+      if (q.paymentAccountId && !byId.has(q.paymentAccountId)) byId.set(q.paymentAccountId, q.paymentAccountName ?? 'Bank account');
+    }
+    return [...byId.entries()].map(([id, name]) => ({ id, name }));
+  }, [queue]);
+  const bankId = queueAccounts.some((a) => a.id === bankFilter) ? bankFilter : (queueAccounts[0]?.id ?? '');
+  const shown = useMemo(() => queue.filter((q) => (q.paymentAccountId ?? '') === bankId), [queue, bankId]);
+
+  // The next check number of THAT account (each bank account has its own check sequence).
+  useEffect(() => {
+    if (!bankId) return;
+    let cancelled = false;
+    api
+      .get<{ next: string }>(`/api/check-numbers/next?paymentAccountId=${encodeURIComponent(bankId)}`)
+      .then((r) => {
+        if (!cancelled) setNextNumber(r.next);
+      })
+      .catch(() => {
+        /* the user types the number */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [bankId]);
 
   useEffect(() => {
     const n = parseFloat(amount);
@@ -326,7 +354,7 @@ export default function PrintChecksPage() {
   const itemKey = (q: QueueItem) => `${q.source}:${q.id}`;
 
   async function handlePrintSelected() {
-    const items = queue.filter((q) => selected.has(itemKey(q)));
+    const items = shown.filter((q) => selected.has(itemKey(q)));
     if (items.length === 0) {
       toast('Tick the checks you want to print.', 'danger');
       return;
@@ -563,6 +591,25 @@ export default function PrintChecksPage() {
           </div>
 
           <div className="flex items-end gap-3">
+            {queueAccounts.length > 0 && (
+              <div className="w-56">
+                <Label htmlFor="print-bank">Bank Account</Label>
+                <Select
+                  id="print-bank"
+                  value={bankId}
+                  onChange={(e) => {
+                    setBankFilter(e.target.value);
+                    setSelected(new Set());
+                  }}
+                >
+                  {queueAccounts.map((a) => (
+                    <option key={a.id} value={a.id}>
+                      {a.name}
+                    </option>
+                  ))}
+                </Select>
+              </div>
+            )}
             <div className="w-44">
               <Label htmlFor="next-number">Next Check Number</Label>
               <Input
@@ -582,9 +629,9 @@ export default function PrintChecksPage() {
                 </Select>
               </div>
             )}
-            {queue.length > 0 && (
+            {shown.length > 0 && (
               <Badge tone="warning">
-                {queue.length} check{queue.length === 1 ? '' : 's'} queued
+                {shown.length} check{shown.length === 1 ? '' : 's'} queued
               </Badge>
             )}
             {queue.length > 0 && (
@@ -614,8 +661,8 @@ export default function PrintChecksPage() {
                       type="checkbox"
                       aria-label="Select all checks"
                       className="h-4 w-4 accent-electric"
-                      checked={queue.length > 0 && queue.every((q) => selected.has(itemKey(q)))}
-                      onChange={(e) => setSelected(e.target.checked ? new Set(queue.map(itemKey)) : new Set())}
+                      checked={shown.length > 0 && shown.every((q) => selected.has(itemKey(q)))}
+                      onChange={(e) => setSelected(e.target.checked ? new Set(shown.map(itemKey)) : new Set())}
                     />
                   </Th>
                   <Th>Date</Th>
@@ -628,7 +675,7 @@ export default function PrintChecksPage() {
                 </tr>
               </thead>
               <tbody>
-                {queue.map((q) => (
+                {shown.map((q) => (
                   <Tr key={itemKey(q)}>
                     <Td>
                       <input
