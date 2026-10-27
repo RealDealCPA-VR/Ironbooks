@@ -15,7 +15,7 @@
  *   Gain: Dr <asset/liability account>  /  Cr Exchange Gain/Loss
  *   Loss: Dr Exchange Gain/Loss         /  Cr <asset/liability account>
  */
-import { and, eq, ne, sql } from 'drizzle-orm';
+import { and, eq, inArray, ne, sql } from 'drizzle-orm';
 import Decimal from 'decimal.js';
 import { currencies, accounts, journalEntryLines } from '@/lib/db/schema';
 import { Money, MoneyParseError, allocate, toAmountString } from '@/lib/money';
@@ -599,6 +599,36 @@ export async function setAccountCurrency(
     newValues: { currency: next },
   });
   return { id: updated.id, currency: updated.currency ?? null };
+}
+
+/**
+ * review5 fx: the lines of a purchase document (check, card charge, bill, vendor credit) may use a
+ * bank / credit-card account in the document's own currency or in home currency only. On an
+ * account in a third currency (a USD check "paying the Euro card") the amount that account moved
+ * by in its own currency is unknown, and the ledger would invent it at the list rate. QB asks for
+ * Transfer Funds / Pay credit card (with the exchange rate) for that.
+ */
+export async function assertLineAccountsInDocumentCurrency(
+  ctx: ServiceContext,
+  accountIds: ReadonlyArray<string | null | undefined>,
+  documentCurrency: string | null,
+): Promise<void> {
+  const ids = [...new Set(accountIds.filter((x): x is string => !!x))];
+  if (ids.length === 0) return;
+  const rows = await ctx.db
+    .select({ name: accounts.name, currency: accounts.currency })
+    .from(accounts)
+    .where(and(eq(accounts.companyId, ctx.companyId), inArray(accounts.id, ids), sql`${accounts.currency} IS NOT NULL`));
+  if (rows.length === 0) return;
+  const home = ((await getHomeCurrencyCode(ctx)) ?? '').trim().toUpperCase();
+  const doc = (documentCurrency ?? '').trim().toUpperCase() || null;
+  for (const a of rows) {
+    const cur = (a.currency ?? '').trim().toUpperCase();
+    if (!cur || cur === home || cur === doc) continue;
+    throw validation(
+      `"${a.name}" is a ${cur} account, but this transaction is in ${doc ?? (home || 'your home currency')}. Use Transfer Funds or Pay credit card (where you enter the exchange rate), or enter it in ${cur}.`,
+    );
+  }
 }
 
 /**

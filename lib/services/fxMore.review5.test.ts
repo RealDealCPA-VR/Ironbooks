@@ -195,4 +195,30 @@ describe('review5 fx (second batch)', () => {
     await expect(categorize(ctx, { bankTransactionId: usdOut, accountId: acct['6100'] })).resolves.toBeTruthy();
     await expect(categorize(ctx, { bankTransactionId: eurOut, accountId: acct['6100'] })).resolves.toBeTruthy();
   });
+
+  it('a check, bill or vendor credit line on a bank / card account in another currency is refused (no invented amount)', async () => {
+    const { createExpense } = await import('./expenses');
+    const { createBill } = await import('./bills');
+    const { createVendorCredit } = await import('./vendorCredits');
+    acct['2150'] = (await createAccount(ctx, { code: '2150', name: 'Euro Card', type: 'liability' as never, subtype: 'credit_card' })).id;
+    await setAccountCurrency(ctx, acct['2150'], 'EUR');
+    // A USD check from Checking "paying the Euro card": the EUR amount it pays off is unknown.
+    await expect(
+      createExpense(ctx, { payeeName: 'Card Co', date: d('2026-03-10'), method: 'check', paymentAccountId: acct['1000'], lines: [{ accountId: acct['2150'], amount: '100.00' }] } as never),
+    ).rejects.toMatchObject({ code: 'VALIDATION' });
+    // A home vendor's bill with a line on the Euro bank.
+    const homeVendor = await createVendor(ctx, { displayName: `Home vendor ${seq}` } as never);
+    await expect(
+      createBill(ctx, { vendorId: homeVendor.id, date: d('2026-03-10'), lines: [{ accountId: acct['1020'], amount: '100.00' }] } as never),
+    ).rejects.toMatchObject({ code: 'VALIDATION' });
+    await expect(
+      createVendorCredit(ctx, { vendorId: homeVendor.id, date: d('2026-03-10'), lines: [{ accountId: acct['2150'], amount: '10.00' }] } as never),
+    ).rejects.toMatchObject({ code: 'VALIDATION' });
+    const [card] = await db.select().from(accounts).where(eq(accounts.id, acct['2150']));
+    expect(Money.of(card.balance).toFixed(2)).toBe('0.00');
+    // Same currency (a EUR check from the Euro bank paying the Euro card) is fine.
+    await expect(
+      createExpense(ctx, { payeeName: 'Card Co', date: d('2026-03-10'), method: 'check', paymentAccountId: acct['1020'], lines: [{ accountId: acct['2150'], amount: '100.00' }] } as never),
+    ).resolves.toBeTruthy();
+  });
 });

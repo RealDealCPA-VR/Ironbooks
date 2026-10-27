@@ -64,7 +64,7 @@ import {
 } from './_base';
 import { postJournalEntry, voidJournalEntry, type PostingLine } from './posting';
 import { allocateCheckNumber, assertCheckNumberAvailable, nextCheckNumber } from './checkNumbers';
-import { homeAmounts, resolveDocumentCurrency } from './currencies';
+import { assertLineAccountsInDocumentCurrency, homeAmounts, resolveDocumentCurrency } from './currencies';
 import { receivePurchasedStock, reversePurchasedStock } from './bills';
 import {
   type InventoryLineDetail,
@@ -404,6 +404,8 @@ async function prepareExpense(
     vendorCurrency,
     accountCurrency: payAcct.currency ?? null,
   });
+  // review5 fx: no line on a bank / card account in a third currency (its amount would be invented).
+  await assertLineAccountsInDocumentCurrency(ctx, lines.map((l) => l.accountId), fx.currency);
   const home = homeAmounts(
     lines.map((l) => Money.of(l.amount).abs()),
     fx.rate,

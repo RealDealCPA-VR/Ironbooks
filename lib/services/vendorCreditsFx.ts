@@ -36,7 +36,7 @@ import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
 import { postJournalEntry, voidJournalEntry, type PostingLine } from './posting';
 import { assertPeriodOpen, recordClosingDateException } from './fiscalPeriods';
-import { homeAmounts, resolveDocumentCurrency } from './currencies';
+import { assertLineAccountsInDocumentCurrency, homeAmounts, resolveDocumentCurrency } from './currencies';
 import { currencyRate, exchangeGainLossLine, foreignCode, homeCode, toHome } from './exchangeRates';
 import { isDepositTargetAccount } from '@/lib/accountTypes';
 
@@ -58,7 +58,7 @@ export interface VendorCreditFx {
 export async function resolveVendorCreditFx(
   ctx: ServiceContext,
   vendorId: string,
-  input: { currency?: string | null; exchangeRate?: string | number | null; lines: Array<{ amount: string | number }> },
+  input: { currency?: string | null; exchangeRate?: string | number | null; lines: Array<{ amount: string | number; accountId?: string | null }> },
 ): Promise<VendorCreditFx> {
   const [v] = await ctx.db
     .select({ currency: vendors.currency })
@@ -69,6 +69,8 @@ export async function resolveVendorCreditFx(
     exchangeRate: input.exchangeRate,
     vendorCurrency: v?.currency ?? null,
   });
+  // review5 fx: no line on a bank / card account in a third currency (its amount would be invented).
+  await assertLineAccountsInDocumentCurrency(ctx, input.lines.map((l) => l.accountId), fx.currency);
   const h = homeAmounts(
     input.lines.map((l) => Money.round2(l.amount)),
     fx.rate,
