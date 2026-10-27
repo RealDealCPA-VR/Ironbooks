@@ -71,14 +71,21 @@ let serverUrl = null;
 let quittingAfterBackup = false;
 /** Relaunch once the quit has finished (set by relaunchApp; a cancelled quit cancels it too). */
 let relaunchAfterQuit = false;
+/**
+ * Config for the next launch (which company file, or No Company Open), written only once the
+ * open company file has been saved and closed. If that save fails and the person keeps working,
+ * it is dropped: the next launch still opens the file they kept working in.
+ */
+let configAfterClose = null;
 
 /**
  * Restart into another company file / mode: quit (the open company file is backed up, saved and
- * released on the way out — before-quit), then start again. If the save fails and the person
- * chooses to keep working, nothing restarts.
+ * released on the way out — before-quit), then start again with `nextConfig` applied. If the save
+ * fails and the person chooses to keep working, nothing restarts and nothing is changed.
  */
-function relaunchApp() {
+function relaunchApp(nextConfig = null) {
   relaunchAfterQuit = true;
+  if (nextConfig) configAfterClose = { ...(configAfterClose || {}), ...nextConfig };
   app.quit();
 }
 
@@ -257,7 +264,11 @@ function saveConfig(patch) {
   const next = { ...loadConfig(), ...patch };
   try {
     fs.mkdirSync(app.getPath('userData'), { recursive: true });
-    fs.writeFileSync(configPath(), JSON.stringify(next, null, 2));
+    // Temp file + rename: a crash or power cut mid-write must not leave a cut-off config.json
+    // (it would read as empty: which company file was open, recent files, hosting… all gone).
+    const tmp = `${configPath()}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(next, null, 2));
+    fs.renameSync(tmp, configPath());
   } catch (err) {
     console.error('[config] save failed:', err);
   }
@@ -280,18 +291,19 @@ function rememberRecentCompany(dir) {
  * Make `location` (a single company file, or an older company folder) the active company file and
  * relaunch into it. The one open now is saved, backed up and released on the way out (before-quit).
  */
-function openCompany(location) {
-  // Opening a local file leaves any remote host, and ends "No Company Open".
+function openCompany(location, extra = {}) {
+  // Opening a local file leaves any remote host, and ends "No Company Open" — once the file open
+  // now has closed (relaunchApp).
   const single = companyFile.isSingleFile(location);
-  saveConfig({
+  rememberRecentCompany(location);
+  relaunchApp({
     ...(single ? { companyFile: location } : { dataDir: location, companyFile: null }),
     remoteHost: null,
     remotePin: null,
     remoteFile: null,
     companyClosed: false,
+    ...extra,
   });
-  rememberRecentCompany(location);
-  relaunchApp();
 }
 
 /** The user name last used to sign in to `location` on this computer (sign-in screen pre-fill). */
@@ -589,8 +601,7 @@ async function closeCompanyFlow({ skipConfirm = false } = {}) {
     if (response !== 0) return;
   }
   // The company file is saved and released on the way out (before-quit).
-  saveConfig({ companyClosed: true, remoteHost: null, remotePin: null, remoteFile: null });
-  relaunchApp();
+  relaunchApp({ companyClosed: true, remoteHost: null, remotePin: null, remoteFile: null });
 }
 
 function sandboxMenuItem() {
@@ -1382,9 +1393,9 @@ async function createCompanyFlow() {
     dialog.showErrorBox('Could not create the company file', openErrorText(e));
     return;
   }
-  // First page of the new file: set up its Admin user, then the setup interview.
-  saveConfig({ startRoute: '/signup' });
-  openCompany(target);
+  // First page of the new file: set up its Admin user, then the setup interview (only once the
+  // file open now has closed — never for that file if the person keeps working in it).
+  openCompany(target, { startRoute: '/signup' });
 }
 
 // Open or Restore Company (QuickBooks File > Open or Restore Company): browse to a company file
@@ -2809,7 +2820,20 @@ app.whenReady().then(async () => {
     getAppOrigin: () => serverUrl,
     isDev,
   });
-  await createWindow();
+  try {
+    await createWindow();
+  } catch (err) {
+    // Without this the app kept running with no window (and the company file locked): starting
+    // it again only focused the missing window. Say what happened and quit (before-quit releases
+    // the company file).
+    console.error('[startup] could not start:', err);
+    dialog.showErrorBox(
+      'Ironbooks could not start',
+      `${String((err && err.message) || err)}\n\nClose any other Ironbooks windows and start it again. If this keeps happening, restart the computer.`,
+    );
+    app.quit();
+    return;
+  }
   checkForUpdates();
   setInterval(() => checkForUpdates(), UPDATE_CHECK_INTERVAL_MS).unref?.();
 });
@@ -2839,10 +2863,16 @@ app.on('before-quit', (event) => {
       })
       .then((goOn) => {
         if (goOn === false) {
-          // The person chose to keep working (the save failed): don't quit, don't relaunch.
+          // The person chose to keep working (the save failed): don't quit, don't relaunch, and
+          // keep the config pointing at the file they are still working in.
           quittingAfterBackup = false;
           relaunchAfterQuit = false;
+          configAfterClose = null;
           return;
+        }
+        if (configAfterClose) {
+          saveConfig(configAfterClose);
+          configAfterClose = null;
         }
         if (relaunchAfterQuit) app.relaunch();
         app.quit();

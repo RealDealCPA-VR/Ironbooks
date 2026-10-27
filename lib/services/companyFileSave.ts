@@ -646,6 +646,15 @@ export async function saveCopyAs(
   if (!abs.toLowerCase().endsWith(format.COMPANY_FILE_EXT)) {
     throw Object.assign(new Error(`A company file name must end in ${format.COMPANY_FILE_EXT}.`), { code: 'VALIDATION' });
   }
+  // Never replace a company file someone has open (QuickBooks refuses too): their next save would
+  // find a different company in its place.
+  const holder = lockFormat.readHolder(abs) as { owner?: Record<string, unknown> | null; stale?: boolean } | null;
+  if (holder && !holder.stale) {
+    throw Object.assign(
+      new Error(`${path.basename(abs)} is open on ${lockFormat.describeOwner(holder.owner ?? null)}. Choose another name for the copy, or ask them to close it first.`),
+      { code: 'VALIDATION' },
+    );
+  }
   let dbSchema: DbSchemaStamp | null = null;
   if (isDbOpen()) {
     try {

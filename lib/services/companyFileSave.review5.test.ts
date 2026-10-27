@@ -269,3 +269,23 @@ describe('a copy of the company file is a separate file with its own backups', (
     expect(fs.existsSync(version)).toBe(true);
   }, 180_000);
 });
+
+describe('Save Copy As over an existing company file', () => {
+  it('refuses a company file that is open on a computer right now', async () => {
+    const { saveCopyAs } = await import('./companyFileSave');
+    const theirs = path.join(SHARE, 'Northwind (open at the front desk).ironbooks');
+    await saveCopyAs(theirs); // some other company file…
+    const held = lockMod.acquire(theirs, { appUser: 'Ann', computer: 'FRONT-DESK' }); // …that Ann has open
+    expect(held.ok).toBe(true);
+    const before = format.readCompanyManifest(theirs).saveId;
+    try {
+      await expect(saveCopyAs(theirs)).rejects.toThrow(/open on FRONT-DESK|is open/);
+      expect(format.readCompanyManifest(theirs).saveId).toBe(before);
+    } finally {
+      lockMod.release(held.lock);
+    }
+    // Once nobody has it open, replacing it (the person confirmed in the Save dialog) works.
+    await saveCopyAs(theirs);
+    expect(format.readCompanyManifest(theirs).saveId).not.toBe(before);
+  }, 120_000);
+});

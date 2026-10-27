@@ -112,7 +112,8 @@ describe('desktop wiring (source pins)', () => {
   });
 
   it('closing releases the file: the next launch shows the start screen without starting a server', () => {
-    expect(main).toMatch(/saveConfig\(\{ companyClosed: true, remoteHost: null, remotePin: null, remoteFile: null \}\);\s*\n\s*relaunchApp\(\);/);
+    // Written once the open file has closed (a failed save + Keep Working leaves it as it was).
+    expect(main).toMatch(/relaunchApp\(\{ companyClosed: true, remoteHost: null, remotePin: null, remoteFile: null \}\);/);
     // An open single company file is saved into itself and its lock released on the way out.
     expect(main).toMatch(/\.then\(\(\) => closeOpenCompanyFile\(\)\)/);
     const create = main.indexOf('async function createWindow()');

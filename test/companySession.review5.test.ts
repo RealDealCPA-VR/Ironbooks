@@ -125,3 +125,30 @@ describe('Save Copy As (source pins)', () => {
     expect(route).toMatch(/keepBackupHistory: body\?\.convert === true/);
   });
 });
+
+describe('switching or closing company files (source pins)', () => {
+  const main = fs.readFileSync(path.resolve(__dirname, '..', 'electron', 'main.js'), 'utf8');
+  it('the next launch\'s company file is only written once the open one has closed', () => {
+    // openCompany / Close Company / New Company hand their config to relaunchApp…
+    expect(main).toMatch(/function relaunchApp\(nextConfig = null\) \{[\s\S]{0,200}configAfterClose = \{ \.\.\.\(configAfterClose \|\| \{\}\), \.\.\.nextConfig \};/);
+    const open = main.slice(main.indexOf('function openCompany(location, extra = {})'));
+    expect(open.slice(0, 600)).toMatch(/relaunchApp\(\{\s*\.\.\.\(single \? \{ companyFile: location \}/);
+    expect(open.slice(0, 600)).not.toMatch(/saveConfig\(/);
+    expect(main).toMatch(/openCompany\(target, \{ startRoute: '\/signup' \}\);/);
+    expect(main).not.toMatch(/saveConfig\(\{ startRoute: '\/signup' \}\)/);
+    // …which before-quit applies only when the file closed (dropped on Keep Working).
+    const quit = main.slice(main.indexOf("app.on('before-quit', (event) => {"));
+    expect(quit).toMatch(/if \(goOn === false\) \{[\s\S]{0,400}configAfterClose = null;\s*return;/);
+    expect(quit).toMatch(/if \(configAfterClose\) \{\s*saveConfig\(configAfterClose\);/);
+  });
+
+  it('config.json is replaced atomically', () => {
+    const save = main.slice(main.indexOf('function saveConfig(patch) {'));
+    expect(save.slice(0, 700)).toMatch(/fs\.writeFileSync\(tmp, JSON\.stringify\(next, null, 2\)\);\s*fs\.renameSync\(tmp, configPath\(\)\);/);
+  });
+
+  it('a launch that cannot start says so and quits instead of running with no window', () => {
+    const ready = main.slice(main.indexOf('app.whenReady().then(async () => {'));
+    expect(ready.slice(0, 900)).toMatch(/try \{\s*await createWindow\(\);\s*\} catch \(err\) \{[\s\S]*dialog\.showErrorBox\([\s\S]*app\.quit\(\);/);
+  });
+});
