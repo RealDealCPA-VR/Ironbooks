@@ -1165,4 +1165,116 @@ describe('review5 inventory', () => {
     }
     expect(await gl('1300')).toBe((await inventoryValuation(ctx)).grandTotal);
   });
+
+  // ---- round 5 fix-up 3 ----
+
+  it('FIFO: voiding a variance bill whose layer a since-voided landed cost split trues the rounding up (GL = valuation)', async () => {
+    const item = await invItem('Split cent');
+    await receiveStock(ctx, { itemId: item.id, quantity: 1, unitCost: '1.00', date: d('2026-01-01') });
+    const v = await createVendor(ctx, { displayName: 'Split cent vendor' } as never);
+    const r = await createItemReceipt(ctx, { vendorId: v.id, date: d('2026-01-02'), lines: [{ itemId: item.id, quantity: 6, unitCost: '1.00' }] } as never);
+    const bill = await enterBillForReceivedItems(ctx, { vendorId: v.id, date: d('2026-01-03'), lines: [{ receiptLineId: await receiptLineId(r.id), quantity: 6, unitCost: '1.005' }] });
+    expect(bill.preview.lines[0].inventoryVariance).toBe('0.03');
+    expect(await openLayers(item.id)).toEqual(['1@1.0000', '6@1.0050']);
+    // One cent of freight over 6 units: one unit is split off to carry what 4dp cannot spread.
+    const alloc = await freightOnReceipt(v.id, r.id, '0.01');
+    expect(await openLayers(item.id)).toEqual(['1@1.0000', '1@1.0070', '5@1.0066']);
+    await voidLandedCostAllocation(ctx, alloc.id);
+    expect(await gl('1300')).toBe('7.04');
+    expect((await inventoryValuation(ctx)).grandTotal).toBe('7.04');
+    // The bill void restores the receipt's cost and puts the split unit back into its layer:
+    // round2(5 x c) + round2(c) need not equal round2(6 x c), so the cent is trued up.
+    await voidBill(ctx, bill.id);
+    expect(await openLayers(item.id)).toEqual(['1@1.0000', '6@1.0000']);
+    expect((await inventoryValuation(ctx)).grandTotal).toBe('7.00');
+    expect(await gl('1300')).toBe('7.00');
+    expect(await gl('5000')).toBe('0.00'); // the two rounding entries cancel out
+    await voidItemReceipt(ctx, r.id);
+    expect(await gl('1300')).toBe('1.00');
+    expect((await inventoryValuation(ctx)).grandTotal).toBe('1.00');
+  });
+
+  it("FIFO: a variance bill after landed cost raised the receipt's layer re-costs the receipt's units (not older stock at the receipt cost)", async () => {
+    const item = await invItem('Freight then bill');
+    await receiveStock(ctx, { itemId: item.id, quantity: 1, unitCost: '1.00', date: d('2026-01-01') }); // unrelated, untagged
+    const v = await createVendor(ctx, { displayName: 'Freight then bill vendor' } as never);
+    const r = await createItemReceipt(ctx, { vendorId: v.id, date: d('2026-01-02'), lines: [{ itemId: item.id, quantity: 100, unitCost: '1.00' }] } as never);
+    const alloc = await freightOnReceipt(v.id, r.id, '10.00');
+    expect(await openLayers(item.id)).toEqual(['100@1.1000', '1@1.0000']);
+    const lineId = await receiptLineId(r.id);
+    // 40 billed at 1.20: every one of them is still on hand, so all $8.00 is capitalized on them.
+    const first = await enterBillForReceivedItems(ctx, { vendorId: v.id, date: d('2026-01-05'), lines: [{ receiptLineId: lineId, quantity: 40, unitCost: '1.20' }] });
+    expect(first.preview.lines[0].inventoryVariance).toBe('8.00');
+    expect(first.preview.lines[0].expensedVariance).toBe('0.00');
+    expect(await openLayers(item.id)).toEqual(['1@1.0000', '40@1.3000', '60@1.1000']);
+    // The other 60: the units the first bill re-costed are not re-costed again.
+    const second = await enterBillForReceivedItems(ctx, { vendorId: v.id, date: d('2026-01-06'), lines: [{ receiptLineId: lineId, quantity: 60, unitCost: '1.20' }] });
+    expect(second.preview.lines[0].inventoryVariance).toBe('12.00');
+    expect(second.preview.lines[0].expensedVariance).toBe('0.00');
+    expect(await openLayers(item.id)).toEqual(['1@1.0000', '40@1.3000', '60@1.3000']);
+    expect(await gl('5000')).toBe('0.00');
+    expect(await gl('1300')).toBe('131.00');
+    expect((await inventoryValuation(ctx)).grandTotal).toBe('131.00');
+    // Undo it all: back to the receipt's units at the cost it stored, the older unit untouched.
+    await voidBill(ctx, second.id);
+    await voidBill(ctx, first.id);
+    expect(await openLayers(item.id)).toEqual(['100@1.1000', '1@1.0000']);
+    await voidLandedCostAllocation(ctx, alloc.id);
+    expect(await openLayers(item.id)).toEqual(['100@1.0000', '1@1.0000']);
+    expect(await gl('1300')).toBe('101.00');
+    expect((await inventoryValuation(ctx)).grandTotal).toBe('101.00');
+  });
+
+  it('FIFO: landed cost put on a receipt before a partial variance bill can still be voided first (the units the bill split off keep its increment)', async () => {
+    const item = await invItem('Freight voided first');
+    await receiveStock(ctx, { itemId: item.id, quantity: 1, unitCost: '1.00', date: d('2026-01-01') });
+    const v = await createVendor(ctx, { displayName: 'Freight voided first vendor' } as never);
+    const r = await createItemReceipt(ctx, { vendorId: v.id, date: d('2026-01-02'), lines: [{ itemId: item.id, quantity: 100, unitCost: '1.00' }] } as never);
+    const alloc = await freightOnReceipt(v.id, r.id, '10.00');
+    const bill = await enterBillForReceivedItems(ctx, { vendorId: v.id, date: d('2026-01-05'), lines: [{ receiptLineId: await receiptLineId(r.id), quantity: 40, unitCost: '1.20' }] });
+    expect(await openLayers(item.id)).toEqual(['1@1.0000', '40@1.3000', '60@1.1000']);
+    // Nothing was sold: the freight comes off all 100 received units (not "stock has moved").
+    await voidLandedCostAllocation(ctx, alloc.id);
+    expect(await openLayers(item.id)).toEqual(['1@1.0000', '40@1.2000', '60@1.0000']);
+    expect(await gl('1300')).toBe('109.00');
+    expect((await inventoryValuation(ctx)).grandTotal).toBe('109.00');
+    await voidBill(ctx, bill.id);
+    expect(await openLayers(item.id)).toEqual(['100@1.0000', '1@1.0000']);
+    expect(await gl('1300')).toBe('101.00');
+    expect((await inventoryValuation(ctx)).grandTotal).toBe('101.00');
+  });
+
+  it('physical counts entered out of date order: a later-dated count (or opening stock) is not on hand at an earlier count date', async () => {
+    const a = await invItem('Out of order count');
+    await adjustQuantityAtSite(ctx, { itemId: a.id, quantityChange: '10', unitCost: '2.00', date: d('2026-01-01') });
+    const feb = await physicalCount(ctx, { itemId: a.id, countedQty: 8, date: d('2026-02-28') });
+    expect(feb.delta).toBe('-2.0000');
+    // The January count found the 10 the books showed on January 31.
+    const jan = await physicalCount(ctx, { itemId: a.id, countedQty: 10, date: d('2026-01-31') });
+    expect(jan.previousQty).toBe('10.0000');
+    expect(jan.delta).toBe('0.0000');
+    expect(jan.journalEntryId).toBeNull();
+    expect((await itemRow(a.id)).quantityOnHand).toBe('8.0000');
+    expect(await gl('1300')).toBe('16.00');
+    // A January shortage is still a shortage today.
+    const short = await physicalCount(ctx, { itemId: a.id, countedQty: 9, date: d('2026-01-31') });
+    expect(short.previousQty).toBe('10.0000');
+    expect(short.delta).toBe('-1.0000');
+    expect((await itemRow(a.id)).quantityOnHand).toBe('7.0000');
+    // Opening stock as of March 1 was not on hand in February.
+    const b = await createItemWithOpeningStock(ctx, {
+      name: 'Opened in March',
+      type: 'inventory',
+      assetAccountId: acct['1300'],
+      incomeAccountId: acct['4000'],
+      openingQuantity: '5',
+      openingValue: '15.00',
+      openingAsOf: d('2026-03-01'),
+    } as never);
+    const early = await physicalCount(ctx, { itemId: b.item.id, countedQty: 0, date: d('2026-02-15') });
+    expect(early.previousQty).toBe('0.0000');
+    expect(early.delta).toBe('0.0000');
+    expect((await itemRow(b.item.id)).quantityOnHand).toBe('5.0000');
+    expect(await gl('1300')).toBe((await inventoryValuation(ctx)).grandTotal);
+  });
 });

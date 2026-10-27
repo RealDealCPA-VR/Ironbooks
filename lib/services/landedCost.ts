@@ -35,6 +35,7 @@ import {
   billLines,
   bills,
   inventoryLayers,
+  itemReceiptBillLines,
   itemReceiptLines,
   itemReceipts,
   items,
@@ -775,7 +776,10 @@ export async function getLandedCostAllocation(ctx: ServiceContext, id: string) {
 
 /**
  * Layers split off (parent layer id -> split layer ids) by allocation lines on `itemId` recorded
- * after `lineId` of `allocation` — active or void, since a split is a physical fact either way.
+ * after `lineId` of `allocation` — active or void, since a split is a physical fact either way —
+ * and by bills for received items entered after the allocation (receiving.ts re-costs the units it
+ * bills as their own layers; they still carry this allocation's increment). A voided bill's link
+ * rows are gone and its splits merged back (receivingLinks.releaseReceiptBilling).
  */
 async function laterSplits(
   ctx: ServiceContext,
@@ -801,12 +805,23 @@ async function laterSplits(
     );
   const at = rows.findIndex((r) => r.lineId === lineId);
   const splits = new Map<string, string[]>();
-  for (const r of rows.slice(at + 1)) {
-    for (const adj of r.layerAdjustments ?? []) {
-      if (!adj.splitFrom) continue;
-      splits.set(adj.splitFrom, [...(splits.get(adj.splitFrom) ?? []), adj.layerId]);
-    }
-  }
+  const add = (adj: { layerId?: string; splitFrom?: string }) => {
+    if (!adj.splitFrom || !adj.layerId) return;
+    splits.set(adj.splitFrom, [...(splits.get(adj.splitFrom) ?? []), adj.layerId]);
+  };
+  for (const r of rows.slice(at + 1)) for (const adj of r.layerAdjustments ?? []) add(adj);
+  // Compared in SQL so the timestamps keep their microseconds.
+  const billSplits = await ctx.db
+    .select({ layerAdjustments: itemReceiptBillLines.layerAdjustments })
+    .from(itemReceiptBillLines)
+    .where(
+      and(
+        eq(itemReceiptBillLines.companyId, ctx.companyId),
+        eq(itemReceiptBillLines.itemId, itemId),
+        sql`${itemReceiptBillLines.createdAt} > (SELECT lca.created_at FROM landed_cost_allocations lca WHERE lca.id = ${allocation.id})`,
+      ),
+    );
+  for (const b of billSplits) for (const adj of b.layerAdjustments ?? []) add(adj);
   return splits;
 }
 

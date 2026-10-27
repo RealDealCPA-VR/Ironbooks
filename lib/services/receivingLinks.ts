@@ -1,8 +1,8 @@
 /**
  * Enhanced receiving — low-level shared pieces used by purchaseOrders.ts, itemReceipts.ts,
- * bills.ts and receiving.ts. Deliberately imports NO other service module (bills.ts and
- * purchaseOrders.ts both import this file, and receiving.ts imports them), so there is no
- * import cycle.
+ * bills.ts and receiving.ts. Deliberately imports no document service module (bills.ts and
+ * purchaseOrders.ts both import this file, and receiving.ts imports them) — only the inventory
+ * costing helpers (inventory.ts, fifo.ts), which import none of them — so there is no import cycle.
  *
  * Contents:
  *   - Receiving preferences (companies.settings.receiving): enhanced receiving on/off, where
@@ -30,7 +30,8 @@ import {
 } from '@/lib/db/schema';
 import { Money } from '@/lib/money';
 import { type ServiceContext, ServiceError, writeAudit } from './_base';
-import { valueRemainderAfter } from './inventory';
+import { fifoLayerValueSql, todayCalendarDay, valueRemainderAfter } from './inventory';
+import { postInventoryTrueUp } from './fifo';
 
 // ---------------------------------------------------------------------------
 // Preferences
@@ -249,6 +250,15 @@ async function stockDecreasedSince(ctx: ServiceContext, itemId: string, since: D
   return Boolean(row);
 }
 
+/** An item's FIFO layer value: the SUM of round2(qty x cost) per layer (the valuation reports' rule). */
+async function fifoItemValue(ctx: ServiceContext, itemId: string) {
+  const [row] = await ctx.db
+    .select({ value: fifoLayerValueSql() })
+    .from(inventoryLayers)
+    .where(and(eq(inventoryLayers.companyId, ctx.companyId), eq(inventoryLayers.itemId, itemId)));
+  return Money.round2(row?.value ?? '0');
+}
+
 /**
  * Landed-cost allocation lines on `itemId` recorded after the receipt-bill link `linkId` (active
  * or void: a split they made is a physical fact either way), oldest first. Compared in SQL so the
@@ -277,7 +287,9 @@ async function landedCostAfterLink(ctx: ServiceContext, linkId: string, itemId: 
  *   - inventory cost adjustments from price variances capitalized into inventory
  *     (CONFLICT when that stock has since been sold — the variance then lives in COGS and the
  *     user must enter a vendor credit instead of voiding — or while landed cost allocated after
- *     the bill still sits on the re-costed layers: that allocation must be voided first).
+ *     the bill still sits on the re-costed layers: that allocation must be voided first),
+ *     with a rounding true-up entry when the restored FIFO layers' value moved by a cent more or
+ *     less than the voided entry took off the inventory account.
  */
 export async function releaseReceiptBilling(ctx: ServiceContext, billId: string): Promise<void> {
   const links = await ctx.db
@@ -290,6 +302,18 @@ export async function releaseReceiptBilling(ctx: ServiceContext, billId: string)
   const poItemDeltas = new Map<string, ReturnType<typeof Money.zero>>(); // `${poId}|${itemId}`
   /** Layers the bill split off a receipt layer, merged back once every cost is restored. */
   const merges: Array<{ layerId: string; splitFrom: string; quantity: string }> = [];
+
+  // FIFO items whose layers this void re-costs: their layer value now, and the variance the voided
+  // entry takes back off their inventory account (see the rounding true-up at the end).
+  const fifoVariance = new Map<string, ReturnType<typeof Money.zero>>();
+  for (const link of links) {
+    const invVariance = Money.of(link.inventoryVariance);
+    const adjusted = ((link.layerAdjustments ?? []) as Array<Record<string, string>>).some((a) => a.kind !== 'average');
+    if (invVariance.isZero() || !adjusted) continue;
+    fifoVariance.set(link.itemId, (fifoVariance.get(link.itemId) ?? Money.zero()).plus(invVariance));
+  }
+  const fifoValueBefore = new Map<string, ReturnType<typeof Money.zero>>();
+  for (const itemId of fifoVariance.keys()) fifoValueBefore.set(itemId, await fifoItemValue(ctx, itemId));
 
   for (const link of links) {
     receiptIds.add(link.itemReceiptId);
@@ -467,6 +491,33 @@ export async function releaseReceiptBilling(ctx: ServiceContext, billId: string)
       .set({ quantityRemaining: Money.of(into.quantityRemaining).plus(Money.of(split.quantityRemaining)).toFixed(4) })
       .where(eq(inventoryLayers.id, into.id));
     await ctx.db.delete(inventoryLayers).where(eq(inventoryLayers.id, split.id));
+  }
+
+  // The voided entry took exactly the capitalized variance off each item's inventory account, but
+  // restoring and merging layers moves their value by what round2(qty x cost) per layer gives: a
+  // landed cost voided since may have left a one-unit split (and trued the GL up to it) that the
+  // merge above folds back in — round2((n-1)c) + round2(c) need not be round2(nc). True the
+  // inventory account up to the layers' value (against the item's COGS account), so the inventory
+  // GL == the FIFO valuation to the cent.
+  if (fifoVariance.size > 0) {
+    const names = new Map(
+      (
+        await ctx.db
+          .select({ id: items.id, name: items.name })
+          .from(items)
+          .where(and(eq(items.companyId, ctx.companyId), inArray(items.id, [...fifoVariance.keys()])))
+      ).map((r) => [r.id, r.name]),
+    );
+    for (const [itemId, invVariance] of fifoVariance) {
+      const valueChange = (await fifoItemValue(ctx, itemId)).minus(fifoValueBefore.get(itemId) ?? Money.zero());
+      await postInventoryTrueUp(ctx, {
+        itemId,
+        itemName: names.get(itemId) ?? 'item',
+        amount: valueChange.plus(invVariance),
+        date: todayCalendarDay(),
+        action: 'void bill',
+      });
+    }
   }
 
   const poIds = new Set<string>();

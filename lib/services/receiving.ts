@@ -39,6 +39,8 @@ import {
   itemReceiptLines,
   itemReceipts,
   items,
+  landedCostAllocationLines,
+  landedCostAllocations,
   purchaseOrderLines,
   purchaseOrders,
   vendors,
@@ -386,6 +388,47 @@ async function isFifoTracked(ctx: ServiceContext, itemId: string): Promise<boole
   return Boolean(row);
 }
 
+/**
+ * Layers of a receipt's item that bills entered against the receipt (still active: a void deletes
+ * its link rows) have already re-costed — the layerIds in their item_receipt_bill_lines
+ * layerAdjustments — plus the units landed cost later split off those (they carry the bill's
+ * increment too). The next bill on the receipt must not re-cost them again.
+ */
+async function recostedReceiptLayers(ctx: ServiceContext, receiptId: string, itemId: string): Promise<Set<string>> {
+  const links = await ctx.db
+    .select({ layerAdjustments: itemReceiptBillLines.layerAdjustments })
+    .from(itemReceiptBillLines)
+    .where(
+      and(
+        eq(itemReceiptBillLines.companyId, ctx.companyId),
+        eq(itemReceiptBillLines.itemReceiptId, receiptId),
+        eq(itemReceiptBillLines.itemId, itemId),
+      ),
+    );
+  const ids = new Set<string>();
+  for (const link of links) {
+    for (const a of link.layerAdjustments ?? []) if (a.kind !== 'average' && a.layerId) ids.add(a.layerId);
+  }
+  if (ids.size === 0) return ids;
+  const splits = await ctx.db
+    .select({ layerAdjustments: landedCostAllocationLines.layerAdjustments })
+    .from(landedCostAllocationLines)
+    .innerJoin(landedCostAllocations, eq(landedCostAllocationLines.allocationId, landedCostAllocations.id))
+    .where(and(eq(landedCostAllocations.companyId, ctx.companyId), eq(landedCostAllocationLines.itemId, itemId)));
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const row of splits) {
+      for (const a of row.layerAdjustments ?? []) {
+        if (a.splitFrom && ids.has(a.splitFrom) && !ids.has(a.layerId)) {
+          ids.add(a.layerId);
+          grew = true;
+        }
+      }
+    }
+  }
+  return ids;
+}
+
 /** Validate the request and compute every amount (read-only when `dryRun`). */
 async function planReceiptBill(ctx: ServiceContext, input: EnterReceiptBillInput, dryRun = false) {
   const [vendor] = await ctx.db
@@ -523,18 +566,28 @@ async function planReceiptBill(ctx: ServiceContext, input: EnterReceiptBillInput
             .orderBy(desc(inventoryLayers.date), desc(inventoryLayers.createdAt));
           const costKey = receiptCost.toFixed(4);
           const open = layers.filter((l) => Money.of(l.quantityRemaining).greaterThan(0));
-          // The receipt's own layers still at the cost it received them at (not yet re-costed by
-          // an earlier bill). A receipt stores the line as layer(s) worth exactly its amount
-          // (fifo.ts layersWorth): one layer at the 4dp cost, or (qty - 1) units plus a one-unit
-          // layer carrying the cents — neither of which need carry the line's 4dp unit cost.
+          // The receipt's own layers (tagged item_receipt:<id>) still on hand, whatever their cost
+          // now (landed cost may have raised it), except those an earlier bill on the receipt
+          // already re-costed. Layers at one of this line's costs come first (a receipt with two
+          // lines for the item): a receipt stores a line as layer(s) worth exactly its amount
+          // (fifo.ts layersWorth) — one layer at the 4dp cost, or (qty - 1) units plus a one-unit
+          // layer carrying the cents.
           const ownRef = `item_receipt:${receipt.id}`;
           const ownCosts = new Set([
             costKey,
             ...layersWorth(received, Money.of(line.amount)).map((p) => p.unitCost.toFixed(4)),
           ]);
-          const own = open.filter((l) => l.sourceRef === ownRef && ownCosts.has(Money.of(l.unitCost).toFixed(4)));
-          // Older (untagged) layers at the receipt's cost: same date first, newest first.
-          const legacy = open.filter((l) => l.sourceRef == null && Money.of(l.unitCost).toFixed(4) === costKey);
+          const recosted = await recostedReceiptLayers(ctx, receipt.id, item.id);
+          const ownOpen = open.filter((l) => l.sourceRef === ownRef && !recosted.has(l.id));
+          const atLineCost = (l: (typeof layers)[number]) => ownCosts.has(Money.of(l.unitCost).toFixed(4));
+          const own = [...ownOpen.filter(atLineCost), ...ownOpen.filter((l) => !atLineCost(l))];
+          // Receipts recorded before layers were tagged: older (untagged) layers at the receipt's
+          // cost, same date first, newest first. Never when the receipt has layers of its own (its
+          // units were sold, or are re-costed already): other stock is not the receipt's.
+          const tagged = layers.some((l) => l.sourceRef === ownRef);
+          const legacy = tagged
+            ? []
+            : open.filter((l) => l.sourceRef == null && Money.of(l.unitCost).toFixed(4) === costKey);
           const sameDay = legacy.filter((l) => l.date.getTime() === receipt.date.getTime());
           const ordered = [...own, ...sameDay, ...legacy.filter((l) => !sameDay.includes(l))];
           let need = touched;

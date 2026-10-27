@@ -481,8 +481,9 @@ export async function takeFromDocumentLayers(
  * Rounding true-up between an item's inventory asset account and its COGS account: `amount` > 0
  * debits inventory, < 0 credits it; $0 posts nothing. Used when a reversal moves the layers by a
  * cent more or less than the voided entry moved the GL, so GL == FIFO valuation to the cent.
+ * (Also used by receivingLinks.releaseReceiptBilling when a bill void restores re-costed layers.)
  */
-async function postInventoryTrueUp(
+export async function postInventoryTrueUp(
   tx: ServiceContext,
   input: { itemId: string; itemName: string; amount: Decimal; date: Date; action: string },
 ): Promise<void> {

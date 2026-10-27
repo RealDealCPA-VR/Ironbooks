@@ -18,6 +18,7 @@ import { and, asc, eq, gte, inArray, isNotNull, notInArray, sql } from 'drizzle-
 import Decimal from 'decimal.js';
 import {
   accounts,
+  auditLogs,
   items,
   inventoryLayers,
   inventoryMovements,
@@ -72,6 +73,9 @@ async function accountIdByCode(ctx: ServiceContext, code: string): Promise<strin
  * Net quantity of an item moved by transactions dated AFTER `date`'s calendar day (sales, receipts,
  * returns, adjustments, builds: their site movements, reversals included — a voided document
  * nets to zero). Transfers and default-site rebalances move stock between sites, not in or out.
+ * Physical counts and opening stock write no site movement, so theirs come from their audit rows
+ * (a count records its date and the quantity before / after; opening stock its as-of date and
+ * quantity): a later-dated count entered first is then not taken for stock on hand at `date`.
  * Used to put a back-dated count against the quantity on hand at its date.
  */
 async function netMovedAfter(ctx: ServiceContext, itemId: string, date: Date): Promise<Decimal> {
@@ -87,7 +91,32 @@ async function netMovedAfter(ctx: ServiceContext, itemId: string, date: Date): P
         notInArray(inventoryMovements.sourceType, ['transfer', 'site_rebalance']),
       ),
     );
-  return Money.of(row?.qty ?? '0');
+  const after = nextDay.toISOString();
+  const countDate = sql`(${auditLogs.newValues}->>'physicalCountDate')`;
+  const openingAsOf = sql`(${auditLogs.newValues}->'openingStock'->>'asOf')`;
+  const [audited] = await ctx.db
+    .select({
+      qty: sql<string>`COALESCE(SUM(CASE
+        WHEN ${countDate} IS NOT NULL
+          THEN (${auditLogs.newValues}->>'quantityOnHand')::numeric - COALESCE((${auditLogs.oldValues}->>'quantityOnHand')::numeric, 0)
+        ELSE (${auditLogs.newValues}->'openingStock'->>'quantity')::numeric
+      END), 0)`,
+    })
+    .from(auditLogs)
+    .where(
+      and(
+        eq(auditLogs.companyId, ctx.companyId),
+        eq(auditLogs.entityType, 'item'),
+        eq(auditLogs.entityId, itemId),
+        sql`(
+          (${countDate} IS NOT NULL AND (${auditLogs.newValues}->>'quantityOnHand') IS NOT NULL
+            AND ${countDate}::timestamptz >= ${after}::timestamptz)
+          OR (${openingAsOf} IS NOT NULL AND (${auditLogs.newValues}->'openingStock'->>'quantity') IS NOT NULL
+            AND ${openingAsOf}::timestamptz >= ${after}::timestamptz)
+        )`,
+      ),
+    );
+  return Money.of(row?.qty ?? '0').plus(Money.of(audited?.qty ?? '0'));
 }
 
 /** Load an inventory-type item scoped to the company. Throws NOT_FOUND. */
@@ -291,8 +320,9 @@ export interface PhysicalCountResult {
  *   - delta < 0 (shrinkage): Dr adjustmentAccount, Cr Inventory Asset
  *   - delta > 0 (overage):   Dr Inventory Asset, Cr adjustmentAccount
  *   - delta = 0: no GL posted, qty unchanged
- * (A $0 count posts no entry but still answers to the closing date.) Counts and opening stock
- * write no site movement, so a later-dated count entered first is not subtracted.
+ * (A $0 count posts no entry but still answers to the closing date.) Later-dated counts and
+ * opening stock count among those transactions too (from their audit rows — they write no site
+ * movement), so counts entered out of date order each compare with the books at their own date.
  */
 export async function physicalCount(
   ctx: ServiceContext,
