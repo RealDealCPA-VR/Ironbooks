@@ -34,6 +34,7 @@ import { Money, toAmountString } from '@/lib/money';
 import { buildRouter, type BuildRouterOptions } from './aiSettings';
 import { AiError } from '@/lib/ai/types';
 import { liveDuplicateSiblings } from './errorDetection';
+import { companyTodayIso } from './preferences';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -259,6 +260,11 @@ export async function applyCorrection(
     if (row.correction.status === 'rejected') {
       throw validation('Cannot apply a rejected correction.');
     }
+    // A detection can collect several suggestions (Analyze run more than once). Once one of them
+    // fixed it, applying another would post a second correcting entry for the same problem.
+    if (row.detection.resolvedAt) {
+      throw validation('This problem has already been fixed by another suggestion, so this one is no longer needed.');
+    }
 
     const data = (row.correction.correctionData ?? {}) as NonNullable<CorrectionRow['correctionData']> & {
       entry?: ProposedEntry;
@@ -481,7 +487,8 @@ async function modelProposal(
   }
   if (lines.length < 2 || !dr.equals(cr) || dr.isZero()) return null;
   return {
-    date: new Date().toISOString().slice(0, 10),
+    // Today in the company's time zone (the UTC day is tomorrow in a US evening).
+    date: await companyTodayIso(ctx),
     description: (e.description || `Correcting entry: ${fallbackDescription}`).slice(0, 500),
     lines,
   };

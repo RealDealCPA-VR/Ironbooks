@@ -10,6 +10,7 @@ import { userPreferences } from '@/lib/db/schema';
 import {
   MY_PREFERENCE_KEYS,
   resolveMyPreferences,
+  todayInTimeZone,
   type CompanyPreferences,
   type MyPreferences,
 } from '@/lib/preferences';
@@ -30,6 +31,24 @@ export async function getMyPreferences(ctx: ServiceContext): Promise<MyPreferenc
     .from(userPreferences)
     .where(and(eq(userPreferences.companyId, ctx.companyId), eq(userPreferences.userId, ctx.userId)));
   return resolveMyPreferences(row?.prefs ?? {});
+}
+
+/**
+ * Today's calendar day for this company ('YYYY-MM-DD'), in its time zone (Preferences > Company).
+ * `new Date().toISOString().slice(0, 10)` is the UTC day: in the evening west of UTC it is already
+ * tomorrow, so "today", "this month" and default dates came out a day (or a month) ahead.
+ */
+export async function companyTodayIso(ctx: ServiceContext, now: Date = new Date()): Promise<string> {
+  const prefs = await getPreferences(ctx);
+  return todayInTimeZone(prefs.timezone, now);
+}
+
+/**
+ * companyTodayIso as a Date at noon UTC of that day — for code that reads calendar parts with
+ * getUTC* (lib/commands/dates.ts) or slices toISOString(): both then see the company's day.
+ */
+export async function companyToday(ctx: ServiceContext, now: Date = new Date()): Promise<Date> {
+  return new Date(`${await companyTodayIso(ctx, now)}T12:00:00.000Z`);
 }
 
 export async function getAllPreferences(ctx: ServiceContext): Promise<AllPreferences> {

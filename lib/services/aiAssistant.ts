@@ -25,6 +25,7 @@ import { apAging, arAging } from './reportsExtra';
 import { assertBalanced } from './posting';
 import { createManualEntry, followMergedNames } from './journal';
 import { buildRouter, type BuildRouterOptions } from './aiSettings';
+import { companyToday } from './preferences';
 import { AiError } from '@/lib/ai/types';
 
 // ---------------------------------------------------------------------------
@@ -671,11 +672,13 @@ export async function ask(
   const question = message.trim();
   if (!question) throw validation('Ask a question.');
   if (question.length > 4000) throw validation('Question is too long (4,000 characters max).');
-  const today = (opts.today ?? new Date()).toISOString().slice(0, 10);
+  // The company's calendar day (its time zone), not the UTC one — see companyToday.
+  const todayDate = opts.today ?? (await companyToday(ctx));
+  const today = todayDate.toISOString().slice(0, 10);
 
   const router = await buildRouter(ctx, opts);
   if (!router.isAvailable('assistant')) {
-    const reply = await offlineAnswer(ctx, question, opts.today ?? new Date());
+    const reply = await offlineAnswer(ctx, question, todayDate);
     return { ...reply, notice: router.unavailableReason('assistant') ?? undefined };
   }
 
@@ -740,7 +743,7 @@ export async function ask(
   } catch (err) {
     if (!(err instanceof AiError)) throw err;
     // Model failed mid-conversation — fall back to the deterministic answer.
-    const reply = await offlineAnswer(ctx, question, opts.today ?? new Date());
+    const reply = await offlineAnswer(ctx, question, todayDate);
     return { ...reply, notice: `AI model unavailable (${err.message}). Showing a basic answer instead.` };
   }
   throw new ServiceError('INTERNAL', 'Assistant did not produce an answer.');

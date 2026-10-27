@@ -71,6 +71,7 @@ import { PREFILL_PATHS, formPrefillSchema, type FormPrefill, type PrefillLine } 
 import { ACTION_HREFS, ACTION_NEEDS, COMMAND_ACTIONS, canDoAction, canOpenHref } from '@/lib/commands/actions';
 import { type ServiceContext, validation } from './_base';
 import { buildRouter, type BuildRouterOptions } from './aiSettings';
+import { companyToday } from './preferences';
 import { notFiscalCloseEntry, profitAndLoss } from './reports';
 import { unpaidBillsDetail } from './reportsLists';
 import { openInvoicesReport } from './reportsAging';
@@ -150,7 +151,8 @@ export async function runCommand(
   input: RunCommandInput,
   opts: RunCommandOptions = {},
 ): Promise<CommandResult> {
-  const today = opts.today ?? new Date();
+  // The company's calendar day (its time zone), not the UTC one — see companyToday.
+  const today = opts.today ?? (await companyToday(ctx));
   if (input.intent) {
     const parsed = commandIntentSchema.safeParse(input.intent);
     if (!parsed.success) throw validation('That choice is no longer valid. Type the command again.');

@@ -564,21 +564,22 @@ export async function reclassifySalesTaxPayment(
   const amount = Money.sub(line.debit ?? 0, line.credit ?? 0);
   if (!amount.greaterThan(0)) throw validation('Only payments (debits) can be moved to sales tax.');
 
-  const [dup] = await ctx.db
-    .select({ id: journalEntries.id })
-    .from(journalEntries)
-    .where(
-      and(
-        eq(journalEntries.companyId, ctx.companyId),
-        eq(journalEntries.status, 'posted'),
-        eq(journalEntries.reference, `fix-line:${line.id}`),
-      ),
-    );
-  if (dup) throw new ServiceError('CONFLICT', 'This payment has already been moved to sales tax.');
-
   const liabilityId = await agencyLiabilityAccountId(ctx, agency.id);
   const amt = toAmountString(amount);
   return inTransaction(ctx, async (tx) => {
+    // Checked inside the transaction that posts the correction: a double-submitted fix must not
+    // count the same payment twice (both requests would otherwise pass a check made before it).
+    const [dup] = await tx.db
+      .select({ id: journalEntries.id })
+      .from(journalEntries)
+      .where(
+        and(
+          eq(journalEntries.companyId, tx.companyId),
+          eq(journalEntries.status, 'posted'),
+          eq(journalEntries.reference, `fix-line:${line.id}`),
+        ),
+      );
+    if (dup) throw new ServiceError('CONFLICT', 'This payment has already been moved to sales tax.');
     const entry = await postJournalEntry(tx, {
       date: input.date ?? line.date,
       description: `Fix sales tax: payment to ${agency.name} recorded as an expense (entry #${line.entryNumber})`,
