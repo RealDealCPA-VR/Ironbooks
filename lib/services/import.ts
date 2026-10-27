@@ -424,17 +424,46 @@ function parseLooseDate(rawDate: string): Date {
     if (!isCalendarDay(Number(iso[1]), Number(iso[2]), Number(iso[3]))) return new Date(NaN);
     return new Date(Date.UTC(Number(iso[1]), Number(iso[2]) - 1, Number(iso[3])));
   }
-  // "02/30/2026" (read by the engine as month/day/year) rolls over the same way.
-  const mdy = /^(\d{1,2})[/-](\d{1,2})[/-](\d{2}|\d{4})$/.exec(s);
-  if (mdy && (d.getMonth() + 1 !== Number(mdy[1]) || d.getDate() !== Number(mdy[2]))) return new Date(NaN);
   // The zone must follow a time of day, so a date part like "01-31-2024" is never read as one.
   const zone = /\d:\d{2}(?::\d{2}(?:\.\d+)?)?\s*(?:(Z|GMT|UTC)|(?:GMT|UTC)?([+-])(\d{2}):?(\d{2}))$/i.exec(s);
+  let day: Date;
   if (zone) {
     const offsetMin = zone[1] ? 0 : (zone[2] === '-' ? -1 : 1) * (Number(zone[3]) * 60 + Number(zone[4]));
     const wall = new Date(d.getTime() + offsetMin * 60_000);
-    return new Date(Date.UTC(wall.getUTCFullYear(), wall.getUTCMonth(), wall.getUTCDate()));
+    day = new Date(Date.UTC(wall.getUTCFullYear(), wall.getUTCMonth(), wall.getUTCDate()));
+  } else {
+    day = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
   }
-  return new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  // The engine rolls an impossible day over in every other form too ("2026/02/30", "2026.02.30",
+  // "02/30/2026 10:00", "2/30/26", "Feb 30, 2026", "31-Apr-26" all become a day in the next
+  // month): the day read must be the day written, or the date is refused.
+  const written = writtenDayParts(s);
+  if (written) {
+    if (written.y !== undefined && day.getUTCFullYear() !== written.y) return new Date(NaN);
+    if (day.getUTCMonth() + 1 !== written.m || day.getUTCDate() !== written.d) return new Date(NaN);
+  }
+  return day;
+}
+
+const MONTH_PREFIXES = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+
+/**
+ * Month and day (and a 4-digit year when it leads) as written at the start of a date the engine
+ * reads: "2026/02/30", "2026.2.30", "02/30/2026", "2-30-26", "Feb 30, 2026", "Mon Feb 30 2026",
+ * "30 Feb 2026", "Tue, 30 Feb 2026 10:00:00 GMT", "30-Feb-26". Null for a shape it does not know
+ * (then nothing is compared).
+ */
+function writtenDayParts(s: string): { y?: number; m: number; d: number } | null {
+  const ymd = /^(\d{4})[/.\-\s]+(\d{1,2})[/.\-\s]+(\d{1,2})(?!\d)/.exec(s);
+  if (ymd) return { y: Number(ymd[1]), m: Number(ymd[2]), d: Number(ymd[3]) };
+  const mdy = /^(\d{1,2})[/.\-\s]+(\d{1,2})[/.\-\s]+(\d{2}|\d{4})(?!\d)/.exec(s);
+  if (mdy) return { m: Number(mdy[1]), d: Number(mdy[2]) };
+  const monthOf = (word: string) => MONTH_PREFIXES.indexOf(word.slice(0, 3).toLowerCase()) + 1;
+  const named = /^(?:[a-z]+\.?,?\s+)?([a-z]{3,})\.?\s+(\d{1,2})(?!\d)/i.exec(s);
+  if (named && monthOf(named[1]) > 0) return { m: monthOf(named[1]), d: Number(named[2]) };
+  const dayFirst = /^(?:[a-z]+\.?,?\s+)?(\d{1,2})[\s\-/.]+([a-z]{3,})\.?(?![a-z])/i.exec(s);
+  if (dayFirst && monthOf(dayFirst[2]) > 0) return { m: monthOf(dayFirst[2]), d: Number(dayFirst[1]) };
+  return null;
 }
 
 /** Drop the first `skipRows` physical lines (bank-export preamble before the header). */

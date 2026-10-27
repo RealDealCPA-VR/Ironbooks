@@ -130,6 +130,45 @@ describe('B. impossible calendar dates are refused', () => {
     ).rejects.toMatchObject({ code: 'VALIDATION' });
     expect(await staged(ba.id)).toEqual([]);
   });
+
+  it('with no date format chosen, every shape the engine reads refuses an impossible day (2026/02/30, Feb 30, 2026 …)', () => {
+    const csv = (cell: string) => `Date,Description,Amount\n"${cell}",X,1.00\n`;
+    for (const bad of [
+      '2026/02/30', // Canadian bank exports
+      '2026/2/30',
+      '2026.02.30',
+      '2026-2-30',
+      '2026/02/30 10:00',
+      '02/30/2026 10:00',
+      '02.30.2026',
+      '2/30/26',
+      'Feb 30, 2026',
+      'February 30 2026',
+      'Mon Feb 30 2026',
+      '30 Feb 2026',
+      '31-Apr-26',
+      'Tue, 30 Feb 2026 10:00:00 GMT',
+      '2026/04/31 23:30 -05:00',
+    ]) {
+      expect(() => parseCSV(csv(bad), SINGLE), bad).toThrow(/cannot parse date/);
+    }
+    // Real days in the same shapes still import, on the day written.
+    for (const [good, iso] of [
+      ['2026/02/28', '2026-02-28'],
+      ['2026.2.3', '2026-02-03'],
+      ['2028/02/29', '2028-02-29'],
+      ['02/28/2026 10:00', '2026-02-28'],
+      ['2/28/26', '2026-02-28'],
+      ['Feb 28, 2026', '2026-02-28'],
+      ['Sept 30, 2026', '2026-09-30'],
+      ['30-Apr-26', '2026-04-30'],
+      ['Tue, 03 Feb 2026 10:00:00 GMT', '2026-02-03'],
+      ['01/31/2026 23:30 -05:00', '2026-01-31'],
+      ['2026/01/31 23:30 -05:00', '2026-01-31'],
+    ]) {
+      expect(parseCSV(csv(good), SINGLE)[0].date.toISOString().slice(0, 10), good).toBe(iso);
+    }
+  });
 });
 
 describe('C. POST /api/import with reviewed rows', () => {
