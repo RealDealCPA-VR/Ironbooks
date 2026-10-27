@@ -14,6 +14,7 @@ import { getSessionGate } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
 import { archiveCompany, renameCompany } from './manage';
 import { serviceErrorStatus } from '@/lib/routeErrors';
+import { stripSecrets } from '@/lib/permissions/mask';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -42,7 +43,7 @@ export async function PATCH(req: NextRequest, { params }: RouteParams) {
       return NextResponse.json({ error: 'name is required', code: 'VALIDATION' }, { status: 400 });
     }
     const company = await renameCompany(db, userId, id, body.name);
-    return NextResponse.json(company);
+    return NextResponse.json(stripSecrets(company));
   } catch (err) {
     return errorResponse(err);
   }
@@ -60,7 +61,7 @@ export async function DELETE(req: NextRequest, { params }: RouteParams) {
     // api.del sends no body, so the typed-name confirmation travels as ?confirm=.
     const confirm = new URL(req.url).searchParams.get('confirm') ?? '';
     const company = await archiveCompany(db, userId, id, confirm);
-    return NextResponse.json(company);
+    return NextResponse.json(stripSecrets(company));
   } catch (err) {
     return errorResponse(err);
   }

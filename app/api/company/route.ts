@@ -14,6 +14,7 @@ import { ServiceError } from '@/lib/services/_base';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { updateCompanyBodySchema } from '@/lib/validation/company';
 import { serviceErrorStatus } from '@/lib/routeErrors';
+import { stripSecrets } from '@/lib/permissions/mask';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -31,7 +32,8 @@ export async function GET() {
     if (!company) {
       return NextResponse.json({ error: 'Company not found', code: 'NOT_FOUND' }, { status: 404 });
     }
-    return NextResponse.json(company);
+    // Never the closing-date or file password hashes (lib/permissions/mask.ts stripSecrets).
+    return NextResponse.json(stripSecrets(company));
   } catch (err) {
     return errorResponse(err);
   }
@@ -60,7 +62,7 @@ export async function PATCH(req: NextRequest) {
       ...(name !== undefined ? { name } : {}),
       ...(Object.keys(settingsPatch).length > 0 ? { settings: settingsPatch } : {}),
     });
-    return NextResponse.json(updated);
+    return NextResponse.json(stripSecrets(updated));
   } catch (err) {
     return errorResponse(err);
   }

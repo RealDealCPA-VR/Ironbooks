@@ -8,6 +8,7 @@ import { COMPANY_COOKIE, DEACTIVATED_MESSAGE, getSessionGate, isArchivedCompany 
 import { ServiceError } from '@/lib/services/_base';
 import { cookieSecure, originFromHeaders } from '@/lib/net/requestInfo';
 import { stampLastOpened } from '../[id]/manage';
+import { stripSecrets } from '@/lib/permissions/mask';
 
 export async function POST(req: NextRequest) {
   // Require a session (file lock, file binding and deactivation checked by getSessionGate) and
@@ -52,7 +53,7 @@ export async function POST(req: NextRequest) {
   }
   // Recency ordering for the companies page: stamp settings.lastOpenedAt on every open.
   await stampLastOpened(db, companyId);
-  const res = NextResponse.json({ ok: true, company: c });
+  const res = NextResponse.json({ ok: true, company: stripSecrets(c) });
   res.cookies.set(COMPANY_COOKIE, companyId, {
     httpOnly: true,
     secure: cookieSecure(originFromHeaders(req.headers)),
