@@ -195,6 +195,18 @@ export function readXlsx(bytes: Uint8Array): GridSheet[] {
     throw fail('This file is not a readable .xlsx workbook.');
   }
   assertReasonableXlsx(zip);
+  try {
+    return readWorkbook(zip);
+  } catch (err) {
+    // A part that inflates past its declared size (a zip bomb lying about it: adm-zip stops at
+    // the declared size), a bad CRC, broken deflate data or XML: say the file is damaged — a
+    // plain 400 — instead of letting zlib's RangeError through as a 500.
+    if (err instanceof ServiceError) throw err;
+    throw fail('This .xlsx workbook is damaged and could not be read. Open it in Excel, save it again and upload it again — or export the report as CSV.');
+  }
+}
+
+function readWorkbook(zip: AdmZip): GridSheet[] {
   const parser = xmlParser();
   const workbookXml = zipText(zip, 'xl/workbook.xml');
   if (!workbookXml) throw fail('This .xlsx file has no workbook (xl/workbook.xml is missing).');
