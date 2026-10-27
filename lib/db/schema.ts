@@ -1668,6 +1668,18 @@ export const aiSettings = pgTable('ai_settings', {
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
+/**
+ * 0072 (review round 5): random secrets that belong to the company FILE and travel with every copy
+ * of it (company file, backup, portable file) — unlike the per-computer .auth-secret, which signs
+ * sessions and never leaves this computer. 'vault' encrypts stored AI provider keys
+ * (lib/ai/keyVault.ts "v2:" blobs). Never used for session signing.
+ */
+export const fileSecrets = pgTable('file_secrets', {
+  name: varchar('name', { length: 64 }).primaryKey(),
+  secret: text('secret').notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
 /** Learned categorizer state (naive Bayes counts) — one row per company. */
 export const aiCategorizerModels = pgTable('ai_categorizer_models', {
   id: uuid('id').primaryKey().defaultRandom(),

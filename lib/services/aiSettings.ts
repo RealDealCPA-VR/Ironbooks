@@ -12,14 +12,14 @@
 import crypto from 'node:crypto';
 import { eq } from 'drizzle-orm';
 import { z } from 'zod';
-import { aiSettings, customers, employees, vendors } from '@/lib/db/schema';
+import { aiSettings, bankAccounts, customers, employees, leads, otherNames, salesReps, vendors } from '@/lib/db/schema';
 import { type ServiceContext, validation, writeAudit, inTransaction } from './_base';
 import { requireRole } from './rbac';
 import { AiRouter } from '@/lib/ai/router';
 import { createProvider, localityOf, type ProviderDeps } from '@/lib/ai/providers';
 import { classifyEndpoint } from '@/lib/ai/tailnet';
 import { verifyTailnetUrls } from '@/lib/net/tailnetVerify';
-import { decryptSecret, encryptSecret } from '@/lib/ai/keyVault';
+import { isLegacyBlob, migrateLegacySecrets, openStoredSecret, readVaultSecret, sealForFile } from '@/lib/ai/keyVault';
 import { Redactor, addressEntities, type KnownEntity } from '@/lib/ai/redact';
 import {
   AI_TASKS,
@@ -73,11 +73,37 @@ function normalizePolicies(raw: Record<string, string> | null | undefined): Reco
   return out;
 }
 
-/** Load the raw settings record (defaults when the company has none yet). Read-only. */
+/**
+ * The company file's vault secret each loaded provider's key is opened with (lib/ai/keyVault.ts).
+ * Keyed by the provider objects loadSettings returns, so the synchronous buildProviders can open
+ * their keys without another database round trip — and nothing secret is added to the objects.
+ */
+const vaultSecretOf = new WeakMap<object, string | null>();
+
+/** The plaintext key of a stored provider, or null (none, or unreadable on this computer). */
+function openKey(p: StoredProviderConfig, companyId: string): string | null {
+  if (!p.apiKeyEnc) return null;
+  return openStoredSecret(p.apiKeyEnc, companyId, vaultSecretOf.get(p) ?? null);
+}
+
+/**
+ * Load the raw settings record (defaults when the company has none yet). It only writes to move
+ * keys saved by an older version (encrypted with this computer's own key, which never travels
+ * with the company file) to the company file's key — lib/ai/keyVault.ts migrateLegacySecrets.
+ */
 export async function loadSettings(ctx: ServiceContext): Promise<SettingsRecord> {
-  const [row] = await ctx.db.select().from(aiSettings).where(eq(aiSettings.companyId, ctx.companyId));
+  let [row] = await ctx.db.select().from(aiSettings).where(eq(aiSettings.companyId, ctx.companyId));
   if (!row) return { ...DEFAULTS, taskPolicies: { ...DEFAULTS.taskPolicies } };
+  const stored = (row.providers as unknown as StoredProviderConfig[]) ?? [];
+  if (
+    stored.some((p) => isLegacyBlob(p?.apiKeyEnc)) &&
+    (await migrateLegacySecrets(ctx.db, { companyId: ctx.companyId })) > 0
+  ) {
+    [row] = await ctx.db.select().from(aiSettings).where(eq(aiSettings.companyId, ctx.companyId));
+  }
   const providers = (row.providers as unknown as StoredProviderConfig[]) ?? [];
+  const fileSecret = providers.some((p) => p?.apiKeyEnc) ? await readVaultSecret(ctx.db) : null;
+  for (const p of providers) if (p && typeof p === 'object') vaultSecretOf.set(p, fileSecret);
   // *.ts.net endpoints count as tailnet (local, unredacted) only when they resolve to tailnet
   // addresses — Funnel names are public (lib/net/tailnetVerify.ts).
   await verifyTailnetUrls(providers.map((p) => p.baseUrl));
@@ -94,7 +120,7 @@ export async function loadSettings(ctx: ServiceContext): Promise<SettingsRecord>
 function toPublic(p: StoredProviderConfig, companyId: string): PublicProviderConfig {
   const { apiKeyEnc, ...rest } = p;
   const ep = p.kind === 'anthropic' && !p.baseUrl ? null : classifyEndpoint(p.baseUrl);
-  const unreadable = !!apiKeyEnc && decryptSecret(apiKeyEnc, companyId) === null;
+  const unreadable = !!apiKeyEnc && openKey(p, companyId) === null;
   return {
     ...rest,
     hasApiKey: !!apiKeyEnc && !unreadable,
@@ -173,6 +199,8 @@ export async function updateSettings(ctx: ServiceContext, input: UpdateSettingsI
   const body = parsed.data;
   const current = await loadSettings(ctx);
   const next: SettingsRecord = { ...current };
+  /** New plaintext keys by provider id, sealed inside the transaction below. */
+  const newKeys = new Map<string, string>();
 
   if (body.providers) {
     const byId = new Map(current.providers.map((p) => [p.id, p]));
@@ -187,8 +215,11 @@ export async function updateSettings(ctx: ServiceContext, input: UpdateSettingsI
       // host requires re-entering the key, so it can never be redirected to an arbitrary URL.
       let apiKeyEnc = prev && sameEndpoint(prev, p) ? prev.apiKeyEnc ?? null : null;
       if (p.clearApiKey) apiKeyEnc = null;
-      if (p.apiKey !== undefined && p.apiKey.trim() !== '') apiKeyEnc = encryptSecret(p.apiKey.trim(), ctx.companyId);
-      if (p.kind === 'anthropic' && !apiKeyEnc && p.enabled) {
+      if (p.apiKey !== undefined && p.apiKey.trim() !== '') {
+        newKeys.set(id, p.apiKey.trim());
+        apiKeyEnc = null; // sealed below with the company file's own key
+      }
+      if (p.kind === 'anthropic' && !apiKeyEnc && !newKeys.has(id) && p.enabled) {
         throw validation(`${p.label}: an Anthropic API key is required.`);
       }
       return {
@@ -219,6 +250,16 @@ export async function updateSettings(ctx: ServiceContext, input: UpdateSettingsI
   });
 
   await inTransaction(ctx, async (tx) => {
+    // New keys are sealed with the company FILE's own key (lib/ai/keyVault.ts), so they still
+    // work when the file is opened on another computer.
+    if (newKeys.size) {
+      const sealed: StoredProviderConfig[] = [];
+      for (const p of next.providers) {
+        const plain = newKeys.get(p.id);
+        sealed.push(plain === undefined ? p : { ...p, apiKeyEnc: await sealForFile(tx.db, plain, tx.companyId) });
+      }
+      next.providers = sealed;
+    }
     const values = {
       providers: next.providers as unknown as Record<string, unknown>[],
       taskPolicies: next.taskPolicies as Record<string, string>,
@@ -250,8 +291,9 @@ export async function updateSettings(ctx: ServiceContext, input: UpdateSettingsI
 // ---------------------------------------------------------------------------
 
 function runtimeConfig(p: StoredProviderConfig, companyId: string): ProviderRuntimeConfig {
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const { apiKeyEnc, ...rest } = p;
-  return { ...rest, apiKey: apiKeyEnc ? decryptSecret(apiKeyEnc, companyId) : null };
+  return { ...rest, apiKey: openKey(p, companyId) };
 }
 
 /** Instantiate the enabled providers (skipping ones whose config cannot be used). */
@@ -275,23 +317,37 @@ export function buildProviders(
 }
 
 /**
- * Company-aware redactor: customer / vendor / employee names, their emails, phones, street
- * addresses and tax ids. Built lazily — only when a cloud call actually happens.
+ * Company-aware redactor: the names of every person and business in the company's name lists —
+ * customers (and their ship-to addresses), vendors, employees, Other Names (owners, partners —
+ * QuickBooks' list for anyone who is not a customer, vendor or employee), leads and sales reps —
+ * with their emails, phones, street addresses, tax ids and account numbers, plus the company's
+ * own bank account numbers. Built lazily — only when a cloud call actually happens.
  */
 export async function buildCompanyRedactor(ctx: ServiceContext): Promise<Redactor> {
-  const [custs, vends, emps] = await Promise.all([
+  const [custs, vends, emps, others, leadRows, reps, banks] = await Promise.all([
     ctx.db.select({
       displayName: customers.displayName, companyName: customers.companyName, email: customers.email,
       phone: customers.phone, billingAddress: customers.billingAddress, shippingAddress: customers.shippingAddress,
+      shipToAddresses: customers.shipToAddresses,
     }).from(customers).where(eq(customers.companyId, ctx.companyId)),
     ctx.db.select({
       displayName: vendors.displayName, companyName: vendors.companyName, email: vendors.email,
-      phone: vendors.phone, address: vendors.address, taxId: vendors.taxId,
+      phone: vendors.phone, address: vendors.address, taxId: vendors.taxId, accountNumber: vendors.accountNumber,
     }).from(vendors).where(eq(vendors.companyId, ctx.companyId)),
     ctx.db.select({
       firstName: employees.firstName, lastName: employees.lastName, email: employees.email,
-      address: employees.address, ssn: employees.ssn,
+      phone: employees.phone, address: employees.address, ssn: employees.ssn,
     }).from(employees).where(eq(employees.companyId, ctx.companyId)),
+    ctx.db.select({
+      name: otherNames.name, companyName: otherNames.companyName, email: otherNames.email,
+      phone: otherNames.phone, address: otherNames.address, accountNumber: otherNames.accountNumber,
+    }).from(otherNames).where(eq(otherNames.companyId, ctx.companyId)),
+    ctx.db.select({
+      name: leads.name, companyName: leads.companyName, email: leads.email, phone: leads.phone,
+      address: leads.address, contacts: leads.contacts,
+    }).from(leads).where(eq(leads.companyId, ctx.companyId)),
+    ctx.db.select({ name: salesReps.name, email: salesReps.email }).from(salesReps).where(eq(salesReps.companyId, ctx.companyId)),
+    ctx.db.select({ accountNumber: bankAccounts.accountNumber }).from(bankAccounts).where(eq(bankAccounts.companyId, ctx.companyId)),
   ]);
   const ents: KnownEntity[] = [];
   const push = (text: string | null | undefined, kind: KnownEntity['kind']) => {
@@ -303,6 +359,11 @@ export async function buildCompanyRedactor(ctx: ServiceContext): Promise<Redacto
     push(c.email, 'EMAIL');
     push(c.phone, 'PHONE');
     ents.push(...addressEntities(c.billingAddress), ...addressEntities(c.shippingAddress));
+    for (const s of Array.isArray(c.shipToAddresses) ? c.shipToAddresses : []) {
+      if (!s || typeof s !== 'object') continue;
+      if (typeof s.name === 'string') push(s.name, 'CUSTOMER');
+      ents.push(...addressEntities(s as Record<string, unknown>));
+    }
   }
   for (const v of vends) {
     push(v.displayName, 'VENDOR');
@@ -310,15 +371,43 @@ export async function buildCompanyRedactor(ctx: ServiceContext): Promise<Redacto
     push(v.email, 'EMAIL');
     push(v.phone, 'PHONE');
     push(v.taxId, 'TAXID');
+    push(v.accountNumber, 'ACCOUNT');
     ents.push(...addressEntities(v.address));
   }
   for (const e of emps) {
     push(`${e.firstName} ${e.lastName}`, 'EMPLOYEE');
     push(`${e.lastName}, ${e.firstName}`, 'EMPLOYEE');
     push(e.email, 'EMAIL');
+    push(e.phone, 'PHONE');
     push(e.ssn, 'SSN');
     ents.push(...addressEntities(e.address));
   }
+  for (const o of others) {
+    push(o.name, 'PERSON');
+    push(o.companyName, 'PERSON');
+    push(o.email, 'EMAIL');
+    push(o.phone, 'PHONE');
+    push(o.accountNumber, 'ACCOUNT');
+    ents.push(...addressEntities(o.address));
+  }
+  for (const l of leadRows) {
+    push(l.name, 'PERSON');
+    push(l.companyName, 'PERSON');
+    push(l.email, 'EMAIL');
+    push(l.phone, 'PHONE');
+    ents.push(...addressEntities(l.address));
+    for (const c of Array.isArray(l.contacts) ? l.contacts : []) {
+      if (!c || typeof c !== 'object') continue;
+      push(c.name, 'PERSON');
+      push(c.email, 'EMAIL');
+      push(c.phone, 'PHONE');
+    }
+  }
+  for (const r of reps) {
+    push(r.name, 'PERSON');
+    push(r.email, 'EMAIL');
+  }
+  for (const b of banks) push(b.accountNumber, 'ACCOUNT');
   return new Redactor(ents);
 }
 
@@ -386,7 +475,7 @@ export async function testConnection(
   // Reuse the saved key only for the endpoint it was saved for (see sameEndpoint).
   const apiKey =
     p.apiKey?.trim() ||
-    (saved?.apiKeyEnc && sameEndpoint(saved, p) ? decryptSecret(saved.apiKeyEnc, ctx.companyId) : null);
+    (saved?.apiKeyEnc && sameEndpoint(saved, p) ? openKey(saved, ctx.companyId) : null);
   const cfg: ProviderRuntimeConfig = {
     id: p.id ?? 'draft',
     kind: p.kind as ProviderRuntimeConfig['kind'],
