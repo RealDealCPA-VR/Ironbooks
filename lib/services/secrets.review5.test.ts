@@ -55,6 +55,8 @@ import { GET as auditOneGET } from '@/app/api/audit-trail/[id]/route';
 import { GET as employeesGET } from '@/app/api/employees/route';
 import { GET as employeeGET } from '@/app/api/employees/[id]/route';
 import { POST as journalPOST } from '@/app/api/journal-entries/route';
+import { POST as portalPasswordPOST } from '@/app/api/employees/[id]/portal-password/route';
+import { verifyPassword } from '@/lib/auth';
 import { accounts } from '@/lib/db/schema';
 
 let db: DB;
@@ -220,5 +222,34 @@ describe('review5: closing-date password guesses are limited like every other pa
     expect((await locked.json()).error).toMatch(/too many wrong closing-date passwords/i);
     // Other people are not affected.
     expect((await closedPeriodEntry(accountant, 'Cl0sing-Secret')).status).toBe(201);
+  });
+});
+
+describe("review5: an employee's portal password follows the file's password rules and is audited", () => {
+  it('a password the rules refuse is a 400; a good one is saved and audited (never the password)', async () => {
+    as(owner, 'POST', `/api/employees/${employeeId}/portal-password`);
+    // Default rules: letters AND numbers.
+    const weak = await portalPasswordPOST(
+      req('POST', `/api/employees/${employeeId}/portal-password`, { password: 'lettersonly' }),
+      params({ id: employeeId }),
+    );
+    expect(weak.status).toBe(400);
+    expect((await weak.json()).error).toBe('The password needs a number.');
+    const [still] = await db.select().from(employees).where(eq(employees.id, employeeId));
+    expect(await verifyPassword('portalPass123', still.portalPasswordHash!)).toBe(true);
+
+    as(owner, 'POST', `/api/employees/${employeeId}/portal-password`);
+    const ok = await portalPasswordPOST(
+      req('POST', `/api/employees/${employeeId}/portal-password`, { password: 'NewPortal2026' }),
+      params({ id: employeeId }),
+    );
+    expect(ok.status).toBe(200);
+    const audits = await db
+      .select()
+      .from(auditLogs)
+      .where(and(eq(auditLogs.companyId, companyId), eq(auditLogs.entityId, employeeId)));
+    const text = JSON.stringify(audits.map((a) => a.newValues));
+    expect(text).toContain('portalPasswordSet');
+    expect(text).not.toContain('NewPortal2026');
   });
 });
