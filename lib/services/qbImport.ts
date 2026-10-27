@@ -1560,7 +1560,7 @@ async function importIIFRows(
     // because below those rows themselves are re-pointed to the conversion account.
     const r = await importOpenItemsFromIif(ctx, docTxns, {
       alreadyInGl: !!opts.openItems.alreadyInGl,
-      controlRows: await collectIifControlRows(ctx, txns, lookup),
+      controlRows: await collectIifControlRows(ctx, txns, lookup, counts),
     });
     counts.openItems = { invoices: r.invoices, bills: r.bills, credits: r.credits, skipped: r.skipped };
     counts.skipped += r.skipped;
@@ -2356,9 +2356,21 @@ async function ensureBucketAccount(
     addToLookup(lookup, parent);
   }
 
-  const name = ref.trim();
-  let code = sanitiseCode(name);
-  if (!code) return null;
+  // The account holds the name as written (up to the 255 characters an account name can hold);
+  // a name without Latin letters or digits ("Касса", "現金") still gets a stable code. Without
+  // these the transaction was skipped (or the whole import stopped on a raw database error),
+  // while the open-items step had already applied its A/R / A/P rows to the documents.
+  const name = ref.trim().slice(0, 255);
+  if (name.length < ref.trim().length) {
+    // A re-import of a name longer than an account name can hold: the account an earlier import
+    // made for it under the review bucket (its name is the first 255 characters).
+    const made = (lookup.byLowerName.get(name.toLowerCase()) ?? []).filter((a) => a.path.startsWith(`${parent!.path}:`));
+    if (made.length === 1) {
+      lookup.byPath.set(normPath(ref), made[0]);
+      return made[0];
+    }
+  }
+  let code = sanitiseCode(name) || `QB-${createHash('sha256').update(name).digest('hex').slice(0, 8).toUpperCase()}`;
   if (lookup.byCode.has(code)) {
     const free = await findAvailableCode(ctx, code);
     if (!free) return null;
@@ -2375,7 +2387,7 @@ async function ensureBucketAccount(
   const entry: AccountRef = { id: created.id, type: 'expense', subtype: created.subtype, code, name, path: `${parent.path}:${name}` };
   addToLookup(lookup, entry);
   // Later references to the same unmatched name resolve to this account.
-  lookup.byPath.set(normPath(name), entry);
+  lookup.byPath.set(normPath(ref), entry);
   counts.issues.push({
     entity: 'account',
     name,
@@ -2384,6 +2396,27 @@ async function ensureBucketAccount(
     message: `Account "${ref}" was not found — created under "${QB_IMPORT_BUCKET.name}" for review.`,
   });
   return entry;
+}
+
+/**
+ * The review-bucket account for an IIF account reference that is not in the books, or the reason
+ * (a row problem) it cannot be made. Shared by the transaction import and the open-items control
+ * rows (collectIifControlRows), so a transaction is posted exactly when its A/R / A/P rows are
+ * applied to the open documents. Never throws for a value the database cannot hold.
+ */
+async function bucketAccountOrProblem(
+  ctx: ServiceContext,
+  counts: ImportCounts,
+  lookup: AccountLookup,
+  ref: string,
+): Promise<AccountRef | string> {
+  try {
+    return (await ensureBucketAccount(ctx, counts, lookup, ref || '(no account)')) ?? 'A row has an unresolvable account.';
+  } catch (caught) {
+    const err = importRowError(caught);
+    if (!err) throw caught;
+    return `Account "${(ref || '').slice(0, 60)}" could not be created: ${err.message}`;
+  }
 }
 
 /**
@@ -2416,6 +2449,7 @@ async function collectIifControlRows(
   ctx: ServiceContext,
   transactions: IIFTransaction[],
   lookup: AccountLookup,
+  counts: ImportCounts,
 ): Promise<IifControlRow[]> {
   const out: IifControlRow[] = [];
   // Same source references importIifTransactions gives these transactions (see there).
@@ -2446,8 +2480,19 @@ async function collectIifControlRows(
         ok = false;
         break;
       }
-      const acct = resolved as AccountRef | null;
-      if (!acct || acct.code === '1250') continue;
+      let acct = resolved as AccountRef | null;
+      if (!acct) {
+        // Exactly what importIifTransactions does with an account the books lack: its review
+        // account, or — when none can be made — the transaction is not posted, so its rows must
+        // not touch the documents either (they did: a skipped payment still reduced the invoice).
+        const made = await bucketAccountOrProblem(ctx, counts, lookup, l.accnt);
+        if (typeof made === 'string') {
+          ok = false;
+          break;
+        }
+        acct = made;
+      }
+      if (acct.code === '1250') continue;
       const side = acct.subtype === 'accounts_receivable' ? 'ar' : acct.subtype === 'accounts_payable' ? 'ap' : null;
       const name = (l.name ?? txn.name ?? '').trim();
       if (!side || !name) continue;
@@ -2600,11 +2645,12 @@ async function importIifTransactions(
       } else if (resolved) {
         acct = resolved as AccountRef;
       } else {
-        acct = await ensureBucketAccount(ctx, counts, lookup, l.accnt || '(no account)');
-        if (!acct) {
-          problem = 'A row has an unresolvable account.';
+        const made = await bucketAccountOrProblem(ctx, counts, lookup, l.accnt);
+        if (typeof made === 'string') {
+          problem = made;
           break;
         }
+        acct = made;
       }
       const classId = l.className ? classIdByPath.get(normPath(l.className)) ?? null : null;
       const isDebit = Money.isPositive(amt);

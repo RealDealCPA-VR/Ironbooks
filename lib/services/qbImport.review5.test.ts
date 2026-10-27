@@ -14,7 +14,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { and, eq, like } from 'drizzle-orm';
 import { getDb, closeDb, type DB } from '@/lib/db';
-import { bills, invoices, journalEntries, users } from '@/lib/db/schema';
+import { accounts, bills, invoices, journalEntries, users } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
 import { createCompany } from './company';
 import { importIIF } from './qbImport';
@@ -63,6 +63,56 @@ const BILLS_IIF = [
   'SPL\tCHECK\t2/8/2024\tRent\tLandlord\t15.00\t1001',
   'ENDTRNS',
 ].join('\r\n');
+
+describe('IIF transactions on accounts the books do not have yet', () => {
+  it('an unknown 300-character account is a review account, not a raw database error halfway through', async () => {
+    const ctx = await newCo('Long Account Co');
+    const iif = [
+      '!TRNS\tTRNSTYPE\tDATE\tACCNT\tNAME\tAMOUNT\tDOCNUM',
+      '!SPL\tTRNSTYPE\tDATE\tACCNT\tNAME\tAMOUNT\tDOCNUM',
+      '!ENDTRNS',
+      'TRNS\tGENERAL JOURNAL\t2/6/2024\tChecking\t\t80.00\t1',
+      `SPL\tGENERAL JOURNAL\t2/6/2024\t${'Z'.repeat(300)}\t\t-80.00\t1`,
+      'ENDTRNS',
+      'TRNS\tGENERAL JOURNAL\t2/7/2024\tChecking\t\t10.00\t2',
+      'SPL\tGENERAL JOURNAL\t2/7/2024\tRent\t\t-10.00\t2',
+      'ENDTRNS',
+    ].join('\r\n');
+    const counts = await importIIF(ctx, iif);
+    expect(counts.transactions).toBe(2);
+    expect(counts.issues.some((i) => i.reason === 'unmatched-account')).toBe(true);
+    const acctCount = async () => (await db.select().from(accounts).where(eq(accounts.companyId, ctx.companyId))).length;
+    const before = await acctCount();
+    const again = await importIIF(ctx, iif);
+    expect(again.transactions).toBe(0);
+    expect(await acctCount()).toBe(before); // the re-import finds the review account again
+  });
+
+  it('a payment on an account whose name has no Latin letters is posted, so the invoice it paid is not short', async () => {
+    const ctx = await newCo('Cyrillic Account Co');
+    const iif = [
+      '!CUST\tNAME',
+      'CUST\tAcme',
+      '!TRNS\tTRNSTYPE\tDATE\tACCNT\tNAME\tAMOUNT\tDOCNUM',
+      '!SPL\tTRNSTYPE\tDATE\tACCNT\tNAME\tAMOUNT\tDOCNUM',
+      '!ENDTRNS',
+      'TRNS\tINVOICE\t2/6/2024\tAccounts Receivable\tAcme\t100.00\t501',
+      'SPL\tINVOICE\t2/6/2024\tSales Income\tAcme\t-100.00\t501',
+      'ENDTRNS',
+      'TRNS\tPAYMENT\t2/7/2024\tКасса\tAcme\t40.00\t',
+      'SPL\tPAYMENT\t2/7/2024\tAccounts Receivable\tAcme\t-40.00\t',
+      'ENDTRNS',
+    ].join('\r\n');
+    const counts = await importIIF(ctx, iif, { openItems: { asDocuments: true, alreadyInGl: false } });
+    // The payment's 40.00 is applied to the invoice (open 60.00) — so the payment itself must be
+    // in the books (Dr Касса 40), or the 40.00 has vanished.
+    expect(counts.transactions).toBe(1);
+    const [inv] = await db.select({ balanceDue: invoices.balanceDue }).from(invoices).where(eq(invoices.companyId, ctx.companyId));
+    expect(inv.balanceDue).toBe('60.00');
+    const [kassa] = await db.select().from(accounts).where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.name, 'Касса')));
+    expect(kassa.balance).toBe('40.00');
+  });
+});
 
 describe('the same QuickBooks file imported twice at once', () => {
   it('IIF with open bills as documents: each bill and transaction comes in once', async () => {
