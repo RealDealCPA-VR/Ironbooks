@@ -1195,6 +1195,12 @@ async function openCompanyFromOs(filePath) {
 /** File > Save Copy As… (and converting an older company folder to a single company file). */
 async function saveCopyAsFlow({ convert = false } = {}) {
   if (!serverUrl || remoteHostOrigin) return;
+  // As in the File menu: a practice copy is never saved out as an ordinary company file (the
+  // copy would drop its sandbox marker and look like real books).
+  if (sandboxActive()) {
+    dialog.showErrorBox('Not available in the sandbox', 'Leave the sandbox first, then save a copy of your real company file.');
+    return;
+  }
   if (isDev) {
     dialog.showErrorBox('Not available in development', 'Run the packaged app to save a copy of the company file.');
     return;

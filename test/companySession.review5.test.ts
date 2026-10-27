@@ -226,3 +226,12 @@ describe('a crash before the first autosave check', () => {
     expect((await session.prepareWorkingCopy(cf, { root: wr })).plan).toBe('reuse');
   });
 });
+
+describe('Save Copy As in the sandbox (source pins)', () => {
+  const main = fs.readFileSync(path.resolve(__dirname, '..', 'electron', 'main.js'), 'utf8');
+  it('is refused from the Company File page too, not only greyed out in the File menu', () => {
+    expect(main).toMatch(/label: 'Save Copy As…', enabled: !remoteHostOrigin && !sandboxActive\(\)/);
+    const fn = main.slice(main.indexOf('async function saveCopyAsFlow('));
+    expect(fn.slice(0, 500)).toMatch(/if \(sandboxActive\(\)\) \{\s*dialog\.showErrorBox\('Not available in the sandbox'/);
+  });
+});
