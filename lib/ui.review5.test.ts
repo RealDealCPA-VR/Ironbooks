@@ -43,6 +43,10 @@ import { registerBody, showEntryRow } from '../app/registers/[accountId]/registe
 import { depositToAccounts, depositToEdit, type Deposit } from '../app/deposits/depositEdit';
 import { applyClearedAnswer, differenceIsZero } from '../app/reconcile/reconcileMath';
 import { canEditInvoice } from '../app/invoices/listActions';
+import { transferAccounts } from '../app/transfers/transferAccounts';
+import { creditItems, rowsOf } from '../app/vendor-credits/lists';
+import { checkNumberSeries, nextCheckNumber } from '../app/print-checks/checkNumbers';
+import { emptyPayForm } from '../app/pay-liabilities/payForm';
 import { compareDocNumbers } from '../components/TransactionNav';
 import { importableRows, reviewedPayload, statementAmount } from '../components/StatementReview';
 
@@ -461,5 +465,155 @@ describe('Invoices list', () => {
     expect(canEditInvoice('draft')).toBe(true);
     expect(canEditInvoice('void')).toBe(false);
     expect(read('app/invoices/page.tsx')).toContain('canEditInvoice(inv.status) &&');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Record locking after an action on the open record
+// ---------------------------------------------------------------------------
+
+describe('lib/client.ts: an action on the open record keeps its version current', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('Unapply in the credit memo form, then Save, sends the version the unapply returned', async () => {
+    const sent: Array<string | undefined> = [];
+    const answers = [
+      { id: 'cm1', updatedAt: '2026-06-09T10:00:00.000Z', lines: [] }, // GET (edit opens)
+      { id: 'cm1', updatedAt: '2026-06-09T10:05:00.000Z', unapplied: '50.00' }, // POST unapply
+      { id: 'cm1', updatedAt: '2026-06-09T10:06:00.000Z' }, // PATCH save
+    ];
+    let i = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: string, init?: RequestInit) => {
+        sent.push((init?.headers as Record<string, string> | undefined)?.['x-expected-updated-at']);
+        return new Response(JSON.stringify(answers[i++]), { status: 200 });
+      }),
+    );
+    await api.get('/api/credit-memos/cm1');
+    await api.post('/api/credit-memos/cm1', { action: 'unapply', applicationId: 'a1' }, { noUndo: true });
+    await api.patch('/api/credit-memos/cm1', { memo: 'x' }, { noUndo: true });
+    // The unapply moved the memo's version (the version trigger fires on every UPDATE); sending
+    // the version loaded before it was a false "changed by another user" 409 naming the user.
+    expect(sent[2]).toBe('2026-06-09T10:05:00.000Z');
+  });
+
+  it('an answer without the record leaves the loaded version alone', async () => {
+    const sent: Array<string | undefined> = [];
+    const answers = [{ id: 'p9', updatedAt: '2026-06-09T09:00:00.000Z' }, { ok: true }, { id: 'p9', updatedAt: '2026-06-09T09:02:00.000Z' }];
+    let i = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: string, init?: RequestInit) => {
+        sent.push((init?.headers as Record<string, string> | undefined)?.['x-expected-updated-at']);
+        return new Response(JSON.stringify(answers[i++]), { status: 200 });
+      }),
+    );
+    await api.get('/api/payments/p9');
+    await api.post('/api/payments/p9', { action: 'apply', applications: [] }, { noUndo: true });
+    await api.put('/api/payments/p9', {}, { noUndo: true });
+    expect(sent[2]).toBe('2026-06-09T09:00:00.000Z');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Transfer Funds
+// ---------------------------------------------------------------------------
+
+describe('Transfer Funds account lists', () => {
+  it('balance-sheet accounts only: never A/R, A/P, Undeposited Funds, Inventory, income or expense', () => {
+    const accounts = [
+      { id: 'chk', code: '1000', name: 'Checking', type: 'asset', subtype: 'checking' },
+      { id: 'uf', code: '1050', name: 'Undeposited Funds', type: 'asset', subtype: 'undeposited_funds' },
+      { id: 'ar', code: '1100', name: 'Accounts Receivable', type: 'asset', subtype: 'accounts_receivable' },
+      { id: 'inv', code: '1300', name: 'Inventory Asset', type: 'asset', subtype: 'inventory' },
+      { id: 'pc', code: '1400', name: 'Petty Cash', type: 'asset', subtype: 'other_current_asset' },
+      { id: 'ap', code: '2000', name: 'Accounts Payable', type: 'liability', subtype: 'accounts_payable' },
+      { id: 'cc', code: '2100', name: 'Visa', type: 'liability', subtype: 'credit_card' },
+      { id: 'loan', code: '2700', name: 'Truck loan', type: 'liability', subtype: 'long_term_liability' },
+      { id: 'eq', code: '3000', name: 'Owner draws', type: 'equity', subtype: 'equity' },
+      { id: 'sales', code: '4000', name: 'Sales', type: 'revenue', subtype: 'income' },
+      { id: 'rent', code: '6100', name: 'Rent', type: 'expense', subtype: 'expense' },
+      { id: 'np', code: '9000', name: 'Estimates', type: 'asset', subtype: 'non_posting' },
+      { id: 'old', code: '1020', name: 'Old bank', type: 'asset', subtype: 'checking', isActive: false },
+    ];
+    expect(transferAccounts(accounts).map((a) => a.id)).toEqual(['chk', 'pc', 'cc', 'loan', 'eq']);
+    // A saved transfer being edited keeps the accounts it already uses.
+    expect(transferAccounts(accounts, ['old']).map((a) => a.id)).toContain('old');
+    expect(read('app/transfers/page.tsx')).toContain('transferAccounts(allAccounts, [editing?.fromAccountId, editing?.toAccountId])');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Vendor credits, Print Checks, Pay Sales Tax, Pay Liabilities, Enter Bill for Received Items
+// ---------------------------------------------------------------------------
+
+describe('Vendor credit Items tab', () => {
+  it('lists the items GET /api/items answers ({ items: [...] }), without discount / tax / group items', () => {
+    const answer = {
+      items: [
+        { id: 'w', name: 'Widget', type: 'inventory' },
+        { id: 's', name: 'Install', type: 'service' },
+        { id: 'd', name: 'Disc', type: 'discount' },
+        { id: 'g', name: 'Kit', type: 'group' },
+      ],
+    };
+    expect(creditItems<{ id: string; type?: string }>(answer).map((i) => i.id)).toEqual(['w', 's']);
+    // Bare lists (classes, customers, jobs) are read too.
+    expect(rowsOf<{ id: string }>([{ id: 'c1' }], 'classes')).toEqual([{ id: 'c1' }]);
+    expect(rowsOf(null, 'items')).toEqual([]);
+    // What the form did with that answer: not an array, so no items at all.
+    expect(Array.isArray(answer)).toBe(false);
+    expect(read('app/vendor-credits/page.tsx')).toContain('setItemList(creditItems<Named>(it))');
+  });
+});
+
+describe('Print Checks numbering', () => {
+  it('a run steps the number at its end and keeps padding and prefix', () => {
+    expect(checkNumberSeries('1001', 3)).toEqual(['1001', '1002', '1003']);
+    expect(checkNumberSeries('001099', 2)).toEqual(['001099', '001100']); // was refused for a batch
+    expect(checkNumberSeries('CHK-99', 2)).toEqual(['CHK-99', 'CHK-100']);
+    expect(checkNumberSeries('ABC', 2)).toBeNull();
+    expect(checkNumberSeries('ABC', 1)).toEqual(['ABC']);
+    expect(nextCheckNumber('001001')).toBe('001002'); // a single check used to leave it unchanged
+    expect(nextCheckNumber('ABC')).toBeNull();
+  });
+
+  it('a single check whose number was recorded leaves the queue and moves the number on even if the PDF fails', () => {
+    const src = read('app/print-checks/page.tsx');
+    const single = src.slice(src.indexOf('async function handlePrintQueued'), src.indexOf('// ── Print the selected checks'));
+    // The number advances and the check leaves the queue BEFORE the PDF is opened.
+    expect(single.indexOf('setNextNumber(next)')).toBeGreaterThan(-1);
+    expect(single.indexOf('setNextNumber(next)')).toBeLessThan(single.indexOf('await openCheckPdf('));
+    expect(single.indexOf('setQueue(')).toBeLessThan(single.indexOf('await openCheckPdf('));
+  });
+});
+
+describe('Pay Sales Tax', () => {
+  it('looks the next check number up again after checks are written or voided', () => {
+    const src = read('app/sales-tax/page.tsx');
+    expect(src).toContain('}, [payFrom, toPrint, numberTick]);');
+    expect(src.match(/setNumberTick\(\(n\) => n \+ 1\)/g)?.length).toBe(2);
+  });
+});
+
+describe('Pay Liabilities', () => {
+  afterEach(() => vi.useRealTimers());
+
+  it('a new payment is dated the day the form opens, not the day the page was loaded', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 5, 9, 23, 30)); // June 9, 11:30 pm local
+    expect(emptyPayForm().date).toBe('2026-06-09');
+    vi.setSystemTime(new Date(2026, 5, 10, 8, 0)); // the app stayed open overnight
+    expect(emptyPayForm().date).toBe('2026-06-10');
+    expect(read('app/pay-liabilities/page.tsx')).not.toMatch(/const EMPTY_FORM: PayForm = \{/);
+  });
+});
+
+describe('Enter Bill for Received Items', () => {
+  it('a late preview answer for earlier quantities never replaces the current one', () => {
+    const src = read('app/receive-bill/page.tsx');
+    expect(src).toContain('const mine = ++previewSeq.current;');
+    expect(src.match(/if \(mine !== previewSeq\.current\) return;/g)?.length).toBe(2);
   });
 });

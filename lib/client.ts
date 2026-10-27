@@ -351,6 +351,25 @@ export function rememberVersions(url: string, data: unknown): void {
 }
 
 /**
+ * After any other successful write to a record's own URL (an unapply, a refund, an apply…): the
+ * record the server answered with is its new version. Those actions move the record's version
+ * too (the version triggers fire on every UPDATE), so keeping the version loaded before them
+ * made the user's next Save a false "changed by another user" 409 — naming themselves. Unlike
+ * rememberVersions, an answer without the record leaves the cached version alone.
+ */
+function refreshVersionFrom(url: string, data: unknown): void {
+  const m = VERSIONED_PATH.exec(pathOf(url).replace(/\/$/, ''));
+  if (!m || !m[2] || !data || typeof data !== 'object' || Array.isArray(data)) return;
+  const key = `/api/${m[1]}/${m[2]}`;
+  for (const v of [data, ...Object.values(data as object)]) {
+    if (isRec(v) && v.id === m[2] && typeof versionOf(v) === 'string') {
+      loadedVersions.set(key, versionOf(v) as string);
+      return;
+    }
+  }
+}
+
+/**
  * POST actions that change or consume the record itself (void / close / status / convert) carry
  * its version too, so acting on a record someone else changed since it was loaded gets the same
  * 409. Convert counts: turning a stale estimate, sales order, purchase order or item receipt into
@@ -450,6 +469,7 @@ async function mutate<T>(
       .then((data) => {
         // The saved record's new version (or forget it, so the next save isn't a false 409).
         if (version) rememberVersions(url, data);
+        else refreshVersionFrom(url, data);
         try {
           writeHooks?.after?.(info, data);
         } catch {

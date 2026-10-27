@@ -6,7 +6,7 @@
  * vendor's quantities and costs, and see the quantity / price variances (vs the receipt and the
  * PO) and the exact journal entry before saving. Receiving preferences live here too.
  */
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { FileInput, Settings2 } from 'lucide-react';
 import {
   Badge,
@@ -234,8 +234,12 @@ export default function ReceiveBillPage() {
     };
   }, [lines, rows, vendorId, billNumber, date, dueDate, memo]);
 
-  // Live variance preview (debounced) from the same service that posts the bill.
+  // Live variance preview (debounced) from the same service that posts the bill. Only the answer
+  // for the lines as they are NOW is shown: a slower answer for an earlier quantity / cost (or an
+  // earlier error) arriving late used to replace it — and an old error blocked Save.
+  const previewSeq = useRef(0);
   useEffect(() => {
+    const mine = ++previewSeq.current;
     if (!vendorId || payload.lines.length === 0) {
       setPreview(null);
       setPreviewError(null);
@@ -245,10 +249,12 @@ export default function ReceiveBillPage() {
       api
         .post<Preview>('/api/receiving/bill', { ...payload, preview: true })
         .then((p) => {
+          if (mine !== previewSeq.current) return;
           setPreview(p);
           setPreviewError(null);
         })
         .catch((err) => {
+          if (mine !== previewSeq.current) return;
           setPreview(null);
           setPreviewError(err instanceof ApiError ? err.message : 'Cannot compute the bill.');
         });

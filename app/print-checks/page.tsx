@@ -58,6 +58,7 @@ import { todayISO } from '@/lib/dates';
 import { saveWithDuplicateCheck } from '@/lib/purchasesClient';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
+import { checkNumberSeries, nextCheckNumber } from './checkNumbers';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -299,23 +300,29 @@ export default function PrintChecksPage() {
       return;
     }
     setPrintingId(item.id);
+    let recorded = false;
     try {
       // 1. Record the number first (asks before reusing a number), then render the PDF.
       const saved = await saveWithDuplicateCheck((allowDuplicateNumber) =>
         api.post('/api/print-queue', { source: item.source, id: item.id, checkNumber: num, allowDuplicateNumber }),
       );
       if (saved === null) return; // user chose a different number
+      recorded = true;
+      // The number is used from here on, whatever happens to the PDF: advance to the next one
+      // (keeping its padding / prefix) and take the check off the queue, as a batch run does.
+      // A PDF failure used to leave both, so the next check was printed with the same number.
+      const next = nextCheckNumber(num);
+      if (next) setNextNumber(next);
+      setQueue((prev) => prev.filter((q) => !(q.id === item.id && q.source === item.source)));
       await openCheckPdf({ source: item.source, id: item.id, checkNumber: num, firstSheetRemaining: runRemaining });
       toast(`Check #${num} printed and recorded.`, 'success');
       // Standard checks: one fewer left on the sheet (a fresh sheet after the last one).
       if (settings.style === 'standard') setRunRemaining((r) => (r <= 1 ? 3 : r - 1));
-
-      // Advance the number for the next check in the run.
-      const parsed = parseInt(num, 10);
-      if (!isNaN(parsed) && String(parsed) === num) setNextNumber(String(parsed + 1));
-      setQueue((prev) => prev.filter((q) => !(q.id === item.id && q.source === item.source)));
     } catch (err) {
-      toast(errMsg(err, 'Failed to print check.'), 'danger');
+      toast(
+        errMsg(err, recorded ? `Check #${num} was recorded but the PDF could not be opened.` : 'Failed to print check.'),
+        'danger',
+      );
     } finally {
       setPrintingId(null);
     }
@@ -336,10 +343,10 @@ export default function PrintChecksPage() {
       toast('Enter the number printed on the first check in the printer.', 'danger');
       return;
     }
-    const start = parseInt(num, 10);
-    const numeric = !isNaN(start) && String(start) === num;
-    if (items.length > 1 && !numeric) {
-      toast('To print several checks at once, the next check number must be a plain number (e.g. 1001).', 'danger');
+    // One number per check, stepped like the + key (padding and prefix kept: 001099 → 001100).
+    const numbers = checkNumberSeries(num, items.length);
+    if (!numbers) {
+      toast('To print several checks at once, the next check number must end in digits (e.g. 1001).', 'danger');
       return;
     }
     setPrintingBatch(true);
@@ -348,7 +355,7 @@ export default function PrintChecksPage() {
       // 1. Record each number in order (asks before reusing a number). Stop at the first check the
       //    user does not confirm, so the numbers stay in step with the check paper.
       for (let i = 0; i < items.length; i++) {
-        const checkNumber = numeric ? String(start + i) : num;
+        const checkNumber = numbers[i];
         const item = items[i];
         const saved = await saveWithDuplicateCheck((allowDuplicateNumber) =>
           api.post('/api/print-queue', { source: item.source, id: item.id, checkNumber, allowDuplicateNumber }),
@@ -382,7 +389,10 @@ export default function PrintChecksPage() {
       toast(errMsg(err, 'The checks were recorded but the PDF could not be opened.'), 'danger');
     } finally {
       // Advance the number past every check that was recorded.
-      if (printed.length > 0 && numeric) setNextNumber(String(start + printed.length));
+      if (printed.length > 0) {
+        const next = nextCheckNumber(printed[printed.length - 1].checkNumber);
+        if (next) setNextNumber(next);
+      }
       const done = new Set(printed.map((p) => itemKey(p.item)));
       setQueue((prev) => prev.filter((q) => !done.has(itemKey(q))));
       setSelected((prev) => new Set([...prev].filter((k) => !done.has(k))));

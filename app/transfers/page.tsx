@@ -25,6 +25,7 @@ import { api } from '@/lib/client';
 import MemorizeButton from '@/components/MemorizeButton';
 import { formatCurrency } from '@/lib/money';
 import { formatDate, todayISO } from '@/lib/dates';
+import { transferAccounts } from './transferAccounts';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -35,6 +36,8 @@ interface Account {
   code: string;
   name: string;
   type: string;
+  subtype?: string | null;
+  isActive?: boolean;
   /** p1 fx: currency of a bank / card account (null = home). */
   currency?: string | null;
 }
@@ -70,7 +73,9 @@ interface NewTransferModalProps {
   editing?: Transfer | null;
 }
 
-function NewTransferModal({ open, onClose, accounts, onCreated, editing }: NewTransferModalProps) {
+function NewTransferModal({ open, onClose, accounts: allAccounts, onCreated, editing }: NewTransferModalProps) {
+  // Balance-sheet accounts only, never A/R, A/P, Undeposited Funds or Inventory (transferAccounts).
+  const accounts = transferAccounts(allAccounts, [editing?.fromAccountId, editing?.toAccountId]);
   const [fromAccountId, setFromAccountId] = useState('');
   const [toAccountId, setToAccountId] = useState('');
   const [amount, setAmount] = useState('');

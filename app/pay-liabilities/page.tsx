@@ -33,6 +33,7 @@ import {
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { todayISO } from '@/lib/dates';
+import { emptyPayForm, type PayForm } from './payForm';
 import { saveWithDuplicateCheck } from '@/lib/purchasesClient';
 import { Money, formatCurrency } from '@/lib/money';
 import { isBankAccount } from '@/lib/accountTypes';
@@ -89,27 +90,7 @@ interface Account {
 
 type LiabilityType = 'payroll';
 
-interface PayForm {
-  amount: string;
-  date: string;
-  paymentAccountId: string;
-  memo: string;
-  payeeName: string;
-  checkNumber: string;
-  toPrint: boolean;
-}
-
 const today = () => todayISO();
-
-const EMPTY_FORM: PayForm = {
-  amount: '',
-  date: today(),
-  paymentAccountId: '',
-  memo: '',
-  payeeName: '',
-  checkNumber: '',
-  toPrint: false,
-};
 
 // ---------------------------------------------------------------------------
 // Liability tile
@@ -178,7 +159,7 @@ function PayModal({
   onClose: () => void;
   onSuccess: () => void;
 }) {
-  const [form, setForm] = useState<PayForm>(EMPTY_FORM);
+  const [form, setForm] = useState<PayForm>(emptyPayForm);
   const [saving, setSaving] = useState(false);
 
   // Reset form whenever the modal opens; agency payments prefill the balance due.
@@ -186,8 +167,8 @@ function PayModal({
     if (open) {
       setForm(
         agency && Number(agency.defaultAmount) > 0
-          ? { ...EMPTY_FORM, amount: agency.defaultAmount }
-          : EMPTY_FORM,
+          ? { ...emptyPayForm(), amount: agency.defaultAmount }
+          : emptyPayForm(),
       );
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps

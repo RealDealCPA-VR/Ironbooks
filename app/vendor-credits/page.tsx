@@ -28,6 +28,7 @@ import { todayISO } from '@/lib/dates';
 import { Money, formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
 import { TransactionNav, useAdjacentTransactions } from '@/components/TransactionNav';
+import { creditItems, rowsOf } from './lists';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -184,15 +185,16 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId, n
     if (!open) return;
     const soft = <T,>(p: Promise<T>, fb: T) => p.catch(() => fb);
     Promise.all([
-      soft(api.get<Named[]>('/api/items'), []),
-      soft(api.get<Named[]>('/api/classes'), []),
-      soft(api.get<Named[]>('/api/customers'), []),
-      soft(api.get<Named[]>('/api/jobs'), []),
+      soft(api.get<unknown>('/api/items'), []),
+      soft(api.get<unknown>('/api/classes'), []),
+      soft(api.get<unknown>('/api/customers'), []),
+      soft(api.get<unknown>('/api/jobs'), []),
     ]).then(([it, cl, cu, jb]) => {
-      setItemList(Array.isArray(it) ? it.filter((i) => !['subtotal', 'discount', 'payment', 'sales_tax', 'group'].includes(i.type ?? '')) : []);
-      setClassList(Array.isArray(cl) ? cl : []);
-      setCustomerList(Array.isArray(cu) ? cu : []);
-      setJobList(Array.isArray(jb) ? jb : []);
+      // GET /api/items answers { items: [...] } (the others a bare list): lib rowsOf reads both.
+      setItemList(creditItems<Named>(it));
+      setClassList(rowsOf<Named>(cl, 'classes'));
+      setCustomerList(rowsOf<Named>(cu, 'customers'));
+      setJobList(rowsOf<Named>(jb, 'jobs'));
     });
   }, [open]);
 
