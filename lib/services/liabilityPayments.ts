@@ -32,7 +32,8 @@ import { type ServiceContext, ServiceError, inTransaction, notFound, validation,
 import { assertNotControlAccount, postJournalEntry, voidJournalEntry } from './posting';
 import { allocateCheckNumber } from './checkNumbers';
 import { assertClosedPeriodEdit } from './postedEdit';
-import { getHomeCurrencyCode } from './currencies';
+import { effectiveHomeCurrency } from './multiCurrency';
+import { foreignCode } from './fxLines';
 import { getPreferences } from './company';
 import { parseDateInput } from '@/lib/validation/helpers';
 import { localDateISO } from '@/lib/dates';
@@ -237,10 +238,10 @@ async function assertPayFromBank(ctx: ServiceContext, accountId: string, what: s
   if (!isBankAccount(acct)) {
     throw validation(`"${acct.name}" is not a bank account. ${what} is paid by check, so pick a checking or savings account.`);
   }
-  const cur = (acct.currency ?? '').trim().toUpperCase();
-  if (cur) {
-    const home = await getHomeCurrencyCode(ctx);
-    if (home && cur !== home) {
+  if ((acct.currency ?? '').trim()) {
+    // review5 fx: the home code also without a base row (it used to let any currency through then).
+    const cur = foreignCode(acct.currency, await effectiveHomeCurrency(ctx));
+    if (cur) {
       throw validation(`"${acct.name}" is a ${cur} account. Pay ${what.toLowerCase()} from a home-currency bank account.`);
     }
   }

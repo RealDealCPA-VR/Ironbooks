@@ -60,7 +60,8 @@ import {
   reverseDocumentInventory,
 } from './inventorySites';
 import { assertClosedPeriodEdit, planPostedEdit, retitleEntry } from './postedEdit';
-import { getHomeCurrencyCode } from './currencies';
+import { effectiveHomeCurrency } from './multiCurrency';
+import { foreignCode } from './fxLines';
 import {
   applyForeignVendorCredit,
   refundForeignVendorCredit,
@@ -185,6 +186,8 @@ interface PreparedLine {
   unitCost: string | null;
   /** What the vendor credits for this line (2dp). */
   amount: string;
+  /** review5 fx: the line's amount in its (same foreign currency) bank / card account. */
+  foreignAmount?: string | null;
   description: string | null;
   classId: string | null;
   customerId: string | null;
@@ -526,7 +529,13 @@ function postingLinesFor(
   prep.forEach((l, i) => {
     const cost = costs.get(i);
     if (!l.isInventory || cost === undefined) {
-      out.push({ accountId: l.accountId, credit: l.amount, memo: l.description, classId: l.classId });
+      out.push({
+        accountId: l.accountId,
+        credit: l.amount,
+        memo: l.description,
+        classId: l.classId,
+        ...(l.foreignAmount ? { foreignAmount: l.foreignAmount } : {}),
+      });
       return;
     }
     if (cost.greaterThan(0)) {
@@ -546,8 +555,8 @@ function postingLinesFor(
 }
 
 /** The prepared lines with each amount replaced by its home value (p1 fx: postings are in home currency). */
-function homePrep(prep: PreparedLine[], fx: { homeLines: string[] }): PreparedLine[] {
-  return prep.map((l, i) => ({ ...l, amount: fx.homeLines[i] }));
+function homePrep(prep: PreparedLine[], fx: { homeLines: string[]; lineForeign?: Array<string | null> }): PreparedLine[] {
+  return prep.map((l, i) => ({ ...l, amount: fx.homeLines[i], foreignAmount: fx.lineForeign?.[i] ?? null }));
 }
 
 function lineRowsFor(creditId: string, prep: PreparedLine[], costs: Map<number, Decimal>) {
@@ -588,10 +597,9 @@ function lineSignature(
  * line accounts get home amounts. A home credit can't be refunded into a foreign account.
  */
 async function foreignCurrencyOf(ctx: ServiceContext, code: string | null | undefined): Promise<string | null> {
-  const v = (code ?? '').trim().toUpperCase();
-  if (!v) return null;
-  const home = await getHomeCurrencyCode(ctx);
-  return home && v === home ? null : v;
+  if (!(code ?? '').trim()) return null;
+  // review5 fx: the home code also without a base row (a bank tagged with it is a home account).
+  return foreignCode(code, await effectiveHomeCurrency(ctx));
 }
 
 export async function createVendorCredit(ctx: ServiceContext, input: CreateVendorCreditInput) {

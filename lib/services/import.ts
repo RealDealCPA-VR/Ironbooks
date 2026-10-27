@@ -31,7 +31,7 @@ import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
 import { listRules, matchRule } from './rules';
 import { foreignCurrencyOfAccount } from './fxLedger';
-import { homeCode } from './fxLines';
+import { listBaseCode } from './fxLines';
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -740,7 +740,10 @@ export async function importTransactions(
   // currency (OFX <CURDEF>) belongs to a different account — refuse it before anything is written.
   if (input.fileType !== 'csv') {
     const fileCurrency = parseOFXCurrency(input.content);
-    const home = await homeCode(ctx);
+    // review5 fx: checked once the currency list has its home currency row. Without one the home
+    // code may be only the USD default of a file that never set up currencies (homeCode would
+    // say USD), and a Canadian bank's CAD statement must still import into its untagged account.
+    const home = await listBaseCode(ctx);
     if (fileCurrency && home) {
       const acctCurrency = (await foreignCurrencyOfAccount(ctx, bankAccount.glAccountId)) ?? home;
       if (fileCurrency !== acctCurrency) {

@@ -71,7 +71,8 @@ import { PAYROLL_PAID_TAG, markTimeEntriesPaidInPayroll, releaseTimeEntriesFromP
 import { getPreferences } from './preferences';
 import { type PrefAccountKind, assertPreferenceAccount } from './prefAccounts';
 import { PAY_PERIODS_PER_YEAR } from '@/lib/preferences';
-import { getHomeCurrencyCode } from './currencies';
+import { effectiveHomeCurrency } from './multiCurrency';
+import { foreignCode } from './fxLines';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -283,11 +284,14 @@ async function preferredAccountId(
     .select({ name: accounts.name, currency: accounts.currency })
     .from(accounts)
     .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, id)));
-  const cur = (acct?.currency ?? '').trim().toUpperCase();
-  if (cur) {
-    const home = (await getHomeCurrencyCode(ctx))?.toUpperCase() ?? null;
-    if (home && cur !== home) {
-      throw validation(`${label} "${acct!.name}" is a ${cur} account. Payroll is paid in ${home}: choose a ${home} account in Preferences > Payroll & Employees / Checking.`);
+  if ((acct?.currency ?? '').trim()) {
+    // review5 fx: the home code as documents and the ledger resolve it (also without a base row in
+    // the currency list), so an account tagged with the home code is a home account.
+    const home = await effectiveHomeCurrency(ctx);
+    const cur = foreignCode(acct!.currency, home);
+    if (cur) {
+      const homeName = home ?? 'your home currency';
+      throw validation(`${label} "${acct!.name}" is a ${cur} account. Payroll is paid in ${homeName}: choose a ${home ?? 'home-currency'} account in Preferences > Payroll & Employees / Checking.`);
     }
   }
   return id;

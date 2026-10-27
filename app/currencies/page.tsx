@@ -309,7 +309,7 @@ function FxAdjustmentModal({
                 className="accent-electric"
               />
               FX Gain
-              <span className="text-xs text-navy/40">(Dr account / Cr Other Income 4900)</span>
+              <span className="text-xs text-navy/40">(Dr account / Cr Exchange Gain/Loss)</span>
             </label>
             <label className="flex items-center gap-2 cursor-pointer text-sm text-navy/80">
               <input
@@ -320,7 +320,7 @@ function FxAdjustmentModal({
                 className="accent-electric"
               />
               FX Loss
-              <span className="text-xs text-navy/40">(Dr Bank Fees 6100 / Cr account)</span>
+              <span className="text-xs text-navy/40">(Dr Exchange Gain/Loss / Cr account)</span>
             </label>
           </div>
         </div>

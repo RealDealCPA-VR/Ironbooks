@@ -18,7 +18,7 @@
  */
 import { and, eq } from 'drizzle-orm';
 import Decimal from 'decimal.js';
-import { currencies } from '@/lib/db/schema';
+import { companies, currencies } from '@/lib/db/schema';
 import { Money, MoneyParseError, toAmountString } from '@/lib/money';
 import type { ServiceContext } from './_base';
 import { ServiceError } from './_base';
@@ -45,7 +45,50 @@ export function foreignCode(code: string | null | undefined, home: string | null
   return home && v === home ? null : v;
 }
 
+export interface CurrencyListRow {
+  code: string;
+  rateToBase: string;
+  isBase: boolean;
+}
+
+/**
+ * review5 fx: THE home currency code, from the currency list and the Preferences currency: the
+ * list's base, else the Preferences currency, else USD. In a list with no base row (older files,
+ * migration 0056) that holds that default as a FOREIGN currency (a rate other than 1, e.g. USD at
+ * 1.36 in a Canadian file), the list's rates are in units of a home currency the file never
+ * recorded, so the default is not the home currency and the code is unknown: null (every code is
+ * then foreign, as the list's rates say).
+ */
+export function homeCodeFromList(rows: ReadonlyArray<CurrencyListRow>, settingsCurrency: unknown): string | null {
+  const base = rows.find((r) => r.isBase);
+  if (base) return base.code.trim().toUpperCase();
+  const fromSettings = typeof settingsCurrency === 'string' ? settingsCurrency.trim() : '';
+  const fallback = (fromSettings || 'USD').toUpperCase();
+  const listed = rows.find((r) => r.code.trim().toUpperCase() === fallback);
+  return listed && !Money.of(listed.rateToBase).equals(1) ? null : fallback;
+}
+
+/**
+ * The company's home currency code (homeCodeFromList) - the one every home-vs-foreign comparison
+ * of a document, name or account uses (foreignCode(x, await homeCode(ctx))). review5 fx: it used
+ * to read the list's base row only, so in a file without one a bank tagged with the home code was a
+ * foreign account here while its documents resolved as home ones.
+ */
 export async function homeCode(ctx: Pick<ServiceContext, 'db' | 'companyId'>): Promise<string | null> {
+  const [company] = await ctx.db.select({ settings: companies.settings }).from(companies).where(eq(companies.id, ctx.companyId));
+  const settings = (company?.settings ?? {}) as Record<string, unknown> | null;
+  const rows = await ctx.db
+    .select({ code: currencies.code, rateToBase: currencies.rateToBase, isBase: currencies.isBase })
+    .from(currencies)
+    .where(eq(currencies.companyId, ctx.companyId));
+  return homeCodeFromList(rows, settings?.currency);
+}
+
+/**
+ * The currency list's base row only (null while the list has none) - for "is a home currency set
+ * up in the list" questions, never for deciding whether a code is foreign (use homeCode).
+ */
+export async function listBaseCode(ctx: Pick<ServiceContext, 'db' | 'companyId'>): Promise<string | null> {
   const [row] = await ctx.db
     .select({ code: currencies.code })
     .from(currencies)

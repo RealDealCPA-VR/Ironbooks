@@ -48,7 +48,7 @@ import { type DiscountInfo, discountFor, dueDateFromTerms } from './billTerms';
 import { computeDiscount, computeDueDate, dueDateFromTermsList, findTermsRef, type TermsLike, type TermsRow } from './lists/terms';
 import { duplicateNumberFixes } from '@/lib/errorFixes';
 import { getPreferences } from './company';
-import { homeAmounts, resolveDocumentCurrency } from './currencies';
+import { assertLineAccountsInDocumentCurrency, homeAmounts, resolveDocumentCurrency, sameCurrencyAccountIds } from './currencies';
 import { postJournalEntry, voidJournalEntry } from '@/lib/services/posting';
 import { assertClosedPeriodEdit, retitleEntry, sameLedgerLines } from './postedEdit';
 import {
@@ -262,6 +262,8 @@ interface PreparedBill {
   terms: string | null;
   dueDate: Date | null;
   apAccountId: string;
+  /** review5 fx: line accounts in the bill's own foreign currency (they take the typed amount). */
+  sameCurrencyLineAccounts: Set<string>;
 }
 
 /**
@@ -437,6 +439,8 @@ async function prepareBill(ctx: ServiceContext, input: CreateBillInput): Promise
     throw validation('The bill total must be more than zero.');
   }
 
+  // review5 fx: no line on a bank / card account in a third currency (its amount would be invented).
+  await assertLineAccountsInDocumentCurrency(ctx, resolvedLines.map((l) => l.accountId), fx.currency);
   // Home-currency amounts: one anchor (round2(total x rate)) penny-allocated across the lines,
   // so the entry balances exactly. Inventory cost is carried in home currency.
   const home = homeAmounts(
@@ -455,6 +459,7 @@ async function prepareBill(ctx: ServiceContext, input: CreateBillInput): Promise
 
   // Resolve A/P account up front (read-only; no need to hold a tx lock).
   const apAccountId = await resolveApAccount(ctx);
+  const sameCurrencyLineAccounts = await sameCurrencyAccountIds(ctx, resolvedLines.map((l) => l.accountId), fx.currency);
 
   return {
     vendor,
@@ -466,6 +471,7 @@ async function prepareBill(ctx: ServiceContext, input: CreateBillInput): Promise
     terms,
     dueDate,
     apAccountId,
+    sameCurrencyLineAccounts,
   };
 }
 
@@ -772,6 +778,8 @@ function buildPostingLines(prep: PreparedBill, billNumber: string | null, billId
         debit: line.homeAmount,
         memo: line.description,
         classId: line.classId,
+        // review5 fx: a CAD bill's line on the CAD card moves the card by the CAD amount typed.
+        ...(prep.sameCurrencyLineAccounts.has(line.accountId) ? { foreignAmount: line.amount } : {}),
       })),
     // Credit line — Accounts Payable (home currency)
     {

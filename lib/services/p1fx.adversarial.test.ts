@@ -177,6 +177,9 @@ describe('P1 FX — adversarial QA', () => {
     await setBaseCurrency(ctx, { code: 'USD', name: 'US Dollar' });
     await upsertCurrency(ctx, { code: 'EUR', name: 'Euro', rateToBase: '1.10' });
     await upsertCurrency(ctx, { code: 'GBP', name: 'Pound', rateToBase: '1.25' });
+    // review5 fx: the list rates were set at the start of the year, so the adjustments dated later
+    // in 2026 update the list (a back-dated one keeps a newer list rate).
+    await db.execute(sql`UPDATE currencies SET updated_at = '2026-01-01' WHERE company_id = ${ctx.companyId}`);
     await setAccountCurrency(ctx, acct['1020'], 'EUR');
     await setAccountCurrency(ctx, acct['1030'], 'EUR');
     await setAccountCurrency(ctx, acct['1040'], 'GBP');
@@ -341,9 +344,9 @@ describe('P1 FX — adversarial QA', () => {
       applications: [{ invoiceId: inv.id, amountApplied: '100000.00' }],
     } as never);
     const ufIn = Money.of(await bal('1050')).minus(ufBefore);
-    // Receive Payments stores the settlement rate at the column's 6 decimals (1.234567) and posts
-    // at exactly that rate (payments team, resolvePaymentCurrency).
-    expect(ufIn.toFixed(2)).toBe('123456.70');
+    // Receive Payments stores the settlement rate at the column's 8 decimals (review5 fx: it was 6,
+    // 1.234567) and posts at exactly that rate (resolvePaymentCurrency).
+    expect(ufIn.toFixed(2)).toBe('123456.74');
     await createDeposit(ctx, { depositAccountId: acct['1020'], date: d('2026-03-03'), paymentIds: [payment.id], exchangeRate: '1.2345674' });
     // Same rate on both sides: UF back to where it was, no exchange gain/loss.
     expect(Money.of(await bal('1050')).minus(ufBefore).toFixed(2)).toBe('0.00');

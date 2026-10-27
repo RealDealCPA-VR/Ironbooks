@@ -980,8 +980,7 @@ export async function updateDeposit(ctx: ServiceContext, id: string, input: Crea
     .where(and(eq(deposits.id, id), eq(deposits.companyId, ctx.companyId)));
   if (!existing) throw notFound('Deposit');
   if (existing.voidedAt) throw new ServiceError('CONFLICT', 'This deposit is void and cannot be edited.');
-
-  // p1 fx: an edit that states no rate keeps the deposit's OWN rate while the deposit stays in the
+  // p1 fx / review5 fx: an edit that states no rate keeps the deposit's OWN rate while the deposit stays in the
   // same currency (QB keeps a transaction's exchange rate when it is edited). The Make Deposits
   // form opens with the rate box blank, so a memo-only edit used to re-price a foreign deposit at
   // today's list rate (new home value and exchange gain/loss, a re-post, and a refusal on a

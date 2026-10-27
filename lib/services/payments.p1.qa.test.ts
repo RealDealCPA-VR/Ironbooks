@@ -354,11 +354,16 @@ describe('QA: foreign-currency payments', () => {
 
   it('zero, negative and sub-micro exchange rates are refused; nothing is saved', async () => {
     const before = (await searchPayments(ctx, { customerId: cust, limit: 500 })).total;
-    for (const rate of ['0', '-1.2', '0.0000001']) {
+    // review5 fx: rates keep 8 decimals, so the sub-micro rate is one that rounds to 0 there.
+    for (const rate of ['0', '-1.2', '0.000000001']) {
       await expect(
         receivePayment(ctx, { customerId: cust, date: D('2026-05-20'), method: 'cash', amount: '5.00', currency: 'EUR', exchangeRate: rate, applications: [] }),
       ).rejects.toThrow(/Exchange rate must be positive/);
     }
+    // A rate that leaves the payment worth nothing in home currency is refused too.
+    await expect(
+      receivePayment(ctx, { customerId: cust, date: D('2026-05-20'), method: 'cash', amount: '5.00', currency: 'EUR', exchangeRate: '0.0000001', applications: [] }),
+    ).rejects.toThrow(/too small to convert/);
     expect((await searchPayments(ctx, { customerId: cust, limit: 500 })).total).toBe(before);
   });
 });

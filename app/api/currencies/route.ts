@@ -3,21 +3,12 @@
  * POST /api/currencies   — upsert a currency (insert or update rate)
  *                          body: { code, name, rateToBase, isBase? }
  *                          If isBase is true, delegates to setBaseCurrency (rate is forced to 1).
+ *                          The home currency can't change once foreign-currency data exists.
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { listCurrencies, setBaseCurrency, upsertCurrency } from '@/lib/services/currencies';
-import { ServiceError } from '@/lib/services/_base';
-import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
-
-function errorResponse(err: unknown) {
-  if (err instanceof ServiceError) {
-    const status = serviceErrorStatus(err.code);
-    return NextResponse.json({ error: err.message, code: err.code }, { status });
-  }
-  console.error('[currencies] unexpected error:', err);
-  return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
-}
+import { routeError, requireJsonObject } from '@/lib/routeErrors';
 
 export async function GET() {
   try {
@@ -25,7 +16,7 @@ export async function GET() {
     const rows = await listCurrencies(ctx);
     return NextResponse.json(rows);
   } catch (err) {
-    return errorResponse(err);
+    return routeError(err, 'GET /api/currencies');
   }
 }
 
@@ -41,24 +32,25 @@ export async function POST(req: NextRequest) {
     };
 
     if (!code) {
-      return NextResponse.json({ error: 'code is required' }, { status: 400 });
+      return NextResponse.json({ error: 'code is required', code: 'VALIDATION' }, { status: 400 });
     }
     if (!name) {
-      return NextResponse.json({ error: 'name is required' }, { status: 400 });
+      return NextResponse.json({ error: 'name is required', code: 'VALIDATION' }, { status: 400 });
     }
 
-    if (isBase) {
+    // The services validate the code (3 letters), the name and the rate (plain 400s).
+    if (isBase === true) {
       const row = await setBaseCurrency(ctx, { code, name });
       return NextResponse.json(row, { status: 200 });
     }
 
     if (rateToBase === undefined || rateToBase === null || rateToBase === '') {
-      return NextResponse.json({ error: 'rateToBase is required for non-base currencies' }, { status: 400 });
+      return NextResponse.json({ error: 'rateToBase is required for non-base currencies', code: 'VALIDATION' }, { status: 400 });
     }
 
     const row = await upsertCurrency(ctx, { code, name, rateToBase });
     return NextResponse.json(row, { status: 200 });
   } catch (err) {
-    return errorResponse(err);
+    return routeError(err, 'POST /api/currencies');
   }
 }

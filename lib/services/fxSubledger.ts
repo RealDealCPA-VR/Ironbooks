@@ -27,7 +27,9 @@ import {
   creditMemos,
   customers,
   homeCurrencyAdjustments,
+  invoiceLines,
   invoices,
+  items,
   journalEntries,
   journalEntryLines,
   paymentApplications,
@@ -62,13 +64,64 @@ export interface ForeignOpenItem {
    * (older data; refused since the payments P1 round). Already taken off foreignOpen.
    */
   memoApplied?: Decimal;
+  /**
+   * Invoices only (review5 fx): payment-item lines received on the invoice itself (they went to
+   * Undeposited Funds, never to A/R). Already taken off foreignOpen.
+   */
+  paymentLines?: Decimal;
 }
 
 const r2 = (v: Decimal | string | number) => Money.round2(v);
 
+/**
+ * review5 fx: ids per IN (...) list. A large company file has tens of thousands of foreign
+ * documents; one IN list per query over all of them exceeds Postgres' 65,535 bind parameters
+ * ("bind message has N parameter formats but 0 parameters") and A/R aging, A/P aging, the
+ * integrity check and Home Currency Adjustment failed.
+ */
+const CHUNK = 2000;
+function chunks<T>(xs: T[]): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < xs.length; i += CHUNK) out.push(xs.slice(i, i + CHUNK));
+  return out;
+}
+function groupBy<T>(xs: T[], key: (x: T) => string): Map<string, T[]> {
+  const m = new Map<string, T[]>();
+  for (const x of xs) {
+    const k = key(x);
+    const list = m.get(k);
+    if (list) list.push(x);
+    else m.set(k, [x]);
+  }
+  return m;
+}
+
 /** Home value of a foreign amount at a rate (round2); exactly 0 when nothing is left. */
 export function homeAt(foreign: Decimal, rate: Decimal | string | number): Decimal {
   return foreign.isZero() ? Money.zero() : r2(foreign.times(Money.of(rate)));
+}
+
+/**
+ * review5 fx: payment-item lines of each invoice (invoice currency). Received with the invoice,
+ * they never reach A/R (the invoice debits Undeposited Funds for them), so they are not open:
+ * the A/R an invoice charges is total - retainage - these lines.
+ */
+async function paymentLinesByInvoice(ctx: ServiceContext, invoiceIds: string[]): Promise<Map<string, Decimal>> {
+  const out = new Map<string, Decimal>();
+  for (let i = 0; i < invoiceIds.length; i += 2000) {
+    const chunk = invoiceIds.slice(i, i + 2000);
+    const rows = await ctx.db
+      .select({
+        invoiceId: invoiceLines.invoiceId,
+        amount: sql<string>`COALESCE(SUM(CAST(${invoiceLines.amount} AS NUMERIC)), 0)`,
+      })
+      .from(invoiceLines)
+      .innerJoin(items, eq(items.id, invoiceLines.itemId))
+      .where(and(inArray(invoiceLines.invoiceId, chunk), eq(items.type, 'payment')))
+      .groupBy(invoiceLines.invoiceId);
+    for (const r of rows) out.set(r.invoiceId, Money.of(r.amount));
+  }
+  return out;
 }
 
 type InvoiceOpenRow = {
@@ -90,9 +143,14 @@ async function invoiceOpenAmounts(
   ctx: ServiceContext,
   rows: InvoiceOpenRow[],
   asOf?: Date,
-): Promise<Map<string, { foreign: Decimal; homeOpen: Decimal; memoApplied: Decimal }>> {
-  const out = new Map<string, { foreign: Decimal; homeOpen: Decimal; memoApplied: Decimal }>();
+): Promise<Map<string, { foreign: Decimal; homeOpen: Decimal; memoApplied: Decimal; paymentLines: Decimal }>> {
+  const out = new Map<string, { foreign: Decimal; homeOpen: Decimal; memoApplied: Decimal; paymentLines: Decimal }>();
   if (rows.length === 0) return out;
+  if (rows.length > CHUNK) {
+    // Each invoice's amounts depend only on its own rows: compute them chunk by chunk.
+    for (const part of chunks(rows)) for (const [k, v] of await invoiceOpenAmounts(ctx, part, asOf)) out.set(k, v);
+    return out;
+  }
   const ids = rows.map((i) => i.id);
   const entryIds = rows.map((i) => i.postedEntryId).filter((x): x is string => !!x);
   // The invoice's own A/R line (home), exactly as posted.
@@ -171,11 +229,13 @@ async function invoiceOpenAmounts(
   }
   const appsBy = new Map<string, typeof apps>();
   for (const a of apps) appsBy.set(a.invoiceId, [...(appsBy.get(a.invoiceId) ?? []), a]);
+  const paymentLines = await paymentLinesByInvoice(ctx, ids);
   for (const i of rows) {
     const rate = Money.of(i.rate ?? 1);
     const memoApplied = memoBy.get(i.id) ?? Money.zero();
     let foreign = Money.of(i.total)
       .minus(Money.of(i.retainage ?? 0))
+      .minus(paymentLines.get(i.id) ?? Money.zero())
       .plus(laterForeignBy.get(i.id) ?? Money.zero())
       .minus(memoApplied);
     let homeOpen =
@@ -187,7 +247,7 @@ async function invoiceOpenAmounts(
         homeOpen = homeOpen.minus(legacyApplicationHome(a, rate));
       }
     }
-    out.set(i.id, { foreign, homeOpen, memoApplied });
+    out.set(i.id, { foreign, homeOpen, memoApplied, paymentLines: paymentLines.get(i.id) ?? Money.zero() });
   }
   return out;
 }
@@ -400,7 +460,7 @@ export async function foreignOpenReceivables(ctx: ServiceContext, asOf: Date): P
     const open = await invoiceOpenAmounts(ctx, foreignInv, asOf);
     for (const i of foreignInv) {
       const rate = Money.of(i.rate ?? 1);
-      const { foreign, homeOpen, memoApplied } = open.get(i.id)!;
+      const { foreign, homeOpen, memoApplied, paymentLines } = open.get(i.id)!;
       if (foreign.isZero() && homeOpen.isZero()) continue;
       out.push({
         kind: 'invoice',
@@ -413,6 +473,7 @@ export async function foreignOpenReceivables(ctx: ServiceContext, asOf: Date): P
         foreignOpen: r2(foreign),
         homeOpen: r2(homeOpen),
         memoApplied,
+        paymentLines,
       });
     }
   }
@@ -439,11 +500,15 @@ export async function foreignOpenReceivables(ctx: ServiceContext, asOf: Date): P
     );
   // The credit as of the date: today's unapplied + refunds / applies dated after it (customerCredits.ts).
   const foreignPays = pays.filter((p) => foreignCode(p.currency, home));
-  const unappliedThen = await paymentsUnappliedAsOf(
-    ctx,
-    foreignPays.map((p) => ({ id: p.id, unapplied: p.unapplied, exchangeRate: p.rate })),
-    asOf,
-  );
+  const unappliedThen = new Map<string, Decimal>();
+  for (const part of chunks(foreignPays)) {
+    const m = await paymentsUnappliedAsOf(
+      ctx,
+      part.map((p) => ({ id: p.id, unapplied: p.unapplied, exchangeRate: p.rate })),
+      asOf,
+    );
+    for (const [k, v] of m) unappliedThen.set(k, v);
+  }
   for (const p of foreignPays) {
     const cur = foreignCode(p.currency, home)!;
     const rate = Money.of(p.rate ?? 1);
@@ -493,34 +558,45 @@ export async function foreignOpenPayables(ctx: ServiceContext, asOf: Date): Prom
   const fb = billRows.filter((b) => foreignCode(b.currency, home));
   if (fb.length > 0) {
     const ids = fb.map((b) => b.id);
-    const payApps = await ctx.db
-      .select({
-        billId: billPaymentApplications.billId,
-        applied: billPaymentApplications.amountApplied,
-        home: billPaymentApplications.amountHome,
-      })
-      .from(billPaymentApplications)
-      .innerJoin(billPayments, eq(billPaymentApplications.billPaymentId, billPayments.id))
-      .where(
-        and(inArray(billPaymentApplications.billId, ids), isNull(billPayments.voidedAt), lte(billPayments.date, asOf)),
+    const payAppRows: Array<{ billId: string; applied: string; home: string | null }> = [];
+    const vcAppRows: Array<{ billId: string; amount: string; home: string }> = [];
+    for (const part of chunks(ids)) {
+      payAppRows.push(
+        ...(await ctx.db
+          .select({
+            billId: billPaymentApplications.billId,
+            applied: billPaymentApplications.amountApplied,
+            home: billPaymentApplications.amountHome,
+          })
+          .from(billPaymentApplications)
+          .innerJoin(billPayments, eq(billPaymentApplications.billPaymentId, billPayments.id))
+          .where(
+            and(inArray(billPaymentApplications.billId, part), isNull(billPayments.voidedAt), lte(billPayments.date, asOf)),
+          )),
       );
-    const vcApps = await ctx.db
-      .select({
-        billId: vendorCreditApplications.billId,
-        amount: vendorCreditApplications.amount,
-        home: vendorCreditApplications.homeBill,
-      })
-      .from(vendorCreditApplications)
-      .where(and(inArray(vendorCreditApplications.billId, ids), lte(vendorCreditApplications.date, asOf)));
+      vcAppRows.push(
+        ...(await ctx.db
+          .select({
+            billId: vendorCreditApplications.billId,
+            amount: vendorCreditApplications.amount,
+            home: vendorCreditApplications.homeBill,
+          })
+          .from(vendorCreditApplications)
+          .where(and(inArray(vendorCreditApplications.billId, part), lte(vendorCreditApplications.date, asOf)))),
+      );
+    }
+    // Keyed lookups, not a scan of every application per bill (quadratic on a large file).
+    const payApps = groupBy(payAppRows, (x) => x.billId);
+    const vcApps = groupBy(vcAppRows, (x) => x.billId);
     for (const b of fb) {
       const rate = Money.of(b.rate ?? 1);
       let foreign = Money.of(b.total);
       let homeOpen = r2(foreign.times(rate));
-      for (const a of payApps.filter((x) => x.billId === b.id)) {
+      for (const a of payApps.get(b.id) ?? []) {
         foreign = foreign.minus(Money.of(a.applied));
         homeOpen = homeOpen.minus(Money.of(a.home ?? a.applied));
       }
-      for (const a of vcApps.filter((x) => x.billId === b.id)) {
+      for (const a of vcApps.get(b.id) ?? []) {
         foreign = foreign.minus(Money.of(a.amount));
         homeOpen = homeOpen.minus(Money.of(a.home));
       }
@@ -564,20 +640,26 @@ export async function foreignOpenPayables(ctx: ServiceContext, asOf: Date): Prom
       ),
     );
   if (credits.length > 0) {
-    const apps = await ctx.db
-      .select({
-        creditId: vendorCreditApplications.vendorCreditId,
-        amount: vendorCreditApplications.amount,
-        home: vendorCreditApplications.homeCredit,
-        date: vendorCreditApplications.date,
-      })
-      .from(vendorCreditApplications)
-      .where(inArray(vendorCreditApplications.vendorCreditId, credits.map((c) => c.id)));
+    const appRows: Array<{ creditId: string; amount: string; home: string; date: Date }> = [];
+    for (const part of chunks(credits.map((c) => c.id))) {
+      appRows.push(
+        ...(await ctx.db
+          .select({
+            creditId: vendorCreditApplications.vendorCreditId,
+            amount: vendorCreditApplications.amount,
+            home: vendorCreditApplications.homeCredit,
+            date: vendorCreditApplications.date,
+          })
+          .from(vendorCreditApplications)
+          .where(inArray(vendorCreditApplications.vendorCreditId, part))),
+      );
+    }
+    const apps = groupBy(appRows, (a) => a.creditId);
     const laterRefunds = await vendorCreditRefundsAfter(ctx, asOf);
     for (const c of credits) {
       const cur = foreignCode(c.currency, home);
       if (!cur) continue;
-      const mine = apps.filter((a) => a.creditId === c.id);
+      const mine = apps.get(c.id) ?? [];
       const allHome = mine.reduce((s, a) => s.plus(Money.of(a.home)), Money.zero());
       const homeTotal = Money.of(c.homeTotal ?? r2(Money.of(c.total).times(Money.of(c.rate ?? 1))));
       // Refunds to date (home: what is neither unapplied nor applied today); refunds dated after
@@ -615,12 +697,15 @@ export async function foreignOpenPayables(ctx: ServiceContext, asOf: Date): Prom
 export async function foreignInvoiceHomeOpen(
   ctx: ServiceContext,
   asOf: Date,
-): Promise<Map<string, { foreignOpen: Decimal; homeOpen: Decimal; currency: string; memoApplied: Decimal }>> {
+): Promise<Map<string, { foreignOpen: Decimal; homeOpen: Decimal; currency: string; memoApplied: Decimal; paymentLines: Decimal }>> {
   const items = await foreignOpenReceivables(ctx, asOf);
   return new Map(
     items
       .filter((i) => i.kind === 'invoice')
-      .map((i) => [i.id, { foreignOpen: i.foreignOpen, homeOpen: i.homeOpen, currency: i.currency, memoApplied: i.memoApplied ?? Money.zero() }]),
+      .map((i) => [
+        i.id,
+        { foreignOpen: i.foreignOpen, homeOpen: i.homeOpen, currency: i.currency, memoApplied: i.memoApplied ?? Money.zero(), paymentLines: i.paymentLines ?? Money.zero() },
+      ]),
   );
 }
 
@@ -644,11 +729,17 @@ export async function foreignAmountsByEntry(
   };
   for (let i = 0; i < ids.length; i += 2000) {
     const chunk = ids.slice(i, i + 2000);
-    for (const r of await ctx.db
-      .select({ e: invoices.postedEntryId, c: invoices.currency, t: invoices.total, ret: invoices.retainageAmount })
+    const invRows = await ctx.db
+      .select({ id: invoices.id, e: invoices.postedEntryId, c: invoices.currency, t: invoices.total, ret: invoices.retainageAmount })
       .from(invoices)
-      .where(and(eq(invoices.companyId, ctx.companyId), inArray(invoices.postedEntryId, chunk)))) {
-      put(r.e, r.c, Money.of(r.t).minus(Money.of(r.ret ?? 0)));
+      .where(and(eq(invoices.companyId, ctx.companyId), inArray(invoices.postedEntryId, chunk)));
+    // review5 fx: the A/R the invoice charged (payment-item lines went to Undeposited Funds).
+    const invPaymentLines = await paymentLinesByInvoice(
+      ctx,
+      invRows.filter((r) => foreignCode(r.c, home)).map((r) => r.id),
+    );
+    for (const r of invRows) {
+      put(r.e, r.c, Money.of(r.t).minus(Money.of(r.ret ?? 0)).minus(invPaymentLines.get(r.id) ?? Money.zero()));
     }
     const pays = await ctx.db
       .select({ id: paymentsReceived.id, e: paymentsReceived.postedEntryId, c: paymentsReceived.currency, a: paymentsReceived.amount })

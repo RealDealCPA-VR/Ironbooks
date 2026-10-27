@@ -4,53 +4,52 @@
  * Record an FX gain or loss as a balanced journal entry.
  * Body: { accountId, amount, gain, date, memo? }
  *
- *   gain=true  → Dr accountId / Cr 4900 Other Income
- *   gain=false → Dr 6100 Bank & Merchant Fees / Cr accountId
+ *   gain=true  → Dr accountId / Cr Exchange Gain/Loss
+ *   gain=false → Dr Exchange Gain/Loss / Cr accountId
+ *
+ * On a foreign-currency bank / card account the entry changes the home value only.
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { recordFxAdjustment } from '@/lib/services/currencies';
-import { ServiceError } from '@/lib/services/_base';
-import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
+import { routeError, requireJsonObject } from '@/lib/routeErrors';
+import { parseDateInput } from '@/lib/validation/helpers';
 
-function errorResponse(err: unknown) {
-  if (err instanceof ServiceError) {
-    const status = serviceErrorStatus(err.code);
-    return NextResponse.json({ error: err.message, code: err.code }, { status });
-  }
-  console.error('[currencies/fx-adjustment] unexpected error:', err);
-  return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
-}
+const bad = (error: string) => NextResponse.json({ error, code: 'VALIDATION' }, { status: 400 });
 
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
     const body = await requireJsonObject(req);
     const { accountId, amount, gain, date, memo } = body as {
-      accountId: string;
-      amount: string | number;
-      gain: boolean;
-      date: string;
-      memo?: string;
+      accountId: unknown;
+      amount: unknown;
+      gain: unknown;
+      date: unknown;
+      memo?: unknown;
     };
 
-    if (!accountId) return NextResponse.json({ error: 'accountId is required' }, { status: 400 });
-    if (amount === undefined || amount === null || amount === '')
-      return NextResponse.json({ error: 'amount is required' }, { status: 400 });
-    if (gain === undefined || gain === null)
-      return NextResponse.json({ error: 'gain (boolean) is required' }, { status: 400 });
-    if (!date) return NextResponse.json({ error: 'date is required' }, { status: 400 });
+    if (!accountId || typeof accountId !== 'string') return bad('accountId is required');
+    if (amount === undefined || amount === null || amount === '') return bad('amount is required');
+    if (typeof amount !== 'string' && typeof amount !== 'number') return bad('amount must be a number');
+    // review5 fx: `gain` must really be a boolean — Boolean("false") is true, which posted a loss
+    // as a gain.
+    if (typeof gain !== 'boolean') return bad('gain must be true (FX gain) or false (FX loss)');
+    if (!date || typeof date !== 'string') return bad('date is required');
+    const when = parseDateInput(date);
+    if (!when) return bad(`"${date}" is not a valid date`);
+    if (memo != null && typeof memo !== 'string') return bad('memo must be text');
 
     const result = await recordFxAdjustment(ctx, {
       accountId,
       amount,
-      gain: Boolean(gain),
-      date: new Date(date),
-      memo,
+      gain,
+      date: when,
+      memo: memo ?? undefined,
     });
 
     return NextResponse.json(result, { status: 201 });
   } catch (err) {
-    return errorResponse(err);
+    return routeError(err, 'POST /api/currencies/fx-adjustment');
   }
 }

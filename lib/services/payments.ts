@@ -53,9 +53,10 @@ import { createInvoice, markPaidAmount } from './invoices';
 import { applyToInvoice, unapplyCreditApplication } from './creditMemos';
 import { docRef } from './docNumbers';
 import { removePaymentFromDeposit } from './deposits';
-import { assertForeignCurrencyAllowed } from './multiCurrency';
+import { assertForeignCurrencyAllowed, effectiveHomeCurrency } from './multiCurrency';
+import { foreignCode } from './fxLines';
 import { computeDiscount, findTermsRef, type TermsLike, type TermsRow } from './lists/terms';
-import { getHomeCurrencyCode } from './currencies';
+import { getOrCreateExchangeGainLossAccount } from './currencies';
 import {
   type JournalCreditToInvoiceInput,
   type JournalItemPaymentInput,
@@ -225,11 +226,9 @@ async function getOrCreateAccount(
 
 /** Find or create the Exchange Gain/Loss expense account (code 6900) for realized FX. */
 async function getOrCreateExchangeGainLossId(ctx: ServiceContext): Promise<string> {
-  return getOrCreateAccount(ctx, '6900', {
-    name: 'Exchange Gain/Loss',
-    type: 'expense',
-    subtype: 'operating_expenses',
-  });
+  // review5 fx: one resolver for every module (QB's "Exchange Gain or Loss" account, never an
+  // unrelated account that happens to be numbered 6900).
+  return getOrCreateExchangeGainLossAccount(ctx);
 }
 
 /** Default early-payment discount account (contra income, QB "Discounts Given"). */
@@ -528,19 +527,23 @@ async function applyEarlierPayments(
   return last;
 }
 
-/** Normalise a currency code: upper case; the home currency (or blank) becomes null. */
+/**
+ * Normalise a currency code: upper case; the home currency (or blank) becomes null. review5 fx: the
+ * home code as invoices resolve it (also without a base row), so a bank tagged with the home code
+ * takes home payments and a payment typed in the home code is a home payment.
+ */
 async function normalizeCurrency(ctx: ServiceContext, code: string | null | undefined): Promise<string | null> {
-  const v = (code ?? '').trim().toUpperCase();
-  if (!v) return null;
-  const home = ((await getHomeCurrencyCode(ctx)) ?? '').toUpperCase();
-  return v === home ? null : v;
+  if (!(code ?? '').trim()) return null;
+  return foreignCode(code, await effectiveHomeCurrency(ctx));
 }
 
 /**
  * Currency + settlement rate of a received payment. A home-currency payment always settles at 1.
  * A foreign one uses the rate typed on the payment, or the currency list's current rate (QB fills
- * the exchange rate in from the currency list). Rounded to the column's 6 decimals so every later
- * calculation (refunds, apply-later) uses exactly the stored rate.
+ * the exchange rate in from the currency list). Rounded to the column's 8 decimals (review5 fx: the
+ * same precision as the currency list and the invoices — it was 6, so a payment at the very rate its
+ * invoice was booked at showed a realized gain / loss) so every later calculation (refunds,
+ * apply-later) uses exactly the stored rate.
  */
 export async function resolvePaymentCurrency(
   ctx: ServiceContext,
@@ -565,7 +568,8 @@ export async function resolvePaymentCurrency(
     rate = Money.of(row.rateToBase);
   }
   if (!rate.isFinite() || !rate.greaterThan(0)) throw validation('Exchange rate must be positive.');
-  rate = Money.of(rate.toFixed(6));
+  if (rate.greaterThan(1_000_000)) throw validation('The exchange rate is too large.');
+  rate = Money.of(rate.toFixed(8));
   if (!rate.greaterThan(0)) throw validation('Exchange rate must be positive.');
   return { currency, rate };
 }
@@ -781,6 +785,18 @@ async function postPayment(
   if (depAcct.subtype === 'accounts_receivable' || depAcct.subtype === 'inventory') {
     throw validation('Deposit account must be a bank account or Undeposited Funds.');
   }
+  // review5 fx: QB lists only accounts in the payment's currency or the home currency under
+  // "Deposit to". A payment banked in a third currency (or a home payment in a foreign bank)
+  // would post a list-rate conversion of the home amount as that account's own-currency amount.
+  {
+    const [depCur] = await tx.db.select({ currency: accounts.currency }).from(accounts).where(eq(accounts.id, depositAccountId));
+    const depCode = await normalizeCurrency(tx, depCur?.currency ?? null);
+    if (depCode && depCode !== paymentCurrency) {
+      throw validation(
+        `"${depAcct.name}" is a ${depCode} account. Deposit this ${paymentCurrency ?? 'home-currency'} payment into ${paymentCurrency ? `a ${paymentCurrency} account or ` : ''}a home-currency account (or Undeposited Funds).`,
+      );
+    }
+  }
 
   // --- Discount account (only when a discount is taken) ---
   let discountAccountId: string | null = null;
@@ -803,6 +819,11 @@ async function postPayment(
   // A/R control account clears exactly what createInvoice debited. The difference is
   // realized FX gain/loss. Discounts are converted at the invoice's booked rate on both sides.
   const cashBase = Money.round2(Money.mul(totalAmount, paymentRate));
+  // review5 fx: money received that is worth nothing in home currency would be saved with no
+  // ledger entry at all (as the bill, check and deposit forms say, it is too small to convert).
+  if (paymentCurrency && totalAmount.greaterThan(0) && !cashBase.greaterThan(0)) {
+    throw validation('This payment is too small to convert to your home currency. Check the exchange rate.');
+  }
   let arBase = Money.zero();
   let discountBase = Money.zero();
   // A foreign invoice is relieved at its booked rate, except by the application that pays it off,
@@ -902,7 +923,7 @@ async function postPayment(
     amount: amountStr,
     unapplied: toAmountString(unapplied),
     currency: paymentCurrency,
-    exchangeRate: paymentRate.toFixed(6),
+    exchangeRate: paymentRate.toFixed(8),
     depositAccountId,
     discountAccountId,
     memo: input.memo ?? null,
@@ -983,7 +1004,7 @@ async function postPayment(
       journalOffsets,
       credits,
       currency: paymentCurrency,
-      exchangeRate: paymentRate.toFixed(6),
+      exchangeRate: paymentRate.toFixed(8),
       discountTotal: toAmountString(sumDiscount),
       discountAccountId,
       postedEntryId: entry?.id ?? null,
@@ -2247,6 +2268,17 @@ async function refundPaymentInTx(ctx: ServiceContext, input: RefundPaymentInput)
   // Bank accounts, Undeposited Funds or another cash-like current asset (lib/accountTypes.ts).
   if (!isDepositTargetAccount(bankAcct)) {
     throw validation('Refunds must be paid from a bank/cash account.');
+  }
+  // review5 fx: refund from an account in the payment's currency or the home currency (a third
+  // currency - or a home payment from a foreign bank - would book a list-rate conversion).
+  {
+    const bankCode = await normalizeCurrency(ctx, bankAcct.currency ?? null);
+    const payCode = await normalizeCurrency(ctx, payment.currency ?? null);
+    if (bankCode && bankCode !== payCode) {
+      throw validation(
+        `This is a ${bankCode} account. Refund this ${payCode ?? 'home-currency'} payment from ${payCode ? `a ${payCode} account or ` : ''}a home-currency account.`,
+      );
+    }
   }
 
   const arAccountId = await getArAccountId(ctx);

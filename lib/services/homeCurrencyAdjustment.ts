@@ -18,17 +18,18 @@
  * Every line is posted through postJournalEntry (balanced, closing date respected, audited).
  * Voiding an adjustment voids both entries.
  */
-import { and, asc, desc, eq, inArray } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNull } from 'drizzle-orm';
 import Decimal from 'decimal.js';
 import { accounts, currencies, homeCurrencyAdjustments, loans } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
-import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from './_base';
+import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
 import { postJournalEntry, voidJournalEntry, type PostingLine } from './posting';
 import { getOrCreateExchangeGainLossAccount } from './currencies';
 import { foreignCode, homeCode, parseRate } from './exchangeRates';
 import { foreignAccountBalances } from './fxLedger';
 import { foreignOpenPayables, foreignOpenReceivables } from './fxSubledger';
 import { getLoan, voidOrphanLoanFx } from './loans';
+import { assertListRatesKeepHomeCurrency } from './multiCurrency';
 
 export interface HcaLine {
   kind: 'account' | 'customer' | 'vendor' | 'loan';
@@ -106,6 +107,9 @@ async function defaultArAp(ctx: ServiceContext) {
 export async function previewHomeCurrencyAdjustment(ctx: ServiceContext, input: HcaInput): Promise<HcaPreview> {
   if (!input.date || isNaN(new Date(input.date).getTime())) throw validation('Pick the date of the adjustment.');
   const date = new Date(input.date);
+  // review5 fx: "as of" a date means the whole day (as the A/R / A/P aging and the balance sheet as
+  // of that date read it): a document dated later that same day is revalued too.
+  const asOf = endOfUtcDay(date);
   const { home, rates } = await ratesFor(ctx, input);
   const lines: HcaLine[] = [];
   const need = (cur: string) => {
@@ -126,7 +130,7 @@ export async function previewHomeCurrencyAdjustment(ctx: ServiceContext, input: 
   };
 
   // 1. Foreign-currency bank / credit-card accounts.
-  for (const a of await foreignAccountBalances(ctx, date)) {
+  for (const a of await foreignAccountBalances(ctx, asOf)) {
     const rate = need(a.currency);
     const newHome = Money.round2(a.foreign.times(rate));
     push(
@@ -149,7 +153,7 @@ export async function previewHomeCurrencyAdjustment(ctx: ServiceContext, input: 
   const { ar, ap } = await defaultArAp(ctx);
 
   // 2. Foreign A/R per customer + currency.
-  const recv = await foreignOpenReceivables(ctx, date);
+  const recv = await foreignOpenReceivables(ctx, asOf);
   const byCustomer = new Map<string, { name: string; currency: string; foreign: Decimal; home: Decimal; newHome: Decimal }>();
   for (const it of recv) {
     const k = `${it.entityId}|${it.currency}`;
@@ -180,7 +184,7 @@ export async function previewHomeCurrencyAdjustment(ctx: ServiceContext, input: 
   }
 
   // 3. Foreign A/P per vendor + currency (bills positive = owed).
-  const pay = await foreignOpenPayables(ctx, date);
+  const pay = await foreignOpenPayables(ctx, asOf);
   const byVendor = new Map<string, { name: string; currency: string; foreign: Decimal; home: Decimal; newHome: Decimal }>();
   for (const it of pay) {
     const k = `${it.entityId}|${it.currency}`;
@@ -220,7 +224,7 @@ export async function previewHomeCurrencyAdjustment(ctx: ServiceContext, input: 
     const cur = foreignCode(loan.currency, home);
     if (!cur) continue;
     const rate = need(cur);
-    const { activePrincipal } = await loanPrincipalPaid(ctx, loan.id, date);
+    const { activePrincipal } = await loanPrincipalPaid(ctx, loan.id, asOf);
     const balance = Money.round2(Money.of(loan.originalAmount).minus(activePrincipal));
     if (balance.isZero()) continue;
     const carried = Money.round2(balance.times(Money.of(loan.exchangeRate ?? rate)));
@@ -249,6 +253,35 @@ export async function previewHomeCurrencyAdjustment(ctx: ServiceContext, input: 
     lines,
     total: toAmountString(total),
   };
+}
+
+const ymdOf = (d: Date) => new Date(d).toISOString().slice(0, 10);
+/** A real instant's LOCAL calendar day (this machine is the user's), as "YYYY-MM-DD". */
+const localDateISO = (d: Date) =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
+function hasAccountLines(detail: unknown): boolean {
+  return Array.isArray(detail) && detail.some((l) => (l as { kind?: string } | null)?.kind === 'account');
+}
+
+/** Posted (not voided) adjustments that revalued a bank / card account (permanent lines). */
+async function liveAccountAdjustments(ctx: ServiceContext) {
+  const rows = await ctx.db
+    .select({
+      id: homeCurrencyAdjustments.id,
+      date: homeCurrencyAdjustments.date,
+      createdAt: homeCurrencyAdjustments.createdAt,
+      detail: homeCurrencyAdjustments.detail,
+    })
+    .from(homeCurrencyAdjustments)
+    .where(and(eq(homeCurrencyAdjustments.companyId, ctx.companyId), isNull(homeCurrencyAdjustments.voidedAt)))
+    .orderBy(desc(homeCurrencyAdjustments.date));
+  return rows.filter((r) => hasAccountLines(r.detail));
+}
+
+/** The last instant of `d`'s UTC calendar day (date-only values are stored at UTC midnight). */
+function endOfUtcDay(d: Date): Date {
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1) - 1);
 }
 
 /** Principal of a loan's active (not voided) payments dated on/before `asOf`. */
@@ -306,15 +339,51 @@ async function linesFor(ctx: ServiceContext, hca: HcaLine[], reverse: boolean): 
 
 /** Post a Home Currency Adjustment (and its next-day reversal for A/R, A/P and loans). */
 export async function createHomeCurrencyAdjustment(ctx: ServiceContext, input: HcaInput) {
-  await voidOrphanLoanFx(ctx);
-  const preview = await previewHomeCurrencyAdjustment(ctx, input);
-  if (preview.lines.length === 0) {
-    throw validation('Nothing to adjust: every foreign-currency balance is already at these rates.');
-  }
+  if (!input.date || isNaN(new Date(input.date).getTime())) throw validation('Pick the date of the adjustment.');
   const date = new Date(input.date);
   const reversalDate = new Date(date.getTime() + 86_400_000);
 
+  // review5 fx: the balances are read inside the transaction that posts the adjustment, so a
+  // double-submitted (or concurrent) adjustment sees the first one and finds nothing left to
+  // revalue, instead of both posting the same permanent bank / card revaluation.
   return inTransaction(ctx, async (tx) => {
+    await voidOrphanLoanFx(tx);
+    const preview = await previewHomeCurrencyAdjustment(tx, input);
+    if (preview.lines.length === 0) {
+      throw validation('Nothing to adjust: every foreign-currency balance is already at these rates.');
+    }
+    // review5 fx: a bank / card revaluation is permanent and each one is computed from the home
+    // value the earlier ones left. One dated before a later posted revaluation would shift that
+    // later one off its rate (the account would no longer be at foreign x the latest rate).
+    if (preview.lines.some((l) => l.kind === 'account')) {
+      const later = (await liveAccountAdjustments(tx)).find((h) => ymdOf(h.date) > ymdOf(date));
+      if (later) {
+        throw validation(
+          `A home currency adjustment dated ${ymdOf(later.date)} already revalues your foreign-currency bank and card accounts. Date this one on or after ${ymdOf(later.date)}, or void the later adjustment first.`,
+        );
+      }
+    }
+    // review5 fx: the currency list holds ONE rate per currency — the current one new
+    // transactions default to. An adjustment dated before that rate was last set (a late
+    // year-end revaluation) records the old date's rate on the adjustment only; it used to
+    // replace today's rate with it, so every new transaction defaulted to last year's rate.
+    const listUpdates: Array<{ id: string; code: string; rate: string }> = [];
+    if (input.updateCurrencyList !== false) {
+      const listed = await tx.db
+        .select({ id: currencies.id, code: currencies.code, updatedAt: currencies.updatedAt })
+        .from(currencies)
+        .where(and(eq(currencies.companyId, tx.companyId), eq(currencies.isBase, false)));
+      for (const [code, rate] of Object.entries(preview.rates)) {
+        const listedRow = listed.find((c) => c.code === code);
+        // updatedAt is a real instant: its LOCAL calendar day (the day the user set the rate);
+        // the adjustment's date is a calendar day stored at UTC midnight.
+        if (!listedRow || localDateISO(listedRow.updatedAt) > ymdOf(date)) continue;
+        listUpdates.push({ id: listedRow.id, code, rate });
+      }
+      // review5 fx: with no base row a list rate can change the home currency (USD listed at 1.30
+      // and saved at 1 becomes it) - refused like the Currencies page refuses it, before posting.
+      await assertListRatesKeepHomeCurrency(tx, listUpdates);
+    }
     const [row] = await tx.db
       .insert(homeCurrencyAdjustments)
       .values({
@@ -347,13 +416,8 @@ export async function createHomeCurrencyAdjustment(ctx: ServiceContext, input: H
       .set({ entryId: entry?.id ?? null, reversalEntryId: reversal?.id ?? null })
       .where(eq(homeCurrencyAdjustments.id, row.id))
       .returning();
-    if (input.updateCurrencyList !== false) {
-      for (const [code, rate] of Object.entries(preview.rates)) {
-        await tx.db
-          .update(currencies)
-          .set({ rateToBase: rate, updatedAt: new Date() })
-          .where(and(eq(currencies.companyId, tx.companyId), eq(currencies.code, code), eq(currencies.isBase, false)));
-      }
+    for (const u of listUpdates) {
+      await tx.db.update(currencies).set({ rateToBase: u.rate, updatedAt: new Date() }).where(eq(currencies.id, u.id));
     }
     await writeAudit(tx, {
       action: 'create',
@@ -381,6 +445,8 @@ export async function listHomeCurrencyAdjustments(ctx: ServiceContext) {
 }
 
 export async function getHomeCurrencyAdjustment(ctx: ServiceContext, id: string) {
+  // A malformed id is "not found" (404), not a Postgres uuid error (500).
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(id))) throw notFound('Home currency adjustment');
   const [row] = await ctx.db
     .select()
     .from(homeCurrencyAdjustments)
@@ -391,9 +457,26 @@ export async function getHomeCurrencyAdjustment(ctx: ServiceContext, id: string)
 
 /** Void an adjustment: both its entry and its reversal (closing date respected). */
 export async function voidHomeCurrencyAdjustment(ctx: ServiceContext, id: string) {
-  const row = await getHomeCurrencyAdjustment(ctx, id);
-  if (row.voidedAt) return row;
   return inTransaction(ctx, async (tx) => {
+    // Read in the transaction: a double-submitted void voids (and audits) it once.
+    const row = await getHomeCurrencyAdjustment(tx, id);
+    if (row.voidedAt) return row;
+    // review5 fx: a later bank / card revaluation was computed on top of this one; voiding this
+    // one first would leave those accounts off the later rate. Void the latest first (QB order).
+    if (hasAccountLines(row.detail)) {
+      const later = (await liveAccountAdjustments(tx)).find(
+        (h) =>
+          h.id !== row.id &&
+          (ymdOf(h.date) > ymdOf(row.date) ||
+            (ymdOf(h.date) === ymdOf(row.date) && h.createdAt.getTime() > row.createdAt.getTime())),
+      );
+      if (later) {
+        throw new ServiceError(
+          'CONFLICT',
+          `The home currency adjustment dated ${ymdOf(later.date)} revalued your bank and card accounts after this one. Void that one first.`,
+        );
+      }
+    }
     for (const entryId of [row.reversalEntryId, row.entryId]) {
       if (entryId) await voidJournalEntry(tx, entryId);
     }

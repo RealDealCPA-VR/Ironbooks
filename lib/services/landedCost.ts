@@ -55,7 +55,7 @@ import {
 } from './_base';
 import { postJournalEntry, voidJournalEntry } from './posting';
 import { valueRemainderAfter } from './inventory';
-import { homeAmounts } from './currencies';
+import { billLineHomeShares } from './currencies';
 
 export type LandedCostMethod = 'quantity' | 'value' | 'weight';
 
@@ -203,52 +203,12 @@ function signedLine(accountId: string, amount: Dec, memo: string) {
 }
 
 /**
- * The HOME amount each line of these bills posted to its account. A foreign-currency bill stores
- * its line amounts in the bill's currency and posts one anchor round2(total x rate) penny-allocated
- * over the lines (bills.ts prepareBill); landed cost moves that home amount out of the charge
- * account, never the foreign figure. Home bills: the stored amount.
- */
-async function billLineHomeAmounts(
-  ctx: ServiceContext,
-  billRows: ReadonlyArray<{ id: string; currency: string | null; exchangeRate: string | null }>,
-): Promise<Map<string, Dec>> {
-  const out = new Map<string, Dec>();
-  const foreign = billRows.filter((b) => (b.currency ?? '').trim() !== '');
-  if (foreign.length === 0) return out;
-  const byBill = new Map<string, Array<{ id: string; billId: string; amount: string }>>();
-  for (const ids of chunked(foreign.map((b) => b.id))) {
-    for (const l of await ctx.db
-      .select({ id: billLines.id, billId: billLines.billId, amount: billLines.amount })
-      .from(billLines)
-      .where(inArray(billLines.billId, ids))
-      .orderBy(asc(billLines.billId), asc(billLines.lineOrder))) {
-      const list = byBill.get(l.billId) ?? [];
-      list.push(l);
-      byBill.set(l.billId, list);
-    }
-  }
-  for (const b of foreign) {
-    const own = byBill.get(b.id) ?? [];
-    const home = homeAmounts(
-      own.map((l) => l.amount),
-      b.exchangeRate ?? 1,
-    );
-    own.forEach((l, i) => out.set(l.id, home.lines[i]));
-  }
-  return out;
-}
-
-/**
- * Ids per IN (...) list: one query binding every bill line / bill of a large company file went past
- * Postgres' 65,535 bind parameters ("bind message has N parameter formats") and the Landed Cost
- * screen failed to load.
+ * The most ids bound in one IN (...) list: one query binding every bill line / bill of a large
+ * company file went past Postgres' 65,535 bind parameters ("bind message has N parameter formats")
+ * and the Landed Cost screen failed to load. (The foreign bills' home shares are read 2,000 at a
+ * time too: currencies.billLineHomeShares.)
  */
 const IN_CHUNK = 2000;
-function chunked<T>(xs: T[]): T[][] {
-  const out: T[][] = [];
-  for (let i = 0; i < xs.length; i += IN_CHUNK) out.push(xs.slice(i, i + IN_CHUNK));
-  return out;
-}
 
 /** Sum of active (non-void) allocations per bill line. */
 async function allocatedByBillLine(ctx: ServiceContext, billLineIds: string[]): Promise<Map<string, Dec>> {
@@ -356,8 +316,6 @@ export async function listLandedCostSources(
       billId: bills.id,
       billNumber: bills.billNumber,
       billDate: bills.date,
-      billCurrency: bills.currency,
-      billRate: bills.exchangeRate,
       vendorName: vendors.displayName,
       billLineId: billLines.id,
       description: billLines.description,
@@ -376,14 +334,14 @@ export async function listLandedCostSources(
 
   const eligible = rows.filter((r) => r.itemType !== 'inventory');
   const allocated = await allocatedByBillLine(ctx, eligible.map((r) => r.billLineId));
-  const billsById = new Map(eligible.map((r) => [r.billId, { id: r.billId, currency: r.billCurrency, exchangeRate: r.billRate }]));
-  const homeByLine = await billLineHomeAmounts(ctx, [...billsById.values()]);
+  // review5 fx: a charge is allocated at what it cost in home currency (a EUR freight line's home
+  // share), the amount its expense account was debited with.
+  const homeShare = await billLineHomeShares(ctx, [...new Set(eligible.map((r) => r.billId))]);
   return eligible
     .map((r) => {
       const done = allocated.get(r.billLineId) ?? Money.zero();
-      // Allocations are in home currency (what the charge line posted).
-      const lineHome = homeByLine.get(r.billLineId) ?? Money.of(r.amount);
-      const remaining = lineHome.minus(done);
+      const amount = homeShare.get(r.billLineId) ?? Money.of(r.amount);
+      const remaining = amount.minus(done);
       return {
         billId: r.billId,
         billNumber: r.billNumber,
@@ -393,7 +351,7 @@ export async function listLandedCostSources(
         description: r.description,
         accountId: r.accountId,
         accountName: r.accountName,
-        amount: toAmountString(lineHome),
+        amount: toAmountString(amount),
         allocated: toAmountString(done),
         remaining: toAmountString(remaining),
       };
@@ -460,8 +418,9 @@ async function computeAllocation(ctx: ServiceContext, input: AllocateLandedCostI
   }
 
   const already = (await allocatedByBillLine(ctx, [billLine.id])).get(billLine.id) ?? Money.zero();
-  // p1 fx: the charge account carries the line's HOME amount (a foreign bill stores its currency).
-  const lineHome = (await billLineHomeAmounts(ctx, [bill])).get(billLine.id) ?? Money.of(billLine.amount);
+  // review5 fx: in home currency — the charge's home share on a foreign bill (allocations are
+  // posted, and stored, in home currency).
+  const lineHome = (await billLineHomeShares(ctx, [bill.id])).get(billLine.id) ?? Money.of(billLine.amount);
   const remaining = lineHome.minus(already);
   let amount = remaining;
   if (input.amount != null && input.amount !== '') {

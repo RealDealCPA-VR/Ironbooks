@@ -39,6 +39,8 @@ import { createSalesReceipt, type CreateSalesReceiptInput } from './salesReceipt
 import { createCreditMemo, type CreateCreditMemoInput } from './creditMemos';
 import { createDeposit, type CreateDepositInput } from './deposits';
 import { createTransfer, type CreateTransferInput } from './transfers';
+import { accountCurrencyOf, currencyRate } from './exchangeRates';
+import { Money } from '@/lib/money';
 import { createPurchaseOrder, type CreatePurchaseOrderInput } from './purchaseOrders';
 
 // ---------------------------------------------------------------------------
@@ -161,6 +163,7 @@ export interface RunFailure {
 }
 
 /** Reserved key inside the template jsonb that carries legacy non-payload options. */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const OPTIONS_KEY = '__options';
 
 interface TemplateOptions {
@@ -593,14 +596,18 @@ async function generateFromTemplate(
     );
   }
 
+  // review5 fx: a memorized foreign-currency invoice / bill / check / deposit / transfer is entered
+  // at the exchange rate of the day it is entered (the currency list's), as QB does — not the rate
+  // memorized months ago.
+  const fresh = { exchangeRate: undefined };
   switch (template.docType as DocType) {
     case 'invoice': {
-      const input = { ...(payload as unknown as CreateInvoiceInput), date: runDate, dueDate: shiftedDate(payload, 'dueDate', runDate) };
+      const input = { ...(payload as unknown as CreateInvoiceInput), ...fresh, date: runDate, dueDate: shiftedDate(payload, 'dueDate', runDate) };
       docId = (await createInvoice(ctx, input)).id;
       break;
     }
     case 'bill': {
-      const input = { ...(payload as unknown as CreateBillInput), date: runDate, dueDate: shiftedDate(payload, 'dueDate', runDate) };
+      const input = { ...(payload as unknown as CreateBillInput), ...fresh, date: runDate, dueDate: shiftedDate(payload, 'dueDate', runDate) };
       docId = (await createBill(ctx, input)).id;
       break;
     }
@@ -618,7 +625,7 @@ async function generateFromTemplate(
       break;
     }
     case 'expense': {
-      const input = { ...(payload as unknown as CreateExpenseInput), date: runDate };
+      const input = { ...(payload as unknown as CreateExpenseInput), ...fresh, date: runDate };
       docId = (await createExpense(ctx, input)).id;
       break;
     }
@@ -627,6 +634,7 @@ async function generateFromTemplate(
       // reused — the next number comes from the check sequence (or Print Checks).
       const input = {
         ...(payload as unknown as CreateExpenseInput),
+        ...fresh,
         method: 'check' as const,
         reference: null,
         date: runDate,
@@ -649,6 +657,7 @@ async function generateFromTemplate(
       // one-time money and are never re-deposited from a memorized deposit.
       const input = {
         ...(payload as unknown as CreateDepositInput),
+        ...fresh,
         paymentIds: [],
         salesReceiptIds: [],
         date: runDate,
@@ -657,7 +666,36 @@ async function generateFromTemplate(
       break;
     }
     case 'transfer': {
-      const input = { ...(payload as unknown as CreateTransferInput), date: runDate };
+      // review5 fx: the memorized home amount is never reused (it is recomputed at today's rate). A
+      // same-currency foreign transfer also drops the memorized rate (home per unit). Between a
+      // foreign and a home account the cross rate is the foreign currency's home rate (or its
+      // inverse), so it is today's too - unless the amount that arrived was memorized. Between two
+      // foreign currencies `exchangeRate` is the cross rate the user memorized, so it stays.
+      const memorized = payload as unknown as CreateTransferInput;
+      // A missing / malformed / deleted account is left to createTransfer's own plain message.
+      const currencyOf = async (id: unknown): Promise<string | null | undefined> => {
+        if (typeof id !== 'string' || !UUID_RE.test(id)) return undefined;
+        try {
+          return (await accountCurrencyOf(ctx, id)).currency;
+        } catch (err) {
+          if (err instanceof ServiceError) return undefined;
+          throw err;
+        }
+      };
+      const from = await currencyOf(memorized.fromAccountId);
+      const to = await currencyOf(memorized.toAccountId);
+      const known = from !== undefined && to !== undefined;
+      let rate: { exchangeRate?: string | undefined } = {};
+      if (known && from === to) rate = fresh;
+      else if (known && (from === null) !== (to === null) && (memorized.toAmount == null || String(memorized.toAmount).trim() === '')) {
+        try {
+          const listed = (await currencyRate(ctx, from ?? to)).rate;
+          rate = { exchangeRate: (from ? listed : Money.of(1).dividedBy(listed)).toFixed(8) };
+        } catch (err) {
+          if (!(err instanceof ServiceError)) throw err; // no list rate: the memorized one stays
+        }
+      }
+      const input = { ...memorized, ...rate, homeAmount: undefined, date: runDate };
       docId = (await createTransfer(ctx, input)).id;
       break;
     }

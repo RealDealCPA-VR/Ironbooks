@@ -111,19 +111,40 @@ export function planRegisterEntry(register: PlanAccount, other: PlanAccount, sid
   const base = { ok: true as const, debitAccountId: debit.id, creditAccountId: credit.id };
 
   if (isBankAccount(debit) && isBankAccount(credit)) {
-    if ((debit.currency ?? null) !== (credit.currency ?? null)) {
+    if (currencyOf(debit) !== currencyOf(credit)) {
       return { ok: false, message: 'These bank accounts use different currencies. Use Transfer Funds to enter the exchange rate.' };
     }
     return { ...base, kind: 'transfer' };
   }
-  if (isBankAccount(credit)) return { ...base, kind: 'check', paymentAccountId: credit.id, lineAccountId: debit.id };
-  if (isBankAccount(debit)) {
+  let plan: RegisterEntryPlan;
+  if (isBankAccount(credit)) plan = { ...base, kind: 'check', paymentAccountId: credit.id, lineAccountId: debit.id };
+  else if (isBankAccount(debit)) {
     if (isUndepositedFunds(credit)) {
       return { ok: false, message: 'Use Make Deposits to deposit the payments waiting in Undeposited Funds.' };
     }
-    return { ...base, kind: 'deposit', lineAccountId: credit.id };
+    plan = { ...base, kind: 'deposit', lineAccountId: credit.id };
+  } else if (isCreditCardAccount(credit)) plan = { ...base, kind: 'card_charge', paymentAccountId: credit.id, lineAccountId: debit.id };
+  else if (isCreditCardAccount(debit)) plan = { ...base, kind: 'card_credit', paymentAccountId: debit.id, lineAccountId: credit.id };
+  else plan = { ...base, kind: 'journal' };
+
+  // review5 fx: the amount is typed in THIS register's currency. The document must be written on
+  // an account in that currency, and the other account must be in it or in home currency —
+  // otherwise a EUR amount would be saved as a home-currency check (or the other way round) with
+  // no exchange rate.
+  const regCur = currencyOf(register);
+  const docAccountId = plan.kind === 'deposit' ? plan.debitAccountId : (plan.paymentAccountId ?? register.id);
+  const docCur = docAccountId === register.id ? regCur : currencyOf(other);
+  const otherCur = currencyOf(other);
+  if (docCur !== regCur || (otherCur && otherCur !== regCur)) {
+    return {
+      ok: false,
+      message: 'These accounts use different currencies, so the amount can’t be entered in this register. Use Write Checks, Make Deposits or Transfer Funds, where you can enter the exchange rate.',
+    };
   }
-  if (isCreditCardAccount(credit)) return { ...base, kind: 'card_charge', paymentAccountId: credit.id, lineAccountId: debit.id };
-  if (isCreditCardAccount(debit)) return { ...base, kind: 'card_credit', paymentAccountId: debit.id, lineAccountId: credit.id };
-  return { ...base, kind: 'journal' };
+  return plan;
+}
+
+/** Account currency as the plan compares it (blank = home; callers pass home as null). */
+function currencyOf(a: Pick<PlanAccount, 'currency'>): string | null {
+  return (a.currency ?? '').trim().toUpperCase() || null;
 }

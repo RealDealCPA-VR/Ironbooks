@@ -62,7 +62,9 @@ import {
   validation,
   writeAudit,
 } from './_base';
-import { assertForeignCurrencyAllowed } from './multiCurrency';
+import { assertForeignCurrencyAllowed, effectiveHomeCurrency } from './multiCurrency';
+import { currencyRate } from './exchangeRates';
+import { foreignCode } from './fxLines';
 import { assertNotControlLineAccount, postJournalEntry, voidJournalEntry } from './posting';
 import { recordCOGS, valueRemainderAfter } from './inventory';
 import { consumeStock, restoreConsumedStock } from './fifo';
@@ -540,6 +542,30 @@ function assertEditKeepsApplications(
       `This invoice already has ${toAmountString(externalPaid)} in payments or credits applied, so its new amount due (${toAmountString(openAfter)}) cannot be less than that. Unapply some of the payment first, or increase the invoice.`,
     );
   }
+}
+
+/**
+ * review5 fx: the invoice's currency and exchange rate, as QB fills them in. The code is
+ * normalised (upper case; the home currency is no currency, always at rate 1 - a stated rate
+ * would scale every GL line). A foreign invoice without a typed rate takes the currency list's
+ * rate (like bills, checks and Receive Payments) instead of 1, and an edit that leaves the rate
+ * blank keeps the invoice's saved rate. A foreign currency that is not in the list needs a typed
+ * rate.
+ */
+async function resolveInvoiceCurrency(
+  ctx: ServiceContext,
+  input: CreateInvoiceInput,
+  saved?: { currency: string | null; exchangeRate: string | null },
+): Promise<CreateInvoiceInput> {
+  // The home code even when no currency list exists yet (a home invoice typed as "usd").
+  const home = await effectiveHomeCurrency(ctx);
+  const cur = foreignCode(input.currency ?? null, home);
+  const sameAsSaved = !!saved && foreignCode(saved.currency, home) === cur;
+  if (!cur) return { ...input, currency: sameAsSaved ? saved!.currency : null, exchangeRate: 1 };
+  const blank = input.exchangeRate == null || String(input.exchangeRate).trim() === '';
+  const stated = blank && sameAsSaved && saved!.exchangeRate != null ? saved!.exchangeRate : input.exchangeRate;
+  const fx = await currencyRate(ctx, cur, stated);
+  return { ...input, currency: sameAsSaved ? saved!.currency : fx.currency, exchangeRate: fx.rate.toFixed(8) };
 }
 
 // ---------------------------------------------------------------------------
@@ -1541,6 +1567,7 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
   // Customer's tax item when the form left it out; non-taxable customer → untaxed lines.
   input = await applyCustomerTaxDefaults(ctx, input, { defaultRate: true });
   input = await applyCustomerShipToDefault(ctx, input);
+  input = await resolveInvoiceCurrency(ctx, input);
   const prep = await prepareInvoice(ctx, input);
   const isDraft = input.status === 'draft';
 
@@ -2237,6 +2264,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
   // An edit that does not mention the sales rep keeps the current one (it was usually set
   // via assignInvoiceRep, and it is also a price-rule condition).
   if (input.salesRepId === undefined) input = { ...input, salesRepId: existing.salesRepId };
+  input = await resolveInvoiceCurrency(ctx, input, existing);
 
   // Validate + compute the new document (read-only). Exclude this invoice's own
   // current balance from the credit-limit exposure — it is being replaced.

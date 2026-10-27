@@ -158,6 +158,16 @@ export async function paymentsUnappliedAsOf(
   asOf?: Date,
 ): Promise<Map<string, Decimal>> {
   if (!asOf) return new Map(payments.map((p) => [p.id, Money.round2(Money.of(p.unapplied))]));
+  if (payments.length > 2000) {
+    // review5 fx: the A/R aging reads every payment ever received; one IN (...) list over all of
+    // them exceeds Postgres' 65,535 bind parameters on a large file. Each payment's credit depends
+    // only on its own rows, so it is computed 2000 payments at a time.
+    const out = new Map<string, Decimal>();
+    for (let i = 0; i < payments.length; i += 2000) {
+      for (const [k, v] of await paymentsUnappliedAsOf(ctx, payments.slice(i, i + 2000), asOf)) out.set(k, v);
+    }
+    return out;
+  }
   const events = await paymentCreditEvents(ctx, payments, { after: asOf });
   const ids = payments.map((p) => p.id);
   const later = await homeAppliedToLaterInvoices(ctx, ids, asOf);
@@ -260,7 +270,11 @@ async function homeAppliedToLaterInvoices(ctx: ServiceContext, paymentIds: strin
       .where(
         and(
           eq(paymentsReceived.companyId, ctx.companyId),
-          inArray(paymentApplications.paymentId, chunk),
+          // The id list filters the payments (the join then finds each one's applications by
+          // payment_applications_payment_idx). On payment_applications.payment_id it became an
+          // index condition re-evaluated for every payment of the company, chunk after chunk:
+          // quadratic, and the as-of A/R aging of a file with 66,000 payments never finished.
+          inArray(paymentsReceived.id, chunk),
           isNull(paymentsReceived.currency),
           gt(invoices.date, asOf),
         ),

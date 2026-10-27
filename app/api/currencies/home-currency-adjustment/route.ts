@@ -10,6 +10,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { routeError, requireJsonObject } from '@/lib/routeErrors';
+import { parseDateInput } from '@/lib/validation/helpers';
 import {
   createHomeCurrencyAdjustment,
   listHomeCurrencyAdjustments,
@@ -35,14 +36,19 @@ export async function POST(req: NextRequest) {
       preview?: boolean;
       updateCurrencyList?: boolean;
     };
-    if (!body.date || isNaN(new Date(body.date).getTime())) {
+    // review5 fx: a real calendar date ("2026-02-30" is refused, not rolled over to March 2).
+    const date = typeof body.date === 'string' ? parseDateInput(body.date) : null;
+    if (!date) {
       return NextResponse.json({ error: 'Pick the date of the adjustment.', code: 'VALIDATION' }, { status: 400 });
+    }
+    if (body.memo != null && typeof body.memo !== 'string') {
+      return NextResponse.json({ error: 'The memo must be text.', code: 'VALIDATION' }, { status: 400 });
     }
     if (body.rates != null && (typeof body.rates !== 'object' || Array.isArray(body.rates))) {
       return NextResponse.json({ error: 'rates must map currency codes to rates.', code: 'VALIDATION' }, { status: 400 });
     }
     const input = {
-      date: new Date(body.date),
+      date,
       rates: body.rates ?? undefined,
       memo: body.memo ?? null,
       updateCurrencyList: body.updateCurrencyList,

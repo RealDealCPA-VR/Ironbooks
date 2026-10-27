@@ -72,7 +72,8 @@ import {
   writeAudit,
 } from './_base';
 import { adjustPoReceivedUnbilled, recomputePoStatus } from './receivingLinks';
-import { getHomeCurrencyCode } from './currencies';
+import { effectiveHomeCurrency } from './multiCurrency';
+import { foreignCode } from './fxLines';
 
 // ---------------------------------------------------------------------------
 // Constants / types
@@ -432,8 +433,8 @@ async function reverseStock(
  */
 async function assertHomeCurrencyVendor(ctx: ServiceContext, vendorCurrency: string | null) {
   if (!vendorCurrency) return;
-  const home = await getHomeCurrencyCode(ctx);
-  if (home && vendorCurrency.toUpperCase() === home) return;
+  // review5 fx: the home code also without a base row (a vendor tagged with it is a home vendor).
+  if (!foreignCode(vendorCurrency, await effectiveHomeCurrency(ctx))) return;
   throw validation(
     `This vendor uses ${vendorCurrency}. Receive their items with Enter Bills (which converts to your home currency) instead of an item receipt.`,
   );

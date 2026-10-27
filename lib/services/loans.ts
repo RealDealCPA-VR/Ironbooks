@@ -39,7 +39,8 @@ import {
 } from './_base';
 import { createExpense, voidExpense } from './expenses';
 import { createBill, voidBill } from './bills';
-import { getHomeCurrencyCode, homeAmounts } from './currencies';
+import { homeAmounts } from './currencies';
+import { effectiveHomeCurrency } from './multiCurrency';
 import { postJournalEntry, voidJournalEntry } from './posting';
 import { currencyRate, exchangeGainLossLine, foreignCode, toHome } from './exchangeRates';
 import { subledgerAccountReason } from '@/lib/registerEntryPlan';
@@ -196,7 +197,11 @@ async function accountOf(ctx: ServiceContext, id: string) {
   return row;
 }
 
-async function validateLoanInput(ctx: ServiceContext, input: LoanInput) {
+async function validateLoanInput(
+  ctx: ServiceContext,
+  input: LoanInput,
+  existing?: { currency: string | null; exchangeRate: string | null },
+) {
   if (!input.name?.trim()) throw validation('Give the loan a name.');
   const amount = Money.of(input.originalAmount);
   if (!amount.greaterThan(0)) throw validation('The loan amount must be greater than zero.');
@@ -238,7 +243,7 @@ async function validateLoanInput(ctx: ServiceContext, input: LoanInput) {
     throw validation('Pick an escrow account for the escrow part of each payment.');
   }
   let lenderCurrency: string | null = null;
-  const home = await getHomeCurrencyCode(ctx);
+  const home = await effectiveHomeCurrency(ctx); // review5 fx: also without a base row
   if (input.lenderVendorId) {
     const [v] = await ctx.db
       .select({ id: vendors.id, currency: vendors.currency })
@@ -257,7 +262,16 @@ async function validateLoanInput(ctx: ServiceContext, input: LoanInput) {
       `The lender uses ${lenderCurrency ?? home ?? 'your home currency'}, so the loan must be in ${lenderCurrency ?? home ?? 'your home currency'} too.`,
     );
   }
-  const fx = currency ? await currencyRate(ctx, currency, input.exchangeRate) : null;
+  // review5 fx: an edit that leaves the rate blank keeps the rate the loan was booked at (the
+  // form's "Blank = list rate" is for a new loan). Taking today's list rate re-booked the loan:
+  // its carrying value in Home Currency Adjustment and the realized gain / loss of every later
+  // payment were then measured against a rate the liability was never posted at.
+  const blankRate = input.exchangeRate == null || String(input.exchangeRate).trim() === '';
+  const keptRate =
+    blankRate && existing?.exchangeRate && currency && foreignCode(existing.currency, home) === currency
+      ? existing.exchangeRate
+      : input.exchangeRate;
+  const fx = currency ? await currencyRate(ctx, currency, keptRate) : null;
   // The payment account's currency is checked when a payment is set up (assertLoanPaymentCurrency).
   return { amount, rate, ppy, escrow, currency, fxRate: fx ? fx.rate.toFixed(8) : null };
 }
@@ -302,7 +316,7 @@ export async function updateLoan(ctx: ServiceContext, id: string, input: LoanInp
     .from(loans)
     .where(and(eq(loans.companyId, ctx.companyId), eq(loans.id, id)));
   if (!existing) throw notFound('Loan');
-  const v = await validateLoanInput(ctx, input);
+  const v = await validateLoanInput(ctx, input, existing);
   return inTransaction(ctx, async (tx) => {
     const [loan] = await tx.db
       .update(loans)
@@ -484,7 +498,7 @@ async function assertLoanPaymentCurrency(
   loanCurrency: string | null,
   refs: { lenderVendorId: string | null; paymentAccountId: string | null },
 ) {
-  const home = await getHomeCurrencyCode(ctx);
+  const home = await effectiveHomeCurrency(ctx); // review5 fx: also without a base row
   const loanLabel = loanCurrency ?? home ?? 'your home currency';
   if (refs.lenderVendorId) {
     const [v] = await ctx.db
@@ -663,7 +677,19 @@ async function setUpLoanPaymentInTx(ctx: ServiceContext, loanId: string, input: 
         accountLines.map((l) => l.amount),
         payFx.rate,
       ).lines[0];
-      const bookedHome = toHome(principal, loan.exchangeRate ?? payFx.rate);
+      const bookedRate = loan.exchangeRate ?? payFx.rate;
+      // review5 fx: the payment that pays the loan off takes off what is left of its home value
+      // (round2(original x rate) - what earlier payments took), so no rounding cents stay on the
+      // liability once nothing is owed (QB clears it on the final payment).
+      const bookedHome = principal.equals(Money.of(loan.balance))
+        ? Money.round2(
+            toHome(loan.originalAmount, bookedRate).minus(
+              loan.payments
+                .filter((p) => p.active)
+                .reduce((s, p) => s.plus(toHome(p.principal, bookedRate)), Money.zero()),
+            ),
+          )
+        : toHome(principal, bookedRate);
       const gain = Money.round2(bookedHome.minus(paidHome)); // > 0: cost less than booked
       if (!gain.isZero()) {
         const fxLine = await exchangeGainLossLine(tx, gain, gain.greaterThan(0) ? 'Realized exchange gain — loan principal' : 'Realized exchange loss — loan principal');

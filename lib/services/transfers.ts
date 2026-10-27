@@ -129,13 +129,33 @@ function parseHomeAmount(v: string | number | null | undefined): Decimal | null 
   return Money.round2(r);
 }
 
-/** Resolve currencies and the home / to amounts of a transfer (see the header). */
-async function resolveTransferFx(ctx: ServiceContext, input: CreateTransferInput, amountStr: string): Promise<TransferFx> {
+/**
+ * Resolve currencies and the home / to amounts of a transfer (see the header). `saved` (edits):
+ * the transfer as booked — with no rate and no home amount typed, a foreign FROM side keeps its
+ * booked home rate (the exact saved home value when the amount is unchanged) instead of today's
+ * list rate, as long as both accounts keep the currencies it was booked in (QB keeps a
+ * transaction's exchange rate when it is edited; review5 fx / banking: Transfer Funds re-sends no
+ * rate, so a memo edit re-posted the transfer at the new list rate and was refused once reconciled).
+ */
+async function resolveTransferFx(
+  ctx: ServiceContext,
+  input: CreateTransferInput,
+  amountStr: string,
+  saved?: { currency: string | null; toCurrency: string | null; exchangeRate: string | null; amount: string; homeAmount: string | null },
+): Promise<TransferFx> {
   const home = await homeCode(ctx);
   const fromCurrency = await currencyOfAccount(ctx, input.fromAccountId, home);
   const toCurrency = await currencyOfAccount(ctx, input.toAccountId, home);
   const amount = Money.of(amountStr);
-  const homeOverride = parseHomeAmount(input.homeAmount);
+  const blank = (v: unknown) => v === undefined || v === null || String(v).trim() === '';
+  const keep =
+    !!saved && !!fromCurrency && foreignCode(saved.currency, home) === fromCurrency &&
+    foreignCode(saved.toCurrency, home) === toCurrency && saved.exchangeRate != null &&
+    blank(input.homeAmount) && (fromCurrency === toCurrency ? blank(input.exchangeRate) : true);
+  const savedHome =
+    keep && saved!.homeAmount != null && Money.eq(saved!.amount, amount) ? saved!.homeAmount : null;
+  const homeOverride = parseHomeAmount(input.homeAmount) ?? (savedHome != null && fromCurrency === toCurrency ? Money.round2(savedHome) : null);
+  const savedRate = keep ? saved!.exchangeRate : null;
   const homeLabel = home ?? 'home currency';
 
   if (!fromCurrency && !toCurrency) {
@@ -146,7 +166,7 @@ async function resolveTransferFx(ctx: ServiceContext, input: CreateTransferInput
   let homeAmt: Decimal;
   if (fromCurrency === toCurrency) {
     // Same foreign currency on both sides.
-    const fx = await currencyRate(ctx, fromCurrency, input.exchangeRate);
+    const fx = await currencyRate(ctx, fromCurrency, blank(input.exchangeRate) ? savedRate : input.exchangeRate);
     toAmount = amount;
     homeAmt = homeOverride ? Money.round2(homeOverride) : toHome(amount, fx.rate);
   } else {
@@ -162,7 +182,7 @@ async function resolveTransferFx(ctx: ServiceContext, input: CreateTransferInput
     if (homeOverride) homeAmt = Money.round2(homeOverride);
     else if (!fromCurrency) homeAmt = amount; // home -> foreign: the home side is the home value
     else if (!toCurrency) homeAmt = toAmount; // foreign -> home: what arrived is the home value
-    else homeAmt = toHome(amount, (await currencyRate(ctx, fromCurrency)).rate);
+    else homeAmt = savedHome != null ? Money.round2(savedHome) : toHome(amount, (await currencyRate(ctx, fromCurrency, savedRate)).rate);
   }
   if (!homeAmt.greaterThan(0)) throw validation('The transfer is too small to convert to your home currency.');
   const rate = fromCurrency ? homeAmt.dividedBy(amount) : Money.of(1);
@@ -270,34 +290,6 @@ export async function createTransfer(ctx: ServiceContext, input: CreateTransferI
 // updateTransfer / voidTransfer (D1)
 // ---------------------------------------------------------------------------
 
-/**
- * p1 fx: an edit that states no rate keeps the transfer's OWN rate (QB keeps a transaction's
- * exchange rate when it is edited). The Transfer Funds form opens with the rate box blank, so a
- * memo-only edit used to re-price a foreign transfer at today's list rate: a new home value, a
- * re-post, and a refusal on a reconciled transfer although nothing was changed. Applies only while
- * both accounts keep their currencies; a stated rate / home amount always wins.
- */
-async function withSavedRate(
-  ctx: ServiceContext,
-  input: CreateTransferInput,
-  existing: typeof transfers.$inferSelect,
-): Promise<CreateTransferInput> {
-  const stated = (v: unknown) => v !== undefined && v !== null && String(v).trim() !== '';
-  if (stated(input.exchangeRate) || stated(input.homeAmount) || !existing.exchangeRate) return input;
-  const home = await homeCode(ctx);
-  const fromCurrency = await currencyOfAccount(ctx, input.fromAccountId, home);
-  const toCurrency = await currencyOfAccount(ctx, input.toAccountId, home);
-  if (fromCurrency !== (existing.currency ?? null) || toCurrency !== (existing.toCurrency ?? null)) return input;
-  // A home-currency side fixes the home value by itself (what left or arrived there).
-  if (!fromCurrency || !toCurrency) return input;
-  // Same amount: exactly the home value it was saved with (re-deriving it from the 8-decimal
-  // rate could land a cent off and re-post).
-  if (existing.homeAmount && Money.eq(input.amount, existing.amount)) return { ...input, homeAmount: existing.homeAmount };
-  if (fromCurrency === toCurrency) return { ...input, exchangeRate: existing.exchangeRate };
-  // Foreign to another foreign currency: the home value came from the FROM currency's rate.
-  return { ...input, homeAmount: toAmountString(toHome(Money.of(input.amount), existing.exchangeRate)) };
-}
-
 export async function updateTransfer(ctx: ServiceContext, id: string, input: CreateTransferInput) {
   const amountStr = validateTransfer(input);
   const [existing] = await ctx.db
@@ -307,7 +299,9 @@ export async function updateTransfer(ctx: ServiceContext, id: string, input: Cre
   if (!existing) throw notFound('Transfer');
   if (existing.voidedAt) throw new ServiceError('CONFLICT', 'This transfer is void and cannot be edited.');
   await assertAccountsOwned(ctx, input, [existing.fromAccountId, existing.toAccountId]);
-  const fx = await resolveTransferFx(ctx, await withSavedRate(ctx, input, existing), amountStr);
+  // An edit that states no rate keeps the transfer's own booked rate while both accounts keep
+  // their currencies (resolveTransferFx `saved`).
+  const fx = await resolveTransferFx(ctx, input, amountStr, existing);
 
   return inTransaction(ctx, async (tx) => {
     const lines = transferLines(input, fx);

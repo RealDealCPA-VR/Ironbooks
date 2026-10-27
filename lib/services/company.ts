@@ -13,7 +13,7 @@ import { requireEffectivePermission } from './access';
 import type { DB } from '@/lib/db';
 import { logTransaction } from './transactionLog';
 import { assertPreferenceAccounts } from './prefAccounts';
-import { assertMultiCurrencyChangeAllowed, resolveMultiCurrency } from './multiCurrency';
+import { assertMultiCurrencyChangeAllowed, assertPreferenceCurrencyChangeAllowed, effectiveHomeCurrency, resolveMultiCurrency } from './multiCurrency';
 import { setBaseCurrency } from './currencies';
 import {
   COMPANY_PREFERENCE_KEYS,
@@ -378,6 +378,9 @@ export async function updateCompany(ctx: ServiceContext, input: UpdateCompanyInp
       'multiCurrencyEnabled' in settingsPatch
         ? await assertMultiCurrencyChangeAllowed(tx, existing.settings as Record<string, unknown>, settingsPatch.multiCurrencyEnabled)
         : null;
+    // review5 fx: with no home currency in the currency list, the Preferences currency is the home
+    // currency - it can't change once foreign-currency data exists.
+    if ('currency' in settingsPatch) await assertPreferenceCurrencyChangeAllowed(tx, settingsPatch.currency);
 
     const [row] = await tx.db
       .update(companies)
@@ -414,6 +417,9 @@ async function ensureHomeCurrency(ctx: ServiceContext, settings: Record<string, 
     .from(currencies)
     .where(and(eq(currencies.companyId, ctx.companyId), eq(currencies.isBase, true)));
   if (base) return;
+  // review5 fx: a list that holds the Preferences / USD default as a foreign currency is in units of a
+  // home currency the file never recorded - it is picked on the Currencies page, not guessed here.
+  if ((await effectiveHomeCurrency(ctx)) === null) return;
   const code = (typeof settings.currency === 'string' && settings.currency.trim() ? settings.currency : 'USD')
     .trim()
     .toUpperCase()

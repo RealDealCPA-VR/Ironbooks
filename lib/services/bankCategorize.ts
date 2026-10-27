@@ -13,7 +13,7 @@
  * IMPORTANT: GL writes happen ONLY through `postJournalEntry` (posting.ts).
  * All money arithmetic uses '@/lib/money'.
  */
-import { and, desc, eq, gte, isNotNull, lte, ne, or, sql } from 'drizzle-orm';
+import { and, desc, eq, gte, inArray, isNotNull, lte, ne, or, sql } from 'drizzle-orm';
 import { Money, allocate, toAmountString } from '@/lib/money';
 import {
   accounts,
@@ -39,7 +39,7 @@ import { activeBankRules, noteRuleApplied } from './bankRules';
 import { postJournalEntry, voidJournalEntry } from './posting';
 import { applyRulesToAccount } from './rules';
 import { accountSigned, foreignCurrencyOfAccount } from './fxLedger';
-import { currencyRate, toHome } from './exchangeRates';
+import { currencyRate, homeCode, toHome } from './exchangeRates';
 import { subledgerAccountReason } from '@/lib/registerEntryPlan';
 import { isUndepositedFunds } from '@/lib/accountTypes';
 
@@ -268,15 +268,48 @@ export async function categorize(ctx: ServiceContext, input: CategorizeInput) {
       );
     }
   }
-  const offsets: { accountId: string; classId: string | null; amount: string }[] = splits
+  // review5 fx: the feed amount split the same way in the account's currency, for offsets on an
+  // account in that same currency (a CAD bank line paying the CAD card) — converting the home share
+  // back at the rate can be a cent off.
+  const foreignShares = fx ? (splits ? allocate(absAmt, splits.map((sp) => sp.percent)) : [Money.of(absAmt)]) : [];
+  const offsets: { accountId: string; classId: string | null; amount: string; foreign?: string }[] = splits
     ? allocate(homeAmt, splits.map((sp) => sp.percent))
         .map((a, i) => ({
           accountId: splits[i].accountId,
           classId: splits[i].classId ?? input.classId ?? null,
           amount: toAmountString(a),
+          ...(fx ? { foreign: toAmountString(foreignShares[i]) } : {}),
         }))
         .filter((o) => Money.gt(o.amount, 0))
-    : [{ accountId: input.accountId, classId: input.classId ?? null, amount: homeAmt }];
+    : [{ accountId: input.accountId, classId: input.classId ?? null, amount: homeAmt, ...(fx ? { foreign: absAmt } : {}) }];
+  // review5 fx: an offset on a bank / card account in ANOTHER currency than the feed (a home
+  // Checking line "to the Euro bank", a EUR line paying a GBP card) has no amount in that account's
+  // currency: the ledger would invent one at the list rate. QB needs Transfer Funds (or a check /
+  // deposit) with the exchange rate for that, so it is refused here.
+  const offsetAccts = await ctx.db
+    .select({ id: accounts.id, name: accounts.name, currency: accounts.currency })
+    .from(accounts)
+    .where(and(eq(accounts.companyId, ctx.companyId), inArray(accounts.id, [...new Set(offsets.map((o) => o.accountId))])));
+  {
+    const home = ((await homeCode(ctx)) ?? '').trim().toUpperCase();
+    const norm = (c: string | null) => {
+      const v = (c ?? '').trim().toUpperCase();
+      return v === '' || v === home ? null : v;
+    };
+    const other = offsetAccts.find((a) => norm(a.currency) && norm(a.currency) !== (fx?.currency ?? null));
+    if (other) {
+      throw validation(
+        `"${other.name}" is a ${norm(other.currency)} account and this bank line is in ${fx?.currency ?? (home || 'your home currency')}. Use Transfer Funds (or Write Checks / Make Deposits) to enter the exchange rate.`,
+      );
+    }
+  }
+  if (fx) {
+    const sameCur = new Set(
+      offsetAccts.filter((a) => (a.currency ?? '').trim().toUpperCase() === fx.currency).map((a) => a.id),
+    );
+    for (const o of offsets) if (!sameCur.has(o.accountId)) delete o.foreign;
+  }
+  const offsetFx = (o: { foreign?: string }) => (o.foreign != null ? { foreignAmount: o.foreign } : {});
   const mainAccountId = splits
     ? [...offsets].sort((a, b) => (Money.gt(b.amount, a.amount) ? 1 : Money.gt(a.amount, b.amount) ? -1 : 0))[0].accountId
     : input.accountId;
@@ -289,10 +322,10 @@ export async function categorize(ctx: ServiceContext, input: CategorizeInput) {
     amt.greaterThan(0)
       ? [
           { accountId: bankGlAccountId, debit: homeAmt, memo, ...bankFx },
-          ...offsets.map((o) => ({ accountId: o.accountId, credit: o.amount, memo, classId: o.classId })),
+          ...offsets.map((o) => ({ accountId: o.accountId, credit: o.amount, memo, classId: o.classId, ...offsetFx(o) })),
         ]
       : [
-          ...offsets.map((o) => ({ accountId: o.accountId, debit: o.amount, memo, classId: o.classId })),
+          ...offsets.map((o) => ({ accountId: o.accountId, debit: o.amount, memo, classId: o.classId, ...offsetFx(o) })),
           { accountId: bankGlAccountId, credit: homeAmt, memo, ...bankFx },
         ];
 

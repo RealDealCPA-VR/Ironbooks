@@ -22,6 +22,7 @@ import { createDeposit } from './deposits';
 import { createTransfer } from './transfers';
 import { createManualEntry, resolveEntityNames } from './journal';
 import type { JournalEntityType } from './posting';
+import { foreignCode, homeCode } from './fxLines';
 
 export interface RegisterEntryInput {
   date: Date;
@@ -108,8 +109,12 @@ export async function enterRegisterTransaction(
   }
   if (!Money.isPositive(amountStr)) throw validation('The amount must be more than zero.');
 
+  const home = await homeCode(ctx);
+  // Currencies as the plan compares them: the home currency (any case) is no currency.
   const register = await loadAccount(ctx, registerAccountId, 'Account');
+  register.currency = foreignCode(register.currency, home);
   const other = await loadAccount(ctx, input.otherAccountId, 'Account');
+  other.currency = foreignCode(other.currency, home);
   const plan = planRegisterEntry(register, other, input.side);
   if (!plan.ok) throw validation(plan.message);
   requirePermission(ctx, KIND_AREA[plan.kind], 'create');
