@@ -15,7 +15,7 @@
  * books integrity and is reversible; true file deletion is deferred to the per-company
  * data-directory work in the desktop shell (deleting the PGlite dir removes everything at once).
  */
-import { and, eq } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import type { DB } from '@/lib/db';
 import { companies, userCompanies } from '@/lib/db/schema';
 import { ServiceError, notFound, validation, writeAudit } from '@/lib/services/_base';
@@ -124,14 +124,15 @@ export async function archiveCompany(
     );
   }
 
-  const settings: CompanySettings = {
-    ...((company.settings ?? {}) as CompanySettings),
-    archived: true,
-    archivedAt: new Date().toISOString(),
-  };
+  // Only the archive keys change, in one statement: a settings change another request makes at the
+  // same moment (closing date, file password, …) is never written back over.
+  const archivedAt = new Date().toISOString();
   const [updated] = await db
     .update(companies)
-    .set({ settings, updatedAt: new Date() })
+    .set({
+      settings: sql`coalesce(${companies.settings}, '{}'::jsonb) || jsonb_build_object('archived', true, 'archivedAt', ${archivedAt}::text)`,
+      updatedAt: new Date(),
+    })
     .where(eq(companies.id, companyId))
     .returning();
 
@@ -142,7 +143,7 @@ export async function archiveCompany(
       entityType: 'company',
       entityId: companyId,
       oldValues: { archived: false },
-      newValues: { archived: true, archivedAt: settings.archivedAt },
+      newValues: { archived: true, archivedAt },
     },
   );
   return updated;
@@ -153,14 +154,12 @@ export async function archiveCompany(
  * page can order files by recency. Best-effort merge; never throws on a missing row.
  */
 export async function stampLastOpened(db: DB, companyId: string): Promise<void> {
-  const [company] = await db
-    .select({ settings: companies.settings })
-    .from(companies)
+  // One statement that touches only lastOpenedAt: reading the settings and writing them all back
+  // would undo a settings change another request made in between (multi-user mode).
+  await db
+    .update(companies)
+    .set({
+      settings: sql`coalesce(${companies.settings}, '{}'::jsonb) || jsonb_build_object('lastOpenedAt', ${new Date().toISOString()}::text)`,
+    })
     .where(eq(companies.id, companyId));
-  if (!company) return;
-  const settings: CompanySettings = {
-    ...((company.settings ?? {}) as CompanySettings),
-    lastOpenedAt: new Date().toISOString(),
-  };
-  await db.update(companies).set({ settings }).where(eq(companies.id, companyId));
 }
