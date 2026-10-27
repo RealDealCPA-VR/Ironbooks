@@ -19,7 +19,7 @@
  * the next suggestion). A 10-minute overlap window plus a "seen" key set guards against rows
  * whose created_at predates the watermark because their transaction committed late.
  */
-import { and, desc, eq, gt, inArray, isNull, like, ne, notInArray } from 'drizzle-orm';
+import { and, desc, eq, gt, isNull, like, ne, sql } from 'drizzle-orm';
 import { z } from 'zod';
 import {
   accounts,
@@ -33,7 +33,6 @@ import {
   expenseLines,
   expenses,
   journalEntries,
-  journalEntryLines,
   vendors,
 } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
@@ -149,18 +148,17 @@ async function collectExamples(ctx: ServiceContext, since: Date | null): Promise
   }
 
   // Bank-feed lines the user categorized (excluding AI auto-applied ones).
-  const autoRows = await ctx.db
-    .select({ entryId: aiAutoApplied.journalEntryId })
-    .from(aiAutoApplied)
-    .where(eq(aiAutoApplied.companyId, ctx.companyId));
-  const autoIds = autoRows.map((r) => r.entryId);
+  // Joined in SQL, with no per-entry bound parameters: a long bank history (tens of thousands of
+  // categorized lines) would otherwise exceed the database's 65,535-parameter limit — and a
+  // per-row search of the lines was quadratic.
   const bankConds = [
     eq(journalEntries.companyId, ctx.companyId),
     eq(journalEntries.status, 'posted'),
     like(journalEntries.sourceRef, 'bank_transaction:%'),
+    // Lines the AI auto-applied are not learned from (the model never trains on its own output).
+    sql`NOT EXISTS (SELECT 1 FROM ai_auto_applied aa WHERE aa.company_id = ${ctx.companyId} AND aa.journal_entry_id = ${journalEntries.id})`,
   ];
   if (since) bankConds.push(gt(journalEntries.createdAt, since));
-  if (autoIds.length) bankConds.push(notInArray(journalEntries.id, autoIds));
   const bankRows = await ctx.db
     .select({
       entryId: journalEntries.id,
@@ -168,30 +166,29 @@ async function collectExamples(ctx: ServiceContext, since: Date | null): Promise
       payee: bankTransactions.payee,
       description: bankTransactions.description,
       amount: bankTransactions.amount,
-      bankGl: bankAccounts.accountId,
+      // The entry's first line that is not the bank account (its category).
+      offsetAccountId: sql<string | null>`(
+        SELECT jel.account_id FROM journal_entry_lines jel
+        WHERE jel.journal_entry_id = ${journalEntries.id} AND jel.account_id <> ${bankAccounts.accountId}
+        ORDER BY jel.created_at, jel.id
+        LIMIT 1
+      )`,
     })
     .from(journalEntries)
     .innerJoin(bankTransactions, eq(bankTransactions.matchedEntryId, journalEntries.id))
     .innerJoin(bankAccounts, eq(bankTransactions.bankAccountId, bankAccounts.id))
     .where(and(...bankConds));
-  if (bankRows.length) {
-    const lines = await ctx.db
-      .select({ entryId: journalEntryLines.journalEntryId, accountId: journalEntryLines.accountId, classId: journalEntryLines.classId })
-      .from(journalEntryLines)
-      .where(inArray(journalEntryLines.journalEntryId, bankRows.map((r) => r.entryId)));
-    for (const r of bankRows) {
-      const offset = lines.find((l) => l.entryId === r.entryId && l.accountId !== r.bankGl);
-      if (!offset) continue;
-      out.push({
-        key: `bank_entry:${r.entryId}`,
-        createdAt: r.createdAt,
-        payee: r.payee,
-        memo: r.description,
-        amount: r.amount,
-        direction: Money.isNegative(r.amount) ? 'out' : 'in',
-        labels: { account: offset.accountId },
-      });
-    }
+  for (const r of bankRows) {
+    if (!r.offsetAccountId) continue;
+    out.push({
+      key: `bank_entry:${r.entryId}`,
+      createdAt: r.createdAt,
+      payee: r.payee,
+      memo: r.description,
+      amount: r.amount,
+      direction: Money.isNegative(r.amount) ? 'out' : 'in',
+      labels: { account: r.offsetAccountId },
+    });
   }
 
   out.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());

@@ -10,6 +10,8 @@ import { userPreferences } from '@/lib/db/schema';
 import {
   MY_PREFERENCE_KEYS,
   resolveMyPreferences,
+  todayInTimeZone,
+  zonedDayBound,
   type CompanyPreferences,
   type MyPreferences,
 } from '@/lib/preferences';
@@ -30,6 +32,52 @@ export async function getMyPreferences(ctx: ServiceContext): Promise<MyPreferenc
     .from(userPreferences)
     .where(and(eq(userPreferences.companyId, ctx.companyId), eq(userPreferences.userId, ctx.userId)));
   return resolveMyPreferences(row?.prefs ?? {});
+}
+
+/**
+ * Today's calendar day for this company ('YYYY-MM-DD'), in its time zone (Preferences > Company).
+ * `new Date().toISOString().slice(0, 10)` is the UTC day: in the evening west of UTC it is already
+ * tomorrow, so "today", "this month" and default dates came out a day (or a month) ahead.
+ */
+export async function companyTodayIso(ctx: ServiceContext, now: Date = new Date()): Promise<string> {
+  const prefs = await getPreferences(ctx);
+  return todayInTimeZone(prefs.timezone, now);
+}
+
+/**
+ * companyTodayIso as a Date at noon UTC of that day — for code that reads calendar parts with
+ * getUTC* (lib/commands/dates.ts) or slices toISOString(): both then see the company's day.
+ */
+export async function companyToday(ctx: ServiceContext, now: Date = new Date()): Promise<Date> {
+  return new Date(`${await companyTodayIso(ctx, now)}T12:00:00.000Z`);
+}
+
+/**
+ * A report filter on WHEN something happened (audit trail timestamps) given as a calendar day
+ * 'YYYY-MM-DD': the instant that day starts (or, with `end`, its last millisecond) in the company's
+ * time zone. A Date passes through unchanged; anything else is a VALIDATION error.
+ */
+export async function companyDayBound(
+  ctx: ServiceContext,
+  value: Date | string | null | undefined,
+  name: string,
+  end = false,
+): Promise<Date | undefined> {
+  if (value === undefined || value === null || value === '') return undefined;
+  if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) throw validation(`Invalid ${name} date.`);
+    return value;
+  }
+  const v = value.trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(v)) {
+    const prefs = await getPreferences(ctx);
+    const d = zonedDayBound(v, prefs.timezone, end);
+    if (!d) throw validation(`Invalid ${name} date.`);
+    return d;
+  }
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) throw validation(`Invalid ${name} date.`);
+  return d;
 }
 
 export async function getAllPreferences(ctx: ServiceContext): Promise<AllPreferences> {

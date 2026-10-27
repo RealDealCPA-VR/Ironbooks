@@ -21,7 +21,7 @@
  *    (paychecks, item receipts, expense reports, payments, bill payments, refunds, bounced checks,
  *    cost-of-goods entries).
  */
-import { and, eq, inArray } from 'drizzle-orm';
+import { and, eq, inArray, sql } from 'drizzle-orm';
 import type Decimal from 'decimal.js';
 import {
   billLines,
@@ -463,5 +463,34 @@ export async function applyDocumentSync(
     }
     n += 1;
   }
+  if (n > 0) await touchDocumentVersion(tx, plan.doc.kind, plan.doc.postedEntryId);
   return n;
+}
+
+const HEADER_TABLES = {
+  invoice: invoices,
+  salesreceipt: salesReceipts,
+  credit_memo: creditMemos,
+  bill: bills,
+  expense: expenses,
+  vendor_credit: vendorCredits,
+  deposit: deposits,
+} as const;
+
+/**
+ * Record locking: the document's rows changed under it, so its version (updated_at) must move —
+ * a copy someone opened before the reclassify is then refused as stale ("This record was changed
+ * by …", lib/services/concurrency.ts) instead of re-posting the old account when it is saved.
+ * Only the line tables changed, and the version triggers sit on the header tables, so it is
+ * bumped here explicitly (strictly later than the current version, like the triggers do).
+ */
+async function touchDocumentVersion(tx: ServiceContext, kind: DocKind, postedEntryId: string | null): Promise<void> {
+  if (!postedEntryId) return;
+  const t = HEADER_TABLES[kind] as unknown as typeof bills;
+  await tx.db
+    .update(t)
+    .set({
+      updatedAt: sql`GREATEST(date_trunc('milliseconds', clock_timestamp() AT TIME ZONE 'UTC'), ${t.updatedAt} + interval '1 millisecond')`,
+    })
+    .where(and(eq(t.companyId, tx.companyId), eq(t.postedEntryId, postedEntryId)));
 }

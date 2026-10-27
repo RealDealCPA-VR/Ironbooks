@@ -12,6 +12,8 @@ import { type AccountOpt, BackToCenter, accountLabel, money, today, useList } fr
 interface Candidate {
   invoiceId: string;
   invoiceNumber: number;
+  /** The number printed on the invoice. */
+  number: string;
   customerName: string;
   date: string;
   dueDate: string | null;
@@ -137,7 +139,7 @@ export default function WriteOffPage() {
                       <Td>
                         <input
                           type="checkbox"
-                          aria-label={`Select invoice ${r.invoiceNumber}`}
+                          aria-label={`Select invoice ${r.number}`}
                           disabled={r.foreignCurrency}
                           checked={selected.has(r.invoiceId)}
                           onChange={() => {
@@ -149,7 +151,7 @@ export default function WriteOffPage() {
                         />
                       </Td>
                       <Td>
-                        #{r.invoiceNumber} {r.foreignCurrency && <Badge tone="warning">Foreign currency</Badge>}
+                        #{r.number} {r.foreignCurrency && <Badge tone="warning">Foreign currency</Badge>}
                       </Td>
                       <Td>{r.customerName}</Td>
                       <Td>{r.date.slice(0, 10)}</Td>

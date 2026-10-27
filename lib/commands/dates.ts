@@ -57,6 +57,14 @@ function addDays(s: string, n: number): string {
   const [y, m, d] = s.split('-').map(Number);
   return ymd(y, m - 1, d + n);
 }
+/**
+ * Day `d` of month `m` (0-based, may be out of 0-11: the year rolls) clamped to that month's last
+ * day: Feb 31 is Feb 28/29, never Mar 3.
+ */
+function sameDayClamped(y: number, m: number, d: number): string {
+  const last = new Date(Date.UTC(y, m + 1, 0)).getUTCDate();
+  return ymd(y, m, Math.min(d, last));
+}
 function validYmd(y: number, m: number, d: number): boolean {
   if (m < 0 || m > 11 || d < 1 || d > 31) return false;
   const dt = new Date(Date.UTC(y, m, d));
@@ -269,8 +277,8 @@ export function parseDateRange(text: string, today: Date, opts: DateRangeOptions
     let from: string;
     if (unit === 'day') from = addDays(now, -(n - 1));
     else if (unit === 'week') from = addDays(now, -(n * 7 - 1));
-    else if (unit === 'month') from = addDays(ymd(t.y, t.m - n, t.d), 1);
-    else from = addDays(ymd(t.y - n, t.m, t.d), 1);
+    else if (unit === 'month') from = addDays(sameDayClamped(t.y, t.m - n, t.d), 1);
+    else from = addDays(sameDayClamped(t.y - n, t.m, t.d), 1);
     return { range: { from, to: now, label: `last ${n} ${unit}${n === 1 ? '' : 's'}` }, matched: m[0] };
   }
 

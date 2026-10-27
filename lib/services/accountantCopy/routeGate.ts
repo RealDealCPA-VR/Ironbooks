@@ -40,6 +40,9 @@ export const ACCOUNTANT_COPY_ALLOWED_API = [
   '/api/sales-orders',
   '/api/purchase-orders',
   '/api/reconciliations',
+  // Typing into an account register's blank row saves a check, deposit, transfer, credit card
+  // charge / credit or General Journal entry through those forms' own services (all carried).
+  '/api/registers',
   // Names and items (adding them, and editing their everyday fields — guard.ts refuses the rest).
   '/api/customers',
   '/api/vendors',
@@ -75,6 +78,8 @@ export const ACCOUNTANT_COPY_ALLOWED_API = [
   // Ctrl+K command bar: a read-only parse (POST only to carry the typed text); forms it opens
   // save through their own routes, which this gate checks as usual.
   '/api/command-bar',
+  // The Calendar's to-dos are the same To Do list as /api/todos (an alias route).
+  '/api/calendar/todos',
 ];
 
 /** Paths allowed only exactly (not their sub-paths). */
@@ -82,6 +87,12 @@ export const ACCOUNTANT_COPY_ALLOWED_EXACT = [
   // Adjust Quantity on Hand (action 'adjust' / 'cogs'): carried as an inventory adjustment. Physical
   // counts, value adjustments and batch counts (its sub-paths) are not.
   '/api/inventory',
+  // Housekeeping / read-only POSTs that never change the books:
+  '/api/company-file/save', // File > Save Company File (writes what is already in the books)
+  '/api/pricing/quote', // the price lookup sales forms make while lines are typed
+  '/api/form-templates/preview', // live preview of a template on sample data
+  '/api/single-user', // switch to / from single-user mode (a session mode)
+  '/api/ai/assistant', // questions answered with read-only report tools (proposals stay refused)
 ];
 
 /**

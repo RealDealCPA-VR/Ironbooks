@@ -105,8 +105,12 @@ describe('review5: assistant tools need the report area of their data', () => {
     await expect(runTool(banking, 'ar_aging', {})).rejects.toMatchObject({ code: 'FORBIDDEN' });
     await expect(runTool(banking, 'ap_aging', {})).rejects.toMatchObject({ code: 'FORBIDDEN' });
     await expect(runTool(banking, 'profit_and_loss', {})).resolves.toBeTruthy();
-    // No model configured: the offline answer runs the same tools.
-    await expect(ask(banking, [], 'Who owes us money?')).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    // No model configured: the offline answer runs the same tools. It says the right is missing
+    // (accountant review 5: a plain answer, not a failed request) and carries no aging data.
+    const denied = await ask(banking, [], 'Who owes us money?');
+    expect(denied.answer).toMatch(/permission to view Reports — Customers & Sales/);
+    expect(denied.answer).not.toMatch(/Customers owe/);
+    expect(denied.toolCalls).toEqual([]);
     const owner = { db, companyId, userId, access: fullAccess(), role: 'owner' as const };
     expect((await ask(owner, [], 'Who owes us money?')).answer).toMatch(/Customers owe/);
   });

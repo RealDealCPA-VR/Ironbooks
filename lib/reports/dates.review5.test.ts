@@ -30,21 +30,22 @@ describe('lotExpired', () => {
  * Voided/Deleted Transactions and the Closing Date Exception Report filter and show WHEN a change
  * was made (a real timestamp). The pages used UTC-day bounds and printed the UTC clock, so a
  * transaction voided at 9 pm on Oct 26 in California showed as "2026-10-27 04:00" and fell
- * outside a report run for Oct 26.
+ * outside a report run for Oct 26. The pages now pass the typed days to the report service, which
+ * reads them in the company's time zone, and show each change on that zone's clock.
  */
 describe('audit timestamps on report pages', () => {
-  it('a picked day covers that local calendar day', async () => {
-    const { localDayRange } = await import('./dates');
-    const prev = process.env.TZ;
-    process.env.TZ = 'America/Los_Angeles';
-    try {
-      const r = localDayRange('2026-10-26', '2026-10-26');
-      expect(r.from?.toISOString()).toBe('2026-10-26T07:00:00.000Z');
-      expect(r.to?.toISOString()).toBe('2026-10-27T06:59:59.999Z');
-      expect(localDayRange(undefined, 'nope')).toEqual({ from: undefined, to: undefined });
-    } finally {
-      process.env.TZ = prev;
-    }
+  it('a picked day covers that calendar day in the company time zone', async () => {
+    const { zonedDayBound } = await import('@/lib/preferences');
+    expect(zonedDayBound('2026-10-26', 'America/Los_Angeles')?.toISOString()).toBe('2026-10-26T07:00:00.000Z');
+    expect(zonedDayBound('2026-10-26', 'America/Los_Angeles', true)?.toISOString()).toBe('2026-10-27T06:59:59.999Z');
+    expect(zonedDayBound('nope', 'America/Los_Angeles')).toBeUndefined();
+  });
+
+  it('shows the change on the company clock when the page passes its time zone', async () => {
+    const { localDateTime } = await import('./dates');
+    expect(localDateTime('2026-10-27T04:05:00.000Z', 'America/Los_Angeles')).toBe('2026-10-26 21:05');
+    expect(localDateTime('2026-10-27T04:05:00.000Z', 'America/New_York')).toBe('2026-10-27 00:05');
+    expect(localDateTime(null, 'America/New_York')).toBe('');
   });
 
   it('shows the local date and time of the change', async () => {

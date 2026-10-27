@@ -46,6 +46,7 @@ import { applyPayment } from '../payments';
 import { applyToInvoice } from '../creditMemos';
 import { applyToBill } from '../vendorCredits';
 import { journalOpenItems, resolveEntityNames } from '../journal';
+import { requirePermission } from '../access';
 
 export const REVIEW_TASKS = [
   { key: 'unapplied_customer_credits', group: 'Customers', title: 'Fix unapplied customer payments and credits' },
@@ -361,7 +362,26 @@ async function compareBalances(ctx: ServiceContext): Promise<{ issues: ReviewIss
       fix: { kind: 'link', href: `/registers/${id}?to=${snap.asOf}`, label: 'Open register' },
     });
   }
-  // The transactions behind the change: dated in the reviewed period, entered or voided later.
+  // The transactions behind the change: dated in the reviewed period, entered, voided or changed in
+  // place later. The only in-place change of posted lines is Reclassify Transactions, and it is
+  // found by its audit row (an account moved on at least one line). The entry's updated_at is no
+  // guide: printing a check, a memo / number edit or a class-only reclassify moves it too, and
+  // none of them changes an account balance.
+  const reclassifiedAfter = sql`(
+    SELECT a.entity_id FROM audit_logs a
+    WHERE a.company_id = ${ctx.companyId}
+      AND a.entity_type = 'journal_entry'
+      AND a.action = 'update'
+      AND a.created_at > ${snap.createdAt}
+      AND jsonb_typeof(a.new_values -> 'reclassify') = 'array'
+      AND EXISTS (
+        SELECT 1
+        FROM jsonb_array_elements(a.new_values -> 'reclassify') AS n(v)
+        JOIN jsonb_array_elements(COALESCE(a.old_values -> 'reclassify', '[]'::jsonb)) AS o(v)
+          ON o.v ->> 'lineId' = n.v ->> 'lineId'
+        WHERE (n.v ->> 'accountId') IS DISTINCT FROM (o.v ->> 'accountId')
+      )
+  )`;
   const late = await ctx.db
     .select({
       id: journalEntries.id,
@@ -379,19 +399,23 @@ async function compareBalances(ctx: ServiceContext): Promise<{ issues: ReviewIss
       and(
         eq(journalEntries.companyId, ctx.companyId),
         lte(journalEntries.date, endOfDay(snap.asOf)),
-        sql`(${journalEntries.createdAt} > ${snap.createdAt} OR ${journalEntries.voidedAt} > ${snap.createdAt})`,
+        sql`(${journalEntries.createdAt} > ${snap.createdAt} OR ${journalEntries.voidedAt} > ${snap.createdAt} OR (${journalEntries.status} = 'posted' AND ${journalEntries.id} IN ${reclassifiedAfter}))`,
         sql`${journalEntries.status} IN ('posted', 'void')`,
       ),
     )
     .orderBy(asc(journalEntries.date));
   const prior: ReviewIssue[] = late
     .filter((e) => !(e.status === 'void' && e.createdAt > snap.createdAt)) // entered and voided after: no net effect
-    .map((e) => ({
-      id: `je:${e.id}`,
-      title: `Entry #${e.n} dated ${e.date.toISOString().slice(0, 10)} was ${e.voidedAt && e.voidedAt > snap.createdAt ? 'voided' : 'entered'} after the last review`,
-      detail: `${e.description}${e.user ? ` — by ${e.user}` : ''}. It changes balances you already reviewed.`,
-      fix: { kind: 'link' as const, href: `/journal?focus=${e.id}`, label: 'Open entry' },
-    }));
+    .map((e) => {
+      const what =
+        e.voidedAt && e.voidedAt > snap.createdAt ? 'voided' : e.createdAt > snap.createdAt ? 'entered' : 'changed';
+      return {
+        id: `je:${e.id}`,
+        title: `Entry #${e.n} dated ${e.date.toISOString().slice(0, 10)} was ${what} after the last review`,
+        detail: `${e.description}${e.user ? ` — by ${e.user}` : ''}. It changes balances you already reviewed.`,
+        fix: { kind: 'link' as const, href: `/journal?focus=${e.id}`, label: 'Open entry' },
+      };
+    });
   return { issues, prior };
 }
 
@@ -477,6 +501,9 @@ export async function autoApplyCustomerCredit(
   ctx: ServiceContext,
   input: { refType: 'payment' | 'credit_memo'; refId: string; date?: Date | null },
 ): Promise<{ applied: string; invoices: number }> {
+  // The route only guarantees Accounting; applying a payment / credit memo is a Customers change
+  // (Receive Payments needs Customers: modify), so this fix is never a side door around it.
+  requirePermission(ctx, 'customers', 'modify');
   let customerId: string;
   let available: ReturnType<typeof Money.zero>;
   if (input.refType === 'payment') {
@@ -526,6 +553,8 @@ export async function autoApplyCustomerCredit(
 
 /** Apply an unapplied bill credit to the vendor's oldest open bills. */
 export async function autoApplyVendorCredit(ctx: ServiceContext, input: { refId: string }) {
+  // Applying a bill credit is a Vendors change (the bill credit's own Apply needs Vendors: modify).
+  requirePermission(ctx, 'vendors', 'modify');
   const [c] = await ctx.db
     .select()
     .from(vendorCredits)

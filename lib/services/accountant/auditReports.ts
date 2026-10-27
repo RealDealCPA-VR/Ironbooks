@@ -9,11 +9,15 @@
  *    the audit trail, who did it and when, with the document number/date/amount and (detail) the
  *    original values.
  */
-import { and, asc, desc, eq, gt, gte, inArray, lte, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, gte, inArray, lt, lte, or, sql } from 'drizzle-orm';
 import { auditLogs, companies, journalEntries, journalEntryLines, users } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import type { ServiceContext } from '../_base';
 import { maskForContext } from '../access';
+import { companyDayBound } from '../preferences';
+
+/** A 'when it happened' filter: a calendar day is read in the company's time zone (Preferences). */
+export type HappenedBound = Date | string | null | undefined;
 
 // ---------------------------------------------------------------------------
 // J11 — Closing Date Exception report
@@ -35,8 +39,12 @@ export interface ClosingDateExceptionRow {
 
 export async function closingDateExceptionReport(
   ctx: ServiceContext,
-  range: { from?: Date; to?: Date } = {},
+  rangeIn: { from?: HappenedBound; to?: HappenedBound } = {},
 ): Promise<{ closingDate: string | null; rows: ClosingDateExceptionRow[] }> {
+  const range = {
+    from: await companyDayBound(ctx, rangeIn.from, 'from'),
+    to: await companyDayBound(ctx, rangeIn.to, 'to', true),
+  };
   const [company] = await ctx.db
     .select({ settings: companies.settings })
     .from(companies)
@@ -73,19 +81,27 @@ export async function closingDateExceptionReport(
     };
   });
 
-  // Entries dated on/before the CURRENT closing date but created after it was set.
+  // Entries dated on/before the CURRENT closing date that were entered while the books were already
+  // closed on their date. Each entry is checked against the closing date IN EFFECT when it was
+  // entered (the closing-date history from the audit trail), not against one start time:
+  //  - an entry made while the period was open again (closing date moved back or cleared, then set
+  //    again) is not an exception;
+  //  - one imported while January was closed stays one after February is closed and reopened;
+  //  - a save that kept the same date (a password change) changes nothing.
   if (cd) {
     const setLogs = await ctx.db
       .select({ createdAt: auditLogs.createdAt, newValues: auditLogs.newValues })
       .from(auditLogs)
       .where(and(eq(auditLogs.companyId, ctx.companyId), eq(auditLogs.entityType, 'company')))
       .orderBy(asc(auditLogs.createdAt));
-    const setAt = setLogs
-      .filter((s) => ((s.newValues ?? {}) as Record<string, unknown>).closingDate === cd)
-      .map((s) => s.createdAt)[0];
-    if (setAt) {
-      const seen = new Set(rows.map((r) => r.entryId));
-      const late = await ctx.db
+    const periods = closedPeriods(setLogs);
+    const seen = new Set(rows.map((r) => r.entryId));
+    const late = new Map<string, { e: LateEntry; closedThrough: string }>();
+    // A handful of closing-date changes in practice; chunked so a long history never builds one
+    // enormous statement.
+    for (let i = 0; i < periods.length; i += 200) {
+      const chunk = periods.slice(i, i + 200);
+      const found = await ctx.db
         .select({
           id: journalEntries.id,
           entryNumber: journalEntries.entryNumber,
@@ -100,44 +116,112 @@ export async function closingDateExceptionReport(
           and(
             eq(journalEntries.companyId, ctx.companyId),
             sql`${journalEntries.status} IN ('posted', 'void')`,
-            lte(journalEntries.date, new Date(`${cd}T23:59:59.999Z`)),
-            gt(journalEntries.createdAt, setAt),
+            range.from ? gte(journalEntries.createdAt, range.from) : undefined,
+            range.to ? lte(journalEntries.createdAt, range.to) : undefined,
+            or(
+              ...chunk.map((p) =>
+                and(
+                  gte(journalEntries.createdAt, p.from),
+                  p.to ? lt(journalEntries.createdAt, p.to) : undefined,
+                  lte(journalEntries.date, new Date(`${p.closingDate < cd ? p.closingDate : cd}T23:59:59.999Z`)),
+                ),
+              ),
+            ),
           ),
         );
-      const lateAmounts = await entryAmounts(ctx, late.map((l) => l.id));
-      for (const e of late) {
-        if (seen.has(e.id)) continue;
-        if (range.from && e.createdAt < range.from) continue;
-        if (range.to && e.createdAt > range.to) continue;
-        rows.push({
-          auditLogId: null,
-          entryId: e.id,
-          entryNumber: e.entryNumber,
-          operation: 'post',
-          transactionDate: e.date.toISOString().slice(0, 10),
-          closingDate: cd,
-          description: e.description,
-          amount: lateAmounts.get(e.id) ?? null,
-          user: e.user ?? null,
-          at: e.createdAt.toISOString(),
-          source: 'entered_after_close',
-        });
+      for (const e of found) {
+        if (seen.has(e.id) || late.has(e.id)) continue;
+        const p = periodAt(periods, e.createdAt);
+        if (p) late.set(e.id, { e, closedThrough: p.closingDate });
       }
+    }
+    const lateAmounts = await entryAmounts(ctx, [...late.keys()]);
+    for (const { e, closedThrough } of late.values()) {
+      rows.push({
+        auditLogId: null,
+        entryId: e.id,
+        entryNumber: e.entryNumber,
+        operation: 'post',
+        transactionDate: e.date.toISOString().slice(0, 10),
+        closingDate: closedThrough,
+        description: e.description,
+        amount: lateAmounts.get(e.id) ?? null,
+        user: e.user ?? null,
+        at: e.createdAt.toISOString(),
+        source: 'entered_after_close',
+      });
     }
   }
   rows.sort((a, b) => b.at.localeCompare(a.at));
   return { closingDate: cd, rows };
 }
 
+interface LateEntry {
+  id: string;
+  entryNumber: number;
+  date: Date;
+  description: string;
+  createdAt: Date;
+  user: string | null;
+}
+
+interface ClosedPeriod {
+  /** When this closing date took effect. */
+  from: Date;
+  /** When it was moved or cleared (null: still in effect). */
+  to: Date | null;
+  closingDate: string;
+}
+
+/**
+ * The closing-date history, oldest first: each span of time during which the books were closed
+ * through one date. Built from the company audit rows that carry a closing date (Set Closing Date
+ * writes { closingDate } — null when cleared); a save that kept the date extends the span.
+ */
+function closedPeriods(logs: { createdAt: Date; newValues: unknown }[]): ClosedPeriod[] {
+  const out: ClosedPeriod[] = [];
+  for (const l of logs) {
+    const v = (l.newValues ?? {}) as Record<string, unknown>;
+    if (!Object.prototype.hasOwnProperty.call(v, 'closingDate')) continue;
+    const next = typeof v.closingDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v.closingDate) ? v.closingDate : null;
+    const last = out[out.length - 1];
+    if (last && last.to === null) {
+      if (last.closingDate === next) continue; // same date saved again (password change)
+      last.to = l.createdAt;
+    }
+    if (next) out.push({ from: l.createdAt, to: null, closingDate: next });
+  }
+  return out;
+}
+
+/** The closing date in effect at `at` (periods sorted and not overlapping). */
+function periodAt(periods: ClosedPeriod[], at: Date): ClosedPeriod | null {
+  let lo = 0;
+  let hi = periods.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const p = periods[mid];
+    if (at < p.from) hi = mid - 1;
+    else if (p.to && at >= p.to) lo = mid + 1;
+    else return p;
+  }
+  return null;
+}
+
 async function entryAmounts(ctx: ServiceContext, ids: string[]): Promise<Map<string, string>> {
-  if (ids.length === 0) return new Map();
-  const rows = await ctx.db
-    .select({ id: journalEntryLines.journalEntryId, total: sql<string>`COALESCE(SUM(${journalEntryLines.debit}), 0)` })
-    .from(journalEntryLines)
-    .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
-    .where(and(eq(journalEntries.companyId, ctx.companyId), inArray(journalEntryLines.journalEntryId, ids)))
-    .groupBy(journalEntryLines.journalEntryId);
-  return new Map(rows.map((r) => [r.id, toAmountString(r.total)]));
+  const out = new Map<string, string>();
+  // In chunks: entries posted after the books were closed can be a whole imported history, more
+  // ids than the database accepts bound parameters in one statement (65,535).
+  for (let i = 0; i < ids.length; i += 1000) {
+    const rows = await ctx.db
+      .select({ id: journalEntryLines.journalEntryId, total: sql<string>`COALESCE(SUM(${journalEntryLines.debit}), 0)` })
+      .from(journalEntryLines)
+      .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+      .where(and(eq(journalEntries.companyId, ctx.companyId), inArray(journalEntryLines.journalEntryId, ids.slice(i, i + 1000))))
+      .groupBy(journalEntryLines.journalEntryId);
+    for (const r of rows) out.set(r.id, toAmountString(r.total));
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -192,8 +276,13 @@ function pickStr(v: Record<string, unknown>, keys: string[]): string | null {
 
 export async function voidedDeletedTransactions(
   ctx: ServiceContext,
-  opts: { from?: Date; to?: Date; detail?: boolean } = {},
+  optsIn: { from?: HappenedBound; to?: HappenedBound; detail?: boolean } = {},
 ): Promise<{ rows: VoidedDeletedRow[]; count: number }> {
+  const opts = {
+    from: await companyDayBound(ctx, optsIn.from, 'from'),
+    to: await companyDayBound(ctx, optsIn.to, 'to', true),
+    detail: optsIn.detail,
+  };
   const types = Object.keys(TRANSACTION_ENTITY_LABELS);
   const conds = [
     eq(auditLogs.companyId, ctx.companyId),
@@ -223,16 +312,18 @@ export async function voidedDeletedTransactions(
   const info = new Map<string, { number: string | null; date: string | null; amount: string | null; name: string | null }>();
   const byType = new Map<string, string[]>();
   for (const l of logs) byType.set(l.entityType, [...(byType.get(l.entityType) ?? []), l.entityId]);
-  const docTables: Record<string, { table: string; num: string; total: string; party?: string; partyTable?: string }> = {
-    invoice: { table: 'invoices', num: 'invoice_number', total: 'total', party: 'customer_id', partyTable: 'customers' },
-    sales_receipt: { table: 'sales_receipts', num: 'receipt_number', total: 'total', party: 'customer_id', partyTable: 'customers' },
-    credit_memo: { table: 'credit_memos', num: 'memo_number', total: 'total', party: 'customer_id', partyTable: 'customers' },
-    payment_received: { table: 'payments_received', num: 'reference', total: 'amount', party: 'customer_id', partyTable: 'customers' },
-    bill: { table: 'bills', num: 'bill_number', total: 'total', party: 'vendor_id', partyTable: 'vendors' },
-    bill_payment: { table: 'bill_payments', num: 'reference', total: 'amount', party: 'vendor_id', partyTable: 'vendors' },
-    vendor_credit: { table: 'vendor_credits', num: 'memo', total: 'total', party: 'vendor_id', partyTable: 'vendors' },
-    expense: { table: 'expenses', num: 'reference', total: 'total', party: 'vendor_id', partyTable: 'vendors' },
-    deposit: { table: 'deposits', num: 'memo', total: 'total' },
+  // num: the number the form shows (a typed ref number first, as everywhere else in the app);
+  // fallbackName: the payee when the document has no vendor (a one-time payee on a check).
+  const docTables: Record<string, { table: string; num: string; total: string; party?: string; partyTable?: string; fallbackName?: string }> = {
+    invoice: { table: 'invoices', num: "COALESCE(NULLIF(t.ref_number, ''), t.invoice_number::text)", total: 'total', party: 'customer_id', partyTable: 'customers' },
+    sales_receipt: { table: 'sales_receipts', num: "COALESCE(NULLIF(t.ref_number, ''), t.receipt_number::text)", total: 'total', party: 'customer_id', partyTable: 'customers' },
+    credit_memo: { table: 'credit_memos', num: "COALESCE(NULLIF(t.ref_number, ''), t.memo_number::text)", total: 'total', party: 'customer_id', partyTable: 'customers' },
+    payment_received: { table: 'payments_received', num: 't.reference', total: 'amount', party: 'customer_id', partyTable: 'customers' },
+    bill: { table: 'bills', num: 't.bill_number', total: 'total', party: 'vendor_id', partyTable: 'vendors' },
+    bill_payment: { table: 'bill_payments', num: 't.reference', total: 'amount', party: 'vendor_id', partyTable: 'vendors' },
+    vendor_credit: { table: 'vendor_credits', num: 't.ref_number', total: 'total', party: 'vendor_id', partyTable: 'vendors' },
+    expense: { table: 'expenses', num: 't.reference', total: 'total', party: 'vendor_id', partyTable: 'vendors', fallbackName: 't.payee_name' },
+    deposit: { table: 'deposits', num: 't.memo', total: 'total' },
   };
   for (const [type, ids] of byType) {
     const spec = docTables[type];
@@ -248,10 +339,12 @@ export async function voidedDeletedTransactions(
     }
     if (!spec) continue;
     try {
-      const partySel = spec.party ? sql.raw(`, p.display_name AS party`) : sql.raw(`, NULL AS party`);
+      const partySel = spec.party
+        ? sql.raw(`, ${spec.fallbackName ? `COALESCE(p.display_name, ${spec.fallbackName})` : 'p.display_name'} AS party`)
+        : sql.raw(`, NULL AS party`);
       const partyJoin = spec.party ? sql.raw(` LEFT JOIN ${spec.partyTable} p ON p.id = t.${spec.party}`) : sql.raw('');
       const res = await ctx.db.execute(
-        sql`SELECT t.id, t.${sql.raw(spec.num)}::text AS num, t.date, t.${sql.raw(spec.total)}::text AS total${partySel}
+        sql`SELECT t.id, (${sql.raw(spec.num)})::text AS num, t.date, t.${sql.raw(spec.total)}::text AS total${partySel}
             FROM ${sql.raw(spec.table)} t${partyJoin}
             WHERE t.company_id = ${ctx.companyId} AND t.id IN (${sql.join(uniq.map((id) => sql`${id}::uuid`), sql`, `)})`,
       );

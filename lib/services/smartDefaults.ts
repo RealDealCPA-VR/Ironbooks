@@ -266,6 +266,7 @@ async function lastCustomerTxn(ctx: ServiceContext, customerId: string, form: Cu
         id: invoices.id,
         date: invoices.date,
         number: invoices.invoiceNumber,
+        ref: invoices.refNumber,
         terms: invoices.terms,
         classId: invoices.classId,
         salesRepId: invoices.salesRepId,
@@ -294,7 +295,7 @@ async function lastCustomerTxn(ctx: ServiceContext, customerId: string, form: Cu
       form,
       id: h.id,
       date: h.date,
-      number: String(h.number),
+      number: shownNumber(h.ref, h.number),
       header: { terms: h.terms, classId: h.classId, salesRepId: h.salesRepId, taxRateId: h.taxRateId, memo: h.memo },
       lines: salesLines(rows),
     };
@@ -305,6 +306,7 @@ async function lastCustomerTxn(ctx: ServiceContext, customerId: string, form: Cu
         id: salesReceipts.id,
         date: salesReceipts.date,
         number: salesReceipts.receiptNumber,
+        ref: salesReceipts.refNumber,
         classId: salesReceipts.classId,
         taxRateId: salesReceipts.taxRateId,
         memo: salesReceipts.memo,
@@ -324,14 +326,14 @@ async function lastCustomerTxn(ctx: ServiceContext, customerId: string, form: Cu
       form,
       id: h.id,
       date: h.date,
-      number: String(h.number),
+      number: shownNumber(h.ref, h.number),
       header: { ...EMPTY_HEADER, classId: h.classId, taxRateId: h.taxRateId, memo: h.memo },
       lines: salesLines(rows),
     };
   }
   if (form === 'estimate') {
     const [h] = await ctx.db
-      .select({ id: estimates.id, date: estimates.date, number: estimates.estimateNumber, taxRateId: estimates.taxRateId, memo: estimates.memo })
+      .select({ id: estimates.id, date: estimates.date, number: estimates.estimateNumber, ref: estimates.refNumber, taxRateId: estimates.taxRateId, memo: estimates.memo })
       .from(estimates)
       .where(and(eq(estimates.companyId, c), eq(estimates.customerId, customerId), ne(estimates.status, 'void')))
       .orderBy(desc(estimates.date), desc(estimates.createdAt))
@@ -347,13 +349,13 @@ async function lastCustomerTxn(ctx: ServiceContext, customerId: string, form: Cu
       form,
       id: h.id,
       date: h.date,
-      number: String(h.number),
+      number: shownNumber(h.ref, h.number),
       header: { ...EMPTY_HEADER, taxRateId: h.taxRateId, memo: h.memo },
       lines: salesLines(rows),
     };
   }
   const [h] = await ctx.db
-    .select({ id: salesOrders.id, date: salesOrders.date, number: salesOrders.orderNumber, taxRateId: salesOrders.taxRateId, memo: salesOrders.memo })
+    .select({ id: salesOrders.id, date: salesOrders.date, number: salesOrders.orderNumber, ref: salesOrders.refNumber, taxRateId: salesOrders.taxRateId, memo: salesOrders.memo })
     .from(salesOrders)
     .where(and(eq(salesOrders.companyId, c), eq(salesOrders.customerId, customerId), ne(salesOrders.status, 'void')))
     .orderBy(desc(salesOrders.date), desc(salesOrders.createdAt))
@@ -369,7 +371,7 @@ async function lastCustomerTxn(ctx: ServiceContext, customerId: string, form: Cu
     form: 'sales_order',
     id: h.id,
     date: h.date,
-    number: String(h.number),
+    number: shownNumber(h.ref, h.number),
     header: { ...EMPTY_HEADER, taxRateId: h.taxRateId, memo: h.memo },
     lines: salesLines(rows),
   };
@@ -393,6 +395,11 @@ function line(p: Partial<SmartLine> & { kind: SmartLine['kind']; amount: string 
     customerId: p.customerId ?? null,
     jobId: p.jobId ?? null,
   };
+}
+
+/** The number printed on the form: the typed ref number, else the sequence number. */
+function shownNumber(ref: string | null, n: number | string | null): string | null {
+  return ref && ref.trim() ? ref.trim() : n == null ? null : String(n);
 }
 
 /** The most recent of several candidates (ties keep the earlier one in the list). */

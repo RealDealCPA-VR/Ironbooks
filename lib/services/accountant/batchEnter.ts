@@ -186,7 +186,7 @@ function runnerFor(doc: ResolvedBatchDoc, bank: string | null): (tx: ServiceCont
           refNumber: doc.ref,
           date: toDate(doc.date),
           memo: doc.memo,
-          lines: [{ accountId: doc.accountId, amount: doc.amount, description: doc.memo }],
+          lines: [{ accountId: doc.accountId, amount: doc.amount, description: doc.memo, classId: doc.classId }],
         });
     case 'journal':
       return (tx) =>

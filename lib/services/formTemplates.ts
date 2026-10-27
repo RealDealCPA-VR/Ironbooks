@@ -14,7 +14,7 @@ import { and, asc, eq } from 'drizzle-orm';
 import { formTemplates } from '@/lib/db/schema';
 import { defaultDesign, isFormType, normalizeDesign, type FormDesign, type FormType } from '@/lib/pdf/design';
 import type { FormLogo } from '@/lib/pdf/template';
-import { type ServiceContext, notFound, validation, writeAudit } from './_base';
+import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from './_base';
 import { assertWrite } from './rbac';
 import { deleteAttachment, getAttachmentFile, saveAttachment } from './attachments';
 
@@ -97,38 +97,43 @@ export async function createFormTemplate(
 ): Promise<FormTemplateView> {
   assertWrite(ctx); // view-only members change nothing (checked before any write or file save)
   assertFormType(input.formType);
+  const formType = input.formType;
   const name = input.name?.trim();
   if (!name) throw validation('Template name is required.');
-  await assertUniqueName(ctx, input.formType, name);
-  let design: FormDesign;
-  let logoAttachmentId: string | null = null;
-  if (input.copyFromId) {
-    const src = await loadRow(ctx, input.copyFromId);
-    if (src.formType !== input.formType) throw validation('Can only copy a template of the same form type.');
-    design = normalizeDesign(input.formType, input.design ?? src.design);
-    logoAttachmentId = src.logoAttachmentId;
-  } else {
-    design = input.design ? normalizeDesign(input.formType, input.design) : defaultDesign(input.formType);
-  }
-  if (input.isDefault) await clearDefault(ctx, input.formType);
-  const [row] = await ctx.db
-    .insert(formTemplates)
-    .values({
-      companyId: ctx.companyId,
-      formType: input.formType,
-      name,
-      isDefault: Boolean(input.isDefault),
-      design: design as unknown as Record<string, unknown>,
-      logoAttachmentId,
-    })
-    .returning();
-  await writeAudit(ctx, {
-    action: 'create',
-    entityType: 'form_template',
-    entityId: row.id,
-    newValues: { formType: row.formType, name: row.name, isDefault: row.isDefault },
+  // One transaction: the name check, clearing the old default and the insert (two saves at once
+  // can't leave two defaults, and a failed insert never leaves the form without its default).
+  return inTransaction(ctx, async (tx) => {
+    await assertUniqueName(tx, formType, name);
+    let design: FormDesign;
+    let logoAttachmentId: string | null = null;
+    if (input.copyFromId) {
+      const src = await loadRow(tx, input.copyFromId);
+      if (src.formType !== formType) throw validation('Can only copy a template of the same form type.');
+      design = normalizeDesign(formType, input.design ?? src.design);
+      logoAttachmentId = src.logoAttachmentId;
+    } else {
+      design = input.design ? normalizeDesign(formType, input.design) : defaultDesign(formType);
+    }
+    if (input.isDefault) await clearDefault(tx, formType);
+    const [row] = await tx.db
+      .insert(formTemplates)
+      .values({
+        companyId: tx.companyId,
+        formType,
+        name,
+        isDefault: Boolean(input.isDefault),
+        design: design as unknown as Record<string, unknown>,
+        logoAttachmentId,
+      })
+      .returning();
+    await writeAudit(tx, {
+      action: 'create',
+      entityType: 'form_template',
+      entityId: row.id,
+      newValues: { formType: row.formType, name: row.name, isDefault: row.isDefault },
+    });
+    return view(row);
   });
-  return view(row);
 }
 
 export interface UpdateFormTemplateInput {
@@ -144,44 +149,47 @@ export async function updateFormTemplate(
   input: UpdateFormTemplateInput,
 ): Promise<FormTemplateView> {
   assertWrite(ctx); // view-only members change nothing (checked before any write or file save)
-  const before = await loadRow(ctx, id);
-  const formType = before.formType as FormType;
-  const patch: Partial<typeof formTemplates.$inferInsert> = { updatedAt: new Date() };
-  if (input.name !== undefined) {
-    const name = input.name.trim();
-    if (!name) throw validation('Template name is required.');
-    await assertUniqueName(ctx, formType, name, id);
-    patch.name = name;
-  }
-  if (input.design !== undefined) {
-    patch.design = normalizeDesign(formType, input.design) as unknown as Record<string, unknown>;
-  }
-  if (input.isActive !== undefined) {
-    patch.isActive = input.isActive;
-    if (!input.isActive) patch.isDefault = false; // an inactive template can't be the default
-  }
-  if (input.isDefault === true) {
-    if (input.isActive === false || (!before.isActive && input.isActive !== true)) {
-      throw validation('Make the template active before making it the default.');
+  // One transaction (see createFormTemplate): two simultaneous "make default" leave one default.
+  return inTransaction(ctx, async (tx) => {
+    const before = await loadRow(tx, id);
+    const formType = before.formType as FormType;
+    const patch: Partial<typeof formTemplates.$inferInsert> = { updatedAt: new Date() };
+    if (input.name !== undefined) {
+      const name = input.name.trim();
+      if (!name) throw validation('Template name is required.');
+      await assertUniqueName(tx, formType, name, id);
+      patch.name = name;
     }
-    await clearDefault(ctx, formType);
-    patch.isDefault = true;
-  } else if (input.isDefault === false) {
-    patch.isDefault = false;
-  }
-  const [row] = await ctx.db
-    .update(formTemplates)
-    .set(patch)
-    .where(and(eq(formTemplates.id, id), eq(formTemplates.companyId, ctx.companyId)))
-    .returning();
-  await writeAudit(ctx, {
-    action: 'update',
-    entityType: 'form_template',
-    entityId: id,
-    oldValues: { name: before.name, isDefault: before.isDefault, isActive: before.isActive, design: before.design },
-    newValues: { name: row.name, isDefault: row.isDefault, isActive: row.isActive, design: row.design },
+    if (input.design !== undefined) {
+      patch.design = normalizeDesign(formType, input.design) as unknown as Record<string, unknown>;
+    }
+    if (input.isActive !== undefined) {
+      patch.isActive = input.isActive;
+      if (!input.isActive) patch.isDefault = false; // an inactive template can't be the default
+    }
+    if (input.isDefault === true) {
+      if (input.isActive === false || (!before.isActive && input.isActive !== true)) {
+        throw validation('Make the template active before making it the default.');
+      }
+      await clearDefault(tx, formType);
+      patch.isDefault = true;
+    } else if (input.isDefault === false) {
+      patch.isDefault = false;
+    }
+    const [row] = await tx.db
+      .update(formTemplates)
+      .set(patch)
+      .where(and(eq(formTemplates.id, id), eq(formTemplates.companyId, tx.companyId)))
+      .returning();
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'form_template',
+      entityId: id,
+      oldValues: { name: before.name, isDefault: before.isDefault, isActive: before.isActive, design: before.design },
+      newValues: { name: row.name, isDefault: row.isDefault, isActive: row.isActive, design: row.design },
+    });
+    return view(row);
   });
-  return view(row);
 }
 
 /** Delete a template (the logo file goes too unless another template shares it). */

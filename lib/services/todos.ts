@@ -18,7 +18,7 @@
  * names (details, type, status); rows come back carrying both, so every caller keeps working.
  */
 import { and, asc, eq, inArray, isNull, lte, or } from 'drizzle-orm';
-import { leads, todos, userCompanies } from '@/lib/db/schema';
+import { customers, employees, items, leads, otherNames, todos, userCompanies, vendors } from '@/lib/db/schema';
 import { can, type Area } from '@/lib/permissions/model';
 import { isRealIsoDay } from '@/lib/validation/prefs';
 import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from './_base';
@@ -217,6 +217,49 @@ async function toView(ctx: ServiceContext, r: TodoRow): Promise<TodoView> {
   return { ...r, details: r.notes, type: r.kind, completedAt: r.doneAt, entityName };
 }
 
+/**
+ * Display names of the records many to-dos link to, one query per record type (not one per
+ * to-do: the Calendar, Reminders and the inbox list every open to-do). Same names as linkedName.
+ */
+async function linkedNames(ctx: ServiceContext, rows: TodoRow[]): Promise<Map<string, string>> {
+  const byType = new Map<TodoEntityType, Set<string>>();
+  for (const r of rows) {
+    if (!r.entityType || !r.entityId || !UUID_RE.test(r.entityId)) continue;
+    const t = r.entityType as TodoEntityType;
+    if (!TODO_ENTITY_TYPES.includes(t)) continue;
+    if (!byType.has(t)) byType.set(t, new Set());
+    byType.get(t)!.add(r.entityId);
+  }
+  const out = new Map<string, string>();
+  const c = ctx.companyId;
+  for (const [type, idSet] of byType) {
+    const all = [...idSet];
+    for (let i = 0; i < all.length; i += 500) {
+      const ids = all.slice(i, i + 500);
+      let found: Array<{ id: string; n: string }> = [];
+      if (type === 'customer') {
+        found = await ctx.db.select({ id: customers.id, n: customers.displayName }).from(customers).where(and(eq(customers.companyId, c), inArray(customers.id, ids)));
+      } else if (type === 'vendor') {
+        found = await ctx.db.select({ id: vendors.id, n: vendors.displayName }).from(vendors).where(and(eq(vendors.companyId, c), inArray(vendors.id, ids)));
+      } else if (type === 'employee') {
+        const rs = await ctx.db
+          .select({ id: employees.id, f: employees.firstName, l: employees.lastName })
+          .from(employees)
+          .where(and(eq(employees.companyId, c), inArray(employees.id, ids)));
+        found = rs.map((r) => ({ id: r.id, n: `${r.f} ${r.l}` }));
+      } else if (type === 'lead') {
+        found = await ctx.db.select({ id: leads.id, n: leads.name }).from(leads).where(and(eq(leads.companyId, c), inArray(leads.id, ids)));
+      } else if (type === 'other_name') {
+        found = await ctx.db.select({ id: otherNames.id, n: otherNames.name }).from(otherNames).where(and(eq(otherNames.companyId, c), inArray(otherNames.id, ids)));
+      } else if (type === 'item') {
+        found = await ctx.db.select({ id: items.id, n: items.name }).from(items).where(and(eq(items.companyId, c), inArray(items.id, ids)));
+      }
+      for (const f of found) out.set(`${type}:${f.id}`, f.n);
+    }
+  }
+  return out;
+}
+
 export interface ListTodosOptions {
   /** Which statuses to return. Default: 'open' (or open + done with includeDone). */
   status?: TodoStatus | 'all';
@@ -265,9 +308,14 @@ export async function listTodos(ctx: ServiceContext, opts: ListTodosOptions = {}
   );
   // Undated to-dos sort last (QB lists dated ones first).
   visible.sort((a, b) => (a.dueDate ? 0 : 1) - (b.dueDate ? 0 : 1));
-  const out: TodoView[] = [];
-  for (const r of visible) out.push(await toView(ctx, r));
-  return out;
+  const names = await linkedNames(ctx, visible);
+  return visible.map((r) => ({
+    ...r,
+    details: r.notes,
+    type: r.kind,
+    completedAt: r.doneAt,
+    entityName: r.entityType && r.entityId ? (names.get(`${r.entityType}:${r.entityId}`) ?? null) : null,
+  }));
 }
 
 /**

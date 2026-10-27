@@ -13,9 +13,9 @@
  * Definitions are admin/owner only (QB: only the Admin can define fields);
  * values are writable by any non-viewer role (enforced centrally by writeAudit).
  */
-import { and, eq } from 'drizzle-orm';
+import { and, eq, sql, type SQL } from 'drizzle-orm';
 import { companies, customers, vendors, items, invoices } from '@/lib/db/schema';
-import { type ServiceContext, notFound, validation, writeAudit } from './_base';
+import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from './_base';
 import { requireEffectivePermission } from './access';
 
 // ---------------------------------------------------------------------------
@@ -150,20 +150,26 @@ export async function setCustomFieldDefinitions(
     next[entity] = normalized;
   }
 
-  const settings = { ...((company.settings ?? {}) as Record<string, unknown>) };
-  settings.customFields = next;
+  // Only the customFields key is written (a JSON merge in the database): writing back the whole
+  // settings object read above would undo any other setting saved in the meantime — the closing
+  // date and its password among them. The write and its audit row commit together (a save that
+  // can't be audited — e.g. by a view-only member — changes nothing).
+  await inTransaction(ctx, async (tx) => {
+    await tx.db
+      .update(companies)
+      .set({
+        settings: sql`coalesce(${companies.settings}, '{}'::jsonb) || jsonb_build_object('customFields', ${JSON.stringify(next)}::jsonb)`,
+        updatedAt: new Date(),
+      })
+      .where(eq(companies.id, tx.companyId));
 
-  await ctx.db
-    .update(companies)
-    .set({ settings, updatedAt: new Date() })
-    .where(eq(companies.id, ctx.companyId));
-
-  await writeAudit(ctx, {
-    action: 'update',
-    entityType: 'company',
-    entityId: ctx.companyId,
-    oldValues: { customFields: before },
-    newValues: { customFields: next },
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'company',
+      entityId: tx.companyId,
+      oldValues: { customFields: before },
+      newValues: { customFields: next },
+    });
   });
 
   return next;
@@ -211,25 +217,36 @@ export async function setEntityCustomFields(
   if (!row) throw notFound(`${entity[0].toUpperCase()}${entity.slice(1)}`);
 
   const before = (row.customFields ?? {}) as Record<string, string>;
-  const next: Record<string, string> = { ...before };
+  const set: Record<string, string> = {};
+  const cleared: string[] = [];
   for (const [key, raw] of Object.entries(values)) {
     const value = String(raw ?? '').trim();
-    if (value === '') delete next[key];
-    else next[key] = value;
+    if (value === '') cleared.push(key);
+    else set[key] = value;
   }
 
-  await ctx.db
-    .update(table)
-    .set({ customFields: next })
-    .where(and(eq(table.id, id), eq(table.companyId, ctx.companyId)));
+  // Merged in the database (set keys, then drop cleared ones): two values saved at once on the
+  // same record both stick, instead of the later save writing back the map it read before.
+  let merged: SQL = sql`coalesce(${table.customFields}, '{}'::jsonb) || ${JSON.stringify(set)}::jsonb`;
+  for (const key of cleared) merged = sql`(${merged}) - ${key}::text`;
+  // The value change and its audit row commit together (a save that can't be audited — e.g. by
+  // a view-only member — changes nothing).
+  return inTransaction(ctx, async (tx) => {
+    const [updated] = await tx.db
+      .update(table)
+      .set({ customFields: merged as unknown as Record<string, string> })
+      .where(and(eq(table.id, id), eq(table.companyId, tx.companyId)))
+      .returning({ customFields: table.customFields });
+    const next = (updated?.customFields ?? {}) as Record<string, string>;
 
-  await writeAudit(ctx, {
-    action: 'update',
-    entityType: ENTITY_AUDIT_TYPE[entity],
-    entityId: id,
-    oldValues: { customFields: before },
-    newValues: { customFields: next },
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: ENTITY_AUDIT_TYPE[entity],
+      entityId: id,
+      oldValues: { customFields: before },
+      newValues: { customFields: next },
+    });
+
+    return next;
   });
-
-  return next;
 }

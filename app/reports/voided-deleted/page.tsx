@@ -6,10 +6,17 @@ import { getPageContext } from '@/lib/context';
 import { formatCurrency } from '@/lib/money';
 import { voidedDeletedTransactions } from '@/lib/services/accountant/auditReports';
 import ReportToolbar, { type ExportTable } from '../_components/ReportToolbar';
-// The change's own day and time on this computer's calendar and clock (they were UTC).
-import { localDateTime, localDayRange } from '@/lib/reports/dates';
+// The change's own day and time on the company's calendar and clock (they were UTC): the same
+// time zone the report service reads the From / To days in (Preferences).
+import { localDateTime } from '@/lib/reports/dates';
+import { getPreferences } from '@/lib/services/preferences';
 
 export const dynamic = 'force-dynamic';
+
+/** A typed day; the report reads it in the company's time zone. */
+function day(v: string | undefined): string | undefined {
+  return v && /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : undefined;
+}
 
 function summarize(original: unknown): string {
   if (!original || typeof original !== 'object') return '';
@@ -32,8 +39,9 @@ export default async function VoidedDeletedPage({
 }) {
   const ctx = await getPageContext('/reports/voided-deleted');
   const p = await searchParams;
+  const { timezone } = await getPreferences(ctx);
   const detail = p.detail === '1';
-  const { rows } = await voidedDeletedTransactions(ctx, { ...localDayRange(p.from, p.to), detail });
+  const { rows } = await voidedDeletedTransactions(ctx, { from: day(p.from), to: day(p.to), detail });
 
   const exportTable: ExportTable = {
     filename: detail ? 'voided-deleted-detail' : 'voided-deleted-summary',
@@ -51,7 +59,7 @@ export default async function VoidedDeletedPage({
     ],
     rows: rows.map((r) => [
       r.action === 'void' ? 'Voided' : 'Deleted',
-      localDateTime(r.at),
+      localDateTime(r.at, timezone),
       r.user ?? '',
       r.typeLabel,
       r.number ?? '',
@@ -113,7 +121,7 @@ export default async function VoidedDeletedPage({
                 <Fragment key={r.auditLogId}>
                   <Tr>
                     <Td><Badge tone={r.action === 'void' ? 'warning' : 'danger'}>{r.action === 'void' ? 'Voided' : 'Deleted'}</Badge></Td>
-                    <Td className="whitespace-nowrap">{localDateTime(r.at)}</Td>
+                    <Td className="whitespace-nowrap">{localDateTime(r.at, timezone)}</Td>
                     <Td>{r.user ?? '—'}</Td>
                     <Td>{r.typeLabel}</Td>
                     <Td>{r.number ?? ''}</Td>

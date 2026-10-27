@@ -13,6 +13,7 @@
  */
 import { and, eq, inArray, isNull, isNotNull, sql } from 'drizzle-orm';
 import {
+  accounts,
   errorCorrections,
   errorDetections,
   journalEntries,
@@ -213,6 +214,9 @@ async function detectMissingFields(
     .where(
       and(
         eq(journalEntries.companyId, ctx.companyId),
+        // Only entries in the books: a voided or draft entry is not a finding (and voiding one
+        // could never make it go away).
+        eq(journalEntries.status, 'posted'),
         sql`TRIM(${journalEntries.description}) = ''`,
       ),
     );
@@ -243,6 +247,7 @@ async function detectMissingFields(
     .where(
       and(
         eq(journalEntries.companyId, ctx.companyId),
+        eq(journalEntries.status, 'posted'),
         isNull(journalEntryLines.debit),
         isNull(journalEntryLines.credit),
       ),
@@ -307,6 +312,13 @@ async function detectOutliers(
     byAccount.set(l.accountId, bucket);
   }
 
+  // The finding names the account the way the user knows it ("6110 · Fuel"), not by its id.
+  const acctRows = await ctx.db
+    .select({ id: accounts.id, code: accounts.code, name: accounts.name })
+    .from(accounts)
+    .where(eq(accounts.companyId, ctx.companyId));
+  const acctLabel = new Map(acctRows.map((a) => [a.id, a.code ? `${a.code} · ${a.name}` : a.name]));
+
   for (const [accountId, bucket] of byAccount) {
     if (bucket.length < 3) continue; // insufficient data
 
@@ -331,7 +343,7 @@ async function detectOutliers(
           errorType: 'unusual_pattern',
           severity: 'medium',
           description:
-            `Outlier amount ${toAmountString(amount)} on account ${accountId} ` +
+            `Outlier amount ${toAmountString(amount)} on account ${acctLabel.get(accountId) ?? '(unknown account)'} ` +
             `(mean ${toAmountString(mean)}, stddev ${toAmountString(stddev)}, ` +
             `threshold ${toAmountString(threshold)}).`,
         })

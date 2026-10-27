@@ -302,6 +302,32 @@ function parseSourceRef(ref: string | null): { docType: SalesTaxDocType; docId: 
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+/**
+ * Ids per `IN (…)` query. A company's whole sales history can name more forms than the database
+ * accepts bound parameters in one statement (65,535), so id lists are queried in chunks.
+ */
+const ID_CHUNK = 1000;
+
+async function inChunks<T>(ids: readonly string[], fetch: (chunk: string[]) => Promise<T[]>): Promise<T[]> {
+  const out: T[] = [];
+  for (let i = 0; i < ids.length; i += ID_CHUNK) {
+    for (const row of await fetch(ids.slice(i, i + ID_CHUNK))) out.push(row);
+  }
+  return out;
+}
+
+/** Rows grouped by a key (instead of filtering the whole list once per document). */
+function groupRows<T>(rows: readonly T[], key: (r: T) => string): Map<string, T[]> {
+  const m = new Map<string, T[]>();
+  for (const r of rows) {
+    const k = key(r);
+    const list = m.get(k);
+    if (list) list.push(r);
+    else m.set(k, [r]);
+  }
+  return m;
+}
+
 interface DocContext {
   rates: Map<string, RateInfo>;
   itemTypes: Map<string, string>;
@@ -322,47 +348,59 @@ async function loadDocumentShares(
   const shares = new Map<string, TaxShare[]>();
 
   if (docIds.invoice.length) {
-    const heads = await ctx.db
-      .select({ id: invoices.id, taxRateId: invoices.taxRateId })
-      .from(invoices)
-      .where(and(eq(invoices.companyId, ctx.companyId), inArray(invoices.id, docIds.invoice)));
-    const lines = await ctx.db
-      .select({
-        docId: invoiceLines.invoiceId,
-        itemId: invoiceLines.itemId,
-        amount: invoiceLines.amount,
-        taxable: invoiceLines.taxable,
-        taxRateId: invoiceLines.taxRateId,
-      })
-      .from(invoiceLines)
-      .where(inArray(invoiceLines.invoiceId, docIds.invoice));
+    const heads = await inChunks(docIds.invoice, (ids) =>
+      ctx.db
+        .select({ id: invoices.id, taxRateId: invoices.taxRateId })
+        .from(invoices)
+        .where(and(eq(invoices.companyId, ctx.companyId), inArray(invoices.id, ids))),
+    );
+    const lines = groupRows(
+      await inChunks(docIds.invoice, (ids) =>
+        ctx.db
+          .select({
+            docId: invoiceLines.invoiceId,
+            itemId: invoiceLines.itemId,
+            amount: invoiceLines.amount,
+            taxable: invoiceLines.taxable,
+            taxRateId: invoiceLines.taxRateId,
+          })
+          .from(invoiceLines)
+          .where(inArray(invoiceLines.invoiceId, ids)),
+      ),
+      (l) => l.docId,
+    );
     for (const h of heads) {
-      const ls = lines.filter((l) => l.docId === h.id);
+      const ls = lines.get(h.id) ?? [];
       shares.set(`invoice:${h.id}`, documentShares(h.taxRateId, ls, itemTypes, rates));
     }
   }
   if (docIds.sales_receipt.length) {
     // Receipts store their receipt-level rate since 0029; older receipts fall back to the
     // customer's default rate (lines taxed at the receipt rate carry taxRateId NULL).
-    const heads = await ctx.db
-      .select({ id: salesReceipts.id, taxRateId: salesReceipts.taxRateId, custRate: customers.taxRateId })
-      .from(salesReceipts)
-      .leftJoin(customers, eq(salesReceipts.customerId, customers.id))
-      .where(
-        and(eq(salesReceipts.companyId, ctx.companyId), inArray(salesReceipts.id, docIds.sales_receipt)),
-      );
-    const lines = await ctx.db
-      .select({
-        docId: salesReceiptLines.salesReceiptId,
-        itemId: salesReceiptLines.itemId,
-        amount: salesReceiptLines.amount,
-        taxable: salesReceiptLines.taxable,
-        taxRateId: salesReceiptLines.taxRateId,
-      })
-      .from(salesReceiptLines)
-      .where(inArray(salesReceiptLines.salesReceiptId, docIds.sales_receipt));
+    const heads = await inChunks(docIds.sales_receipt, (ids) =>
+      ctx.db
+        .select({ id: salesReceipts.id, taxRateId: salesReceipts.taxRateId, custRate: customers.taxRateId })
+        .from(salesReceipts)
+        .leftJoin(customers, eq(salesReceipts.customerId, customers.id))
+        .where(and(eq(salesReceipts.companyId, ctx.companyId), inArray(salesReceipts.id, ids))),
+    );
+    const lines = groupRows(
+      await inChunks(docIds.sales_receipt, (ids) =>
+        ctx.db
+          .select({
+            docId: salesReceiptLines.salesReceiptId,
+            itemId: salesReceiptLines.itemId,
+            amount: salesReceiptLines.amount,
+            taxable: salesReceiptLines.taxable,
+            taxRateId: salesReceiptLines.taxRateId,
+          })
+          .from(salesReceiptLines)
+          .where(inArray(salesReceiptLines.salesReceiptId, ids)),
+      ),
+      (l) => l.docId,
+    );
     for (const h of heads) {
-      const ls = lines.filter((l) => l.docId === h.id);
+      const ls = lines.get(h.id) ?? [];
       shares.set(
         `salesreceipt:${h.id}`,
         documentShares(h.taxRateId ?? h.custRate ?? null, ls, itemTypes, rates),
@@ -370,11 +408,13 @@ async function loadDocumentShares(
     }
   }
   if (docIds.credit_memo.length) {
-    const heads = await ctx.db
-      .select({ id: creditMemos.id, taxRateId: creditMemos.taxRateId, custRate: customers.taxRateId })
-      .from(creditMemos)
-      .leftJoin(customers, eq(creditMemos.customerId, customers.id))
-      .where(and(eq(creditMemos.companyId, ctx.companyId), inArray(creditMemos.id, docIds.credit_memo)));
+    const heads = await inChunks(docIds.credit_memo, (ids) =>
+      ctx.db
+        .select({ id: creditMemos.id, taxRateId: creditMemos.taxRateId, custRate: customers.taxRateId })
+        .from(creditMemos)
+        .leftJoin(customers, eq(creditMemos.customerId, customers.id))
+        .where(and(eq(creditMemos.companyId, ctx.companyId), inArray(creditMemos.id, ids))),
+    );
     for (const h of heads) {
       // Memo lines carry no per-line rate: the whole memo tax belongs to the memo-level rate
       // (legacy memos without one fall back to the customer's default rate).
@@ -594,16 +634,18 @@ interface InvoiceHead {
 
 async function loadInvoiceHeads(ctx: ServiceContext, invoiceIds: string[]): Promise<InvoiceHead[]> {
   if (invoiceIds.length === 0) return [];
-  return ctx.db
-    .select({
-      id: invoices.id,
-      date: invoices.date,
-      total: invoices.total,
-      retainageAmount: invoices.retainageAmount,
-      amountPaid: invoices.amountPaid,
-    })
-    .from(invoices)
-    .where(and(eq(invoices.companyId, ctx.companyId), inArray(invoices.id, invoiceIds)));
+  return inChunks(invoiceIds, (ids) =>
+    ctx.db
+      .select({
+        id: invoices.id,
+        date: invoices.date,
+        total: invoices.total,
+        retainageAmount: invoices.retainageAmount,
+        amountPaid: invoices.amountPaid,
+      })
+      .from(invoices)
+      .where(and(eq(invoices.companyId, ctx.companyId), inArray(invoices.id, ids))),
+  );
 }
 
 /**
@@ -662,23 +704,25 @@ async function invoiceSettlements(ctx: ServiceContext, heads: InvoiceHead[]): Pr
     dated.set(invoiceId, (dated.get(invoiceId) ?? Money.zero()).plus(amount));
   };
 
-  const pays = await ctx.db
-    .select({
-      invoiceId: paymentApplications.invoiceId,
-      applied: paymentApplications.amountApplied,
-      discount: paymentApplications.discountAmount,
-      date: paymentsReceived.date,
-      paymentId: paymentsReceived.id,
-    })
-    .from(paymentApplications)
-    .innerJoin(paymentsReceived, eq(paymentApplications.paymentId, paymentsReceived.id))
-    .where(
-      and(
-        inArray(paymentApplications.invoiceId, ids),
-        eq(paymentsReceived.companyId, ctx.companyId),
-        sql`${paymentsReceived.voidedAt} IS NULL`,
+  const pays = await inChunks(ids, (chunk) =>
+    ctx.db
+      .select({
+        invoiceId: paymentApplications.invoiceId,
+        applied: paymentApplications.amountApplied,
+        discount: paymentApplications.discountAmount,
+        date: paymentsReceived.date,
+        paymentId: paymentsReceived.id,
+      })
+      .from(paymentApplications)
+      .innerJoin(paymentsReceived, eq(paymentApplications.paymentId, paymentsReceived.id))
+      .where(
+        and(
+          inArray(paymentApplications.invoiceId, chunk),
+          eq(paymentsReceived.companyId, ctx.companyId),
+          sql`${paymentsReceived.voidedAt} IS NULL`,
+        ),
       ),
-    );
+  );
   for (const p of pays) {
     push(String(p.invoiceId), Money.add(p.applied, p.discount ?? 0), p.date, `p:${p.paymentId}`);
   }
@@ -711,17 +755,19 @@ async function invoiceSettlements(ctx: ServiceContext, heads: InvoiceHead[]): Pr
   // memo date: the later of the memo date and the invoice date. The two then offset in the same
   // period. Dating it on the application day instead would leave the memo month with a negative
   // liability whenever a credit is applied later than it was issued.
-  const credits = await ctx.db
-    .select({
-      id: creditApplications.id,
-      invoiceId: creditApplications.invoiceId,
-      amount: creditApplications.amount,
-      memoDate: creditMemos.date,
-      memoStatus: creditMemos.status,
-    })
-    .from(creditApplications)
-    .innerJoin(creditMemos, eq(creditMemos.id, creditApplications.creditMemoId))
-    .where(and(eq(creditApplications.companyId, ctx.companyId), inArray(creditApplications.invoiceId, ids)));
+  const credits = await inChunks(ids, (chunk) =>
+    ctx.db
+      .select({
+        id: creditApplications.id,
+        invoiceId: creditApplications.invoiceId,
+        amount: creditApplications.amount,
+        memoDate: creditMemos.date,
+        memoStatus: creditMemos.status,
+      })
+      .from(creditApplications)
+      .innerJoin(creditMemos, eq(creditMemos.id, creditApplications.creditMemoId))
+      .where(and(eq(creditApplications.companyId, ctx.companyId), inArray(creditApplications.invoiceId, chunk))),
+  );
   for (const c of credits) {
     if (c.memoStatus === 'void') continue;
     push(c.invoiceId, Money.of(c.amount), c.memoDate, `c:${c.id}`);
@@ -1068,20 +1114,24 @@ export async function salesTaxRevenueSummary(
       .select({ id: accounts.id })
       .from(accounts)
       .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, '1250')));
-    const lines = await ctx.db
-      .select({
-        docId: invoiceLines.invoiceId,
-        itemId: invoiceLines.itemId,
-        accountId: invoiceLines.accountId,
-        amount: invoiceLines.amount,
-        taxable: invoiceLines.taxable,
-        taxRateId: invoiceLines.taxRateId,
-      })
-      .from(invoiceLines)
-      .where(inArray(invoiceLines.invoiceId, invHeads.map((h) => h.id)));
-    const salesLines = retainageAcct ? lines.filter((l) => l.accountId !== retainageAcct.id) : lines;
+    const lines = await inChunks(
+      invHeads.map((h) => h.id),
+      (ids) =>
+        ctx.db
+          .select({
+            docId: invoiceLines.invoiceId,
+            itemId: invoiceLines.itemId,
+            accountId: invoiceLines.accountId,
+            amount: invoiceLines.amount,
+            taxable: invoiceLines.taxable,
+            taxRateId: invoiceLines.taxRateId,
+          })
+          .from(invoiceLines)
+          .where(inArray(invoiceLines.invoiceId, ids)),
+    );
+    const salesLines = groupRows(retainageAcct ? lines.filter((l) => l.accountId !== retainageAcct.id) : lines, (l) => l.docId);
     for (const h of invHeads) {
-      addDoc(h.taxRateId, salesLines.filter((l) => l.docId === h.id), Money.of(h.fx ?? 1), 1, invShare.get(h.id));
+      addDoc(h.taxRateId, salesLines.get(h.id) ?? [], Money.of(h.fx ?? 1), 1, invShare.get(h.id));
     }
   }
 
@@ -1091,18 +1141,25 @@ export async function salesTaxRevenueSummary(
     .leftJoin(customers, eq(salesReceipts.customerId, customers.id))
     .where(and(...dateConds(salesReceipts.companyId as never, salesReceipts.date as never), sql`${salesReceipts.status} <> 'void'`));
   if (srHeads.length) {
-    const lines = await ctx.db
-      .select({
-        docId: salesReceiptLines.salesReceiptId,
-        itemId: salesReceiptLines.itemId,
-        amount: salesReceiptLines.amount,
-        taxable: salesReceiptLines.taxable,
-        taxRateId: salesReceiptLines.taxRateId,
-      })
-      .from(salesReceiptLines)
-      .where(inArray(salesReceiptLines.salesReceiptId, srHeads.map((h) => h.id)));
+    const lines = groupRows(
+      await inChunks(
+        srHeads.map((h) => h.id),
+        (ids) =>
+          ctx.db
+            .select({
+              docId: salesReceiptLines.salesReceiptId,
+              itemId: salesReceiptLines.itemId,
+              amount: salesReceiptLines.amount,
+              taxable: salesReceiptLines.taxable,
+              taxRateId: salesReceiptLines.taxRateId,
+            })
+            .from(salesReceiptLines)
+            .where(inArray(salesReceiptLines.salesReceiptId, ids)),
+      ),
+      (l) => l.docId,
+    );
     for (const h of srHeads) {
-      addDoc(h.taxRateId ?? h.custRate ?? null, lines.filter((l) => l.docId === h.id), Money.of(1), 1);
+      addDoc(h.taxRateId ?? h.custRate ?? null, lines.get(h.id) ?? [], Money.of(1), 1);
     }
   }
 
@@ -1117,24 +1174,29 @@ export async function salesTaxRevenueSummary(
     .leftJoin(customers, eq(creditMemos.customerId, customers.id))
     .where(and(...dateConds(creditMemos.companyId as never, creditMemos.date as never), sql`${creditMemos.status} <> 'void'`));
   if (cmHeads.length) {
-    const lines = await ctx.db
-      .select({
-        docId: creditMemoLines.creditMemoId,
-        itemId: creditMemoLines.itemId,
-        amount: creditMemoLines.amount,
-        taxable: creditMemoLines.taxable,
-      })
-      .from(creditMemoLines)
-      .where(inArray(creditMemoLines.creditMemoId, cmHeads.map((h) => h.id)));
+    const lines = groupRows(
+      await inChunks(
+        cmHeads.map((h) => h.id),
+        (ids) =>
+          ctx.db
+            .select({
+              docId: creditMemoLines.creditMemoId,
+              itemId: creditMemoLines.itemId,
+              amount: creditMemoLines.amount,
+              taxable: creditMemoLines.taxable,
+            })
+            .from(creditMemoLines)
+            .where(inArray(creditMemoLines.creditMemoId, ids)),
+      ),
+      (l) => l.docId,
+    );
     for (const h of cmHeads) {
       // Legacy memos without a memo-level rate fall back to the customer's rate when they carry tax.
       const rateId = h.taxRateId ?? (Money.gt(h.taxAmount, 0) ? h.custRate : null) ?? null;
       addDoc(
         rateId,
         // Each line keeps its own Tax flag (a returned non-taxable line is not a taxable sale).
-        lines
-          .filter((l) => l.docId === h.id)
-          .map((l) => ({ ...l, taxable: rateId !== null && l.taxable !== false, taxRateId: null })),
+        (lines.get(h.id) ?? []).map((l) => ({ ...l, taxable: rateId !== null && l.taxable !== false, taxRateId: null })),
         Money.of(1),
         -1,
       );

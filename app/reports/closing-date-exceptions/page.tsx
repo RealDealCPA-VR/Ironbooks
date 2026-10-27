@@ -6,12 +6,19 @@ import { getPageContext } from '@/lib/context';
 import { formatCurrency } from '@/lib/money';
 import { closingDateExceptionReport } from '@/lib/services/accountant/auditReports';
 import ReportToolbar, { type ExportTable } from '../_components/ReportToolbar';
-// The change's own day and time on this computer's calendar and clock (they were UTC).
-import { localDateTime, localDayRange } from '@/lib/reports/dates';
+// The change's own day and time on the company's calendar and clock (they were UTC): the same
+// time zone the report service reads the From / To days in (Preferences).
+import { localDateTime } from '@/lib/reports/dates';
+import { getPreferences } from '@/lib/services/preferences';
 
 export const dynamic = 'force-dynamic';
 
 const OP_LABEL: Record<string, string> = { post: 'Added', void: 'Voided', reclassify: 'Reclassified' };
+
+/** A typed day; the report reads it in the company's time zone. */
+function day(v: string | undefined): string | undefined {
+  return v && /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : undefined;
+}
 
 export default async function ClosingDateExceptionsPage({
   searchParams,
@@ -20,7 +27,8 @@ export default async function ClosingDateExceptionsPage({
 }) {
   const ctx = await getPageContext('/reports/closing-date-exceptions');
   const p = await searchParams;
-  const report = await closingDateExceptionReport(ctx, localDayRange(p.from, p.to));
+  const { timezone } = await getPreferences(ctx);
+  const report = await closingDateExceptionReport(ctx, { from: day(p.from), to: day(p.to) });
 
   const exportTable: ExportTable = {
     filename: 'closing-date-exceptions',
@@ -36,7 +44,7 @@ export default async function ClosingDateExceptionsPage({
       { header: 'Amount', numeric: true },
     ],
     rows: report.rows.map((r) => [
-      localDateTime(r.at),
+      localDateTime(r.at, timezone),
       r.user ?? '',
       r.source === 'override' ? OP_LABEL[r.operation] ?? r.operation : 'Entered after close',
       r.entryNumber ?? '',
@@ -93,7 +101,7 @@ export default async function ClosingDateExceptionsPage({
               )}
               {report.rows.map((r) => (
                 <Tr key={`${r.auditLogId ?? 'je'}-${r.entryId}`}>
-                  <Td className="whitespace-nowrap">{localDateTime(r.at)}</Td>
+                  <Td className="whitespace-nowrap">{localDateTime(r.at, timezone)}</Td>
                   <Td>{r.user ?? '—'}</Td>
                   <Td>
                     {r.source === 'override' ? (

@@ -16,7 +16,7 @@ import Decimal from 'decimal.js';
 import { bills, expenses, recurringTemplates, vendors } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, validation } from './_base';
-import { createTemplate, type Frequency } from './recurring';
+import { advanceDate, createTemplate, type Frequency } from './recurring';
 import { getBill } from './bills';
 import { getExpense } from './expenses';
 import { payeeKey } from '@/lib/ai/categorizer';
@@ -62,13 +62,14 @@ function median(xs: number[]): number {
   return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
 }
 
+/**
+ * The next occurrence, exactly as a memorized transaction advances (recurring.advanceDate): on
+ * the document's own calendar day (dates are UTC calendar days), clamped to the month end. Local
+ * setMonth/setDate moved a bill dated the 1st to the 28th-30th west of UTC and rolled Jan 31 into
+ * March.
+ */
 function addFrequency(d: Date, f: Frequency): Date {
-  const n = new Date(d);
-  if (f === 'weekly') n.setDate(n.getDate() + 7);
-  else if (f === 'monthly') n.setMonth(n.getMonth() + 1);
-  else if (f === 'quarterly') n.setMonth(n.getMonth() + 3);
-  else n.setFullYear(n.getFullYear() + 1);
-  return n;
+  return advanceDate(d, f) ?? d;
 }
 
 /** Pure detector over a list of documents — exported for unit tests. */

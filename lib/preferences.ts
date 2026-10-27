@@ -586,6 +586,45 @@ export function todayInTimeZone(timeZone: string | null | undefined, now: Date =
   }
 }
 
+/**
+ * The instant a calendar day 'YYYY-MM-DD' starts (or, with `end`, its last millisecond) in a time
+ * zone — for filtering real timestamps (audit trail: "changed on/after Oct 26") by the company's
+ * calendar day. UTC midnight is 8 pm the evening before in New York, so a void made at 9 pm on
+ * the 26th fell outside "to Oct 26". Undefined for a malformed day; UTC on a bad zone.
+ */
+export function zonedDayBound(day: string, timeZone: string | null | undefined, end = false): Date | undefined {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec((day ?? '').trim());
+  if (!m) return undefined;
+  const [y, mo, d] = [Number(m[1]), Number(m[2]) - 1, Number(m[3])];
+  const probe = new Date(Date.UTC(y, mo, d));
+  if (probe.getUTCFullYear() !== y || probe.getUTCMonth() !== mo || probe.getUTCDate() !== d) return undefined;
+  // Wall-clock midnight starting the day (or the next day, for the end bound), read as UTC.
+  const wall = Date.UTC(y, mo, end ? d + 1 : d);
+  let fmt: Intl.DateTimeFormat;
+  try {
+    fmt = new Intl.DateTimeFormat('en-US', {
+      timeZone: timeZone || 'UTC',
+      hourCycle: 'h23',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    });
+  } catch {
+    fmt = new Intl.DateTimeFormat('en-US', { timeZone: 'UTC', hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  }
+  /** The zone's offset from UTC at instant t (ms; negative west of UTC). */
+  const offsetAt = (t: number) => {
+    const p = Object.fromEntries(fmt.formatToParts(new Date(t)).map((x) => [x.type, x.value]));
+    return Date.UTC(Number(p.year), Number(p.month) - 1, Number(p.day), Number(p.hour), Number(p.minute), Number(p.second)) - t;
+  };
+  let t = wall - offsetAt(wall);
+  t = wall - offsetAt(t); // second pass: the offset at the result itself (DST changeover days)
+  return new Date(end ? t - 1 : t);
+}
+
 /** Add days to a 'YYYY-MM-DD' calendar date (UTC arithmetic: no DST drift). */
 export function addDaysIso(iso: string, days: number): string {
   const d = new Date(`${iso.slice(0, 10)}T00:00:00Z`);
