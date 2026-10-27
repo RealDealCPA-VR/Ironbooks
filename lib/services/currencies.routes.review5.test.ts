@@ -34,6 +34,7 @@ import { createCompany } from './company';
 import { POST as currenciesPOST } from '@/app/api/currencies/route';
 import { POST as fxAdjPOST } from '@/app/api/currencies/fx-adjustment/route';
 import { GET as hcaGET, DELETE as hcaDELETE } from '@/app/api/currencies/home-currency-adjustment/[id]/route';
+import { POST as hcaPOST } from '@/app/api/currencies/home-currency-adjustment/route';
 
 let db: DB;
 let owner: string;
@@ -118,5 +119,15 @@ describe('currency API routes (review5)', () => {
     expect((await hcaGET(req('GET', '/api/currencies/home-currency-adjustment/not-a-uuid'), params)).status).toBe(404);
     as('DELETE', '/api/currencies/home-currency-adjustment/[id]');
     expect((await hcaDELETE(req('DELETE', '/api/currencies/home-currency-adjustment/not-a-uuid'), params)).status).toBe(404);
+  });
+
+  it('POST /api/currencies/home-currency-adjustment: an impossible date or a memo that is not text is a 400', async () => {
+    as('POST', '/api/currencies/home-currency-adjustment');
+    const url = '/api/currencies/home-currency-adjustment';
+    // "Feb 30" used to be taken as March 2 (JavaScript rolls the day over).
+    expect((await hcaPOST(req('POST', url, { date: '2026-02-30', preview: true }))).status).toBe(400);
+    // A memo that is not text used to crash the post (memo.trim is not a function -> 500).
+    expect((await hcaPOST(req('POST', url, { date: '2026-03-31', memo: 5 }))).status).toBe(400);
+    expect((await hcaPOST(req('POST', url, { date: '2026-03-31', preview: true }))).status).toBe(200);
   });
 });
