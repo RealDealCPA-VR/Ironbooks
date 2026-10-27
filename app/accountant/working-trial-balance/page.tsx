@@ -5,7 +5,7 @@ import { Scale, Plus } from 'lucide-react';
 import { Badge, Button, Card, Input, Label, Modal, PageHeader, Select, Table, Td, Th, Tr, toast, toastError } from '@/components/ui';
 import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
-import { type AccountOpt, BackToCenter, accountLabel, money, today, useList } from '../_shared';
+import { type AccountOpt, BackToCenter, accountLabel, money, thisYearStart, today, useList } from '../_shared';
 
 interface Row {
   accountId: string;
@@ -32,13 +32,9 @@ interface AdjLine {
   memo: string;
 }
 
-function yearStart(): string {
-  return `${new Date().getUTCFullYear()}-01-01`;
-}
-
 export default function WorkingTrialBalancePage() {
   const accounts = useList<AccountOpt>('/api/accounts');
-  const [from, setFrom] = useState(yearStart());
+  const [from, setFrom] = useState(thisYearStart());
   const [to, setTo] = useState(today());
   const [data, setData] = useState<Wtb | null>(null);
   const [loading, setLoading] = useState(false);
