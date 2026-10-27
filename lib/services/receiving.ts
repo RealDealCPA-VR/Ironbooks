@@ -28,6 +28,7 @@
  * Voiding such a bill (bills.voidBill -> receivingLinks.releaseReceiptBilling) reverses the
  * entry and restores receipt/PO quantities and any inventory cost adjustment.
  */
+import { systemAccountIdByCode, systemAccountIdOrNull } from './accountRoles';
 import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
 import {
   accounts,
@@ -318,12 +319,10 @@ interface PlannedLine extends ReceiptBillLinePreview {
 }
 
 async function accountIdByCode(ctx: ServiceContext, code: string): Promise<string> {
-  const [row] = await ctx.db
-    .select({ id: accounts.id })
-    .from(accounts)
-    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, code)));
-  if (!row) throw notFound(`Account with code ${code}`);
-  return row.id;
+  // The system numbers (2000 A/P, 1300 Inventory Asset, 5000 COGS, 2200 Sales Tax Payable, 2300
+  // Payroll Liabilities) resolve by role, so a chart converted from QuickBooks with other numbers
+  // posts to the right account (lib/services/accountRoles.ts). Other numbers: as before.
+  return systemAccountIdByCode(ctx, code);
 }
 
 /** Placeholder account id used by previews before the PPV account exists. */
@@ -697,11 +696,10 @@ async function planReceiptBill(ctx: ServiceContext, input: EnterReceiptBillInput
     fallbackAccrual ??= dryRun ? await findAccrualAccountOrPlaceholder(ctx) : await getOrCreateAccrualAccount(ctx);
     l.accrualAccountId = fallbackAccrual;
   }
-  const [apRow] = await ctx.db
-    .select({ id: accounts.id })
-    .from(accounts)
-    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, '2000')));
-  if (!apRow) throw notFound('Accounts Payable account (code 2000)');
+  // By role, not by number (lib/services/accountRoles.ts): the A/P account bills post to.
+  const apId = await systemAccountIdOrNull(ctx, 'accounts_payable');
+  if (!apId) throw notFound('Accounts Payable account (code 2000)');
+  const apRow = { id: apId };
   // A variance / inventory account on A/P would merge into the bill's own A/P line below and
   // put an amount on A/P that the bill (and so A/P aging) does not carry (QB invariant I11).
   if (planned.some((l) => l.varianceAccountId === apRow.id || l.inventoryAccountId === apRow.id)) {

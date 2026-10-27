@@ -20,6 +20,7 @@
  *
  * averageCost is maintained as a weighted average: updated on positive receipts only.
  */
+import { systemAccountIdByCode, systemAccountIdOrNull } from './accountRoles';
 import { and, asc, eq, exists, inArray, sql } from 'drizzle-orm';
 import { onOrBeforeDay } from './journal';
 import Decimal from 'decimal.js';
@@ -248,12 +249,10 @@ export async function adjustmentPostingFields(
 
 /** Resolve an account id by code for the current company. Throws NOT_FOUND. */
 async function accountIdByCode(ctx: ServiceContext, code: string): Promise<string> {
-  const [row] = await ctx.db
-    .select({ id: accounts.id })
-    .from(accounts)
-    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, code)));
-  if (!row) throw notFound(`Account with code ${code}`);
-  return row.id;
+  // The system numbers (2000 A/P, 1300 Inventory Asset, 5000 COGS, 2200 Sales Tax Payable, 2300
+  // Payroll Liabilities) resolve by role, so a chart converted from QuickBooks with other numbers
+  // posts to the right account (lib/services/accountRoles.ts). Other numbers: as before.
+  return systemAccountIdByCode(ctx, code);
 }
 
 /** Load an item scoped to the company. Throws NOT_FOUND. */
@@ -1345,11 +1344,8 @@ async function inventoryAccountMap(
 ): Promise<Map<string, string | null>> {
   let defaultAccountId: string | null = null;
   if (rows.some((r) => !r.assetAccountId)) {
-    const [acct] = await ctx.db
-      .select({ id: accounts.id })
-      .from(accounts)
-      .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, '1300')));
-    defaultAccountId = acct?.id ?? null;
+    // The Inventory Asset account by role (lib/services/accountRoles.ts), the one postings use.
+    defaultAccountId = await systemAccountIdOrNull(ctx, 'inventory_asset');
   }
   return new Map(rows.map((r) => [r.id, r.assetAccountId ?? defaultAccountId]));
 }

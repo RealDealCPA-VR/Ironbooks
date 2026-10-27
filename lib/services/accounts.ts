@@ -5,6 +5,7 @@
  * see lib/accountTypes.ts). Callers may pass either a QB `qbType` (preferred — what the UI picker
  * sends) or the stored (type, subtype) pair; both are validated against each other.
  */
+import { isSystemAccount } from './accountRoles';
 import { and, asc, eq, sql } from 'drizzle-orm';
 import { accountSubtypeEnum, accounts, companies, journalEntries, journalEntryLines } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
@@ -386,6 +387,14 @@ export async function updateAccount(
   const before = await getAccount(ctx, id);
   // Accountant's Copy (I1): client can't edit accounts the accountant is working with.
   await assertAccountChangeAllowed(ctx, id, { deactivate: patch.isActive === false && before.isActive });
+  // An account Ironbooks posts to on its own (A/P, Undeposited Funds, Sales Tax Payable, ... by
+  // number or by role) must stay active: the next invoice, bill or paycheck would otherwise post to
+  // a hidden account, or fail. Merge refuses the same (lib/services/merge.ts).
+  if (patch.isActive === false && before.isActive && (await isSystemAccount(ctx, before))) {
+    throw validation(
+      `"${before.code} ${before.name}" is an account Ironbooks posts to on its own (invoices, bills, payments, inventory, sales tax or payroll), so it can't be made inactive. To use another account for it, choose that account under Company > System Accounts first.`,
+    );
+  }
   let type: AccountType = before.type;
   let subtype: string = before.subtype;
   if (patch.qbType) {

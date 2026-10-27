@@ -14,6 +14,7 @@
  * reference the correct A/R / A/P accounts; only the customer/vendor FK on the
  * sub-ledger documents is updated. The GL and trial balance remain balanced.
  */
+import { isSystemAccount } from './accountRoles';
 import { and, eq, inArray, like, sql } from 'drizzle-orm';
 import {
   bouncedChecks,
@@ -584,7 +585,9 @@ export async function mergeAccounts(
   // reconciliation, Home Currency Adjustment read them); QB only merges accounts in the same
   // currency.
   await assertSameCurrency(ctx, fromRow.currency, toRow.currency, `"${fromRow.name}" and "${toRow.name}"`);
-  if (CODE_POSTED_ACCOUNTS.has(fromRow.code)) {
+  // By number, or the account a role resolves to (lib/services/accountRoles.ts — a converted chart's
+  // "20000 Accounts Payable").
+  if (CODE_POSTED_ACCOUNTS.has(fromRow.code) || (await isSystemAccount(ctx, fromRow))) {
     throw validation(
       `"${fromRow.code} ${fromRow.name}" is an account Ironbooks posts to on its own (invoices, bills, payments, inventory, sales tax or payroll), so it is the one to keep. Merge "${toRow.code} ${toRow.name}" into it instead — you can rename it afterwards.`,
     );

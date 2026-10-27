@@ -137,8 +137,8 @@ describe('L14: review snapshots refuse impossible dates', () => {
 
 describe('L7: the Calendar leaves void orders out of "entered"', () => {
   it('void sales and purchase orders are not listed', async () => {
-    const so = await createSalesOrder(ctx, { customerId, date: D('2026-06-10'), lines: [{ description: 'Widget', quantity: 1, rate: '5.00', accountId: acct['4000'] }] });
-    const keep = await createSalesOrder(ctx, { customerId, date: D('2026-06-10'), lines: [{ description: 'Gadget', quantity: 1, rate: '6.00', accountId: acct['4000'] }] });
+    const so = await createSalesOrder(ctx, { customerId, date: D('2026-06-10'), lines: [{ description: 'Widget', quantity: 1, rate: '5.00' }] });
+    const keep = await createSalesOrder(ctx, { customerId, date: D('2026-06-10'), lines: [{ description: 'Gadget', quantity: 1, rate: '6.00' }] });
     await updateSalesOrderStatus(ctx, so.id, 'void');
     const po = await createPurchaseOrder(ctx, { vendorId, date: D('2026-06-10'), lines: [{ description: 'Bolts', quantity: 1, rate: '4.00', accountId: acct.e1 }] as never });
     await updatePurchaseOrderStatus(ctx, po.id, 'void');

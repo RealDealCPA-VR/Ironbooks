@@ -28,6 +28,7 @@ import { createManualEntry } from '../journal';
 import { requirePermission } from '../access';
 import type { Area } from '@/lib/permissions/model';
 import { getClosingDateSettings } from '../company';
+import { systemAccountIdOrNull } from '../accountRoles';
 import { BATCH_ENTER_TYPES, type BatchEnterRow, type BatchEnterType } from './batchEnterParse';
 import {
   type BatchLookupLists,
@@ -110,7 +111,9 @@ export async function batchEnterLookups(ctx: ServiceContext): Promise<BatchEnter
   requirePermission(ctx, 'accounting', 'create');
   const lists = await loadLists(ctx);
   const closing = await getClosingDateSettings(ctx);
-  const ap = lists.accounts.find((a) => a.code === '2000');
+  // The account bills really post to (by role — lib/services/accountRoles.ts).
+  const apId = await systemAccountIdOrNull(ctx, 'accounts_payable');
+  const ap = lists.accounts.find((a) => a.id === apId);
   return {
     ...lists,
     closingDate: closing.closingDate,

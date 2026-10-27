@@ -46,6 +46,7 @@
  * to the GL — through postJournalEntry, like every other document — with a
  * sourceRef of `iif:…` so re-importing the same file skips duplicates.
  */
+import { systemAccountIdOrNull } from './accountRoles';
 import { createHash } from 'node:crypto';
 import Papa from 'papaparse';
 import { and, eq, like } from 'drizzle-orm';
@@ -2284,7 +2285,8 @@ async function importItemRow(
   }
   // The file already brings in the inventory asset account's balance: create the stock (layer,
   // quantity, average cost) without posting it again.
-  const assetIdForStock = assetAccountId ?? lookup.byCode.get('1300')?.id ?? null;
+  // Items without their own asset account stock into the Inventory Asset account by role.
+  const assetIdForStock = assetAccountId ?? (await systemAccountIdOrNull(ctx, 'inventory_asset')) ?? lookup.byCode.get('1300')?.id ?? null;
   const ledgerCarried = !!opening && !!assetIdForStock && !!input.carriedAccountIds?.has(assetIdForStock);
 
   try {

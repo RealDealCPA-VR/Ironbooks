@@ -16,6 +16,7 @@
  *      (b) reclassifySalesTaxPayment — post a correcting entry Dr 2200 Sales Tax Payable / Cr the
  *          expense account, stamped "tax_agency:<id>", so the money counts as a tax payment.
  */
+import { systemAccountIdOrNull } from '../accountRoles';
 import { and, eq, inArray, sql } from 'drizzle-orm';
 import {
   accounts,
@@ -58,12 +59,10 @@ async function loadAgency(ctx: ServiceContext, agencyId: string) {
  */
 export async function agencyLiabilityAccountId(ctx: ServiceContext, agencyId: string): Promise<string> {
   await loadAgency(ctx, agencyId);
-  const [row] = await ctx.db
-    .select({ id: accounts.id })
-    .from(accounts)
-    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, SALES_TAX_PAYABLE_CODE)));
-  if (!row) throw validation('Sales Tax Payable (2200) is missing from the chart of accounts.');
-  return row.id;
+  // The Sales Tax Payable account by role (lib/services/accountRoles.ts): where the sales put it.
+  const id = await systemAccountIdOrNull(ctx, 'sales_tax_payable');
+  if (!id) throw validation(`Sales Tax Payable (${SALES_TAX_PAYABLE_CODE}) is missing from the chart of accounts.`);
+  return id;
 }
 
 // ---------------------------------------------------------------------------

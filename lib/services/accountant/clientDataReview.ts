@@ -48,6 +48,7 @@ import { applyToBill } from '../vendorCredits';
 import { journalOpenItems, resolveEntityNames } from '../journal';
 import { requirePermission } from '../access';
 import { isIsoDate } from '@/lib/onboarding';
+import { systemAccountIdOrNull } from '../accountRoles';
 
 export const REVIEW_TASKS = [
   { key: 'unapplied_customer_credits', group: 'Customers', title: 'Fix unapplied customer payments and credits' },
@@ -234,11 +235,10 @@ async function itemSetup(ctx: ServiceContext): Promise<ReviewIssue[]> {
 }
 
 async function payrollLiabilityMispayments(ctx: ServiceContext): Promise<ReviewIssue[]> {
-  const [acct] = await ctx.db
-    .select({ id: accounts.id })
-    .from(accounts)
-    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, '2300')));
-  if (!acct) return [];
+  // The Payroll Liabilities account by role (lib/services/accountRoles.ts), the one paychecks use.
+  const liabId = await systemAccountIdOrNull(ctx, 'payroll_liabilities');
+  if (!liabId) return [];
+  const acct = { id: liabId };
   const rows = await ctx.db
     .select({
       lineId: journalEntryLines.id,

@@ -29,6 +29,7 @@
  * restoring stock), re-creates the lines, and re-posts — all inside ONE
  * transaction — preserving invoiceNumber and createdAt.
  */
+import { systemAccountIdByCode } from './accountRoles';
 import { assertAccountantDatesOpen, assertAccountantMayBillCosts } from './accountantCopy/guard';
 import { hasAccountantCost } from './accountantCopy/inventoryCost';
 import { and, eq, inArray, isNull, ne, or, sql } from 'drizzle-orm';
@@ -377,12 +378,10 @@ export async function getInvoiceCustomFieldDefs(
 
 /** Look up an account id by code, scoped to the company. Throws NOT_FOUND. */
 async function accountIdByCode(ctx: ServiceContext, code: string): Promise<string> {
-  const [row] = await ctx.db
-    .select({ id: accounts.id })
-    .from(accounts)
-    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, code)));
-  if (!row) throw notFound(`Account with code ${code}`);
-  return row.id;
+  // The system numbers (2000 A/P, 1300 Inventory Asset, 5000 COGS, 2200 Sales Tax Payable, 2300
+  // Payroll Liabilities) resolve by role, so a chart converted from QuickBooks with other numbers
+  // posts to the right account (lib/services/accountRoles.ts). Other numbers: as before.
+  return systemAccountIdByCode(ctx, code);
 }
 
 /** Look up an account by code, creating it if missing (for accounts older companies may lack). */

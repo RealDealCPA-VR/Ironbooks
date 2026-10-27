@@ -11,6 +11,7 @@
  * pay-from account, voidable, one check per tax agency when several agencies are paid at once.
  * The journal entry stays the ledger record (sales tax: sourceRef "tax_agency:<agencyId>").
  */
+import { systemAccountIdByCodeOrNull } from './accountRoles';
 import { and, desc, eq, inArray, ne, sql } from 'drizzle-orm';
 import { isBankAccount } from '@/lib/accountTypes';
 import {
@@ -55,14 +56,12 @@ const CODE_PAYROLL_LIABILITIES = '2300';
 
 /** Resolve an account ID by code for this company. Throws VALIDATION when missing. */
 async function accountIdByCode(ctx: ServiceContext, code: string): Promise<string> {
-  const [row] = await ctx.db
-    .select({ id: accounts.id })
-    .from(accounts)
-    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, code)));
-  if (!row) {
+  // 2200 Sales Tax Payable / 2300 Payroll Liabilities resolve by role (lib/services/accountRoles.ts).
+  const id = await systemAccountIdByCodeOrNull(ctx, code);
+  if (!id) {
     throw validation(`Required account ${code} not found in this company's chart of accounts.`);
   }
-  return row.id;
+  return id;
 }
 
 /**

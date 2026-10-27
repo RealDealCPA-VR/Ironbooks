@@ -43,6 +43,7 @@ import { type ServiceContext, ServiceError, inTransaction, notFound, validation,
 import { allowLedgerRewrite } from '../posting';
 import { applyDocumentSync, type DocSyncPlan, planDocumentSync } from './reclassifySync';
 import { assertPeriodOpen, recordClosingDateException } from '../fiscalPeriods';
+import { systemAccountIds } from '../accountRoles';
 
 const CONTROL_SUBTYPES = new Set([
   'checking',
@@ -63,6 +64,9 @@ export async function controlAccountIds(ctx: ServiceContext): Promise<Set<string
   const ids = new Set(
     rows.filter((a) => CONTROL_SUBTYPES.has(a.subtype as string) || CONTROL_CODES.has(a.code)).map((a) => a.id),
   );
+  // The accounts the roles resolve to (a converted chart's Sales Tax Payable / Payroll Liabilities
+  // under other numbers — lib/services/accountRoles.ts) are control accounts too.
+  for (const id of (await systemAccountIds(ctx)).values()) ids.add(id);
   const banks = await ctx.db
     .select({ id: bankAccounts.accountId })
     .from(bankAccounts)

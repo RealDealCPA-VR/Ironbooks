@@ -14,6 +14,7 @@
  * default as inventory.adjustInventory / fifo.ts), with optional Class and Customer:Job on the
  * adjustment line.
  */
+import { systemAccountIdByCode } from './accountRoles';
 import { and, asc, eq, gte, inArray, isNotNull, notInArray, sql } from 'drizzle-orm';
 import Decimal from 'decimal.js';
 import {
@@ -61,12 +62,10 @@ import { assertDefaultSiteQuantities } from './inventorySites';
 
 /** Resolve an account id by code for the current company. Throws NOT_FOUND. */
 async function accountIdByCode(ctx: ServiceContext, code: string): Promise<string> {
-  const [row] = await ctx.db
-    .select({ id: accounts.id })
-    .from(accounts)
-    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, code)));
-  if (!row) throw notFound(`Account with code ${code}`);
-  return row.id;
+  // The system numbers (2000 A/P, 1300 Inventory Asset, 5000 COGS, 2200 Sales Tax Payable, 2300
+  // Payroll Liabilities) resolve by role, so a chart converted from QuickBooks with other numbers
+  // posts to the right account (lib/services/accountRoles.ts). Other numbers: as before.
+  return systemAccountIdByCode(ctx, code);
 }
 
 /**
