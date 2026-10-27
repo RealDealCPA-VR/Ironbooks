@@ -276,7 +276,9 @@ export async function deactivateVendor(ctx: ServiceContext, id: string) {
     newValues: { isActive: false },
   });
 
-  return row;
+  // Masked like every other vendor read: DELETE /api/vendors/:id returned the raw row, so a user
+  // whose role hides tax IDs / account numbers read the vendor's full SSN/EIN by making it inactive.
+  return maskForContext(ctx, row);
 }
 
 

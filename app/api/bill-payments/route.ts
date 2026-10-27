@@ -34,7 +34,7 @@ import { serviceErrorBody, serviceErrorStatus } from '@/lib/routeErrors';
 import { getServerContext } from '@/lib/context';
 import { payBillsWithCredits, listBillPayments } from '@/lib/services/billPayments';
 import { ServiceError } from '@/lib/services/_base';
-import { zodErrorBody } from '@/lib/validation/helpers';
+import { queryInt, zodErrorBody } from '@/lib/validation/helpers';
 import { payBillsSchema } from '@/lib/validation/billPayments';
 
 // Map ServiceError codes to HTTP status codes.
@@ -50,8 +50,9 @@ export async function GET(req: NextRequest) {
     const { searchParams } = req.nextUrl;
 
     const vendorId = searchParams.get('vendorId') ?? undefined;
-    const limit    = searchParams.has('limit')  ? Number(searchParams.get('limit'))  : undefined;
-    const offset   = searchParams.has('offset') ? Number(searchParams.get('offset')) : undefined;
+    // limit=-1 reached Postgres as "LIMIT -1" (HTTP 500); clamp like every other list route.
+    const limit = queryInt(searchParams, 'limit', 100, 1000);
+    const offset = queryInt(searchParams, 'offset', 0);
 
     const payments = await listBillPayments(ctx, { vendorId, limit, offset });
     return NextResponse.json({ payments });

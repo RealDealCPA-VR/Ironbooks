@@ -31,6 +31,7 @@ import {
 } from '@/lib/services/expenses';
 import { ServiceError } from '@/lib/services/_base';
 import { createExpenseSchema } from '@/lib/validation/expenses';
+import { queryInt } from '@/lib/validation/helpers';
 
 function errorStatus(code: string): number {
   return serviceErrorStatus(code);
@@ -62,8 +63,9 @@ export async function GET(req: NextRequest) {
       paymentAccountId: searchParams.get('paymentAccountId') ?? undefined,
       toPrint: searchParams.get('toPrint') === 'true' || undefined,
       includeVoided: searchParams.get('includeVoided') === 'true',
-      limit: searchParams.has('limit') ? Number(searchParams.get('limit')) : undefined,
-      offset: searchParams.has('offset') ? Number(searchParams.get('offset')) : undefined,
+      // A negative / non-numeric limit reached Postgres as "LIMIT -1" (HTTP 500).
+      limit: queryInt(searchParams, 'limit', 200, 1000),
+      offset: queryInt(searchParams, 'offset', 0),
     });
     return NextResponse.json({ expenses: rows });
   } catch (err) {

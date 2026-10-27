@@ -533,6 +533,11 @@ export async function checkPrintData(
   source: PrintSource,
   id: string,
 ): Promise<CheckPrintData> {
+  // A check is a negotiable instrument: never print one for a transaction that was voided (by
+  // another user while it sat in the print queue, or a stale Reprint) or that is not a check at
+  // all (a credit card charge, a cash expense, an ACH bill payment) — the PDF used to come out as
+  // a signed-ready check for the full original amount.
+  const voided = () => new ServiceError('CONFLICT', 'This check is void, so it cannot be printed.');
   if (source === 'expense') {
     const [row] = await ctx.db
       .select({ e: expenses, v: vendors, o: otherNames })
@@ -541,6 +546,12 @@ export async function checkPrintData(
       .leftJoin(otherNames, eq(expenses.otherNameId, otherNames.id))
       .where(and(eq(expenses.companyId, ctx.companyId), eq(expenses.id, id)));
     if (!row) throw notFound('Check');
+    if (row.e.voidedAt) throw voided();
+    if (row.e.method !== 'check') {
+      throw validation(
+        `Only checks can be printed. This is a ${row.e.method === 'credit_card' ? 'credit card charge' : 'cash expense'}.`,
+      );
+    }
     const lines = await ctx.db
       .select({ l: expenseLines, code: accounts.code, name: accounts.name, itemName: items.name })
       .from(expenseLines)
@@ -569,6 +580,8 @@ export async function checkPrintData(
       .leftJoin(vendors, eq(billPayments.vendorId, vendors.id))
       .where(and(eq(billPayments.companyId, ctx.companyId), eq(billPayments.id, id)));
     if (!row) throw notFound('Bill payment');
+    if (row.p.voidedAt) throw voided();
+    if (row.p.method !== 'check') throw validation('Only bill payments made by check can be printed as a check.');
     const apps = await ctx.db
       .select({ a: billPaymentApplications, billNumber: bills.billNumber, billDate: bills.date })
       .from(billPaymentApplications)
@@ -625,6 +638,15 @@ export async function checkPrintData(
       .where(and(eq(paymentChecks.companyId, ctx.companyId), eq(paymentChecks.id, id)));
     if (!row) throw notFound('Check');
     const c = row.c;
+    if (c.voidedAt) throw voided();
+    if (c.postedEntryId) {
+      // Voided another way (the credit memo's refund, Void journal entry, Batch Void).
+      const [entry] = await ctx.db
+        .select({ status: journalEntries.status })
+        .from(journalEntries)
+        .where(and(eq(journalEntries.id, c.postedEntryId), eq(journalEntries.companyId, ctx.companyId)));
+      if (entry?.status === 'void') throw voided();
+    }
     // Voucher detail: the liability lines of the entry (sales tax agency, payroll items) or the
     // refund itself.
     const lines = c.postedEntryId
@@ -675,6 +697,10 @@ export async function checkPrintData(
     .innerJoin(employees, eq(paychecks.employeeId, employees.id))
     .where(and(eq(paychecks.companyId, ctx.companyId), eq(paychecks.id, id)));
   if (!row) throw notFound('Paycheck');
+  if (row.p.voidedAt) throw voided();
+  if (row.p.entryType !== 'paycheck') {
+    throw validation('A year-to-date summary or a liability adjustment is not a paycheck, so it cannot be printed.');
+  }
   const lines = await ctx.db.select().from(paycheckLines).where(eq(paycheckLines.paycheckId, id));
   return {
     payee: `${row.first} ${row.last}`.trim(),

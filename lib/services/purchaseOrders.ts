@@ -463,6 +463,15 @@ async function updateStatusInTx(ctx: ServiceContext, id: string, status: 'open' 
   if (!po) throw notFound('Purchase order');
   await assertDividingDateOpen(ctx, po.date); // Accountant's Copy (I1)
 
+  // Close on a voided purchase order turned it back into a closed order (listed with its full
+  // amount on the purchase order reports and its PDF). Only Undo of the void reopens it ('open').
+  if (po.status === 'void') {
+    if (status === 'void') return po; // idempotent
+    if (status === 'closed') {
+      throw new ServiceError('CONFLICT', 'This purchase order is void, so it cannot be closed.');
+    }
+  }
+
   if (po.status === 'closed' && status !== 'closed') {
     throw new ServiceError(
       'CONFLICT',
@@ -747,9 +756,12 @@ export async function convertToBill(
       newValues: {
         status: newStatus,
         billId: bill.id,
-        billedQuantities: plan.map(({ line, qty }) => ({
+        // billLineOrder: the bill line that billed it (createBill keeps the plan's order), so an
+        // edit of the bill can move the PO's billed quantity with it (syncPoBillingForBillEdit).
+        billedQuantities: plan.map(({ line, qty }, i) => ({
           lineId: line.id,
           quantity: qty.toFixed(4),
+          billLineOrder: i,
         })),
       },
     });
@@ -765,7 +777,22 @@ export async function convertToBill(
  * which is written in the same transaction as the claim. A PO whose status the user set by hand
  * (e.g. closed early) keeps it; otherwise the status is recomputed from the lines.
  */
-export async function releasePoBillingForBill(ctx: ServiceContext, billId: string): Promise<void> {
+/** One purchase-order line quantity a bill holds (its conversion claim, net of later bill edits). */
+export interface PoBillClaim {
+  poId: string;
+  lineId: string;
+  /** The bill line (lineOrder) that bills it. */
+  billLineOrder: number;
+  quantity: ReturnType<typeof Money.zero>;
+}
+
+/**
+ * The PO line quantities a bill holds: convertToBill's audit row ({ billId, billedQuantities }) plus
+ * the signed adjustments a later edit of the bill recorded (syncPoBillingForBillEdit), netted per
+ * PO line and bill line, in PO order. Rows written before billLineOrder was recorded map by their
+ * position in the conversion (createBill keeps that order).
+ */
+export async function poClaimsForBill(ctx: ServiceContext, billId: string): Promise<PoBillClaim[]> {
   const rows = await ctx.db
     .select({ entityId: auditLogs.entityId, newValues: auditLogs.newValues })
     .from(auditLogs)
@@ -776,12 +803,169 @@ export async function releasePoBillingForBill(ctx: ServiceContext, billId: strin
         sql`${auditLogs.newValues}->>'billId' = ${billId}`,
         sql`${auditLogs.newValues}->'billedQuantities' IS NOT NULL`,
       ),
-    );
+    )
+    .orderBy(asc(auditLogs.createdAt));
+  const net = new Map<string, PoBillClaim>();
   for (const row of rows) {
-    const poId = row.entityId;
-    const nv = (row.newValues ?? {}) as { billedQuantities?: Array<{ lineId?: string; quantity?: string }> };
-    const claims = (nv.billedQuantities ?? []).filter((c) => c.lineId && Money.of(c.quantity ?? 0).greaterThan(0));
-    if (!poId || claims.length === 0) continue;
+    const nv = (row.newValues ?? {}) as {
+      billedQuantities?: Array<{ lineId?: string; quantity?: string; billLineOrder?: number }>;
+    };
+    (nv.billedQuantities ?? []).forEach((c, i) => {
+      if (!row.entityId || !c.lineId) return;
+      let qty;
+      try {
+        qty = Money.of(c.quantity ?? 0);
+      } catch {
+        return; // malformed history
+      }
+      const billLineOrder = Number.isInteger(c.billLineOrder) ? (c.billLineOrder as number) : i;
+      const key = `${row.entityId}|${c.lineId}|${billLineOrder}`;
+      const prev = net.get(key);
+      net.set(key, { poId: row.entityId, lineId: c.lineId, billLineOrder, quantity: (prev?.quantity ?? Money.zero()).plus(qty) });
+    });
+  }
+  return [...net.values()];
+}
+
+/**
+ * A bill made from a purchase order is being edited (call INSIDE updateBill's transaction, with
+ * the bill's saved lines and the new ones): the PO's billed quantity follows the bill. QB updates
+ * the P.O.'s "Rcv'd" column when such a bill's quantity changes; the PO used to keep the original
+ * claim (a bill cut from 10 to 6 units left the P.O. closed with 10 billed, so the 4 still owed
+ * could never be billed, and its received figure overstated what came in).
+ *
+ * The PO line stays tied to the bill line that billed it: that line must stay on the bill with the
+ * same item (its quantity, cost and account may change). The vendor can't change.
+ */
+export async function syncPoBillingForBillEdit(
+  ctx: ServiceContext,
+  input: {
+    billId: string;
+    vendorChanged: boolean;
+    oldLines: ReadonlyArray<{ lineOrder: number; itemId: string | null; quantity: string }>;
+    newLines: ReadonlyArray<{ itemId: string | null; quantity: string }>;
+  },
+): Promise<void> {
+  const claims = (await poClaimsForBill(ctx, input.billId)).filter((c) => c.quantity.greaterThan(0));
+  if (claims.length === 0) return;
+  const poIds = [...new Set(claims.map((c) => c.poId))];
+  const pos = await ctx.db
+    .select()
+    .from(purchaseOrders)
+    .where(and(eq(purchaseOrders.companyId, ctx.companyId), inArray(purchaseOrders.id, poIds)));
+  const poById = new Map(pos.map((p) => [p.id, p] as const));
+  const label = (poId: string) => {
+    const p = poById.get(poId);
+    return p ? `purchase order #${p.refNumber || p.poNumber}` : 'a purchase order';
+  };
+  if (input.vendorChanged) {
+    throw new ServiceError(
+      'CONFLICT',
+      `This bill was created from ${label(claims[0].poId)}, so its vendor can't change. Void it and enter the other vendor's bill instead.`,
+    );
+  }
+  // 1. Validate every PO-linked line and work out how far each PO line's billed quantity moves.
+  const oldByOrder = new Map(input.oldLines.map((l) => [l.lineOrder, l] as const));
+  const deltas = new Map<string, Array<{ claim: PoBillClaim; delta: ReturnType<typeof Money.zero> }>>();
+  for (const c of claims) {
+    const before = oldByOrder.get(c.billLineOrder);
+    const after = input.newLines[c.billLineOrder];
+    if (!before || !after || (after.itemId ?? null) !== (before.itemId ?? null)) {
+      throw new ServiceError(
+        'CONFLICT',
+        `Line ${c.billLineOrder + 1} of this bill was billed from ${label(c.poId)}. Keep it on the bill with the same item (you can change its quantity, cost or account); to remove or replace it, void the bill and create it from the purchase order again.`,
+      );
+    }
+    const newQty = Money.of(after.quantity);
+    if (newQty.equals(Money.of(before.quantity))) continue;
+    const delta = newQty.minus(c.quantity);
+    if (delta.isZero()) continue;
+    const list = deltas.get(c.poId) ?? [];
+    list.push({ claim: c, delta });
+    deltas.set(c.poId, list);
+  }
+  if (deltas.size === 0) return;
+
+  // 2. Move the counters (guarded: never past the ordered quantity or below zero) and re-derive
+  //    the PO status; a status the user set by hand (closed early) is kept, as on a bill void.
+  const { enhancedReceiving } = await getReceivingSettings(ctx);
+  const linesOf = async (poId: string) =>
+    ctx.db
+      .select({
+        quantity: purchaseOrderLines.quantity,
+        quantityBilled: purchaseOrderLines.quantityBilled,
+        quantityReceivedUnbilled: purchaseOrderLines.quantityReceivedUnbilled,
+      })
+      .from(purchaseOrderLines)
+      .where(eq(purchaseOrderLines.purchaseOrderId, poId));
+  for (const [poId, changes] of deltas) {
+    const po = poById.get(poId);
+    if (!po) continue;
+    const derivedBefore = poStatusFromLines(await linesOf(poId), enhancedReceiving);
+    for (const { claim: c, delta } of changes) {
+      const d = delta.toFixed(4);
+      const moved = await ctx.db
+        .update(purchaseOrderLines)
+        .set({ quantityBilled: sql`${purchaseOrderLines.quantityBilled} + ${d}::numeric` })
+        .where(
+          and(
+            eq(purchaseOrderLines.id, c.lineId),
+            eq(purchaseOrderLines.purchaseOrderId, c.poId),
+            sql`${purchaseOrderLines.quantityBilled} + ${d}::numeric <= ${purchaseOrderLines.quantity}`,
+            sql`${purchaseOrderLines.quantityBilled} + ${d}::numeric >= 0`,
+          ),
+        )
+        .returning({ id: purchaseOrderLines.id });
+      if (moved.length === 0) {
+        const [pl] = await ctx.db.select().from(purchaseOrderLines).where(eq(purchaseOrderLines.id, c.lineId));
+        const open = pl ? Money.of(pl.quantity).minus(Money.of(pl.quantityBilled ?? '0')) : Money.zero();
+        throw validation(
+          `Line ${c.billLineOrder + 1}: ${label(c.poId)} has ${c.quantity.plus(open).toFixed(2)} on order for this line that this bill can take (${c.quantity.toFixed(2)} billed here, ${open.toFixed(2)} not yet billed). Change the purchase order first to bill more.`,
+        );
+      }
+    }
+    const derivedAfter = poStatusFromLines(await linesOf(poId), enhancedReceiving);
+    const status = po.status !== derivedBefore ? po.status : derivedAfter;
+    await ctx.db
+      .update(purchaseOrders)
+      .set({
+        status: status as never,
+        ...(status !== 'closed' && po.convertedBillId === input.billId ? { convertedBillId: null } : {}),
+        ...(status === 'closed' && !po.convertedBillId ? { convertedBillId: input.billId } : {}),
+      })
+      .where(and(eq(purchaseOrders.id, poId), eq(purchaseOrders.companyId, ctx.companyId)));
+    // The signed adjustment, read back by poClaimsForBill (a later edit or the bill's void).
+    await writeAudit(ctx, {
+      action: 'update',
+      entityType: 'purchase_order',
+      entityId: poId,
+      oldValues: { status: po.status },
+      newValues: {
+        status,
+        reason: 'bill_edited',
+        billId: input.billId,
+        billedQuantities: changes.map(({ claim, delta }) => ({
+          lineId: claim.lineId,
+          quantity: delta.toFixed(4),
+          billLineOrder: claim.billLineOrder,
+        })),
+      },
+    });
+  }
+}
+
+export async function releasePoBillingForBill(ctx: ServiceContext, billId: string): Promise<void> {
+  // Net per PO line across the conversion and any later edits of the bill.
+  const byPo = new Map<string, Array<{ lineId: string; quantity: string }>>();
+  for (const c of await poClaimsForBill(ctx, billId)) {
+    if (!c.quantity.greaterThan(0)) continue;
+    const list = byPo.get(c.poId) ?? [];
+    const same = list.find((x) => x.lineId === c.lineId);
+    if (same) same.quantity = Money.of(same.quantity).plus(c.quantity).toFixed(4);
+    else list.push({ lineId: c.lineId, quantity: c.quantity.toFixed(4) });
+    byPo.set(c.poId, list);
+  }
+  for (const [poId, claims] of byPo) {
     const [po] = await ctx.db
       .select()
       .from(purchaseOrders)

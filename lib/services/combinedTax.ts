@@ -65,7 +65,11 @@ export async function setComponents(
     if (!c || typeof c !== 'object') throw validation(`Component ${i + 1}: enter a name and a rate.`);
     if (typeof c.name !== 'string' || !c.name.trim()) throw validation(`Component ${i + 1}: name is required.`);
     // NaN / Infinity / text are refused (NaN used to be stored and taxed every invoice NaN).
-    const r = parseTaxRateFraction(c.rate, `Component ${i + 1}: rate`);
+    // Rounded to the 6 places the column stores BEFORE the combined rate is summed: the total was
+    // the sum of the unrounded rates, so components typed past 6 decimals (0.0000005 + 0.0000005)
+    // stored as 0.000001 each under a combined 0.000001 — the agencies' shares no longer added up
+    // to the rate the invoices charged.
+    const r = Money.of(parseTaxRateFraction(c.rate, `Component ${i + 1}: rate`).toFixed(6));
     return { name: c.name.trim(), agencyId: c.agencyId ?? null, rate: r };
   });
   // The combined rate is the sum of its components and must itself be a valid rate.

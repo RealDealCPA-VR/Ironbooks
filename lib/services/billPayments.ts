@@ -777,7 +777,10 @@ export async function updateBillPayment(ctx: ServiceContext, id: string, input: 
     if (!reference && input.method === 'check' && !toPrint && (await isBankPayFrom(tx, input.paymentAccountId))) {
       reference = keep ?? (await allocateCheckNumber(tx, { paymentAccountId: input.paymentAccountId, exclude: { source: 'bill_payment', id }, allowDuplicate: true }));
     }
-    if (reference && input.method === 'check' && input.checkDuplicateNumber && reference !== (cur.reference ?? '').trim()) {
+    // The number already on this check is re-checked only when it moves to another bank account
+    // (a check 1005 moved onto an account that already has a 1005 was saved as a duplicate).
+    const sameCheck = reference === (cur.reference ?? '').trim() && cur.paymentAccountId === input.paymentAccountId;
+    if (reference && input.method === 'check' && input.checkDuplicateNumber && !sameCheck) {
       await assertCheckNumberAvailable(tx, {
         paymentAccountId: input.paymentAccountId,
         number: reference,
@@ -1073,6 +1076,15 @@ export async function billIdsForPayments(ctx: ServiceContext, paymentIds: string
  *  4. Stamp voidedAt on the bill payment.
  */
 export async function voidBillPayment(ctx: ServiceContext, id: string) {
+  // Load + validate in the same transaction as the void (as voidBill / voidExpense do): a payment
+  // edited at the same moment gets a NEW journal entry, and a void working from the row it read
+  // before that edit voided the old (already void) entry — the payment ended up void, its bills
+  // open again, but the edited payment's entry stayed posted (A/P and the bank no longer matched
+  // the bills). A second, double-submitted void also sees the payment already void.
+  return inTransaction(ctx, (tx) => voidBillPaymentInTx(tx, id));
+}
+
+async function voidBillPaymentInTx(ctx: ServiceContext, id: string) {
   const [payment] = await ctx.db
     .select()
     .from(billPayments)

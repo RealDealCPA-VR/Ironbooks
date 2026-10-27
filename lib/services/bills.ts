@@ -1223,6 +1223,17 @@ export async function updateBill(ctx: ServiceContext, id: string, input: CreateB
       }
     }
 
+    // A bill made from a purchase order: the PO's billed quantities follow the edited lines (and
+    // its PO-linked lines must stay on the bill). Imported lazily: purchaseOrders.ts imports this
+    // module (createBill).
+    const { syncPoBillingForBillEdit } = await import('./purchaseOrders');
+    await syncPoBillingForBillEdit(tx, {
+      billId: id,
+      vendorChanged: bill.vendorId !== input.vendorId,
+      oldLines,
+      newLines: prep.resolvedLines,
+    });
+
     // 1) Void the original journal entry (assertPeriodOpen runs on its date).
     if (bill.postedEntryId) {
       await voidJournalEntry(tx, bill.postedEntryId);

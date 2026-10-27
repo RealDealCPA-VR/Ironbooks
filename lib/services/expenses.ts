@@ -673,7 +673,11 @@ export async function updateExpense(ctx: ServiceContext, id: string, input: Crea
           (cur.method === 'check' ? cur.reference?.trim() : null) ||
           (await allocateCheckNumber(tx, { paymentAccountId: input.paymentAccountId, exclude: { source: 'expense', id }, allowDuplicate: true }));
       }
-      if (reference && input.checkDuplicateNumber && reference !== (cur.reference ?? '').trim()) {
+      // A number already on this check is only re-checked when it lands on another bank account:
+      // check 1005 moved from Checking to Payroll Checking, where a check 1005 already exists, was
+      // saved as a silent duplicate (the account's register then had two checks 1005).
+      const sameCheck = reference === (cur.reference ?? '').trim() && cur.paymentAccountId === input.paymentAccountId;
+      if (reference && input.checkDuplicateNumber && !sameCheck) {
         await assertCheckNumberAvailable(tx, {
           paymentAccountId: input.paymentAccountId,
           number: reference,
