@@ -358,6 +358,8 @@ export type GlobalCommand =
   | 'transfer'
   /** Ctrl+O: copy the highlighted register transaction (Ctrl+V pastes it on the blank line). */
   | 'copy-transaction'
+  /** Ctrl+V on a register's blank line after Ctrl+O; anywhere else Ctrl+V pastes text. */
+  | 'paste-transaction'
   /** Ctrl+U: use the list item — take the picker's highlighted entry, or "use" a list row. */
   | 'use'
   /** F2 / Ctrl+1: Product Information. */
@@ -455,6 +457,12 @@ export const GLOBAL_SHORTCUTS: ShortcutDef[] = [
     command: 'copy-transaction',
     inFields: false,
     description: 'In a register: copy the highlighted transaction (Ctrl+V on the blank line pastes it)',
+  },
+  {
+    keys: 'Ctrl+V',
+    ctrlKey: 'v',
+    command: 'paste-transaction',
+    description: "In a register, after Ctrl+O: paste the transaction on the blank line (elsewhere it pastes text)",
   },
   { keys: 'Ctrl+U', ctrlKey: 'u', command: 'use', description: 'Use the highlighted list item' },
   { keys: 'Ctrl+1', ctrlKey: '1', command: 'product-info', description: 'Product Information' },
@@ -678,6 +686,41 @@ export function altLetter(e: KeyLike): string | null {
   return letterOf(e);
 }
 
+/**
+ * QuickBooks Desktop's menu-bar letters: Alt+F File, Alt+E Edit, Alt+V View, Alt+L Lists,
+ * Alt+A Favorites, Alt+C Company, Alt+U Customers, Alt+O Vendors, Alt+Y Employees, Alt+B Banking,
+ * Alt+R Reports, Alt+W Window, Alt+H Help (lib/qbShortcuts.ts has the sources). In an open form
+ * the form's buttons keep their letters (Alt+S, Alt+A, Alt+R, Alt+P, Alt+N).
+ */
+export const MENU_MNEMONICS: Readonly<Record<string, string>> = {
+  File: 'f',
+  Edit: 'e',
+  View: 'v',
+  Lists: 'l',
+  Favorites: 'a',
+  Company: 'c',
+  Customers: 'u',
+  Vendors: 'o',
+  Employees: 'y',
+  Banking: 'b',
+  Reports: 'r',
+  Window: 'w',
+  Help: 'h',
+};
+
+/** The menu (index in `menus`) an Alt+letter press opens, or -1. */
+export function menuForKey(e: KeyLike, menus: readonly string[]): number {
+  const letter = altLetter(e);
+  return letter ? menus.findIndex((m) => MENU_MNEMONICS[m] === letter) : -1;
+}
+
+/** The menu a plain letter opens while the menu bar has the keyboard (after Alt alone), or -1. */
+export function menuForLetter(e: KeyLike, menus: readonly string[]): number {
+  if (e.altKey || ctrlOrCmd(e)) return -1;
+  const letter = letterOf(e);
+  return letter ? menus.findIndex((m) => MENU_MNEMONICS[m] === letter) : -1;
+}
+
 /** Form-level actions QuickBooks users expect on every list / form page. */
 export type FormShortcutAction =
   | 'new'
@@ -721,6 +764,38 @@ export function formShortcutFor(e: KeyLike): FormShortcutAction | null {
   if (letter) return FORM_ALT_KEYS[letter] ?? null;
   if (key === 'Escape' && !ctrlOrCmd(e) && !e.altKey && !e.shiftKey) return 'cancel';
   return null;
+}
+
+/** Where a plain Enter was pressed, as enterRecordsForm needs it. */
+export interface EnterContext {
+  tag: string;
+  /** input type. */
+  type?: string;
+  /** An open picker list (aria-expanded="true") takes Enter for itself. */
+  expanded?: boolean;
+  /** In a line grid (data-grid-row): Enter goes down a line there. */
+  inGrid?: boolean;
+  /** In a list / register (data-list): Enter opens the row, or records the register's blank line. */
+  inList?: boolean;
+  /** In a real <form>: the browser submits it. */
+  inNativeForm?: boolean;
+}
+
+/** Input types where Enter is not "record": choices, buttons, search boxes. */
+const ENTER_SKIP_TYPES = new Set(['checkbox', 'radio', 'button', 'submit', 'reset', 'file', 'image', 'search', 'range', 'color']);
+
+/**
+ * QuickBooks: Enter in a field of a transaction records it (the form's Save & Close) — unless
+ * "Pressing Enter moves between fields" is on (components/PreferenceBehaviors.tsx takes Enter
+ * first then). Not in text areas (a new line), line grids (the next line), lists and registers,
+ * open picker lists, search boxes, or a real <form> (which submits itself).
+ */
+export function enterRecordsForm(e: KeyLike, c: EnterContext): boolean {
+  if (e.key !== 'Enter' || ctrlOrCmd(e) || e.altKey || e.shiftKey) return false;
+  if (c.expanded || c.inGrid || c.inList || c.inNativeForm) return false;
+  const tag = c.tag.toUpperCase();
+  if (tag === 'SELECT') return true;
+  return tag === 'INPUT' && !ENTER_SKIP_TYPES.has((c.type || 'text').toLowerCase());
 }
 
 export interface FormShortcutEnv {
@@ -1501,6 +1576,15 @@ const QUICK_REPORT_PARAM: Readonly<Record<QuickReportKind, string>> = {
  */
 export function quickReportHref(kind: QuickReportKind, id: string): string {
   return `/reports/std/transaction-detail-by-account?dates=all&${QUICK_REPORT_PARAM[kind]}=${encodeURIComponent(id)}`;
+}
+
+/**
+ * QB Ctrl+R / Ctrl+U ("Use Account") on the Chart of Accounts: a balance-sheet account opens its
+ * register; an income or expense account — which has no register in QuickBooks — its QuickReport.
+ * Rows carry it as data-register.
+ */
+export function accountRegisterHref(id: string, type: string): string {
+  return ['asset', 'liability', 'equity'].includes(type) ? `/registers/${encodeURIComponent(id)}` : quickReportHref('account', id);
 }
 
 export interface ListKeysOptions<T extends HTMLElement> {

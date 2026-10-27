@@ -9,7 +9,10 @@ import * as React from 'react';
 import { cn } from '@/lib/utils';
 import {
   adjustDateForKey,
+  buttonsIn,
   committedAmountText,
+  describeButton,
+  pickShortcutButton,
   stepDocNumber,
   useListKeys,
 } from '@/lib/shortcuts';
@@ -404,6 +407,160 @@ if (typeof document !== 'undefined') {
 /** Open <Modal> dialogs, oldest first (the last one owns Esc and the Tab trap). */
 const openModals: HTMLElement[] = [];
 
+// ---- Has this form been changed? ----
+
+const SNAPSHOT_FIELDS = 'input:not([type="hidden"]):not([type="file"]), select, textarea';
+
+/** The form's field values, in page order, as one string (fields in [data-nav-ignore] left out). */
+export function fieldSnapshot(scope: HTMLElement | null): string {
+  if (!scope) return '';
+  return Array.from(scope.querySelectorAll<HTMLInputElement>(SNAPSHOT_FIELDS))
+    .filter((el) => !el.closest('[data-nav-ignore]'))
+    .map((el) => (el.type === 'checkbox' || el.type === 'radio' ? String(el.checked) : el.value))
+    .join('\u0001');
+}
+
+/** Keys that never change a field: moving around, the window keys, Esc. */
+const NON_EDIT_KEYS = new Set([
+  'Tab', 'Shift', 'Control', 'Alt', 'Meta', 'CapsLock', 'Escape', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
+  'Home', 'End', 'PageUp', 'PageDown', 'ContextMenu', 'NumLock', 'ScrollLock', 'Pause', 'Insert',
+]);
+
+/** A key press that may change what the form holds (typing, deleting, pasting, a QuickBooks key). */
+export function isEditingKey(e: Pick<KeyboardEvent, 'key' | 'ctrlKey' | 'metaKey' | 'altKey'>): boolean {
+  if (/^F\d{1,2}$/.test(e.key) || (NON_EDIT_KEYS.has(e.key) && !(e.ctrlKey && e.key === 'Insert'))) return false;
+  const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+  if (e.ctrlKey || e.metaKey) return ['v', 'x', 'z', 'y', 'd', 'Delete', 'Insert', 'Backspace'].includes(k);
+  if (e.altKey) return false; // Alt+letter: buttons and menus (Alt+Down only opens a list)
+  return true;
+}
+
+export interface FormChangeTracker {
+  /** The form now differs from how it looked before the first edit. */
+  changed(): boolean;
+  /** A different record was loaded into the form: it counts as unchanged again. */
+  reset(): void;
+}
+
+const trackers = new WeakMap<HTMLElement, FormChangeTracker>();
+
+/**
+ * Whether the person has changed the form in `scope` (a dialog, a page form). How the form looked
+ * is noted at the first key press or click that can edit it — not when it opens, because a saved
+ * transaction's fields fill in over a moment, and the remembered default date and similar
+ * defaults are filled in by the app. One tracker per scope, shared by the Modal (Esc asks
+ * "record your changes?") and components/TransactionNav.tsx (Previous / Next / Revert).
+ */
+export function trackFormChanges(scope: HTMLElement): FormChangeTracker {
+  const existing = trackers.get(scope);
+  if (existing) return existing;
+  let baseline: string | null = null;
+  const note = () => {
+    if (baseline === null) baseline = fieldSnapshot(scope);
+  };
+  scope.addEventListener(
+    'keydown',
+    (e) => {
+      if (e.isTrusted && isEditingKey(e)) note();
+    },
+    true,
+  );
+  scope.addEventListener(
+    'pointerdown',
+    (e) => {
+      const t = e.target as HTMLElement | null;
+      if (t?.closest?.('input, select, textarea, label, [role="option"], [role="checkbox"], [role="switch"]')) note();
+    },
+    true,
+  );
+  scope.addEventListener('paste', note, true);
+  scope.addEventListener('drop', note, true);
+  const tracker: FormChangeTracker = {
+    changed: () => baseline !== null && fieldSnapshot(scope) !== baseline,
+    reset: () => {
+      baseline = null;
+    },
+  };
+  trackers.set(scope, tracker);
+  return tracker;
+}
+
+/** Whether the form in `scope` has been changed — false when nothing is tracking it yet. */
+export function formWasChanged(scope: HTMLElement): boolean {
+  return trackers.get(scope)?.changed() ?? false;
+}
+
+/** The button "Yes, record my changes" presses: the form's Save & Close, else its Save. */
+export function recordChangesButton(scope: HTMLElement): HTMLElement | null {
+  const els = buttonsIn(scope).filter(
+    (el) => !el.closest('[data-grid-row], [data-list] tbody tr, [data-nav-ignore]') && el.getAttribute('aria-label') !== 'Close',
+  );
+  const i = pickShortcutButton(els.map(describeButton), 'save-close');
+  return i >= 0 ? els[i] : null;
+}
+
+/** Ask the top dialog to close the way Esc does (Ctrl+F4, Window > Close Window). */
+export const CLOSE_DIALOG_EVENT = 'ironbooks:close-dialog';
+
+/**
+ * QuickBooks' question when a changed form is closed: "Do you want to record your changes?"
+ * Yes records (the form's Save button), No closes without saving, Cancel goes back to the form.
+ * Y / N answer too, as in a Windows message box; Esc is Cancel.
+ */
+export function RecordChangesPrompt({
+  open,
+  what,
+  onYes,
+  onNo,
+  onCancel,
+}: {
+  open: boolean;
+  /** The form's title ("Create Invoices"). */
+  what: string;
+  onYes: () => void;
+  onNo: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <Modal
+      open={open}
+      onClose={onCancel}
+      title="Record your changes?"
+      confirmChanges={false}
+      footer={
+        <div
+          className="flex gap-2"
+          onKeyDown={(e) => {
+            if (e.ctrlKey || e.metaKey || e.altKey) return;
+            if (e.key === 'y' || e.key === 'Y') {
+              e.preventDefault();
+              onYes();
+            } else if (e.key === 'n' || e.key === 'N') {
+              e.preventDefault();
+              onNo();
+            }
+          }}
+        >
+          <Button autoFocus onClick={onYes} data-shortcut="record-yes">
+            <span className="underline underline-offset-2">Y</span>es
+          </Button>
+          <Button variant="secondary" onClick={onNo} data-shortcut="record-no">
+            <span className="underline underline-offset-2">N</span>o
+          </Button>
+          <Button variant="secondary" onClick={onCancel} data-shortcut="record-cancel">
+            Cancel
+          </Button>
+        </div>
+      }
+    >
+      <p className="text-sm text-navy/70">
+        {what ? <>&ldquo;{what}&rdquo; has been changed. </> : 'This form has been changed. '}
+        Do you want to record your changes?
+      </p>
+    </Modal>
+  );
+}
+
 /** The element that had focus before focus moved into `dialog`, or null. */
 function openerOf(dialog: HTMLElement): HTMLElement | null {
   for (let i = focusHistory.length - 1; i >= 0; i--) {
@@ -414,6 +571,11 @@ function openerOf(dialog: HTMLElement): HTMLElement | null {
   return null;
 }
 
+/**
+ * A modal dialog. Esc, the × button, a click outside it and Ctrl+F4 close it — and when it holds
+ * a form the person has changed (trackFormChanges) and the form has a Save button, QuickBooks'
+ * "Do you want to record your changes?" comes first: Yes saves, No closes, Cancel stays.
+ */
 export function Modal({
   open,
   onClose,
@@ -421,6 +583,7 @@ export function Modal({
   children,
   footer,
   size = 'md',
+  confirmChanges = true,
 }: {
   open: boolean;
   onClose: () => void;
@@ -429,6 +592,8 @@ export function Modal({
   footer?: React.ReactNode;
   /** md = forms (default), lg = transaction modals with line grids, xl = wide editors. */
   size?: 'md' | 'lg' | 'xl';
+  /** Ask "record your changes?" before closing a changed form (default true). */
+  confirmChanges?: boolean;
 }) {
   const titleId = React.useId();
   const dialogRef = React.useRef<HTMLDivElement>(null);
@@ -437,6 +602,28 @@ export function Modal({
   // dialog is open (every keystroke in its fields) doesn't re-run the focus effect below.
   const onCloseRef = React.useRef(onClose);
   onCloseRef.current = onClose;
+  const [asking, setAsking] = React.useState(false);
+  const confirmRef = React.useRef(confirmChanges);
+  confirmRef.current = confirmChanges;
+
+  /** Close, asking first when the form was changed and can be saved. */
+  const attemptClose = React.useCallback(() => {
+    const dialog = dialogRef.current;
+    if (dialog && confirmRef.current && trackFormChanges(dialog).changed() && recordChangesButton(dialog)) {
+      setAsking(true);
+      return;
+    }
+    onCloseRef.current();
+  }, []);
+
+  React.useEffect(() => {
+    if (!open) setAsking(false);
+  }, [open]);
+
+  // Track changes from the moment the dialog is on screen.
+  React.useLayoutEffect(() => {
+    if (open && dialogRef.current) trackFormChanges(dialogRef.current);
+  }, [open]);
 
   // Escape-to-close + focus management (first field, trap inside the dialog, restore on close).
   React.useEffect(() => {
@@ -462,7 +649,7 @@ export function Modal({
       if (e.key === 'Escape') {
         if (e.defaultPrevented) return; // a picker inside used it to close its list
         e.stopPropagation();
-        onCloseRef.current();
+        attemptClose();
         return;
       }
       if (e.key !== 'Tab') return;
@@ -484,20 +671,28 @@ export function Modal({
         first.focus();
       }
     }
+    // Ctrl+F4 / Window > Close Window: the top dialog closes as with Esc.
+    function onCloseRequest(e: Event) {
+      if (openModals[openModals.length - 1] !== dialogRef.current || e.defaultPrevented) return;
+      e.preventDefault();
+      attemptClose();
+    }
     if (dialogEl) openModals.push(dialogEl);
     document.addEventListener('keydown', onKeyDown);
+    window.addEventListener(CLOSE_DIALOG_EVENT, onCloseRequest);
     return () => {
       document.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener(CLOSE_DIALOG_EVENT, onCloseRequest);
       const i = dialogEl ? openModals.lastIndexOf(dialogEl) : -1;
       if (i >= 0) openModals.splice(i, 1);
       restoreRef.current?.focus?.();
     };
-  }, [open]);
+  }, [open, attemptClose]);
 
   if (!open) return null;
   return (
     <div className="fixed inset-x-0 bottom-0 top-[var(--titlebar-h)] z-50 flex items-center justify-center p-4">
-      <div className="absolute inset-0 bg-black/30 backdrop-blur-[2px] animate-in fade-in duration-150" onClick={onClose} />
+      <div className="absolute inset-0 bg-black/30 backdrop-blur-[2px] animate-in fade-in duration-150" onClick={attemptClose} />
       <div
         ref={dialogRef}
         role="dialog"
@@ -513,9 +708,11 @@ export function Modal({
         <div className="flex items-center justify-between mb-4">
           <h2 id={titleId} className="text-lg font-semibold text-navy">{title}</h2>
           <button
-            onClick={onClose}
+            type="button"
+            onClick={attemptClose}
             aria-label="Close"
-            className="flex h-7 w-7 items-center justify-center rounded-full bg-slate-100 text-lg leading-none text-navy/50 transition-colors hover:bg-slate-200 hover:text-navy"
+            title="Close (Esc)"
+            className="flex h-7 w-7 items-center justify-center rounded-full bg-slate-100 text-lg leading-none text-navy/50 transition-colors hover:bg-slate-200 hover:text-navy outline-none focus-visible:ring-4 focus-visible:ring-electric/25"
           >
             &times;
           </button>
@@ -523,6 +720,27 @@ export function Modal({
         {children}
         {footer && <div className="mt-6 flex justify-end gap-2">{footer}</div>}
       </div>
+      {confirmChanges && (
+        <RecordChangesPrompt
+          open={asking}
+          what={title}
+          onYes={() => {
+            setAsking(false);
+            const dialog = dialogRef.current;
+            const btn = dialog ? recordChangesButton(dialog) : null;
+            // After the question has closed and handed the focus back: the field commits first.
+            window.setTimeout(() => {
+              (document.activeElement as HTMLElement | null)?.blur?.();
+              window.setTimeout(() => btn?.click(), 0);
+            }, 0);
+          }}
+          onNo={() => {
+            setAsking(false);
+            onCloseRef.current();
+          }}
+          onCancel={() => setAsking(false)}
+        />
+      )}
     </div>
   );
 }

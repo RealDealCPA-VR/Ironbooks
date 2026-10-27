@@ -310,6 +310,19 @@ export interface MyPreferences {
   showHomeWorkflow: boolean;
   /** p1 ux: 'simple' = everyday tasks only (default for new users); 'advanced' = every menu. */
   navMode: 'simple' | 'advanced';
+  /**
+   * QB Favorites menu (Alt+A in the desktop app): the pages this person put on it, in order
+   * (Favorites > Customize Favorites, components/FavoritesMenu.tsx).
+   */
+  favorites: string[];
+}
+
+/** Most pages on the Favorites menu (QuickBooks allows 30). */
+export const MAX_FAVORITES = 30;
+
+/** A Favorites entry: an in-app page path ('/invoices', '/reports/profit-loss'). */
+export function isFavoritePath(v: unknown): v is string {
+  return typeof v === 'string' && v.length <= 200 && /^\/[a-z0-9][a-z0-9\-/_]*$/i.test(v) && !v.includes('//');
 }
 
 export const DEFAULT_MY_PREFERENCES: MyPreferences = {
@@ -330,6 +343,7 @@ export const DEFAULT_MY_PREFERENCES: MyPreferences = {
   startWithPayee: true,
   showHomeWorkflow: true,
   navMode: 'simple',
+  favorites: [],
 };
 
 export const MY_PREFERENCE_KEYS = Object.keys(DEFAULT_MY_PREFERENCES) as (keyof MyPreferences)[];
@@ -563,6 +577,8 @@ export function resolveMyPreferences(stored: unknown): MyPreferences {
   // warnWhenDeleting is always on (lib/preferenceFields.ts `fixed`): deleting/voiding always asks.
   const my = { ...overlay(DEFAULT_MY_PREFERENCES, stored), warnWhenDeleting: true };
   if (my.navMode !== 'advanced') my.navMode = 'simple';
+  const favorites = Array.isArray(my.favorites) ? my.favorites.filter(isFavoritePath) : [];
+  my.favorites = [...new Set(favorites)].slice(0, MAX_FAVORITES);
   return my;
 }
 

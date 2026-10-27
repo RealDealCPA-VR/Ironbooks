@@ -25,6 +25,9 @@ import {
   transactionTarget,
 } from '@/lib/prefBehaviors';
 import { PAGE_FORM_KEYS, formKeyForSave, recallFormDate, rememberFormDate } from '@/lib/smartDefaults';
+import { COMPANY_RENAMED_EVENT, companyRenameFrom } from '@/lib/companyRename';
+import { resetPageFormChanges } from '@/components/LeaveGuard';
+import { nextTabStop } from '@/lib/keyboardTargets';
 
 const DATA_CHANGED_KEY = 'bka:dataChangedAt';
 
@@ -76,7 +79,12 @@ export default function PreferenceBehaviors() {
         }
         return true;
       },
-      after: (info) => {
+      after: (info, data) => {
+        // A renamed company: the header chip and the window title follow now, not after a reload.
+        const renamed = companyRenameFrom(info, data);
+        if (renamed) window.dispatchEvent(new CustomEvent(COMPANY_RENAMED_EVENT, { detail: renamed }));
+        // A page form that just saved (Write Checks, a register's blank line) holds nothing unsaved.
+        resetPageFormChanges();
         if (!recordsTransaction(info)) return;
         const p = ref.current;
         if (p.my.beepOnRecord) beep();
@@ -99,22 +107,20 @@ export default function PreferenceBehaviors() {
   React.useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
       if (!ref.current.my.enterMovesBetweenFields) return;
-      if (e.key !== 'Enter' || e.shiftKey || e.ctrlKey || e.metaKey || e.altKey || e.defaultPrevented) return;
+      if (e.key !== 'Enter' || e.shiftKey || e.ctrlKey || e.metaKey || e.altKey || e.defaultPrevented || e.isComposing) return;
       const el = e.target as HTMLElement | null;
-      if (!el || el.tagName !== 'INPUT') return;
+      if (!el || (el.tagName !== 'INPUT' && el.tagName !== 'SELECT')) return;
       const input = el as HTMLInputElement;
-      if (['checkbox', 'radio', 'submit', 'button', 'file'].includes(input.type)) return;
-      if (input.closest('[data-grid-row]')) return; // line grids: Enter already moves down a line
+      if (['checkbox', 'radio', 'submit', 'button', 'file', 'search'].includes(input.type)) return;
+      if (input.closest('[data-grid-row], [data-list]')) return; // line grids / registers: Enter moves down a line
       if (input.getAttribute('aria-expanded') === 'true') return; // an open picker list
-      const scope = input.closest('form, [role="dialog"]') ?? document.body;
-      const fields = Array.from(
-        scope.querySelectorAll<HTMLElement>('input, select, textarea'),
-      ).filter((f) => !(f as HTMLInputElement).disabled && f.offsetParent !== null && (f as HTMLInputElement).type !== 'hidden');
-      const i = fields.indexOf(input);
-      if (i >= 0 && i < fields.length - 1) {
-        e.preventDefault();
-        fields[i + 1].focus();
-      }
+      if (!input.closest('form, [role="dialog"], [data-shortcut-scope]')) return;
+      // Enter moves like Tab, in Tab order (onto the Save buttons after the last field); the
+      // form is recorded with Ctrl+Enter or the Save buttons.
+      e.preventDefault();
+      const next = nextTabStop(input, 1);
+      next?.focus();
+      if (next instanceof HTMLInputElement && next.type !== 'checkbox' && next.type !== 'radio') next.select?.();
     }
     const typed = new WeakSet<HTMLInputElement>();
     function onInput(e: Event) {

@@ -43,6 +43,8 @@ import { Button, Card, Input, Select, Label, toast, toastError } from '@/compone
 import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
 import { resolveCompanyPreferences } from '@/lib/preferences';
+import { UNSAVED_WORK_ATTR } from '@/lib/shortcuts';
+import { leaveOnPurpose } from '@/components/LeaveGuard';
 import { cn } from '@/lib/utils';
 import {
   BUSINESS_TYPES,
@@ -922,6 +924,7 @@ function Interview() {
     } catch {
       // Skipping must never trap the user (e.g. a role that can't change company settings).
     }
+    leaveOnPurpose(); // the person chose to skip: no "leave this page?" on the way out
     window.location.href = '/dashboard';
   }
 
@@ -941,7 +944,12 @@ function Interview() {
   ];
 
   return (
-    <main className="min-h-screen bg-offwhite p-4 sm:p-8 font-sans flex items-center justify-center">
+    <main
+      className="min-h-screen bg-offwhite p-4 sm:p-8 font-sans flex items-center justify-center"
+      // The answers live only on screen until the last step saves them: leaving from a menu,
+      // F5 or closing the window asks first (components/LeaveGuard.tsx, lib/shortcuts.ts).
+      {...(!done && step > 1 ? { [UNSAVED_WORK_ATTR]: '' } : {})}
+    >
       <div className="w-full max-w-lg">
         <div className="flex items-center justify-center gap-2 mb-8">
           <div className="h-9 w-9 rounded-xl bg-electric flex items-center justify-center">

@@ -4,12 +4,10 @@
  * the row / form commands (pickCommandButton), Ctrl+L / Alt+Down and QuickReport links.
  */
 import { describe, expect, it } from 'vitest';
+import { shortcutsHelpGroups } from './qbShortcuts';
 import {
-  DATE_KEY_HELP,
   FORM_ALT_KEYS,
   GLOBAL_SHORTCUTS,
-  LIST_KEY_HELP,
-  NUMBER_KEY_HELP,
   type KeyLike,
   altLetter,
   globalShortcutFor,
@@ -315,15 +313,18 @@ describe('quickReportHref (Ctrl+Q)', () => {
   });
 });
 
-describe('help tables for the new keys', () => {
-  it('document every date key', () => {
-    const keys = DATE_KEY_HELP.map((r) => r.keys).join(' | ');
-    for (const s of ['+ / -', 'T', 'W / K', 'M / H', 'Y / R', '[ / ]', "; / '"]) expect(keys).toContain(s);
+describe('the shortcuts help for these keys', () => {
+  const help = shortcutsHelpGroups({ desktop: false });
+  const keysIn = (id: string) => (help.find((g) => g.id === id)?.rows ?? []).map((r) => r.keys);
+
+  it('documents every date key under "Date fields on forms"', () => {
+    const keys = keysIn('date-fields');
+    for (const s of ['Alt+Down', '+ / -', 'T', 'W / K', 'M / H', 'Y / R', '[ / ]', "; / '"]) expect(keys).toContain(s);
   });
 
-  it('document the list and number-field keys', () => {
-    const list = LIST_KEY_HELP.map((r) => r.keys).join(' | ');
-    for (const s of ['Up / Down', 'Home / End', 'PgUp / PgDn', 'Enter', 'Ctrl+E / Ctrl+D']) expect(list).toContain(s);
-    expect(NUMBER_KEY_HELP.map((r) => r.keys)).toContain('+ / -');
+  it('documents the list keys and the number-field keys', () => {
+    const list = keysIn('lists');
+    for (const s of ['Up / Down, Home / End', 'Ctrl+Page Up / Ctrl+Page Down', 'Enter', 'Ctrl+E', 'Ctrl+D', 'Ctrl+Q', 'A…Z']) expect(list).toContain(s);
+    expect(keysIn('data-fields')).toContain('+ / -');
   });
 });

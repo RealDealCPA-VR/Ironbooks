@@ -6,6 +6,9 @@ import DesktopBridge from "@/components/DesktopBridge";
 import SandboxBanner from "@/components/SandboxBanner";
 import ClosingPasswordProvider from "@/components/ClosingPasswordProvider";
 import WindowTitleBar from "@/components/WindowTitleBar";
+import LeaveGuard from "@/components/LeaveGuard";
+import KeyboardBase from "@/components/KeyboardBase";
+import ShortcutsHelp from "@/components/ShortcutsHelp";
 import { ThemeSync } from "@/lib/useTheme";
 import { DEFAULT_THEME, THEME_BOOT_SCRIPT } from "@/lib/theme";
 
@@ -49,6 +52,11 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <AppShell>{children}</AppShell>
         <Toaster />
         <ClosingPasswordProvider />
+        {/* Keyboard on every screen (sign-in and the setup interview too): leaving a form asks
+            first, the QuickBooks field keys, and the F1 / ? Help window. */}
+        <LeaveGuard />
+        <KeyboardBase />
+        <ShortcutsHelp />
       </body>
     </html>
   );

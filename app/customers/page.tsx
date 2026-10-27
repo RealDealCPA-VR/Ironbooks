@@ -21,6 +21,7 @@ import {
   toast,
 } from '@/components/ui';
 import { quickReportHref } from '@/lib/shortcuts';
+import { listItemPrefill } from '@/lib/keyboardTargets';
 import { api, ApiError } from '@/lib/client';
 // wave2 prefs: default terms from Preferences + attachments on the record
 import { usePreferences } from '@/lib/usePreferences';
@@ -808,7 +809,7 @@ function CustomersPageContent() {
             </thead>
             <tbody>
               {customers.map((c) => (
-                <Tr key={c.id} data-quick-report={quickReportHref('customer', c.id)}>
+                <Tr key={c.id} data-quick-report={quickReportHref('customer', c.id)} data-use-prefill={listItemPrefill({ customerId: c.id })}>
                   <Td className="font-semibold text-navy">{c.displayName}</Td>
                   <Td className="text-navy/70">{c.companyName ?? '-'}</Td>
                   <Td className="text-navy/70">

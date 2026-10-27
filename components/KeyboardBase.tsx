@@ -5,6 +5,10 @@
  *
  *  - the QB date keys (+ - T W K M H Y R [ ] ; ') and Alt+Down (open the calendar) in EVERY date
  *    field — the kit's <Input type="date"> handles its own; any other date field is handled here;
+ *  - Tab / Shift+Tab leave a date field for the next / previous field, as in QuickBooks: the
+ *    browser's date box would otherwise stop on its month, day, year and calendar button first
+ *    (four Tabs per date on every form). Typing a date still fills it in, and Left / Right move
+ *    between its parts;
  *  - Ctrl+Z undoes a change the QuickBooks keys made (a date key, + / - on a number, QuickMath,
  *    a pasted line), which the field's own undo does not know about, and undoes typing in a date
  *    field (which has no undo of its own); typing elsewhere keeps the field's own undo;
@@ -18,6 +22,7 @@
  */
 import * as React from 'react';
 import { adjustDateForKey, historyGuarded, isCalendarKey } from '@/lib/shortcuts';
+import { nextTabStop } from '@/lib/keyboardTargets';
 
 /** The browser keys (Ctrl + letter) the app takes away from the browser when it has no use for them. */
 const BROWSER_CTRL_LETTERS = new Set(['d', 'e', 'f', 'g', 'h', 'j', 'k', 'l', 'n', 'o', 'p', 'r', 's', 'u']);
@@ -103,6 +108,24 @@ export default function KeyboardBase() {
       if (e.isComposing) return;
       const target = e.target as HTMLElement | null;
       const ctrl = e.ctrlKey || e.metaKey;
+
+      // ---- Tab out of a date field: one Tab stop, like every other field ----
+      if (
+        target instanceof HTMLInputElement &&
+        target.type === 'date' &&
+        e.key === 'Tab' &&
+        !ctrl &&
+        !e.altKey &&
+        !e.defaultPrevented
+      ) {
+        const to = nextTabStop(target, e.shiftKey ? -1 : 1);
+        if (to) {
+          e.preventDefault();
+          to.focus();
+          if (to instanceof HTMLInputElement && /^(text|search|tel|url|email|number|)$/.test(to.type)) to.select?.();
+        }
+        return;
+      }
 
       // ---- date fields not drawn by the kit's <Input> ----
       if (target instanceof HTMLInputElement && target.type === 'date' && !e.defaultPrevented && !target.readOnly && !target.disabled) {

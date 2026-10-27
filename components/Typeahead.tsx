@@ -97,10 +97,11 @@ export const Typeahead = React.forwardRef<HTMLInputElement, TypeaheadProps>(func
         setActive((i) => moveHighlight(i, results.length, e.key as 'ArrowDown' | 'ArrowUp' | 'Home' | 'End'));
         return;
       case 'Enter':
-        if (active >= 0 && results[active]) {
-          e.preventDefault();
-          choose(results[active]);
-        } else setOpen(false);
+        // An open list owns Enter: it takes the highlighted entry, or just closes (keeping the
+        // typed text). Only the next Enter records the form (components/FormShortcuts.tsx).
+        e.preventDefault();
+        if (active >= 0 && results[active]) choose(results[active]);
+        else setOpen(false);
         return;
       case 'Tab':
         if (active >= 0 && results[active]) choose(results[active]);

@@ -11,18 +11,19 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
-  LIST_KEY_HELP,
   NAVIGATE_REQUEST_EVENT,
   type KeyLike,
   evaluateAmountDecimal,
   evaluateAmountExpression,
   formatAmountResult,
   isReloadKey,
+  leaveRisk,
   listKeyAction,
   mightLoseWork,
   navigateGuarded,
   nextListIndex,
 } from './shortcuts';
+import { shortcutsHelpGroups } from './qbShortcuts';
 import { Money } from './money';
 
 /** What an amount field shows after QuickMath commits (components/ui.tsx AmountInput). */
@@ -78,14 +79,30 @@ describe('QuickMath rounds like the books', () => {
 // item from the desktop menu bar (Banking > Write Checks, File > Back Up…) or a page from the
 // command bar (Ctrl+K) pushed the new page straight away: the open invoice was silently lost.
 
-/** A stand-in for document.querySelectorAll('[role="dialog"][data-modal]'). */
-const docWith = (dialogs: Array<{ hasField: boolean }>) => ({
-  querySelectorAll: () =>
-    dialogs.map((d) => ({ querySelector: () => (d.hasField ? {} : null) })) as unknown as NodeListOf<HTMLElement>,
+/**
+ * A stand-in for the document: its form dialogs ('[role="dialog"][data-modal]') and whether a page
+ * says it holds unsaved answers ('[data-unsaved-work]', the setup interview).
+ */
+const docWith = (dialogs: Array<{ hasField: boolean }>, unsavedPage = false) => ({
+  querySelectorAll: (sel: string) =>
+    (sel.includes('data-unsaved-work')
+      ? unsavedPage
+        ? [{}]
+        : []
+      : dialogs.map((d) => ({ querySelector: () => (d.hasField ? {} : null) }))) as unknown as NodeListOf<HTMLElement>,
 });
-/** A stand-in for a focused element. */
-const el = (tagName: string, opts: { inMain?: boolean; type?: string } = {}) =>
-  ({ tagName, type: opts.type ?? 'text', isContentEditable: false, closest: (sel: string) => (sel === 'main' && opts.inMain ? {} : null) }) as unknown as EventTarget;
+/** A stand-in for a focused element ('main' / '[data-shell-chrome]' ancestors as asked). */
+const el = (tagName: string, opts: { inMain?: boolean; type?: string; chrome?: boolean; connected?: boolean } = {}) =>
+  ({
+    tagName,
+    type: opts.type ?? 'text',
+    isContentEditable: false,
+    isConnected: opts.connected ?? true,
+    closest: (sel: string) => {
+      if (sel.includes('data-shell-chrome')) return opts.chrome ? {} : null;
+      return sel.includes('main') && opts.inMain ? {} : null;
+    },
+  }) as unknown as Element;
 
 describe('mightLoseWork', () => {
   it('an open form dialog with fields could lose work, wherever the focus is', () => {
@@ -101,10 +118,41 @@ describe('mightLoseWork', () => {
     expect(mightLoseWork(el('BUTTON', { inMain: true }), docWith([{ hasField: false }]))).toBe(false);
     expect(mightLoseWork(null, docWith([]))).toBe(false);
   });
+
+  it('a ticked checkbox on the page counts as work (Pay Bills, Make Deposits)', () => {
+    expect(mightLoseWork(el('INPUT', { inMain: true, type: 'checkbox' }), docWith([]))).toBe(true);
+    expect(mightLoseWork(el('INPUT', { inMain: true, type: 'radio' }), docWith([]))).toBe(true);
+    expect(mightLoseWork(el('INPUT', { inMain: true, type: 'submit' }), docWith([]))).toBe(false);
+  });
+
+  it('a page that says it holds unsaved answers (the setup interview) could lose work', () => {
+    expect(mightLoseWork(null, docWith([], true))).toBe(true);
+    expect(mightLoseWork(el('BUTTON', { inMain: true }), docWith([], true))).toBe(true);
+  });
+});
+
+describe('leaveRisk: the command bar and the title-bar menus judge by the field the cursor was in', () => {
+  const field = el('INPUT', { inMain: true });
+  it('focus in the command bar (shell chrome) with a field typed in just before: at risk', () => {
+    expect(leaveRisk(el('INPUT', { inMain: false, chrome: true }), field, docWith([]))).toBe(true);
+    // A title-bar menu button (outside main), as after a mouse click on the menu bar.
+    expect(leaveRisk(el('BUTTON', { inMain: false }), field, docWith([]))).toBe(true);
+  });
+
+  it('focus back on the page (a button, nothing typed) or no field remembered: not at risk', () => {
+    expect(leaveRisk(el('BUTTON', { inMain: true }), field, docWith([]))).toBe(false);
+    expect(leaveRisk(el('INPUT', { inMain: false, chrome: true }), null, docWith([]))).toBe(false);
+  });
+
+  it('a remembered field that has left the page (another page is showing) does not count', () => {
+    expect(leaveRisk(el('BUTTON', { inMain: false }), el('INPUT', { inMain: true, connected: false }), docWith([]))).toBe(false);
+  });
 });
 
 describe('navigateGuarded (desktop menus, command bar)', () => {
-  it('hands the page to the app shell, which asks before leaving a form', () => {
+  // The leave / stay decision itself is tested with the real guard in a browser engine:
+  // test/dom/leaveGuard.dom.tsx (test/leaveGuardDom.test.ts).
+  it('hands the page to the leave-this-form guard, which decides', () => {
     const shell = new EventTarget();
     const asked: string[] = [];
     shell.addEventListener(NAVIGATE_REQUEST_EVENT, (e) => {
@@ -114,13 +162,16 @@ describe('navigateGuarded (desktop menus, command bar)', () => {
     const pushed: string[] = [];
     expect(navigateGuarded('/expenses?new=1', (h) => pushed.push(h), shell)).toBe(true);
     expect(asked).toEqual(['/expenses?new=1']);
-    expect(pushed).toEqual([]); // the shell decides (confirm first when work could be lost)
+    expect(pushed).toEqual([]);
   });
 
-  it('goes straight there when no app shell is listening (sign-in screens)', () => {
+  it('with no guard listening (unit tests only: it is on every page) it goes straight there, through `go` when given', () => {
     const pushed: string[] = [];
     expect(navigateGuarded('/backup', (h) => pushed.push(h), new EventTarget())).toBe(false);
+    const went: string[] = [];
+    navigateGuarded('/invoices', (h) => pushed.push(h), new EventTarget(), { go: (h) => went.push(h) });
     expect(pushed).toEqual(['/backup']);
+    expect(went).toEqual(['/invoices']);
   });
 });
 
@@ -151,7 +202,8 @@ describe('Ctrl+PgUp / Ctrl+PgDn in a list', () => {
   });
 
   it('the shortcuts help lists them', () => {
-    expect(LIST_KEY_HELP.map((r) => r.keys).join(' | ')).toContain('Ctrl+PgUp / Ctrl+PgDn');
+    const lists = shortcutsHelpGroups({ desktop: false }).find((g) => g.id === 'lists');
+    expect(lists?.rows.map((r) => r.keys)).toContain('Ctrl+Page Up / Ctrl+Page Down');
   });
 });
 
@@ -173,10 +225,7 @@ describe('F5 with typed work on screen', () => {
     expect(isReloadKey(key('F1'))).toBe(false);
   });
 
-  it('the app shell asks before reloading when work could be lost', async () => {
-    const fs = await import('node:fs');
-    const shell = fs.readFileSync('components/AppShell.tsx', 'utf8');
-    expect(shell).toMatch(/isReloadKey\(e\) && !e\.repeat && mightLoseWork\(e\.target\)\) \{\s*e\.preventDefault\(\);\s*setReloadAsk\(true\)/);
-    expect(shell).toContain('title="Reload this window?"');
-  });
+  // What F5 does — asks over typed work, refreshes the page in place, and never lets a held-down
+  // F5 through to the window's reload — is tested by pressing F5 on the real guard in a browser
+  // engine: test/dom/leaveGuard.dom.tsx (test/leaveGuardDom.test.ts).
 });

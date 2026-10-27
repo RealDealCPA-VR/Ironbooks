@@ -2,7 +2,7 @@
 import * as React from 'react';
 import { useRouter } from './next-navigation';
 
-type Props = React.AnchorHTMLAttributes<HTMLAnchorElement> & { href: string | { pathname?: string }; prefetch?: boolean };
+type Props = Omit<React.AnchorHTMLAttributes<HTMLAnchorElement>, 'href'> & { href: string | { pathname?: string }; prefetch?: boolean };
 
 const Link = React.forwardRef<HTMLAnchorElement, Props>(function Link({ href, prefetch: _p, onClick, ...rest }, ref) {
   const router = useRouter();

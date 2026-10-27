@@ -17,11 +17,13 @@
  * "Could be lost" is lib/shortcuts.ts leaveRisk: a form dialog is open, a page holds unsaved
  * answers (data-unsaved-work), or the cursor is in a field on the page — or was, just before the
  * command bar or the title-bar menu took the focus (remembered here), so the mouse and the
- * keyboard paths ask alike.
+ * keyboard paths ask alike — or a form on the page (Write Checks, a register's blank line) has
+ * been changed, wherever the cursor is now (trackFormChanges, started when a field there first
+ * takes the focus).
  */
 import * as React from 'react';
 import { usePathname, useRouter } from 'next/navigation';
-import { ConfirmDialog } from '@/components/ui';
+import { ConfirmDialog, formWasChanged, trackFormChanges } from '@/components/ui';
 import {
   NAVIGATE_REQUEST_EVENT,
   PAGE_REFRESH_EVENT,
@@ -41,11 +43,22 @@ declare global {
   }
 }
 
+/** A reload the person already agreed to (no second "leave this page?" from the browser). */
+let reloadingOnPurpose = false;
+
+/** The page is about to leave because the person chose to (a "Skip" button): don't ask again. */
+export function leaveOnPurpose() {
+  reloadingOnPurpose = true;
+}
+
 /** Start the page over in place (components/PageRefresh.tsx), else reload the window. */
 export function refreshNow() {
   const ev = new Event(PAGE_REFRESH_EVENT, { cancelable: true });
   window.dispatchEvent(ev);
-  if (!ev.defaultPrevented) window.location.reload();
+  if (!ev.defaultPrevented) {
+    reloadingOnPurpose = true;
+    window.location.reload();
+  }
 }
 
 /** Ask for a refresh through the guard (F5, View > Refresh). */
@@ -56,6 +69,23 @@ export function requestRefresh() {
 /** In the shell's own chrome (header, sidebar, title bar) rather than on the page. */
 const inChrome = (el: Element | null) => !!el?.closest?.('[data-shell-chrome], [data-window-titlebar]');
 const onPage = (el: Element | null) => !!el?.closest?.('main, [role="dialog"]') && !inChrome(el);
+
+/** The forms on a page (not in a dialog) whose changes leaving would lose. */
+export const PAGE_FORMS = 'main form, main [data-shortcut-scope], main [data-register-entry]';
+
+/** After a save: the page's forms count as unchanged again (the next edit notes them afresh). */
+export function resetPageFormChanges(root: ParentNode = document) {
+  root.querySelectorAll<HTMLElement>(PAGE_FORMS).forEach((f) => {
+    if (!f.closest('[role="dialog"]') && formWasChanged(f)) trackFormChanges(f).reset();
+  });
+}
+
+/** A form on the page has been changed. */
+export function pageFormChanged(root: ParentNode = document): boolean {
+  return Array.from(root.querySelectorAll<HTMLElement>(PAGE_FORMS)).some(
+    (f) => !f.closest('[role="dialog"]') && formWasChanged(f),
+  );
+}
 
 export default function LeaveGuard() {
   const router = useRouter();
@@ -75,6 +105,9 @@ export default function LeaveGuard() {
       const el = e.target as Element | null;
       if (!el || !onPage(el)) return; // the command bar, the menus: keep what was there
       remembered.current = isFormField(el) ? el : null;
+      // Start noticing changes to the page form this field belongs to.
+      const form = isFormField(el) ? (el.closest(PAGE_FORMS) as HTMLElement | null) : null;
+      if (form && !form.closest('[role="dialog"]')) trackFormChanges(form);
     }
     function onFocusOut(e: FocusEvent) {
       // Clicking the page's background leaves no field active (the window losing focus to a
@@ -93,11 +126,21 @@ export default function LeaveGuard() {
     };
   }, []);
 
-  const atRisk = React.useCallback(() => leaveRisk(document.activeElement, remembered.current), []);
+  const atRisk = React.useCallback(() => leaveRisk(document.activeElement, remembered.current) || pageFormChanged(), []);
 
   React.useEffect(() => {
     window.__ironbooksUnsavedWork = atRisk;
+    // In a browser, closing the tab or typing another address asks too (the desktop window asks
+    // through electron/main.js instead: there a beforeunload refusal would silently keep it open).
+    const desktop = Boolean((window as unknown as { bookkeeper?: { isDesktop?: boolean } }).bookkeeper?.isDesktop);
+    function onBeforeUnload(e: BeforeUnloadEvent) {
+      if (desktop || reloadingOnPurpose || !atRisk()) return;
+      e.preventDefault();
+      e.returnValue = '';
+    }
+    window.addEventListener('beforeunload', onBeforeUnload);
     return () => {
+      window.removeEventListener('beforeunload', onBeforeUnload);
       if (window.__ironbooksUnsavedWork === atRisk) delete window.__ironbooksUnsavedWork;
     };
   }, [atRisk]);
@@ -118,6 +161,32 @@ export default function LeaveGuard() {
     }
     window.addEventListener(NAVIGATE_REQUEST_EVENT, onNavigate);
     return () => window.removeEventListener(NAVIGATE_REQUEST_EVENT, onNavigate);
+  }, [router, atRisk]);
+
+  // Every in-app link (a page's own links, a menu link): a plain click that would leave a form
+  // being typed asks first. Ctrl / Shift / middle clicks, new-window and download links and
+  // other sites are left alone.
+  React.useEffect(() => {
+    function onClick(e: MouseEvent) {
+      if (e.defaultPrevented || e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
+      const a = (e.target as Element | null)?.closest?.('a[href]') as HTMLAnchorElement | null;
+      if (!a || (a.target && a.target !== '_self') || a.hasAttribute('download')) return;
+      let url: URL;
+      try {
+        url = new URL(a.href, window.location.href);
+      } catch {
+        return;
+      }
+      if (url.origin !== window.location.origin) return;
+      if (url.pathname === window.location.pathname && url.search === window.location.search) return; // same page (#anchor)
+      if (!atRisk()) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const href = `${url.pathname}${url.search}${url.hash}`;
+      setPending({ kind: 'leave', run: () => router.push(href) });
+    }
+    window.addEventListener('click', onClick, true);
+    return () => window.removeEventListener('click', onClick, true);
   }, [router, atRisk]);
 
   // F5 / View > Refresh.
