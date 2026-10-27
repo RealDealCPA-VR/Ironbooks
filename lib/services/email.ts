@@ -22,6 +22,7 @@ import { fillMergeFields } from '@/lib/preferences';
 import { formatCurrency } from '@/lib/money';
 import { assertOutboundAllowed } from '@/lib/net/guard';
 import { assertNotSandbox } from './sandboxState';
+import { getHomeCurrencyCode } from './currencies';
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -99,6 +100,38 @@ export async function sendMail(opts: MailOptions, ctx: ServiceContext): Promise<
 // ---------------------------------------------------------------------------
 
 /**
+ * The Send Forms merge fields for an invoice email. Amounts are shown in the INVOICE's currency
+ * (the attached PDF's), not always in dollars: a EUR invoice says "€1,000.00" in the email too.
+ */
+export function invoiceMergeFields(inv: {
+  number: string;
+  customerName: string;
+  companyName: string;
+  total: string;
+  balanceDue: string;
+  dueDate: Date | string | null;
+  /** The invoice's currency, else the home currency; anything unusable falls back to USD. */
+  currency?: unknown;
+}): Record<string, string> {
+  const code = typeof inv.currency === 'string' && /^[A-Za-z]{3}$/.test(inv.currency.trim()) ? inv.currency.trim().toUpperCase() : 'USD';
+  const money = (v: string) => {
+    try {
+      return formatCurrency(v, code);
+    } catch {
+      return formatCurrency(v);
+    }
+  };
+  return {
+    number: inv.number,
+    'customer.name': inv.customerName,
+    'company.name': inv.companyName,
+    total: money(inv.total),
+    balance: money(inv.balanceDue),
+    dueDate: inv.dueDate ? new Date(inv.dueDate).toISOString().slice(0, 10) : '',
+  };
+}
+
+/**
  * Send an invoice as a PDF attachment to the customer's email (or to a
  * caller-supplied `to` address if the customer email is absent).
  *
@@ -164,14 +197,21 @@ export async function emailInvoice(
 
   // Subject + body from Send Forms preferences.
   const prefs = await getPreferences(ctx);
-  const merge = {
+  let home: string | null = null;
+  try {
+    home = await getHomeCurrencyCode(ctx);
+  } catch {
+    /* no currency list: fall back to the company setting below */
+  }
+  const merge = invoiceMergeFields({
     number: shownNumber,
-    'customer.name': customerName,
-    'company.name': company.name,
-    total: formatCurrency(invoice.total),
-    balance: formatCurrency(invoice.balanceDue),
-    dueDate: invoice.dueDate ? new Date(invoice.dueDate).toISOString().slice(0, 10) : '',
-  };
+    customerName,
+    companyName: company.name,
+    total: invoice.total,
+    balanceDue: invoice.balanceDue,
+    dueDate: invoice.dueDate,
+    currency: invoice.currency || home || (company.settings as Record<string, unknown> | null)?.currency,
+  });
   const form = prefs.sendForms.invoice;
 
   await sendMail({

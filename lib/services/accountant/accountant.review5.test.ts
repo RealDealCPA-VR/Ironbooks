@@ -9,6 +9,8 @@
  *  C  Client Data Review's "Apply" fixes apply customer payments / credits and bill credits: they
  *     need the Customers / Vendors modify right like Receive Payments / Pay Bills (the route only
  *     guarantees Accounting).
+ *  D  Voided/Deleted Transactions shows the number on the form (an invoice's typed number, a bill
+ *     credit's Ref. No. — not its memo) and a one-time payee's name.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
@@ -30,8 +32,11 @@ import { trialBalance } from '../reports';
 import { reclassifyLines } from './reclassify';
 import { findMisrecordedSalesTax, reclassifySalesTaxPayment } from './salesTaxTools';
 import { autoApplyCustomerCredit, autoApplyVendorCredit } from './clientDataReview';
+import { voidedDeletedTransactions } from './auditReports';
+import { voidInvoice } from '../invoices';
+import { voidExpense } from '../expenses';
 import { receivePayment } from '../payments';
-import { createVendorCredit } from '../vendorCredits';
+import { createVendorCredit, voidVendorCredit } from '../vendorCredits';
 import { paymentsReceived } from '@/lib/db/schema';
 import { normalizeGrant, type EffectiveAccess, type PermissionGrant } from '@/lib/permissions/model';
 
@@ -184,5 +189,39 @@ describe('C: Client Data Review is no side door around Customers / Vendors', () 
     const full = { ...ctx, access: accessWith({ accounting: ['full'], customers: ['full'], vendors: ['full'] }) };
     expect((await autoApplyCustomerCredit(full, { refType: 'payment', refId: payId })).applied).toBe('100.00');
     expect((await autoApplyVendorCredit(full, { refId: credit.id })).applied).toBe('20.00');
+  });
+});
+
+describe('D: Voided/Deleted Transactions shows the number the user sees', () => {
+  it('invoice ref number, bill credit ref number and the check payee', async () => {
+    const inv = await createInvoice(ctx, {
+      customerId,
+      refNumber: 'INV-R5-77',
+      date: D('2026-06-02'),
+      lines: [{ description: 'Work', quantity: 1, rate: '50.00', accountId: acct.i1 }],
+    });
+    await voidInvoice(ctx, inv.id);
+    const vc = await createVendorCredit(ctx, {
+      vendorId,
+      refNumber: 'VC-9001',
+      memo: 'Returned damaged paper',
+      date: D('2026-06-03'),
+      lines: [{ accountId: acct.e1, amount: '15.00' }],
+    });
+    await voidVendorCredit(ctx, vc.id);
+    const chk = await createExpense(ctx, {
+      payeeName: 'R5 One-time Plumber',
+      date: D('2026-06-04'),
+      method: 'check',
+      reference: '7001',
+      paymentAccountId: acct['1000'],
+      lines: [{ accountId: acct.e2, amount: '90.00' }],
+    });
+    await voidExpense(ctx, chk.id);
+
+    const rep = await voidedDeletedTransactions(ctx);
+    expect(rep.rows.find((r) => r.entityId === inv.id)).toMatchObject({ number: 'INV-R5-77', name: 'R5 Customer' });
+    expect(rep.rows.find((r) => r.entityId === vc.id)).toMatchObject({ number: 'VC-9001', name: 'R5 Vendor' });
+    expect(rep.rows.find((r) => r.entityId === chk.id)).toMatchObject({ number: '7001', name: 'R5 One-time Plumber' });
   });
 });

@@ -223,16 +223,18 @@ export async function voidedDeletedTransactions(
   const info = new Map<string, { number: string | null; date: string | null; amount: string | null; name: string | null }>();
   const byType = new Map<string, string[]>();
   for (const l of logs) byType.set(l.entityType, [...(byType.get(l.entityType) ?? []), l.entityId]);
-  const docTables: Record<string, { table: string; num: string; total: string; party?: string; partyTable?: string }> = {
-    invoice: { table: 'invoices', num: 'invoice_number', total: 'total', party: 'customer_id', partyTable: 'customers' },
-    sales_receipt: { table: 'sales_receipts', num: 'receipt_number', total: 'total', party: 'customer_id', partyTable: 'customers' },
-    credit_memo: { table: 'credit_memos', num: 'memo_number', total: 'total', party: 'customer_id', partyTable: 'customers' },
-    payment_received: { table: 'payments_received', num: 'reference', total: 'amount', party: 'customer_id', partyTable: 'customers' },
-    bill: { table: 'bills', num: 'bill_number', total: 'total', party: 'vendor_id', partyTable: 'vendors' },
-    bill_payment: { table: 'bill_payments', num: 'reference', total: 'amount', party: 'vendor_id', partyTable: 'vendors' },
-    vendor_credit: { table: 'vendor_credits', num: 'memo', total: 'total', party: 'vendor_id', partyTable: 'vendors' },
-    expense: { table: 'expenses', num: 'reference', total: 'total', party: 'vendor_id', partyTable: 'vendors' },
-    deposit: { table: 'deposits', num: 'memo', total: 'total' },
+  // num: the number the form shows (a typed ref number first, as everywhere else in the app);
+  // fallbackName: the payee when the document has no vendor (a one-time payee on a check).
+  const docTables: Record<string, { table: string; num: string; total: string; party?: string; partyTable?: string; fallbackName?: string }> = {
+    invoice: { table: 'invoices', num: "COALESCE(NULLIF(t.ref_number, ''), t.invoice_number::text)", total: 'total', party: 'customer_id', partyTable: 'customers' },
+    sales_receipt: { table: 'sales_receipts', num: "COALESCE(NULLIF(t.ref_number, ''), t.receipt_number::text)", total: 'total', party: 'customer_id', partyTable: 'customers' },
+    credit_memo: { table: 'credit_memos', num: "COALESCE(NULLIF(t.ref_number, ''), t.memo_number::text)", total: 'total', party: 'customer_id', partyTable: 'customers' },
+    payment_received: { table: 'payments_received', num: 't.reference', total: 'amount', party: 'customer_id', partyTable: 'customers' },
+    bill: { table: 'bills', num: 't.bill_number', total: 'total', party: 'vendor_id', partyTable: 'vendors' },
+    bill_payment: { table: 'bill_payments', num: 't.reference', total: 'amount', party: 'vendor_id', partyTable: 'vendors' },
+    vendor_credit: { table: 'vendor_credits', num: 't.ref_number', total: 'total', party: 'vendor_id', partyTable: 'vendors' },
+    expense: { table: 'expenses', num: 't.reference', total: 'total', party: 'vendor_id', partyTable: 'vendors', fallbackName: 't.payee_name' },
+    deposit: { table: 'deposits', num: 't.memo', total: 'total' },
   };
   for (const [type, ids] of byType) {
     const spec = docTables[type];
@@ -248,10 +250,12 @@ export async function voidedDeletedTransactions(
     }
     if (!spec) continue;
     try {
-      const partySel = spec.party ? sql.raw(`, p.display_name AS party`) : sql.raw(`, NULL AS party`);
+      const partySel = spec.party
+        ? sql.raw(`, ${spec.fallbackName ? `COALESCE(p.display_name, ${spec.fallbackName})` : 'p.display_name'} AS party`)
+        : sql.raw(`, NULL AS party`);
       const partyJoin = spec.party ? sql.raw(` LEFT JOIN ${spec.partyTable} p ON p.id = t.${spec.party}`) : sql.raw('');
       const res = await ctx.db.execute(
-        sql`SELECT t.id, t.${sql.raw(spec.num)}::text AS num, t.date, t.${sql.raw(spec.total)}::text AS total${partySel}
+        sql`SELECT t.id, (${sql.raw(spec.num)})::text AS num, t.date, t.${sql.raw(spec.total)}::text AS total${partySel}
             FROM ${sql.raw(spec.table)} t${partyJoin}
             WHERE t.company_id = ${ctx.companyId} AND t.id IN (${sql.join(uniq.map((id) => sql`${id}::uuid`), sql`, `)})`,
       );
