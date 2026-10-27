@@ -458,6 +458,8 @@ export interface CheckPrintData {
   voucher: VoucherLine[];
   /** Payee mailing address lines (vendor / employee / customer), for window envelopes. */
   payeeAddress: string[];
+  /** The bank account the check is drawn on (its check paper / number sequence). */
+  paymentAccountId: string | null;
 }
 
 /**
@@ -566,6 +568,7 @@ export async function checkPrintData(
       memo: expenseMemo(row.e, row.v, row.o),
       checkNumber: row.e.reference,
       payeeAddress: addressLines(row.v?.address ?? row.o?.address),
+      paymentAccountId: row.e.paymentAccountId,
       voucher: lines.map((r) => ({
         account: r.l.itemId && r.itemName ? `Item: ${r.itemName}` : `${r.code ?? ''} – ${r.name ?? 'Account'}`,
         description: r.l.description,
@@ -611,6 +614,7 @@ export async function checkPrintData(
       memo: row.v?.accountNumber ? `Acct # ${row.v.accountNumber}` : null,
       checkNumber: row.p.reference,
       payeeAddress: addressLines(row.v?.address),
+      paymentAccountId: row.p.paymentAccountId,
       voucher: [
         ...apps.map((r, i) => {
           const cash = cashByBill[i];
@@ -681,6 +685,7 @@ export async function checkPrintData(
       memo: c.memo,
       checkNumber: c.reference,
       payeeAddress,
+      paymentAccountId: c.paymentAccountId,
       voucher:
         lines.length > 0
           ? lines.map((l) => ({
@@ -702,6 +707,9 @@ export async function checkPrintData(
     throw validation('A year-to-date summary or a liability adjustment is not a paycheck, so it cannot be printed.');
   }
   const lines = await ctx.db.select().from(paycheckLines).where(eq(paycheckLines.paycheckId, id));
+  const bank =
+    (row.p.postedEntryId ? (await paycheckBankAccounts(ctx, [row.p.postedEntryId])).get(row.p.postedEntryId) : undefined) ??
+    (await checkingAccount(ctx));
   return {
     payee: `${row.first} ${row.last}`.trim(),
     amount: toAmountString(row.p.netPay),
@@ -709,6 +717,7 @@ export async function checkPrintData(
     memo: 'Paycheck',
     checkNumber: row.p.checkNumber,
     payeeAddress: addressLines(row.address),
+    paymentAccountId: bank?.id ?? null,
     voucher: [
       { account: 'Gross pay', description: null, amount: toAmountString(row.p.grossPay) },
       ...lines

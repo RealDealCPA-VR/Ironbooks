@@ -492,6 +492,61 @@ describe('review5 purchases (third pass)', { timeout: 180_000 }, () => {
     expect((await billsToPayGET(withUrl('/api/bills/to-pay?asOf=2026-02-28&dueOnOrBefore='))).status).toBe(200);
   });
 
+  it('P: Pay Sales Tax for several agencies continues the check numbers with their leading zeros', async () => {
+    const { paySalesTaxAgencies } = await import('./liabilityPayments');
+    const { createTaxAgency } = await import('./salesTax');
+    const a1 = await createTaxAgency(ctx, { name: `R5C State ${++seq}` });
+    const a2 = await createTaxAgency(ctx, { name: `R5C County ${++seq}` });
+    const res = await paySalesTaxAgencies(ctx, {
+      date: d('2026-07-15'),
+      paymentAccountId: acct['1020'],
+      checkNumber: '004101',
+      payments: [
+        { agencyId: a1.id, amount: '10.00' },
+        { agencyId: a2.id, amount: '5.00' },
+      ],
+    });
+    // Before: 004101 then 4102.
+    expect(res.checks.map((c) => c.reference)).toEqual(['004101', '004102']);
+  });
+
+  it("Q: one Print Checks PDF never mixes checks drawn on different bank accounts", async () => {
+    const { POST: checksPdfPOST } = await import('@/app/api/checks/pdf/route');
+    const v = await newVendor();
+    const write = (account: string) =>
+      createExpense(ctx, {
+        vendorId: v.id,
+        date: d('2026-08-01'),
+        method: 'check',
+        toPrint: true,
+        paymentAccountId: account,
+        lines: [{ accountId: acct['6000'], amount: '12.00' }],
+      });
+    const a = await write(acct['1000']);
+    const b = await write(acct['1000']);
+    const c = await write(acct['1020']);
+    expect((await checkPrintData(ctx, 'expense', c.id)).paymentAccountId).toBe(acct['1020']);
+    const post = (items: unknown[]) =>
+      checksPdfPOST(
+        new Request('http://localhost/api/checks/pdf', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ items }),
+        }) as never,
+      );
+    // Before: one PDF — the Payroll Checking check printed on the operating account's check paper.
+    const mixed = await post([
+      { source: 'expense', id: a.id, checkNumber: '9001' },
+      { source: 'expense', id: c.id, checkNumber: '9002' },
+    ]);
+    expect(mixed.status).toBe(400);
+    const same = await post([
+      { source: 'expense', id: a.id, checkNumber: '9001' },
+      { source: 'expense', id: b.id, checkNumber: '9002' },
+    ]);
+    expect(same.status).toBe(200);
+  });
+
   it('I: making a vendor inactive does not hand a restricted user the full tax ID', async () => {
     const { BUILTIN_ROLES, unionRoles } = await import('@/lib/permissions/model');
     const restricted: ServiceContext = { ...ctx, access: unionRoles(BUILTIN_ROLES.filter((r) => r.key === 'purchasing')) };

@@ -96,12 +96,22 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       if (items.length === 0) throw validation('Pick at least one check to print.');
       if (items.length > MAX_BATCH) throw validation(`Print at most ${MAX_BATCH} checks at a time.`);
       const checks: CheckPdfData[] = [];
+      const bankAccounts = new Set<string | null>();
       for (const raw of items) {
         const it = (raw ?? {}) as Record<string, unknown>;
         if (typeof it.source !== 'string' || !PRINT_SOURCES.includes(it.source as PrintSource) || typeof it.id !== 'string') {
           throw validation('Each check needs a source and an id.');
         }
         const data = await checkPrintData(ctx, it.source as PrintSource, it.id);
+        // One print run is one bank account's check paper (QB Print Checks picks the account first):
+        // a Payroll Checking check printed on Operating Checking's stock carries that account's
+        // bank numbers, and the bank pays it from the wrong account.
+        bankAccounts.add(data.paymentAccountId);
+        if (bankAccounts.size > 1) {
+          throw validation(
+            "These checks are drawn on different bank accounts. Print one bank account's checks at a time, on that account's check paper.",
+          );
+        }
         checks.push({
           company: companyInfo,
           payee: data.payee,

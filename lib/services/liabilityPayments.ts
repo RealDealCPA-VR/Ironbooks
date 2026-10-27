@@ -247,9 +247,13 @@ async function assertPayFromBank(ctx: ServiceContext, accountId: string, what: s
   return acct;
 }
 
-/** "1001" → "1002"; a non-numeric number can't be continued (null = take the account's next). */
+/**
+ * "1001" → "1002", "001001" → "001002" (leading zeros kept, as the account's next check number
+ * keeps them); a non-numeric number can't be continued (null = take the account's next).
+ */
 function followingNumber(n: string): string | null {
-  return /^\d+$/.test(n) ? String(parseInt(n, 10) + 1) : null;
+  if (!/^\d{1,15}$/.test(n)) return null;
+  return String(parseInt(n, 10) + 1).padStart(n.length, '0');
 }
 
 /**
