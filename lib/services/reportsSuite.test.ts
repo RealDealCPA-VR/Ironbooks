@@ -12,6 +12,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import path from 'node:path';
 import fs from 'node:fs';
 import { getDb, closeDb, type DB } from '@/lib/db';
+import { localDateISO } from '@/lib/dates';
 import {
   billLines,
   billPaymentApplications,
@@ -65,7 +66,10 @@ let inventoryItemId: string;
 let serviceItemId: string;
 
 const DAY = 24 * 60 * 60 * 1000;
-const now = new Date();
+// Noon UTC of TODAY'S LOCAL calendar day: the reports default to the local day (endOfLocalToday)
+// and documents are calendar days, so fixtures built from the raw UTC instant landed on
+// tomorrow every evening west of UTC (44 days overdue instead of 45).
+const now = new Date(`${localDateISO(new Date())}T12:00:00.000Z`);
 const daysAgo = (n: number) => new Date(now.getTime() - n * DAY);
 const daysAhead = (n: number) => new Date(now.getTime() + n * DAY);
 
