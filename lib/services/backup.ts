@@ -877,7 +877,8 @@ export const COMPANY_BACKUP_EXCLUDED_TABLES: Record<string, string> = {
   backup_log: 'backup history of the source machine',
   receipt_upload_tokens: 'short-lived phone-upload tokens; must not be replayable elsewhere',
   accountant_copies: "Accountant's Copy transfer state belongs to the source file",
-  ai_settings: 'AI provider config holds API keys encrypted with a machine-local key',
+  ai_settings:
+    "AI provider config holds API keys encrypted with the source company file's own key (file_secrets, lib/ai/keyVault.ts), which a per-company restore into another file does not carry",
   ai_categorizer_models: 'learned categorizer cache, rebuilt from use',
   ai_proposals: 'pending AI suggestion queue (ephemeral, regenerated)',
   ai_auto_applied: 'AI auto-apply undo log keyed to bank-feed rows of the source session',
