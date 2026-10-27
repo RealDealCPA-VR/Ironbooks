@@ -616,6 +616,24 @@ describe('review5 purchases (third pass)', { timeout: 180_000 }, () => {
     expect((await nec1099Recipients(ctx, 2026)).some((r) => r.vendorId === v.id)).toBe(true);
   });
 
+  it('T: a malformed 1099 account mapping is a 400 with a plain message, not a 500', async () => {
+    const { PATCH: mappingPATCH } = await import('@/app/api/reports/1099/mapping/route');
+    const patch = (body: unknown) =>
+      mappingPATCH(
+        new Request('http://localhost/api/reports/1099/mapping', {
+          method: 'PATCH',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+        }) as never,
+      );
+    // Before: TypeError "Cannot read properties of null (reading 'box')" -> HTTP 500.
+    expect((await patch({ boxes: [null] })).status).toBe(400);
+    expect((await patch({ boxes: [{ box: 'nec_1', accountIds: [42] }] })).status).toBe(400);
+    const ok = await patch({ boxes: [{ box: 'nec_1', accountIds: [acct['6000']] }] });
+    expect(ok.status).toBe(200);
+    expect((await patch({ boxes: [] })).status).toBe(200);
+  });
+
   it('I: making a vendor inactive does not hand a restricted user the full tax ID', async () => {
     const { BUILTIN_ROLES, unionRoles } = await import('@/lib/permissions/model');
     const restricted: ServiceContext = { ...ctx, access: unionRoles(BUILTIN_ROLES.filter((r) => r.key === 'purchasing')) };

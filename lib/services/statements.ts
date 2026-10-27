@@ -40,7 +40,7 @@ import {
   vendors,
 } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
-import { notFound, validation, writeAudit, type ServiceContext } from './_base';
+import { inTransaction, notFound, validation, writeAudit, type ServiceContext } from './_base';
 import { taxIdFor } from './access';
 import { journalOpenItems } from './journal';
 import { generalJournalSourceSql } from './posting';
@@ -1443,6 +1443,10 @@ export async function set1099Mapping(ctx: ServiceContext, mapping: Tax1099Mappin
   const seen = new Set<string>();
   const allAccountIds: string[] = [];
   for (const entry of mapping.boxes) {
+    // A request body's entry may be anything (null, a string): a 400, not a TypeError (HTTP 500).
+    if (!entry || typeof entry !== 'object') {
+      throw validation('Each 1099 box mapping needs a box and a list of accountIds.');
+    }
     if (!validBoxes.has(entry.box)) {
       throw validation(`Unknown 1099 box "${entry.box}". Valid: ${[...validBoxes].join(', ')}.`);
     }
@@ -1450,8 +1454,8 @@ export async function set1099Mapping(ctx: ServiceContext, mapping: Tax1099Mappin
       throw validation(`Duplicate 1099 box "${entry.box}" in mapping.`);
     }
     seen.add(entry.box);
-    if (!Array.isArray(entry.accountIds)) {
-      throw validation(`accountIds for box "${entry.box}" must be an array.`);
+    if (!Array.isArray(entry.accountIds) || entry.accountIds.some((id) => typeof id !== 'string')) {
+      throw validation(`accountIds for box "${entry.box}" must be a list of account ids.`);
     }
     allAccountIds.push(...entry.accountIds);
   }
@@ -1473,35 +1477,40 @@ export async function set1099Mapping(ctx: ServiceContext, mapping: Tax1099Mappin
     }
   }
 
-  const [company] = await ctx.db
-    .select()
-    .from(companies)
-    .where(eq(companies.id, ctx.companyId));
-  if (!company) throw notFound('Company');
+  // Read and write the settings JSON in ONE transaction: another settings save (preferences,
+  // receiving, ...) committed between the read and the write here was overwritten with the old
+  // copy of its keys.
+  return inTransaction(ctx, async (tx) => {
+    const [company] = await tx.db
+      .select()
+      .from(companies)
+      .where(eq(companies.id, tx.companyId));
+    if (!company) throw notFound('Company');
 
-  const oldSettings = (company.settings ?? {}) as Record<string, unknown>;
-  const cleaned: Tax1099Mapping = {
-    boxes: mapping.boxes
-      .map((b) => ({ box: b.box, accountIds: [...new Set(b.accountIds)] }))
-      .filter((b) => b.accountIds.length > 0),
-  };
-  const newSettings = { ...oldSettings, tax1099: cleaned };
+    const oldSettings = (company.settings ?? {}) as Record<string, unknown>;
+    const cleaned: Tax1099Mapping = {
+      boxes: mapping.boxes
+        .map((b) => ({ box: b.box, accountIds: [...new Set(b.accountIds)] }))
+        .filter((b) => b.accountIds.length > 0),
+    };
+    const newSettings = { ...oldSettings, tax1099: cleaned };
 
-  const [updated] = await ctx.db
-    .update(companies)
-    .set({ settings: newSettings, updatedAt: new Date() })
-    .where(eq(companies.id, ctx.companyId))
-    .returning();
+    const [updated] = await tx.db
+      .update(companies)
+      .set({ settings: newSettings, updatedAt: new Date() })
+      .where(eq(companies.id, tx.companyId))
+      .returning();
 
-  await writeAudit(ctx, {
-    action: 'update',
-    entityType: 'company',
-    entityId: ctx.companyId,
-    oldValues: { tax1099: oldSettings.tax1099 ?? null },
-    newValues: { tax1099: cleaned },
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'company',
+      entityId: tx.companyId,
+      oldValues: { tax1099: oldSettings.tax1099 ?? null },
+      newValues: { tax1099: cleaned },
+    });
+
+    return (updated.settings as Record<string, unknown>).tax1099 as Tax1099Mapping;
   });
-
-  return (updated.settings as Record<string, unknown>).tax1099 as Tax1099Mapping;
 }
 
 // ---------------------------------------------------------------------------
