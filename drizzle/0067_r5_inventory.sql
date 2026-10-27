@@ -2,10 +2,11 @@
 -- layers they came from (lib/services/fifo.ts restoreConsumedStock). The layers a sale drew are
 -- found through the audit row consumeStock writes for the item (entity_type 'item', entity_id the
 -- item, new_values.entryId the COGS entry), so audit_logs needs an index on the record it is
--- about: without one every reversed FIFO line scanned the company's whole audit trail. The index
--- also serves the record history ("who changed this item / invoice").
-CREATE INDEX IF NOT EXISTS "audit_logs_company_entity_idx" ON "audit_logs" ("company_id", "entity_type", "entity_id");
---> statement-breakpoint
+-- about: without one every reversed FIFO line scanned the company's whole audit trail. 0063
+-- (ledger) already adds that index, audit_logs_entity_idx (company_id, entity_type, entity_id,
+-- created_at), which also serves the record history ("who changed this item / invoice"); a second
+-- (company_id, entity_type, entity_id) index here only doubled every audit write and took the
+-- planner's choice away from 0063's index, so none is created.
 -- Record locking for items (QB "This record was changed by another user"): an item's version
 -- was its updated_at, which every sale, receipt, adjustment and build also moves (they write the
 -- quantity on hand / average cost) — so saving an Edit Item form opened before anyone sold the

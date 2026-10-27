@@ -269,11 +269,12 @@ describe('review5 inventory', () => {
     expect(await gl('1300')).toBe('20.00');
   });
 
-  it('migration 0067: the audit trail is indexed by the record it is about (FIFO restores look it up)', async () => {
-    const res = await db.execute(sql`SELECT indexdef FROM pg_indexes WHERE indexname = 'audit_logs_company_entity_idx'`);
-    const rows = ((res as unknown as { rows?: Array<{ indexdef: string }> }).rows ?? []) as Array<{ indexdef: string }>;
-    expect(rows).toHaveLength(1);
-    expect(rows[0].indexdef).toMatch(/\(company_id, entity_type, entity_id\)/);
+  it('migrations 0063 / 0067: the audit trail is indexed by the record it is about (FIFO restores look it up)', async () => {
+    // One index leads with (company_id, entity_type, entity_id): 0063's audit_logs_entity_idx.
+    const res = await db.execute(sql`SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'audit_logs'`);
+    const rows = ((res as unknown as { rows?: Array<{ indexname: string; indexdef: string }> }).rows ?? []) as Array<{ indexname: string; indexdef: string }>;
+    const byRecord = rows.filter((r) => /\(company_id, entity_type, entity_id[,)]/.test(r.indexdef));
+    expect(byRecord.map((r) => r.indexname)).toEqual(['audit_logs_entity_idx']);
   });
 
   it('FIFO: a voided sale puts its units back in FIFO order (the next sale is costed at the oldest cost)', async () => {
