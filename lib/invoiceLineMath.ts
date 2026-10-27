@@ -130,7 +130,9 @@ export interface InvoiceFormTotals extends LiveLineTotals {
   total: Decimal;
   /** Held back as retainage (part of the total, not due yet). */
   retainage: Decimal;
-  /** total − retainage − payment lines. */
+  /** total − retainage: what is due now, before payment lines (the server's dueNow). */
+  dueNow: Decimal;
+  /** dueNow − payment lines. */
   balanceDue: Decimal;
 }
 
@@ -142,7 +144,8 @@ export interface InvoiceFormTotals extends LiveLineTotals {
  *    time entry round2(hours × rate) — all non-taxable income lines;
  *  - header discount: round2(the typed amount), or round2(subtotal × round2(percent) / 100);
  *  - tax: round2(taxable base × rate) (a negative base is not taxed) + manual sales-tax lines;
- *  - total: round2(subtotal − discount + tax); retainage round2(total × round2(percent) / 100).
+ *  - total: round2(subtotal − discount + tax); retainage round2(total × round2(percent) / 100);
+ *  - due now: total − retainage; balance due: due now − payment lines.
  * The float version showed a 15% discount of $10.10 as $1.51 while the invoice saved $1.52.
  */
 export function invoiceFormTotals(input: InvoiceFormTotalsInput): InvoiceFormTotals {
@@ -171,7 +174,9 @@ export function invoiceFormTotals(input: InvoiceFormTotalsInput): InvoiceFormTot
   const retainage = retPct.greaterThan(0)
     ? Money.round2(total.times(Decimal.min(retPct, 100)).dividedBy(100))
     : Money.zero();
-  let balanceDue = total.minus(retainage).minus(live.payments);
+  // lib/services/invoices.ts: dueNow = round2(total − retainage); the balance = dueNow − payments.
+  const dueNow = Money.round2(total.minus(retainage));
+  let balanceDue = dueNow.minus(live.payments);
   if (balanceDue.lessThan(0)) balanceDue = Money.zero();
-  return { ...live, subtotal, billables, discount, tax, total, retainage, balanceDue };
+  return { ...live, subtotal, billables, discount, tax, total, retainage, dueNow, balanceDue };
 }

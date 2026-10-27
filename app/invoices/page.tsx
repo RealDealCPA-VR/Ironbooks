@@ -289,6 +289,8 @@ interface LiveTotals {
   total: number;
   /** Retainage held back (part of the total, not due yet). */
   retainage: number;
+  /** Total less retainage (before payment lines). */
+  dueNow: number;
   balanceDue: number;
   /** What the selected billables add (cost + markup lines + time). */
   billables: number;
@@ -335,6 +337,7 @@ function computeTotals(
     payments: t.payments.toNumber(),
     total: t.total.toNumber(),
     retainage: t.retainage.toNumber(),
+    dueNow: t.dueNow.toNumber(),
     balanceDue: t.balanceDue.toNumber(),
     billables: t.billables.toNumber(),
   };
@@ -1647,7 +1650,7 @@ function InvoiceModal({
               <div className="flex items-center justify-between">
                 <span className="text-sm font-semibold text-navy/70">Due now</span>
                 <span className="text-base font-bold text-navy tabular-nums">
-                  {formatCurrency(totals.balanceDue.toFixed(2), currency || 'USD')}
+                  {formatCurrency(totals.dueNow.toFixed(2), currency || 'USD')}
                 </span>
               </div>
             </>

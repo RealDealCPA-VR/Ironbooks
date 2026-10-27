@@ -58,6 +58,8 @@ import { classWarningApplies, confirmTransactionDate } from '@/lib/formPrefs';
 import { fetchDueDateForTerms, useTermsChoices, withCurrentTerms } from '@/lib/termsClient';
 import MemorizeButton from '@/components/MemorizeButton';
 import { TransactionNav, compareDocNumbers } from '@/components/TransactionNav';
+import type Decimal from 'decimal.js';
+import { billItemLineAmount, sumLineAmounts, typedLineAmount } from '@/lib/purchaseLineMath';
 import { recallNote, useSmartDefaults } from '@/lib/useSmartDefaults';
 import { billRowFromRecall, lineClassOverride } from '@/lib/smartDefaults';
 import AttachmentPanel from '@/components/AttachmentPanel';
@@ -227,14 +229,21 @@ function emptyLine(mode: LineMode = 'expense'): LineRow {
   };
 }
 
-/** Display amount for a line: explicit amount (expense) or qty x cost (item). */
-function lineAmount(line: LineRow): number {
+/**
+ * Display amount for a line: explicit amount (expense) or qty x cost (item), rounded to cents the
+ * way lib/services/bills.ts saves it (lib/purchaseLineMath.ts): 3 × 1.335 is $4.01, not $4.00.
+ */
+function lineAmountDec(line: LineRow): Decimal {
   if (line.mode === 'item') {
     const kept = loadedItemAmount(line);
-    if (kept != null) return Number(kept) || 0;
-    return (Number(line.quantity) || 0) * (Number(line.unitCost) || 0);
+    if (kept != null) return typedLineAmount(kept);
+    return billItemLineAmount(line.quantity, line.unitCost);
   }
-  return Number(line.amount) || 0;
+  return typedLineAmount(line.amount);
+}
+
+function lineAmount(line: LineRow): number {
+  return lineAmountDec(line).toNumber();
 }
 
 // ---------------------------------------------------------------------------
@@ -596,8 +605,8 @@ export default function BillsPage() {
     disabled: submitting,
   });
 
-  // Compute running total for display (Number() only — display only, not stored)
-  const runningTotal = lines.reduce((sum, l) => sum + lineAmount(l), 0);
+  // Running total for display: the sum of the lines rounded as the bill saves them.
+  const runningTotal = sumLineAmounts(lines.map(lineAmountDec)).toNumber();
   const selectedVendor = vendors.find((v) => v.id === vendorId);
 
   // ---------------------------------------------------------------------------

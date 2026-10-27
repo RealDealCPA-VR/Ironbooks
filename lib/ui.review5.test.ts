@@ -2,12 +2,17 @@
  * Review round 5 (team uia): client-side defects in the transaction forms, centers and registers.
  *
  *  - Amount fields (components/ui.tsx AmountInput → lib/shortcuts.ts committedAmountText):
- *    QuickMath was float math ("4.35*1.5" kept 6.52, the server rounds 6.525 to 6.53), and an
+ *    QuickMath was float math ("8.03*1.5" kept 12.04, the server rounds 12.045 to 12.05), and an
  *    amount typed as "1,250.00" stayed in the field: the forms add with Number() (NaN), so a
  *    payment applied as "1,250.00" was silently dropped and the API refuses commas.
  *  - Invoice form totals (lib/invoiceLineMath.ts invoiceFormTotals): header discount, tax, total,
  *    retainage and billables shown in floats — a 15% discount of $10.10 showed $1.51 and saved
- *    $1.52; the Balance Due ignored retainage.
+ *    $1.52; the Balance Due ignored retainage. With retainage and a payment line, "Due now" showed
+ *    the balance net of the payment, then took the payment off again (it is total − retainage).
+ *  - Enter Bills / Create Purchase Orders / Create Item Receipts / Receive & Bill
+ *    (lib/purchaseLineMath.ts): float qty × cost with no per-line rounding — 3 × 1.335 showed
+ *    $4.00 where the bill saves $4.01. lib/services/formTotals.review5.test.ts saves the same
+ *    documents through the services and compares.
  *  - Invoice billables: a cleared markup field sent no markup, so the server applied the
  *    Preferences default markup the user had removed.
  *  - Sales receipts / credit memos / estimates / sales orders (lib/salesLineMath.ts): lines and
@@ -19,7 +24,12 @@
  *  - Pay Bills: a new payment date or filter cleared every ticked bill; a journal-credit-only
  *    application could not be saved.
  *  - Make Deposits: editing a foreign-currency deposit hid its own payments; "Deposit To" listed
- *    A/R, inventory and fixed assets.
+ *    A/R, inventory and fixed assets (a deposit already saved to such an account keeps it listed).
+ *  - Enter Bill for Received Items: a late preview answer replaced the current one
+ *    (lib/latestRequest.ts). Assess Finance Charges: assessed for the date typed after the
+ *    preview (app/finance-charges/assessDate.ts).
+ *  - lib/client.ts keeps the version a record was loaded at across unversioned actions (apply /
+ *    refund / unapply), so another user's change in between still gets the 409.
  *  - Reconcile: Finish enabled (and shown green) at a 0.01 difference the server refuses; a line
  *    clicked again before its answer ended unticked while the server had it cleared.
  *  - Statement import review: balances typed "2500" tied out on screen but the import refused them;
@@ -31,9 +41,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { committedAmountText, evaluateAmountExpression } from './shortcuts';
+import { committedAmountText, evaluateAmountExpression, formatAmountResult } from './shortcuts';
 import { billableCostTotal, invoiceFormTotals, type LiveLineInput } from './invoiceLineMath';
 import { previewSalesTotals } from './salesLineMath';
+import { billItemLineAmount, poLineAmount, sumLineAmounts, typedLineAmount } from './purchaseLineMath';
 import { api, ApiError, UNREADABLE_RESPONSE_MESSAGE } from './client';
 import { choiceForTypedText, type TypeaheadChoice } from './typeahead';
 import { carryAmounts, carryRows, payBillsHasWork, sumApplied } from './paymentApply';
@@ -50,6 +61,8 @@ import { emptyPayForm } from '../app/pay-liabilities/payForm';
 import { docNumberPayload } from '../components/sales/DocNumberField';
 import { estimateLineNumbers } from '../app/estimates/estimateLines';
 import { runFix } from './errorFixFlow';
+import { createLatestGate } from './latestRequest';
+import { assessBody, previewForDate } from '../app/finance-charges/assessDate';
 import type { ErrorFix } from './errorFixes';
 import { invFromLine } from '../components/inventory/AdvancedInventory';
 import { compareDocNumbers } from '../components/TransactionNav';
@@ -64,7 +77,14 @@ const read = (rel: string) => fs.readFileSync(path.join(ROOT, rel), 'utf8');
 
 describe('AmountInput commit (lib/shortcuts.ts committedAmountText)', () => {
   it('QuickMath rounds the exact result half-up to cents, like the server', () => {
-    // 4.35 × 1.5 = 6.525 exactly; the float product is 6.52499… and was kept as 6.52.
+    // 8.03 × 1.5 = 12.045 exactly; the float product is 12.04499… and the old field kept 12.04.
+    expect(committedAmountText('8.03*1.5')).toBe('12.05');
+    // 20000.01 / 2 = 10000.005; the float quotient 10000.00499… was kept as 10000.
+    expect(committedAmountText('20000.01/2')).toBe('10000.01');
+    // The old pipeline (float evaluation, then formatAmountResult) got both wrong:
+    expect(formatAmountResult(8.03 * 1.5)).toBe('12.04');
+    expect(formatAmountResult(20000.01 / 2)).toBe('10000');
+    // Cases the float version already happened to get right stay right.
     expect(committedAmountText('4.35*1.5')).toBe('6.53');
     expect(committedAmountText('20.01/2')).toBe('10.01'); // 10.005
     expect(committedAmountText('0.1+0.2')).toBe('0.3');
@@ -166,6 +186,30 @@ describe('invoice form totals (lib/invoiceLineMath.ts invoiceFormTotals)', () =>
     expect(t.balanceDue.toFixed(2)).toBe('800.04'); // the server's dueNow − payments
   });
 
+  it('"Due now" is the total less retainage (the server dueNow); payment lines come off after it', () => {
+    // The form showed Due now 800.04, then "Less payments received −100.00", then Balance Due
+    // 800.04 — the payment taken off twice on screen. lib/services/invoices.ts: dueNow =
+    // round2(total − retainage) = 900.04, balance = dueNow − payments = 800.04.
+    const t = invoiceFormTotals({
+      lines: [inc('1', '1000.05', false), { kind: 'payment', quantity: '1', rate: '100', taxable: false }],
+      discount: '',
+      discountType: 'amount',
+      taxRate: '',
+      retainagePercent: '10',
+    });
+    expect(t.dueNow.toFixed(2)).toBe('900.04');
+    expect(t.dueNow.minus(t.payments).toFixed(2)).toBe(t.balanceDue.toFixed(2));
+    // No retainage: due now is the total.
+    const plain = invoiceFormTotals({ lines: [inc('2', '10.005', false)], discount: '', discountType: 'amount', taxRate: '' });
+    expect(plain.dueNow.toFixed(2)).toBe(plain.total.toFixed(2));
+    // The form's "Due now" row shows it (and "Balance Due" the amount net of payment lines).
+    const src = read('app/invoices/page.tsx');
+    const dueNowRow = /Due now<\/span>[\s\S]{0,200}?formatCurrency\(([^)]*)\)/.exec(src)?.[1] ?? '';
+    expect(dueNowRow).toContain('totals.dueNow');
+    const balanceRow = /Balance Due<\/span>[\s\S]{0,200}?formatCurrency\(([^)]*)\)/.exec(src)?.[1] ?? '';
+    expect(balanceRow).toContain('totals.balanceDue');
+  });
+
   it('the invoice form uses it, and sends the markup shown (a cleared field is 0, not the default)', () => {
     const src = read('app/invoices/page.tsx');
     expect(src).toContain('invoiceFormTotals(');
@@ -199,6 +243,54 @@ describe('sales form previews (lib/salesLineMath.ts previewSalesTotals)', () => 
     expect(t.subtotal).toBe(2.52); // 3.03 − 0.51
     expect(t.tax).toBe(0.23); // round2(2.52 × 0.05 = 0.126) + 0.10
     expect(t.total).toBe(2.75);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Purchase form totals
+// ---------------------------------------------------------------------------
+
+describe('bill and purchase order line totals (lib/purchaseLineMath.ts), as the services save them', () => {
+  it('a bill item line of 3 × 1.335 is $4.01 and two of them $8.02 (the float math showed 4.00 / 8.01)', () => {
+    expect(billItemLineAmount('3', '1.335').toFixed(2)).toBe('4.01'); // lib/services/bills.ts round2(qty × cost)
+    expect(sumLineAmounts([billItemLineAmount('3', '1.335'), billItemLineAmount('3', '1.335')]).toFixed(2)).toBe('8.02');
+    // The old display: (Number(qty) || 0) * (Number(unitCost) || 0), summed unrounded.
+    expect((3 * 1.335).toFixed(2)).toBe('4.00');
+    expect((3 * 1.335 + 3 * 1.335).toFixed(2)).toBe('8.01');
+    // Blank / partial input while typing.
+    expect(billItemLineAmount('', '5').toFixed(2)).toBe('0.00');
+    expect(billItemLineAmount('2', 'abc').toFixed(2)).toBe('0.00');
+    expect(typedLineAmount('10.005').toFixed(2)).toBe('10.01');
+    expect(typedLineAmount('').toFixed(2)).toBe('0.00');
+  });
+
+  it('a purchase order line keeps quantity and rate at 4 places, then rounds to cents', () => {
+    expect(poLineAmount('3', '1.335').toFixed(2)).toBe('4.01');
+    // lib/services/purchaseOrders.ts stores the rate at 4 places first: 1.00004 → 1.0000, so
+    // 1000 of them are 1000.00 (not the exact 1000.04).
+    expect(poLineAmount('1000', '1.00004').toFixed(2)).toBe('1000.00');
+    expect(poLineAmount('', '').toFixed(2)).toBe('0.00');
+  });
+
+  it('Enter Bills and Create Purchase Orders show those amounts', () => {
+    const bills = read('app/bills/page.tsx');
+    expect(bills).toMatch(/billItemLineAmount\(line\.quantity, line\.unitCost\)/);
+    expect(bills).not.toMatch(/\(Number\(line\.quantity\) \|\| 0\) \* \(Number\(line\.unitCost\) \|\| 0\)/);
+    expect(bills).toMatch(/sumLineAmounts\(/);
+    const po = read('app/purchase-orders/page.tsx');
+    expect(po).toMatch(/poLineAmount\(line\.quantity, line\.rate\)/);
+    expect(po).toMatch(/sumLineAmounts\(/);
+    expect(po).not.toMatch(/return qty \* rate;/);
+    // Receive & Bill: the bill convertToBill creates, round2(qty × rate) per line.
+    expect(po).toMatch(/billItemLineAmount\(qtyInputs\[l\.id\] \?\? '', l\.rate\)/);
+    expect(po).not.toMatch(/sum \+ qty \* \(parseFloat\(l\.rate\)/);
+    // Create Item Receipts: same rounding (lib/services/itemReceipts.ts round2(qty × unit cost)),
+    // and a line that rounds to 0.00 is refused before it is sent.
+    const ir = read('app/item-receipts/page.tsx');
+    expect(ir).toMatch(/billItemLineAmount\(l\.quantity, l\.unitCost\)/);
+    expect(ir).toMatch(/billItemLineAmount\(line\.quantity, line\.unitCost\)/);
+    expect(ir).not.toMatch(/\(parseFloat\(l\.quantity\) \|\| 0\) \* \(parseFloat\(l\.unitCost\) \|\| 0\)/);
+    expect(billItemLineAmount('1', '0.004').greaterThan(0)).toBe(false);
   });
 });
 
@@ -372,6 +464,22 @@ describe('Make Deposits', () => {
     expect(depositToAccounts(accounts).map((a) => a.id)).toEqual(['chk', 'sav', 'pc']);
     expect(read('app/deposits/page.tsx')).not.toContain("accounts.filter((a) => a.type === 'asset' && a.code !== '1050')");
   });
+
+  it('editing a deposit saved to an account no longer offered keeps that account in "Deposit To"', () => {
+    // A deposit saved earlier into a fixed asset: without it in the list the select showed its
+    // placeholder while the form still held the hidden id, and the deposit's currency was looked
+    // up against an account missing from the list.
+    const accounts = [
+      { id: 'chk', code: '1000', name: 'Checking', type: 'asset', subtype: 'checking' },
+      { id: 'fa', code: '1500', name: 'Truck', type: 'asset', subtype: 'fixed_assets', currency: 'CAD' },
+      { id: 'ar', code: '1100', name: 'Accounts Receivable', type: 'asset', subtype: 'accounts_receivable' },
+    ];
+    expect(depositToAccounts(accounts, ['fa']).map((a) => a.id)).toEqual(['chk', 'fa']);
+    expect(depositToAccounts(accounts, [null, undefined]).map((a) => a.id)).toEqual(['chk']);
+    // A new deposit (nothing to keep) still offers banks / other current assets only.
+    expect(depositToAccounts(accounts).map((a) => a.id)).toEqual(['chk']);
+    expect(read('app/deposits/page.tsx')).toMatch(/depositToAccounts\(accounts, \[editing\?\.depositAccountId\]\)/);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -477,16 +585,10 @@ describe('Invoices list', () => {
 // Record locking after an action on the open record
 // ---------------------------------------------------------------------------
 
-describe('lib/client.ts: an action on the open record keeps its version current', () => {
+describe('lib/client.ts: an unversioned action on the open record does not refresh its version', () => {
   afterEach(() => vi.unstubAllGlobals());
 
-  it('Unapply in the credit memo form, then Save, sends the version the unapply returned', async () => {
-    const sent: Array<string | undefined> = [];
-    const answers = [
-      { id: 'cm1', updatedAt: '2026-06-09T10:00:00.000Z', lines: [] }, // GET (edit opens)
-      { id: 'cm1', updatedAt: '2026-06-09T10:05:00.000Z', unapplied: '50.00' }, // POST unapply
-      { id: 'cm1', updatedAt: '2026-06-09T10:06:00.000Z' }, // PATCH save
-    ];
+  const stubFetch = (answers: unknown[], sent: Array<string | undefined>) => {
     let i = 0;
     vi.stubGlobal(
       'fetch',
@@ -494,30 +596,49 @@ describe('lib/client.ts: an action on the open record keeps its version current'
         sent.push((init?.headers as Record<string, string> | undefined)?.['x-expected-updated-at']);
         return new Response(JSON.stringify(answers[i++]), { status: 200 });
       }),
+    );
+  };
+
+  it('the answer of an unapply / apply / refund is not taken as the version the form was loaded at', async () => {
+    // Apply / refund / unapply are not checked against the loaded version on the server, so the
+    // record they answer with may carry another user's change made since the form opened. Taking
+    // its version would let the next Save overwrite that change instead of getting the 409.
+    const sent: Array<string | undefined> = [];
+    stubFetch(
+      [
+        { id: 'cm1', updatedAt: '2026-06-09T10:00:00.000Z', lines: [] }, // GET (edit opens)
+        { id: 'cm1', updatedAt: '2026-06-09T10:05:00.000Z', unapplied: '50.00' }, // POST unapply
+        { id: 'cm1', updatedAt: '2026-06-09T10:06:00.000Z' }, // PATCH save
+      ],
+      sent,
     );
     await api.get('/api/credit-memos/cm1');
     await api.post('/api/credit-memos/cm1', { action: 'unapply', applicationId: 'a1' }, { noUndo: true });
     await api.patch('/api/credit-memos/cm1', { memo: 'x' }, { noUndo: true });
-    // The unapply moved the memo's version (the version trigger fires on every UPDATE); sending
-    // the version loaded before it was a false "changed by another user" 409 naming the user.
-    expect(sent[2]).toBe('2026-06-09T10:05:00.000Z');
+    expect(sent[1]).toBeUndefined(); // the unapply itself is not versioned
+    expect(sent[2]).toBe('2026-06-09T10:00:00.000Z');
+    expect(read('lib/client.ts')).not.toMatch(/refreshVersionFrom/);
   });
 
-  it('an answer without the record leaves the loaded version alone', async () => {
+  it('the credit memo page reloads its list after Unapply, which is what refreshes the version', async () => {
     const sent: Array<string | undefined> = [];
-    const answers = [{ id: 'p9', updatedAt: '2026-06-09T09:00:00.000Z' }, { ok: true }, { id: 'p9', updatedAt: '2026-06-09T09:02:00.000Z' }];
-    let i = 0;
-    vi.stubGlobal(
-      'fetch',
-      vi.fn(async (_url: string, init?: RequestInit) => {
-        sent.push((init?.headers as Record<string, string> | undefined)?.['x-expected-updated-at']);
-        return new Response(JSON.stringify(answers[i++]), { status: 200 });
-      }),
+    stubFetch(
+      [
+        { id: 'cm2', updatedAt: '2026-06-09T10:00:00.000Z', lines: [] }, // GET (edit opens)
+        { id: 'cm2', updatedAt: '2026-06-09T10:05:00.000Z' }, // POST unapply
+        [{ id: 'cm2', updatedAt: '2026-06-09T10:05:00.000Z' }], // GET list (onCreated = fetchData)
+        { id: 'cm2', updatedAt: '2026-06-09T10:06:00.000Z' }, // PATCH save
+      ],
+      sent,
     );
-    await api.get('/api/payments/p9');
-    await api.post('/api/payments/p9', { action: 'apply', applications: [] }, { noUndo: true });
-    await api.put('/api/payments/p9', {}, { noUndo: true });
-    expect(sent[2]).toBe('2026-06-09T09:00:00.000Z');
+    await api.get('/api/credit-memos/cm2');
+    await api.post('/api/credit-memos/cm2', { action: 'unapply', applicationId: 'a1' }, { noUndo: true });
+    await api.get('/api/credit-memos');
+    await api.patch('/api/credit-memos/cm2', { memo: 'x' }, { noUndo: true });
+    expect(sent[3]).toBe('2026-06-09T10:05:00.000Z');
+    const page = read('app/credit-memos/page.tsx');
+    expect(page).toMatch(/action: 'unapply', applicationId \}\);[\s\S]{0,300}onCreated\(\)/);
+    expect(page).toMatch(/onCreated=\{fetchData\}/);
   });
 });
 
@@ -616,10 +737,36 @@ describe('Pay Liabilities', () => {
 });
 
 describe('Enter Bill for Received Items', () => {
-  it('a late preview answer for earlier quantities never replaces the current one', () => {
+  it('a late preview answer for earlier quantities never replaces the current one', async () => {
+    // The page's preview effect, as it runs: each change starts a request; answers land out of order.
+    const gate = createLatestGate();
+    const shown: string[] = [];
+    const resolvers: Array<() => void> = [];
+    const request = (answer: string) => {
+      const isLatest = gate.begin();
+      return new Promise<void>((done) => {
+        resolvers.push(() => {
+          if (isLatest()) shown.push(answer);
+          done();
+        });
+      });
+    };
+    const first = request('qty 5'); // the user typed 5 ...
+    const second = request('qty 50'); // ... then 50 before the first answer came back
+    resolvers[1](); // the answer for 50 arrives first
+    resolvers[0](); // the slow answer for 5 arrives late
+    await Promise.all([first, second]);
+    expect(shown).toEqual(['qty 50']);
+    // Cancelled (e.g. the lines were cleared): nothing pending lands.
+    const third = request('qty 7');
+    gate.cancel();
+    resolvers[2]();
+    await third;
+    expect(shown).toEqual(['qty 50']);
+
     const src = read('app/receive-bill/page.tsx');
-    expect(src).toContain('const mine = ++previewSeq.current;');
-    expect(src.match(/if \(mine !== previewSeq\.current\) return;/g)?.length).toBe(2);
+    expect(src).toContain('const isLatest = previewGate.current.begin();');
+    expect(src.match(/if \(!isLatest\(\)\) return;/g)?.length).toBe(2); // the answer and the error
   });
 });
 
@@ -720,8 +867,20 @@ describe('editing a sales receipt or credit memo keeps each line’s site / bin 
 
 describe('Assess Finance Charges', () => {
   it('assesses for the date the charges on screen were worked out for; a new date needs a new preview', () => {
+    const june = { asOf: '2026-06-30', customers: [{ customerId: 'c1' }] };
+    // Shown (and assessable) only while the field holds the preview's date.
+    expect(previewForDate(june, '2026-06-30')).toBe(june);
+    expect(previewForDate(june, '2026-07-31')).toBeNull(); // the date was changed after the preview
+    expect(previewForDate(null, '2026-06-30')).toBeNull();
+    // A preview for June answering after the date became July is not shown either.
+    expect(previewForDate({ asOf: '2026-06-30' }, '2026-07-31')).toBeNull();
+    // The assessment is for the preview's own date and the ticked customers.
+    expect(assessBody(june, new Set(['c1', 'c2']))).toEqual({ asOf: '2026-06-30', customerIds: ['c1', 'c2'] });
+
     const src = read('app/finance-charges/page.tsx');
-    expect(src).toContain('asOf: preview.asOf,');
-    expect(src).toMatch(/setAsOf\(e\.target\.value\);\s*setPreview\(null\);/);
+    expect(src).toContain('const preview = previewForDate(loadedPreview, asOf);');
+    expect(src).toContain("api.post<AssessResult>('/api/finance-charges', assessBody(preview, selected))");
+    // A cleared date is refused before the preview (the route would silently use today).
+    expect(src).toMatch(/if \(!asOf\) \{\s*toast\('Enter the assessment date first\.', 'danger'\);/);
   });
 });

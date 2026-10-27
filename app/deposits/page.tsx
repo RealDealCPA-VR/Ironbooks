@@ -747,8 +747,9 @@ function DepositsPageContent() {
     }
   }
 
-  // "Deposit To": bank accounts and other current assets — never UF, A/R, inventory or fixed assets.
-  const bankAccounts = depositToAccounts(accounts);
+  // "Deposit To": bank accounts and other current assets — never UF, A/R, inventory or fixed assets
+  // (a deposit being edited keeps the account it was saved to, so the select can show it).
+  const bankAccounts = depositToAccounts(accounts, [editing?.depositAccountId]);
 
   return (
     <main className="min-h-screen bg-offwhite p-8 font-sans">

@@ -46,6 +46,7 @@ import {
   useAdvancedInventory,
 } from '@/components/inventory/AdvancedInventory';
 import { formatCurrency } from '@/lib/money';
+import { billItemLineAmount, sumLineAmounts } from '@/lib/purchaseLineMath';
 import { formatDate } from '@/lib/utils';
 
 // ---------------------------------------------------------------------------
@@ -128,11 +129,9 @@ function statusLabel(status: ReceiptStatus): string {
   return 'Void';
 }
 
+/** The receipt total as lib/services/itemReceipts.ts saves it: the sum of round2(qty × cost) lines. */
 function computeTotal(lines: LineRow[]): number {
-  return lines.reduce(
-    (sum, l) => sum + (parseFloat(l.quantity) || 0) * (parseFloat(l.unitCost) || 0),
-    0,
-  );
+  return sumLineAmounts(lines.map((l) => billItemLineAmount(l.quantity, l.unitCost))).toNumber();
 }
 
 function lineRemaining(line: PoLine): number {
@@ -346,7 +345,8 @@ function NewReceiptModal({ open, onClose, vendors, items, onCreated, editId }: N
       if (l.unitCost === '' || parseFloat(l.unitCost) < 0) {
         toast(`Line ${i + 1}: enter a unit cost (0 or more).`, 'danger'); return;
       }
-      if ((parseFloat(l.quantity) || 0) * (parseFloat(l.unitCost) || 0) <= 0) {
+      // The service refuses a line whose round2(qty × cost) is 0.00 (e.g. 1 × 0.004).
+      if (!billItemLineAmount(l.quantity, l.unitCost).greaterThan(0)) {
         toast(`Line ${i + 1}: line amount must be greater than zero.`, 'danger'); return;
       }
     }
@@ -509,7 +509,7 @@ function NewReceiptModal({ open, onClose, vendors, items, onCreated, editId }: N
               </div>
 
               {lines.map((line, idx) => {
-                const amount = (parseFloat(line.quantity) || 0) * (parseFloat(line.unitCost) || 0);
+                const amount = billItemLineAmount(line.quantity, line.unitCost).toNumber();
                 return (
                   <div
                     key={idx}

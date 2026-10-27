@@ -133,7 +133,13 @@ export function depositToEdit(dep: Deposit): DepositEdit {
  * isDepositTargetAccount, as on Receive Payments), never Undeposited Funds itself. The list used to
  * hold every asset account — Accounts Receivable, Inventory Asset, fixed assets — so a deposit
  * could be put "into" A/R or inventory, moving the GL without the customer or stock records.
+ * `keepIds`: the account a saved deposit being edited already uses stays listed (as Transfer
+ * Funds keeps its saved accounts), so the select shows it and its currency is known.
  */
-export function depositToAccounts<T extends DepositAccount>(accounts: T[]): T[] {
-  return accounts.filter((a) => isDepositTargetAccount({ type: a.type, subtype: a.subtype ?? null }) && !isUndepositedFunds({ type: a.type, subtype: a.subtype ?? null }) && a.code !== '1050');
+export function depositToAccounts<T extends DepositAccount>(accounts: T[], keepIds: Array<string | null | undefined> = []): T[] {
+  return accounts.filter((a) => {
+    if (keepIds.includes(a.id)) return true;
+    const like = { type: a.type, subtype: a.subtype ?? null };
+    return isDepositTargetAccount(like) && !isUndepositedFunds(like) && a.code !== '1050';
+  });
 }

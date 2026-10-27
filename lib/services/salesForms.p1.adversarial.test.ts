@@ -289,7 +289,9 @@ describe('p1/salesforms adversarial QA', () => {
       }
       const inv = fs.readFileSync(path.resolve(process.cwd(), 'app', 'invoices', 'page.tsx'), 'utf8');
       expect(inv).toMatch(/useDocNumber\('invoice'/);
-      expect(inv).toMatch(/if \(refNumber\.trim\(\)\) payload\.refNumber/);
+      // A typed number is sent; an untouched suggested one is left to the server (review round 5:
+      // components/sales/DocNumberField.tsx docNumberPayload).
+      expect(inv).toMatch(/if \(invNumber\.payload\) payload\.refNumber = invNumber\.payload/);
       expect(inv).toMatch(/if \(allowDuplicateNumber\) payload\.allowDuplicateNumber = true/);
     });
 

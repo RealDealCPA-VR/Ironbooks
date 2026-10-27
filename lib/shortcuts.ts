@@ -71,7 +71,7 @@ export function evaluateAmountExpression(raw: string): number | null {
 
 /**
  * The same QuickMath parser in exact decimal arithmetic (decimal.js, like lib/money): the result
- * the amount field keeps, so "4.35*1.5" is 6.525 (6.53 at cents), not the float 6.52499….
+ * the amount field keeps, so "8.03*1.5" is 12.045 (12.05 at cents), not the float 12.04499….
  */
 export function evaluateAmountDecimal(raw: string): Decimal | null {
   const s = normalizeAmountText(raw);
@@ -180,7 +180,7 @@ const GROUPED_AMOUNT_RE = /^-?(\d{1,3}(,\d{3})+|\d+)(\.\d*)?$/;
 /**
  * What an amount field holds once the user commits it (blur, or Enter in the field):
  *  - QuickMath ("12.5*3+10") is worked out in exact decimals and rounded to cents half-up, as
- *    lib/money rounds on the server ("4.35*1.5" → "6.53"; the old float math kept 6.52);
+ *    lib/money rounds on the server ("8.03*1.5" → "12.05"; the old float math kept 12.04);
  *  - a plain amount typed with a $ sign, spaces or thousands separators ("$1,250.50") becomes the
  *    bare number ("1250.50"). The forms add amounts with Number(), which reads "1,250.50" as NaN:
  *    a payment applied as "1,250.00" was silently dropped, and the API (zMoney) refuses commas.

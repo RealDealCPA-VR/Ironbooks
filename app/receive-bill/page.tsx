@@ -26,6 +26,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { createLatestGate } from '@/lib/latestRequest';
 import { todayISO } from '@/lib/dates';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
@@ -237,9 +238,9 @@ export default function ReceiveBillPage() {
   // Live variance preview (debounced) from the same service that posts the bill. Only the answer
   // for the lines as they are NOW is shown: a slower answer for an earlier quantity / cost (or an
   // earlier error) arriving late used to replace it — and an old error blocked Save.
-  const previewSeq = useRef(0);
+  const previewGate = useRef(createLatestGate());
   useEffect(() => {
-    const mine = ++previewSeq.current;
+    const isLatest = previewGate.current.begin();
     if (!vendorId || payload.lines.length === 0) {
       setPreview(null);
       setPreviewError(null);
@@ -249,12 +250,12 @@ export default function ReceiveBillPage() {
       api
         .post<Preview>('/api/receiving/bill', { ...payload, preview: true })
         .then((p) => {
-          if (mine !== previewSeq.current) return;
+          if (!isLatest()) return;
           setPreview(p);
           setPreviewError(null);
         })
         .catch((err) => {
-          if (mine !== previewSeq.current) return;
+          if (!isLatest()) return;
           setPreview(null);
           setPreviewError(err instanceof ApiError ? err.message : 'Cannot compute the bill.');
         });
