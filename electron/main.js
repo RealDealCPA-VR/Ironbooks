@@ -448,6 +448,11 @@ function activeCompanyDir() {
   return dir;
 }
 
+/** The database migrations this app ships (packaged: resources/app/drizzle). */
+function migrationsDir() {
+  return isDev ? path.join(__dirname, '..', 'drizzle') : path.join(process.resourcesPath, 'app', 'drizzle');
+}
+
 /** Where working copies of open company files live (never a roaming profile). */
 function workingRoot() {
   return companySession.workingRoot({ userData: app.getPath('userData') });
@@ -729,6 +734,8 @@ async function openSingleFileForLaunch(filePath) {
     prep = await companySession.prepareWorkingCopy(filePath, {
       root: workingRoot(),
       appVersion: app.getVersion(),
+      // A file a newer Ironbooks saved is refused before its working copy is touched.
+      knownSchemaAt: companySession.latestMigrationAt(migrationsDir()),
       onConflict: ({ state, manifest }) => confirmConflict(filePath, state, manifest),
     });
   } catch (err) {
@@ -1280,7 +1287,7 @@ async function startNextServer() {
       // Sandbox mode: where "Try it on a copy" puts copies, and the PDF "SANDBOX" stamp flag.
       BKA_SANDBOX_ROOT: sandboxRoot(),
       BKA_SANDBOX: sandboxActive() ? '1' : '',
-      BKA_MIGRATIONS_DIR: path.join(process.resourcesPath, 'app', 'drizzle'),
+      BKA_MIGRATIONS_DIR: migrationsDir(),
       // Offline desktop build: the server is bound to 127.0.0.1 only, so it is safe to
       // surface a password-reset token directly in the local HTTP response.
       BKA_OFFLINE: '1',

@@ -154,14 +154,42 @@ async function writeWorkingCopyAs(workDir, target, { companyName, appVersion, fi
 }
 
 /**
+ * The newest database migration an app ships: the largest `when` in its drizzle journal
+ * (<migrations>/meta/_journal.json). Null when it can't be read.
+ */
+function latestMigrationAt(migrationsDir) {
+  try {
+    const journal = JSON.parse(fs.readFileSync(path.join(migrationsDir, 'meta', '_journal.json'), 'utf8'));
+    const whens = (Array.isArray(journal && journal.entries) ? journal.entries : []).map((e) => Number(e && e.when)).filter(Number.isFinite);
+    return whens.length ? Math.max(...whens) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The company file's last save was made by a newer Ironbooks (its database layout is newer). */
+function savedByNewerVersion(manifest, knownSchemaAt) {
+  const at = Number(manifest && manifest.dbSchema && manifest.dbSchema.lastMigrationAt);
+  return Number.isFinite(knownSchemaAt) && knownSchemaAt > 0 && Number.isFinite(at) && at > knownSchemaAt;
+}
+
+/**
  * Prepare the working copy for opening `companyFile` (the lock is already held). Returns
  * { workDir, dataDir, plan, manifest, conflictCopy? }. `onConflict` decides a 'conflict':
  * resolve true to keep the unsaved changes as a separate copy and continue, false to stop
- * (then nothing has changed).
+ * (then nothing has changed). `knownSchemaAt` (latestMigrationAt of this app's migrations): a
+ * company file last saved by a newer version is refused before anything is touched (NEWER_FORMAT).
  */
-async function prepareWorkingCopy(companyFile, { root, onConflict, appVersion } = {}) {
+async function prepareWorkingCopy(companyFile, { root, onConflict, appVersion, knownSchemaAt } = {}) {
   const manifest = format.readCompanyManifest(companyFile);
   if (!manifest) throw new format.NotACompanyFileError('the file has no readable company information');
+  if (savedByNewerVersion(manifest, knownSchemaAt)) {
+    const err = new Error(
+      'This company file was saved by a newer version of Ironbooks. Update Ironbooks (Help > Check for Updates) to open it.',
+    );
+    err.code = 'NEWER_FORMAT';
+    throw err;
+  }
   const workDir = workingDirFor(companyFile, root);
   const state = readState(workDir);
   const plan = planOpen({ companyFile, state, manifest, dataExists: hasData(workDir) });
@@ -259,4 +287,6 @@ module.exports = {
   writeWorkingCopyAs,
   prepareWorkingCopy,
   pruneWorkingCopies,
+  latestMigrationAt,
+  savedByNewerVersion,
 };

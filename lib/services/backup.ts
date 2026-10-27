@@ -19,6 +19,7 @@ import {
   openDb,
   withDamagedFileAccess,
   MIGRATIONS_FOLDER,
+  NewerCompanyFileError,
   type DB,
 } from '@/lib/db';
 import { checkLedgerHealth } from '@/lib/db/ledgerGuards';
@@ -517,6 +518,12 @@ export async function restoreBackup(buffer: Buffer, targetDir?: string): Promise
     } catch (err) {
       console.error('[backup] restored company file could not be opened:', err);
       await rollBack();
+      if (err instanceof NewerCompanyFileError) {
+        throw new ServiceError(
+          'VALIDATION',
+          'This backup was made with a newer version of Ironbooks, so this version cannot restore it. Update Ironbooks (Help > Check for Updates), then restore it again. Your current company file has not been changed.',
+        );
+      }
       throw new ServiceError(
         'VALIDATION',
         'This backup was not restored because the company file inside it could not be opened. ' +

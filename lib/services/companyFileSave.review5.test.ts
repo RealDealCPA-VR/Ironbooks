@@ -214,3 +214,17 @@ describe('saves asked for while one is running', () => {
     expect(sessionMod.readState(workDir).base.saveId).toBe(m.saveId);
   }, 180_000);
 });
+
+describe('every save records the database layout it holds', () => {
+  it('so an older Ironbooks can refuse the file instead of downgrading it', async () => {
+    adoptFileOnDisk();
+    expect((await saveCompanyFile({ force: true })).outcome).toBe('saved');
+    const journal = JSON.parse(fs.readFileSync(path.resolve(process.cwd(), 'drizzle', 'meta', '_journal.json'), 'utf8'));
+    const newest = Math.max(...journal.entries.map((e: { when: number }) => e.when));
+    const m = format.readCompanyManifest(FILE);
+    expect(m.dbSchema).toMatchObject({ lastMigrationAt: newest });
+    expect(m.dbSchema.migrations).toBe(journal.entries.length);
+    expect(sessionMod.savedByNewerVersion(m, newest)).toBe(false);
+    expect(sessionMod.savedByNewerVersion(m, newest - 1)).toBe(true);
+  }, 120_000);
+});

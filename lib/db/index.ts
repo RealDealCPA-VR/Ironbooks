@@ -96,6 +96,50 @@ export class LedgerDamagedError extends ServiceError {
 }
 
 /**
+ * A company file a NEWER Ironbooks has upgraded (its database has migrations this app does not
+ * ship). QuickBooks refuses a file upgraded by a newer version; so do we, before touching it:
+ * opening it here would skip the unknown migrations, re-install this app's older ledger guards
+ * and drop the newer version's ledger triggers, and this code would then write into a database
+ * layout it does not know — which, for a shared company file, is saved back for everyone.
+ */
+export class NewerCompanyFileError extends ServiceError {
+  constructor() {
+    super(
+      'CONFLICT',
+      'This company file was last used with a newer version of Ironbooks, so this version cannot open it safely. Update Ironbooks (Help > Check for Updates), then open the file again.',
+      { newerVersion: true },
+    );
+    this.name = 'NewerCompanyFileError';
+  }
+}
+
+/** The newest migration this app ships (`when` in the drizzle journal); null without a journal. */
+export function latestShippedMigrationAt(migrationsFolder: string = MIGRATIONS_FOLDER): number | null {
+  try {
+    const journal = JSON.parse(fs.readFileSync(path.join(migrationsFolder, 'meta', '_journal.json'), 'utf8')) as {
+      entries?: Array<{ when?: unknown }>;
+    };
+    const whens = (journal.entries ?? []).map((e) => Number(e.when)).filter((n) => Number.isFinite(n));
+    return whens.length ? Math.max(...whens) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function refuseNewerFile(client: PGlite, migrationsFolder: string): Promise<void> {
+  const shipped = latestShippedMigrationAt(migrationsFolder);
+  if (shipped === null) return;
+  let newest: number | null = null;
+  try {
+    const res = await client.query<{ last: string | number | null }>('SELECT MAX(created_at) AS last FROM drizzle.__drizzle_migrations');
+    newest = res.rows[0]?.last == null ? null : Number(res.rows[0].last);
+  } catch {
+    return; // never migrated: a brand-new database
+  }
+  if (newest !== null && Number.isFinite(newest) && newest > shipped) throw new NewerCompanyFileError();
+}
+
+/**
  * Scope in which a damaged company file may still be opened: only the backup routes use it, so
  * a damaged file can be backed up for support and replaced by restoring a good backup.
  */
@@ -209,6 +253,8 @@ export function openDb(dataDir?: string): DbHandle {
     // Only migrate if a migrations folder has been generated. In early dev before
     // `db:generate`, callers can use db:push instead.
     if (fs.existsSync(MIGRATIONS_FOLDER)) {
+      // Before anything writes to it: a file upgraded by a newer version is refused untouched.
+      await refuseNewerFile(client, MIGRATIONS_FOLDER);
       await migrate(db, { migrationsFolder: MIGRATIONS_FOLDER });
       // Migrations already recorded are never re-run, so a file whose ledger guards were turned
       // off or replaced outside the app would stay unguarded. Re-install them on every open,

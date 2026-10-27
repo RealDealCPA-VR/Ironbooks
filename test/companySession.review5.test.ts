@@ -98,3 +98,21 @@ describe('desktop wiring (source pins)', () => {
     );
   });
 });
+
+describe('a company file saved by a newer Ironbooks (source pins)', () => {
+  const main = fs.readFileSync(path.resolve(__dirname, '..', 'electron', 'main.js'), 'utf8');
+  it("the shell tells the working copy which database layout this app knows", () => {
+    expect(main).toMatch(/knownSchemaAt: companySession\.latestMigrationAt\(migrationsDir\(\)\)/);
+    expect(main).toMatch(/BKA_MIGRATIONS_DIR: migrationsDir\(\)/);
+  });
+  it('the layout this app knows is the newest migration in its journal', () => {
+    const journal = JSON.parse(fs.readFileSync(path.resolve(__dirname, '..', 'drizzle', 'meta', '_journal.json'), 'utf8'));
+    const newest = Math.max(...journal.entries.map((e: { when: number }) => e.when));
+    expect(session.latestMigrationAt(path.resolve(__dirname, '..', 'drizzle'))).toBe(newest);
+    expect(session.latestMigrationAt(path.join(root, 'no-such-folder'))).toBeNull();
+    expect(session.savedByNewerVersion({ dbSchema: { lastMigrationAt: newest + 1 } }, newest)).toBe(true);
+    expect(session.savedByNewerVersion({ dbSchema: { lastMigrationAt: newest } }, newest)).toBe(false);
+    expect(session.savedByNewerVersion({}, newest)).toBe(false); // saved before files carried it
+    expect(session.savedByNewerVersion({ dbSchema: { lastMigrationAt: newest + 1 } }, null)).toBe(false);
+  });
+});

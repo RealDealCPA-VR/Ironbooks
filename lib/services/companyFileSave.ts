@@ -28,7 +28,7 @@ import { randomUUID } from 'node:crypto';
 import { sql } from 'drizzle-orm';
 import format from '@/electron/companyFileFormat';
 import lockFormat from '@/electron/companyLock';
-import { closeDb, firstOpenWalPosition, getDb, holdDbOpen, isDbOpen, resolveDataDir, withDamagedFileAccess } from '@/lib/db';
+import { closeDb, firstOpenWalPosition, getDb, holdDbOpen, isDbOpen, resolveDataDir, withDamagedFileAccess, type DB } from '@/lib/db';
 import { currentFingerprint } from './backupFingerprint';
 import { APP_VERSION } from '@/lib/appVersion';
 
@@ -97,6 +97,8 @@ interface SaveState {
   conflictCopy: string | null;
   /** The save this process last wrote into `conflictCopy` (later work goes into the same copy). */
   conflictSaveId: string | null;
+  /** The database layout the working copy has (its newest migration), stamped into every save. */
+  dbSchema: DbSchemaStamp | null;
   timer: ReturnType<typeof setInterval> | null;
   closed: boolean;
 }
@@ -138,6 +140,7 @@ function state(): SaveState | null {
     error: null,
     conflictCopy: null,
     conflictSaveId: null,
+    dbSchema: null,
     timer: null,
     closed: false,
   };
@@ -226,6 +229,39 @@ async function currentLsn(s: SaveState): Promise<string | null> {
       rows?: Array<{ lsn?: string }>;
     };
     return res.rows?.[0]?.lsn ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The database layout of a company file, in its manifest: an older Ironbooks that finds a newer
+ * layout there refuses to open the file (electron/companySession.js) instead of downgrading it.
+ */
+export interface DbSchemaStamp {
+  migrations: number;
+  /** `when` of the newest migration applied (drizzle journal), ms. */
+  lastMigrationAt: number;
+}
+
+async function dbSchemaOf(db: DB): Promise<DbSchemaStamp | null> {
+  try {
+    const res = (await db.execute(
+      sql`select count(*)::int as n, max(created_at)::text as last from drizzle.__drizzle_migrations`,
+    )) as unknown as { rows?: Array<{ n?: number | string; last?: string | null }> };
+    const row = res.rows?.[0];
+    const last = row?.last == null ? NaN : Number(row.last);
+    return Number.isFinite(last) ? { migrations: Number(row?.n ?? 0), lastMigrationAt: last } : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The working copy's layout right now (null when it is not the open, active database). */
+async function currentDbSchema(s: SaveState): Promise<DbSchemaStamp | null> {
+  if (!workingCopyActive(s) || !isDbOpen(s.dataDir)) return null;
+  try {
+    return await dbSchemaOf(await withDamagedFileAccess(() => getDb(s.dataDir)));
   } catch {
     return null;
   }
@@ -333,7 +369,7 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
     // The company file must still be the save this working copy started from.
     const ws = readWorkingState(s.statePath);
     const baseSaveId = ws?.base?.saveId ?? null;
-    const onDisk = format.readCompanyManifest(s.file) as { saveId?: string; fileId?: string } | null;
+    const onDisk = format.readCompanyManifest(s.file) as { saveId?: string; fileId?: string; dbSchema?: DbSchemaStamp | null } | null;
     if (!onDisk && fs.existsSync(path.dirname(s.file)) && fs.existsSync(s.file)) {
       throw Object.assign(new Error('The company file on disk can no longer be read (it may have been replaced by another program).'), {
         code: 'UNREADABLE',
@@ -360,6 +396,9 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
       }
     }
     const owner = s.lockDir ? readOwner(s.lockDir) : null;
+    // The layout this save holds (an older Ironbooks refuses a newer one): measured while the
+    // working copy is open, else the one last measured, else what the file said when it was opened.
+    s.dbSchema = (await currentDbSchema(s)) ?? s.dbSchema ?? onDisk?.dbSchema ?? null;
     const result = await format.writeCompanyFile(target, {
       manifest: {
         formatVersion: format.COMPANY_FILE_FORMAT_VERSION,
@@ -373,6 +412,7 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
         passwordProtected: Boolean(readDesktopManifest(dataDir)?.passwordProtected),
         // The transaction-log head this save holds: the next open knows exactly what is saved.
         fingerprint,
+        ...(s.dbSchema ? { dbSchema: s.dbSchema } : {}),
       },
       backupManifest: {
         app: 'bookkeeper-ai',
@@ -600,10 +640,12 @@ export async function saveCopyAs(target: string, opts: { companyName?: string | 
   if (!abs.toLowerCase().endsWith(format.COMPANY_FILE_EXT)) {
     throw Object.assign(new Error(`A company file name must end in ${format.COMPANY_FILE_EXT}.`), { code: 'VALIDATION' });
   }
+  let dbSchema: DbSchemaStamp | null = null;
   if (isDbOpen()) {
     try {
       const db = await withDamagedFileAccess(() => getDb());
       await db.execute(sql`checkpoint`);
+      dbSchema = await dbSchemaOf(db);
     } catch {
       /* the snapshot is consistent without it */
     }
@@ -628,6 +670,7 @@ export async function saveCopyAs(target: string, opts: { companyName?: string | 
       savedBy: { computer: os.hostname(), appUser: null },
       appVersion: APP_VERSION,
       passwordProtected: Boolean(readDesktopManifest(dataDir)?.passwordProtected),
+      ...(dbSchema ? { dbSchema } : {}),
     },
     backupManifest: { app: 'bookkeeper-ai', formatVersion: 1, kind: 'full', companyName, createdAt: now, appVersion: APP_VERSION },
     entries,

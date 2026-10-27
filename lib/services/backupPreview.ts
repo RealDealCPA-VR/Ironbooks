@@ -15,7 +15,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { and, count, eq, isNull, max } from 'drizzle-orm';
-import { closeDb, getDb, withDamagedFileAccess } from '@/lib/db';
+import { closeDb, getDb, NewerCompanyFileError, withDamagedFileAccess } from '@/lib/db';
 import { bills, companies, invoices, journalEntries } from '@/lib/db/schema';
 import { BACKUP_MANIFEST_ENTRY, FILE_LOCAL_FILES, validateBackupZip, verifyRestoredBooks } from './backup';
 import { trialBalance } from './reports';
@@ -128,6 +128,12 @@ export async function previewBackup(buffer: Buffer): Promise<BackupPreview> {
       problems = await verifyRestoredBooks(dataDir);
     } catch (err) {
       console.warn('[backup] preview could not open the backup:', err);
+      if (err instanceof NewerCompanyFileError) {
+        throw new ServiceError(
+          'VALIDATION',
+          'This backup was made with a newer version of Ironbooks, so this version cannot open or restore it. Update Ironbooks (Help > Check for Updates) first.',
+        );
+      }
       throw new ServiceError(
         'VALIDATION',
         'The company file inside this backup could not be opened, so it cannot be restored. Try an earlier backup.',
