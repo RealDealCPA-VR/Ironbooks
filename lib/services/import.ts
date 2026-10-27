@@ -470,9 +470,23 @@ function parseWithFormat(rawDate: string, format: string): Date {
  *     (east of UTC, local midnight is the previous UTC day).
  */
 function parseLooseDate(rawDate: string): Date {
+  const s = rawDate.trim();
+  // A bare number: an Excel serial day (a CSV re-saved from Excel: 46053 = 2026-01-31) or a
+  // YYYYMMDD stamp; any other number is no date (the engine read "46053" as the year 46053).
+  if (/^\d+$/.test(s)) {
+    const ymd8 = /^(\d{4})(\d{2})(\d{2})$/.exec(s);
+    if (ymd8) {
+      const [y, m, dd] = [Number(ymd8[1]), Number(ymd8[2]), Number(ymd8[3])];
+      return y >= 1900 && isCalendarDay(y, m, dd) ? new Date(Date.UTC(y, m - 1, dd)) : new Date(NaN);
+    }
+    const serial = Number(s);
+    if (s.length === 5 && serial >= 20000 && serial <= 80000) return new Date(Date.UTC(1899, 11, 30) + serial * 86_400_000);
+    return new Date(NaN);
+  }
+  // A date needs its year: the engine fills in 2001 for "01/31", "Jan 31" or "31 Jan".
+  if (!writesYear(s)) return new Date(NaN);
   const d = new Date(rawDate);
   if (isNaN(d.getTime())) return d;
-  const s = rawDate.trim();
   const iso = /^(\d{4})-(\d{2})-(\d{2})(?!\d)/.exec(s);
   if (iso) {
     // The engine rolls an impossible day over ("2026-02-30" → March 2): refuse it instead.
@@ -498,6 +512,17 @@ function parseLooseDate(rawDate: string): Date {
     if (day.getUTCMonth() + 1 !== written.m || day.getUTCDate() !== written.d) return new Date(NaN);
   }
   return day;
+}
+
+/**
+ * True when a written date carries its year: four digits anywhere ("2026-01-31", "Jan 31, 2026",
+ * "31 Jan 2026"), or the two-digit year of "1/31/26", "31-Jan-26" or "Jan 31, 26".
+ */
+function writesYear(s: string): boolean {
+  if (/(^|[^\d])\d{4}(?!\d)/.test(s)) return true;
+  if (/^\d{1,2}[/.\-\s]+\d{1,2}[/.\-\s]+\d{2}(?!\d)/.test(s)) return true;
+  if (/^(?:[a-z]+\.?,?\s+)?\d{1,2}[\s\-/.]+[a-z]{3,}\.?[\s\-/.,]+'?\d{2}(?!\d)/i.test(s)) return true;
+  return /^(?:[a-z]+\.?,?\s+)?[a-z]{3,}\.?\s+\d{1,2}(?:st|nd|rd|th)?,?\s+'?\d{2}(?!\d)/i.test(s);
 }
 
 const MONTH_PREFIXES = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
