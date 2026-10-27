@@ -244,4 +244,22 @@ describe('review5 fx (second batch)', () => {
     expect(Money.of(l.balance).toFixed(2)).toBe('0.00');
     expect((await trialBalance(ctx)).balanced).toBe(true);
   });
+
+  it('billable costs from a foreign bill are billed at what they cost in home currency', async () => {
+    const { createBill } = await import('./bills');
+    const { listUnbilled, createInvoiceWithBillables } = await import('./billables');
+    const v = await eurVendor('EUR subcontractor');
+    const c = await createCustomer(ctx, { displayName: `Home client ${seq}` } as never);
+    // EUR 100.00 at 1.20 = USD 120.00 of Office Supplies, billable to a home-currency customer.
+    const bill = await createBill(ctx, { vendorId: v.id, date: d('2026-03-01'), currency: 'EUR', exchangeRate: '1.20', lines: [{ accountId: acct['6300'], amount: '100.00', customerId: c.id }] } as never);
+    const unbilled = await listUnbilled(ctx, c.id);
+    expect(unbilled.costs).toHaveLength(1);
+    expect(unbilled.costs[0].amount).toBe('120.00');
+    const inv = await createInvoiceWithBillables(ctx, { customerId: c.id, date: d('2026-03-05'), lines: [] } as never, { billLineIds: [unbilled.costs[0].id] });
+    expect(inv.total).toBe('120.00');
+    // Track reimbursed expenses as income is off: the reimbursement nets the expense to zero.
+    const [supplies] = await db.select().from(accounts).where(eq(accounts.id, acct['6300']));
+    expect(Money.of(supplies.balance).toFixed(2)).toBe('0.00');
+    expect(bill.id).toBeTruthy();
+  });
 });

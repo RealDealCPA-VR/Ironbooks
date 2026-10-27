@@ -15,7 +15,7 @@
  *
  * No direct GL posting here — the GL is written exclusively by createInvoice.
  */
-import { and, eq, inArray, isNull, ne } from 'drizzle-orm';
+import { and, asc, eq, inArray, isNull, ne } from 'drizzle-orm';
 import { assertAccountantMayBillCosts } from './accountantCopy/guard';
 import { Money, toAmountString } from '@/lib/money';
 import {
@@ -37,6 +37,9 @@ import {
 } from './_base';
 import { createInvoice, type CreateInvoiceInput, type InvoiceLineInput } from './invoices';
 import { getPreferences } from './company';
+import { homeAmounts } from './currencies';
+import { currencyRate, foreignCode } from './exchangeRates';
+import { effectiveHomeCurrency } from './multiCurrency';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -50,10 +53,14 @@ export interface UnbilledCost {
   /** Bill number or expense payee/reference — where the cost came from. */
   ref: string | null;
   description: string | null;
+  /** What the cost was booked at in HOME currency (review5 fx: a foreign bill / check line's home share). */
   amount: string;
   jobId: string | null;
   /** The expense account the cost was recorded to (where the reimbursement goes by default). */
   accountId?: string | null;
+  /** review5 fx: the source document's foreign currency (null = home) and the line's amount in it. */
+  currency?: string | null;
+  foreignAmount?: string | null;
 }
 
 export interface UnbilledTime {
@@ -111,6 +118,9 @@ export async function listUnbilled(
       accountId: billLines.accountId,
       date: bills.date,
       billNumber: bills.billNumber,
+      docId: bills.id,
+      currency: bills.currency,
+      exchangeRate: bills.exchangeRate,
     })
     .from(billLines)
     .innerJoin(bills, eq(billLines.billId, bills.id))
@@ -135,6 +145,9 @@ export async function listUnbilled(
       date: expenses.date,
       payeeName: expenses.payeeName,
       reference: expenses.reference,
+      docId: expenses.id,
+      currency: expenses.currency,
+      exchangeRate: expenses.exchangeRate,
     })
     .from(expenseLines)
     .innerJoin(expenses, eq(expenseLines.expenseId, expenses.id))
@@ -193,6 +206,41 @@ export async function listUnbilled(
     };
   });
 
+  // review5 fx: a cost on a foreign-currency bill / check was booked at its HOME share (the
+  // document's home total penny-allocated over its lines, as bills.ts / expenses.ts post it). It
+  // used to be billed at its foreign amount as if that were home currency (EUR 100 of costs that
+  // cost USD 120 billed as USD 100, and the reimbursement did not net the expense).
+  const home = await effectiveHomeCurrency(ctx);
+  const homeShares = new Map<string, string>();
+  const foreignBills = [...new Set(billRows.filter((r) => foreignCode(r.currency, home)).map((r) => r.docId))];
+  for (const billId of foreignBills) {
+    const all = await ctx.db
+      .select({ id: billLines.id, amount: billLines.amount })
+      .from(billLines)
+      .where(eq(billLines.billId, billId))
+      .orderBy(asc(billLines.lineOrder));
+    const rate = billRows.find((r) => r.docId === billId)!.exchangeRate ?? 1;
+    const h = homeAmounts(all.map((l) => Money.of(l.amount)), rate);
+    all.forEach((l, i) => homeShares.set(l.id, toAmountString(h.lines[i])));
+  }
+  const foreignExpenses = [...new Set(expenseRows.filter((r) => foreignCode(r.currency, home)).map((r) => r.docId))];
+  for (const expenseId of foreignExpenses) {
+    const all = await ctx.db
+      .select({ id: expenseLines.id, amount: expenseLines.amount })
+      .from(expenseLines)
+      .where(eq(expenseLines.expenseId, expenseId))
+      .orderBy(asc(expenseLines.lineOrder));
+    const rate = expenseRows.find((r) => r.docId === expenseId)!.exchangeRate ?? 1;
+    const h = homeAmounts(all.map((l) => Money.of(l.amount).abs()), rate);
+    all.forEach((l, i) => homeShares.set(l.id, toAmountString(Money.of(l.amount).isNegative() ? h.lines[i].negated() : h.lines[i])));
+  }
+  const fxOf = (r: { id: string; amount: string; currency: string | null }) => {
+    const cur = foreignCode(r.currency, home);
+    return cur
+      ? { amount: homeShares.get(r.id) ?? r.amount, currency: cur, foreignAmount: r.amount }
+      : { amount: r.amount, currency: null, foreignAmount: null };
+  };
+
   const costs: UnbilledCost[] = [
     ...billRows.map((r) => ({
       id: r.id,
@@ -200,9 +248,9 @@ export async function listUnbilled(
       date: r.date,
       ref: r.billNumber ?? null,
       description: r.description ?? null,
-      amount: r.amount,
       jobId: r.jobId ?? null,
       accountId: r.accountId ?? null,
+      ...fxOf(r),
     })),
     ...expenseRows.map((r) => ({
       id: r.id,
@@ -210,9 +258,9 @@ export async function listUnbilled(
       date: r.date,
       ref: r.payeeName ?? r.reference ?? null,
       description: r.description ?? null,
-      amount: r.amount,
       jobId: r.jobId ?? null,
       accountId: r.accountId ?? null,
+      ...fxOf(r),
     })),
   ];
 
@@ -237,6 +285,7 @@ async function buildBillableLines(
   ctx: ServiceContext,
   customerId: string,
   selection: BillableSelection,
+  invoiceFx: InvoiceFx = { currency: null, rate: Money.of(1) },
 ): Promise<InvoiceLineInput[]> {
   const unbilled = await listUnbilled(ctx, customerId);
   const costById = new Map(unbilled.costs.map((c) => [c.id, c]));
@@ -254,14 +303,14 @@ async function buildBillableLines(
     if (!cost || cost.source !== 'bill') {
       throw new ServiceError('CONFLICT', `Bill line ${id} is not an unbilled billable cost for this customer.`);
     }
-    lines.push(...costToLines(cost, markup, route));
+    lines.push(...costToLines(inInvoiceCurrency(cost, invoiceFx), markup, route));
   }
   for (const id of selection.expenseLineIds ?? []) {
     const cost = costById.get(id);
     if (!cost || cost.source !== 'expense') {
       throw new ServiceError('CONFLICT', `Expense line ${id} is not an unbilled billable cost for this customer.`);
     }
-    lines.push(...costToLines(cost, markup, route));
+    lines.push(...costToLines(inInvoiceCurrency(cost, invoiceFx), markup, route));
   }
   for (const id of selection.timeEntryIds ?? []) {
     const t = timeById.get(id);
@@ -279,6 +328,24 @@ async function buildBillableLines(
   }
 
   return lines;
+}
+
+/** The invoice's currency (null = home) and its rate (home units per 1 unit). */
+interface InvoiceFx {
+  currency: string | null;
+  rate: ReturnType<typeof Money.of>;
+}
+
+/**
+ * review5 fx: a cost in the invoice's currency — its own amount when it was in that same currency,
+ * else its home cost (converted at the invoice's rate for a foreign-currency invoice).
+ */
+function inInvoiceCurrency(cost: UnbilledCost, invoiceFx: InvoiceFx): UnbilledCost {
+  if ((cost.currency ?? null) === invoiceFx.currency) {
+    return cost.currency ? { ...cost, amount: cost.foreignAmount ?? cost.amount } : cost;
+  }
+  if (!invoiceFx.currency) return cost; // `amount` is the home cost
+  return { ...cost, amount: toAmountString(Money.round2(Money.of(cost.amount).dividedBy(invoiceFx.rate))) };
 }
 
 interface ReimbursementRouting {
@@ -455,7 +522,13 @@ export async function createInvoiceWithBillables(
   }
   await assertAccountantMayBillCosts(ctx); // Accountant's Copy (I1)
 
-  const billableLines = await buildBillableLines(ctx, input.customerId, selection);
+  // review5 fx: the invoice's currency + rate, as createInvoice resolves them (blank = home).
+  const home = await effectiveHomeCurrency(ctx);
+  const invCur = foreignCode(input.currency ?? null, home);
+  const invoiceFx: InvoiceFx = invCur
+    ? { currency: invCur, rate: (await currencyRate(ctx, invCur, input.exchangeRate)).rate }
+    : { currency: null, rate: Money.of(1) };
+  const billableLines = await buildBillableLines(ctx, input.customerId, selection, invoiceFx);
 
   return inTransaction(ctx, async (tx) => {
     // createInvoice nests as a savepoint on this transaction (same pattern as
