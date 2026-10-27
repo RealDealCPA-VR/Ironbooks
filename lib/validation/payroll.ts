@@ -114,7 +114,9 @@ export const createAdjustmentSchema = z.discriminatedUnion('type', [
 ]);
 export type CreateAdjustmentBody = z.infer<typeof createAdjustmentSchema>;
 
-const zRate = z.union([z.string(), z.number()]).nullish();
+// A plain decimal ("0.034", 0.034): text such as "abc" or "NaN" used to reach the service, where it
+// answered HTTP 500 or was stored as a NaN rate (review round 5).
+const zRate = z.union([z.literal(''), zDecimal]).nullish();
 
 /** POST /api/payroll/state-settings — create or replace SUI/SDI settings for a state + year. */
 export const stateTaxSettingSchema = z.object({
@@ -130,7 +132,7 @@ export const stateTaxSettingSchema = z.object({
 export const workersCompCodeSchema = z.object({
   code: z.string().min(1, 'class code is required').max(20),
   description: z.string().max(255).nullish(),
-  ratePer100: z.union([z.string(), z.number()]),
+  ratePer100: zDecimal,
   isActive: z.boolean().optional(),
 });
 export const updateWorkersCompCodeSchema = workersCompCodeSchema.partial();

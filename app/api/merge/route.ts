@@ -38,7 +38,7 @@ function errorResponse(err: unknown) {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = await req.json().catch(() => ({}));
+    const body = (await req.json().catch(() => null)) ?? {}; // a JSON null reads as {} → 400 below
 
     const { type, fromId, toId } = body as { type?: string; fromId?: string; toId?: string };
     if (!type || !fromId || !toId) {

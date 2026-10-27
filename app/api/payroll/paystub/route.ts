@@ -13,7 +13,7 @@ import { renderPaystubPdf } from '@/lib/pdf/paystub';
 import { payStubData } from '@/lib/services/payroll';
 import { and, eq } from 'drizzle-orm';
 import { paychecks, employees, companies } from '@/lib/db/schema';
-import { serviceErrorStatus } from '@/lib/routeErrors';
+import { headerSafeFilename, serviceErrorStatus } from '@/lib/routeErrors';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -23,11 +23,6 @@ function errorResponse(err: unknown) {
   }
   console.error('[payroll/paystub] unexpected error:', err);
   return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
-}
-
-/** A file name for Content-Disposition: accents dropped, anything else outside [A-Za-z0-9._-] → _. */
-function headerSafeFilename(name: string): string {
-  return name.normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^A-Za-z0-9._-]+/g, '_');
 }
 
 /** Format a Date or timestamp to YYYY-MM-DD. */

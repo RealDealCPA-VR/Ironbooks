@@ -14,6 +14,7 @@ import { Lock } from 'lucide-react';
 import { Button, Card, Input, Label, toast } from '@/components/ui';
 import { AccessKeyText } from '@/components/AccessKey';
 import { api } from '@/lib/client';
+import { safeNext } from '@/lib/safeNext';
 
 interface FileInfo {
   companyName: string | null;
@@ -123,7 +124,8 @@ export default function LoginPage() {
       } catch {
         /* the shell is optional */
       }
-      const next = new URLSearchParams(window.location.search).get('next') || '/dashboard';
+      // Only a page of this app (never another site or a javascript: URL — lib/safeNext.ts).
+      const next = safeNext(new URLSearchParams(window.location.search).get('next'), '/dashboard', ['/login']);
       // gapsb K: an expired password (or one an Admin asked to change) must be replaced first.
       if (res?.mustChangePassword) {
         window.location.href =

@@ -106,9 +106,8 @@ export function cloneAttachmentFileForRestore(
   }
   const original = path
     .basename(abs)
-    .replace(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-/i, '')
-    .replace(/[^a-zA-Z0-9._-]/g, '_');
-  const diskName = `${randomUUID()}-${original || 'file'}`;
+    .replace(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-/i, '');
+  const diskName = `${randomUUID()}-${diskSafeName(original)}`;
   const dir = path.join(dataDir, 'attachments');
   fs.mkdirSync(dir, { recursive: true });
   const createdPath = path.join(dir, diskName);
@@ -119,6 +118,35 @@ export function cloneAttachmentFileForRestore(
 /** Ensure the storage folder exists (idempotent). */
 function ensureDir(dir: string): void {
   fs.mkdirSync(dir, { recursive: true });
+}
+
+/** Longest stored file-name part after the "<uuid>-" prefix (file systems allow 255 per name). */
+const MAX_DISK_NAME = 120;
+
+/**
+ * The file-name part of a stored document: the original name reduced to safe characters and
+ * shortened (keeping its extension) so "<uuid>-<name>" stays well inside the 255-character limit
+ * of Windows / macOS / Linux file names. The full original name is kept in the database row.
+ */
+export function diskSafeName(original: string): string {
+  const safe = (original || '').replace(/[^a-zA-Z0-9._-]/g, '_') || 'file';
+  if (safe.length <= MAX_DISK_NAME) return safe;
+  const ext = /\.[A-Za-z0-9]{1,10}$/.exec(safe)?.[0] ?? '';
+  return safe.slice(0, MAX_DISK_NAME - ext.length) + ext;
+}
+
+/**
+ * A MIME type that can be sent back as a Content-Type header ("type/subtype", optional simple
+ * parameters), else null. Anything else (line breaks, quotes, non-ASCII — e.g. from a crafted
+ * backup) is served as application/octet-stream.
+ */
+export function safeMimeType(value: string | null | undefined): string | null {
+  if (typeof value !== 'string') return null;
+  const v = value.trim();
+  if (!v || v.length > 100) return null;
+  return /^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*\/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*(\s*;\s*[A-Za-z0-9_.+-]+=[A-Za-z0-9_.+-]+)*$/.test(v)
+    ? v
+    : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -325,9 +353,8 @@ export async function saveAttachment(
   const dir = attachmentsDir();
   ensureDir(dir);
 
-  // Build a safe on-disk name: <uuid>-<sanitized-filename>
-  const safe = filename.replace(/[^a-zA-Z0-9._-]/g, '_');
-  const diskName = `${randomUUID()}-${safe}`;
+  // Build a safe on-disk name: <uuid>-<sanitized, shortened filename> (the row keeps the full name).
+  const diskName = `${randomUUID()}-${diskSafeName(filename)}`;
   const absolutePath = path.join(dir, diskName);
 
   // Write file synchronously so any OS error is caught before the DB insert.
@@ -344,7 +371,7 @@ export async function saveAttachment(
       entityId,
       filename,
       storagePath,
-      mimeType: mimeType || null,
+      mimeType: safeMimeType(mimeType),
       sizeBytes: buffer.length,
       description: params.description?.trim() || null,
     })
@@ -508,7 +535,7 @@ export async function getAttachmentFile(
   }
 
   const buffer = fs.readFileSync(absolutePath);
-  return { filename: row.filename, mimeType: row.mimeType ?? null, buffer };
+  return { filename: row.filename, mimeType: safeMimeType(row.mimeType), buffer };
 }
 
 // ---------------------------------------------------------------------------

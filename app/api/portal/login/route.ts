@@ -33,6 +33,7 @@ export async function POST(req: NextRequest) {
       .select({ emp: employees, companySettings: companies.settings })
       .from(employees)
       .innerJoin(companies, eq(companies.id, employees.companyId))
+      // Employee emails are stored as typed ("Jane.Doe@Acme.com"): compare case-insensitively.
       .where(sql`lower(trim(${employees.email})) = ${email.trim().toLowerCase()}`);
     // Employees of an archived (soft-deleted) company can no longer sign in to the portal.
     const matches = rows.filter((r) => !isArchivedSettings(r.companySettings)).map((r) => r.emp);

@@ -10,7 +10,7 @@ import { ServiceError } from '@/lib/services/_base';
 import { w2Data } from '@/lib/services/payrollReports';
 import { renderW2Pdf } from '@/lib/pdf/payrollForms';
 import { maskSensitive } from '@/lib/permissions/mask';
-import { serviceErrorStatus } from '@/lib/routeErrors';
+import { headerSafeFilename, serviceErrorStatus } from '@/lib/routeErrors';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -42,11 +42,8 @@ export async function GET(req: NextRequest) {
     const data = maskSensitive(await w2Data(ctx, { employeeId, year }), ctx.access);
     const pdfBytes = await renderW2Pdf(data);
 
-    // Header-safe: a non-Latin-1 name ("Trường") or a quote is not a valid header value (HTTP 500).
-    const filename = `W2_${data.employee.lastName}_${data.employee.firstName}_${year}.pdf`
-      .normalize('NFD')
-      .replace(/[̀-ͯ]/g, '')
-      .replace(/[^A-Za-z0-9._-]+/g, '_');
+    // Header-safe: a non-Latin-1 name ("Trường", "O’Brien") or a quote is not a valid header value (HTTP 500).
+    const filename = headerSafeFilename(`W2_${data.employee.lastName}_${data.employee.firstName}_${year}.pdf`);
 
     return new NextResponse(pdfBytes.buffer.slice(pdfBytes.byteOffset, pdfBytes.byteOffset + pdfBytes.byteLength) as ArrayBuffer, {
       status: 200,

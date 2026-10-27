@@ -9,6 +9,10 @@
  *
  * `maskSensitive` deep-walks plain JSON (objects/arrays), so a route can pass its whole response
  * body. Contexts without `access` (trusted/internal) see everything.
+ *
+ * `stripSecrets` removes credential material that no response may carry whatever the caller's
+ * roles (review round 5): password / answer hashes, TOTP secrets, reset tokens, sealed API keys and
+ * the company-file password hash. Backups keep them (they restore the file); API answers never do.
  */
 import type { EffectiveAccess } from './model';
 
@@ -69,6 +73,56 @@ export function maskSensitive<T>(
         } else {
           out[k] = walk(val);
         }
+      }
+      return out;
+    }
+    return v;
+  };
+  return walk(data) as T;
+}
+
+/**
+ * Keys holding credential material. They are removed from API answers for everyone, the Admin
+ * included: a bcrypt hash can be cracked offline (the closing-date password exists to stop users
+ * who have the closed-period right but not the password).
+ */
+const SECRET_KEYS = new Set([
+  'passwordHash',
+  'portalPasswordHash',
+  'closingDatePasswordHash',
+  'challengeAnswerHash',
+  'totpSecret',
+  'resetToken',
+  'apiKeyEnc',
+]);
+
+/** True for a field name stripSecrets removes. */
+export function isSecretKey(key: string): boolean {
+  return SECRET_KEYS.has(key);
+}
+
+/**
+ * Deep copy of plain JSON without credential material: secret keys are dropped (a portal password
+ * becomes `hasPortalPassword`), and the company-file lock `{ enabled, hash }` becomes `{ enabled }`.
+ * Class instances (Date, Decimal, Buffer…) pass through untouched.
+ */
+export function stripSecrets<T>(data: T): T {
+  const walk = (v: unknown): unknown => {
+    if (Array.isArray(v)) return v.map(walk);
+    if (v && typeof v === 'object' && isPlainObject(v)) {
+      const src = v as Record<string, unknown>;
+      const out: Record<string, unknown> = {};
+      for (const [k, val] of Object.entries(src)) {
+        if (SECRET_KEYS.has(k)) {
+          if (k === 'portalPasswordHash' && !('hasPortalPassword' in src)) out.hasPortalPassword = Boolean(val);
+          continue;
+        }
+        if (k === 'fileLock' && val && typeof val === 'object' && !Array.isArray(val)) {
+          const lock = val as { enabled?: unknown; hash?: unknown };
+          out[k] = { enabled: Boolean(lock.enabled && lock.hash) };
+          continue;
+        }
+        out[k] = walk(val);
       }
       return out;
     }

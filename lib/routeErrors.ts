@@ -134,12 +134,23 @@ export function routeError(err: unknown, tag: string): NextResponse {
   if (err instanceof SyntaxError) {
     return invalidJsonBody();
   }
-  // An amount that is not a number (lib/money.ts), thrown before any transaction translated it.
+  // An amount that is not a number ("abc", "3.4%") reaching Money.of in a service before any
+  // transaction translated it (lib/money.ts): a 400 with the plain message, not a 500.
   if (err instanceof MoneyParseError) {
     return NextResponse.json({ error: err.message, code: 'VALIDATION' }, { status: 400 });
   }
   console.error(`[${tag}]`, err);
   return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
+}
+
+/**
+ * A file name that is a valid Content-Disposition header value: accents folded ("Trường" →
+ * "Truong", "Seán" → "Sean"), anything else outside [A-Za-z0-9._-] (quotes, slashes, "’", non-Latin
+ * letters) → "_". A header value must be Latin-1, so such a name used to make the response throw
+ * (HTTP 500).
+ */
+export function headerSafeFilename(name: string): string {
+  return name.normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^A-Za-z0-9._-]+/g, '_');
 }
 
 /** Wrap PDF bytes in an inline application/pdf response. */
@@ -151,7 +162,7 @@ export function pdfResponse(bytes: Uint8Array, filename: string): NextResponse {
       'Content-Type': 'application/pdf',
       // Alphanumeric document numbers (wave2 foundation) may carry quotes, slashes or non-ASCII
       // characters that are not valid in a header value — keep the filename header-safe.
-      'Content-Disposition': `inline; filename="${filename.replace(/[^A-Za-z0-9._-]+/g, '_')}"`,
+      'Content-Disposition': `inline; filename="${headerSafeFilename(filename)}"`,
       'Content-Length': String(buf.byteLength),
     },
   });

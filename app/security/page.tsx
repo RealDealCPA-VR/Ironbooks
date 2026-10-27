@@ -4,7 +4,9 @@ import { CheckCircle2, ShieldCheck } from 'lucide-react';
 import { QRCodeSVG } from 'qrcode.react';
 import { Button, Card, Input, Label, PageHeader, Spinner, toast } from '@/components/ui';
 import { ChallengeQuestionCard } from '@/components/ChallengeQuestionCard';
-import { api } from '@/lib/client';
+import { ApiError, api } from '@/lib/client';
+// Only same-app paths for ?next= (never an open redirect).
+import { safeNext } from '@/lib/safeNext';
 
 interface Me {
   id: string;
@@ -13,10 +15,6 @@ interface Me {
   totpEnabled: boolean;
 }
 
-/** Only same-app paths for ?next= (never an open redirect). */
-function safeNext(raw: string | null): string {
-  return raw && raw.startsWith('/') && !raw.startsWith('//') ? raw : '/dashboard';
-}
 
 export default function SecurityPage() {
   // After sign-in, someone without a challenge question is sent here once (app/login).
@@ -59,6 +57,8 @@ export default function SecurityPage() {
       setOtpUrl(r.otpauthUrl);
       toast('Scan or enter the secret in your authenticator app, then enter a code.', 'info');
     } catch (e) {
+      // 409: two-factor sign-in is already on (the server never replaces a live secret).
+      if (e instanceof ApiError && e.status === 409) setEnabled(true);
       toast(e instanceof Error ? e.message : 'Failed', 'danger');
     } finally {
       setBusy(false);

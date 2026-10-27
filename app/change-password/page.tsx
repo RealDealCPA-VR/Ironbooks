@@ -10,6 +10,7 @@ import Link from 'next/link';
 import { KeyRound } from 'lucide-react';
 import { Button, Card, Input, Label, toast } from '@/components/ui';
 import { api } from '@/lib/client';
+import { safeNext } from '@/lib/safeNext';
 import { PasswordRulesHint, meetsPolicy, usePasswordPolicy } from '@/components/PasswordRules';
 
 interface Me {
@@ -17,10 +18,8 @@ interface Me {
   mustChangePassword?: boolean;
 }
 
-/** Only same-site paths are followed after the change (no open redirect). */
-function safeNext(raw: string | null): string {
-  return raw && raw.startsWith('/') && !raw.startsWith('//') && !raw.startsWith('/change-password') ? raw : '/dashboard';
-}
+/** Only same-app paths are followed after the change (no open redirect — lib/safeNext.ts). */
+const nextAfterChange = (raw: string | null) => safeNext(raw, '/dashboard', ['/change-password']);
 
 export default function ChangePasswordPage() {
   const policy = usePasswordPolicy();
@@ -54,7 +53,7 @@ export default function ChangePasswordPage() {
     try {
       await api.post('/api/auth/change-password', { currentPassword: current, newPassword: next });
       toast('Your password was changed.', 'success');
-      window.location.href = safeNext(new URLSearchParams(window.location.search).get('next'));
+      window.location.href = nextAfterChange(new URLSearchParams(window.location.search).get('next'));
     } catch (e) {
       toast(e instanceof Error ? e.message : 'Could not change the password.', 'danger');
     } finally {

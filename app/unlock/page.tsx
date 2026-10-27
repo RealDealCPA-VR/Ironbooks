@@ -10,17 +10,13 @@ import { Suspense, useEffect, useRef, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { Lock } from 'lucide-react';
 import { Button, Card, Input, Label } from '@/components/ui';
-
-function safeNext(raw: string | null): string {
-  // Only allow same-app absolute paths (never an open redirect).
-  if (raw && raw.startsWith('/') && !raw.startsWith('//') && raw !== '/unlock') return raw;
-  return '/';
-}
+import { safeNext } from '@/lib/safeNext';
 
 function UnlockInner() {
   const router = useRouter();
   const params = useSearchParams();
-  const next = safeNext(params.get('next'));
+  // Only same-app paths (never an open redirect — lib/safeNext.ts).
+  const next = safeNext(params.get('next'), '/', ['/unlock']);
 
   const [phase, setPhase] = useState<'checking' | 'prompt'>('checking');
   const [companyName, setCompanyName] = useState<string | null>(null);
@@ -29,7 +25,8 @@ function UnlockInner() {
   const [submitting, setSubmitting] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  async function attempt(pwd: string): Promise<boolean> {
+  /** true = unlocked; otherwise the message to show ('' = just ask for the password). */
+  async function attempt(pwd: string): Promise<true | string> {
     const res = await fetch('/api/unlock', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -41,8 +38,10 @@ function UnlockInner() {
       return true;
     }
     const data = await res.json().catch(() => ({}));
-    setCompanyName(typeof data.companyName === 'string' ? data.companyName : null);
-    return false;
+    if (typeof data.companyName === 'string') setCompanyName(data.companyName);
+    // Too many wrong passwords: say so (the right password is refused too until the wait is over).
+    if (res.status === 429) return typeof data.error === 'string' ? data.error : 'Too many attempts. Wait a minute and try again.';
+    return pwd ? 'Incorrect password. Please try again.' : '';
   }
 
   // Auto-pass when the file has no password.
@@ -50,7 +49,8 @@ function UnlockInner() {
     let active = true;
     (async () => {
       const passed = await attempt('');
-      if (active && !passed) {
+      if (active && passed !== true) {
+        if (passed) setError(passed);
         setPhase('prompt');
         setTimeout(() => inputRef.current?.focus(), 50);
       }
@@ -66,9 +66,9 @@ function UnlockInner() {
     if (!password) return;
     setSubmitting(true);
     setError('');
-    const ok = await attempt(password);
-    if (!ok) {
-      setError('Incorrect password. Please try again.');
+    const result = await attempt(password);
+    if (result !== true) {
+      setError(result || 'Incorrect password. Please try again.');
       setSubmitting(false);
       setPassword('');
       inputRef.current?.focus();

@@ -24,6 +24,7 @@ import { assertSessionAllowed } from '@/lib/services/sessions';
 import { assertPasswordChangeNotRequired } from '@/lib/services/passwordPolicy';
 import { PASSWORD_CHANGE_REQUIRED_MESSAGE } from '@/lib/passwordPolicy';
 import { getRequestOrigin } from '@/lib/net/requestInfo';
+import { GLOBAL_KEY_WEIGHT, attemptKeys, loginLimiter, tooManyAttempts } from '@/lib/net/rateLimit';
 import { ServiceError, type ServiceContext } from '@/lib/services/_base';
 import { ensureSandboxEnvSynced } from '@/lib/services/sandboxState';
 
@@ -89,8 +90,12 @@ async function selectedCompanyCookie(): Promise<string | undefined> {
  * If the request carries an x-closing-password header, verify it against the company's
  * closing-date password hash. A valid password (or any explicit attempt when no password is
  * configured) unlocks postings dated on/before the closing date for THIS request only.
+ *
+ * Guesses are rate-limited like sign-in (per person, per address and globally — review round 5):
+ * this was the one password with no attempt limit, so a user with the closed-period right but not
+ * the password (an Accountant, an External Accountant) could try passwords until one worked.
  */
-async function resolveClosingDateOverride(db: DB, companyId: string): Promise<boolean> {
+async function resolveClosingDateOverride(db: DB, companyId: string, userId?: string | null): Promise<boolean> {
   let supplied: string | null = null;
   try {
     const h = await headers();
@@ -99,7 +104,31 @@ async function resolveClosingDateOverride(db: DB, companyId: string): Promise<bo
     return false;
   }
   if (supplied === null) return false;
-  return verifyClosingDatePassword(db, companyId, supplied);
+  const origin = await getRequestOrigin();
+  const limiter = loginLimiter();
+  // Only signed-in people can guess, so the person (in this company) is the key, plus the global
+  // cap — not the address: everyone working on this computer shares 'local', and one person's
+  // wrong guesses must not lock the others out.
+  const keys = attemptKeys('closing-password', `${companyId}:${userId ?? ''}`, origin.addr).filter((k) => !k.includes(':addr:'));
+  const weights = { [keys[keys.length - 1]]: GLOBAL_KEY_WEIGHT };
+  const gate = limiter.begin(keys, Date.now(), weights);
+  if (!gate.allowed) {
+    const { retryAfter } = tooManyAttempts(gate.retryAfterMs);
+    const secs = Number(retryAfter);
+    throw new ServiceError(
+      'FORBIDDEN',
+      `Too many wrong closing-date passwords. Try again in ${secs < 90 ? `${secs} seconds` : `${Math.ceil(secs / 60)} minutes`}.`,
+      { rateLimited: true, retryAfterSeconds: secs },
+    );
+  }
+  try {
+    const ok = await verifyClosingDatePassword(db, companyId, supplied);
+    if (ok) limiter.recordSuccess(keys.slice(0, -1));
+    else limiter.recordFailure(keys, Date.now(), weights);
+    return ok;
+  } finally {
+    gate.release();
+  }
 }
 
 /**
@@ -234,7 +263,7 @@ export async function getServerContext(): Promise<ServiceContext> {
       // The closing-date password only unlocks closed periods for users whose roles allow
       // modifying transactions on/before the closing date (QB Enterprise parity).
       const closingDateOverride =
-        access.flags.closedPeriod && (await resolveClosingDateOverride(db, companyId));
+        access.flags.closedPeriod && (await resolveClosingDateOverride(db, companyId, userId));
       return { db, companyId, userId, role, closingDateOverride, access, sessionId: session?.sessionId };
     }
   }

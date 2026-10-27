@@ -26,6 +26,8 @@ import { assertBalanced } from './posting';
 import { createManualEntry, followMergedNames } from './journal';
 import { buildRouter, type BuildRouterOptions } from './aiSettings';
 import { AiError } from '@/lib/ai/types';
+import { can, type Area } from '@/lib/permissions/model';
+import { requirePermission } from './access';
 
 // ---------------------------------------------------------------------------
 // Read-only tools
@@ -51,6 +53,12 @@ function cap<T>(rows: T[], n = MAX_ROWS): { rows: T[]; truncated: boolean } {
 
 interface ToolDef {
   description: string;
+  /**
+   * The report area the tool's data belongs to (the caller needs 'view' of it, like the report's own
+   * route): A/R aging is Reports — Customers & Sales, A/P aging Reports — Vendors & Purchases, the
+   * rest Reports — Financial. The assistant route only checks Reports — Financial.
+   */
+  area: Area;
   args: z.ZodType<Record<string, unknown>, z.ZodTypeDef, unknown>;
   argsHelp: string;
   run(ctx: ServiceContext, args: Record<string, unknown>): Promise<unknown>;
@@ -58,6 +66,7 @@ interface ToolDef {
 
 export const TOOLS: Record<string, ToolDef> = {
   profit_and_loss: {
+    area: 'reports_financial',
     description: 'Profit & Loss (income, expenses, net income) for a date range.',
     argsHelp: '{"from"?: "YYYY-MM-DD", "to"?: "YYYY-MM-DD"}',
     args: z.object({ from: zDateStr.optional(), to: zDateStr.optional() }),
@@ -75,6 +84,7 @@ export const TOOLS: Record<string, ToolDef> = {
     },
   },
   balance_sheet: {
+    area: 'reports_financial',
     description: 'Balance Sheet (assets, liabilities, equity) as of a date.',
     argsHelp: '{"asOf"?: "YYYY-MM-DD"}',
     args: z.object({ asOf: zDateStr.optional() }),
@@ -95,6 +105,7 @@ export const TOOLS: Record<string, ToolDef> = {
     },
   },
   ar_aging: {
+    area: 'reports_sales',
     description: 'Accounts receivable aging by customer (who owes us, how overdue).',
     argsHelp: '{"asOf"?: "YYYY-MM-DD"}',
     args: z.object({ asOf: zDateStr.optional() }),
@@ -106,6 +117,7 @@ export const TOOLS: Record<string, ToolDef> = {
     },
   },
   ap_aging: {
+    area: 'reports_purchases',
     description: 'Accounts payable aging by vendor (what we owe, how overdue).',
     argsHelp: '{"asOf"?: "YYYY-MM-DD"}',
     args: z.object({ asOf: zDateStr.optional() }),
@@ -117,6 +129,7 @@ export const TOOLS: Record<string, ToolDef> = {
     },
   },
   account_balances: {
+    area: 'reports_financial',
     description: 'Account balances from the general ledger (natural sign), optionally filtered by name/code.',
     argsHelp: '{"asOf"?: "YYYY-MM-DD", "query"?: "text matching account name or code"}',
     args: z.object({ asOf: zDateStr.optional(), query: z.string().max(100).optional() }),
@@ -135,6 +148,7 @@ export const TOOLS: Record<string, ToolDef> = {
     },
   },
   list_accounts: {
+    area: 'reports_financial',
     description: 'Chart of accounts (active): code, name, type. Use before proposing an entry.',
     argsHelp: '{"query"?: "text"}',
     args: z.object({ query: z.string().max(100).optional() }),
@@ -152,6 +166,7 @@ export const TOOLS: Record<string, ToolDef> = {
     },
   },
   search_transactions: {
+    area: 'reports_financial',
     description: 'Search posted journal entries by text (description/reference/memo), date range, account code and amount.',
     argsHelp: '{"query"?: "text", "from"?: "YYYY-MM-DD", "to"?: "YYYY-MM-DD", "accountCode"?: "6000", "minAmount"?: number, "maxAmount"?: number, "limit"?: 1-25}',
     args: z.object({
@@ -241,6 +256,8 @@ async function searchTransactions(ctx: ServiceContext, a: SearchArgs) {
 export async function runTool(ctx: ServiceContext, name: string, rawArgs: unknown): Promise<unknown> {
   const tool = TOOLS[name];
   if (!tool) throw validation(`Unknown tool "${name}".`);
+  // Same right as the report itself (e.g. A/R aging needs Reports — Customers & Sales).
+  requirePermission(ctx, tool.area, 'view');
   const parsed = tool.args.safeParse(rawArgs ?? {});
   if (!parsed.success) throw validation(`Invalid arguments for ${name}: ${parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')}`);
   return tool.run(ctx, parsed.data);
@@ -608,8 +625,10 @@ const stepJsonSchema = {
   required: ['action'],
 };
 
-function systemPrompt(today: string): string {
+function systemPrompt(today: string, ctx: Pick<ServiceContext, 'access'>): string {
+  // Only the tools this person may use (the others would only answer "no permission").
   const tools = Object.entries(TOOLS)
+    .filter(([, t]) => !ctx.access || can(ctx.access, t.area, 'view'))
     .map(([name, t]) => `- ${name}: ${t.description} Args: ${t.argsHelp}`)
     .join('\n');
   return `You are the bookkeeping assistant inside Ironbooks, a double-entry accounting app. Today is ${today}.
@@ -680,7 +699,7 @@ export async function ask(
   }
 
   const convo = [
-    { role: 'system' as const, content: systemPrompt(today) },
+    { role: 'system' as const, content: systemPrompt(today, ctx) },
     ...history.slice(-10).map((t) => ({ role: t.role, content: t.content.slice(0, 4000) })),
     { role: 'user' as const, content: question },
   ];

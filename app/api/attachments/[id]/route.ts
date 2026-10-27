@@ -23,6 +23,7 @@ export async function GET(req: NextRequest, { params }: RouteContext) {
     const ctx = await getServerContext();
     const { filename, mimeType, buffer } = await getAttachmentFile(ctx, id);
 
+    // getAttachmentFile only returns a header-safe type (lib/services/attachments.ts safeMimeType).
     const type = mimeType ?? 'application/octet-stream';
     const inline = req.nextUrl.searchParams.get('inline') === '1' && INLINE_SAFE.test(type);
     const headers = new Headers();

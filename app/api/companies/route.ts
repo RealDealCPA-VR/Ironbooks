@@ -20,6 +20,7 @@ import {
   ensureDevCompany,
 } from '@/lib/services/company';
 import { serviceErrorStatus } from '@/lib/routeErrors';
+import { stripSecrets } from '@/lib/permissions/mask';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -48,15 +49,16 @@ export async function GET(req: NextRequest) {
       // Scope to the caller's ACTIVE memberships — never list other tenants' company files.
       // Archived (soft-deleted) files are hidden by default; ?includeArchived=1 overrides.
       const includeArchived = req.nextUrl.searchParams.get('includeArchived') === '1';
+      // Company rows without the closing-date / file password hashes (stripSecrets).
       return NextResponse.json(
-        await listCompaniesForUser(db, userId, { excludeArchived: !includeArchived }),
+        stripSecrets(await listCompaniesForUser(db, userId, { excludeArchived: !includeArchived })),
       );
     }
     if (!(await allowFirstRun(db))) {
       return NextResponse.json({ error: 'Unauthorized', code: 'FORBIDDEN' }, { status: 401 });
     }
     await ensureDevCompany(db); // first run: guarantee at least one
-    return NextResponse.json(await listCompanies(db));
+    return NextResponse.json(stripSecrets(await listCompanies(db)));
   } catch (err) {
     return errorResponse(err);
   }
@@ -92,7 +94,7 @@ export async function POST(req: NextRequest) {
     // Owner = the authenticated user; first-run only, fall back to the seeded dev user.
     const ownerId = sessionUserId ?? (await ensureDevCompany(db)).userId;
     const company = await createCompany(db, { name, ownerId, settings: { ...NEW_COMPANY_SETTINGS } });
-    return NextResponse.json(company, { status: 201 });
+    return NextResponse.json(stripSecrets(company), { status: 201 });
   } catch (err) {
     return errorResponse(err);
   }

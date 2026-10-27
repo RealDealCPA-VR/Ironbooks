@@ -218,9 +218,12 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/qb-import/gl': r('file_utilities', 'GET POST'),
   '/api/qb-import/open-items': r('file_utilities', 'GET POST'),
   '/api/integrity': r('file_utilities', 'GET'),
-  '/api/import': r('file_utilities', 'POST'),
-  '/api/import/csv-preview': r('file_utilities', 'POST'),
-  '/api/import/extract': r('file_utilities', 'POST'),
+  // Bank statement / bank feed files (OFX, QBO, CSV, Excel, PDF or scanned statements) only stage
+  // lines in a bank or card account's feed (Banking > Bank Feeds in QB), so they need Banking —
+  // not File Utilities, which a Bookkeeper or the Banking role does not have (review round 5).
+  '/api/import': r('banking', 'POST'),
+  '/api/import/csv-preview': r('banking', 'POST'),
+  '/api/import/extract': r('banking', 'POST'),
   '/api/import/qb': r('file_utilities', 'POST'),
   '/api/import/rebuild': r('file_utilities', 'GET POST:modify'),
   '/api/qb-import': r('file_utilities', 'POST'),

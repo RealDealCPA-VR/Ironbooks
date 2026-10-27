@@ -20,7 +20,8 @@ export async function GET() {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = (await req.json().catch(() => ({}))) as { entryId?: unknown; memo?: unknown };
+    // A JSON null reads as {} → 400 below (never a TypeError).
+    const body = ((await req.json().catch(() => null)) ?? {}) as { entryId?: unknown; memo?: unknown };
     if (typeof body.entryId !== 'string') {
       return NextResponse.json({ error: 'Pick the refund to print.', code: 'VALIDATION' }, { status: 400 });
     }

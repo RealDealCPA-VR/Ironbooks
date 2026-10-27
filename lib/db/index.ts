@@ -271,6 +271,18 @@ export function openDb(dataDir?: string): DbHandle {
       }
     }
     await noteFirstOpenPosition(client, dir);
+    // AI provider keys saved by older versions were encrypted with this computer's .auth-secret,
+    // which never travels with the company file: re-encrypt the ones this computer can still read
+    // with the file's own key (lib/ai/keyVault.ts). After the first-open position on purpose, so
+    // the change is saved to the single company file like any other. Never blocks the open.
+    if (fs.existsSync(MIGRATIONS_FOLDER) && !opened.damage) {
+      try {
+        const { migrateLegacySecrets } = await import('@/lib/ai/keyVault');
+        await migrateLegacySecrets(db, { dataDir: dir });
+      } catch (err) {
+        console.warn('[db] could not move AI keys to the company file key:', (err as Error)?.message ?? err);
+      }
+    }
   })().catch(async (err) => {
     // A failed open (folder unreachable for a moment, damaged PG_VERSION, a migration that threw)
     // must not stay cached: every later request would answer this error until the app restarted,

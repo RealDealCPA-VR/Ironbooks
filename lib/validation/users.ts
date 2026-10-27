@@ -41,6 +41,11 @@ export const resetPasswordSchema = z.object({
   password: passwordSchema,
   /** gapsb K: the user must choose a new password at their next sign-in. */
   requireChange: z.boolean().optional(),
+  /**
+   * Review round 5: also turn off the user's two-factor sign-in (they lost the phone or the
+   * authenticator app; without this nobody could ever let them back in).
+   */
+  turnOffTwoFactor: z.boolean().optional(),
 });
 
 /** gapsb K: POST /api/auth/change-password (a person changing their own password). */

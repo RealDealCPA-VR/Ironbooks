@@ -32,6 +32,12 @@ async function handlePost(req: NextRequest) {
   }
 
   const status = await getFileLockStatus(db);
+  // The unlock screen asks with an EMPTY password every time it loads (a file without a password
+  // opens straight through). On a protected file that probe is not a guess: answer "protected"
+  // without counting it, or a few page loads would lock the person out before they typed anything.
+  if (status.enabled && !password) {
+    return NextResponse.json({ ok: false, enabled: true, companyName: status.companyName }, { status: 401 });
+  }
   // File-password guessing is rate-limited like sign-in (the file password is one shared secret,
   // so the "account" key is the file itself).
   const origin = originFromHeaders(req.headers);

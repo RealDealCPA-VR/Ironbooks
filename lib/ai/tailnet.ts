@@ -1,66 +1,37 @@
 /**
  * Tailnet helpers — classify where a model endpoint lives and (optionally) discover peers.
  *
+ * The classes are EXACTLY the network policy's (lib/net/cidr.ts classifyHost), because the AI
+ * router trusts them: a 'local' provider gets unredacted data and skips the company's cloud
+ * opt-in, so anything the network policy would treat as the internet must be 'cloud' here too.
  *  - loopback: 127.0.0.0/8, ::1, localhost
- *  - lan:      RFC1918 (10/8, 172.16/12, 192.168/16), link-local, *.local, bare hostnames
+ *  - lan:      RFC 1918 (10/8, 172.16/12, 192.168/16) and IPv6 ULA fc00::/7 addresses
  *  - tailnet:  Tailscale CGNAT range 100.64.0.0/10, Tailscale ULA fd7a:115c:a1e0::/48, and *.ts.net
  *              names verified to resolve only to those (lib/net/tailnetVerify.ts) — Tailscale
  *              Funnel names under ts.net are public, so an unverified *.ts.net name is 'public'
- *  - public:   anything else
+ *  - public:   anything else, INCLUDING short or "local" names (gpu-box, studio.local, nas.lan,
+ *              *.internal): a name could resolve anywhere (a DNS search domain, a public DNS
+ *              answer), so it is never trusted with unredacted data. Use the machine's IP address
+ *              or its full *.ts.net name.
+ *  - invalid:  link-local (169.254/16, fe80::/10 — includes cloud metadata), 0/8, multicast, …
  *
  * Plain-HTTP to a PUBLIC host sends client data over the open internet unencrypted — the UI
  * warns loudly. HTTP inside the tailnet is fine (WireGuard already encrypts the hop).
  */
 import { execFile } from 'node:child_process';
 import type { HostClass } from './types';
-import { isVerifiedTailnetName } from '@/lib/net/cidr';
+import { classifyHost as classifyNetworkHost } from '@/lib/net/cidr';
 
-function ipv4Parts(host: string): number[] | null {
-  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
-  if (!m) return null;
-  const parts = m.slice(1).map(Number);
-  return parts.every((p) => p >= 0 && p <= 255) ? parts : null;
+/** Classify a bare host (no scheme/port) — the network policy's own classification. */
+export function classifyHost(rawHost: string): HostClass {
+  return classifyNetworkHost(rawHost);
 }
 
-/** Classify a bare host (no scheme/port). */
-export function classifyHost(rawHost: string): HostClass {
-  let host = (rawHost || '').trim().toLowerCase();
-  if (!host) return 'invalid';
-  if (host.startsWith('[') && host.endsWith(']')) host = host.slice(1, -1);
-  host = host.replace(/\.$/, '');
-
-  if (host === 'localhost' || host.endsWith('.localhost')) return 'loopback';
-
-  const v4 = ipv4Parts(host);
-  if (v4) {
-    const [a, b] = v4;
-    if (a === 127) return 'loopback';
-    if (a === 100 && b >= 64 && b <= 127) return 'tailnet'; // 100.64.0.0/10 (CGNAT / Tailscale)
-    if (a === 10) return 'lan';
-    if (a === 172 && b >= 16 && b <= 31) return 'lan';
-    if (a === 192 && b === 168) return 'lan';
-    if (a === 169 && b === 254) return 'lan';
-    if (a === 0) return 'invalid';
-    return 'public';
-  }
-
-  if (host.includes(':')) {
-    // IPv6 literal.
-    if (host === '::1') return 'loopback';
-    if (host.startsWith('fd7a:115c:a1e0:')) return 'tailnet';
-    if (/^f[cd][0-9a-f]{2}:/.test(host)) return 'lan'; // ULA fc00::/7
-    if (/^fe[89ab][0-9a-f]:/.test(host)) return 'lan'; // link-local fe80::/10
-    return 'public';
-  }
-
-  if (!/^[a-z0-9.-]+$/.test(host)) return 'invalid';
-  if (host.endsWith('.ts.net')) return isVerifiedTailnetName(host) ? 'tailnet' : 'public';
-  if (host.endsWith('.local') || host.endsWith('.lan') || host.endsWith('.home.arpa') || host.endsWith('.internal')) {
-    return 'lan';
-  }
-  // A single-label hostname (e.g. "gpu-box") only resolves via local DNS / MagicDNS.
-  if (!host.includes('.')) return 'lan';
-  return 'public';
+/** A host NAME (not an address) that only looks local: single-label or a .local-style suffix. */
+function looksLocalName(host: string): boolean {
+  const h = host.trim().toLowerCase().replace(/\.$/, '');
+  if (!h || h.includes(':') || /^[\d.]+$/.test(h)) return false;
+  return !h.includes('.') || /\.(local|lan|home\.arpa|internal|localdomain|corp|home)$/.test(h);
 }
 
 export interface EndpointClassification {
@@ -90,7 +61,9 @@ export function classifyEndpoint(baseUrl: string | null | undefined): EndpointCl
   }
   const hostClass = classifyHost(url.hostname);
   let warning: string | null = null;
-  if (hostClass === 'public' && protocol === 'http') {
+  if (hostClass === 'public' && looksLocalName(url.hostname)) {
+    warning = `${url.hostname} is a name that could point anywhere, so it is treated as a CLOUD model (data is redacted, cloud AI must be on and Privacy & Network must allow it). To keep it local, use the machine's IP address (192.168.x.x or 100.x.y.z) or its full Tailscale name (*.ts.net).`;
+  } else if (hostClass === 'public' && protocol === 'http') {
     warning =
       'This is a PUBLIC address over plain HTTP — anything sent is readable on the internet. Use your Tailscale address (100.x.y.z or *.ts.net) or HTTPS.';
   } else if (hostClass === 'public') {
@@ -98,7 +71,7 @@ export function classifyEndpoint(baseUrl: string | null | undefined): EndpointCl
   } else if (hostClass === 'lan' && protocol === 'http') {
     warning = 'Local network over HTTP — fine on a trusted network; prefer the machine’s Tailscale address.';
   } else if (hostClass === 'invalid') {
-    warning = 'Unrecognized host.';
+    warning = 'This address cannot be used (link-local, reserved or not a valid host name).';
   }
   return {
     hostClass,

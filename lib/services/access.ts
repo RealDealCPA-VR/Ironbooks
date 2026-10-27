@@ -25,7 +25,7 @@ import {
   type RoleDefinition,
   type RoleFlags,
 } from '@/lib/permissions/model';
-import { maskAccountNumber, maskSensitive, maskSsn } from '@/lib/permissions/mask';
+import { maskAccountNumber, maskSensitive, maskSsn, stripSecrets } from '@/lib/permissions/mask';
 import { ServiceError, type ServiceContext } from './_base';
 
 export interface ResolvedAccess {
@@ -196,10 +196,13 @@ export function hasFlag(
  * Mask sensitive fields (SSNs / tax IDs, bank & account numbers) in a service's return value for
  * the context's effective permissions (lib/permissions/mask.ts). Services that return such data
  * to callers apply it at their boundary, so every route and export built on them is covered.
- * Trusted contexts (no `access`) see everything.
+ * Credential material (password hashes, the file-password hash, TOTP secrets — stripSecrets) is
+ * removed for every signed-in caller, the Admin included. Trusted contexts (no `access`) see
+ * everything.
  */
 export function maskForContext<T>(ctx: Pick<ServiceContext, 'access'>, data: T): T {
-  return maskSensitive(data, ctx.access);
+  if (!ctx.access) return data;
+  return stripSecrets(maskSensitive(data, ctx.access));
 }
 
 /** An SSN / taxpayer id as this context may see it (full, or "***-**-6789"). */

@@ -14,8 +14,9 @@ import { getServerContext } from '@/lib/context';
 import { resolveDataDir } from '@/lib/db';
 import { dataDirOf } from '@/lib/db/txHooks';
 import { queryTransactionLog } from '@/lib/services/transactionLog';
-import { redactSecretsDeep } from '@/lib/services/company';
 import { ServiceError } from '@/lib/services/_base';
+import { maskForContext } from '@/lib/services/access';
+import { stripSecrets } from '@/lib/permissions/mask';
 import { serviceErrorStatus } from '@/lib/routeErrors';
 
 function errorResponse(err: unknown) {
@@ -69,9 +70,15 @@ export async function GET(req: NextRequest) {
       limit,
       offset,
     });
-    // Records written by older builds can carry the closing-date password hash in a settings
-    // snapshot: the file keeps them (hash chain), the response never does.
-    return NextResponse.json({ ...page, rows: page.rows.map((r) => ({ ...r, data: redactSecretsDeep(r.data) })) });
+    // The records carry the same before/after snapshots as the audit trail (vendor tax ids, bank
+    // and account numbers, …): mask them for the caller's roles exactly like /api/audit-trail.
+    // Records written by older builds can carry the closing-date / file password hash in a
+    // settings snapshot: the file keeps them (hash chain), the response never does (stripSecrets,
+    // whoever asks).
+    return NextResponse.json({
+      ...page,
+      rows: page.rows.map((r) => ({ ...r, data: maskForContext(ctx, stripSecrets(r.data)) })),
+    });
   } catch (err) {
     return errorResponse(err);
   }
