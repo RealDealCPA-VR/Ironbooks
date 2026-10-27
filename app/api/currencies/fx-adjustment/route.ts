@@ -4,8 +4,8 @@
  * Record an FX gain or loss as a balanced journal entry.
  * Body: { accountId, amount, gain, date, memo? }
  *
- *   gain=true  → Dr accountId / Cr 4900 Other Income
- *   gain=false → Dr 6100 Bank & Merchant Fees / Cr accountId
+ *   gain=true  → Dr accountId / Cr Exchange Gain/Loss
+ *   gain=false → Dr Exchange Gain/Loss / Cr accountId
  *
  * On a foreign-currency bank / card account the entry changes the home value only.
  */

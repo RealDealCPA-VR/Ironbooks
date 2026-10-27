@@ -12,8 +12,8 @@
  *
  * FX gain/loss entries are posted through postJournalEntry so the GL remains the single source
  * of truth:
- *   Gain: Dr <asset/liability account>  /  Cr 4900 Other Income
- *   Loss: Dr 6100 Bank & Merchant Fees  /  Cr <asset/liability account>
+ *   Gain: Dr <asset/liability account>  /  Cr Exchange Gain/Loss
+ *   Loss: Dr Exchange Gain/Loss         /  Cr <asset/liability account>
  */
 import { and, eq, ne, sql } from 'drizzle-orm';
 import Decimal from 'decimal.js';
@@ -101,16 +101,6 @@ function listRateOf(v: unknown): Decimal {
   const rounded = new Decimal(r.toFixed(8));
   if (!rounded.greaterThan(0)) throw validation('The exchange rate is too small (it rounds to 0 at 8 decimals).');
   return rounded;
-}
-
-/** Resolve a GL account by code, scoped to the company. Throws NOT_FOUND if missing. */
-async function resolveAccountByCode(ctx: ServiceContext, code: string): Promise<string> {
-  const [row] = await ctx.db
-    .select({ id: accounts.id })
-    .from(accounts)
-    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, code)));
-  if (!row) throw notFound(`Account ${code}`);
-  return row.id;
 }
 
 // ---------------------------------------------------------------------------
@@ -310,8 +300,8 @@ export async function revaluation(
 /**
  * Post a balanced FX gain/loss journal entry through the posting engine.
  *
- *   Gain: Dr <accountId>       /  Cr 4900 (Other Income)
- *   Loss: Dr 6100 (Bank Fees)  /  Cr <accountId>
+ *   Gain: Dr <accountId>          /  Cr Exchange Gain/Loss
+ *   Loss: Dr Exchange Gain/Loss   /  Cr <accountId>
  *
  * Both lines are equal to `amount` so the entry is always balanced.
  */
@@ -345,8 +335,14 @@ export async function recordFxAdjustment(
   const homeOnly = targetCur !== '' && targetCur !== ((await getHomeCurrencyCode(ctx)) ?? '').toUpperCase();
   const subjectFx = homeOnly ? { foreignAmount: '0' } : {};
 
-  const otherIncomeId = await resolveAccountByCode(ctx, '4900');
-  const bankFeesId = await resolveAccountByCode(ctx, '6100');
+  // review5 fx: the other side is the Exchange Gain/Loss account, where every other realized and
+  // unrealized exchange difference goes (QB "Exchange Gain or Loss"). It used to be whatever
+  // accounts were numbered 4900 / 6100 (Other Income / Bank & Merchant Fees): FX losses landed in
+  // bank fees, and in a converted file without those numbers the adjustment could not be posted.
+  const fxAccountId = await getOrCreateExchangeGainLossAccount(ctx);
+  if (fxAccountId === accountId) {
+    throw validation('Pick the account being revalued — the other side of an FX adjustment is already Exchange Gain/Loss.');
+  }
 
   const amtStr = toAmountString(absAmount);
   const description = memo ?? (gain ? 'FX gain adjustment' : 'FX loss adjustment');
@@ -354,15 +350,15 @@ export async function recordFxAdjustment(
   let lines: Array<{ accountId: string; debit?: string; credit?: string; memo?: string; foreignAmount?: string }>;
 
   if (gain) {
-    // Gain: Dr the subject account / Cr Other Income (4900)
+    // Gain: Dr the subject account / Cr Exchange Gain/Loss
     lines = [
       { accountId, debit: amtStr, memo: description, ...subjectFx },
-      { accountId: otherIncomeId, credit: amtStr, memo: description },
+      { accountId: fxAccountId, credit: amtStr, memo: description },
     ];
   } else {
-    // Loss: Dr Bank & Merchant Fees (6100) / Cr the subject account
+    // Loss: Dr Exchange Gain/Loss / Cr the subject account
     lines = [
-      { accountId: bankFeesId, debit: amtStr, memo: description },
+      { accountId: fxAccountId, debit: amtStr, memo: description },
       { accountId, credit: amtStr, memo: description, ...subjectFx },
     ];
   }
