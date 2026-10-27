@@ -26,7 +26,9 @@ export async function POST(
 
     let body: { correctionId?: string; approved?: unknown; entry?: unknown };
     try {
-      body = await request.json();
+      // `null` (or a non-object) reads as {} so the checks below answer 400, never a TypeError.
+      const raw: unknown = await request.json();
+      body = raw && typeof raw === 'object' ? (raw as typeof body) : {};
     } catch {
       return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
     }

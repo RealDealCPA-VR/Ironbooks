@@ -60,6 +60,10 @@ import { createCustomer } from './customers';
 import { createEstimate } from './estimates';
 import { createPurchaseOrder } from './purchaseOrders';
 import { GET as searchGET } from '@/app/api/search/route';
+import { POST as errorApplyPOST } from '@/app/api/errors/[id]/apply/route';
+import { POST as mergePOST } from '@/app/api/merge/route';
+import { POST as refundsPrintPOST } from '@/app/api/print-queue/refunds/route';
+import { POST as statementEmailPOST } from '@/app/api/sales-forms/statement-email/route';
 
 let db: DB;
 let owner: string;
@@ -329,5 +333,21 @@ describe('review5: global search (Ctrl+K) shows the numbered sales and purchase 
     const clerks = await search(clerk);
     expect(clerks).toContain('Estimate: Estimate #QX-5501');
     expect(clerks).not.toContain('Purchase Order: Purchase Order #QX-5502');
+  });
+});
+
+describe('review5: a JSON null body is a 400, never a 500', () => {
+  it('error apply, merge, refund check printing and statement email', async () => {
+    const id = '00000000-0000-4000-8000-000000000000';
+    const nullBody = (url: string) =>
+      new NextRequest(`http://127.0.0.1${url}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: 'null' });
+    as(owner, 'POST', `/api/errors/${id}/apply`);
+    expect((await errorApplyPOST(nullBody(`/api/errors/${id}/apply`), params({ id }))).status).toBe(400);
+    as(owner, 'POST', '/api/merge');
+    expect((await mergePOST(nullBody('/api/merge'))).status).toBe(400);
+    as(owner, 'POST', '/api/print-queue/refunds');
+    expect((await refundsPrintPOST(nullBody('/api/print-queue/refunds'))).status).toBe(400);
+    as(owner, 'POST', '/api/sales-forms/statement-email');
+    expect((await statementEmailPOST(nullBody('/api/sales-forms/statement-email'))).status).toBe(400);
   });
 });

@@ -16,7 +16,8 @@ function parseDate(v: unknown): Date | undefined {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+    // A JSON null reads as {} → 400 below (never a TypeError).
+    const body = ((await req.json().catch(() => null)) ?? {}) as Record<string, unknown>;
     if (typeof body.customerId !== 'string' || !body.customerId) {
       return NextResponse.json({ error: 'customerId is required', code: 'VALIDATION' }, { status: 400 });
     }
