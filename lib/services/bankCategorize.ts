@@ -38,7 +38,7 @@ import { activeBankRules, noteRuleApplied } from './bankRules';
 import { postJournalEntry, voidJournalEntry } from './posting';
 import { applyRulesToAccount } from './rules';
 import { accountSigned, foreignCurrencyOfAccount } from './fxLedger';
-import { currencyRate, toHome } from './exchangeRates';
+import { currencyRate, homeCode, toHome } from './exchangeRates';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -251,16 +251,30 @@ export async function categorize(ctx: ServiceContext, input: CategorizeInput) {
         }))
         .filter((o) => Money.gt(o.amount, 0))
     : [{ accountId: input.accountId, classId: input.classId ?? null, amount: homeAmt, ...(fx ? { foreign: absAmt } : {}) }];
+  // review5 fx: an offset on a bank / card account in ANOTHER currency than the feed (a home
+  // Checking line "to the Euro bank", a EUR line paying a GBP card) has no amount in that account's
+  // currency: the ledger would invent one at the list rate. QB needs Transfer Funds (or a check /
+  // deposit) with the exchange rate for that, so it is refused here.
+  const offsetAccts = await ctx.db
+    .select({ id: accounts.id, name: accounts.name, currency: accounts.currency })
+    .from(accounts)
+    .where(and(eq(accounts.companyId, ctx.companyId), inArray(accounts.id, [...new Set(offsets.map((o) => o.accountId))])));
+  {
+    const home = ((await homeCode(ctx)) ?? '').trim().toUpperCase();
+    const norm = (c: string | null) => {
+      const v = (c ?? '').trim().toUpperCase();
+      return v === '' || v === home ? null : v;
+    };
+    const other = offsetAccts.find((a) => norm(a.currency) && norm(a.currency) !== (fx?.currency ?? null));
+    if (other) {
+      throw validation(
+        `"${other.name}" is a ${norm(other.currency)} account and this bank line is in ${fx?.currency ?? (home || 'your home currency')}. Use Transfer Funds (or Write Checks / Make Deposits) to enter the exchange rate.`,
+      );
+    }
+  }
   if (fx) {
     const sameCur = new Set(
-      (
-        await ctx.db
-          .select({ id: accounts.id, currency: accounts.currency })
-          .from(accounts)
-          .where(and(eq(accounts.companyId, ctx.companyId), inArray(accounts.id, [...new Set(offsets.map((o) => o.accountId))])))
-      )
-        .filter((a) => (a.currency ?? '').trim().toUpperCase() === fx.currency)
-        .map((a) => a.id),
+      offsetAccts.filter((a) => (a.currency ?? '').trim().toUpperCase() === fx.currency).map((a) => a.id),
     );
     for (const o of offsets) if (!sameCur.has(o.accountId)) delete o.foreign;
   }

@@ -18,6 +18,8 @@ import { createInvoice } from './invoices';
 import { receivePayment } from './payments';
 import { createHomeCurrencyAdjustment } from './homeCurrencyAdjustment';
 import { trialBalance } from './reports';
+import { createBankAccount } from './bankAccounts';
+import { bankTransactions } from '@/lib/db/schema';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-review5-fxmore');
 let db: DB;
@@ -165,5 +167,32 @@ describe('review5 fx (second batch)', () => {
     await createHomeCurrencyAdjustment(ctx, { date: midnight(today), rates: { EUR: '1.15' } });
     const eur2 = (await listCurrencies(ctx)).find((x) => x.code === 'EUR')!;
     expect(Money.of(eur2.rateToBase).toFixed(2)).toBe('1.15');
+  });
+
+  it('a bank-feed line is not added against a bank or card account in another currency (no invented amount)', async () => {
+    const { categorize } = await import('./bankCategorize');
+    const feedLine = async (accountId: string, amount: string) => {
+      const ba = await createBankAccount(ctx, { accountId, bankName: `Bank ${accountId.slice(0, 4)}`, accountNumber: `${seq}${amount}` } as never);
+      const [t] = await db
+        .insert(bankTransactions)
+        .values({ companyId: ctx.companyId, bankAccountId: ba.id, date: d('2026-03-11'), description: 'TRANSFER', amount, matched: false })
+        .returning();
+      return t.id;
+    };
+    // USD 100 leaving Checking "to the Euro bank": the EUR amount that arrived is unknown.
+    const usdOut = await feedLine(acct['1000'], '-100.00');
+    await expect(categorize(ctx, { bankTransactionId: usdOut, accountId: acct['1020'] })).rejects.toMatchObject({ code: 'VALIDATION' });
+    // A EUR feed line against a GBP card.
+    await upsertCurrency(ctx, { code: 'GBP', name: 'Pound', rateToBase: '1.50' });
+    const gbpCard = (await createAccount(ctx, { code: '2170', name: 'GBP Card', type: 'liability' as never, subtype: 'credit_card' })).id;
+    await setAccountCurrency(ctx, gbpCard, 'GBP');
+    const eurOut = await feedLine(acct['1020'], '-50.00');
+    await expect(categorize(ctx, { bankTransactionId: eurOut, accountId: gbpCard })).rejects.toMatchObject({ code: 'VALIDATION' });
+    // Nothing was posted to either foreign account.
+    const [eurBank] = await db.select().from(accounts).where(eq(accounts.id, acct['1020']));
+    expect(Money.of(eurBank.balance).toFixed(2)).toBe('0.00');
+    // The same lines against a home-currency account are fine.
+    await expect(categorize(ctx, { bankTransactionId: usdOut, accountId: acct['6100'] })).resolves.toBeTruthy();
+    await expect(categorize(ctx, { bankTransactionId: eurOut, accountId: acct['6100'] })).resolves.toBeTruthy();
   });
 });
