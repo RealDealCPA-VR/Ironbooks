@@ -62,4 +62,14 @@ describe('review5 fx subledger on a large file', () => {
     expect(p.lines.find((l) => l.kind === 'customer')?.adjustment).toBe('33000.00');
     expect(p.lines.find((l) => l.kind === 'vendor')?.adjustment).toBe('33000.00');
   }, 300_000);
+
+  it('A/R aging as of a date reads every unapplied customer payment (A/R credit subledger)', async () => {
+    const { arAging } = await import('./reportsExtra');
+    const [cust] = await db.execute(sql`SELECT id FROM customers WHERE company_id = ${ctx.companyId} LIMIT 1`).then((r) => r.rows as Array<{ id: string }>);
+    await db.execute(sql`INSERT INTO payments_received (company_id, customer_id, date, method, amount, unapplied, exchange_rate)
+      SELECT ${ctx.companyId}, ${cust.id}, '2026-02-01', 'cash', '1', '1', '1' FROM generate_series(1, ${N}) g`);
+    const aging = await arAging(ctx, new Date('2026-12-31T00:00:00Z'));
+    // EUR 660,000 of invoices at 1.20 (USD 792,000) less USD 66,000 of unapplied payments.
+    expect(aging.totals.total).toBe('726000.00');
+  }, 300_000);
 });
