@@ -225,7 +225,21 @@ export function openDb(dataDir?: string): DbHandle {
       }
     }
     await noteFirstOpenPosition(client, dir);
-  })();
+  })().catch(async (err) => {
+    // A failed open (folder unreachable for a moment, damaged PG_VERSION, a migration that threw)
+    // must not stay cached: every later request would answer this error until the app restarted,
+    // and the lock — renewed by its heartbeat — would keep every other computer out. Close what
+    // was opened first (callers meanwhile still get this handle and this error), then forget the
+    // handle and release the lock so the next request opens the file afresh.
+    try {
+      await client.close();
+    } catch {
+      /* never finished opening */
+    }
+    if (handles.get(dir) === opened) handles.delete(dir);
+    if (!opened.lost) releaseDirLock(dir);
+    throw err;
+  });
 
   handles.set(dir, opened);
   return opened;

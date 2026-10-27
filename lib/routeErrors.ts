@@ -5,6 +5,7 @@
  */
 import { NextResponse } from 'next/server';
 import { ServiceError, type ServiceErrorCode } from '@/lib/services/_base';
+import { MoneyParseError } from '@/lib/money';
 
 /** 400 response for a request body that is not valid JSON (or not a JSON object). */
 export function invalidJsonBody(): NextResponse {
@@ -132,6 +133,10 @@ export function routeError(err: unknown, tag: string): NextResponse {
   // A malformed request body (`await req.json()` on invalid JSON) is the caller's fault, not ours.
   if (err instanceof SyntaxError) {
     return invalidJsonBody();
+  }
+  // An amount that is not a number (lib/money.ts), thrown before any transaction translated it.
+  if (err instanceof MoneyParseError) {
+    return NextResponse.json({ error: err.message, code: 'VALIDATION' }, { status: 400 });
   }
   console.error(`[${tag}]`, err);
   return NextResponse.json({ error: 'Internal server error' }, { status: 500 });

@@ -71,32 +71,100 @@ export interface DepreciationScheduleItem {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Look up an account by code, creating it if it does not exist.
- * `type` must match Drizzle enum literals: 'asset' | 'liability' | 'equity' | 'revenue' | 'expense'.
- */
-async function getOrCreateAccount(
-  ctx: ServiceContext,
-  code: string,
-  def: { name: string; type: string; subtype: string },
-): Promise<string> {
-  const [existing] = await ctx.db
-    .select({ id: accounts.id })
-    .from(accounts)
-    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, code)));
-  if (existing) return existing.id;
+/** A default depreciation account: where to look for it and what to create when there is none. */
+interface DefaultDepreciationAccount {
+  /** Preferred number (used when it is free, or when the account there is this account). */
+  code: string;
+  name: string;
+  type: 'asset' | 'expense';
+  subtype: string;
+  /** Account types that may hold it (base type + detail subtypes). */
+  subtypes: readonly string[];
+  /** What its name looks like in a chart the user built or converted from QuickBooks. */
+  namePattern: RegExp;
+}
 
+const DEPRECIATION_EXPENSE: DefaultDepreciationAccount = {
+  code: '6800',
+  name: 'Depreciation Expense',
+  type: 'expense',
+  subtype: 'operating_expenses',
+  subtypes: ['operating_expenses', 'other_expense'],
+  namePattern: /depreciation|\bdepr\b/i,
+};
+
+const ACCUMULATED_DEPRECIATION: DefaultDepreciationAccount = {
+  code: '1590',
+  name: 'Accumulated Depreciation',
+  type: 'asset',
+  subtype: 'fixed_assets',
+  subtypes: ['fixed_assets', 'other_asset'],
+  namePattern: /depreciation|\bdepr\b|\baccum/i,
+};
+
+/**
+ * The company's Depreciation Expense / Accumulated Depreciation account, created when it has none.
+ * An account only qualifies when it is of the right kind AND named like one: the number alone is
+ * not enough — in a chart converted from QuickBooks 1590 or 6800 can be a bank account or the
+ * telephone expense, which would then have been credited / debited with the depreciation. The
+ * preferred number wins among qualifying accounts; a new account takes the next free number.
+ */
+async function getOrCreateDepreciationAccount(ctx: ServiceContext, def: DefaultDepreciationAccount): Promise<string> {
+  const rows = await ctx.db
+    .select({ id: accounts.id, code: accounts.code, name: accounts.name, type: accounts.type, subtype: accounts.subtype, isActive: accounts.isActive })
+    .from(accounts)
+    .where(eq(accounts.companyId, ctx.companyId));
+  const fits = (a: (typeof rows)[number]) =>
+    a.type === def.type && def.subtypes.includes(a.subtype) && def.namePattern.test(a.name);
+  const candidates = rows
+    .filter(fits)
+    .sort(
+      (a, b) =>
+        Number(b.code === def.code) - Number(a.code === def.code) ||
+        Number(b.isActive) - Number(a.isActive) ||
+        Number(b.name.toLowerCase() === def.name.toLowerCase()) - Number(a.name.toLowerCase() === def.name.toLowerCase()) ||
+        a.code.localeCompare(b.code, undefined, { numeric: true }),
+    );
+  if (candidates.length) return candidates[0].id;
+
+  const taken = new Set(rows.map((r) => r.code.trim()));
+  let n = Number(def.code);
+  while (taken.has(String(n))) n += 1;
   const [created] = await ctx.db
     .insert(accounts)
     .values({
       companyId: ctx.companyId,
-      code,
+      code: String(n),
       name: def.name,
       type: def.type as never,
       subtype: def.subtype as never,
     })
     .returning();
+  await writeAudit(ctx, { action: 'create', entityType: 'account', entityId: created.id, newValues: created });
   return created.id;
+}
+
+/**
+ * `months` calendar months after `date` on the UTC calendar (ledger dates are calendar days at
+ * UTC midnight), keeping the day of the month and clamping it to the target month's last day:
+ * Jan 31 + 1 = Feb 28 / 29, + 2 = Mar 31. A local-time setMonth overflowed (Jan 31 -> Mar 3, so
+ * February had no period and March two) and shifted a day in time zones west of UTC.
+ */
+function addMonthsClampedUtc(date: Date, months: number): Date {
+  const y = date.getUTCFullYear();
+  const m = date.getUTCMonth() + months;
+  const lastDay = new Date(Date.UTC(y, m + 1, 0)).getUTCDate();
+  return new Date(
+    Date.UTC(
+      y,
+      m,
+      Math.min(date.getUTCDate(), lastDay),
+      date.getUTCHours(),
+      date.getUTCMinutes(),
+      date.getUTCSeconds(),
+      date.getUTCMilliseconds(),
+    ),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -127,17 +195,27 @@ export async function createAsset(ctx: ServiceContext, input: CreateAssetInput) 
     throw validation('usefulLifeMonths must be a positive integer.');
   }
 
-  // Resolve optional account overrides — just verify they belong to this company.
-  for (const accountId of [
-    input.depreciationExpenseAccountId,
-    input.accumulatedDepreciationAccountId,
-    input.assetAccountId,
-  ].filter(Boolean) as string[]) {
+  // Optional account overrides: they must belong to this company and be of the kind they stand
+  // for (QB Fixed Asset Manager lists only expense accounts for depreciation expense and fixed /
+  // other asset accounts for the asset and its accumulated depreciation) — a bank or A/R account
+  // there would be credited or debited with every month's depreciation.
+  const overrides: Array<{ id: string | null | undefined; label: string; ok: (a: { type: string; subtype: string }) => boolean }> = [
+    { id: input.depreciationExpenseAccountId, label: 'The depreciation expense account', ok: (a) => a.type === 'expense' && a.subtype !== 'cost_of_goods_sold' },
+    { id: input.accumulatedDepreciationAccountId, label: 'The accumulated depreciation account', ok: (a) => a.type === 'asset' && ACCUMULATED_DEPRECIATION.subtypes.includes(a.subtype) },
+    { id: input.assetAccountId, label: 'The asset account', ok: (a) => a.type === 'asset' && ACCUMULATED_DEPRECIATION.subtypes.includes(a.subtype) },
+  ];
+  for (const o of overrides) {
+    if (!o.id) continue;
     const [row] = await ctx.db
-      .select({ id: accounts.id })
+      .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype, name: accounts.name })
       .from(accounts)
-      .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, accountId)));
-    if (!row) throw notFound(`Account ${accountId}`);
+      .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, o.id)));
+    if (!row) throw notFound(`Account ${o.id}`);
+    if (!o.ok(row)) {
+      throw validation(
+        `${o.label} can't be "${row.name}". Pick ${o.label.includes('expense') ? 'an expense' : 'a Fixed Asset or Other Asset'} account.`,
+      );
+    }
   }
 
   const [asset] = await ctx.db
@@ -232,9 +310,8 @@ export function depreciationSchedule(asset: {
 
     accumulated = accumulated.plus(periodAmount);
 
-    // Compute the date for this period: placedInService + p months.
-    const d = new Date(asset.placedInService);
-    d.setMonth(d.getMonth() + p);
+    // The date for this period: placedInService + p months.
+    const d = addMonthsClampedUtc(new Date(asset.placedInService), p);
 
     schedule.push({
       period: p,
@@ -275,60 +352,57 @@ export interface PostDepreciationInput {
 export async function postDepreciation(ctx: ServiceContext, input: PostDepreciationInput) {
   const { assetId, date } = input;
 
-  const [asset] = await ctx.db
-    .select()
-    .from(fixedAssets)
-    .where(and(eq(fixedAssets.companyId, ctx.companyId), eq(fixedAssets.id, assetId)));
-  if (!asset) throw notFound('Fixed asset');
-
-  const cost = Money.of(asset.cost);
-  const salvage = Money.of(asset.salvageValue);
-  const depreciableBase = cost.minus(salvage);
-  const alreadyAccumulated = Money.of(asset.accumulatedDepreciation);
-
-  // Guard: already fully depreciated.
-  if (alreadyAccumulated.greaterThanOrEqualTo(depreciableBase)) {
-    throw new ServiceError(
-      'VALIDATION',
-      `Asset "${asset.name}" is already fully depreciated (accumulated ${toAmountString(alreadyAccumulated)} of ${toAmountString(depreciableBase)}).`,
-    );
-  }
-
-  // Standard monthly amount.
-  const monthlyAmount = Money.round2(depreciableBase.dividedBy(asset.usefulLifeMonths));
-
-  // Clamp to remaining depreciable amount to avoid over-depreciation.
-  const remaining = depreciableBase.minus(alreadyAccumulated);
-  // The asset's last useful-life period takes whatever remains (as depreciationSchedule does), so
-  // a rounded-down monthly amount never leaves a cent to depreciate after the useful life ends.
-  const postedPeriods = (
-    await ctx.db
-      .select({ id: depreciationEntries.id })
-      .from(depreciationEntries)
-      .where(and(eq(depreciationEntries.companyId, ctx.companyId), eq(depreciationEntries.fixedAssetId, assetId)))
-  ).length;
-  const isLastPeriod = postedPeriods + 1 >= asset.usefulLifeMonths;
-  const periodAmount =
-    isLastPeriod || monthlyAmount.greaterThan(remaining) ? Money.round2(remaining) : monthlyAmount;
-
-  // Resolve GL accounts (use overrides if the asset has them; otherwise get-or-create defaults).
-  const depExpenseAccountId =
-    asset.depreciationExpenseAccountId ??
-    (await getOrCreateAccount(ctx, '6800', {
-      name: 'Depreciation Expense',
-      type: 'expense',
-      subtype: 'operating_expenses',
-    }));
-
-  const accumDepAccountId =
-    asset.accumulatedDepreciationAccountId ??
-    (await getOrCreateAccount(ctx, '1590', {
-      name: 'Accumulated Depreciation',
-      type: 'asset',
-      subtype: 'fixed_assets',
-    }));
-
+  // Everything — reading the asset's accumulated depreciation, the clamp to what is left, the
+  // posting and the write-back — happens in ONE transaction with the asset row locked. Reading
+  // the asset first and writing `accumulated + amount` later let two posts at once (two months,
+  // two users) both start from the same total: the asset kept only one of them while the ledger
+  // had both, and the last period could be depreciated twice past cost - salvage.
   return inTransaction(ctx, async (tx) => {
+    const [asset] = await tx.db
+      .select()
+      .from(fixedAssets)
+      .where(and(eq(fixedAssets.companyId, tx.companyId), eq(fixedAssets.id, assetId)))
+      .for('update');
+    if (!asset) throw notFound('Fixed asset');
+
+    const cost = Money.of(asset.cost);
+    const salvage = Money.of(asset.salvageValue);
+    const depreciableBase = cost.minus(salvage);
+    const alreadyAccumulated = Money.of(asset.accumulatedDepreciation);
+
+    // Guard: already fully depreciated.
+    if (alreadyAccumulated.greaterThanOrEqualTo(depreciableBase)) {
+      throw new ServiceError(
+        'VALIDATION',
+        `Asset "${asset.name}" is already fully depreciated (accumulated ${toAmountString(alreadyAccumulated)} of ${toAmountString(depreciableBase)}).`,
+      );
+    }
+
+    // Standard monthly amount.
+    const monthlyAmount = Money.round2(depreciableBase.dividedBy(asset.usefulLifeMonths));
+
+    // Clamp to remaining depreciable amount to avoid over-depreciation.
+    const remaining = depreciableBase.minus(alreadyAccumulated);
+    // The asset's last useful-life period takes whatever remains (as depreciationSchedule does), so
+    // a rounded-down monthly amount never leaves a cent to depreciate after the useful life ends.
+    const postedPeriods = (
+      await tx.db
+        .select({ id: depreciationEntries.id })
+        .from(depreciationEntries)
+        .where(and(eq(depreciationEntries.companyId, tx.companyId), eq(depreciationEntries.fixedAssetId, assetId)))
+    ).length;
+    const isLastPeriod = postedPeriods + 1 >= asset.usefulLifeMonths;
+    const periodAmount =
+      isLastPeriod || monthlyAmount.greaterThan(remaining) ? Money.round2(remaining) : monthlyAmount;
+
+    // Resolve GL accounts (use overrides if the asset has them; otherwise get-or-create defaults,
+    // inside this transaction so two first posts never create the default accounts twice).
+    const depExpenseAccountId =
+      asset.depreciationExpenseAccountId ?? (await getOrCreateDepreciationAccount(tx, DEPRECIATION_EXPENSE));
+
+    const accumDepAccountId =
+      asset.accumulatedDepreciationAccountId ?? (await getOrCreateDepreciationAccount(tx, ACCUMULATED_DEPRECIATION));
+
     // Idempotency guard: refuse to post the same asset's depreciation twice for the same
     // date (e.g. a double-clicked "Run depreciation" or a re-run monthly job). Checked inside
     // the transaction so concurrent posts can't both pass.

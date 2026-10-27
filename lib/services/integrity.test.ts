@@ -122,7 +122,7 @@ describe('verifyIntegrity', () => {
     const names = result.checks.map((c) => c.name);
     expect(names).toContain('Journal entries balanced');
     expect(names).toContain('Cached account balances match GL');
-    expect(names).toContain('A/R control account (1200) matches open invoices');
+    expect(names).toContain('A/R control account matches open invoices');
     expect(names).toContain('No cross-company journal entry lines');
   });
 

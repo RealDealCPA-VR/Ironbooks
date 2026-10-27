@@ -361,7 +361,8 @@ describe('QA: adjusting entries', () => {
     const rep = await getAdjustingEntries(ctx, { from: new Date(2026, 5, 1), to: new Date(2026, 5, 30) });
     const ids = rep.entries.map((e) => e.id);
     expect(ids).toContain(edited.id);
-    expect(ids).not.toContain(a.id); // the voided original of the edit
+    // A description-only edit keeps the entry (review round 5); a re-posting edit voids the original.
+    if (edited.id !== a.id) expect(ids).not.toContain(a.id);
     expect(ids).not.toContain(cleared.id);
     expect(rep.entries.every((e) => e.description !== 'Other co AJE')).toBe(true);
     expect(rep.totalDebit).toBe(rep.totalCredit);

@@ -19,9 +19,17 @@ export const postingLineSchema = z.object({
 export const createJournalEntrySchema = z.object({
   date: zDate,
   description: z.string().trim().min(1, 'description is required'),
-  reference: z.string().nullish(),
+  /** QB "Entry No." — journal_entries.reference is varchar(100). */
+  reference: z.string().trim().max(100, 'Entry No. can be at most 100 characters.').nullish(),
   lines: zLines(postingLineSchema),
   /** QB "Adjusting Entry" checkbox. */
   isAdjusting: z.boolean().optional(),
 });
 export type CreateJournalEntryBody = z.infer<typeof createJournalEntrySchema>;
+
+/**
+ * PATCH /api/journal-entries/:id — the same body as a new entry (the edit re-posts it). An
+ * omitted `reference` keeps the entry's number; `null` clears it.
+ */
+export const updateJournalEntrySchema = createJournalEntrySchema;
+export type UpdateJournalEntryBody = z.infer<typeof updateJournalEntrySchema>;

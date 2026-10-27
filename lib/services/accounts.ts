@@ -27,6 +27,7 @@ import {
 } from '@/lib/taxLines';
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
 import { postJournalEntry } from './posting';
+import { ledgerToday } from './fiscalPeriods';
 import { resolveCompanyPreferences } from '@/lib/preferences';
 import { assertAccountChangeAllowed } from './accountantCopy/guard';
 
@@ -270,6 +271,8 @@ export async function createAccount(ctx: ServiceContext, input: CreateAccountInp
 
 async function createAccountInTx(ctx: ServiceContext, input: CreateAccountInput) {
   if (!input.name?.trim()) throw validation('Account name is required.');
+  // The number is stored trimmed, so it is checked for uniqueness trimmed (" 1000" is 1000).
+  input = { ...input, code: typeof input.code === 'string' ? input.code.trim() : input.code };
   const { type, subtype } = resolveTypeAndSubtype(input);
   if (!input.code?.trim()) {
     // Preferences > Accounting 'Require account numbers': refuse a blank number; otherwise
@@ -343,7 +346,8 @@ async function createAccountInTx(ctx: ServiceContext, input: CreateAccountInput)
       // opening balance flips the direction. Opening Balance Equity takes the offset.
       const debitNew = DEBIT_NORMAL.has(type) !== openingBalance.isNegative();
       await postJournalEntry(tx, {
-        date: input.openingBalanceDate ?? new Date(),
+        // No date given: today on this computer's calendar (a ledger date), never the current instant.
+        date: input.openingBalanceDate ?? ledgerToday(),
         description: `Opening balance for ${row.code} ${row.name}`,
         status: 'posted',
         sourceRef: `account:${row.id}`,

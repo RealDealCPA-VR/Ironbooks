@@ -33,6 +33,7 @@ import { can, type Area } from '@/lib/permissions/model';
 import { createInvoice, type CreateInvoiceInput } from './invoices';
 import { createBill, type CreateBillInput } from './bills';
 import { createManualEntry, type ManualEntryInput } from './journal';
+import { getPreferences } from './company';
 import { createExpense, type CreateExpenseInput } from './expenses';
 import { createSalesReceipt, type CreateSalesReceiptInput } from './salesReceipts';
 import { createCreditMemo, type CreateCreditMemoInput } from './creditMemos';
@@ -604,7 +605,15 @@ async function generateFromTemplate(
       break;
     }
     case 'journal_entry': {
-      const input = { ...(payload as unknown as ManualEntryInput), date: runDate };
+      // With "Automatically assign general journal entry numbers" on, each entry gets the NEXT
+      // number (as in QB), not the number the entry had when it was memorized — re-using it gave
+      // every recurrence the same Entry No. With the preference off the stored number is kept.
+      const autoNumber = (await getPreferences(ctx)).autoAssignJeNumbers;
+      const input = {
+        ...(payload as unknown as ManualEntryInput),
+        ...(autoNumber ? { reference: null } : {}),
+        date: runDate,
+      };
       docId = (await createManualEntry(ctx, input)).id;
       break;
     }

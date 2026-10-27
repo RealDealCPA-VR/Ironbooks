@@ -27,6 +27,8 @@ interface CloseResult {
   netIncome: string;
   totalRevenue: string;
   totalExpenses: string;
+  /** The account the net income went to (the equity account of type Retained Earnings). */
+  retainedEarnings?: { code: string; name: string };
 }
 
 // ---------------------------------------------------------------------------
@@ -66,7 +68,7 @@ function ConfirmModal({ open, fiscalYear, running, onConfirm, onClose }: Confirm
             <p>
               Running year-end close for <strong>Fiscal Year {fiscalYear}</strong> will post a
               journal entry that zeros out all revenue and expense accounts and transfers
-              net income into <strong>Retained Earnings (3900)</strong>.
+              net income into your <strong>Retained Earnings</strong> account.
             </p>
           </div>
         </div>
@@ -140,8 +142,11 @@ function ResultCard({ result }: ResultCardProps) {
       </div>
 
       <p className="mt-3 text-xs text-navy/40">
-        Net income of {formatCurrency(result.netIncome)} has been transferred to Retained
-        Earnings (3900). Revenue and expense accounts are now zeroed out for the new fiscal year.
+        Net income of {formatCurrency(result.netIncome)} has been transferred to{' '}
+        {result.retainedEarnings
+          ? `${result.retainedEarnings.code} · ${result.retainedEarnings.name}`
+          : 'Retained Earnings'}
+        . Revenue and expense accounts are now zeroed out for the new fiscal year.
       </p>
     </Card>
   );
@@ -192,7 +197,7 @@ export default function YearEndPage() {
         <Card className="p-6">
           <p className="text-sm text-navy/70 mb-5">
             Year-end close zeroes out all revenue and expense accounts for the selected fiscal year
-            and transfers net income into <strong>Retained Earnings (3900)</strong>. Run this once
+            and transfers net income into your <strong>Retained Earnings</strong> account. Run this once
             at the end of each fiscal year after all transactions have been entered and reviewed.
           </p>
 

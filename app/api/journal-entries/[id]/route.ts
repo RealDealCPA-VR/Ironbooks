@@ -9,6 +9,8 @@ import { getServerContext } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
 import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
 import { getEntry, updateEntry, voidEntry } from '@/lib/services/journal';
+import { zodErrorBody } from '@/lib/validation/helpers';
+import { updateJournalEntrySchema } from '@/lib/validation/journal';
 
 type Params = { params: Promise<{ id: string }> };
 
@@ -28,20 +30,23 @@ export async function PATCH(req: NextRequest, { params }: Params) {
     const { id } = await params;
     const ctx = await getServerContext();
     const body = await requireJsonObject(req);
-
-    const date = body.date ? new Date(body.date) : undefined;
-    if (!date || isNaN(date.getTime())) {
-      return NextResponse.json({ error: 'date is required (ISO string).' }, { status: 400 });
+    // Same shape checks as a new entry: lines that are not an array of objects, a description
+    // that is not text or a date that does not exist (Feb 30) are a 400, never a TypeError (500)
+    // or a silently rolled-over date.
+    const parsed = updateJournalEntrySchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
+    const input = parsed.data;
 
     // Multi-user: 409 if someone else changed this entry since it was loaded.
     const entry = await withVersionCheck(ctx, 'journal_entry', id, expectedVersion(req), (c) =>
       updateEntry(c, id, {
-        date,
-        description: body.description ?? '',
-        reference: body.reference === undefined ? undefined : (body.reference ?? null),
-        lines: body.lines ?? [],
-        isAdjusting: typeof body.isAdjusting === 'boolean' ? body.isAdjusting : undefined,
+        date: input.date,
+        description: input.description,
+        reference: body.reference === undefined ? undefined : (input.reference ?? null),
+        lines: input.lines,
+        isAdjusting: input.isAdjusting,
       }),
     );
     return NextResponse.json({ entry });

@@ -9,7 +9,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
-import { getCompany, updateCompany } from '@/lib/services/company';
+import { getCompany, redactCompany, updateCompany } from '@/lib/services/company';
 import { ServiceError } from '@/lib/services/_base';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { updateCompanyBodySchema } from '@/lib/validation/company';
@@ -31,7 +31,8 @@ export async function GET() {
     if (!company) {
       return NextResponse.json({ error: 'Company not found', code: 'NOT_FOUND' }, { status: 404 });
     }
-    return NextResponse.json(company);
+    // Never hand the closing-date password hash to the browser (any member may call this).
+    return NextResponse.json(redactCompany(company));
   } catch (err) {
     return errorResponse(err);
   }

@@ -14,6 +14,7 @@ import type { PgColumn, PgTable } from 'drizzle-orm/pg-core';
 import type { DB } from '@/lib/db';
 import { auditLogs } from '@/lib/db/schema';
 import { ServiceError, type ServiceErrorFix } from './errors';
+import { MoneyParseError } from '@/lib/money';
 import { logTransaction } from './transactionLog';
 import { auditBackstop } from './accountantCopy/guard';
 import type { EffectiveAccess } from '@/lib/permissions/model';
@@ -141,6 +142,10 @@ export async function writeAudit(
  */
 export function translateLedgerDbError(err: unknown): unknown {
   if (err instanceof ServiceError || !err || typeof err !== 'object') return err;
+  // An amount that is not a number (lib/money.ts toDecimal) is the caller's mistake: a plain 400,
+  // never an "Internal server error". Stored payloads (memorized transactions, imports, AI drafts)
+  // reach the money math without passing a request schema.
+  if (err instanceof MoneyParseError) return new ServiceError('VALIDATION', err.message, { input: err.input });
   const code = (err as { code?: unknown }).code;
   const message = String((err as { message?: unknown }).message ?? '');
   if (code === 'BK001') return new ServiceError('UNBALANCED', message, { sqlstate: code });

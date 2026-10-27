@@ -11,7 +11,7 @@ import { asc } from 'drizzle-orm';
 import { getServerContext, isArchivedCompany } from '@/lib/context';
 import { getDb } from '@/lib/db';
 import { companies } from '@/lib/db/schema';
-import { runDue, runGroup, runTemplateNow } from '@/lib/services/recurring';
+import { runDue, runGroup, runTemplateNow, todayUtcMidnight } from '@/lib/services/recurring';
 import { ServiceError, type ServiceContext } from '@/lib/services/_base';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { runRecurringSchema } from '@/lib/validation/recurring';
@@ -79,6 +79,13 @@ export async function POST(req: NextRequest) {
     if (!parsed.success) {
       return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
+    // "As of" is a calendar day. An instant (an ISO time, what "Run due" sends) means the day it
+    // is on THIS computer's calendar: at 9:30 pm in New York the UTC day is already tomorrow, and
+    // tomorrow's memorized transactions were entered early.
+    const asOf =
+      parsed.data.asOf && typeof body?.asOf === 'string' && body.asOf.includes('T')
+        ? todayUtcMidnight(parsed.data.asOf)
+        : (parsed.data.asOf ?? undefined);
     if (internal) {
       // The desktop shell's launch-time / hourly run: due templates only, across every company.
       if (parsed.data.id || parsed.data.group) {
@@ -87,7 +94,7 @@ export async function POST(req: NextRequest) {
           { status: 400 },
         );
       }
-      return NextResponse.json(await runDueForCompanies(internal, parsed.data.asOf ?? undefined));
+      return NextResponse.json(await runDueForCompanies(internal, asOf));
     }
     const ctx = await getServerContext();
 
@@ -104,7 +111,7 @@ export async function POST(req: NextRequest) {
 
     // Otherwise run all due templates up to asOf. Auto-enter templates post;
     // remind-only templates come back in `reminders` without posting.
-    const result = await runDue(ctx, parsed.data.asOf ?? undefined);
+    const result = await runDue(ctx, asOf);
     return NextResponse.json(result);
   } catch (err) {
     return errorResponse(err);

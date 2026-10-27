@@ -40,9 +40,11 @@ import { balanceFixes, balanceSummary } from '@/lib/errorFixes';
 import { getPreferences } from './company';
 import { nextJournalNumber } from '@/lib/prefBehaviors';
 import { isJournalScreenEntry } from '@/lib/journalScreen';
+import { assertClosedPeriodEdit, lineKey, sameLedgerLines } from './postedEdit';
 import {
   type JournalEntityType,
   type PostingLine,
+  assertBalanced,
   postJournalEntry,
   voidJournalEntry,
   balanceDelta,
@@ -160,6 +162,16 @@ export interface GLOptions {
  */
 async function autoJournalNumber(ctx: ServiceContext): Promise<string | null> {
   if (!(await getPreferences(ctx)).autoAssignJeNumbers) return null;
+  return nextManualJournalNumber(ctx);
+}
+
+/**
+ * The next General Journal Entry No.: after the highest number on a journal entry (sourceRef
+ * 'manual': the journal window, the API, memorized entries). Other postings carry their own
+ * document's number as their reference (invoice, vendor bill and check numbers), which the
+ * journal's numbering never follows. The New Journal Entry window pre-fills it from here.
+ */
+export async function nextManualJournalNumber(ctx: ServiceContext): Promise<string> {
   const rows = await ctx.db
     .select({ reference: journalEntries.reference })
     .from(journalEntries)
@@ -608,7 +620,20 @@ async function updateEntryInner(ctx: ServiceContext, id: string, input: UpdateEn
       'This entry was posted by a source document. Edit the source document instead.',
     );
   }
-  await assertNoJournalApplications(ctx, id, 'edited');
+  // Well-formed, balanced lines first (the "did anything change?" comparison reads their amounts).
+  assertBalanced(input.lines);
+  // QB keeps the SAME entry when the date and the lines (accounts, amounts, classes, names) did
+  // not change — a memo, description, Entry No. or adjusting-flag edit, or an unchanged re-save.
+  // Voiding and re-posting it gave the entry a new number every time, lost a reconciled line's
+  // cleared mark (or was refused outright for a reconciled entry) and was refused for an entry
+  // with payments or credits applied, although none of that is touched by such an edit.
+  const unchanged =
+    before.date.toISOString().slice(0, 10) === input.date.toISOString().slice(0, 10) &&
+    sameLedgerLines(
+      before.lines.map((l) => ({ accountId: l.accountId, debit: l.debit, credit: l.credit, classId: l.classId, entityType: l.entityType, entityId: l.entityId })),
+      input.lines,
+    );
+  if (!unchanged) await assertNoJournalApplications(ctx, id, 'edited');
 
   // Period lock on BOTH dates — the old date is where balances get reversed,
   // the new date is where they get re-posted. (postJournalEntry/voidJournalEntry
@@ -626,6 +651,67 @@ async function updateEntryInner(ctx: ServiceContext, id: string, input: UpdateEn
   const isAdjusting = input.isAdjusting ?? before.isAdjusting;
 
   return inTransaction(ctx, async (tx) => {
+    // The checks above ran before this transaction: another edit or void of the same entry (a
+    // double-clicked Save, a second user) may have committed since. voidJournalEntry treats an
+    // already-void entry as done, so without this re-check BOTH edits would post a replacement.
+    const [current] = await tx.db
+      .select({ status: journalEntries.status })
+      .from(journalEntries)
+      .where(and(eq(journalEntries.id, id), eq(journalEntries.companyId, tx.companyId)))
+      .for('update');
+    if (!current || current.status !== 'posted') {
+      throw new ServiceError(
+        'CONFLICT',
+        'This journal entry was just changed or voided (by you in another window or by another user). Reload it to see the latest version.',
+      );
+    }
+    if (unchanged) {
+      // Same ledger: keep the entry, change only its header and line memos. Any change to a
+      // transaction dated on/before the closing date still needs the password (and is listed on
+      // the Closing Date Exception report).
+      await assertClosedPeriodEdit(tx, { entryId: id, what: 'journal entry' });
+      const reference = input.reference === undefined ? before.reference : input.reference;
+      const [row] = await tx.db
+        .update(journalEntries)
+        .set({ description: input.description.trim(), reference, isAdjusting, updatedAt: new Date() })
+        .where(and(eq(journalEntries.id, id), eq(journalEntries.companyId, tx.companyId)))
+        .returning();
+      // Pair each submitted line with a stored line of the same account / amount / class / name.
+      const pool = new Map<string, JournalEntryLine[]>();
+      for (const l of before.lines) {
+        const k = lineKey(l);
+        pool.set(k, [...(pool.get(k) ?? []), l]);
+      }
+      for (const nl of input.lines) {
+        const old = pool.get(lineKey(nl))?.shift();
+        const memo = nl.memo?.trim() ? nl.memo : null;
+        if (old && (old.memo ?? null) !== memo) {
+          await tx.db.update(journalEntryLines).set({ memo }).where(eq(journalEntryLines.id, old.id));
+        }
+      }
+      await writeAudit(tx, {
+        action: 'update',
+        entityType: 'journal_entry',
+        entityId: id,
+        oldValues: {
+          entryNumber: before.entryNumber,
+          date: before.date,
+          description: before.description,
+          reference: before.reference,
+          isAdjusting: before.isAdjusting,
+          lines: before.lines,
+        },
+        newValues: {
+          entryNumber: before.entryNumber,
+          date: before.date,
+          description: input.description.trim(),
+          reference,
+          isAdjusting,
+          lines: input.lines,
+        },
+      });
+      return row;
+    }
     // 1. Void the original (reverses cached balances; guards reconciled lines).
     await voidJournalEntry(tx, id);
 
@@ -682,6 +768,12 @@ export function defaultReversalDate(entryDate: Date): Date {
 /** Refuse to void / reverse a document-posted entry from the journal screen (lib/journalScreen.ts). */
 function assertJournalScreenEntry(sourceRef: string | null | undefined, op: 'void' | 'reverse'): void {
   if (isJournalScreenEntry(sourceRef, op)) return;
+  if (op === 'reverse' && sourceRef?.startsWith('fiscal-close:')) {
+    throw new ServiceError(
+      'CONFLICT',
+      "A year-end closing entry can't be reversed: the reversal would count in next year's Profit & Loss. Void the closing entry instead to take the year-end close back.",
+    );
+  }
   throw new ServiceError(
     'CONFLICT',
     op === 'void'
@@ -1241,18 +1333,79 @@ export async function getAdjustingEntries(
   if (opts.from) conds.push(gte(journalEntries.date, opts.from));
   if (opts.to) conds.push(onOrBeforeDay(opts.to));
   const heads = await ctx.db
-    .select({ id: journalEntries.id })
+    .select()
     .from(journalEntries)
     .where(and(...conds))
     .orderBy(asc(journalEntries.date), asc(journalEntries.entryNumber));
+  // Lines and names for every entry in a few batched queries (not getEntry per entry: two or more
+  // queries each made a year of adjusting entries slow to open).
+  const linesByEntry = new Map<string, JournalEntryLine[]>();
+  const allLines: Array<JournalEntryLine & { journalEntryId: string }> = [];
+  for (let i = 0; i < heads.length; i += 500) {
+    const chunk = heads.slice(i, i + 500).map((h) => h.id);
+    const rows = await ctx.db
+      .select({
+        journalEntryId: journalEntryLines.journalEntryId,
+        id: journalEntryLines.id,
+        accountId: journalEntryLines.accountId,
+        accountCode: accounts.code,
+        accountName: accounts.name,
+        debit: journalEntryLines.debit,
+        credit: journalEntryLines.credit,
+        memo: journalEntryLines.memo,
+        classId: journalEntryLines.classId,
+        className: classes.name,
+        entityType: journalEntryLines.entityType,
+        entityId: journalEntryLines.entityId,
+      })
+      .from(journalEntryLines)
+      .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
+      .leftJoin(classes, eq(journalEntryLines.classId, classes.id))
+      .where(inArray(journalEntryLines.journalEntryId, chunk))
+      .orderBy(asc(journalEntryLines.createdAt));
+    for (const l of rows) {
+      allLines.push({
+        ...l,
+        debit: l.debit ?? null,
+        credit: l.credit ?? null,
+        memo: l.memo ?? null,
+        classId: l.classId ?? null,
+        className: l.className ?? null,
+        entityType: (l.entityType as JournalEntityType | null) ?? null,
+        entityId: l.entityId ?? null,
+        entityName: null,
+      });
+    }
+  }
+  const names = await resolveEntityNames(ctx, allLines);
+  for (const { journalEntryId, ...l } of allLines) {
+    const line: JournalEntryLine = {
+      ...l,
+      entityName: l.entityType && l.entityId ? (names.get(`${l.entityType}:${l.entityId}`) ?? null) : null,
+    };
+    linesByEntry.set(journalEntryId, [...(linesByEntry.get(journalEntryId) ?? []), line]);
+  }
   const entries: JournalEntryDetail[] = [];
   let debit = Money.zero();
   let credit = Money.zero();
-  for (const h of heads) {
-    const e = await getEntry(ctx, h.id);
-    entries.push(e);
-    if (e.status !== 'posted') continue;
-    for (const l of e.lines) {
+  for (const entry of heads) {
+    const lines = linesByEntry.get(entry.id) ?? [];
+    entries.push({
+      id: entry.id,
+      entryNumber: entry.entryNumber,
+      date: entry.date,
+      description: entry.description,
+      reference: entry.reference ?? null,
+      status: entry.status,
+      sourceRef: entry.sourceRef ?? null,
+      isAdjusting: entry.isAdjusting ?? false,
+      createdAt: entry.createdAt,
+      updatedAt: entry.updatedAt,
+      voidedAt: entry.voidedAt ?? null,
+      lines,
+    });
+    if (entry.status !== 'posted') continue;
+    for (const l of lines) {
       debit = debit.plus(Money.of(l.debit));
       credit = credit.plus(Money.of(l.credit));
     }

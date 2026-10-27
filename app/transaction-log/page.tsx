@@ -29,6 +29,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { localDayEndIso, localDayStartIso } from '@/lib/dates';
 import ReportToolbar, { type ExportTable } from '@/app/reports/_components/ReportToolbar';
 
 interface LogRecord {
@@ -221,8 +222,11 @@ export default function TransactionLogPage() {
     setLoading(true);
     try {
       const params = new URLSearchParams({ limit: String(FETCH_LIMIT) });
-      if (from) params.set('from', from);
-      if (to) params.set('to', to);
+      // The picked days are THIS computer's calendar days: send their exact local bounds.
+      const fromIso = localDayStartIso(from);
+      const toIso = localDayEndIso(to);
+      if (fromIso) params.set('from', fromIso);
+      if (toIso) params.set('to', toIso);
       if (userId) params.set('userId', userId);
       if (entityType) params.set('entityType', entityType);
       if (action) params.set('action', action);

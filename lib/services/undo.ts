@@ -861,6 +861,30 @@ async function expenseVoidLinks(ctx: ServiceContext, id: string): Promise<string
 }
 
 /** Snapshot key holding the links found by prepareUndo for a void. */
+/**
+ * Journal entry voided from the journal screen: Undo re-enters it as a NEW plain journal entry
+ * (createManualEntry, sourceRef 'manual'). Only plain entries (and reversals, whose copy is the
+ * same GL) can come back that way. An entry something else tracks by its source link would lose
+ * that link: a year-end closing entry copy is counted by the Profit & Loss (which leaves closing
+ * entries out), a depreciation copy is on no asset's schedule, a refund copy gives no credit back,
+ * a sales-tax payment copy is not a payment to the agency, an opening-balance copy is not the
+ * account's opening balance. Those voids get no Undo.
+ */
+async function journalVoidLinks(ctx: ServiceContext, id: string): Promise<string[]> {
+  const [e] = await ctx.db
+    .select({ sourceRef: journalEntries.sourceRef })
+    .from(journalEntries)
+    .where(and(eq(journalEntries.id, id), eq(journalEntries.companyId, ctx.companyId)));
+  const ref = e?.sourceRef ?? null;
+  if (!ref || ref === 'manual' || ref.startsWith('reversal:')) return [];
+  if (ref.startsWith('fiscal-close:')) return ['a year-end close'];
+  if (ref.startsWith('fixed_asset:')) return ["a fixed asset's depreciation schedule"];
+  if (ref.startsWith('refund:')) return ['a refunded customer or vendor credit'];
+  if (ref.startsWith('account:')) return ["an account's opening balance"];
+  if (ref.startsWith('tax_agency:') || ref.startsWith('sales_tax_adj:')) return ['a sales tax agency'];
+  return ['the transaction that posted it'];
+}
+
 const VOID_LINKS_KEY = '__voidLinks';
 
 function voidLinksOf(snap: unknown): string[] {
@@ -959,6 +983,7 @@ const ADAPTERS: Record<string, Adapter> = {
     update: (ctx, id, s) => updateEntry(ctx, id, entryInput(s)),
     create: (ctx, s) => createManualEntry(ctx, entryInput(s)),
     describe: (s) => `journal entry #${s.entryNumber}`,
+    voidLinks: journalVoidLinks,
   }),
   'sales-receipts': ledgerDoc({
     entity: 'sales_receipt',

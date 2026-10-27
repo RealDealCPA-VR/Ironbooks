@@ -14,6 +14,7 @@ import { getServerContext } from '@/lib/context';
 import { resolveDataDir } from '@/lib/db';
 import { dataDirOf } from '@/lib/db/txHooks';
 import { queryTransactionLog } from '@/lib/services/transactionLog';
+import { redactSecretsDeep } from '@/lib/services/company';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus } from '@/lib/routeErrors';
 
@@ -27,10 +28,22 @@ function errorResponse(err: unknown) {
   return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
 }
 
+/**
+ * A From / To bound. Records carry the instant they were written, so a calendar day means the
+ * day on THIS computer's calendar (read as a UTC day, a change made at 9:30 pm in New York was
+ * listed under the next day). The window may also send exact instants (ISO date-times).
+ */
 function parseDay(value: string | null, endOfDay: boolean): Date | undefined {
-  if (!value || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return undefined;
-  const d = new Date(`${value}T${endOfDay ? '23:59:59.999' : '00:00:00.000'}Z`);
-  return isNaN(d.getTime()) ? undefined : d;
+  if (!value) return undefined;
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (m) {
+    const [y, mo, d] = [Number(m[1]), Number(m[2]) - 1, Number(m[3])];
+    const local = endOfDay ? new Date(y, mo, d, 23, 59, 59, 999) : new Date(y, mo, d, 0, 0, 0, 0);
+    return isNaN(local.getTime()) || local.getDate() !== d ? undefined : local;
+  }
+  if (!/^\d{4}-\d{2}-\d{2}T/.test(value)) return undefined;
+  const instant = new Date(value);
+  return isNaN(instant.getTime()) ? undefined : instant;
 }
 
 export async function GET(req: NextRequest) {
@@ -56,7 +69,9 @@ export async function GET(req: NextRequest) {
       limit,
       offset,
     });
-    return NextResponse.json(page);
+    // Records written by older builds can carry the closing-date password hash in a settings
+    // snapshot: the file keeps them (hash chain), the response never does.
+    return NextResponse.json({ ...page, rows: page.rows.map((r) => ({ ...r, data: redactSecretsDeep(r.data) })) });
   } catch (err) {
     return errorResponse(err);
   }

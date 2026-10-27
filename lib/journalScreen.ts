@@ -10,7 +10,10 @@
  * VOIDED here (the posting engine gives the credit back), but not reversed. Fixed-asset
  * depreciation entries may be VOIDED here too (voidEntry takes the period off the asset's
  * schedule and accumulated depreciation), but not reversed (a reversal would leave the schedule
- * saying the period was depreciated).
+ * saying the period was depreciated). Year-end closing entries (fiscal-close:<year>) may be
+ * VOIDED (that takes the close back) but not reversed: the reversal is an ordinary entry dated in
+ * the next year, which that year's Profit & Loss counts (reports leave only fiscal-close entries
+ * out), so it showed the whole closed year's income and expenses a second time.
  */
 // tax_agency / sales_tax_adj are GL-only sales-tax entries (Batch Void treats them as journals too);
 // qbgl entries are the imported QuickBooks General Ledger, which no subledger document tracks;
@@ -34,5 +37,6 @@ export function isJournalScreenEntry(sourceRef: string | null | undefined, op: '
   if (!sourceRef || sourceRef === 'manual') return true;
   if (JOURNAL_SCREEN_EXACT.has(sourceRef)) return true;
   if (op === 'void' && (sourceRef.startsWith('refund:') || sourceRef.startsWith('fixed_asset:'))) return true;
+  if (op === 'reverse' && sourceRef.startsWith('fiscal-close:')) return false;
   return JOURNAL_SCREEN_PREFIXES.some((p) => sourceRef.startsWith(p));
 }

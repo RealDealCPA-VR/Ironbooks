@@ -191,9 +191,12 @@ function startHeartbeat(dir: string, file: string, info: LockInfo, onLost?: (hos
   lock.timer = setInterval(() => {
     try {
       const current = readLock(file);
-      if (current && !isOwn(current.info)) {
-        // Someone else took it over (we were judged stale): stop claiming it, stop using the file.
-        lose(dir, lock, current);
+      // Someone else took it over (we were judged stale), or took it over and has closed the file
+      // again (its lock, which replaced ours, is gone): stop claiming it, stop using the file.
+      // Re-creating a vanished lock would let this process write over changes the other
+      // computer made underneath its in-memory database.
+      if (!current || !isOwn(current.info)) {
+        lose(dir, lock, current ?? { info: null });
         return;
       }
       info.heartbeatAt = new Date().toISOString();
@@ -209,8 +212,9 @@ function startHeartbeat(dir: string, file: string, info: LockInfo, onLost?: (hos
 /**
  * Before a transaction commits: throw CompanyFileInUseError (after running the lost handling)
  * when another process has taken over this process's lock on `dir`, so the write is rolled back
- * instead of landing in a folder someone else now owns. No-op when no lock is held (a folder
- * opened without one) or the lock file cannot be read for a moment (the heartbeat decides).
+ * instead of landing in a folder someone else now owns — also when the lock file is GONE (taken
+ * over and released again by another process). No-op when no lock is held (a folder opened
+ * without one) or the lock file cannot be read for a moment (the heartbeat decides).
  */
 export function assertDirLockHeld(dir: string): void {
   const lock = held.get(dir);
@@ -221,7 +225,8 @@ export function assertDirLockHeld(dir: string): void {
   } catch {
     return;
   }
-  if (current && !isOwn(current.info)) throw new CompanyFileInUseError(lose(dir, lock, current));
+  // A vanished lock is lost too (taken over and released by another process meanwhile).
+  if (!current || !isOwn(current.info)) throw new CompanyFileInUseError(lose(dir, lock, current ?? { info: null }));
 }
 
 /** Release this process's lock on `dir` (no-op when it holds none). */

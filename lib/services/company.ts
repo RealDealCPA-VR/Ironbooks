@@ -3,10 +3,10 @@
  * A "company file" maps to a PGlite data directory (see lib/db). For now we operate on the
  * active database; multi-file management is layered on in the Electron shell.
  */
-import { and, eq } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import { accounts, companies, currencies, users, userCompanies } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
-import { notFound, validation, writeAudit } from './_base';
+import { inTransaction, notFound, validation, writeAudit } from './_base';
 import { hashPassword, verifyPassword } from '@/lib/auth';
 import { assertWrite } from './rbac';
 import { requireEffectivePermission } from './access';
@@ -52,8 +52,59 @@ export const DEFAULT_COA: AccountSeed[] = [
   { code: '6700', name: 'Taxes & Licenses', type: 'expense', subtype: 'taxes' },
 ];
 
+/**
+ * Settings keys that never leave the server: the closing-date password hash (bcrypt; anyone who
+ * has it can try passwords offline and then post into closed periods). Stripped from every
+ * company row handed to a page or written to the audit trail / transaction log.
+ */
+const SECRET_SETTINGS_KEYS = ['closingDatePasswordHash'] as const;
+
+/**
+ * The per-file sign-in password (lib/services/fileLock.ts) keeps its bcrypt hash in
+ * settings.fileLock.hash. Only whether the file is protected is ever handed out.
+ */
+const FILE_LOCK_KEY = 'fileLock';
+function redactFileLock(v: unknown): unknown {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return v;
+  const fl = v as { enabled?: unknown; hash?: unknown };
+  return { enabled: Boolean(fl.enabled && fl.hash) };
+}
+
+/** A copy of `settings` without the secret keys (closing-date and file password hashes). */
+export function redactCompanySettings<T>(settings: T): T {
+  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) return settings;
+  const out = { ...(settings as Record<string, unknown>) };
+  for (const k of SECRET_SETTINGS_KEYS) delete out[k];
+  if (FILE_LOCK_KEY in out) out[FILE_LOCK_KEY] = redactFileLock(out[FILE_LOCK_KEY]);
+  return out as T;
+}
+
+/**
+ * A deep copy of arbitrary stored data (audit-trail snapshots, transaction-log records) with
+ * every secret settings key removed at any depth. Older builds wrote the whole settings object,
+ * closing-date password hash included, into the audit trail and the transaction log; those rows
+ * are kept (they are the history), but the hash is never handed out when they are read.
+ */
+export function redactSecretsDeep<T>(value: T, depth = 0): T {
+  if (depth > 32 || !value || typeof value !== 'object') return value;
+  if (Array.isArray(value)) return value.map((v) => redactSecretsDeep(v, depth + 1)) as unknown as T;
+  if (value instanceof Date) return value;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    if ((SECRET_SETTINGS_KEYS as readonly string[]).includes(k)) continue;
+    out[k] = k === FILE_LOCK_KEY && v && typeof v === 'object' && !Array.isArray(v) ? redactFileLock(v) : redactSecretsDeep(v, depth + 1);
+  }
+  return out as T;
+}
+
+/** A company row as it may be returned to a client: settings without secret keys. */
+export function redactCompany<T extends { settings?: unknown } | null | undefined>(row: T): T {
+  if (!row || typeof row !== 'object') return row;
+  return { ...row, settings: redactCompanySettings(row.settings) };
+}
+
 export async function listCompanies(db: DB) {
-  return db.select().from(companies);
+  return (await db.select().from(companies)).map(redactCompany);
 }
 
 /**
@@ -72,7 +123,7 @@ export async function listCompaniesForUser(
     .from(companies)
     .innerJoin(userCompanies, eq(userCompanies.companyId, companies.id))
     .where(and(eq(userCompanies.userId, userId), eq(userCompanies.isActive, true)));
-  const list = rows.map((r) => r.company);
+  const list = rows.map((r) => redactCompany(r.company));
   if (!opts?.excludeArchived) return list;
   return list.filter(
     (c) => (c.settings as Record<string, unknown> | null)?.archived !== true,
@@ -307,50 +358,53 @@ export interface UpdateCompanyInput {
  */
 export async function updateCompany(ctx: ServiceContext, input: UpdateCompanyInput) {
   assertWrite(ctx); // early viewer block (writeAudit re-checks centrally)
-  const existing = await getCompany(ctx);
-  if (!existing) throw notFound('company');
 
   const settingsPatch: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(input.settings ?? {})) {
     if (SETTINGS_KEY_SET.has(key) && value !== undefined) settingsPatch[key] = value;
   }
-  // Account-valued preferences must name the right kind of account (a paycheck account that is
-  // A/R or a wages account that is A/P would break the subledger == control-account rule).
-  await assertPreferenceAccounts(ctx, settingsPatch);
-  // A2: Multiple Currencies can't be turned off once foreign-currency data exists (QB lock).
-  const multiCurrency =
-    'multiCurrencyEnabled' in settingsPatch
-      ? await assertMultiCurrencyChangeAllowed(ctx, existing.settings as Record<string, unknown>, settingsPatch.multiCurrencyEnabled)
-      : null;
 
-  const mergedSettings = {
-    ...(existing.settings ?? {}),
-    ...settingsPatch,
-  };
+  // Read, check and write in ONE transaction, and merge only the patched keys in SQL: a
+  // Preferences save that ran next to Set Closing Date (or another save) used to write back the
+  // whole settings object it had read, silently dropping the other change (e.g. the closing date).
+  const updated = await inTransaction(ctx, async (tx) => {
+    const existing = await getCompany(tx);
+    if (!existing) throw notFound('company');
+    // Account-valued preferences must name the right kind of account (a paycheck account that is
+    // A/R or a wages account that is A/P would break the subledger == control-account rule).
+    await assertPreferenceAccounts(tx, settingsPatch);
+    // A2: Multiple Currencies can't be turned off once foreign-currency data exists (QB lock).
+    const multiCurrency =
+      'multiCurrencyEnabled' in settingsPatch
+        ? await assertMultiCurrencyChangeAllowed(tx, existing.settings as Record<string, unknown>, settingsPatch.multiCurrencyEnabled)
+        : null;
 
-  const [updated] = await ctx.db
-    .update(companies)
-    .set({
-      ...(input.name !== undefined ? { name: input.name } : {}),
-      settings: mergedSettings,
-      updatedAt: new Date(),
-    })
-    .where(eq(companies.id, ctx.companyId))
-    .returning();
+    const [row] = await tx.db
+      .update(companies)
+      .set({
+        ...(input.name !== undefined ? { name: input.name } : {}),
+        settings: sql`coalesce(${companies.settings}, '{}'::jsonb) || ${JSON.stringify(settingsPatch)}::jsonb`,
+        updatedAt: new Date(),
+      })
+      .where(eq(companies.id, tx.companyId))
+      .returning();
 
-  // Turning Multiple Currencies on: the home currency goes into the currency list (QB shows it
-  // there as soon as the preference is on) so foreign currencies can be added next to it.
-  if (multiCurrency === 'on') await ensureHomeCurrency(ctx, mergedSettings);
+    // Turning Multiple Currencies on: the home currency goes into the currency list (QB shows it
+    // there as soon as the preference is on) so foreign currencies can be added next to it.
+    if (multiCurrency === 'on') await ensureHomeCurrency(tx, (row.settings ?? {}) as Record<string, unknown>);
 
-  await writeAudit(ctx, {
-    action: 'update',
-    entityType: 'company',
-    entityId: ctx.companyId,
-    oldValues: { name: existing.name, settings: existing.settings },
-    newValues: { name: updated.name, settings: updated.settings },
+    // The audit trail (and the transaction log it feeds) never carries the password hash.
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'company',
+      entityId: tx.companyId,
+      oldValues: { name: existing.name, settings: redactCompanySettings(existing.settings) },
+      newValues: { name: row.name, settings: redactCompanySettings(row.settings) },
+    });
+    return row;
   });
 
-  return updated;
+  return redactCompany(updated);
 }
 
 /** Put the home currency (Preferences currency, default USD) in the currency list if missing. */
@@ -410,52 +464,69 @@ export async function setClosingDate(
   // Enterprise roles: Closing Date / Periods — modify (Admin, Accountant, External Accountant,
   // custom roles), same rule as the route map for PATCH /api/company/closing-date.
   await requireEffectivePermission(ctx, 'closing', 'modify');
-  const existing = await getCompany(ctx);
-  if (!existing) throw notFound('company');
 
-  if (input.closingDate !== null && !/^\d{4}-\d{2}-\d{2}$/.test(input.closingDate)) {
-    throw validation('closingDate must be in YYYY-MM-DD format (or null to clear).');
+  if (input.closingDate !== null && !isCalendarDay(input.closingDate)) {
+    throw validation('closingDate must be a real date in YYYY-MM-DD format (or null to clear).');
   }
 
-  const settings = { ...((existing.settings ?? {}) as Record<string, unknown>) };
-  const before: ClosingDateSettings = {
-    closingDate: typeof settings.closingDate === 'string' ? (settings.closingDate as string) : null,
-    hasPassword: Boolean(settings.closingDatePasswordHash),
-  };
+  // Hash before the transaction (bcrypt is slow; the database stays free meanwhile).
+  const newHash =
+    input.closingDate !== null && typeof input.password === 'string' && input.password !== ''
+      ? await hashPassword(input.password)
+      : null;
 
-  if (input.closingDate === null) {
-    delete settings.closingDate;
-    delete settings.closingDatePasswordHash;
-  } else {
-    settings.closingDate = input.closingDate;
-    if (input.password === null || input.password === '') {
-      delete settings.closingDatePasswordHash;
-    } else if (typeof input.password === 'string') {
-      settings.closingDatePasswordHash = await hashPassword(input.password);
+  // Only the two closing-date keys are written, in SQL, inside one transaction with the read
+  // for the audit row: a Preferences save running at the same moment keeps its own keys, and
+  // this change is never undone by a stale copy of the settings written back by another save.
+  return inTransaction(ctx, async (tx) => {
+    const existing = await getCompany(tx);
+    if (!existing) throw notFound('company');
+    const settings = (existing.settings ?? {}) as Record<string, unknown>;
+    const before: ClosingDateSettings = {
+      closingDate: typeof settings.closingDate === 'string' ? (settings.closingDate as string) : null,
+      hasPassword: Boolean(settings.closingDatePasswordHash),
+    };
+
+    let next: ReturnType<typeof sql>;
+    if (input.closingDate === null) {
+      next = sql`coalesce(${companies.settings}, '{}'::jsonb) - 'closingDate' - 'closingDatePasswordHash'`;
+    } else if (input.password === null || input.password === '') {
+      next = sql`(coalesce(${companies.settings}, '{}'::jsonb) - 'closingDatePasswordHash') || jsonb_build_object('closingDate', ${input.closingDate}::text)`;
+    } else if (newHash !== null) {
+      next = sql`coalesce(${companies.settings}, '{}'::jsonb) || jsonb_build_object('closingDate', ${input.closingDate}::text, 'closingDatePasswordHash', ${newHash}::text)`;
+    } else {
+      next = sql`coalesce(${companies.settings}, '{}'::jsonb) || jsonb_build_object('closingDate', ${input.closingDate}::text)`;
     }
-  }
 
-  const [updated] = await ctx.db
-    .update(companies)
-    .set({ settings, updatedAt: new Date() })
-    .where(eq(companies.id, ctx.companyId))
-    .returning();
+    const [updated] = await tx.db
+      .update(companies)
+      .set({ settings: next, updatedAt: new Date() })
+      .where(eq(companies.id, tx.companyId))
+      .returning();
 
-  const after: ClosingDateSettings = {
-    closingDate: typeof updated.settings?.closingDate === 'string' ? updated.settings.closingDate : null,
-    hasPassword: Boolean(updated.settings?.closingDatePasswordHash),
-  };
+    const after: ClosingDateSettings = {
+      closingDate: typeof updated.settings?.closingDate === 'string' ? updated.settings.closingDate : null,
+      hasPassword: Boolean(updated.settings?.closingDatePasswordHash),
+    };
 
-  // Audit without ever logging the hash.
-  await writeAudit(ctx, {
-    action: 'update',
-    entityType: 'company',
-    entityId: ctx.companyId,
-    oldValues: { closingDate: before.closingDate, hasPassword: before.hasPassword },
-    newValues: { closingDate: after.closingDate, hasPassword: after.hasPassword },
+    // Audit without ever logging the hash.
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'company',
+      entityId: tx.companyId,
+      oldValues: { closingDate: before.closingDate, hasPassword: before.hasPassword },
+      newValues: { closingDate: after.closingDate, hasPassword: after.hasPassword },
+    });
+
+    return after;
   });
+}
 
-  return after;
+/** 'YYYY-MM-DD' naming a day that exists (not 2026-02-30, not 2026-13-01). */
+function isCalendarDay(s: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+  const d = new Date(`${s}T00:00:00.000Z`);
+  return !isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s;
 }
 
 /**

@@ -7,6 +7,7 @@ import { getServerContext } from '@/lib/context';
 import { listPeriods, closePeriod } from '@/lib/services/fiscalPeriods';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
+import { parseDateInput } from '@/lib/validation/helpers';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -30,9 +31,10 @@ export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
     const body = await requireJsonObject(req);
-    const periodStart = new Date(body.periodStart);
-    const periodEnd = new Date(body.periodEnd);
-    if (isNaN(periodStart.getTime()) || isNaN(periodEnd.getTime())) {
+    // Real calendar days only: new Date('2026-02-30') rolls over to March 2.
+    const periodStart = typeof body.periodStart === 'string' ? parseDateInput(body.periodStart) : null;
+    const periodEnd = typeof body.periodEnd === 'string' ? parseDateInput(body.periodEnd) : null;
+    if (!periodStart || !periodEnd) {
       return NextResponse.json(
         { error: 'periodStart and periodEnd must be valid dates', code: 'VALIDATION' },
         { status: 400 },

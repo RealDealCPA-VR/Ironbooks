@@ -8,7 +8,7 @@
  * Checks:
  *  1. Every posted journal entry is balanced (sum debit == sum credit).
  *  2. Each account's cached `balance` column matches the GL-derived balance.
- *  3. A/R control account (code 1200) balance equals sum of open invoices' balanceDue.
+ *  3. The A/R control accounts equal the open invoices, unapplied credits and named GJ items.
  *  4. No journal_entry_lines reference an account belonging to another company.
  *  5. The database ledger guards (drizzle/0017_team_ledger.sql) are installed and enabled.
  *
@@ -184,20 +184,28 @@ async function checkCachedBalances(ctx: ServiceContext): Promise<IntegrityCheck>
 }
 
 // ---------------------------------------------------------------------------
-// Check 3: A/R control account (code 1200) balance == sum of open invoice balanceDue.
+// Check 3: the A/R control accounts == open invoices, credits and General Journal items.
 // ---------------------------------------------------------------------------
-async function checkARControl(ctx: ServiceContext): Promise<IntegrityCheck> {
-  const name = 'A/R control account (1200) matches open invoices';
+/** Check name (app/integrity/page.tsx maps it to the Rebuild action that fixes it). */
+export const AR_CONTROL_CHECK = 'A/R control account matches open invoices';
 
-  // Look up the 1200 account.
-  const [arAccount] = await ctx.db
+async function checkARControl(ctx: ServiceContext): Promise<IntegrityCheck> {
+  const name = AR_CONTROL_CHECK;
+
+  // EVERY Accounts Receivable account (by type, like the balance sheet and the month-end aging
+  // step) — not just the one numbered 1200: a chart converted from QuickBooks brings its own A/R
+  // account, and an amount there that no customer explains must be reported too.
+  const arAccounts = await ctx.db
     .select({ id: accounts.id, balance: accounts.balance })
     .from(accounts)
-    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, '1200')));
+    .where(
+      and(eq(accounts.companyId, ctx.companyId), eq(accounts.type, 'asset'), eq(accounts.subtype, 'accounts_receivable')),
+    );
 
-  if (!arAccount) {
-    return { name, ok: true, detail: 'Account 1200 (A/R) not found — check skipped.' };
+  if (arAccounts.length === 0) {
+    return { name, ok: true, detail: 'No Accounts Receivable account — check skipped.' };
   }
+  const arIds = new Set(arAccounts.map((a) => a.id));
 
   // Sum balanceDue across open/partial/overdue invoices for this company. balanceDue is in the
   // invoice's currency, so only home-currency invoices are summed here (p1 fx).
@@ -221,9 +229,9 @@ async function checkARControl(ctx: ServiceContext): Promise<IntegrityCheck> {
   }
   const invRow = { totalDue: toAmountString(homeDue) };
 
-  const arBalance = Money.of(arAccount.balance);
+  const arBalance = arAccounts.reduce((sum, a) => sum.plus(Money.of(a.balance)), Money.zero());
   // Named General Journal lines on A/R are customer open items too (journal.ts journalOpenItems).
-  const journalItems = (await journalOpenItems(ctx, 'ar')).filter((j) => j.accountId === arAccount.id);
+  const journalItems = (await journalOpenItems(ctx, 'ar')).filter((j) => arIds.has(j.accountId));
   // Unapplied customer payments were credited to A/R in full, so they are credits here too.
   const unappliedCredits = (await unappliedCustomerPayments(ctx)).reduce(
     (sum, p) => sum.plus(Money.of(p.amount)),
@@ -253,7 +261,7 @@ async function checkARControl(ctx: ServiceContext): Promise<IntegrityCheck> {
     return {
       name,
       ok: true,
-      detail: `A/R balance ${toAmountString(arBalance)} matches open invoice balanceDue ${toAmountString(invoicesDue)}.`,
+      detail: `A/R balance ${toAmountString(arBalance)} matches the open invoices, credits and General Journal items (${toAmountString(invoicesDue)}).`,
     };
   }
   // Journal entries made before names were required can hit A/R with no customer. Those amounts
@@ -266,7 +274,7 @@ async function checkARControl(ctx: ServiceContext): Promise<IntegrityCheck> {
       and(
         eq(journalEntries.companyId, ctx.companyId),
         eq(journalEntries.status, 'posted'),
-        eq(journalEntryLines.accountId, arAccount.id),
+        inArray(journalEntryLines.accountId, [...arIds]),
         generalJournalSourceSql(),
         sql`${journalEntryLines.entityId} IS NULL`,
       ),
@@ -279,7 +287,7 @@ async function checkARControl(ctx: ServiceContext): Promise<IntegrityCheck> {
   return {
     name,
     ok: false,
-    detail: `A/R cached balance ${toAmountString(arBalance)} != open invoice balanceDue ${toAmountString(invoicesDue)} (diff ${toAmountString(arBalance.minus(invoicesDue))}).${hint}`,
+    detail: `A/R balance ${toAmountString(arBalance)} does not match the open invoices, credits and General Journal items (${toAmountString(invoicesDue)}; difference ${toAmountString(arBalance.minus(invoicesDue))}).${hint}`,
   };
 }
 
@@ -351,6 +359,8 @@ export const LEDGER_GUARD_TRIGGERS: Record<string, string> = {
   bka_je_non_posting: 'Non-posting accounts never carry posted amounts (post transitions)',
   bka_accounts_non_posting: 'Accounts with history cannot become non-posting',
   bka_transfers_no_ar_ap: 'Transfers never move money into or out of A/R or A/P',
+  // drizzle/0063_r5_ledger.sql (was 0037's bk_journal_item_applications_void_guard)
+  bka_jia_void_guard: 'Journal entries with payments or credits applied cannot be voided or edited',
   // drizzle/0046_p1_controls.sql — record locking versions
   ...Object.fromEntries(
     [

@@ -484,6 +484,10 @@ export async function accountantChanges(ctx: ServiceContext): Promise<Accountant
         txns.push({ op: 'edit', type: 'journal_entry', id: e.id, baseVersion: iso(v), after: await journalPayload(ctx, fin) });
       } else if (e.status === 'void' || (fin && fin.status === 'void')) {
         txns.push({ op: 'void', type: 'journal_entry', id: e.id, baseVersion: iso(v) });
+      } else if (e.status === 'posted' && finalOf(e.id) === e.id) {
+        // Edited in place (same date and lines: description, memo, Entry No., Adjusting flag —
+        // journal.ts updateEntry keeps the entry then). The client applies it with updateEntry too.
+        txns.push({ op: 'edit', type: 'journal_entry', id: e.id, baseVersion: iso(v), after: await journalPayload(ctx, e) });
       }
       continue;
     }

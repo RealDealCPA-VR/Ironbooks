@@ -348,7 +348,8 @@ describe('ledger invariants enforced by the database', () => {
       sql`SELECT tgname, tgenabled FROM pg_trigger WHERE tgname LIKE 'bka%' AND tgname NOT LIKE 'bka\_version\_%' AND NOT tgisinternal`,
     );
     const rows = (res as unknown as { rows: Array<{ tgname: string; tgenabled: string }> }).rows;
-    expect(rows.length).toBe(16); // 11 from 0017 + 3 non-posting guards + 1 transfer A/R-A/P guard from 0025 + 1 foreign-amount guard from 0043
+    expect(rows.length).toBe(17); // 11 from 0017 + 3 non-posting guards + 1 transfer A/R-A/P guard from 0025 + 1 foreign-amount guard from 0043 + 1 journal-application void guard from 0063
+    expect(rows.map((r) => r.tgname)).toContain('bka_jia_void_guard');
     expect(rows.map((r) => r.tgname)).toContain('bka_jel_fx_guard');
     const versions = await db.execute(
       sql`SELECT tgname FROM pg_trigger WHERE tgname LIKE 'bka\_version\_%' AND NOT tgisinternal`,

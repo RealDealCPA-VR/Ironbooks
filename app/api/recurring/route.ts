@@ -4,7 +4,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
-import { listTemplates, createTemplate } from '@/lib/services/recurring';
+import { listTemplates, createTemplate, todayUtcMidnight } from '@/lib/services/recurring';
 import { ServiceError } from '@/lib/services/_base';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { createRecurringTemplateSchema } from '@/lib/validation/recurring';
@@ -40,7 +40,8 @@ export async function POST(req: NextRequest) {
 
     const tpl = await createTemplate(ctx, {
       ...parsed.data,
-      nextRunDate: parsed.data.nextRunDate ?? new Date(),
+      // No date: today on this computer's calendar (a ledger date), never the current instant.
+      nextRunDate: parsed.data.nextRunDate ?? todayUtcMidnight(),
       // mode wins; legacy autoEnter (default true) maps to automatic / remind.
       autoEnter: parsed.data.autoEnter ?? true,
     });

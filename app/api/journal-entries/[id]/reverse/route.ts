@@ -12,6 +12,7 @@ import { getServerContext } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
 import { reverseEntry } from '@/lib/services/journal';
 import { serviceErrorStatus } from '@/lib/routeErrors';
+import { parseDateInput } from '@/lib/validation/helpers';
 
 type Params = { params: Promise<{ id: string }> };
 
@@ -23,10 +24,12 @@ export async function POST(req: NextRequest, { params }: Params) {
 
     let asOfDate: Date | undefined;
     if (body?.asOfDate) {
-      asOfDate = new Date(body.asOfDate);
-      if (isNaN(asOfDate.getTime())) {
-        return NextResponse.json({ error: 'asOfDate must be a valid ISO date.' }, { status: 400 });
+      // A real calendar day (Feb 30 used to roll over to Mar 2 and post there).
+      const parsed = typeof body.asOfDate === 'string' ? parseDateInput(body.asOfDate) : null;
+      if (!parsed) {
+        return NextResponse.json({ error: 'asOfDate must be a valid ISO date.', code: 'VALIDATION' }, { status: 400 });
       }
+      asOfDate = parsed;
     }
 
     const entry = await reverseEntry(ctx, id, asOfDate);

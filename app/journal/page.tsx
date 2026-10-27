@@ -36,7 +36,7 @@ import {
 import { Help } from '@/components/Help';
 import { TypeaheadSelect } from '@/components/TypeaheadSelect';
 import type { TypeaheadChoice } from '@/lib/typeahead';
-import { computeJournalBalance, journalPayloadAmount } from '@/lib/journalBalance';
+import { computeJournalBalance, journalPayloadLines } from '@/lib/journalBalance';
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
@@ -47,7 +47,6 @@ import EntryDetailModal from '@/components/EntryDetailModal';
 import { usePreferences } from '@/lib/usePreferences';
 import { classWarningApplies, confirmTransactionDate } from '@/lib/formPrefs';
 import { formatAccountLabel } from '@/lib/preferences';
-import { nextJournalNumber } from '@/lib/prefBehaviors';
 import MemorizeButton from '@/components/MemorizeButton';
 import AttachmentPanel from '@/components/AttachmentPanel';
 import { activeOrSelected, otherNameLabel, type OtherNameEntry } from '@/lib/lists/otherNameOptions';
@@ -242,11 +241,15 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
       setDate(todayISO());
       setDescription('');
       setReference('');
-      // Preferences > Accounting 'Automatically number journal entries': next Entry No.
+      // Preferences > Accounting 'Automatically number journal entries': next Entry No. — the
+      // server's, from journal entries only (the newest entries of every kind carry invoice,
+      // bill and check numbers, which the journal's numbering never follows).
       if (prefs.company.autoAssignJeNumbers) {
         api
-          .get<{ entries: { reference: string | null }[] }>('/api/journal-entries')
-          .then((d) => setReference((r) => r || nextJournalNumber(d.entries.map((e) => e.reference))))
+          .get<{ nextNumber?: string }>('/api/journal-entries?nextNumber=1&limit=1')
+          .then((d) => {
+            if (d.nextNumber) setReference((r) => r || d.nextNumber!);
+          })
           .catch(() => {});
       }
       setIsAdjusting(false);
@@ -381,21 +384,8 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
       description: description.trim(),
       reference: reference.trim() || null,
       isAdjusting,
-      lines: lines
-        .filter((l) => l.accountId)
-        .map((l) => {
-          const [entityType, entityId] = l.name ? l.name.split(':') : [null, null];
-          return {
-            accountId: l.accountId,
-            // Send exactly what the Save gate validated ("1,250.00 " -> "1250.00").
-            debit: journalPayloadAmount(l.debit),
-            credit: journalPayloadAmount(l.credit),
-            memo: l.memo.trim() || null,
-            classId: l.classId || null,
-            entityType: entityType || null,
-            entityId: entityId || null,
-          };
-        }),
+      // Exactly what the Save gate validated ("1,250.00 " -> "1250.00"), names included.
+      lines: journalPayloadLines(lines),
     };
     const ctx = { payload, resubmit: send, applyToForm, fallback: 'Failed to save entry.' };
     // Class tracking "warn when a line has no class" (lib/formPrefs.ts): offer fixes instead of a
@@ -435,19 +425,13 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
             getTemplate={() => {
               if (!bal.canSave) return 'Balance the entry (debits = credits) before memorizing.';
               if (!description.trim()) return 'Enter a description before memorizing.';
+              // The same lines a save posts (the Name column too: A/R and A/P lines need it).
               return {
                 date,
                 description: description.trim(),
                 reference: reference.trim() || null,
-                lines: lines
-                  .filter((l) => l.accountId)
-                  .map((l) => ({
-                    accountId: l.accountId,
-                    debit: journalPayloadAmount(l.debit),
-                    credit: journalPayloadAmount(l.credit),
-                    memo: l.memo.trim() || null,
-                    classId: l.classId || null,
-                  })),
+                isAdjusting,
+                lines: journalPayloadLines(lines),
               };
             }}
           />
@@ -469,8 +453,9 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
       {fixer.panel}
       {editing && (
         <p className="mb-4 rounded-lg bg-gold/10 border border-gold/30 px-3 py-2 text-xs text-navy/80">
-          Saving voids the original entry and posts a corrected one; the audit trail keeps both
-          versions.
+          Changing the date or a line&apos;s account, amount, class or name voids the original entry
+          and posts a corrected one (the audit trail keeps both versions). Memo, description,
+          Entry No. and Adjusting Entry changes keep the same entry.
         </p>
       )}
 
@@ -495,6 +480,7 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
           <Input
             id="je-ref"
             placeholder="e.g. JE-001"
+            maxLength={100}
             value={reference}
             onChange={(e) => setReference(e.target.value)}
           />
