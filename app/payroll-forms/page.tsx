@@ -23,7 +23,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
-import { lastCompletedQuarter } from '@/lib/formPeriods';
+import { lastCompletedQuarter, lastCompletedYear } from '@/lib/formPeriods';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -40,10 +40,9 @@ interface Employee {
 // Helpers
 // ---------------------------------------------------------------------------
 
-const currentYear = new Date().getFullYear();
-
-/** Build a list of recent years for the year picker. */
+/** Build a list of recent years for the year picker (this year first). */
 function recentYears(count = 5): number[] {
+  const currentYear = new Date().getFullYear();
   return Array.from({ length: count }, (_, i) => currentYear - i);
 }
 
@@ -57,7 +56,7 @@ export default function PayrollFormsPage() {
 
   // W-2 form state
   const [w2EmployeeId, setW2EmployeeId] = useState('');
-  const [w2Year, setW2Year]             = useState(String(currentYear - 1));
+  const [w2Year, setW2Year]             = useState(String(lastCompletedYear()));
 
   // 941 form state
   // 941 form state (quarterly — defaults to the last finished quarter, the one due next)
@@ -68,10 +67,10 @@ export default function PayrollFormsPage() {
   const [f940Deposits, setF940Deposits] = useState('');
 
   // 940 form state (annual — defaults to the last completed year)
-  const [f940Year, setF940Year] = useState(String(currentYear - 1));
+  const [f940Year, setF940Year] = useState(String(lastCompletedYear()));
 
   // W-3 form state (annual — defaults to the last completed year)
-  const [w3Year, setW3Year] = useState(String(currentYear - 1));
+  const [w3Year, setW3Year] = useState(String(lastCompletedYear()));
 
   // ---------------------------------------------------------------------------
   // Load employees on mount

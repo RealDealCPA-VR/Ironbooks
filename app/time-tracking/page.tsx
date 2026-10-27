@@ -58,14 +58,15 @@ interface LogTimeForm {
   billable: boolean;
 }
 
-const emptyForm: LogTimeForm = {
+/** A blank Log Time form dated today (worked out each time: the app can stay open past midnight). */
+const emptyForm = (): LogTimeForm => ({
   customerId: '',
   date: todayISO(),
   hours: '',
   rate: '',
   description: '',
   billable: true,
-};
+});
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -154,7 +155,7 @@ export default function TimeTrackingPage() {
       });
       toast('Time entry logged', 'success');
       setShowLog(false);
-      setForm(emptyForm);
+      setForm(emptyForm());
       load();
     } catch (e) {
       toast(e instanceof ApiError ? e.message : 'Failed to log time', 'danger');
@@ -214,7 +215,7 @@ export default function TimeTrackingPage() {
         title="Time Tracking"
         icon={Timer}
         action={
-          <Button onClick={() => { setForm(emptyForm); setShowLog(true); }}>
+          <Button onClick={() => { setForm(emptyForm()); setShowLog(true); }}>
             <Plus className="h-4 w-4" />
             Log Time
           </Button>
@@ -295,7 +296,7 @@ export default function TimeTrackingPage() {
             title="No time entries yet"
             message="Log your first time entry to start tracking billable hours."
             action={
-              <Button onClick={() => { setForm(emptyForm); setShowLog(true); }}>
+              <Button onClick={() => { setForm(emptyForm()); setShowLog(true); }}>
                 <Plus className="h-4 w-4" />
                 Log Time
               </Button>
