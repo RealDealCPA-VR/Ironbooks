@@ -46,6 +46,7 @@
  * to the GL — through postJournalEntry, like every other document — with a
  * sourceRef of `iif:…` so re-importing the same file skips duplicates.
  */
+import { createHash } from 'node:crypto';
 import Papa from 'papaparse';
 import { and, eq } from 'drizzle-orm';
 import { csvUnsafeText } from '@/lib/csv';
@@ -82,10 +83,12 @@ import { createType } from './typeLists';
 import { createSalesRep } from './salesReps';
 import { createTaxRate } from './salesTax';
 import { createBudget, setBudgetLine, listBudgets } from './budgets';
+import { companyFiscalYearEnd, fiscalWindowFor } from './reportEngine';
 import { readXlsx } from './qbGlFiles';
 import * as L from './qbIifLists';
 import { assignJobType } from './lists/jobTypes';
 import type { IifControlRow } from './openItemsImport';
+import { importRowError } from './qbImportErrors';
 
 // ---------------------------------------------------------------------------
 // IIF type+subtype mapping
@@ -993,7 +996,8 @@ async function importAccountRow(
     });
     counts.accounts++;
     return { id: row.id, code };
-  } catch (err) {
+  } catch (caught) {
+    const err = importRowError(caught) ?? caught;
     if (err instanceof ServiceError && err.code === 'VALIDATION') {
       counts.skipped++;
       counts.issues.push({ entity: 'account', name, code, reason: 'validation', message: err.message });
@@ -1240,7 +1244,8 @@ async function importIifAccounts(
         await ctx.db.update(accounts).set({ isActive: false, updatedAt: new Date() }).where(eq(accounts.id, row.id));
         await writeAudit(ctx, { action: 'update', entityType: 'account', entityId: row.id, oldValues: { isActive: true }, newValues: { isActive: false } });
       }
-    } catch (err) {
+    } catch (caught) {
+      const err = importRowError(caught) ?? caught;
       if (err instanceof ServiceError && err.code === 'VALIDATION') {
         counts.skipped++;
         counts.issues.push({ entity: 'account', name: displayPath, code, reason: 'validation', message: err.message });
@@ -1307,7 +1312,8 @@ const typeListImporter = (kind: 'customer' | 'vendor'): ListImporter => async ({
           id = row.id;
           byPath.set(normPath(path), id);
           n++;
-        } catch (err) {
+        } catch (caught) {
+          const err = importRowError(caught) ?? caught;
           if (err instanceof ServiceError && err.code === 'VALIDATION') {
             counts.issues.push({ entity: 'list', name: r.NAME, reason: 'validation', message: err.message });
             break;
@@ -1332,7 +1338,8 @@ const salesRepImporter: ListImporter = async ({ ctx, counts }, rows) => {
       await createSalesRep(ctx, { name, commissionRate: 0 });
       names.add(name.toLowerCase());
       n++;
-    } catch (err) {
+    } catch (caught) {
+      const err = importRowError(caught) ?? caught;
       if (err instanceof ServiceError && err.code === 'VALIDATION') {
         counts.issues.push({ entity: 'list', name, reason: 'validation', message: err.message });
         continue;
@@ -1351,6 +1358,7 @@ const salesRepImporter: ListImporter = async ({ ctx, counts }, rows) => {
 const budgetImporter: ListImporter = async ({ ctx, counts, lookup }, rows) => {
   const existing = await listBudgets(ctx);
   const budgetIds = new Map(existing.map((b) => [`${b.name}|${b.fiscalYear}`, b.id]));
+  const fye = await companyFiscalYearEnd(ctx);
   let n = 0;
   for (const r of rows) {
     const start = parseIifDate(r.STARTDATE);
@@ -1365,25 +1373,34 @@ const budgetImporter: ListImporter = async ({ ctx, counts, lookup }, rows) => {
       });
       continue;
     }
-    const year = start.getUTCFullYear();
     const suffix = [opt(r.CLASS), opt(r.CUSTOMER)].filter(Boolean).join(' / ');
     const name = suffix ? `QuickBooks budget — ${suffix}` : 'QuickBooks budget';
-    const key = `${name}|${year}`;
-    let budgetId = budgetIds.get(key);
-    if (!budgetId) {
-      const b = await createBudget(ctx, { name, fiscalYear: year });
-      budgetId = b.id;
-      budgetIds.set(key, budgetId);
+    try {
+      const period = (r.PERIOD ?? 'MONTH').toUpperCase();
+      const months = period.startsWith('Q') ? 3 : period.startsWith('Y') ? 12 : 1;
+      const parts = allocate(amount, Array.from({ length: months }, () => 1));
+      for (let i = 0; i < months; i++) {
+        // Each month goes to the budget of the FISCAL year it falls in (budgets are keyed by the
+        // year their fiscal year ends, lines by calendar month): a July-June company's July row
+        // belongs to the next year's budget, and a year spread from July runs on into the next
+        // budget instead of being cut off at December.
+        const mid = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth() + i, 15));
+        const fiscalYear = fiscalWindowFor(mid, fye).end.getUTCFullYear();
+        const key = `${name}|${fiscalYear}`;
+        let budgetId = budgetIds.get(key);
+        if (!budgetId) {
+          const b = await createBudget(ctx, { name, fiscalYear });
+          budgetId = b.id;
+          budgetIds.set(key, budgetId);
+        }
+        await setBudgetLine(ctx, { budgetId, accountId: acct.id, month: mid.getUTCMonth() + 1, amount: toAmountString(parts[i]) });
+      }
+      n++;
+    } catch (caught) {
+      const err = importRowError(caught);
+      if (err?.code !== 'VALIDATION') throw caught;
+      counts.issues.push({ entity: 'list', name: `Budget ${r.ACCNT ?? ''}`, reason: 'validation', message: err.message });
     }
-    const period = (r.PERIOD ?? 'MONTH').toUpperCase();
-    const months = period.startsWith('Q') ? 3 : period.startsWith('Y') ? 12 : 1;
-    const parts = allocate(amount, Array.from({ length: months }, () => 1));
-    for (let i = 0; i < months; i++) {
-      const month = start.getUTCMonth() + 1 + i;
-      if (month > 12) break;
-      await setBudgetLine(ctx, { budgetId, accountId: acct.id, month, amount: toAmountString(parts[i]) });
-    }
-    n++;
   }
   return n;
 };
@@ -1592,7 +1609,8 @@ async function importIifClasses(ctx: ServiceContext, counts: ImportCounts, rows:
           byPath.set(normPath(path), id);
           existing.push({ id, name: seg, parentId });
           counts.classes++;
-        } catch (err) {
+        } catch (caught) {
+          const err = importRowError(caught) ?? caught;
           if (err instanceof ServiceError && err.code === 'VALIDATION') {
             counts.skipped++;
             counts.issues.push({ entity: 'class', name: cls.name, reason: 'validation', message: err.message });
@@ -1660,16 +1678,29 @@ async function importIifCustomers(ctx: ServiceContext, counts: ImportCounts, row
     // Parent customer for "Customer:Job" (created on the fly when the file lacks it).
     const segs = displayName.split(':');
     let parentId: string | null = null;
-    for (let i = 1; i < segs.length; i++) {
+    let parentProblem: string | null = null;
+    for (let i = 1; i < segs.length && !parentProblem; i++) {
       const pName = segs.slice(0, i).join(':');
       let pid = idByName.get(pName.toLowerCase());
       if (!pid) {
-        const p = await createCustomer(ctx, { displayName: pName, parentId });
-        pid = p.id;
-        idByName.set(pName.toLowerCase(), pid);
-        counts.customers++;
+        try {
+          const p = await createCustomer(ctx, { displayName: pName, parentId });
+          pid = p.id;
+          idByName.set(pName.toLowerCase(), pid);
+          counts.customers++;
+        } catch (caught) {
+          const err = importRowError(caught);
+          if (err?.code !== 'VALIDATION') throw caught;
+          parentProblem = `Its parent "${pName}" could not be created: ${err.message}`;
+          break;
+        }
       }
       parentId = pid;
+    }
+    if (parentProblem) {
+      counts.skipped++;
+      counts.issues.push({ entity: 'customer', name: displayName, reason: 'validation', message: parentProblem });
+      continue;
     }
 
     const fields: Record<string, string> = { ...(cust.fields ?? {}) };
@@ -1749,14 +1780,16 @@ async function importIifCustomers(ctx: ServiceContext, counts: ImportCounts, row
             const jobTypeName = cust.raw?.JOBTYPE?.trim();
             const jobTypeId = jobTypeName ? lists.jobTypeByName.get(jobTypeName.split(':').pop()!.trim().toLowerCase()) : undefined;
             if (jobTypeId) await assignJobType(ctx, job.id, jobTypeId);
-          } catch (err) {
+          } catch (caught) {
+            const err = importRowError(caught) ?? caught;
             if (err instanceof ServiceError && err.code === 'VALIDATION') {
               counts.issues.push({ entity: 'job', name: displayName, reason: 'validation', message: err.message });
             } else throw err;
           }
         }
       }
-    } catch (err) {
+    } catch (caught) {
+      const err = importRowError(caught) ?? caught;
       if (err instanceof ServiceError && err.code === 'VALIDATION') {
         counts.skipped++;
         counts.issues.push({ entity: 'customer', name: displayName, reason: 'validation', message: err.message });
@@ -1824,7 +1857,8 @@ async function importIifVendors(ctx: ServiceContext, counts: ImportCounts, rows:
         await ctx.db.update(vendorsTable).set({ ...patch, updatedAt: new Date() }).where(eq(vendorsTable.id, row.id));
         await writeAudit(ctx, { action: 'update', entityType: 'vendor', entityId: row.id, newValues: patch });
       }
-    } catch (err) {
+    } catch (caught) {
+      const err = importRowError(caught) ?? caught;
       if (err instanceof ServiceError && err.code === 'VALIDATION') {
         counts.skipped++;
         counts.issues.push({ entity: 'vendor', name: displayName, reason: 'validation', message: err.message });
@@ -1911,7 +1945,8 @@ async function importIifEmployees(ctx: ServiceContext, counts: ImportCounts, row
           ...(release ? { releaseDate: release } : {}),
           ...(emp.hidden ? { isActive: false } : {}),
         });
-      } catch (err) {
+      } catch (caught) {
+        const err = importRowError(caught) ?? caught;
         if (err instanceof ServiceError && err.code === 'VALIDATION') {
           counts.issues.push({ entity: 'employee', name: raw, reason: 'validation', message: `Imported, but some details were not saved: ${err.message}` });
         } else throw err;
@@ -1919,7 +1954,8 @@ async function importIifEmployees(ctx: ServiceContext, counts: ImportCounts, row
       if (emp.ssn && ssnDigits.length !== 9) {
         counts.issues.push({ entity: 'employee', name: raw, reason: 'validation', message: 'The SSN in the file is not 9 digits and was not saved.' });
       }
-    } catch (err) {
+    } catch (caught) {
+      const err = importRowError(caught) ?? caught;
       if (err instanceof ServiceError && err.code === 'VALIDATION') {
         counts.skipped++;
         counts.issues.push({ entity: 'employee', name: raw, reason: 'validation', message: err.message });
@@ -2017,7 +2053,8 @@ async function importIifItems(
         try {
           const r = await createTaxRate(ctx, { name: item.name, rate: Money.of(pct).dividedBy(100).toFixed(6) });
           rates.set(item.name.toLowerCase(), r.id);
-        } catch (err) {
+        } catch (caught) {
+          const err = importRowError(caught) ?? caught;
           if (err instanceof ServiceError && err.code === 'VALIDATION') {
             counts.issues.push({ entity: 'item', name: item.name, reason: 'validation', message: `Tax rate not created: ${err.message}` });
           } else throw err;
@@ -2064,7 +2101,8 @@ async function importIifItems(
       if (!ok) {
         counts.issues.push({ entity: 'item', name: parent, reason: 'note', message: 'Imported with the components that were found.' });
       }
-    } catch (err) {
+    } catch (caught) {
+      const err = importRowError(caught) ?? caught;
       if (err instanceof ServiceError && err.code === 'VALIDATION') {
         counts.issues.push({ entity: 'item', name: parent, reason: 'validation', message: `Components not saved: ${err.message}` });
       } else throw err;
@@ -2212,7 +2250,8 @@ async function importItemRow(
       try {
         planOpeningStock(input.opening, input.type);
         opening = input.opening;
-      } catch (err) {
+      } catch (caught) {
+        const err = importRowError(caught) ?? caught;
         if (err instanceof ServiceError && err.code === 'VALIDATION') skip(err.message);
         else throw err;
       }
@@ -2267,7 +2306,8 @@ async function importItemRow(
       await writeAudit(ctx, { action: 'update', entityType: 'item', entityId: row.id, newValues: patch });
     }
     return row.id;
-  } catch (err) {
+  } catch (caught) {
+    const err = importRowError(caught) ?? caught;
     if (err instanceof ServiceError && err.code === 'VALIDATION') {
       counts.skipped++;
       counts.issues.push({ entity: 'item', name, reason: 'validation', message: err.message });
@@ -2346,8 +2386,15 @@ async function ensureBucketAccount(
 function iifBaseKey(txn: IIFTransaction, date: Date, totalDebit: ReturnType<typeof Money.zero>): string {
   const rawName = (txn.name?.trim() || (txn.lines.find((l) => l.name && l.name.trim())?.name ?? '')).trim();
   const name = rawName.replace(/\s+/g, ' ').toLowerCase();
-  return `iif:${txn.type || 'TRNS'}:${txn.num || 'no-num'}:${date.toISOString().slice(0, 10)}:${toAmountString(totalDebit)}${name ? `:${encodeURIComponent(name)}` : ''}`;
+  const key = `iif:${txn.type || 'TRNS'}:${txn.num || 'no-num'}:${date.toISOString().slice(0, 10)}:${toAmountString(totalDebit)}${name ? `:${encodeURIComponent(name)}` : ''}`;
+  // journal_entries.source_ref holds 255 characters (with the ':<occurrence>' suffix). A longer
+  // key (long DOCNUM / TRNSTYPE, a long or accented "Customer:Job" name) keeps a readable prefix
+  // and a hash of the whole key, still stable across re-imports. Shorter keys are unchanged, so
+  // files imported before keep matching their entries.
+  if (key.length <= IIF_KEY_MAX) return key;
+  return `${key.slice(0, IIF_KEY_MAX - 33)}#${createHash('sha256').update(key).digest('hex').slice(0, 32)}`;
 }
+const IIF_KEY_MAX = 240;
 
 /**
  * Named A/R and A/P rows of the transactions importIifTransactions will actually post (date
@@ -2551,7 +2598,8 @@ async function importIifTransactions(
       await postJournalEntry(ctx, {
         date,
         description: txn.memo?.trim() || `QB import: ${label}`,
-        reference: txn.num ?? null,
+        // journal_entries.reference holds 100 characters (QB's own DOCNUM is far shorter).
+        reference: txn.num ? txn.num.slice(0, 100) : null,
         lines,
         sourceRef,
       });
@@ -2565,7 +2613,8 @@ async function importIifTransactions(
             'Its Accounts Receivable / Payable row was posted to the conversion account, because the open invoices and bills brought in as documents already reflect it.',
         });
       }
-    } catch (err) {
+    } catch (caught) {
+      const err = importRowError(caught) ?? caught;
       if (err instanceof ServiceError) {
         counts.skipped++;
         counts.issues.push({ entity: 'transaction', name: label, reason: 'validation', message: err.message });
@@ -2666,7 +2715,8 @@ async function importCustomerRows(ctx: ServiceContext, rows: Row[], mapping: Csv
         ...(terms ? { terms } : {}),
       });
       counts.customers++;
-    } catch (err) {
+    } catch (caught) {
+      const err = importRowError(caught) ?? caught;
       if (err instanceof ServiceError && err.code === 'VALIDATION') {
         counts.skipped++;
         counts.issues.push({ entity: 'customer', name: displayName, reason: 'validation', message: err.message });
@@ -2720,7 +2770,8 @@ async function importVendorRows(ctx: ServiceContext, rows: Row[], mapping: CsvCo
         ...(is1099 ? { is1099: yes(is1099) } : {}),
       });
       counts.vendors++;
-    } catch (err) {
+    } catch (caught) {
+      const err = importRowError(caught) ?? caught;
       if (err instanceof ServiceError && err.code === 'VALIDATION') {
         counts.skipped++;
         counts.issues.push({ entity: 'vendor', name: displayName, reason: 'validation', message: err.message });

@@ -1681,6 +1681,16 @@ export function analyzeGl(report: GlReport, opts: AnalyzeOptions = {}): GlAnalys
     v[role]++;
     nameRoles.set(name, v);
   };
+  // QB's own rule: the Name on an Accounts Receivable line is always a customer, on an Accounts
+  // Payable line always a vendor — whatever the transaction type (a General Journal opening
+  // balance per customer, a refund Check to a customer). That decides the name's list outright.
+  const controlNames = new Map<string, { ar: boolean; ap: boolean }>();
+  const markControl = (name: string, side: 'ar' | 'ap') => {
+    if (!name) return;
+    const c = controlNames.get(name) ?? { ar: false, ap: false };
+    c[side] = true;
+    controlNames.set(name, c);
+  };
   const classes = new Set<string>();
   for (const l of allLines) if (l.className) classes.add(l.className);
 
@@ -1723,6 +1733,13 @@ export function analyzeGl(report: GlReport, opts: AnalyzeOptions = {}): GlAnalys
       vote(header.name, role);
       for (const l of lines) {
         if (l.name && l.name !== header.name && l.name.includes(':')) vote(l.name, 'customer'); // jobs
+        const qbType = typeOf.get(l.accountKey)?.t;
+        const side = qbType === 'Accounts Receivable' ? 'ar' : qbType === 'Accounts Payable' ? 'ap' : null;
+        if (side) {
+          const n = l.name || header.name;
+          if (n && !nameRoles.has(n)) vote(n, side === 'ar' ? 'customer' : 'vendor');
+          markControl(n, side);
+        }
       }
     }
     if (leftover.length) {
@@ -1775,6 +1792,9 @@ export function analyzeGl(report: GlReport, opts: AnalyzeOptions = {}): GlAnalys
           role = r;
         }
       }
+      const ctl = controlNames.get(name);
+      if (ctl?.ar) role = 'customer';
+      else if (ctl?.ap) role = 'vendor';
       return { name, role, count: v.customer + v.vendor + v.employee + v.other };
     })
     .sort((a, b) => a.name.localeCompare(b.name));

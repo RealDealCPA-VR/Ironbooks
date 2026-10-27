@@ -44,6 +44,7 @@ import { postJournalEntry, type PostingLine } from './posting';
 import { createVendor } from './vendors';
 import { controlSideOfAccount, loadQbNameResolver, type QbNameRole } from './qbNameResolver';
 import { loadGrid } from './qbGlFiles';
+import { dataExceptionMessage, isDataException } from './qbImportErrors';
 import {
   QB_ACCOUNT_TYPES,
   analyzeGl,
@@ -592,7 +593,8 @@ async function runGlImportUnanalyzed(
         .from(employeesTable)
         .where(eq(employeesTable.companyId, tx.companyId));
       const custByName = new Map(custRows.map((c) => [c.name.toLowerCase(), c.id]));
-      const anyList = new Set([...custRows.map((c) => c.name.toLowerCase()), ...vendRows.map((v) => v.name.toLowerCase())]);
+      const vendSet = new Set(vendRows.map((v) => v.name.toLowerCase()));
+      const anyList = new Set([...custRows.map((c) => c.name.toLowerCase()), ...vendSet]);
       const empKey = (f: string, l: string) => `${f} ${l}`.toLowerCase();
       const empSet = new Set(empRows.map((e) => empKey(e.first, e.last)));
       const tryCreate = async (label: string, fn: () => Promise<unknown>): Promise<boolean> => {
@@ -624,17 +626,48 @@ async function runGlImportUnanalyzed(
         }
         return id;
       };
+      const ensureVendor = async (name: string) => {
+        const lower = name.toLowerCase();
+        if (vendSet.has(lower)) return;
+        if (await tryCreate(`Vendor "${name}"`, () => createVendor(tx, { displayName: name }))) {
+          vendSet.add(lower);
+          anyList.add(lower);
+          counts.vendorsCreated++;
+        }
+      };
+      // Every A/R line carries a customer and every A/P line a vendor (QB's rule, and what aging,
+      // statements and QuickReports read). The list a name goes to is decided by the account it
+      // sits on in THIS file (after the mapping step), not by a guess from transaction types: a
+      // customer that only appears on General Journal or refund-check lines, or a name that
+      // already exists on the other list, still gets the customer / vendor record its line needs.
+      const controlKind = new Map<string, 'ar' | 'ap' | null>();
+      for (const a of p.accounts) {
+        const id = bkIdOf.get(a.key)!;
+        const ex = p.existing.find((e) => e.id === id);
+        controlKind.set(a.key, controlSideOfAccount(ex ?? { type: a.bkType, subtype: a.bkSubtype }));
+      }
+      const controlNames = new Map<string, { name: string; ar: boolean; ap: boolean }>();
+      for (const t of analysis.transactions) {
+        for (const l of t.lines) {
+          const side = controlKind.get(l.accountKey);
+          const raw = side ? (l.name || t.name).trim() : '';
+          if (!raw) continue;
+          const c = controlNames.get(raw.toLowerCase()) ?? { name: raw, ar: false, ap: false };
+          c[side!] = true;
+          controlNames.set(raw.toLowerCase(), c);
+        }
+      }
+      for (const c of controlNames.values()) {
+        if (c.ar && !custByName.has(c.name.toLowerCase())) await ensureCustomer(c.name);
+        if (c.ap) await ensureVendor(c.name);
+      }
       for (const n of analysis.names) {
         const lower = n.name.toLowerCase();
+        if (controlNames.has(lower)) continue; // handled above
         if (n.role === 'customer') {
           if (!anyList.has(lower)) await ensureCustomer(n.name);
         } else if (n.role === 'vendor') {
-          if (!anyList.has(lower)) {
-            if (await tryCreate(`Vendor "${n.name}"`, () => createVendor(tx, { displayName: n.name }))) {
-              anyList.add(lower);
-              counts.vendorsCreated++;
-            }
-          }
+          if (!anyList.has(lower)) await ensureVendor(n.name);
         } else if (n.role === 'employee') {
           const { firstName, lastName } = splitPersonName(n.name);
           if (!empSet.has(empKey(firstName, lastName))) {
@@ -939,6 +972,11 @@ async function runGlImportUnanalyzed(
     });
   } catch (err) {
     if (err instanceof Rollback) return err.result;
+    // A value the books cannot hold (a 300-character account or class name, an amount past the
+    // ledger's limit): the transaction rolled back — say so plainly instead of answering 500.
+    if (isDataException(err)) {
+      throw validation(`Nothing was saved: ${dataExceptionMessage(err)} Check the account, class and name columns of the report.`);
+    }
     throw err;
   }
 }

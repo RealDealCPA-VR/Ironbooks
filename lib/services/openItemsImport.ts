@@ -68,6 +68,7 @@ import { createVendorCredit } from './vendorCredits';
 import { type GridRow, loadGrid } from './qbGlFiles';
 import { parseAmount, parseQbDate } from './qbGlParse';
 import type { IIFTransaction, ImportIssue } from './qbImport';
+import { importRowError } from './qbImportErrors';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -312,28 +313,53 @@ function decodeFile(f: OpenItemsFile): Uint8Array {
 /** Read the open items from the uploaded report (xlsx / csv / pdf) or the typed-in list. */
 export async function loadOpenItems(input: Pick<OpenItemsInput, 'file' | 'items' | 'side'>): Promise<ParsedOpenItems> {
   if (input.items && input.items.length) {
-    const side: LedgerSide = input.side ?? (input.items.every((i) => i.kind === 'bill' || i.kind === 'vendor_credit') ? 'ap' : 'ar');
-    for (const it of input.items) {
-      if (!it.name?.trim()) throw validation('Every balance needs a customer or vendor name.');
-      if (!parseQbDate(it.date)) throw validation(`"${it.date}" is not a valid date.`);
-      let a;
-      try {
-        a = Money.of(it.openBalance);
-      } catch {
-        throw validation(`"${it.openBalance}" is not a valid amount.`);
-      }
+    // Typed-in balances arrive straight from the request body: check every field's type before
+    // using it (a JSON number as the invoice number or name must be a 400, never a TypeError).
+    const text = (v: unknown, what: string, max: number): string | null => {
+      if (v === undefined || v === null || v === '') return null;
+      if (typeof v !== 'string' && typeof v !== 'number') throw validation(`${what} must be text.`);
+      const s = String(v).trim();
+      if (s.length > max) throw validation(`${what} "${s.slice(0, 40)}…" is longer than ${max} characters.`);
+      return s || null;
+    };
+    const rows = input.items.map((raw) => {
+      if (!raw || typeof raw !== 'object') throw validation('Each balance must be an object.');
+      const it = raw as unknown as Record<string, unknown>;
+      const name = text(it.name, 'The name', 255);
+      if (!name) throw validation('Every balance needs a customer or vendor name.');
+      const dateText = text(it.date, 'The date', 30);
+      const date = parseQbDate(dateText);
+      if (!date) throw validation(`"${dateText ?? ''}" is not a valid date.`);
+      const dueText = text(it.dueDate, 'The due date', 30);
+      const dueDate = dueText ? parseQbDate(dueText) : null;
+      if (dueText && !dueDate) throw validation(`"${dueText}" is not a valid due date.`);
+      // QuickBooks-style amounts: "1,234.56", "$1,234.56", "(25.00)".
+      const amountText = text(it.openBalance, 'The amount', 40) ?? '';
+      const a = parseAmount(amountText);
+      if (!a) throw validation(`"${amountText}" is not a valid amount.`);
       // Validate the value that will actually be stored (rounded to cents): 0.001 rounds to 0.00.
       // Decimal(0).isPositive() is true in decimal.js — compare explicitly.
-      if (!a.isFinite() || !Money.round2(a).greaterThan(0)) throw validation('Amounts must be at least 0.01.');
-      if (Money.round2(a).greaterThan(MAX_LEDGER_AMOUNT)) throw validation(`"${it.openBalance}" is larger than the books can hold.`);
-      const okKind = side === 'ar' ? ['invoice', 'credit_memo'] : ['bill', 'vendor_credit'];
-      if (!okKind.includes(it.kind)) throw validation('Mixing customer and vendor balances in one import is not allowed.');
-    }
-    return {
-      side,
-      items: input.items.map((i) => ({ ...i, date: parseQbDate(i.date)!, openBalance: toAmountString(i.openBalance), dueDate: i.dueDate ? parseQbDate(i.dueDate) : null })),
-      warnings: [],
-    };
+      if (!Money.round2(a).greaterThan(0)) throw validation('Amounts must be at least 0.01.');
+      if (Money.round2(a).greaterThan(MAX_LEDGER_AMOUNT)) throw validation(`"${amountText}" is larger than the books can hold.`);
+      const kind = it.kind as OpenItemKind;
+      if (!['invoice', 'credit_memo', 'bill', 'vendor_credit'].includes(kind)) throw validation('Each balance needs a kind (invoice, credit, bill or vendor credit).');
+      const item: OpenItem = {
+        kind,
+        name,
+        date,
+        dueDate,
+        number: text(it.number, 'The number', 50),
+        qbType: text(it.qbType, 'The type', 100),
+        terms: text(it.terms, 'The terms', 100),
+        memo: text(it.memo, 'The memo', 1000),
+        openBalance: toAmountString(a),
+      };
+      return item;
+    });
+    const side: LedgerSide = input.side ?? (rows.every((i) => i.kind === 'bill' || i.kind === 'vendor_credit') ? 'ap' : 'ar');
+    const okKind = side === 'ar' ? ['invoice', 'credit_memo'] : ['bill', 'vendor_credit'];
+    if (rows.some((it) => !okKind.includes(it.kind))) throw validation('Mixing customer and vendor balances in one import is not allowed.');
+    return { side, items: rows, warnings: [] };
   }
   if (!input.file) throw validation('Choose a report file or enter the balances.');
   const bytes = decodeFile(input.file);
@@ -808,7 +834,7 @@ async function convertOne(ctx: ServiceContext, env: ConvertEnv, it: OpenItem, qb
       await postJournalEntry(tx, {
         date,
         description: `QuickBooks conversion offset — ${desc}`,
-        reference: it.number ?? null,
+        reference: it.number ? it.number.slice(0, 100) : null,
         sourceRef: `qbopen-offset:${tag}`,
         lines: controlDebit
           ? [
@@ -890,7 +916,10 @@ async function runConversion(ctx: ServiceContext, side: LedgerSide, items: OpenI
   for (const { item: it, docTag: qbdoc } of plan) {
     const label = labelOf(it);
     try {
-      const r = await convertOne(ctx, env, it, qbdoc).catch((err) => {
+      const r = await convertOne(ctx, env, it, qbdoc).catch((caught) => {
+        // A value the database cannot hold (a 120-character bill number, a 300-character name)
+        // is this row's problem, like any validation error — never a 500 halfway through.
+        const err = importRowError(caught) ?? caught;
         if (qbdoc && err instanceof ServiceError) failedTags.add(qbdoc);
         throw err;
       });

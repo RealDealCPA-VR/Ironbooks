@@ -108,14 +108,16 @@ export function OpenItemsImport() {
             items: manual
               .filter((m) => m.name.trim() && m.amount.trim())
               .map((m) => {
-                const amt = Number(m.amount);
-                const credit = amt < 0;
+                // Amounts as a QuickBooks user types them: "1,250.00", "$1,250", "-25" or "(25.00)"
+                // for a credit. The text (not a JS float) goes to the server, which checks it.
+                const raw = m.amount.trim().replace(/[$,\s]/g, '');
+                const credit = /^-|-$|^\(.*\)$/.test(raw);
                 return {
                   kind: (manualSide === 'ar' ? (credit ? 'credit_memo' : 'invoice') : credit ? 'vendor_credit' : 'bill') as Kind,
                   name: m.name.trim(),
                   date: m.date,
                   number: m.number.trim() || null,
-                  openBalance: String(Math.abs(amt)),
+                  openBalance: raw.replace(/^[-(]+|[)-]+$/g, ''),
                 };
               }),
           };
