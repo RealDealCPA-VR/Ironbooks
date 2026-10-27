@@ -161,7 +161,11 @@ export function parseAmount(raw: string | null | undefined): Decimal | null {
   if (raw == null) return null;
   let s = String(raw).trim();
   if (!s) return null;
-  s = s.replace(/[$\s,]/g, '');
+  s = s.replace(/[$\s]/g, '');
+  // A comma only as the US thousands separator (1,234.56). A decimal comma — a report re-saved by
+  // Excel in a French-Canadian or European locale ("1 234,56") — is not read as 123456.
+  if (s.includes(',') && !/^[(+-]?\d{1,3}(,\d{3})+(\.\d*)?[)-]?$/.test(s)) return null;
+  s = s.replace(/,/g, '');
   let neg = false;
   if (s.startsWith('(') && s.endsWith(')')) {
     neg = true;
@@ -179,6 +183,16 @@ export function parseAmount(raw: string | null | undefined): Decimal | null {
   if (!/^(\d+\.?\d*|\.\d+)(e[-+]?\d+)?$/i.test(s)) return null;
   const d = Money.round2(s);
   return neg ? d.negated() : d;
+}
+
+/**
+ * True for money written with a decimal comma ("1 234,56", "1.234,56", "(12,50)"): what Excel
+ * writes when a QuickBooks export is re-saved in a French-Canadian or European locale. parseAmount
+ * does not read those (it used to read "1 234,56" as 123456), so a report holding them is refused.
+ */
+export function isDecimalCommaAmount(raw: string | null | undefined): boolean {
+  const s = String(raw ?? '').trim();
+  return /^[(+-]?\$?\s?\d{1,3}([ .  ]\d{3})*,\d{1,2}\s?\$?\)?-?$/.test(s) || /^[(+-]?\d+,\d{1,2}\)?-?$/.test(s);
 }
 
 /** Parse a QB date cell ('01/15/2024', '1/5/24', '2024-01-15') → 'YYYY-MM-DD', or null. */
@@ -581,6 +595,13 @@ export function parseGlGrid(rows: GridRow[]): GlReport {
     if (nonEmpty.length === 1 && (FOOTER_TEXT.test(joined) || titleSet.has(joined.toLowerCase()))) continue;
 
     const label = labelOf(row);
+    const commaCell = (['debit', 'credit', 'amount', 'balance'] as const).map((c) => get(cells, c)).find(isDecimalCommaAmount);
+    if (commaCell) {
+      report.errors.push(
+        `Row ${rowNo}: "${commaCell}" is written with a decimal comma, so it can't be read reliably. Export the report from QuickBooks again (Excel .xlsx, or CSV without re-saving it in Excel).`,
+      );
+      continue;
+    }
     let typeTxt = get(cells, 'type');
     const date = parseQbDate(get(cells, 'date'));
     const debit = parseAmount(get(cells, 'debit'));

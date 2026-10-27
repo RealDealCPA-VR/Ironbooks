@@ -66,7 +66,7 @@ import { apAging, arAging } from './reportsExtra';
 import { createVendor } from './vendors';
 import { createVendorCredit } from './vendorCredits';
 import { type GridRow, loadGrid } from './qbGlFiles';
-import { parseAmount, parseQbDate } from './qbGlParse';
+import { isDecimalCommaAmount, parseAmount, parseQbDate } from './qbGlParse';
 import type { IIFTransaction, ImportIssue } from './qbImport';
 import { importRowError } from './qbImportErrors';
 import { withImportLock } from './importLock';
@@ -269,6 +269,11 @@ export function parseOpenItemsGrid(rows: GridRow[], forceSide?: LedgerSide | nul
       continue;
     }
     if (/^total\b/i.test(typeCell)) continue;
+    if (isDecimalCommaAmount(cells[amountCol])) {
+      throw validation(
+        `"${(cells[amountCol] ?? '').trim()}" is written with a decimal comma, so the report can't be read reliably. Export it from QuickBooks again (Excel .xlsx, or CSV without re-saving it in Excel).`,
+      );
+    }
     const amt = parseAmount(cells[amountCol]);
     if (amt === null || amt.isZero()) continue;
     const date = parseQbDate(cells[col.date]);
