@@ -125,3 +125,30 @@ export function appliedExceedsReceived(
 ): boolean {
   return cashApplied(body).greaterThan(moneyDec(amountReceived));
 }
+
+/**
+ * Pay Bills rows after the open bills are read again. A different vendor, or a payment just
+ * saved, starts fresh (`keep` false). Re-reading the SAME vendor's bills because the payment date
+ * or a filter changed keeps what was ticked and typed for every bill still listed — that reload
+ * used to clear every selection, so changing the date (or pressing + in it) lost the whole batch.
+ */
+export function carryRows<R>(prev: Record<string, R>, ids: readonly string[], empty: () => R, keep: boolean): Record<string, R> {
+  return Object.fromEntries(ids.map((id) => [id, keep && prev[id] !== undefined ? prev[id] : empty()]));
+}
+
+/** The typed amounts of a keyed set (General Journal lines) still listed; others are dropped. */
+export function carryAmounts(prev: Record<string, string>, ids: readonly string[], keep: boolean): Record<string, string> {
+  if (!keep) return {};
+  const out: Record<string, string> = {};
+  for (const id of ids) if (prev[id] !== undefined) out[id] = prev[id];
+  return out;
+}
+
+/**
+ * Whether Pay Bills has anything to save: a ticked bill, a General Journal amount being paid, or
+ * a General Journal vendor credit applied to a General Journal amount owed (no cash at all — the
+ * save accepts it, but the button used to stay disabled for it).
+ */
+export function payBillsHasWork(w: { billsSelected: number; journalPaid: number; journalCreditOnJournal: string | number }): boolean {
+  return w.billsSelected > 0 || w.journalPaid > 0 || moneyDec(w.journalCreditOnJournal).greaterThan(0);
+}

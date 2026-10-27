@@ -57,7 +57,7 @@ import { usePreferences } from '@/lib/usePreferences';
 import { classWarningApplies, confirmTransactionDate } from '@/lib/formPrefs';
 import { fetchDueDateForTerms, useTermsChoices, withCurrentTerms } from '@/lib/termsClient';
 import MemorizeButton from '@/components/MemorizeButton';
-import { TransactionNav } from '@/components/TransactionNav';
+import { TransactionNav, compareDocNumbers } from '@/components/TransactionNav';
 import { recallNote, useSmartDefaults } from '@/lib/useSmartDefaults';
 import { billRowFromRecall, lineClassOverride } from '@/lib/smartDefaults';
 import AttachmentPanel from '@/components/AttachmentPanel';
@@ -531,7 +531,7 @@ export default function BillsPage() {
 
   // QB Previous / Next: bills in date order (Previous from a new bill opens the latest).
   const navOrder = useMemo(
-    () => [...bills].sort((a, b) => a.date.localeCompare(b.date) || (a.billNumber ?? '').localeCompare(b.billNumber ?? '')),
+    () => [...bills].sort((a, b) => a.date.localeCompare(b.date) || compareDocNumbers(a.billNumber, b.billNumber)),
     [bills],
   );
   const navIndex = editingId ? navOrder.findIndex((b) => b.id === editingId) : -1;

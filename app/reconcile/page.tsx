@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { CheckSquare } from 'lucide-react';
 import {
@@ -26,6 +26,7 @@ import { formatCurrency, Money } from '@/lib/money';
 import { formatDate as fmtDate, todayISO } from '@/lib/dates';
 // cmdbar: "reconcile checking" opens this page with the account picked.
 import { usePrefill } from '@/lib/commands/usePrefill';
+import { applyClearedAnswer, differenceIsZero } from './reconcileMath';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -133,9 +134,9 @@ function lineAmount(line: ClearableLine): string {
   return '0.00';
 }
 
+/** Finish is offered only at a difference of exactly 0.00 (what the service requires). */
 function differenceClose(difference: string): boolean {
-  // "complete" button is enabled when |difference| <= 0.01
-  return Money.abs(difference).lessThanOrEqualTo('0.01');
+  return differenceIsZero(difference);
 }
 
 // ---------------------------------------------------------------------------
@@ -374,7 +375,13 @@ function ReconcileSession({
   const [completing, setCompleting] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [confirmCancel, setConfirmCancel] = useState(false);
-  const [toggling, setToggling] = useState<string | null>(null);
+  /** Lines whose cleared mark is being saved (each stays disabled until its own answer). */
+  const [toggling, setToggling] = useState<ReadonlySet<string>>(() => new Set());
+  /** Toggles sent so far: only the latest answer's totals are shown (answers can cross). */
+  const toggleSeq = useRef(0);
+  /** Toggles still waiting; when several overlapped, the totals are read again once all answered. */
+  const inFlight = useRef(0);
+  const overlapped = useRef(false);
   const [editBalance, setEditBalance] = useState('');
   const [savingBalance, setSavingBalance] = useState(false);
 
@@ -426,26 +433,40 @@ function ReconcileSession({
   }, [loadLines]);
 
   async function handleToggle(line: ClearableLine) {
-    setToggling(line.journalEntryLineId);
+    const id = line.journalEntryLineId;
+    if (toggling.has(id)) return;
+    const want = !line.isCleared;
+    const mine = ++toggleSeq.current;
+    if (inFlight.current > 0) overlapped.current = true;
+    inFlight.current++;
+    setToggling((prev) => new Set(prev).add(id));
     try {
       const updatedProgress = await api.patch<Progress>(`/api/reconciliations/${recon.id}`, {
         action: 'toggleCleared',
-        journalEntryLineId: line.journalEntryLineId,
-        isCleared: !line.isCleared,
+        journalEntryLineId: id,
+        isCleared: want,
       });
-      // Update isCleared on the line locally to avoid a full refetch.
-      setLines((prev) =>
-        prev.map((l) =>
-          l.journalEntryLineId === line.journalEntryLineId
-            ? { ...l, isCleared: !l.isCleared }
-            : l,
-        ),
-      );
-      setProgress(updatedProgress);
+      // The line takes the state this request asked for (lib: applyClearedAnswer), and the
+      // totals come from the newest answer only — an older one arriving late is out of date.
+      setLines((prev) => applyClearedAnswer(prev, id, want));
+      if (mine === toggleSeq.current) setProgress(updatedProgress);
     } catch (err) {
       toastError(err, 'Failed to toggle line.');
     } finally {
-      setToggling(null);
+      setToggling((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+      inFlight.current--;
+      if (inFlight.current === 0 && overlapped.current) {
+        overlapped.current = false;
+        // Several marks were saved at once: their answers may have crossed, so read the totals.
+        api
+          .get<Progress>(`/api/reconciliations/${recon.id}`)
+          .then(setProgress)
+          .catch(() => {});
+      }
     }
   }
 
@@ -862,7 +883,7 @@ function ReconcileSession({
                       type="checkbox"
                       className="h-4 w-4 rounded border-slate-300 text-electric focus:ring-electric/30 cursor-pointer"
                       checked={line.isCleared}
-                      disabled={toggling === line.journalEntryLineId || recon.status !== 'in_progress'}
+                      disabled={toggling.has(line.journalEntryLineId) || recon.status !== 'in_progress'}
                       onChange={() => handleToggle(line)}
                     />
                   </Td>

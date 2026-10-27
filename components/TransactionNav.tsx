@@ -140,6 +140,16 @@ export function TransactionNav({ sourceRef, onPrevious, onNext, onRevert, loadKe
 export default TransactionNav;
 
 /**
+ * Order of two document numbers as people read them: "999" before "1000", "INV-99" before
+ * "INV-100" (plain text order put check 1000 before 999, so Previous / Next on a day's checks
+ * jumped around). Blank numbers come first.
+ */
+export function compareDocNumbers(a: string | number | null | undefined, b: string | number | null | undefined): number {
+  if (typeof a === 'number' && typeof b === 'number') return a - b;
+  return String(a ?? '').localeCompare(String(b ?? ''), undefined, { numeric: true, sensitivity: 'base' });
+}
+
+/**
  * The saved transactions before / after `currentId` in date order (then `tieBreak`), for
  * TransactionNav's Previous / Next. With no current one (a new, blank form) Previous is the latest.
  */
@@ -153,9 +163,7 @@ export function useAdjacentTransactions<T extends { id: string }>(
     const ordered = [...items].sort((a, b) => {
       const d = date(a).localeCompare(date(b));
       if (d) return d;
-      const ta = tieBreak(a);
-      const tb = tieBreak(b);
-      return typeof ta === 'number' && typeof tb === 'number' ? ta - tb : String(ta).localeCompare(String(tb));
+      return compareDocNumbers(tieBreak(a), tieBreak(b));
     });
     if (!currentId) return { prev: ordered[ordered.length - 1] ?? null, next: null };
     const i = ordered.findIndex((t) => t.id === currentId);

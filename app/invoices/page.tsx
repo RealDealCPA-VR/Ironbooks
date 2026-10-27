@@ -27,7 +27,7 @@ import {
 import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
-import { liveLineTotals } from '@/lib/invoiceLineMath';
+import { billableCostTotal, invoiceFormTotals, type LiveBillables } from '@/lib/invoiceLineMath';
 import { todayISO } from '@/lib/dates';
 import { formatDate } from '@/lib/format';
 import { useFocusParam, useNewParam } from '@/lib/useFocusParam';
@@ -68,6 +68,7 @@ type InvoiceBody = Record<string, unknown>;
 const INVOICE_FIX_FLAGS = ['overrideCreditLimit', 'allowOverBilling', 'checkStock'] as const;
 import { fetchDueDateForTerms, useTermsChoices, withCurrentTerms } from '@/lib/termsClient';
 import { TransactionNav } from '@/components/TransactionNav';
+import { canEditInvoice } from './listActions';
 import MemorizeButton from '@/components/MemorizeButton';
 import AttachmentPanel from '@/components/AttachmentPanel';
 import { recallNote, useSmartDefaults } from '@/lib/useSmartDefaults';
@@ -286,7 +287,11 @@ interface LiveTotals {
   tax: number;
   payments: number;
   total: number;
+  /** Retainage held back (part of the total, not due yet). */
+  retainage: number;
   balanceDue: number;
+  /** What the selected billables add (cost + markup lines + time). */
+  billables: number;
 }
 
 /**
@@ -296,45 +301,42 @@ interface LiveTotals {
  *  - subtotal lines display the running body sum (and reset the group)
  *  - payment lines reduce the balance due (not the subtotal)
  *  - sales_tax lines add straight to the tax amount
- * Selected billables flow in as extra non-taxable income.
+ * Selected billables flow in as extra non-taxable income. Everything is Decimal and rounded at
+ * the steps the server rounds (lib/invoiceLineMath.ts invoiceFormTotals): a %-discount line's
+ * amount is sent as its flat rate, and the header discount / tax / total shown are what saves.
  */
 function computeTotals(
   lines: LineRow[],
   discount: string,
   discountType: DiscountType,
-  taxRate: number,
-  billablesAmount: number,
+  taxRate: string,
+  billables: LiveBillables | null,
+  retainagePercent: string,
 ): LiveTotals {
-  // Line amounts in Decimal, rounded like the server (lib/invoiceLineMath.ts): a %-discount
-  // line's amount is sent as its flat rate, so float rounding would save the wrong cent.
-  const live = liveLineTotals(
-    lines.map((l) => ({
+  const t = invoiceFormTotals({
+    lines: lines.map((l) => ({
       kind: lineKind(l),
       quantity: l.quantity,
       rate: l.rate,
       taxable: l.taxable,
       discountPercent: l.discountPercent,
     })),
-  );
-  const amounts = live.amounts.map((a) => a.toNumber());
-  let subtotal = live.subtotal.toNumber();
-  const taxableSubtotal = live.taxableSubtotal.toNumber();
-  const payments = live.payments.toNumber();
-  const manualTax = live.manualTax.toNumber();
-
-  subtotal += billablesAmount;
-  const discValue = parseFloat(discount) || 0;
-  const discAmount = discountType === 'percent' ? subtotal * (discValue / 100) : discValue;
-  const tax = Math.max(0, taxableSubtotal) * taxRate + manualTax;
-  const total = Math.max(0, subtotal - discAmount + tax);
+    discount,
+    discountType,
+    taxRate,
+    billables,
+    retainagePercent,
+  });
   return {
-    amounts,
-    subtotal,
-    discount: discAmount,
-    tax,
-    payments,
-    total,
-    balanceDue: Math.max(0, total - payments),
+    amounts: t.amounts.map((a) => a.toNumber()),
+    subtotal: t.subtotal.toNumber(),
+    discount: t.discount.toNumber(),
+    tax: t.tax.toNumber(),
+    payments: t.payments.toNumber(),
+    total: t.total.toNumber(),
+    retainage: t.retainage.toNumber(),
+    balanceDue: t.balanceDue.toNumber(),
+    billables: t.billables.toNumber(),
   };
 }
 
@@ -827,31 +829,29 @@ function InvoiceModal({
   const customerJobs = jobs.filter((j) => !j.customerId || j.customerId === customerId);
   const selectedRate = taxRates.find((t) => t.id === taxRateId);
 
-  // Selected billables → extra (non-taxable) invoice amount. Markup applies to costs only.
-  const markupFactor = 1 + (parseFloat(markupPercent) || 0) / 100;
-  const selectedCostsAmount = (billables?.costs ?? [])
-    .filter((c) => selectedCostIds.has(c.id))
-    .reduce((s, c) => s + Number(c.amount) * markupFactor, 0);
-  const selectedTimeAmount = (billables?.time ?? [])
-    .filter((t) => selectedTimeIds.has(t.id))
-    .reduce((s, t) => s + Number(t.amount), 0);
-  const billablesAmount = selectedCostsAmount + selectedTimeAmount;
+  // Selected billables → extra (non-taxable) invoice lines. Markup applies to costs only, as its
+  // own line per cost (lib/services/billables.ts), so each is rounded on its own.
+  const selectedBillables: LiveBillables | null = billables
+    ? {
+        costs: billables.costs.filter((c) => selectedCostIds.has(c.id)),
+        time: billables.time.filter((t) => selectedTimeIds.has(t.id)),
+        markupPercent,
+      }
+    : null;
   const hasBillablesSelected = selectedCostIds.size + selectedTimeIds.size > 0;
 
   const totals = computeTotals(
     lines,
     discount,
     discountType,
-    selectedRate ? parseFloat(selectedRate.rate) || 0 : 0,
-    billablesAmount,
+    selectedRate?.rate ?? '',
+    selectedBillables,
+    retainagePercent,
   );
+  const billablesAmount = totals.billables;
 
-  // Held-back retainage shown on the form (the server computes the same: total × %).
-  const retainageHeld = (() => {
-    const pct = parseFloat(retainagePercent);
-    if (!Number.isFinite(pct) || pct <= 0) return 0;
-    return Math.round(totals.total * Math.min(pct, 100)) / 100;
-  })();
+  // Held-back retainage shown on the form (the server computes the same: round2(total × %)).
+  const retainageHeld = totals.retainage;
 
   /** Inline field messages (lib/fieldValidation.ts), keyed by field / form line index. */
   function validateForm(): FieldErrors {
@@ -1020,7 +1020,9 @@ function InvoiceModal({
           .filter((c) => c.source === 'expense' && selectedCostIds.has(c.id))
           .map((c) => c.id),
         timeEntryIds: billables.time.filter((t) => selectedTimeIds.has(t.id)).map((t) => t.id),
-        markupPercent: markupPercent || undefined,
+        // Always the markup shown on the form: a cleared field is no markup. Leaving it out made
+        // the server apply the Preferences default markup the user had just removed.
+        markupPercent: markupPercent.trim() || '0',
       };
     }
 
@@ -1478,7 +1480,7 @@ function InvoiceModal({
                     {c.description ?? c.ref ?? 'Reimbursable cost'}
                   </span>
                   <span className="tabular-nums font-semibold text-navy/80">
-                    {formatCurrency((Number(c.amount) * markupFactor).toFixed(2))}
+                    {formatCurrency(billableCostTotal(c.amount, markupPercent).toFixed(2))}
                   </span>
                 </label>
               ))}
@@ -1552,7 +1554,7 @@ function InvoiceModal({
           </div>
           {discountType === 'percent' && discount && (
             <p className="mt-1 text-xs text-navy/50">
-              = {formatCurrency((totals.subtotal * ((parseFloat(discount) || 0) / 100)).toFixed(2))} off
+              = {formatCurrency(totals.discount.toFixed(2))} off
             </p>
           )}
         </div>
@@ -1644,7 +1646,7 @@ function InvoiceModal({
               <div className="flex items-center justify-between">
                 <span className="text-sm font-semibold text-navy/70">Due now</span>
                 <span className="text-base font-bold text-navy tabular-nums">
-                  {formatCurrency((totals.total - retainageHeld - totals.payments).toFixed(2), currency || 'USD')}
+                  {formatCurrency(totals.balanceDue.toFixed(2), currency || 'USD')}
                 </span>
               </div>
             </>
@@ -1997,7 +1999,7 @@ function InvoicesPageContent() {
                       >
                         <Package className="h-3.5 w-3.5" /> Packing Slip
                       </Button>
-                      {(inv.status === 'open' || inv.status === 'draft') && (
+                      {canEditInvoice(inv.status) && (
                         <Button
                           variant="ghost"
                           size="sm"

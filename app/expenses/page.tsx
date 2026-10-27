@@ -60,7 +60,7 @@ import { amountMessage, collectErrors, dateMessage, requiredMessage, type FieldE
 import { usePreferences } from '@/lib/usePreferences';
 import { classWarningApplies, confirmTransactionDate } from '@/lib/formPrefs';
 import MemorizeButton from '@/components/MemorizeButton';
-import { TransactionNav } from '@/components/TransactionNav';
+import { TransactionNav, compareDocNumbers } from '@/components/TransactionNav';
 import AttachmentPanel from '@/components/AttachmentPanel';
 import { visibleOtherNames, type OtherNameEntry } from '@/lib/lists/otherNameOptions';
 import { recallNote, useSmartDefaults } from '@/lib/useSmartDefaults';
@@ -555,7 +555,7 @@ function ExpensesPageContent() {
 
   // QB Previous / Next: checks and charges in date order (Previous from a new one opens the latest).
   const navOrder = useMemo(
-    () => [...expenses].sort((a, b) => a.date.localeCompare(b.date) || (a.reference ?? '').localeCompare(b.reference ?? '')),
+    () => [...expenses].sort((a, b) => a.date.localeCompare(b.date) || compareDocNumbers(a.reference, b.reference)),
     [expenses],
   );
   const navIndex = editingId ? navOrder.findIndex((x) => x.id === editingId) : -1;

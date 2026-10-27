@@ -118,6 +118,24 @@ export function labelForId(choices: TypeaheadChoice[], id: string): string {
 }
 
 /**
+ * The id a picker's typed text stands for when the form is SAVED while the cursor is still in it
+ * (Enter in a register's entry row saves without leaving the field):
+ *   blank text              -> '' (nothing chosen)
+ *   still the chosen label  -> the chosen id
+ *   one exact match         -> that entry
+ *   anything else           -> null: the text names nothing in the list (ask to add it), so the
+ *                              entry chosen BEFORE the user retyped the field must not be saved.
+ */
+export function choiceForTypedText(choices: TypeaheadChoice[], text: string, currentId: string): string | null {
+  const q = norm(text);
+  if (!q) return '';
+  const current = currentId ? choices.find((c) => c.id === currentId) : undefined;
+  if (current && norm(current.label) === q) return currentId;
+  const exact = choices.filter((c) => isExactTypeaheadMatch({ value: c.label, terms: c.terms }, q));
+  return exact.length === 1 ? exact[0].id : null;
+}
+
+/**
  * The id a <TypeaheadSelect> keeps when the user leaves the field with typed text:
  *   blank text            -> '' (cleared)
  *   still the current label -> the current id (also when two entries share that label)

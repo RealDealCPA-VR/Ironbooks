@@ -9,9 +9,7 @@ import * as React from 'react';
 import { cn } from '@/lib/utils';
 import {
   adjustDateForKey,
-  evaluateAmountExpression,
-  formatAmountResult,
-  isMathExpression,
+  committedAmountText,
   stepDocNumber,
   useListKeys,
 } from '@/lib/shortcuts';
@@ -178,8 +176,9 @@ export const DocNumberInput = React.forwardRef<HTMLInputElement, React.InputHTML
 
 export type AmountInputProps = Omit<React.InputHTMLAttributes<HTMLInputElement>, 'type'> & {
   /**
-   * Called with the evaluated amount string after a math expression commits
-   * (blur or Enter). Plain numbers never trigger it — they pass through untouched.
+   * Called with the committed amount string after a math expression is worked out, or an
+   * amount typed as "$1,250.50" is made a bare number (blur or Enter). Plain numbers never
+   * trigger it — they pass through untouched.
    * Regular onChange also fires (via a native input event), so controlled
    * value/onChange usage works without this.
    */
@@ -189,9 +188,10 @@ export type AmountInputProps = Omit<React.InputHTMLAttributes<HTMLInputElement>,
 /**
  * Drop-in Input for money fields with a built-in calculator: type math
  * (e.g. `12.5*3+10`, with + - * / and parentheses) and it evaluates on blur or
- * Enter via a safe parser (no eval), rounded to cents. Plain numbers are passed
- * through untouched; invalid expressions are left as typed for the page's own
- * validation to flag.
+ * Enter via a safe parser (no eval, exact decimals), rounded to cents half-up like the server.
+ * An amount typed with a $ sign or thousands separators ("$1,250.50") becomes "1250.50" the
+ * same way. Plain numbers are passed through untouched; invalid expressions are left as typed
+ * for the page's own validation to flag.
  */
 export const AmountInput = React.forwardRef<HTMLInputElement, AmountInputProps>(
   function AmountInput({ onValueCommit, onBlur, onKeyDown, ...props }, ref) {
@@ -202,11 +202,12 @@ export const AmountInput = React.forwardRef<HTMLInputElement, AmountInputProps>(
       const el = innerRef.current;
       if (!el) return false;
       const raw = el.value;
-      if (!isMathExpression(raw)) return false; // plain numbers untouched
-      const result = evaluateAmountExpression(raw);
-      if (result === null) return false; // invalid: leave as typed
-      const next = formatAmountResult(result);
-      if (next !== raw) setNativeInputValue(el, next);
+      // QuickMath worked out (exact decimals, cents half-up), or "$1,250.50" made a bare
+      // "1250.50" so the page's sums and the API read it. Plain numbers are left untouched;
+      // text that is not an amount stays as typed for the page's validation.
+      const next = committedAmountText(raw);
+      if (next === null) return false;
+      setNativeInputValue(el, next);
       onValueCommit?.(next);
       return true;
     }, [onValueCommit]);

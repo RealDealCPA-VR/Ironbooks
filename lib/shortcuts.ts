@@ -18,6 +18,8 @@
  *    Home / End, PgUp / PgDn, Enter, type-ahead) for every list, center and register.
  */
 import * as React from 'react';
+import Decimal from 'decimal.js';
+import { Money } from '@/lib/money';
 import {
   addDays,
   addMonths,
@@ -63,13 +65,22 @@ function normalizeAmountText(raw: string): string {
  *   evaluateAmountExpression('12.5*3+10') === 47.5
  */
 export function evaluateAmountExpression(raw: string): number | null {
+  const d = evaluateAmountDecimal(raw);
+  return d === null ? null : d.toNumber();
+}
+
+/**
+ * The same QuickMath parser in exact decimal arithmetic (decimal.js, like lib/money): the result
+ * the amount field keeps, so "4.35*1.5" is 6.525 (6.53 at cents), not the float 6.52499….
+ */
+export function evaluateAmountDecimal(raw: string): Decimal | null {
   const s = normalizeAmountText(raw);
   if (!s) return null;
   const state = { src: s, pos: 0, failed: false };
 
   const value = parseExpr(state);
   if (state.failed || state.pos !== state.src.length) return null;
-  if (!Number.isFinite(value)) return null;
+  if (!value.isFinite()) return null;
   return value;
 }
 
@@ -79,41 +90,45 @@ interface ParseState {
   failed: boolean;
 }
 
+const BAD = new Decimal(NaN);
+
 function peek(st: ParseState): string {
   return st.src[st.pos] ?? '';
 }
 
 /** expr := term (('+' | '-') term)* */
-function parseExpr(st: ParseState): number {
+function parseExpr(st: ParseState): Decimal {
   let left = parseTerm(st);
   while (!st.failed) {
     const op = peek(st);
     if (op !== '+' && op !== '-') break;
     st.pos++;
     const right = parseTerm(st);
-    left = op === '+' ? left + right : left - right;
+    if (st.failed) return BAD;
+    left = op === '+' ? left.plus(right) : left.minus(right);
   }
   return left;
 }
 
 /** term := factor (('*' | '/') factor)* */
-function parseTerm(st: ParseState): number {
+function parseTerm(st: ParseState): Decimal {
   let left = parseFactor(st);
   while (!st.failed) {
     const op = peek(st);
     if (op !== '*' && op !== '/') break;
     st.pos++;
     const right = parseFactor(st);
-    if (op === '*') left = left * right;
-    else if (right === 0) {
+    if (st.failed) return BAD;
+    if (op === '*') left = left.times(right);
+    else if (right.isZero()) {
       st.failed = true; // division by zero -> invalid expression
-    } else left = left / right;
+    } else left = left.dividedBy(right);
   }
   return left;
 }
 
 /** factor := ('+' | '-') factor | '(' expr ')' | number */
-function parseFactor(st: ParseState): number {
+function parseFactor(st: ParseState): Decimal {
   const c = peek(st);
   if (c === '+') {
     st.pos++;
@@ -121,14 +136,15 @@ function parseFactor(st: ParseState): number {
   }
   if (c === '-') {
     st.pos++;
-    return -parseFactor(st);
+    const v = parseFactor(st);
+    return st.failed ? BAD : v.negated();
   }
   if (c === '(') {
     st.pos++;
     const v = parseExpr(st);
     if (peek(st) !== ')') {
       st.failed = true;
-      return NaN;
+      return BAD;
     }
     st.pos++;
     return v;
@@ -137,7 +153,7 @@ function parseFactor(st: ParseState): number {
 }
 
 /** number := digits ['.' digits] | '.' digits */
-function parseNumber(st: ParseState): number {
+function parseNumber(st: ParseState): Decimal {
   const start = st.pos;
   while (/[0-9]/.test(peek(st))) st.pos++;
   if (peek(st) === '.') {
@@ -148,14 +164,41 @@ function parseNumber(st: ParseState): number {
   // Must contain at least one digit ('.', '' are invalid).
   if (!/[0-9]/.test(text)) {
     st.failed = true;
-    return NaN;
+    return BAD;
   }
-  return Number(text);
+  return new Decimal(text.startsWith('.') ? `0${text}` : text);
 }
 
 /** Round an evaluated amount to cents for display in money fields. */
 export function formatAmountResult(n: number): string {
   return String(Math.round((n + Number.EPSILON) * 100) / 100);
+}
+
+/** A plain amount once $ and spaces are gone: digits with real thousands groups ("1,250.50"). */
+const GROUPED_AMOUNT_RE = /^-?(\d{1,3}(,\d{3})+|\d+)(\.\d*)?$/;
+
+/**
+ * What an amount field holds once the user commits it (blur, or Enter in the field):
+ *  - QuickMath ("12.5*3+10") is worked out in exact decimals and rounded to cents half-up, as
+ *    lib/money rounds on the server ("4.35*1.5" → "6.53"; the old float math kept 6.52);
+ *  - a plain amount typed with a $ sign, spaces or thousands separators ("$1,250.50") becomes the
+ *    bare number ("1250.50"). The forms add amounts with Number(), which reads "1,250.50" as NaN:
+ *    a payment applied as "1,250.00" was silently dropped, and the API (zMoney) refuses commas.
+ * Null when there is nothing to change (a plain number, or text that is not an amount — the
+ * page's own validation reports that).
+ */
+export function committedAmountText(raw: string): string | null {
+  if (isMathExpression(raw)) {
+    const d = evaluateAmountDecimal(raw);
+    if (d === null) return null;
+    const next = Money.round2(d).toString();
+    return next === raw ? null : next;
+  }
+  const s = normalizeAmountText(raw);
+  if (!s || s === raw) return null;
+  // Only real thousands groups: a decimal comma ("12,50") is left as typed for validation to flag.
+  if (!GROUPED_AMOUNT_RE.test(raw.replace(/[\s$]/g, ''))) return null;
+  return s;
 }
 
 // ---------------------------------------------------------------------------

@@ -45,11 +45,13 @@ export function usePriceQuotes(header: QuoteHeader, lines: QuoteLine[], delayMs 
   useEffect(() => {
     const req = wanted.filter((w) => w.itemId && w.qty > 0);
     const size = lines.length;
+    // Every change supersedes the request in flight, including one that leaves nothing to price
+    // (its late answer would otherwise bring back quotes for lines that were just cleared).
+    const mine = ++seq.current;
     if (req.length === 0) {
       setQuotes(Array(size).fill(null));
       return;
     }
-    const mine = ++seq.current;
     const timer = setTimeout(() => {
       api
         .post<{ quotes: PriceQuote[] }>('/api/pricing/quote', {

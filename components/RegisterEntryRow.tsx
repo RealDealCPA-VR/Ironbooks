@@ -21,7 +21,15 @@ import { api, ApiError } from '@/lib/client';
 import { todayISO } from '@/lib/dates';
 import { SUBTYPE_LABELS } from '@/lib/accountTypes';
 import { saveWithDuplicateCheck } from '@/lib/purchasesClient';
-import { type TypeaheadChoice, type TypeaheadOption, choicesToOptions, isExactTypeaheadMatch, labelForId, resolveTypedChoice } from '@/lib/typeahead';
+import {
+  type TypeaheadChoice,
+  type TypeaheadOption,
+  choiceForTypedText,
+  choicesToOptions,
+  isExactTypeaheadMatch,
+  labelForId,
+  resolveTypedChoice,
+} from '@/lib/typeahead';
 import {
   REGISTER_ENTRY_LABELS,
   planRegisterEntry,
@@ -223,6 +231,9 @@ export function RegisterEntryRow({
   }
 
   async function submit(name: { type: NameType; id: string } | null) {
+    // The account the row shows (save() resolved typed text into it; the ref is current even
+    // before React re-renders).
+    const accountId = account.current.id;
     if (!side || !accountId) return;
     setSaving(true);
     try {
@@ -252,7 +263,15 @@ export function RegisterEntryRow({
 
   function save() {
     if (saving) return;
-    if (!accountId) {
+    // Enter saves while the cursor may still be in the Account field: what it shows now counts,
+    // not the account picked before it was retyped (that used to be saved instead).
+    const typed = choiceForTypedText(accountChoices, account.current.text, account.current.id);
+    if (typed === null) {
+      setNewAccount(account.current.text.trim()); // not in the chart: offer to set it up
+      return;
+    }
+    if (typed !== account.current.id) setAccountBoth(typed, labelForId(accountChoices, typed));
+    if (!typed) {
       toast('Choose the account for this transaction.', 'danger');
       return;
     }
@@ -260,8 +279,10 @@ export function RegisterEntryRow({
       toast(`Enter an amount in ${columns[0].label} or ${columns[1].label}.`, 'danger');
       return;
     }
-    if (plan && !plan.ok) {
-      toast(plan.message, 'danger');
+    const chosen = accounts.find((a) => a.id === typed);
+    const typedPlan = chosen ? planRegisterEntry(register, chosen, side) : null;
+    if (typedPlan && !typedPlan.ok) {
+      toast(typedPlan.message, 'danger');
       return;
     }
     const text = payee.trim();

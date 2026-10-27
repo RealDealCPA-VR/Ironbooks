@@ -7,6 +7,7 @@
  * it ties; otherwise only after ticking "Import anyway", which is recorded in the audit trail.
  */
 import { useMemo, useState } from 'react';
+import Decimal from 'decimal.js';
 import { CheckCircle2, Plus, Trash2, TriangleAlert } from 'lucide-react';
 import { Badge, Button, Input, Table, Td, Th, Tr } from '@/components/ui';
 import { formatCurrency } from '@/lib/money';
@@ -42,6 +43,73 @@ interface EditRow {
 
 const METHOD_LABEL = { text: 'Read from the PDF text', ocr: 'Read with offline OCR', ai: 'Read by your AI' } as const;
 
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * An amount as typed on the review screen, as the 2-decimal string the import checks ("2500" →
+ * "2500.00", "$1,234.56" → "1234.56", "(45.00)" → "-45.00"), or null when it is not an amount.
+ * The server ties the statement out with amounts written to the cent (lib/statements/parse.ts
+ * parseMoney): a balance typed as "2500" tied out on screen but was refused on import as
+ * "missing", and "1,234.56" (as statements print it) counted as missing on screen.
+ */
+export function statementAmount(raw: string): string | null {
+  let t = raw.replace(/[\s ]/g, '');
+  if (!t) return null;
+  let neg = false;
+  if (/^\(.*\)$/.test(t)) {
+    neg = true;
+    t = t.slice(1, -1);
+  }
+  if (t.startsWith('-') || t.startsWith('+')) {
+    if (t[0] === '-') neg = !neg;
+    t = t.slice(1);
+  }
+  t = t.replace(/^\$/, '');
+  if (t.startsWith('-')) {
+    neg = !neg;
+    t = t.slice(1);
+  }
+  if (!/^((\d{1,3}(,\d{3})+|\d+)(\.\d{0,2})?|\.\d{1,2})$/.test(t)) return null;
+  const d = new Decimal(t.replace(/,/g, '').replace(/\.$/, ''));
+  if (d.isZero()) return '0.00';
+  return (neg ? d.negated() : d).toFixed(2);
+}
+
+export interface ReviewRow {
+  date: string;
+  description: string;
+  payee: string;
+  amount: string;
+}
+
+/** The rows that can be imported: a real date and a non-zero amount. */
+export function importableRows<R extends ReviewRow>(rows: R[]): R[] {
+  return rows.filter((r) => {
+    const a = statementAmount(r.amount);
+    return DATE_RE.test(r.date) && a !== null && a !== '0.00';
+  });
+}
+
+/** What Import sends: every amount and both balances as checked on screen (2 decimals). */
+export function reviewedPayload(
+  rows: ReviewRow[],
+  opening: string,
+  closing: string,
+  kind: StatementKind,
+  ack: boolean,
+): ReviewedStatement {
+  const valid = importableRows(rows);
+  const o = statementAmount(opening);
+  const c = statementAmount(closing);
+  const t = tieOut(valid.map((r) => ({ amount: statementAmount(r.amount)! })), o, c, kind);
+  return {
+    rows: valid.map((r) => ({ date: r.date, description: r.description.trim(), amount: statementAmount(r.amount)!, payee: r.payee.trim() || null })),
+    openingBalance: o ?? opening.trim(),
+    closingBalance: c ?? closing.trim(),
+    acknowledgeDifference: !t.ok && ack,
+  };
+}
+
 export function StatementReview({
   extract,
   importing,
@@ -67,13 +135,13 @@ export function StatementReview({
   const [closing, setClosing] = useState(extract.closingBalance ?? '');
   const [ack, setAck] = useState(false);
 
-  const validRows = rows.filter((r) => /^\d{4}-\d{2}-\d{2}$/.test(r.date) && /^-?\d+(\.\d{1,2})?$/.test(r.amount.trim()) && Number(r.amount) !== 0);
+  const validRows = importableRows(rows);
   const t = useMemo(
     () =>
       tieOut(
-        validRows.map((r) => ({ amount: Number(r.amount).toFixed(2) })),
-        /^-?\d+(\.\d{1,2})?$/.test(opening.trim()) ? Number(opening).toFixed(2) : null,
-        /^-?\d+(\.\d{1,2})?$/.test(closing.trim()) ? Number(closing).toFixed(2) : null,
+        validRows.map((r) => ({ amount: statementAmount(r.amount)! })),
+        statementAmount(opening),
+        statementAmount(closing),
         extract.statementKind,
       ),
     [validRows, opening, closing, extract.statementKind],
@@ -167,7 +235,15 @@ export function StatementReview({
                   />
                 </Td>
                 <Td>
-                  <button type="button" aria-label="Remove row" onClick={() => setRows((prev) => prev.filter((x) => x.key !== r.key))} className="text-red-400 hover:text-red-600">
+                  <button
+                    type="button"
+                    aria-label="Remove row"
+                    onClick={() => {
+                      setRows((prev) => prev.filter((x) => x.key !== r.key));
+                      setAck(false); // "Import anyway" was for the difference before this change
+                    }}
+                    className="text-red-400 hover:text-red-600"
+                  >
                     <Trash2 className="h-4 w-4" />
                   </button>
                 </Td>
@@ -182,12 +258,13 @@ export function StatementReview({
           type="button"
           variant="secondary"
           size="sm"
-          onClick={() =>
+          onClick={() => {
             setRows((prev) => [
               ...prev,
               { key: Math.max(0, ...prev.map((x) => x.key)) + 1, date: extract.period?.end ?? '', description: '', payee: '', amount: '', flagged: false },
-            ])
-          }
+            ]);
+            setAck(false);
+          }}
         >
           <Plus className="h-4 w-4" /> Add a row
         </Button>
@@ -206,14 +283,7 @@ export function StatementReview({
             type="button"
             loading={importing}
             disabled={invalid > 0 || validRows.length === 0 || (!t.ok && !ack)}
-            onClick={() =>
-              onImport({
-                rows: validRows.map((r) => ({ date: r.date, description: r.description.trim(), amount: Number(r.amount).toFixed(2), payee: r.payee.trim() || null })),
-                openingBalance: opening.trim(),
-                closingBalance: closing.trim(),
-                acknowledgeDifference: !t.ok && ack,
-              })
-            }
+            onClick={() => onImport(reviewedPayload(rows, opening, closing, extract.statementKind, ack))}
           >
             Import {validRows.length} row{validRows.length === 1 ? '' : 's'}
           </Button>

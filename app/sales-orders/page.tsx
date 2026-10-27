@@ -134,7 +134,7 @@ function computeTotal(lines: PricedLineValue[], items: PricedLineItem[], taxRate
     lines.map((l) => ({ ...l, itemType: items.find((i) => i.id === l.itemId)?.type ?? null })),
     taxRate,
   );
-  return t.subtotal + Math.round(t.tax * 100) / 100;
+  return t.total;
 }
 
 // ---------------------------------------------------------------------------
