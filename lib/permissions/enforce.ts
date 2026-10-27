@@ -11,12 +11,14 @@
 import { headers } from 'next/headers';
 import { ServiceError } from '@/lib/services/_base';
 import { permissionDenied } from '@/lib/services/access';
-import { can, type EffectiveAccess } from './model';
+import { can, canActivity, canWholeArea, type EffectiveAccess } from './model';
+import type { ActivityKey } from './activities';
 import {
   ROUTE_METHOD_HEADER,
   ROUTE_PATH_HEADER,
+  apiActivityFor,
   apiRuleFor,
-  pageAreasFor,
+  pageAccessFor,
   type RouteRule,
 } from './routes';
 
@@ -40,7 +42,12 @@ export async function currentRequestInfo(): Promise<RequestInfo | null> {
 }
 
 /** Throw FORBIDDEN unless `access` satisfies the rule. */
-export function assertRule(rule: RouteRule | null, access: EffectiveAccess, path: string): void {
+export function assertRule(
+  rule: RouteRule | null,
+  access: EffectiveAccess,
+  path: string,
+  activity: ActivityKey | null = null,
+): void {
   if (rule === null) {
     throw new ServiceError(
       'FORBIDDEN',
@@ -48,7 +55,13 @@ export function assertRule(rule: RouteRule | null, access: EffectiveAccess, path
     );
   }
   if (rule === 'public' || rule === 'self' || rule === 'member') return;
-  if (!can(access, rule.area, rule.action)) throw permissionDenied(rule.area, rule.action);
+  // prefsperms: the activity of the area (Invoices, Receive Payments, …) when the route has one;
+  // otherwise every activity of the area must allow the action (fail closed).
+  if (activity) {
+    if (!canActivity(access, activity, rule.action)) throw permissionDenied(rule.area, rule.action, activity);
+    return;
+  }
+  if (!canWholeArea(access, rule.area, rule.action)) throw permissionDenied(rule.area, rule.action);
 }
 
 /** Authorize a concrete request against the declarative maps. */
@@ -59,11 +72,18 @@ export function authorizeRequest(info: RequestInfo, access: EffectiveAccess): vo
     throw new ServiceError('FORBIDDEN', 'This request could not be authorized.');
   }
   if (path === '/api' || path.startsWith('/api/')) {
-    assertRule(apiRuleFor(path, method), access, `${method} ${path}`);
+    assertRule(apiRuleFor(path, method), access, `${method} ${path}`, apiActivityFor(path, method));
     return;
   }
-  const areas = pageAreasFor(path);
-  if (areas && !areas.some((a) => can(access, a, 'view'))) throw permissionDenied(areas[0], 'view');
+  const need = pageAccessFor(path);
+  if (!need) return;
+  if (need.activities) {
+    if (!need.activities.some((k) => canActivity(access, k, 'view'))) {
+      throw permissionDenied(need.areas[0] ?? 'company', 'view', need.activities[0]);
+    }
+    return;
+  }
+  if (!need.areas.some((a) => can(access, a, 'view'))) throw permissionDenied(need.areas[0], 'view');
 }
 
 /** getServerContext hook: authorize the in-flight request (no-op outside a request). */

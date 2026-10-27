@@ -16,10 +16,26 @@
  * customize). Custom roles live in the company file (company_roles table).
  */
 
+import {
+  ACTIVITIES,
+  ACTIVITY_KEYS,
+  VIEW_BALANCE,
+  activitiesOf,
+  activityDef,
+  supportedActions,
+  type ActivityAction,
+  type ActivityDef,
+  type ActivityKey,
+} from './activities';
+
 export const ACTIONS = ['view', 'create', 'modify', 'delete', 'print'] as const;
 export type Action = (typeof ACTIONS)[number];
-/** What a role may store per area: concrete actions, or 'full'. */
-export type GrantAction = Action | 'full';
+/**
+ * What a role may store per area or per activity: concrete actions, 'full', or (activities with a
+ * balance) 'view_balance'.
+ */
+export type GrantAction = Action | 'full' | typeof VIEW_BALANCE;
+export type { ActivityAction, ActivityKey } from './activities';
 
 export const AREAS = [
   { key: 'banking', label: 'Banking', group: 'Transactions' },
@@ -82,11 +98,17 @@ export const FLAGS = [
 export type Flag = (typeof FLAGS)[number]['key'];
 export type RoleFlags = Partial<Record<Flag, boolean>>;
 
-/** Stored (sparse) permission grant: area → actions (may contain 'full'). */
-export type PermissionGrant = Partial<Record<Area, GrantAction[]>>;
+/**
+ * Stored (sparse) permission grant. Keys are AREAS (the format every role had before activities:
+ * the actions apply to every activity of the area) or ACTIVITY keys ('customers.invoices').
+ */
+export type PermissionGrant = Partial<Record<Area | ActivityKey, GrantAction[]>>;
 
 /** Normalized permission set: every area present with concrete actions. */
 export type PermissionSet = Record<Area, Action[]>;
+
+/** Normalized activity rights: every activity present with its concrete rights. */
+export type ActivitySet = Record<ActivityKey, ActivityAction[]>;
 
 export interface RoleDefinition {
   /** Built-in key ('admin', 'bookkeeper', …) or a custom role's uuid. */
@@ -101,7 +123,17 @@ export interface RoleDefinition {
 /** Effective access for one user in one company (union of all their roles). */
 export interface EffectiveAccess {
   roleKeys: string[];
+  /**
+   * Per area: an action is here when the role grants it on the area (old-style grant) or on ANY
+   * activity of the area. Coarse - routes and pages check the activity (`canActivity`).
+   */
   permissions: PermissionSet;
+  /**
+   * Per activity (QB Enterprise access levels). Always filled by unionRoles; optional so access
+   * objects built by hand (older tests, trusted contexts) keep type-checking - without it every
+   * activity check falls back to the activity's area.
+   */
+  activities?: ActivitySet;
   flags: Record<Flag, boolean>;
   /** Holds the built-in Admin role. */
   isAdmin: boolean;
@@ -357,20 +389,102 @@ export function emptyPermissionSet(): PermissionSet {
   return s;
 }
 
-/** Expand 'full' and the implicit view; drop unknown areas/actions; stable action order. */
+function expandActions(raw: unknown): Set<string> {
+  const set = new Set<string>();
+  if (!Array.isArray(raw)) return set;
+  for (const x of raw) {
+    if (x === 'full') {
+      ACTIONS.forEach((a) => set.add(a));
+      set.add(VIEW_BALANCE);
+    } else if (typeof x === 'string') set.add(x);
+  }
+  return set;
+}
+
+const isAction = (a: string): a is Action => (ACTIONS as readonly string[]).includes(a);
+
+/**
+ * Expand 'full' and the implicit view; drop unknown areas/actions; stable action order. An
+ * ACTIVITY key adds its rights (View Balance aside) to its area, so `can(access, area, …)` stays
+ * true when any activity of the area allows it.
+ */
 export function normalizeGrant(grant: PermissionGrant | null | undefined): PermissionSet {
   const out = emptyPermissionSet();
   if (!grant || typeof grant !== 'object') return out;
-  for (const area of AREA_KEYS) {
-    const raw = (grant as Record<string, unknown>)[area];
-    if (!Array.isArray(raw) || raw.length === 0) continue;
-    const set = new Set<Action>();
-    for (const x of raw) {
-      if (x === 'full') ACTIONS.forEach((a) => set.add(a));
-      else if ((ACTIONS as readonly string[]).includes(x as string)) set.add(x as Action);
+  const sets = new Map<Area, Set<Action>>();
+  const add = (area: Area, a: Action) => {
+    const s = sets.get(area) ?? new Set<Action>();
+    s.add(a);
+    sets.set(area, s);
+  };
+  for (const [key, raw] of Object.entries(grant as Record<string, unknown>)) {
+    const expanded = expandActions(raw);
+    if ((AREA_KEYS as string[]).includes(key)) {
+      const granted = [...expanded].filter(isAction);
+      if (!granted.length) continue;
+      for (const a of granted) add(key as Area, a);
+      add(key as Area, 'view'); // any action implies view
+      continue;
     }
-    if (set.size) set.add('view'); // any action implies view
-    out[area] = ACTIONS.filter((a) => set.has(a));
+    const def = activityDef(key);
+    if (!def) continue;
+    for (const a of activityRights(def, expanded, false)) if (isAction(a)) add(def.area, a);
+  }
+  for (const area of AREA_KEYS) {
+    const s = sets.get(area);
+    if (s?.size) out[area] = ACTIONS.filter((a) => s.has(a));
+  }
+  return out;
+}
+
+export function emptyActivitySet(): ActivitySet {
+  const s = {} as ActivitySet;
+  for (const k of ACTIVITY_KEYS) s[k] = [];
+  return s;
+}
+
+/**
+ * The rights one activity gets from a list of granted actions: only rights the activity has, and
+ * any right implies View. `legacy` (an old-style AREA grant) also gives View Balance with View:
+ * before activities existed everybody who could view an area saw its balances.
+ */
+function activityRights(def: ActivityDef, expanded: Set<string>, legacy: boolean): ActivityAction[] {
+  const supported = supportedActions(def);
+  const out = new Set<ActivityAction>();
+  // An area grant only ever held the five actions (View Balance is per activity).
+  const src = legacy ? new Set([...expanded].filter(isAction)) : expanded;
+  for (const a of supported) if (src.has(a)) out.add(a);
+  // An old-style area grant of ANY action meant "may use this area" (View was implied), even when
+  // this activity has no such right (e.g. Print on an activity that has nothing to print).
+  if (legacy && [...expanded].some(isAction)) out.add('view');
+  if (out.size) out.add('view');
+  if (legacy && out.has('view') && def.viewBalance) out.add(VIEW_BALANCE);
+  return supported.filter((a) => out.has(a));
+}
+
+/**
+ * Per-activity rights of a stored grant. An AREA key (every role stored before activities, and
+ * the built-in roles) applies to every activity of that area - the migration that keeps every
+ * existing role's access exactly as it was.
+ */
+export function normalizeActivities(grant: PermissionGrant | null | undefined): ActivitySet {
+  const out = emptyActivitySet();
+  if (!grant || typeof grant !== 'object') return out;
+  const merge = (def: ActivityDef, rights: ActivityAction[]) => {
+    if (!rights.length) return;
+    const k = def.key as ActivityKey;
+    const s = new Set([...out[k], ...rights]);
+    out[k] = supportedActions(def).filter((a) => s.has(a));
+  };
+  for (const [key, raw] of Object.entries(grant as Record<string, unknown>)) {
+    const expanded = expandActions(raw);
+    if (!expanded.size) continue;
+    if ((AREA_KEYS as string[]).includes(key)) {
+      for (const def of activitiesOf(key as Area)) merge(def, activityRights(def, expanded, true));
+      continue;
+    }
+    const def = activityDef(key);
+    if (def) merge(def, activityRights(def, expanded, false));
   }
   return out;
 }
@@ -378,6 +492,7 @@ export function normalizeGrant(grant: PermissionGrant | null | undefined): Permi
 /** Union of several roles → effective access. */
 export function unionRoles(roles: RoleDefinition[]): EffectiveAccess {
   const permissions = emptyPermissionSet();
+  const activities = emptyActivitySet();
   const flags: Record<Flag, boolean> = {
     sensitivePayroll: false,
     fullAccountNumbers: false,
@@ -390,11 +505,19 @@ export function unionRoles(roles: RoleDefinition[]): EffectiveAccess {
       const merged = new Set([...permissions[area], ...n[area]]);
       permissions[area] = ACTIONS.filter((a) => merged.has(a));
     }
+    const na = normalizeActivities(role.permissions);
+    for (const def of ACTIVITIES as readonly ActivityDef[]) {
+      const k = def.key as ActivityKey;
+      if (!na[k].length) continue;
+      const merged = new Set([...activities[k], ...na[k]]);
+      activities[k] = supportedActions(def).filter((a) => merged.has(a));
+    }
     for (const f of FLAGS) if (role.flags?.[f.key]) flags[f.key] = true;
   }
   return {
     roleKeys: roles.map((r) => r.key),
     permissions,
+    activities,
     flags,
     isAdmin: roles.some((r) => r.key === ADMIN_ROLE_KEY),
   };
@@ -414,10 +537,50 @@ export function can(
   return access.permissions[area]?.includes(action) ?? false;
 }
 
+/**
+ * QB Enterprise activity check: does the access allow `action` on one activity? Without activity
+ * data (an access object built by hand) it falls back to the activity's area; View Balance then
+ * follows View.
+ */
+export function canActivity(
+  access: Pick<EffectiveAccess, 'permissions' | 'activities'> | null | undefined,
+  activity: string,
+  action: ActivityAction,
+): boolean {
+  if (!access) return false;
+  const def = activityDef(activity);
+  if (!def) return false;
+  if (access.activities) return access.activities[def.key as ActivityKey]?.includes(action) ?? false;
+  return can(access, def.area, action === VIEW_BALANCE ? 'view' : action);
+}
+
+/**
+ * A rule that names only an AREA (a route no activity was mapped to): fail closed - the action is
+ * needed on EVERY activity of the area that has that right. For a role stored the old way (one
+ * grant for the whole area) this is exactly the old area check.
+ */
+export function canWholeArea(
+  access: Pick<EffectiveAccess, 'permissions' | 'activities'> | null | undefined,
+  area: Area,
+  action: Action,
+): boolean {
+  if (!access) return false;
+  if (!access.activities) return can(access, area, action);
+  const defs = activitiesOf(area).filter((d) => supportedActions(d).includes(action));
+  if (!defs.length) return can(access, area, action);
+  return defs.every((d) => access.activities![d.key as ActivityKey]?.includes(action));
+}
+
 /** True when `inner` grants nothing beyond `outer` (used to block privilege escalation). */
 export function isSubset(inner: EffectiveAccess, outer: EffectiveAccess): boolean {
   for (const area of AREA_KEYS) {
     for (const a of inner.permissions[area]) if (!outer.permissions[area].includes(a)) return false;
+  }
+  if (inner.activities) {
+    for (const def of ACTIVITIES as readonly ActivityDef[]) {
+      const k = def.key as ActivityKey;
+      for (const a of inner.activities[k] ?? []) if (!canActivity(outer, k, a)) return false;
+    }
   }
   for (const f of FLAGS) if (inner.flags[f.key] && !outer.flags[f.key]) return false;
   return true;

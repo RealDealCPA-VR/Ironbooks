@@ -25,6 +25,8 @@
  * Pure module (no Node/DB imports): also used client-side to filter navigation.
  */
 import type { Action, Area } from './model';
+import type { ActivityKey } from './activities';
+import { PAGE_ACTIVITIES as PAGE_ACTIVITY_PREFIXES, activityForRoute, pageActivitiesFor } from './routeActivities';
 
 export const HTTP_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] as const;
 export type HttpMethod = (typeof HTTP_METHODS)[number];
@@ -898,6 +900,19 @@ export function apiRuleFor(pathname: string, method: string): RouteRule | null {
 }
 
 /**
+ * prefsperms (QB Enterprise activities): the ACTIVITY of the rule's area a concrete API request
+ * needs (lib/permissions/routeActivities.ts), or null for non-area rules and unmapped routes —
+ * enforce.ts then checks the whole area.
+ */
+export function apiActivityFor(pathname: string, method: string): ActivityKey | null {
+  const rule = apiRuleFor(pathname, method);
+  if (!rule || typeof rule !== 'object') return null;
+  const pattern = matchRoutePattern(pathname)!;
+  const m = method.toUpperCase();
+  return activityForRoute(pattern, m === 'HEAD' ? 'GET' : m, rule.area, pathname);
+}
+
+/**
  * The areas a page path needs 'view' of (ANY one suffices), or null when the page is open to
  * every member.
  */
@@ -911,4 +926,31 @@ export function pageAreasFor(pathname: string): Area[] | null {
   if (!best) return null;
   const v = PAGE_AREAS[best];
   return Array.isArray(v) ? v : [v];
+}
+
+/**
+ * What a page needs (prefsperms): View of one of these ACTIVITIES when
+ * lib/permissions/routeActivities.ts maps the page at least as precisely as PAGE_AREAS does,
+ * else View of one of the AREAS; null when the page is open to every member.
+ */
+export function pageAccessFor(
+  pathname: string,
+): { activities: ActivityKey[]; areas: Area[] } | { activities: null; areas: Area[] } | null {
+  const areas = pageAreasFor(pathname);
+  const activities = pageActivitiesFor(pathname);
+  if (!areas && !activities) return null;
+  if (activities && (!areas || prefixLength(pathname, Object.keys(PAGE_AREAS)) <= prefixLengthOfActivities(pathname))) {
+    return { activities, areas: areas ?? [] };
+  }
+  return { activities: null, areas: areas ?? [] };
+}
+
+function prefixLength(pathname: string, prefixes: string[]): number {
+  let best = -1;
+  for (const p of prefixes) if ((pathname === p || pathname.startsWith(p + '/')) && p.length > best) best = p.length;
+  return best;
+}
+
+function prefixLengthOfActivities(pathname: string): number {
+  return prefixLength(pathname, Object.keys(PAGE_ACTIVITY_PREFIXES));
 }
