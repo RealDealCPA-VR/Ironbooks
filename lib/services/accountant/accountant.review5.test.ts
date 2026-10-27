@@ -6,6 +6,9 @@
  *     account when it is saved.
  *  B  Fix Incorrectly Recorded Sales Tax: a double-submitted "count as a tax payment" posts the
  *     correcting entry once (the "already moved" check runs inside the transaction).
+ *  C  Client Data Review's "Apply" fixes apply customer payments / credits and bill credits: they
+ *     need the Customers / Vendors modify right like Receive Payments / Pay Bills (the route only
+ *     guarantees Accounting).
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
@@ -26,6 +29,11 @@ import { assertCurrentVersion, currentVersion } from '../concurrency';
 import { trialBalance } from '../reports';
 import { reclassifyLines } from './reclassify';
 import { findMisrecordedSalesTax, reclassifySalesTaxPayment } from './salesTaxTools';
+import { autoApplyCustomerCredit, autoApplyVendorCredit } from './clientDataReview';
+import { receivePayment } from '../payments';
+import { createVendorCredit } from '../vendorCredits';
+import { paymentsReceived } from '@/lib/db/schema';
+import { normalizeGrant, type EffectiveAccess, type PermissionGrant } from '@/lib/permissions/model';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-review5-accountant');
 const D = (s: string) => new Date(`${s}T12:00:00Z`);
@@ -139,5 +147,42 @@ describe('B: Fix Incorrectly Recorded Sales Tax', () => {
         ),
       );
     expect(fixes).toHaveLength(1);
+  });
+});
+
+function accessWith(grant: PermissionGrant): EffectiveAccess {
+  return {
+    roleKeys: ['custom'],
+    permissions: normalizeGrant(grant),
+    flags: { sensitivePayroll: false, fullAccountNumbers: false, closedPeriod: false },
+    isAdmin: false,
+  };
+}
+
+describe('C: Client Data Review is no side door around Customers / Vendors', () => {
+  it('applying a customer payment needs Customers: modify; a bill credit needs Vendors: modify', async () => {
+    const cust = (await createCustomer(ctx, { displayName: 'R5 Review Customer' })).id;
+    await createInvoice(ctx, {
+      customerId: cust,
+      date: D('2026-05-01'),
+      lines: [{ description: 'Work', quantity: 1, rate: '100.00', accountId: acct.i1 }],
+    });
+    const pay = await receivePayment(ctx, { customerId: cust, date: D('2026-05-03'), method: 'check', amount: '100.00', applications: [] });
+    const payId = (pay as { id?: string; payment?: { id: string } }).payment?.id ?? (pay as { id: string }).id;
+    const vend = (await createVendor(ctx, { displayName: 'R5 Review Vendor' })).id;
+    await createBill(ctx, { vendorId: vend, date: D('2026-05-01'), lines: [{ accountId: acct.e1, amount: '60.00' }] });
+    const credit = await createVendorCredit(ctx, { vendorId: vend, date: D('2026-05-02'), lines: [{ accountId: acct.e1, amount: '20.00' }] });
+
+    // Accounting: full, but nothing in Customers / Vendors.
+    const accountantOnly = { ...ctx, access: accessWith({ accounting: ['full'] }) };
+    await expect(autoApplyCustomerCredit(accountantOnly, { refType: 'payment', refId: payId })).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    await expect(autoApplyVendorCredit(accountantOnly, { refId: credit.id })).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    const [p] = await db.select({ unapplied: paymentsReceived.unapplied }).from(paymentsReceived).where(eq(paymentsReceived.id, payId));
+    expect(p.unapplied).toBe('100.00');
+
+    // With the area rights it works.
+    const full = { ...ctx, access: accessWith({ accounting: ['full'], customers: ['full'], vendors: ['full'] }) };
+    expect((await autoApplyCustomerCredit(full, { refType: 'payment', refId: payId })).applied).toBe('100.00');
+    expect((await autoApplyVendorCredit(full, { refId: credit.id })).applied).toBe('20.00');
   });
 });

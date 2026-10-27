@@ -46,6 +46,7 @@ import { applyPayment } from '../payments';
 import { applyToInvoice } from '../creditMemos';
 import { applyToBill } from '../vendorCredits';
 import { journalOpenItems, resolveEntityNames } from '../journal';
+import { requirePermission } from '../access';
 
 export const REVIEW_TASKS = [
   { key: 'unapplied_customer_credits', group: 'Customers', title: 'Fix unapplied customer payments and credits' },
@@ -477,6 +478,9 @@ export async function autoApplyCustomerCredit(
   ctx: ServiceContext,
   input: { refType: 'payment' | 'credit_memo'; refId: string; date?: Date | null },
 ): Promise<{ applied: string; invoices: number }> {
+  // The route only guarantees Accounting; applying a payment / credit memo is a Customers change
+  // (Receive Payments needs Customers: modify), so this fix is never a side door around it.
+  requirePermission(ctx, 'customers', 'modify');
   let customerId: string;
   let available: ReturnType<typeof Money.zero>;
   if (input.refType === 'payment') {
@@ -526,6 +530,8 @@ export async function autoApplyCustomerCredit(
 
 /** Apply an unapplied bill credit to the vendor's oldest open bills. */
 export async function autoApplyVendorCredit(ctx: ServiceContext, input: { refId: string }) {
+  // Applying a bill credit is a Vendors change (the bill credit's own Apply needs Vendors: modify).
+  requirePermission(ctx, 'vendors', 'modify');
   const [c] = await ctx.db
     .select()
     .from(vendorCredits)
