@@ -30,6 +30,8 @@
 import { type SQL, sql } from 'drizzle-orm';
 import { formatCurrency, Money, toAmountString } from '@/lib/money';
 import type { ServiceContext } from '../_base';
+import type { PostingLine } from '../posting';
+import { sameLedgerLines } from '../postedEdit';
 import { expensePayload } from './accountant';
 import { depositPayloadOf } from './client';
 import { DOC_LABEL, DOC_ORDER, docPayload, type Labels } from './docs';
@@ -400,14 +402,36 @@ function pick(p: Row, keys: string[], lineKeys: string[]): Row {
 const same = (a: Row, b: Row) => JSON.stringify(norm(a)) === JSON.stringify(norm(b));
 
 /**
- * Whether the accountant's edit changes what the service would re-post. Journal entries, sales /
- * purchase forms and received payments are always voided and re-posted on an edit; checks,
+ * Whether the accountant's edit changes what the service would re-post. Sales / purchase forms
+ * and received payments are always voided and re-posted on an edit; journal entries, checks,
  * transfers, deposits and vendor credits keep their entry when the date and ledger lines stay (a
  * check also its method, items and quantities; a vendor credit its vendor); a bill payment only on
  * a header-only edit (number / print flag; never with a discount or General Journal credits).
  */
 async function editChangesLedger(ctx: ServiceContext, type: string, id: string, after: Row): Promise<boolean> {
   try {
+    if (type === 'journal_entry') {
+      // journal.ts updateEntry keeps the entry — its reconciled lines and its applications — when
+      // the date and the lines (account, amount, class, name) stay: a description, Entry No.,
+      // line memo or Adjusting edit. Anything else (an in-place Reclassify too) voids and re-posts.
+      const [e] = await q(ctx, sql`SELECT date FROM journal_entries WHERE id = ${id}::uuid AND company_id = ${ctx.companyId}::uuid AND status = 'posted'`);
+      if (!e) return true;
+      const toLine = (l: Row): PostingLine => ({
+        accountId: String(l.accountId ?? l.account_id ?? ''),
+        debit: (l.debit ?? null) as string | null,
+        credit: (l.credit ?? null) as string | null,
+        classId: (l.classId ?? l.class_id ?? null) as string | null,
+        entityType: (l.entityType ?? l.entity_type ?? null) as PostingLine['entityType'],
+        entityId: (l.entityId ?? l.entity_id ?? null) as string | null,
+      });
+      const cur = await q(
+        ctx,
+        sql`SELECT l.account_id, l.debit, l.credit, l.class_id, l.entity_type, l.entity_id FROM journal_entry_lines l
+            JOIN journal_entries je ON je.id = l.journal_entry_id
+            WHERE l.journal_entry_id = ${id}::uuid AND je.company_id = ${ctx.companyId}::uuid`,
+      );
+      return !(day(e.date) === day(after.date) && sameLedgerLines(cur.map(toLine), arr(after, 'lines').map(toLine)));
+    }
     if (type === 'expense') {
       // updateExpense keeps the entry only when the ledger lines and date stay AND the items, their
       // quantities, the currency and the method (check / cash / card) stay.
@@ -879,11 +903,13 @@ export async function clientWorkConflicts(
     }
   }
 
-  //    General Journal entries whose customer / vendor lines the client has since applied.
+  //    General Journal entries whose customer / vendor lines the client has since applied (an edit
+  //    that keeps the date and lines leaves the applications alone: updateEntry allows it).
   for (const t of file.transactions) {
     if (t.type !== 'journal_entry' || t.op === 'add') continue;
     const xs = await later.of('entry', t.id);
     if (!xs.length) continue;
+    if (t.op === 'edit' && !(await editChangesLedger(ctx, t.type, t.id, t.after as unknown as Row))) continue;
     flag(
       `${t.type}:${t.op}:${t.id}`,
       `Your file has ${texts(xs)}, dated after the dividing date, so this journal entry can't be ${t.op === 'void' ? 'voided' : 'changed'}. ` +
