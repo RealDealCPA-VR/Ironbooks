@@ -12,7 +12,7 @@
 import crypto from 'node:crypto';
 import { eq } from 'drizzle-orm';
 import { z } from 'zod';
-import { aiSettings, bankAccounts, customers, employees, leads, otherNames, salesReps, vendors } from '@/lib/db/schema';
+import { aiSettings, bankAccounts, customers, employees, jobs, leads, otherNames, salesReps, vendors } from '@/lib/db/schema';
 import { type ServiceContext, validation, writeAudit, inTransaction } from './_base';
 import { requireRole } from './rbac';
 import { AiRouter } from '@/lib/ai/router';
@@ -324,15 +324,16 @@ export function buildProviders(
  * own bank account numbers. Built lazily — only when a cloud call actually happens.
  */
 export async function buildCompanyRedactor(ctx: ServiceContext): Promise<Redactor> {
-  const [custs, vends, emps, others, leadRows, reps, banks] = await Promise.all([
+  const [custs, vends, emps, others, leadRows, reps, banks, jobRows] = await Promise.all([
     ctx.db.select({
       displayName: customers.displayName, companyName: customers.companyName, email: customers.email,
       phone: customers.phone, billingAddress: customers.billingAddress, shippingAddress: customers.shippingAddress,
-      shipToAddresses: customers.shipToAddresses,
+      shipToAddresses: customers.shipToAddresses, resaleNumber: customers.resaleNumber,
     }).from(customers).where(eq(customers.companyId, ctx.companyId)),
     ctx.db.select({
       displayName: vendors.displayName, companyName: vendors.companyName, email: vendors.email,
       phone: vendors.phone, address: vendors.address, taxId: vendors.taxId, accountNumber: vendors.accountNumber,
+      printOnCheckAs: vendors.printOnCheckAs,
     }).from(vendors).where(eq(vendors.companyId, ctx.companyId)),
     ctx.db.select({
       firstName: employees.firstName, lastName: employees.lastName, email: employees.email,
@@ -348,6 +349,8 @@ export async function buildCompanyRedactor(ctx: ServiceContext): Promise<Redacto
     }).from(leads).where(eq(leads.companyId, ctx.companyId)),
     ctx.db.select({ name: salesReps.name, email: salesReps.email }).from(salesReps).where(eq(salesReps.companyId, ctx.companyId)),
     ctx.db.select({ accountNumber: bankAccounts.accountNumber }).from(bankAccounts).where(eq(bankAccounts.companyId, ctx.companyId)),
+    // prefsperms (review 5 leftover): job-costing job names ("Kowalski Kitchen Remodel").
+    ctx.db.select({ name: jobs.name }).from(jobs).where(eq(jobs.companyId, ctx.companyId)),
   ]);
   const ents: KnownEntity[] = [];
   const push = (text: string | null | undefined, kind: KnownEntity['kind']) => {
@@ -358,6 +361,7 @@ export async function buildCompanyRedactor(ctx: ServiceContext): Promise<Redacto
     push(c.companyName, 'CUSTOMER');
     push(c.email, 'EMAIL');
     push(c.phone, 'PHONE');
+    push(c.resaleNumber, 'TAXID'); // prefsperms: the customer's sales tax resale number
     ents.push(...addressEntities(c.billingAddress), ...addressEntities(c.shippingAddress));
     for (const s of Array.isArray(c.shipToAddresses) ? c.shipToAddresses : []) {
       if (!s || typeof s !== 'object') continue;
@@ -368,6 +372,10 @@ export async function buildCompanyRedactor(ctx: ServiceContext): Promise<Redacto
   for (const v of vends) {
     push(v.displayName, 'VENDOR');
     push(v.companyName, 'VENDOR');
+    // prefsperms (review 5 leftover): the legal / print-on-check name — for a sole proprietor
+    // usually a personal name ("Robert J Smith" for "Smith Plumbing"), and exactly what bank-feed
+    // check and ACH descriptions carry.
+    push(v.printOnCheckAs, 'VENDOR');
     push(v.email, 'EMAIL');
     push(v.phone, 'PHONE');
     push(v.taxId, 'TAXID');
@@ -408,6 +416,7 @@ export async function buildCompanyRedactor(ctx: ServiceContext): Promise<Redacto
     push(r.email, 'EMAIL');
   }
   for (const b of banks) push(b.accountNumber, 'ACCOUNT');
+  for (const j of jobRows) push(j.name, 'CUSTOMER');
   return new Redactor(ents);
 }
 
