@@ -85,6 +85,15 @@ describe('A. amounts are read as money or refused — never NaN', () => {
     }
     // Garbage in a Debit / Credit cell (digits it cannot read) is refused too.
     expect(() => parseCSV('Date,Description,Debit,Credit\n01/05/2026,X,12.3.4,\n', SPLIT)).toThrow(/row 1.*not an amount/i);
+    // A decimal comma is never read as a thousands separator ("12,50" is not 1,250.00).
+    for (const bad of ['"12,50"', '"1 234,56"', '"1.234,56"', '"1,23"']) {
+      expect(() => parseCSV(`Date,Description,Amount\n01/05/2026,X,${bad}\n`, SINGLE)).toThrow(/row 1.*not an amount/i);
+    }
+    expect(parseCSV('Date,Description,Amount\n01/05/2026,X,"-$ 1,234.56"\n01/06/2026,Y,"$-5.00"\n01/07/2026,Z,"( 7.25 )"\n', SINGLE).map((t) => t.amount)).toEqual([
+      '-1234.56',
+      '-5.00',
+      '-7.25',
+    ]);
   });
 
   it('OFX TRNAMT and reviewed statement rows must be numbers', () => {

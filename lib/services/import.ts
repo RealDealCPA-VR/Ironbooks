@@ -151,25 +151,34 @@ function legacyIfDifferent(date: Date, legacy: Date): Date | undefined {
  */
 export function readBankAmount(raw: unknown): string | null | 'bad' {
   if (typeof raw !== 'string' && typeof raw !== 'number') return raw == null ? null : 'bad';
-  let s = String(raw).replace(/[\s $,]/g, '');
+  // Spaces may surround the sign, brackets and "$"; inside the number a comma is a thousands
+  // separator only in the US form (1,234.56). "12,50" or "1 234,56" (a decimal comma) is refused:
+  // stripping the separators read them as 1250 / 123456.
+  let s = String(raw).trim();
   if (!/\d/.test(s)) return s === '' || /^[-–—]+$|^n\/?a$/i.test(s) ? null : 'bad';
   let neg = false;
   if (s.startsWith('(') && s.endsWith(')')) {
     neg = true;
-    s = s.slice(1, -1);
+    s = s.slice(1, -1).trim();
   }
   if (s.endsWith('-')) {
     neg = !neg;
-    s = s.slice(0, -1);
+    s = s.slice(0, -1).trim();
   }
   if (s.startsWith('-')) {
     neg = !neg;
-    s = s.slice(1);
+    s = s.slice(1).trim();
   } else if (s.startsWith('+')) {
-    s = s.slice(1);
+    s = s.slice(1).trim();
   }
-  if (!/^(\d+(\.\d+)?|\.\d+)$/.test(s)) return 'bad';
-  const v = Money.round2(s);
+  s = s.replace(/^\$\s*/, '');
+  if (s.startsWith('-') && !neg) {
+    // "$-12.50"
+    neg = true;
+    s = s.slice(1).trim();
+  }
+  if (!/^((\d{1,3}(,\d{3})+|\d+)(\.\d+)?|\.\d+)$/.test(s)) return 'bad';
+  const v = Money.round2(s.replace(/,/g, ''));
   return toAmountString(neg && !v.isZero() ? v.negated() : v);
 }
 
