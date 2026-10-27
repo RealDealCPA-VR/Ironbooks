@@ -52,6 +52,7 @@ import { GET as transactionLogGET } from '@/app/api/transaction-log/route';
 import { GET as w2GET } from '@/app/api/payroll/w2/route';
 import { POST as importPOST } from '@/app/api/import/route';
 import { POST as csvPreviewPOST } from '@/app/api/import/csv-preview/route';
+import { POST as portalLoginPOST } from '@/app/api/portal/login/route';
 import { createVendor } from './vendors';
 
 let db: DB;
@@ -234,6 +235,26 @@ describe('review5: importing a bank statement is Banking, not File Utilities', (
     as(viewer, 'POST', '/api/import');
     const refused = await importPOST(req('POST', '/api/import', { bankAccountId: bank.id, fileType: 'csv', content, csvMapping }));
     expect(refused.status).toBe(403);
+  });
+});
+
+describe('review5: employee portal sign-in', () => {
+  it('works for an employee whose email was entered with capitals (stored as typed)', async () => {
+    await db.insert(employees).values({
+      companyId,
+      firstName: 'Jane',
+      lastName: 'Doe',
+      email: 'Jane.Doe@Acme.Example',
+      portalPasswordHash: await hashPassword('portalPass123'),
+    });
+    h.headers.clear();
+    h.cookies.clear();
+    for (const typed of ['Jane.Doe@Acme.Example', 'jane.doe@acme.example']) {
+      const res = await portalLoginPOST(req('POST', '/api/portal/login', { email: typed, password: 'portalPass123' }));
+      expect(res.status, typed).toBe(200);
+    }
+    const wrong = await portalLoginPOST(req('POST', '/api/portal/login', { email: 'jane.doe@acme.example', password: 'nope-nope-1' }));
+    expect(wrong.status).toBe(401);
   });
 });
 
