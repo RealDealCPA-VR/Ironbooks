@@ -124,6 +124,8 @@ export interface CreateVendorCreditInput {
   /** p1 fx: the vendor's currency is used; a stated rate overrides the currency list's rate. */
   currency?: string | null;
   exchangeRate?: string | number | null;
+  /** Edits: the user confirmed QB's "this transaction has been reconciled" warning (reconciledEdits.ts). */
+  allowReconciledEdit?: boolean;
 }
 
 export interface ApplyToBillInput {
@@ -758,6 +760,7 @@ export async function updateVendorCredit(ctx: ServiceContext, id: string, input:
         date: input.date,
         lines: postingLinesFor(id, apAccountId, cogsAccountId, homePrep(prep, fx), Money.of(fx.homeTotal), new Map()),
         what: 'vendor credit',
+        allowReconciledEdit: input.allowReconciledEdit,
       });
       if (plan === 'unchanged' && cur.vendorId !== input.vendorId) plan = 'repost';
     }

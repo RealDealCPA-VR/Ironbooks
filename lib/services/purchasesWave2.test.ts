@@ -182,7 +182,7 @@ describe('wave2 purchases', () => {
     await tbOk();
   });
 
-  it('D1: a reconciled check allows memo edits but blocks amount edits with a plain message', async () => {
+  it("D1: a reconciled check allows memo edits; an amount edit gives QB's reconciled warning", async () => {
     const exp = await createExpense(ctx, {
       payeeName: 'Landlord',
       date: d('2026-02-10'),
@@ -214,9 +214,11 @@ describe('wave2 purchases', () => {
     };
     const ok = await updateExpense(ctx, exp.id, { ...base, memo: 'Feb rent', lines: [{ accountId: acct['6400'], amount: '500.00' }] });
     expect(ok.memo).toBe('Feb rent');
+    // purchbank: QB warns ("has been reconciled … Change it anyway?") and saves once confirmed
+    // (purchbank.reconciledEdits.test.ts covers the confirmed edit and the discrepancy report).
     await expect(
       updateExpense(ctx, exp.id, { ...base, lines: [{ accountId: acct['6400'], amount: '550.00' }] }),
-    ).rejects.toThrow(/completed bank reconciliation/);
+    ).rejects.toThrow(/has been reconciled/);
     await tbOk();
   });
 

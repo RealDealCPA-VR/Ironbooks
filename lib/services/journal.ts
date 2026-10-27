@@ -41,6 +41,7 @@ import { getPreferences } from './company';
 import { nextJournalNumber } from '@/lib/prefBehaviors';
 import { isJournalScreenEntry } from '@/lib/journalScreen';
 import { assertClosedPeriodEdit, lineKey, sameLedgerLines } from './postedEdit';
+import { carryReconciledLines, prepareReconciledRepost } from './reconciledEdits';
 import {
   type JournalEntityType,
   type PostingLine,
@@ -552,6 +553,11 @@ export interface UpdateEntryInput {
   lines: PostingLine[];
   /** Omitted = keep the original entry's flag. */
   isAdjusting?: boolean;
+  /**
+   * The user confirmed QB's "this transaction has been reconciled" warning: an entry with a line
+   * cleared in a completed reconciliation is re-posted and stays reconciled (reconciledEdits.ts).
+   */
+  allowReconciledEdit?: boolean;
 }
 
 /**
@@ -712,7 +718,15 @@ async function updateEntryInner(ctx: ServiceContext, id: string, input: UpdateEn
       });
       return row;
     }
-    // 1. Void the original (reverses cached balances; guards reconciled lines).
+    // 1. Void the original (reverses cached balances; guards reconciled lines). A line cleared in
+    //    a completed reconciliation gives QB's warning; once confirmed the entry is re-posted and
+    //    stays reconciled at its new amount (the change is on the discrepancy report).
+    await prepareReconciledRepost(tx, {
+      entryId: id,
+      lines: input.lines,
+      what: 'journal entry',
+      allowReconciledEdit: input.allowReconciledEdit,
+    });
     await voidJournalEntry(tx, id);
 
     // 2. Re-post the edited version as a fresh manual entry.
@@ -725,6 +739,7 @@ async function updateEntryInner(ctx: ServiceContext, id: string, input: UpdateEn
       sourceRef: 'manual',
       isAdjusting,
     });
+    await carryReconciledLines(tx, { oldEntryId: id, newEntryId: replacement.id });
 
     // 3. Audit the edit with the full old/new snapshots, linking old → new.
     await writeAudit(tx, {

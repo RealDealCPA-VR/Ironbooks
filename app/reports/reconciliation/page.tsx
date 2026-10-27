@@ -3,8 +3,10 @@
  * Reconciliation reports hub.
  *  - Previous Reconciliations: every session (completed / undone / in-progress)
  *    with a drill-down link to the per-session summary & detail report.
- *  - Reconciliation Discrepancy report: transactions cleared in a completed
- *    reconciliation whose journal entry has since been voided.
+ *  - Previous Reconciliation Discrepancy report (QB): transactions cleared in a completed
+ *    reconciliation that were changed afterwards (QB warns, then allows it — amount changed or
+ *    moved off the account) or voided, with the reconciled amount, the type of change and its
+ *    effect on the reconciled balance.
  * Both tables export to CSV like the other report pages.
  */
 import { useEffect, useState } from 'react';
@@ -56,8 +58,21 @@ interface DiscrepancyRow {
   description: string;
   debit: string | null;
   credit: string | null;
+  /** Effect of the change on the reconciled balance. */
   amount: string;
   voidedAt: string | null;
+  /** 'void' | 'amount' | 'removed' (lib/services/reconcile.ts DiscrepancyRow). */
+  changeType?: 'void' | 'amount' | 'removed';
+  reconciledAmount?: string;
+  newAmount?: string;
+  changedAt?: string | null;
+}
+
+/** QB "Type of Change" column. */
+function changeLabel(t: DiscrepancyRow['changeType']): string {
+  if (t === 'amount') return 'Amount changed';
+  if (t === 'removed') return 'Moved to another account';
+  return 'Voided';
 }
 
 // ---------------------------------------------------------------------------
@@ -156,10 +171,10 @@ export default function ReconciliationReportsPage() {
       'Entry #',
       'Txn Date',
       'Description',
-      'Debit',
-      'Credit',
-      'Amount',
-      'Voided At',
+      'Reconciled Amount',
+      'Type of Change',
+      'Effect of Change',
+      'Changed On',
     );
     const rows = discrepancies.map((d) =>
       toCsvRow(
@@ -168,10 +183,10 @@ export default function ReconciliationReportsPage() {
         d.entryNumber,
         fmtDate(d.date),
         d.description,
-        d.debit ?? '',
-        d.credit ?? '',
+        d.reconciledAmount ?? '',
+        changeLabel(d.changeType),
         d.amount,
-        fmtDate(d.voidedAt),
+        fmtDate(d.changedAt ?? d.voidedAt),
       ),
     );
     downloadCsv([header, ...rows].join('\n'), 'Reconciliation_Discrepancies.csv');
@@ -257,7 +272,7 @@ export default function ReconciliationReportsPage() {
           {/* Discrepancy report */}
           <Card className="p-6">
             <div className="flex items-center justify-between mb-1">
-              <h2 className="text-lg font-bold text-navy">Reconciliation Discrepancies</h2>
+              <h2 className="text-lg font-bold text-navy">Previous Reconciliation Discrepancies</h2>
               <Button
                 variant="secondary"
                 size="sm"
@@ -268,8 +283,9 @@ export default function ReconciliationReportsPage() {
               </Button>
             </div>
             <p className="text-sm text-navy/60 mb-4">
-              Transactions that were cleared in a completed reconciliation but whose journal entry
-              was voided afterwards. These create unexplained beginning-balance differences.
+              Transactions that were cleared in a completed reconciliation and changed or voided
+              afterwards. Their effect is why the next reconciliation&apos;s beginning balance does not
+              match the bank statement.
             </p>
             {discrepancies.length === 0 ? (
               <p className="text-emerald text-sm py-4 text-center bg-emerald/10 rounded-lg">
@@ -284,8 +300,10 @@ export default function ReconciliationReportsPage() {
                     <Th>Entry #</Th>
                     <Th>Txn Date</Th>
                     <Th>Description</Th>
-                    <Th className="text-right">Amount</Th>
-                    <Th>Voided</Th>
+                    <Th className="text-right">Reconciled Amount</Th>
+                    <Th>Type of Change</Th>
+                    <Th className="text-right">Effect of Change</Th>
+                    <Th>Changed On</Th>
                   </tr>
                 </thead>
                 <tbody>
@@ -296,10 +314,12 @@ export default function ReconciliationReportsPage() {
                       <Td className="tabular-nums text-navy/60">#{d.entryNumber}</Td>
                       <Td>{fmtDate(d.date)}</Td>
                       <Td className="max-w-xs truncate">{d.description}</Td>
+                      <Td numeric>{d.reconciledAmount != null ? formatCurrency(d.reconciledAmount) : ''}</Td>
+                      <Td>{changeLabel(d.changeType)}</Td>
                       <Td numeric className="text-red-600">
                         {formatCurrency(d.amount)}
                       </Td>
-                      <Td>{fmtDate(d.voidedAt)}</Td>
+                      <Td>{fmtDate(d.changedAt ?? d.voidedAt)}</Td>
                     </Tr>
                   ))}
                 </tbody>

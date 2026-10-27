@@ -15,6 +15,8 @@ export const createTransferSchema = z
     exchangeRate: zDecimalPositive.nullish(),
     toAmount: zMoneyPositive.nullish(),
     homeAmount: zMoney.nullish(),
+    /** Edits: the user confirmed QB's "this transaction has been reconciled" warning (reconciledEdits.ts). */
+    allowReconciledEdit: z.boolean().optional(),
   })
   .refine((t) => t.fromAccountId !== t.toAccountId, {
     message: 'From account and to account must be different.',

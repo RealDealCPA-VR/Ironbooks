@@ -5,6 +5,8 @@
  *    (counts + totals), cleared balance vs statement balance, difference.
  *  - Detail: every cleared transaction; rows whose journal entry has since been
  *    voided are flagged as discrepancies.
+ *  - Changed after reconciling (QB warns, then allows it): the reconciled amount, the amount now
+ *    and the effect on the reconciled balance.
  *  - CSV export of the full report.
  */
 import { useEffect, useState } from 'react';
@@ -69,6 +71,21 @@ interface ReconciliationReport {
   paymentsTotal: string;
   lines: ReportLine[];
   discrepancies: ReportLine[];
+  /** Reconciled transactions changed after this statement was reconciled. */
+  changes?: ReportChange[];
+}
+
+interface ReportChange {
+  id: string;
+  journalEntryId: string | null;
+  entryNumber: number | null;
+  date: string;
+  description: string | null;
+  reconciledAmount: string;
+  newAmount: string;
+  effect: string;
+  changeType: 'amount' | 'removed';
+  changedAt: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -296,6 +313,44 @@ export default function ReconciliationDetailReportPage() {
                       <Td numeric className="text-red-600">
                         {formatCurrency(l.amount)}
                       </Td>
+                    </Tr>
+                  ))}
+                </tbody>
+              </Table>
+            </Card>
+          )}
+
+          {/* Changed after reconciling (QB Previous Reconciliation Discrepancy) */}
+          {(report.changes?.length ?? 0) > 0 && (
+            <Card className="p-6 border border-amber-200">
+              <h3 className="text-base font-bold text-navy mb-2">Changed after this reconciliation</h3>
+              <p className="text-sm text-navy/60 mb-4">
+                These cleared transactions were changed after this statement was reconciled. They stay
+                reconciled at their new amount; the effect is why the next beginning balance does not match
+                the bank statement.
+              </p>
+              <Table>
+                <thead>
+                  <tr>
+                    <Th>Date</Th>
+                    <Th>Entry #</Th>
+                    <Th>Description</Th>
+                    <Th className="text-right">Reconciled Amount</Th>
+                    <Th>Type of Change</Th>
+                    <Th className="text-right">Effect of Change</Th>
+                    <Th>Changed On</Th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {report.changes!.map((c) => (
+                    <Tr key={c.id}>
+                      <Td>{fmtDate(c.date)}</Td>
+                      <Td className="tabular-nums text-navy/60">{c.entryNumber != null ? `#${c.entryNumber}` : ''}</Td>
+                      <Td>{c.description}</Td>
+                      <Td numeric>{formatCurrency(c.reconciledAmount)}</Td>
+                      <Td>{c.changeType === 'removed' ? 'Moved to another account' : 'Amount changed'}</Td>
+                      <Td numeric className="text-red-600">{formatCurrency(c.effect)}</Td>
+                      <Td>{fmtDate(c.changedAt)}</Td>
                     </Tr>
                   ))}
                 </tbody>

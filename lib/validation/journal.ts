@@ -24,6 +24,8 @@ export const createJournalEntrySchema = z.object({
   lines: zLines(postingLineSchema),
   /** QB "Adjusting Entry" checkbox. */
   isAdjusting: z.boolean().optional(),
+  /** Edits: the user confirmed QB's "this transaction has been reconciled" warning (reconciledEdits.ts). */
+  allowReconciledEdit: z.boolean().optional(),
 });
 export type CreateJournalEntryBody = z.infer<typeof createJournalEntrySchema>;
 

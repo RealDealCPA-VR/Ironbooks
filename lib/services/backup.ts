@@ -36,7 +36,7 @@ import {
   fileImports, fiscalPeriods, fixedAssets, inventoryLayers, invoiceLines, invoices, items,
   jobs, journalEntries, journalEntryLines, locations, memorizedReports, mileageLogs,
   paycheckLines, paychecks, paymentApplications, paymentsReceived, purchaseOrderLines,
-  purchaseOrders, reconciliationItems, reconciliations, recurringTemplates, salesOrderLines,
+  purchaseOrders, reconciliationChanges, reconciliationItems, reconciliations, recurringTemplates, salesOrderLines,
   salesOrders, salesReceiptLines, salesReceipts, salesReps, taxAgencies, taxRateComponents,
   taxRates, timeEntries, transactionRules, transfers, userCompanies, vendorCreditLines,
   vendorCredits, vendors,
@@ -704,6 +704,9 @@ const COMPANY_TABLES: CompanyTableSpec[] = [
       { table: bankAccounts, on: [reconciliations.bankAccountId, bankAccounts.id] },
     ],
   },
+  // purchbank (0081): reconciled transactions changed after QB's warning (the Previous
+  // Reconciliation Discrepancy report). Its entry / line ids are plain references, remapped.
+  { name: 'reconciliationChanges', table: reconciliationChanges, joins: [], companyCol: reconciliationChanges.companyId },
   { name: 'estimates', table: estimates, joins: [], companyCol: estimates.companyId },
   {
     name: 'estimateLines', table: estimateLines, companyCol: estimates.companyId,

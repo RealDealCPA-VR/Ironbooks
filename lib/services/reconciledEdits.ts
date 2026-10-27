@@ -39,6 +39,7 @@ import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError } from './_base';
 import type { PostingLine } from './posting';
 import { foreignCode, homeCode } from './fxLines';
+import { activeCopy } from './accountantCopy/guard';
 
 /** The fix the warning offers: save again with the confirmation flag. */
 export function reconciledEditFixes() {
@@ -169,6 +170,17 @@ export async function prepareReconciledRepost(
   const reconciled = await reconciledLinesOf(ctx, params.entryId);
   if (reconciled.length === 0) return;
   if (await isReconciledRepostArmed(ctx, params.entryId)) return;
+  // Accountant's Copy: the changes file can't carry a reconciled transaction's new posting back
+  // (the client's import refuses it while the statement stays reconciled), so the accountant
+  // leaves it as it is — the memo, payee and number can still be changed.
+  const copy = await activeCopy(ctx.db, ctx.companyId);
+  if (copy?.side === 'accountant') {
+    throw new ServiceError(
+      'FORBIDDEN',
+      `This ${params.what} was cleared in your client's bank reconciliation, so its amount, accounts and date can't be changed in an Accountant's Copy (the change could not be sent back while the statement stays reconciled). You can still change the memo, payee or number.`,
+      { accountantCopy: true, side: copy.side, reconciled: true },
+    );
+  }
 
   // Does the edit keep every reconciled line as it is (same account, same side and amount — in the
   // account's own currency too, for a foreign-currency account)?
