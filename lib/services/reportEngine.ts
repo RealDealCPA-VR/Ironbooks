@@ -888,6 +888,19 @@ export async function customerNames(ctx: ServiceContext): Promise<Map<string, { 
 }
 
 /**
+ * Ids per `id IN (...)` lookup. Postgres / PGlite bind at most 65,535 parameters per statement,
+ * so a company file with more documents of one type than that (70,000 invoices) must be read in
+ * slices — one unchunked list made the whole report fail.
+ */
+const ID_CHUNK = 5000;
+async function byIdChunks<T>(ids: string[], q: (slice: string[]) => PromiseLike<T[]>): Promise<T[]> {
+  if (ids.length <= ID_CHUNK) return ids.length ? await q(ids) : [];
+  const out: T[] = [];
+  for (let i = 0; i < ids.length; i += ID_CHUNK) for (const r of await q(ids.slice(i, i + ID_CHUNK))) out.push(r);
+  return out;
+}
+
+/**
  * Resolve the QB "Name" and "Num" of journal entries from their source documents
  * (sourceRef "invoice:<id>" → the invoice's customer + invoice number, and so on).
  * Batched: one query per document type present.
@@ -919,65 +932,79 @@ export async function resolveEntryNames(
 
   const invIds = ids('invoice', 'invoice-cogs');
   if (invIds.length) {
-    const rows = await ctx.db
-      .select({ id: invoices.id, nameId: invoices.customerId, num: invoices.invoiceNumber, ref: invoices.refNumber })
-      .from(invoices)
-      .where(and(eq(invoices.companyId, c), inArray(invoices.id, invIds)));
+    const rows = await byIdChunks(invIds, (slice) =>
+      ctx.db
+        .select({ id: invoices.id, nameId: invoices.customerId, num: invoices.invoiceNumber, ref: invoices.refNumber })
+        .from(invoices)
+        .where(and(eq(invoices.companyId, c), inArray(invoices.id, slice))),
+    );
     for (const r of rows) docs.set(`inv:${r.id}`, { nameType: 'customer', nameId: r.nameId, num: docRef(r.ref, r.num) });
   }
   // 'bounced:<paymentId>': a bounced check's re-charge belongs to the payment's customer.
   const payIds = ids('payment', 'refund', 'bounced');
   if (payIds.length) {
-    const rows = await ctx.db
-      .select({ id: paymentsReceived.id, nameId: paymentsReceived.customerId, num: paymentsReceived.reference })
-      .from(paymentsReceived)
-      .where(and(eq(paymentsReceived.companyId, c), inArray(paymentsReceived.id, payIds)));
+    const rows = await byIdChunks(payIds, (slice) =>
+      ctx.db
+        .select({ id: paymentsReceived.id, nameId: paymentsReceived.customerId, num: paymentsReceived.reference })
+        .from(paymentsReceived)
+        .where(and(eq(paymentsReceived.companyId, c), inArray(paymentsReceived.id, slice))),
+    );
     for (const r of rows) docs.set(`pay:${r.id}`, { nameType: 'customer', nameId: r.nameId, num: r.num });
   }
   const srIds = ids('salesreceipt', 'sales_receipt');
   if (srIds.length) {
-    const rows = await ctx.db
-      .select({ id: salesReceipts.id, nameId: salesReceipts.customerId, num: salesReceipts.receiptNumber, ref: salesReceipts.refNumber })
-      .from(salesReceipts)
-      .where(and(eq(salesReceipts.companyId, c), inArray(salesReceipts.id, srIds)));
+    const rows = await byIdChunks(srIds, (slice) =>
+      ctx.db
+        .select({ id: salesReceipts.id, nameId: salesReceipts.customerId, num: salesReceipts.receiptNumber, ref: salesReceipts.refNumber })
+        .from(salesReceipts)
+        .where(and(eq(salesReceipts.companyId, c), inArray(salesReceipts.id, slice))),
+    );
     for (const r of rows) docs.set(`sr:${r.id}`, { nameType: 'customer', nameId: r.nameId, num: docRef(r.ref, r.num) });
   }
   const cmIds = ids('credit_memo', 'creditmemo-cogs', 'refund');
   if (cmIds.length) {
-    const rows = await ctx.db
-      .select({ id: creditMemos.id, nameId: creditMemos.customerId, num: creditMemos.memoNumber, ref: creditMemos.refNumber })
-      .from(creditMemos)
-      .where(and(eq(creditMemos.companyId, c), inArray(creditMemos.id, cmIds)));
+    const rows = await byIdChunks(cmIds, (slice) =>
+      ctx.db
+        .select({ id: creditMemos.id, nameId: creditMemos.customerId, num: creditMemos.memoNumber, ref: creditMemos.refNumber })
+        .from(creditMemos)
+        .where(and(eq(creditMemos.companyId, c), inArray(creditMemos.id, slice))),
+    );
     for (const r of rows) docs.set(`cm:${r.id}`, { nameType: 'customer', nameId: r.nameId, num: docRef(r.ref, r.num) });
   }
   const billIds = ids('bill');
   if (billIds.length) {
-    const rows = await ctx.db
-      .select({ id: bills.id, nameId: bills.vendorId, num: bills.billNumber })
-      .from(bills)
-      .where(and(eq(bills.companyId, c), inArray(bills.id, billIds)));
+    const rows = await byIdChunks(billIds, (slice) =>
+      ctx.db
+        .select({ id: bills.id, nameId: bills.vendorId, num: bills.billNumber })
+        .from(bills)
+        .where(and(eq(bills.companyId, c), inArray(bills.id, slice))),
+    );
     for (const r of rows) docs.set(`bill:${r.id}`, { nameType: 'vendor', nameId: r.nameId, num: r.num });
   }
   const vcIds = ids('vendor_credit', 'refund');
   if (vcIds.length) {
-    const rows = await ctx.db
-      .select({ id: vendorCredits.id, nameId: vendorCredits.vendorId })
-      .from(vendorCredits)
-      .where(and(eq(vendorCredits.companyId, c), inArray(vendorCredits.id, vcIds)));
+    const rows = await byIdChunks(vcIds, (slice) =>
+      ctx.db
+        .select({ id: vendorCredits.id, nameId: vendorCredits.vendorId })
+        .from(vendorCredits)
+        .where(and(eq(vendorCredits.companyId, c), inArray(vendorCredits.id, slice))),
+    );
     for (const r of rows) docs.set(`vc:${r.id}`, { nameType: 'vendor', nameId: r.nameId, num: null });
   }
   const expIds = ids('expense');
   if (expIds.length) {
-    const rows = await ctx.db
-      .select({
+    const rows = await byIdChunks(expIds, (slice) =>
+      ctx.db
+        .select({
         id: expenses.id,
         nameId: expenses.vendorId,
         otherNameId: expenses.otherNameId,
         payee: expenses.payeeName,
         num: expenses.reference,
       })
-      .from(expenses)
-      .where(and(eq(expenses.companyId, c), inArray(expenses.id, expIds)));
+        .from(expenses)
+        .where(and(eq(expenses.companyId, c), inArray(expenses.id, slice))),
+    );
     // B3: a check written to an Other Names entry carries that name (type 'other').
     for (const r of rows) {
       docs.set(`exp:${r.id}`, {
@@ -990,27 +1017,33 @@ export async function resolveEntryNames(
   }
   const pcIds = ids('paycheck');
   if (pcIds.length) {
-    const rows = await ctx.db
-      .select({ id: paychecks.id, nameId: paychecks.employeeId, checkNumber: paychecks.checkNumber })
-      .from(paychecks)
-      .where(and(eq(paychecks.companyId, c), inArray(paychecks.id, pcIds)));
+    const rows = await byIdChunks(pcIds, (slice) =>
+      ctx.db
+        .select({ id: paychecks.id, nameId: paychecks.employeeId, checkNumber: paychecks.checkNumber })
+        .from(paychecks)
+        .where(and(eq(paychecks.companyId, c), inArray(paychecks.id, slice))),
+    );
     // The printed check number, or nothing (the entry's reference is then the paycheck id's prefix).
     for (const r of rows) docs.set(`pc:${r.id}`, { nameType: 'employee', nameId: r.nameId, num: r.checkNumber?.trim() ?? '' });
   }
   const erIds = ids('expense_report');
   if (erIds.length) {
-    const rows = await ctx.db
-      .select({ id: expenseReports.id, nameId: expenseReports.employeeId })
-      .from(expenseReports)
-      .where(and(eq(expenseReports.companyId, c), inArray(expenseReports.id, erIds)));
+    const rows = await byIdChunks(erIds, (slice) =>
+      ctx.db
+        .select({ id: expenseReports.id, nameId: expenseReports.employeeId })
+        .from(expenseReports)
+        .where(and(eq(expenseReports.companyId, c), inArray(expenseReports.id, slice))),
+    );
     for (const r of rows) docs.set(`er:${r.id}`, { nameType: 'employee', nameId: r.nameId, num: '' });
   }
   const irIds = ids('item_receipt', 'item_receipt_void');
   if (irIds.length) {
-    const rows = await ctx.db
-      .select({ id: itemReceipts.id, nameId: itemReceipts.vendorId })
-      .from(itemReceipts)
-      .where(and(eq(itemReceipts.companyId, c), inArray(itemReceipts.id, irIds)));
+    const rows = await byIdChunks(irIds, (slice) =>
+      ctx.db
+        .select({ id: itemReceipts.id, nameId: itemReceipts.vendorId })
+        .from(itemReceipts)
+        .where(and(eq(itemReceipts.companyId, c), inArray(itemReceipts.id, slice))),
+    );
     for (const r of rows) docs.set(`ir:${r.id}`, { nameType: 'vendor', nameId: r.nameId, num: null });
   }
   // Bank-feed / imported-statement lines added to the register (bankCategorize.ts): the payee is
@@ -1028,10 +1061,12 @@ export async function resolveEntryNames(
   const taIds = ids('tax_agency');
   const agencyNames = new Map<string, string>();
   if (taIds.length) {
-    const rows = await ctx.db
-      .select({ id: taxAgencies.id, name: taxAgencies.name })
-      .from(taxAgencies)
-      .where(and(eq(taxAgencies.companyId, c), inArray(taxAgencies.id, taIds)));
+    const rows = await byIdChunks(taIds, (slice) =>
+      ctx.db
+        .select({ id: taxAgencies.id, name: taxAgencies.name })
+        .from(taxAgencies)
+        .where(and(eq(taxAgencies.companyId, c), inArray(taxAgencies.id, slice))),
+    );
     for (const r of rows) agencyNames.set(r.id, r.name);
   }
 
@@ -1049,27 +1084,33 @@ export async function resolveEntryNames(
   }
   const otherNameById = new Map<string, string>();
   if (otherIds.size) {
-    const rows = await ctx.db
-      .select({ id: otherNames.id, name: otherNames.name })
-      .from(otherNames)
-      .where(and(eq(otherNames.companyId, c), inArray(otherNames.id, [...otherIds])));
+    const rows = await byIdChunks([...otherIds], (slice) =>
+      ctx.db
+        .select({ id: otherNames.id, name: otherNames.name })
+        .from(otherNames)
+        .where(and(eq(otherNames.companyId, c), inArray(otherNames.id, slice))),
+    );
     for (const r of rows) otherNameById.set(r.id, r.name);
   }
   const custNames = custIds.size ? await customerNames(ctx) : new Map<string, { name: string }>();
   const vendNames = new Map<string, string>();
   if (vendIds.size) {
-    const rows = await ctx.db
-      .select({ id: vendors.id, name: vendors.displayName })
-      .from(vendors)
-      .where(and(eq(vendors.companyId, c), inArray(vendors.id, [...vendIds])));
+    const rows = await byIdChunks([...vendIds], (slice) =>
+      ctx.db
+        .select({ id: vendors.id, name: vendors.displayName })
+        .from(vendors)
+        .where(and(eq(vendors.companyId, c), inArray(vendors.id, slice))),
+    );
     for (const r of rows) vendNames.set(r.id, r.name);
   }
   const empNames = new Map<string, string>();
   if (empIds.size) {
-    const rows = await ctx.db
-      .select({ id: employees.id, first: employees.firstName, last: employees.lastName })
-      .from(employees)
-      .where(and(eq(employees.companyId, c), inArray(employees.id, [...empIds])));
+    const rows = await byIdChunks([...empIds], (slice) =>
+      ctx.db
+        .select({ id: employees.id, first: employees.firstName, last: employees.lastName })
+        .from(employees)
+        .where(and(eq(employees.companyId, c), inArray(employees.id, slice))),
+    );
     for (const r of rows) empNames.set(r.id, `${r.first} ${r.last}`.trim());
   }
   const nameOf = (t: NameType, id: string | null): string => {
@@ -1622,7 +1663,12 @@ export async function ledgerTotalsByName(
   const lineNamed = rows.filter((r) => r.entityType && r.entityId);
   const docRefs = [...new Set(rows.filter((r) => !(r.entityType && r.entityId) && r.sourceRef).map((r) => r.sourceRef!))];
   const docNames = await resolveEntryNames(ctx, docRefs.map((ref) => ({ id: ref, sourceRef: ref, reference: null })));
-  const lineNames = lineNamed.length ? await resolveEntityNames(ctx, lineNamed) : new Map<string, string>();
+  // One ref per distinct name, looked up in slices (resolveEntityNames binds one id per name).
+  const nameRefs = [...new Map(lineNamed.map((r) => [`${r.entityType}:${r.entityId}`, { entityType: r.entityType, entityId: r.entityId }])).values()];
+  const lineNames = new Map<string, string>();
+  for (let i = 0; i < nameRefs.length; i += ID_CHUNK) {
+    for (const [k, v] of await resolveEntityNames(ctx, nameRefs.slice(i, i + ID_CHUNK))) lineNames.set(k, v);
+  }
   const custFull = lineNamed.some((r) => r.entityType === 'customer') ? await customerNames(ctx) : null;
 
   const out = new Map<string, NameTotal>();
