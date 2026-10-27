@@ -541,8 +541,9 @@ describe('statement import review', () => {
     expect(payload.acknowledgeDifference).toBe(false);
     // The import route ties out with exactly what was sent (app/api/import/route.ts):
     expect(tieOut(payload.rows, payload.openingBalance, payload.closingBalance, 'bank').ok).toBe(true);
-    // What the screen used to send for those balances:
-    expect(tieOut(payload.rows, '1000', '1750', 'bank').ok).toBe(false);
+    // What the screen used to send for those balances: the server's tie-out now reads amounts
+    // without cents too (imports review 5, lib/statements/parse.ts amountCents), so both agree.
+    expect(tieOut(payload.rows, '1000', '1750', 'bank').ok).toBe(true);
   });
 
   it('removing or adding a row clears "Import anyway"; the import goes to the account the file was read for', () => {
