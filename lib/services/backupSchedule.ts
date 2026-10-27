@@ -97,7 +97,7 @@ function removeStalePartials(folder: string, now = Date.now()): void {
     return;
   }
   for (const n of names) {
-    if (!/^(auto-)?backup-.*.bka.partial$/.test(n)) continue;
+    if (!/^(auto-)?backup-.*\.bka\.partial$/.test(n)) continue;
     const p = path.join(folder, n);
     try {
       if (now - fs.statSync(p).mtimeMs > STALE_PARTIAL_MS) fs.rmSync(p, { force: true });
