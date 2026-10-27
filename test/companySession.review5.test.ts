@@ -180,3 +180,11 @@ describe('restoring a backup into the open company file from File > Open or Rest
     expect(page).toMatch(/onFile\(new File\(\[r\.data\], r\.name\)\)/);
   });
 });
+
+describe('closing a file another computer took over (source pins)', () => {
+  const main = fs.readFileSync(path.resolve(__dirname, '..', 'electron', 'main.js'), 'utf8');
+  it('still asks the server to close, so the last changes are recorded as unsaved', () => {
+    const fn = main.slice(main.indexOf('async function closeOpenCompanyFile()'));
+    expect(fn.slice(0, 900)).toMatch(/if \(openFile\.lost\) \{[\s\S]*?\/api\/company-file\/close[\s\S]*?return true;\s*\}/);
+  });
+});

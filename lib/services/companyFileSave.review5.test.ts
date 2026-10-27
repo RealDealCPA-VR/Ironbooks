@@ -311,3 +311,23 @@ describe('while a backup is being restored into the open company file', () => {
     expect(await autosaveTick(t + 120_000)).toBe('saved');
   }, 240_000);
 });
+
+describe('closing after another computer took the file over', () => {
+  it('records the last changes as unsaved even when no autosave check saw them yet', async () => {
+    adoptFileOnDisk();
+    expect((await saveCompanyFile({ force: true })).outcome).toBe('saved');
+    fs.writeFileSync(path.join(lock!.dir, 'owner.json'), JSON.stringify({ token: 'other', computer: 'BACK-OFFICE', appUser: 'Bob' }));
+    try {
+      const db = await getDb();
+      await db.execute(sql`insert into save_probe values (50, 'typed just before closing')`);
+      appendLogRecord(process.env.BKA_DATA_DIR!);
+      // The close-time save (no autosave tick in between) is refused…
+      await expect(saveCompanyFile({ final: true })).rejects.toThrow(/Bob on BACK-OFFICE/);
+      // …and the change is recorded as unsaved, so the next open here keeps it apart.
+      expect(sessionMod.readState(workDir).unsavedSince).toBeTruthy();
+    } finally {
+      fs.writeFileSync(path.join(lock!.dir, 'owner.json'), JSON.stringify({ token: lock!.token, computer: os.hostname() }));
+      adoptFileOnDisk();
+    }
+  }, 120_000);
+});

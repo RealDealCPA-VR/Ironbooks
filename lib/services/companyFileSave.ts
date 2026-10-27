@@ -339,6 +339,13 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
       s.status = 'lost';
       const who = owner.appUser || owner.osUser;
       s.error = `${who ? `${who} on ` : ''}${owner.computer ?? 'another computer'} has opened this company file since this computer last saved it, so Ironbooks stopped saving here to protect their work. Your changes are kept on this computer.`;
+      // What is here and not in the company file stays recorded as unsaved — also changes no
+      // autosave check has seen yet (the close-time save) — so the next open here keeps them apart.
+      const fp = currentFingerprint(dataDir);
+      const lsn = await currentLsn(s);
+      if (fp !== s.savedFingerprint || s.unsavedSince !== null || (lsn !== null && lsn !== baselineLsn(s))) {
+        noteUnsaved(s, Date.now(), fp !== s.savedFingerprint);
+      }
       throw Object.assign(new Error(s.error), { code: 'LOCK_LOST' });
     }
   }

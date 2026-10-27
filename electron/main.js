@@ -1111,7 +1111,18 @@ async function askForAccessFlow(filePath, holder) {
 async function closeOpenCompanyFile() {
   if (!openFile) return true;
   stopLockMaintenance();
-  if (openFile.lost) return true; // someone else has it now: nothing of ours to release
+  if (openFile.lost) {
+    // Someone else has it now: nothing of ours to release or save into it. The server still
+    // records what is only here as unsaved (the next open here keeps it as a separate copy).
+    if (serverUrl && !isDev) {
+      await fetch(`${serverUrl}/api/company-file/close`, {
+        method: 'POST',
+        headers: { 'x-bka-internal': internalToken },
+        signal: AbortSignal.timeout(60_000),
+      }).catch(() => {});
+    }
+    return true;
+  }
   if (!serverUrl || isDev) {
     companyLock.release(openFile.lock);
     return true;
