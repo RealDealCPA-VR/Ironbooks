@@ -82,6 +82,28 @@ interface ManualRow {
   amount: string;
 }
 
+/**
+ * Typed-in rows → open items. Amounts as a QuickBooks user types them: "1,250.00", "$1,250",
+ * "-25" or "(25.00)" for a credit. Only the sign, brackets and "$" are taken off: the number goes
+ * to the server as typed, which reads "1,250.00" and refuses a decimal comma ("12,50"). Stripping
+ * commas and spaces here turned "12,50" into 1,250.00 and "1 250,00" into 125,000.00.
+ */
+export function manualOpenItems(manual: ManualRow[], side: Side) {
+  return manual
+    .filter((m) => m.name.trim() && m.amount.trim())
+    .map((m) => {
+      const typed = m.amount.trim();
+      const credit = /^\(.*\)$|^[-]|[-]$|^\$\s*-/.test(typed);
+      return {
+        kind: (side === 'ar' ? (credit ? 'credit_memo' : 'invoice') : credit ? 'vendor_credit' : 'bill') as Kind,
+        name: m.name.trim(),
+        date: m.date,
+        number: m.number.trim() || null,
+        openBalance: typed.replace(/^\(\s*|\s*\)$/g, '').replace(/^-\s*|\s*-$/g, '').replace(/^\$\s*-?\s*/, '').trim(),
+      };
+    });
+}
+
 export function OpenItemsImport() {
   const [mode, setMode] = useState<'report' | 'manual'>('report');
   const [file, setFile] = useState<{ name: string; data: string } | null>(null);
@@ -103,24 +125,7 @@ export function OpenItemsImport() {
     const base =
       mode === 'report'
         ? { file, side: side || undefined }
-        : {
-            side: manualSide,
-            items: manual
-              .filter((m) => m.name.trim() && m.amount.trim())
-              .map((m) => {
-                // Amounts as a QuickBooks user types them: "1,250.00", "$1,250", "-25" or "(25.00)"
-                // for a credit. The text (not a JS float) goes to the server, which checks it.
-                const raw = m.amount.trim().replace(/[$,\s]/g, '');
-                const credit = /^-|-$|^\(.*\)$/.test(raw);
-                return {
-                  kind: (manualSide === 'ar' ? (credit ? 'credit_memo' : 'invoice') : credit ? 'vendor_credit' : 'bill') as Kind,
-                  name: m.name.trim(),
-                  date: m.date,
-                  number: m.number.trim() || null,
-                  openBalance: raw.replace(/^[-(]+|[)-]+$/g, ''),
-                };
-              }),
-          };
+        : { side: manualSide, items: manualOpenItems(manual, manualSide) };
     const sideNow = mode === 'report' ? preview?.side ?? side : manualSide;
     return {
       action,

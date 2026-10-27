@@ -340,8 +340,14 @@ export async function loadOpenItems(input: Pick<OpenItemsInput, 'file' | 'items'
       const dueText = text(it.dueDate, 'The due date', 30);
       const dueDate = dueText ? parseQbDate(dueText) : null;
       if (dueText && !dueDate) throw validation(`"${dueText}" is not a valid due date.`);
-      // QuickBooks-style amounts: "1,234.56", "$1,234.56", "(25.00)".
+      // QuickBooks-style amounts: "1,234.56", "$1,234.56", "(25.00)". A comma only as the US
+      // thousands separator: parseAmount drops every comma, so a decimal comma ("12,50",
+      // "1 250,00") read as 1,250.00 / 125,000.00.
       const amountText = text(it.openBalance, 'The amount', 40) ?? '';
+      const digits = amountText.replace(/[\s$()+-]/g, '');
+      if (digits.includes(',') && !/^\d{1,3}(,\d{3})+(\.\d+)?$/.test(digits)) {
+        throw validation(`"${amountText}" is not an amount. Write amounts like 1,250.00 (a point before the cents).`);
+      }
       const a = parseAmount(amountText);
       if (!a) throw validation(`"${amountText}" is not a valid amount.`);
       // Validate the value that will actually be stored (rounded to cents): 0.001 rounds to 0.00.
