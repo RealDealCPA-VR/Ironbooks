@@ -19,7 +19,8 @@ export const postingLineSchema = z.object({
 export const createJournalEntrySchema = z.object({
   date: zDate,
   description: z.string().trim().min(1, 'description is required'),
-  reference: z.string().nullish(),
+  /** QB "Entry No." — journal_entries.reference is varchar(100). */
+  reference: z.string().trim().max(100, 'Entry No. can be at most 100 characters.').nullish(),
   lines: zLines(postingLineSchema),
   /** QB "Adjusting Entry" checkbox. */
   isAdjusting: z.boolean().optional(),

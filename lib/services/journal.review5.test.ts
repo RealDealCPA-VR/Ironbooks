@@ -7,6 +7,8 @@
  *     so does POST /api/journal-entries/:id/reverse.
  *  C. A class from ANOTHER company in the same file can't be put on a journal line (the entry
  *     detail then showed that company's class name).
+ *  G. An Entry No. longer than the 100 characters the column holds is a 400 with a plain message on
+ *     POST and PATCH (it was a 500: Postgres 22001 "value too long" was not translated).
  */
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import path from 'node:path';
@@ -24,7 +26,7 @@ let ctx: ServiceContext;
 vi.mock('@/lib/context', () => ({ getServerContext: vi.fn(async () => ctx) }));
 import { PATCH as entryPATCH } from '@/app/api/journal-entries/[id]/route';
 import { POST as reversePOST } from '@/app/api/journal-entries/[id]/reverse/route';
-import { GET as entriesGET } from '@/app/api/journal-entries/route';
+import { GET as entriesGET, POST as entriesPOST } from '@/app/api/journal-entries/route';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-review5-journal');
 let db: DB;
@@ -313,5 +315,35 @@ describe('journal entries (review round 5)', () => {
     } finally {
       ctx = outer;
     }
+  });
+  it('G: an Entry No. over 100 characters is a 400 on POST and PATCH, not a 500', async () => {
+    const body = (reference: string) => ({
+      date: '2026-03-12',
+      description: 'Long number',
+      reference,
+      lines: [
+        { accountId: acct['6400'], debit: '3.00' },
+        { accountId: acct['1000'], credit: '3.00' },
+      ],
+    });
+    const tooLong = 'N'.repeat(150);
+    const post = await entriesPOST(req('/api/journal-entries', body(tooLong), 'POST'));
+    expect(post.status).toBe(400);
+    expect((await post.json()).error).toMatch(/100 characters/);
+
+    const je = await entry('3.00', '2026-03-12');
+    const patch = await entryPATCH(req(`/api/journal-entries/${je.id}`, body(tooLong), 'PATCH'), { params: Promise.resolve({ id: je.id }) });
+    expect(patch.status).toBe(400);
+    expect((await patch.json()).error).toMatch(/100 characters/);
+    expect((await getEntry(ctx, je.id)).status).toBe('posted');
+
+    // Any caller that skips the route schema (imports, memorized entries) gets a VALIDATION error too.
+    const err = await createManualEntry(ctx, { ...body(tooLong), date: d('2026-03-12') }).catch((e) => e);
+    expect(err).toBeInstanceOf(ServiceError);
+    expect((err as ServiceError).code).toBe('VALIDATION');
+
+    // Exactly 100 characters still fits.
+    const ok = await entriesPOST(req('/api/journal-entries', body('N'.repeat(100)), 'POST'));
+    expect(ok.status).toBe(201);
   });
 });

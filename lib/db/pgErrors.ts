@@ -12,6 +12,8 @@
  *    failed, so the transaction rolls back as before.
  *  - 22007 invalid_datetime_format / 22008 datetime_field_overflow / 22009 time zone
  *    displacement — a date Postgres cannot store (e.g. year 10000). VALIDATION.
+ *  - 22001 string_data_right_truncation — text longer than a varchar(n) column holds (e.g. a
+ *    150-character Entry No.). VALIDATION naming the limit.
  * Every other error passes through unchanged (ledger BK00x codes are translated in
  * lib/services/_base.ts inTransaction, where deferred checks surface at COMMIT).
  */
@@ -33,6 +35,16 @@ export function translatePgError(err: unknown): unknown {
     return new ServiceError(
       'VALIDATION',
       'That date is not valid: use a real calendar day in years 1900-9999.',
+      { sqlstate: code },
+    );
+  }
+  if (code === '22001') {
+    const limit = /character(?: varying)?\((\d+)\)/i.exec(message)?.[1];
+    return new ServiceError(
+      'VALIDATION',
+      limit
+        ? `That text is too long: at most ${limit} characters fit in that field.`
+        : 'That text is too long for the field it was entered in.',
       { sqlstate: code },
     );
   }

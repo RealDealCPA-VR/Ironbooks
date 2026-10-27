@@ -480,6 +480,7 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
           <Input
             id="je-ref"
             placeholder="e.g. JE-001"
+            maxLength={100}
             value={reference}
             onChange={(e) => setReference(e.target.value)}
           />
