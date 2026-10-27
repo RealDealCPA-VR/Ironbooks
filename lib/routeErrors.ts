@@ -6,6 +6,7 @@
 import { NextResponse } from 'next/server';
 import { ServiceError, type ServiceErrorCode } from '@/lib/services/_base';
 import { MoneyParseError } from '@/lib/money';
+import { translatePgError } from '@/lib/db/pgErrors';
 
 /** 400 response for a request body that is not valid JSON (or not a JSON object). */
 export function invalidJsonBody(): NextResponse {
@@ -126,9 +127,16 @@ export function serviceErrorBody(
   };
 }
 
+/**
+ * The one error → HTTP answer for API routes: a ServiceError by its code (STATUS above), a
+ * Postgres data error by its translation (lib/db/pgErrors.ts — normally done by the company
+ * database client already; this covers one that escaped it), a malformed body and an unparseable
+ * amount (MoneyParseError) as 400. Only an unexpected error is a 500.
+ */
 export function routeError(err: unknown, tag: string): NextResponse {
-  if (err instanceof ServiceError) {
-    return NextResponse.json(serviceErrorBody(err), { status: serviceErrorStatus(err.code) });
+  const known = translatePgError(err);
+  if (known instanceof ServiceError) {
+    return NextResponse.json(serviceErrorBody(known), { status: serviceErrorStatus(known.code) });
   }
   // A malformed request body (`await req.json()` on invalid JSON) is the caller's fault, not ours.
   if (err instanceof SyntaxError) {
