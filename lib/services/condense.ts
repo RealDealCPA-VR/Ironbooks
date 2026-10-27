@@ -1217,16 +1217,34 @@ export function listCondenseArchives(dataDir?: string): Array<CondenseArchive & 
   const dir = resolveDataDir(dataDir);
   const archDir = condenseArchiveDir(dir);
   const fileId = fileIdOf(dir);
-  return readArchiveIndex(archDir)
-    .filter((a) => (a.fileId && fileId ? a.fileId === fileId : path.resolve(a.dataDir) === dir))
-    .map((a) => {
-      // The archives folder as this computer reaches it (a share mapped to another drive letter
-      // here, or reached by its \\server name there).
-      const here = path.join(archDir, path.basename(a.filename || a.path));
-      const p = fs.existsSync(a.path) ? a.path : here;
-      return { ...a, path: p, available: fs.existsSync(p) };
-    })
-    .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+  const ours = (a: CondenseArchive) => (a.fileId && fileId ? a.fileId === fileId : path.resolve(a.dataDir) === dir);
+  // The archives folder as this computer reaches it (a share mapped to another drive letter here,
+  // or reached by its \\server name there).
+  const located = (folder: string) => (a: CondenseArchive) => {
+    const here = path.join(folder, path.basename(a.filename || a.path));
+    const p = fs.existsSync(a.path) ? a.path : here;
+    return { ...a, path: p, available: fs.existsSync(p) };
+  };
+  const list = readArchiveIndex(archDir).filter(ours).map(located(archDir));
+  // A single company file condensed by v1.6.0 had its archive copies (and their index) beside its
+  // working copy, <working copy>/archives: they stay listed and restorable from there.
+  const legacyDir = path.join(path.dirname(dir), 'archives');
+  if (singleCompanyFileHome(dir) !== null && !samePath(legacyDir, archDir)) {
+    const seen = new Set(list.map((a) => a.id));
+    for (const a of readArchiveIndex(legacyDir).filter(ours).map(located(legacyDir))) {
+      if (!seen.has(a.id)) {
+        seen.add(a.id);
+        list.push(a);
+      }
+    }
+  }
+  return list.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+}
+
+function samePath(a: string, b: string): boolean {
+  const x = path.resolve(a);
+  const y = path.resolve(b);
+  return process.platform === 'win32' ? x.toLowerCase() === y.toLowerCase() : x === y;
 }
 
 /**

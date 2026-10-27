@@ -7,6 +7,9 @@
  * only by that computer-specific path: invisible to the person, missing on every other computer
  * that opens the file, and lost with this computer. Like QuickBooks' "Archive Copy" next to the
  * .QBW, it now goes next to the company file and is found by the file's own identity.
+ *
+ * Archive copies v1.6.0 already wrote beside the working copy must not vanish from the list (nor
+ * be refused as "not found") after the update: they are the only way back from those condenses.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
@@ -74,6 +77,43 @@ describe('condensing a single company file', () => {
     const dbB = await getDb(dataB);
     const res = await restoreCondenseArchive({ ...ctx, db: dbB }, result.runId!, dataB);
     expect(res.restored).toBe(true);
+  }, 240_000);
+
+  it('archive copies made by v1.6.0 (beside the working copy) are still listed and can be restored', async () => {
+    // v1.6.0 wrote a single company file's archive copy and its index into <working copy>/archives.
+    openedOn(PC_B);
+    const dataB = path.join(PC_B, 'data');
+    const current = listCondenseArchives(dataB);
+    expect(current).toHaveLength(1);
+    const legacyDir = path.join(PC_B, 'archives');
+    fs.mkdirSync(legacyDir, { recursive: true });
+    const legacyFile = path.join(legacyDir, 'condense-archive-acme-2025-06-30.bka');
+    fs.copyFileSync(current[0].path, legacyFile);
+    const legacyEntry = {
+      id: 'legacy-run-1',
+      path: legacyFile,
+      filename: path.basename(legacyFile),
+      createdAt: '2025-07-01T10:00:00.000Z',
+      dataDir: dataB,
+      companyId: ctx.companyId,
+      companyName: 'Acme',
+      beforeDate: '2025-01-01',
+      entriesCondensed: 3,
+      sizeBytes: fs.statSync(legacyFile).size,
+    };
+    const otherFiles = { ...legacyEntry, id: 'someone-elses', dataDir: path.join(ROOT, 'pc-b', 'Working', 'other-cccccccccccc', 'data') };
+    // The same run recorded in both places is listed once.
+    const both = { ...current[0], available: undefined };
+    fs.writeFileSync(path.join(legacyDir, 'condense-archives.json'), JSON.stringify([legacyEntry, otherFiles, both], null, 2));
+
+    const listed = listCondenseArchives(dataB);
+    expect(listed.map((a) => a.id).sort()).toEqual([current[0].id, 'legacy-run-1'].sort());
+    expect(listed.find((a) => a.id === 'legacy-run-1')).toMatchObject({ available: true, path: legacyFile });
+
+    const dbB = await getDb(dataB);
+    const res = await restoreCondenseArchive({ ...ctx, db: dbB }, 'legacy-run-1', dataB);
+    expect(res.restored).toBe(true);
+    await expect(restoreCondenseArchive({ ...ctx, db: dbB }, 'someone-elses', dataB)).rejects.toThrow(/not found/i);
   }, 240_000);
 
   it('a company folder (older format) keeps its archive copies beside the folder, as before', () => {
