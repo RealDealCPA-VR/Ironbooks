@@ -346,14 +346,27 @@ export async function updateCompany(ctx: ServiceContext, input: UpdateCompanyInp
     // there as soon as the preference is on) so foreign currencies can be added next to it.
     if (multiCurrency === 'on') await ensureHomeCurrency(tx, (row.settings ?? {}) as Record<string, unknown>);
 
-    // The audit trail (and the transaction log it feeds) never carries the closing-date or file
-    // password hash (lib/permissions/mask.ts stripSecrets, the one rule for credential material).
+    // The audit trail (and the transaction log it feeds, which travel with exports and copies)
+    // holds only what this save changed, like setClosingDate (prefsperms, review 5 leftover): the
+    // whole settings object used to be copied in on every Preferences save. stripSecrets stays as
+    // the one rule for credential material (lib/permissions/mask.ts).
+    const keys = Object.keys(settingsPatch);
+    const pick = (src: unknown) => {
+      const from = (src ?? {}) as Record<string, unknown>;
+      return Object.fromEntries(keys.map((k) => [k, from[k] ?? null]));
+    };
     await writeAudit(tx, {
       action: 'update',
       entityType: 'company',
       entityId: tx.companyId,
-      oldValues: { name: existing.name, settings: stripSecrets(existing.settings) },
-      newValues: { name: row.name, settings: stripSecrets(row.settings) },
+      oldValues: {
+        ...(input.name !== undefined ? { name: existing.name } : {}),
+        ...(keys.length ? { settings: stripSecrets(pick(existing.settings)) } : {}),
+      },
+      newValues: {
+        ...(input.name !== undefined ? { name: row.name } : {}),
+        ...(keys.length ? { settings: stripSecrets(pick(row.settings)) } : {}),
+      },
     });
     return row;
   });

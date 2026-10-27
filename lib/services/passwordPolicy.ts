@@ -12,7 +12,7 @@
  * an Admin asked for a new one) the sign-in succeeds but the session is limited to choosing a new
  * password (getServerContext refuses everything else with PASSWORD_CHANGE_REQUIRED_MESSAGE).
  */
-import { asc, desc, eq, inArray } from 'drizzle-orm';
+import { asc, desc, eq, inArray, sql } from 'drizzle-orm';
 import type { DB } from '@/lib/db';
 import { companies, passwordHistory, users } from '@/lib/db/schema';
 import { hashPassword, verifyPassword } from '@/lib/auth';
@@ -83,8 +83,16 @@ export async function updatePasswordPolicy(
   if (!c) throw new ServiceError('NOT_FOUND', 'No company exists in this file yet.');
   const before = await getPasswordPolicy(ctx.db);
   const next = validatePolicyInput(input, before);
-  const settings = { ...((c.settings ?? {}) as Record<string, unknown>), passwordPolicy: next };
-  await ctx.db.update(companies).set({ settings, updatedAt: new Date() }).where(eq(companies.id, c.id));
+  // Only this key is written, merged in SQL (prefsperms, review 5 leftover): writing back the whole
+  // settings object read above undid any Preferences save, closing date or file password set in
+  // between.
+  await ctx.db
+    .update(companies)
+    .set({
+      settings: sql`coalesce(${companies.settings}, '{}'::jsonb) || jsonb_build_object('passwordPolicy', ${JSON.stringify(next)}::jsonb)`,
+      updatedAt: new Date(),
+    })
+    .where(eq(companies.id, c.id));
   await writeAudit(ctx, {
     action: 'update',
     entityType: 'password_policy',
