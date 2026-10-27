@@ -607,9 +607,10 @@ export const paymentsReceived = pgTable('payments_received', {
   reference: varchar('reference', { length: 100 }),
   amount: decimal('amount', { precision: 15, scale: 2 }).notNull(),
   unapplied: decimal('unapplied', { precision: 15, scale: 2 }).notNull().default('0'),
-  /** Payment currency + rate to base — needed to clear A/R on foreign-currency invoices. */
+  /** Payment currency + rate to base — needed to clear A/R on foreign-currency invoices.
+   * review5 fx (0070): 8 decimals like every other rate (was numeric(15, 6)). */
   currency: varchar('currency', { length: 3 }),
-  exchangeRate: decimal('exchange_rate', { precision: 15, scale: 6 }),
+  exchangeRate: decimal('exchange_rate', { precision: 18, scale: 8 }),
   depositAccountId: uuid('deposit_account_id').references(() => accounts.id), // bank or undeposited funds
   postedEntryId: uuid('posted_entry_id').references(() => journalEntries.id),
   voidedAt: timestamp('voided_at'),

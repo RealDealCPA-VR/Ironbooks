@@ -433,10 +433,10 @@ describe('P1 FX — tester re-test round 1', () => {
       { invoiceId: b.id, amountApplied: '33333.33' },
     ]);
     const ufIn = Money.of(await bal('1050')).minus(uf0);
-    // round2(77777.77 x 1.234567) + round2(33333.33 x 0.987654): Receive Payments posts at the
-    // rate stored at the column's 6 decimals (payments team, resolvePaymentCurrency).
+    // round2(77777.77 x 1.2345674) + round2(33333.33 x 0.9876543): Receive Payments posts at the
+    // rate stored at the column's 8 decimals (review5 fx: it was 6; resolvePaymentCurrency).
     expect(ufIn.toFixed(2)).toBe(
-      Money.round2(Money.of('77777.77').times('1.234567')).plus(Money.round2(Money.of('33333.33').times('0.987654'))).toFixed(2),
+      Money.round2(Money.of('77777.77').times('1.2345674')).plus(Money.round2(Money.of('33333.33').times('0.9876543'))).toFixed(2),
     );
     const eur0 = await foreignClosing('1020');
     const bank0 = await bal('1020');

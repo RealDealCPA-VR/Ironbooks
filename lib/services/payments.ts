@@ -537,8 +537,10 @@ async function normalizeCurrency(ctx: ServiceContext, code: string | null | unde
 /**
  * Currency + settlement rate of a received payment. A home-currency payment always settles at 1.
  * A foreign one uses the rate typed on the payment, or the currency list's current rate (QB fills
- * the exchange rate in from the currency list). Rounded to the column's 6 decimals so every later
- * calculation (refunds, apply-later) uses exactly the stored rate.
+ * the exchange rate in from the currency list). Rounded to the column's 8 decimals (review5 fx: the
+ * same precision as the currency list and the invoices — it was 6, so a payment at the very rate its
+ * invoice was booked at showed a realized gain / loss) so every later calculation (refunds,
+ * apply-later) uses exactly the stored rate.
  */
 export async function resolvePaymentCurrency(
   ctx: ServiceContext,
@@ -563,7 +565,8 @@ export async function resolvePaymentCurrency(
     rate = Money.of(row.rateToBase);
   }
   if (!rate.isFinite() || !rate.greaterThan(0)) throw validation('Exchange rate must be positive.');
-  rate = Money.of(rate.toFixed(6));
+  if (rate.greaterThan(1_000_000)) throw validation('The exchange rate is too large.');
+  rate = Money.of(rate.toFixed(8));
   if (!rate.greaterThan(0)) throw validation('Exchange rate must be positive.');
   return { currency, rate };
 }
@@ -813,6 +816,11 @@ async function postPayment(
   // A/R control account clears exactly what createInvoice debited. The difference is
   // realized FX gain/loss. Discounts are converted at the invoice's booked rate on both sides.
   const cashBase = Money.round2(Money.mul(totalAmount, paymentRate));
+  // review5 fx: money received that is worth nothing in home currency would be saved with no
+  // ledger entry at all (as the bill, check and deposit forms say, it is too small to convert).
+  if (paymentCurrency && totalAmount.greaterThan(0) && !cashBase.greaterThan(0)) {
+    throw validation('This payment is too small to convert to your home currency. Check the exchange rate.');
+  }
   let arBase = Money.zero();
   let discountBase = Money.zero();
   // A foreign invoice is relieved at its booked rate, except by the application that pays it off,
@@ -912,7 +920,7 @@ async function postPayment(
     amount: amountStr,
     unapplied: toAmountString(unapplied),
     currency: paymentCurrency,
-    exchangeRate: paymentRate.toFixed(6),
+    exchangeRate: paymentRate.toFixed(8),
     depositAccountId,
     discountAccountId,
     memo: input.memo ?? null,
@@ -993,7 +1001,7 @@ async function postPayment(
       journalOffsets,
       credits,
       currency: paymentCurrency,
-      exchangeRate: paymentRate.toFixed(6),
+      exchangeRate: paymentRate.toFixed(8),
       discountTotal: toAmountString(sumDiscount),
       discountAccountId,
       postedEntryId: entry?.id ?? null,
