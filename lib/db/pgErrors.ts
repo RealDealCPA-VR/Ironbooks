@@ -39,13 +39,15 @@ export function translatePgError(err: unknown): unknown {
     );
   }
   if (code === '22001') {
+    // e.g. a 150-character Entry No. or a 300-character customer name in varchar(255): routes
+    // whose schema has no length limit used to answer 500.
     const limit = /character(?: varying)?\((\d+)\)/i.exec(message)?.[1];
     return new ServiceError(
       'VALIDATION',
       limit
         ? `That text is too long: at most ${limit} characters fit in that field.`
         : 'That text is too long for the field it was entered in.',
-      { sqlstate: code },
+      { sqlstate: code, ...(limit ? { maxLength: Number(limit) } : {}) },
     );
   }
   if (code === '22003') {
@@ -53,16 +55,6 @@ export function translatePgError(err: unknown): unknown {
       'VALIDATION',
       'That amount is too large: the result would exceed the largest amount the ledger can hold (9,999,999,999,999.99).',
       { sqlstate: code },
-    );
-  }
-  if (code === '22001') {
-    // string_data_right_truncation (review round 5): text longer than its column, e.g. a
-    // 300-character name in varchar(255) — routes whose schema has no length limit used to 500.
-    const max = /character varying\((\d+)\)/i.exec(message)?.[1];
-    return new ServiceError(
-      'VALIDATION',
-      max ? `That text is too long: use at most ${max} characters.` : 'That text is too long for this field.',
-      { sqlstate: code, ...(max ? { maxLength: Number(max) } : {}) },
     );
   }
   return err;
