@@ -25,6 +25,8 @@ const crypto = require('node:crypto');
 const format = require('./companyFileFormat');
 
 const STATE_FILE = 'state.json';
+/** lib/services/backupHistory.ts BACKUP_HISTORY_FILE. */
+const BACKUP_HISTORY_FILE = '.backup-history.json';
 const STATE_SCHEMA = 'ironbooks-working-copy/v1';
 /** Working copies of files not opened for this long are removed (they are only caches). */
 const WORKING_COPY_MAX_AGE_MS = 45 * 24 * 3600 * 1000;
@@ -95,14 +97,70 @@ function hasData(workDir) {
  *               file since: the two can't be combined; keep the unsaved changes as a separate
  *               copy, then open the company file as it is
  */
-function planOpen({ companyFile, state, manifest, dataExists }) {
+function planOpen({ companyFile, state, manifest, dataExists, workingFingerprint }) {
   if (!dataExists || !state || !state.companyFile || pathKey(state.companyFile) !== pathKey(companyFile)) {
     return 'extract';
   }
   const baseSaveId = state.base && state.base.saveId;
   const sameSave = Boolean(baseSaveId && manifest && manifest.saveId === baseSaveId);
-  if (state.unsavedSince) return sameSave ? 'recover' : 'conflict';
+  if (state.unsavedSince || crashedWithUnsavedBooks(state, workingFingerprint)) return sameSave ? 'recover' : 'conflict';
   return sameSave ? 'reuse' : 'extract';
+}
+
+/**
+ * The app stopped (crash, power cut) before its first autosave check recorded a change: the
+ * working copy never closed, and its transaction log has moved on from the one its last save
+ * holds — so it has book changes the company file does not, whatever the state says.
+ * `workingFingerprint` is logFingerprint(<working copy>/data); undefined when unknown.
+ */
+function crashedWithUnsavedBooks(state, workingFingerprint) {
+  if (workingFingerprint === undefined || state.closedCleanly !== false) return false;
+  // Everything up to here already went into an "unsaved changes" copy (lib/services/companyFileSave.ts
+  // records what it saved there): nothing is left to keep apart a second time.
+  if (state.conflictFingerprint && workingFingerprint === state.conflictFingerprint) return false;
+  const base = state.base;
+  if (!base || !Object.prototype.hasOwnProperty.call(base, 'fingerprint')) return false;
+  return workingFingerprint !== (base.fingerprint ?? null);
+}
+
+/** lib/services/transactionLog.ts TRANSACTION_LOG_FILE. */
+const TRANSACTION_LOG_FILE = 'transactions.bktlg';
+
+/**
+ * The head of a data folder's running transaction log, exactly as lib/services/backupFingerprint.ts
+ * currentFingerprint() words it (the save logic records it with each save); null without a log.
+ */
+function logFingerprint(dataDir) {
+  const file = path.join(dataDir, TRANSACTION_LOG_FILE);
+  let fd;
+  try {
+    const { size } = fs.statSync(file);
+    if (size === 0) return null;
+    const length = Math.min(size, 256 * 1024);
+    const buf = Buffer.alloc(length);
+    fd = fs.openSync(file, 'r');
+    fs.readSync(fd, buf, 0, length, size - length);
+    const lines = buf.toString('utf8').split('\n').map((l) => l.trim()).filter(Boolean);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      try {
+        const rec = JSON.parse(lines[i]);
+        if (rec && typeof rec.seq === 'number' && typeof rec.hash === 'string') return `log:${rec.seq}:${rec.hash}`;
+      } catch {
+        /* a partial line */
+      }
+    }
+    return `log-size:${size}`;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
 }
 
 /** "ABC Company (unsaved changes from FRONT-DESK, 2026-10-24 1032).ironbooks" next to the file. */
@@ -127,7 +185,11 @@ function conflictCopyPath(companyFile, computer, when = new Date()) {
  * that can't be merged, and to pack a restored portable company file.
  */
 async function writeWorkingCopyAs(workDir, target, { companyName, appVersion, fileId, dataDir } = {}) {
-  const entries = format.snapshotDir(dataDir || dataDirOf(workDir), { lazyPrefixes: [] });
+  // A separate company file: never with the original's backup history (lib/services/backupHistory.ts
+  // BACKUP_HISTORY_FILE), or the copy's backup rotation would delete the original's versions.
+  const entries = format
+    .snapshotDir(dataDir || dataDirOf(workDir), { lazyPrefixes: [] })
+    .filter((e) => e.name !== BACKUP_HISTORY_FILE);
   const now = new Date().toISOString();
   const saveId = crypto.randomUUID();
   await format.writeCompanyFile(target, {
@@ -154,17 +216,52 @@ async function writeWorkingCopyAs(workDir, target, { companyName, appVersion, fi
 }
 
 /**
+ * The newest database migration an app ships: the largest `when` in its drizzle journal
+ * (<migrations>/meta/_journal.json). Null when it can't be read.
+ */
+function latestMigrationAt(migrationsDir) {
+  try {
+    const journal = JSON.parse(fs.readFileSync(path.join(migrationsDir, 'meta', '_journal.json'), 'utf8'));
+    const whens = (Array.isArray(journal && journal.entries) ? journal.entries : []).map((e) => Number(e && e.when)).filter(Number.isFinite);
+    return whens.length ? Math.max(...whens) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The company file's last save was made by a newer Ironbooks (its database layout is newer). */
+function savedByNewerVersion(manifest, knownSchemaAt) {
+  const at = Number(manifest && manifest.dbSchema && manifest.dbSchema.lastMigrationAt);
+  return Number.isFinite(knownSchemaAt) && knownSchemaAt > 0 && Number.isFinite(at) && at > knownSchemaAt;
+}
+
+/**
  * Prepare the working copy for opening `companyFile` (the lock is already held). Returns
  * { workDir, dataDir, plan, manifest, conflictCopy? }. `onConflict` decides a 'conflict':
  * resolve true to keep the unsaved changes as a separate copy and continue, false to stop
- * (then nothing has changed).
+ * (then nothing has changed). `knownSchemaAt` (latestMigrationAt of this app's migrations): a
+ * company file last saved by a newer version is refused before anything is touched (NEWER_FORMAT).
  */
-async function prepareWorkingCopy(companyFile, { root, onConflict, appVersion } = {}) {
+async function prepareWorkingCopy(companyFile, { root, onConflict, appVersion, knownSchemaAt } = {}) {
   const manifest = format.readCompanyManifest(companyFile);
   if (!manifest) throw new format.NotACompanyFileError('the file has no readable company information');
+  if (savedByNewerVersion(manifest, knownSchemaAt)) {
+    const err = new Error(
+      'This company file was saved by a newer version of Ironbooks. Update Ironbooks (Help > Check for Updates) to open it.',
+    );
+    err.code = 'NEWER_FORMAT';
+    throw err;
+  }
   const workDir = workingDirFor(companyFile, root);
   const state = readState(workDir);
-  const plan = planOpen({ companyFile, state, manifest, dataExists: hasData(workDir) });
+  const dataExists = hasData(workDir);
+  const plan = planOpen({
+    companyFile,
+    state,
+    manifest,
+    dataExists,
+    workingFingerprint: dataExists ? logFingerprint(dataDirOf(workDir)) : undefined,
+  });
   let conflictCopy = null;
   if (plan === 'conflict') {
     const keep = onConflict ? await onConflict({ state, manifest, workDir }) : true;
@@ -192,7 +289,9 @@ async function prepareWorkingCopy(companyFile, { root, onConflict, appVersion } 
       plan === 'recover'
         ? state.base
         : { saveId: manifest.saveId || null, savedAt: manifest.savedAt || null, fingerprint: manifest.fingerprint || null },
-    unsavedSince: plan === 'recover' ? state.unsavedSince : null,
+    unsavedSince: plan === 'recover' ? state.unsavedSince || now : null,
+    // What an earlier session saved into an "unsaved changes" copy says nothing about this one.
+    conflictFingerprint: null,
     openedAt: now,
     lastUsedAt: now,
     closedCleanly: false,
@@ -200,7 +299,17 @@ async function prepareWorkingCopy(companyFile, { root, onConflict, appVersion } 
   return { workDir, dataDir: dataDirOf(workDir), plan, manifest, conflictCopy };
 }
 
-/** Remove working copies not used for a long time, except `keep` (best effort). */
+/**
+ * What a working copy folder holds that is only a cache: the database copy, its state and
+ * leftovers of writing them. Anything else in the folder was put there by the app server next to
+ * the database folder — condense archive copies (the only way back after Condense Data), safety
+ * copies made before a restore, scheduled report exports — and is never deleted with the cache.
+ */
+function isCacheEntry(name) {
+  return name === 'data' || name === STATE_FILE || (name.startsWith(`${STATE_FILE}.`) && name.endsWith('.tmp')) || /^data\.(restore-tmp|pre-restore|refused-restore)-\d+$/.test(name);
+}
+
+/** Remove the cache of working copies not used for a long time, except `keep` (best effort). */
 function pruneWorkingCopies(root, keep = [], now = Date.now()) {
   let names = [];
   try {
@@ -219,7 +328,14 @@ function pruneWorkingCopies(root, keep = [], now = Date.now()) {
     const last = Date.parse(st.lastUsedAt || st.openedAt || '') || 0;
     if (now - last < WORKING_COPY_MAX_AGE_MS) continue;
     try {
-      fs.rmSync(dir, { recursive: true, force: true });
+      let entries = fs.readdirSync(dir);
+      if (entries.every(isCacheEntry)) {
+        fs.rmSync(dir, { recursive: true, force: true });
+      } else {
+        // Keep the side files; drop the cache (the state last, so a failure leaves it prunable).
+        entries = entries.filter(isCacheEntry).sort((a, b) => (a === STATE_FILE ? 1 : b === STATE_FILE ? -1 : 0));
+        for (const n of entries) fs.rmSync(path.join(dir, n), { recursive: true, force: true });
+      }
       removed.push(dir);
     } catch {
       /* in use / locked: next time */
@@ -242,4 +358,7 @@ module.exports = {
   writeWorkingCopyAs,
   prepareWorkingCopy,
   pruneWorkingCopies,
+  latestMigrationAt,
+  savedByNewerVersion,
+  logFingerprint,
 };

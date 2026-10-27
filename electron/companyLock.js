@@ -274,13 +274,30 @@ function release(lock) {
 // Access requests ("Mary has ABC Company open — ask Mary to let you in")
 // ---------------------------------------------------------------------------
 
-/** Ask the holder for access. Returns the request id. */
+/**
+ * Ask the holder for access. Returns the request id. Throws code NOT_IN_USE when nobody holds
+ * the file any more (the holder closed it while the person was deciding to ask): the request
+ * must never re-create the lock folder, or the free file would look open (and, a little later,
+ * "stopped responding") to everyone.
+ */
 function requestAccess(companyFile, requester = {}) {
   const dir = lockDirFor(companyFile);
   const id = `${Date.now().toString(36)}-${crypto.randomBytes(4).toString('hex')}`;
   const req = { id, ...whoAmI(), ...requester, createdAt: new Date().toISOString() };
-  fs.mkdirSync(path.join(dir, 'requests'), { recursive: true });
-  writeJson(path.join(dir, 'requests', `${id}.json`), req);
+  const notInUse = () => Object.assign(new Error('The company file is no longer open anywhere.'), { code: 'NOT_IN_USE' });
+  try {
+    // Only inside an existing lock folder (the holder made requests/ when it took the lock).
+    fs.mkdirSync(path.join(dir, 'requests'));
+  } catch (err) {
+    if (err && err.code === 'ENOENT') throw notInUse();
+    if (!err || err.code !== 'EEXIST') throw err;
+  }
+  try {
+    writeJson(path.join(dir, 'requests', `${id}.json`), req);
+  } catch (err) {
+    if (err && err.code === 'ENOENT') throw notInUse(); // released while writing
+    throw err;
+  }
   return id;
 }
 

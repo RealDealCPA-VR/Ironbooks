@@ -1,6 +1,7 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { Suspense, useCallback, useEffect, useRef, useState } from 'react';
+import { useSearchParams } from 'next/navigation';
 import { Archive, ArchiveRestore, Building2, Download, History } from 'lucide-react';
 import {
   Button,
@@ -76,6 +77,37 @@ async function downloadResponse(res: Response, fallbackName: string) {
   anchor.download = filename;
   anchor.click();
   URL.revokeObjectURL(url);
+}
+
+interface PendingBackupBridge {
+  backup?: {
+    takePending?: (token: string) => Promise<{ name: string; data?: ArrayBuffer; error?: string } | null>;
+  };
+}
+
+/**
+ * A backup chosen in File > Open or Restore Company > "Into the Open Company" (or double-clicked
+ * while a company is open): the desktop shell hands it over once, for the token in ?restore=, and
+ * it goes through the same preview and confirmation as a file picked on this page.
+ */
+function PendingBackupRestore({ onFile }: { onFile: (file: File) => void }) {
+  const token = useSearchParams().get('restore');
+  useEffect(() => {
+    if (!token) return;
+    const take = (window as unknown as { bookkeeper?: PendingBackupBridge }).bookkeeper?.backup?.takePending;
+    if (!take) return;
+    take(token)
+      .then((r) => {
+        if (!r) return; // already taken (the token works once)
+        if (r.error || !r.data) {
+          toast(r.error ?? 'The backup file could not be read.', 'danger');
+          return;
+        }
+        onFile(new File([r.data], r.name));
+      })
+      .catch(() => toast('The backup file could not be read.', 'danger'));
+  }, [token, onFile]);
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -263,11 +295,8 @@ export default function BackupPage() {
     }
   }
 
-  function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0] ?? null;
-    // Reset input so same file can be selected again after a cancel.
-    e.target.value = '';
-    if (!file) return;
+  // A backup file to restore (picked here, or handed over by the desktop shell): preview first.
+  const startFromFile = useCallback((file: File) => {
     setPendingFile(file);
     setPendingVersion(null);
     void startPreview(async () =>
@@ -277,6 +306,15 @@ export default function BackupPage() {
         headers: { 'Content-Type': 'application/octet-stream' },
       }),
     );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0] ?? null;
+    // Reset input so same file can be selected again after a cancel.
+    e.target.value = '';
+    if (!file) return;
+    startFromFile(file);
   }
 
   function handlePreviewVersion(row: BackupHistoryRow) {
@@ -416,6 +454,9 @@ export default function BackupPage() {
 
   return (
     <>
+      <Suspense fallback={null}>
+        <PendingBackupRestore onFile={startFromFile} />
+      </Suspense>
       <main className="min-h-screen bg-offwhite p-8 font-sans">
         <PageHeader title="Backup & Restore" icon={ArchiveRestore} />
 

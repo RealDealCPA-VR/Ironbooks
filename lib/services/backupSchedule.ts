@@ -34,6 +34,7 @@ import { readSandboxMarker, sandboxBlockedError } from './sandboxState';
 import {
   backupFolder,
   backupHealth,
+  defaultBackupFolder,
   findBackupRecord,
   isBackupDue,
   markPruned,
@@ -81,6 +82,31 @@ function versionFilename(source: VersionedSource, companyName: string | null, at
   return `${prefix}${slug}-${ts}.bka`;
 }
 
+/** A partial backup file this old is not being written any more: the write was cut short. */
+const STALE_PARTIAL_MS = 60 * 60 * 1000;
+
+/**
+ * Remove versioned backups whose write was cut short (a crash or power cut left
+ * "<name>.bka.partial", as big as a backup, never listed or rotated). Only our own file names.
+ */
+function removeStalePartials(folder: string, now = Date.now()): void {
+  let names: string[] = [];
+  try {
+    names = fs.readdirSync(folder);
+  } catch {
+    return;
+  }
+  for (const n of names) {
+    if (!/^(auto-)?backup-.*\.bka\.partial$/.test(n)) continue;
+    const p = path.join(folder, n);
+    try {
+      if (now - fs.statSync(p).mtimeMs > STALE_PARTIAL_MS) fs.rmSync(p, { force: true });
+    } catch {
+      /* in use or gone */
+    }
+  }
+}
+
 /**
  * Delete versioned backups beyond `keep` (oldest first), and "Back up now" copies beyond
  * MANUAL_VERSIONS_KEEP. Only files this company file recorded
@@ -89,7 +115,12 @@ function versionFilename(source: VersionedSource, companyName: string | null, at
  */
 export function rotateVersions(keep: number, dataDir?: string, now: Date = new Date()): number {
   const dir = resolveDataDir(dataDir);
-  const stale = planRotation(readBackupHistory(dir), keep);
+  // Only versions whose files this computer can see. A single company file carries its history to
+  // every computer that opens it, and each backs up into its own folder: another computer's
+  // versions are neither deleted nor marked deleted here (that hid them from the list on the
+  // computer that has them, where they were then never rotated again).
+  const visible = readBackupHistory(dir).filter((r) => !r.path || fs.existsSync(r.path));
+  const stale = planRotation(visible, keep);
   const pruned: string[] = [];
   for (const rec of stale) {
     try {
@@ -122,8 +153,21 @@ async function doVersionedBackup(source: VersionedSource, opts: VersionedBackupO
     return { status: 'unchanged', lastBackupAt: records[0]?.at ?? null };
   }
 
-  const folder = backupFolder(settings, dir);
-  fs.mkdirSync(folder, { recursive: true });
+  let folder = backupFolder(settings, dir);
+  let unreachable = false;
+  try {
+    fs.mkdirSync(folder, { recursive: true });
+  } catch (err) {
+    // The settings travel inside a single company file, so the chosen folder may be on a drive or
+    // user profile only the computer that chose it has (or a share that is offline right now).
+    // An automatic backup then goes to this computer's default folder rather than not at all;
+    // "Back up now" still reports the problem.
+    if (!settings.folder || source === 'manual') throw err;
+    console.warn(`[backup] the backup folder ${folder} cannot be reached from this computer; using the default folder:`, (err as Error).message);
+    folder = defaultBackupFolder(dir);
+    fs.mkdirSync(folder, { recursive: true });
+    unreachable = true;
+  }
   const { buffer } = createBackup(opts.companyName ?? undefined, dir);
   const filename = versionFilename(source, opts.companyName ?? null, now);
   const outPath = path.join(folder, filename);
@@ -131,6 +175,7 @@ async function doVersionedBackup(source: VersionedSource, opts: VersionedBackupO
   const tmp = `${outPath}.partial`;
   fs.writeFileSync(tmp, buffer);
   fs.renameSync(tmp, outPath);
+  removeStalePartials(folder);
 
   const record = recordBackup(
     {
@@ -142,11 +187,12 @@ async function doVersionedBackup(source: VersionedSource, opts: VersionedBackupO
       sizeBytes: buffer.byteLength,
       fingerprint,
       note:
-        source === 'scheduled'
+        (source === 'scheduled'
           ? 'Automatic backup'
           : source === 'quit'
             ? 'Automatic backup when the app closed'
-            : 'Backed up now',
+            : 'Backed up now') +
+        (unreachable ? ' (the chosen backup folder could not be reached from this computer, so it went to the default folder)' : ''),
     },
     dir,
   );

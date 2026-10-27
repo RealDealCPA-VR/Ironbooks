@@ -71,14 +71,21 @@ let serverUrl = null;
 let quittingAfterBackup = false;
 /** Relaunch once the quit has finished (set by relaunchApp; a cancelled quit cancels it too). */
 let relaunchAfterQuit = false;
+/**
+ * Config for the next launch (which company file, or No Company Open), written only once the
+ * open company file has been saved and closed. If that save fails and the person keeps working,
+ * it is dropped: the next launch still opens the file they kept working in.
+ */
+let configAfterClose = null;
 
 /**
  * Restart into another company file / mode: quit (the open company file is backed up, saved and
- * released on the way out — before-quit), then start again. If the save fails and the person
- * chooses to keep working, nothing restarts.
+ * released on the way out — before-quit), then start again with `nextConfig` applied. If the save
+ * fails and the person chooses to keep working, nothing restarts and nothing is changed.
  */
-function relaunchApp() {
+function relaunchApp(nextConfig = null) {
   relaunchAfterQuit = true;
+  if (nextConfig) configAfterClose = { ...(configAfterClose || {}), ...nextConfig };
   app.quit();
 }
 
@@ -133,8 +140,8 @@ if (!app.requestSingleInstanceLock()) {
 //  - macOS: the 'open-file' app event (fires before 'ready' on cold start, so register early)
 //  - Windows/Linux: a .bka path in process.argv (first launch) or in the second instance's
 //    argv (forwarded to us via 'second-instance' thanks to the single-instance lock above)
-// The path is delivered to the renderer as /backup?file=<path> so the backup/restore page
-// can prefill the restore flow.
+// The Backup page is opened with a one-time token (/backup?restore=<token>) and asks for the file
+// by it (backup:takePending), then shows the backup's preview and the usual restore confirmation.
 // ---------------------------------------------------------------------------
 
 function extractBkaPath(argv) {
@@ -146,6 +153,9 @@ function extractBkaPath(argv) {
   return null;
 }
 
+/** A backup to restore into the open company file, until the Backup page takes it (once). */
+let backupToRestore = null;
+
 function deliverPendingBka() {
   if (!pendingBkaPath || !mainWindow) return;
   const filePath = pendingBkaPath;
@@ -155,8 +165,24 @@ function deliverPendingBka() {
     restoreBackupAsNewFileFlow(filePath).catch((err) => console.error('[restore] backup:', err));
     return;
   }
-  navigate(`/backup?file=${encodeURIComponent(filePath)}`);
+  // Only this one file, and only once: the page names it by a token, never by a path.
+  backupToRestore = { token: crypto.randomBytes(12).toString('hex'), path: filePath };
+  navigate(`/backup?restore=${backupToRestore.token}`);
 }
+
+// The Backup page picks up the backup chosen in File > Open or Restore Company (or double-clicked):
+// { name, data } (or { name, error }) for the token deliverPendingBka gave it; null otherwise.
+ipcMain.handle('backup:takePending', (e, token) => {
+  if (!fromLocalApp(e) || !backupToRestore || typeof token !== 'string' || token !== backupToRestore.token) return null;
+  const filePath = backupToRestore.path;
+  backupToRestore = null;
+  try {
+    const buf = fs.readFileSync(filePath);
+    return { name: path.basename(filePath), data: buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) };
+  } catch (err) {
+    return { name: path.basename(filePath), error: openErrorText(err) };
+  }
+});
 
 pendingBkaPath = extractBkaPath(process.argv);
 
@@ -257,7 +283,11 @@ function saveConfig(patch) {
   const next = { ...loadConfig(), ...patch };
   try {
     fs.mkdirSync(app.getPath('userData'), { recursive: true });
-    fs.writeFileSync(configPath(), JSON.stringify(next, null, 2));
+    // Temp file + rename: a crash or power cut mid-write must not leave a cut-off config.json
+    // (it would read as empty: which company file was open, recent files, hosting… all gone).
+    const tmp = `${configPath()}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(next, null, 2));
+    fs.renameSync(tmp, configPath());
   } catch (err) {
     console.error('[config] save failed:', err);
   }
@@ -280,18 +310,19 @@ function rememberRecentCompany(dir) {
  * Make `location` (a single company file, or an older company folder) the active company file and
  * relaunch into it. The one open now is saved, backed up and released on the way out (before-quit).
  */
-function openCompany(location) {
-  // Opening a local file leaves any remote host, and ends "No Company Open".
+function openCompany(location, extra = {}) {
+  // Opening a local file leaves any remote host, and ends "No Company Open" — once the file open
+  // now has closed (relaunchApp).
   const single = companyFile.isSingleFile(location);
-  saveConfig({
+  rememberRecentCompany(location);
+  relaunchApp({
     ...(single ? { companyFile: location } : { dataDir: location, companyFile: null }),
     remoteHost: null,
     remotePin: null,
     remoteFile: null,
     companyClosed: false,
+    ...extra,
   });
-  rememberRecentCompany(location);
-  relaunchApp();
 }
 
 /** The user name last used to sign in to `location` on this computer (sign-in screen pre-fill). */
@@ -448,6 +479,11 @@ function activeCompanyDir() {
   return dir;
 }
 
+/** The database migrations this app ships (packaged: resources/app/drizzle). */
+function migrationsDir() {
+  return isDev ? path.join(__dirname, '..', 'drizzle') : path.join(process.resourcesPath, 'app', 'drizzle');
+}
+
 /** Where working copies of open company files live (never a roaming profile). */
 function workingRoot() {
   return companySession.workingRoot({ userData: app.getPath('userData') });
@@ -584,8 +620,7 @@ async function closeCompanyFlow({ skipConfirm = false } = {}) {
     if (response !== 0) return;
   }
   // The company file is saved and released on the way out (before-quit).
-  saveConfig({ companyClosed: true, remoteHost: null, remotePin: null, remoteFile: null });
-  relaunchApp();
+  relaunchApp({ companyClosed: true, remoteHost: null, remotePin: null, remoteFile: null });
 }
 
 function sandboxMenuItem() {
@@ -729,6 +764,8 @@ async function openSingleFileForLaunch(filePath) {
     prep = await companySession.prepareWorkingCopy(filePath, {
       root: workingRoot(),
       appVersion: app.getVersion(),
+      // A file a newer Ironbooks saved is refused before its working copy is touched.
+      knownSchemaAt: companySession.latestMigrationAt(migrationsDir()),
       onConflict: ({ state, manifest }) => confirmConflict(filePath, state, manifest),
     });
   } catch (err) {
@@ -952,9 +989,10 @@ async function joinHostedFile(filePath, host) {
     const n = hostingCore.normalizeHostAddress(url);
     if (!n.ok || !pin) continue;
     if (await probePinnedHost(n.origin, pin)) {
-      saveConfig({ remoteHost: n.origin, remotePin: pin, remoteFile: filePath, lastRemoteHost: n.origin, companyClosed: false });
       rememberRecentCompany(filePath);
-      relaunchApp();
+      // The host is the next launch's only once the file open here has been saved and closed
+      // (before-quit): if that save fails and the person keeps working, they stay in their file.
+      relaunchApp({ remoteHost: n.origin, remotePin: pin, remoteFile: filePath, lastRemoteHost: n.origin, companyClosed: false });
       return true;
     }
   }
@@ -1000,6 +1038,11 @@ async function askForAccessFlow(filePath, holder) {
   try {
     id = companyLock.requestAccess(filePath, { appUser: lastUserFor(filePath) });
   } catch (err) {
+    // They closed it while the question was on screen: it is free, open it.
+    if (err && err.code === 'NOT_IN_USE') {
+      openCompany(filePath);
+      return;
+    }
     dialog.showErrorBox('Could not send the request', openErrorText(err));
     return;
   }
@@ -1069,7 +1112,18 @@ async function askForAccessFlow(filePath, holder) {
 async function closeOpenCompanyFile() {
   if (!openFile) return true;
   stopLockMaintenance();
-  if (openFile.lost) return true; // someone else has it now: nothing of ours to release
+  if (openFile.lost) {
+    // Someone else has it now: nothing of ours to release or save into it. The server still
+    // records what is only here as unsaved (the next open here keeps it as a separate copy).
+    if (serverUrl && !isDev) {
+      await fetch(`${serverUrl}/api/company-file/close`, {
+        method: 'POST',
+        headers: { 'x-bka-internal': internalToken },
+        signal: AbortSignal.timeout(60_000),
+      }).catch(() => {});
+    }
+    return true;
+  }
   if (!serverUrl || isDev) {
     companyLock.release(openFile.lock);
     return true;
@@ -1142,6 +1196,12 @@ async function openCompanyFromOs(filePath) {
 /** File > Save Copy As… (and converting an older company folder to a single company file). */
 async function saveCopyAsFlow({ convert = false } = {}) {
   if (!serverUrl || remoteHostOrigin) return;
+  // As in the File menu: a practice copy is never saved out as an ordinary company file (the
+  // copy would drop its sandbox marker and look like real books).
+  if (sandboxActive()) {
+    dialog.showErrorBox('Not available in the sandbox', 'Leave the sandbox first, then save a copy of your real company file.');
+    return;
+  }
   if (isDev) {
     dialog.showErrorBox('Not available in development', 'Run the packaged app to save a copy of the company file.');
     return;
@@ -1177,7 +1237,7 @@ async function saveCopyAsFlow({ convert = false } = {}) {
     const r = await fetch(`${serverUrl}/api/company-file/save-as?target=${encodeURIComponent(target)}`, {
       method: 'POST',
       headers: { 'x-bka-internal': internalToken, 'content-type': 'application/json' },
-      body: JSON.stringify({ companyName: name }),
+      body: JSON.stringify({ companyName: name, convert }),
       signal: AbortSignal.timeout(30 * 60_000),
     });
     const data = await r.json().catch(() => ({}));
@@ -1266,10 +1326,16 @@ async function startNextServer() {
       BKA_COMPANY_LOCK_TOKEN: openFile ? openFile.lock.token : '',
       // Where the real company file lives (training copies are kept next to it), also in the sandbox.
       BKA_REAL_COMPANY_FILE: openFile ? openFile.path : (loadConfig().sandbox && loadConfig().sandbox.realFile) || '',
+      // Scheduled report exports of a single company file go next to the company file, as they do
+      // next to a company folder ("Report Exports/<name>") — never into its working copy in this
+      // computer's local app data, which nobody looks in and which is cleared when unused.
+      BKA_REPORT_EXPORT_DIR:
+        process.env.BKA_REPORT_EXPORT_DIR ||
+        (openFile ? path.join(path.dirname(openFile.path), 'Report Exports', companyFileFormat.companyFileBaseName(openFile.path)) : ''),
       // Sandbox mode: where "Try it on a copy" puts copies, and the PDF "SANDBOX" stamp flag.
       BKA_SANDBOX_ROOT: sandboxRoot(),
       BKA_SANDBOX: sandboxActive() ? '1' : '',
-      BKA_MIGRATIONS_DIR: path.join(process.resourcesPath, 'app', 'drizzle'),
+      BKA_MIGRATIONS_DIR: migrationsDir(),
       // Offline desktop build: the server is bound to 127.0.0.1 only, so it is safe to
       // surface a password-reset token directly in the local HTTP response.
       BKA_OFFLINE: '1',
@@ -1364,9 +1430,9 @@ async function createCompanyFlow() {
     dialog.showErrorBox('Could not create the company file', openErrorText(e));
     return;
   }
-  // First page of the new file: set up its Admin user, then the setup interview.
-  saveConfig({ startRoute: '/signup' });
-  openCompany(target);
+  // First page of the new file: set up its Admin user, then the setup interview (only once the
+  // file open now has closed — never for that file if the person keeps working in it).
+  openCompany(target, { startRoute: '/signup' });
 }
 
 // Open or Restore Company (QuickBooks File > Open or Restore Company): browse to a company file
@@ -1452,7 +1518,9 @@ async function restoreBackupAsNewFileFlow(bkaPath) {
   const scratchWork = path.join(workingRoot(), `restore-${crypto.randomBytes(6).toString('hex')}`);
   const scratch = companySession.dataDirOf(scratchWork);
   try {
-    const info = await companyFileFormat.extractBackupArchive(bkaPath, scratch);
+    const info = await companyFileFormat.extractBackupArchive(bkaPath, scratch, {
+      knownSchemaAt: companySession.latestMigrationAt(migrationsDir()),
+    });
     await companySession.writeWorkingCopyAs(scratchWork, target, {
       companyName: info.companyName || companyFileFormat.companyFileBaseName(target),
       appVersion: app.getVersion(),
@@ -1751,6 +1819,9 @@ async function setHosting(enable, { quiet = false, lan = false } = {}) {
     hostingError = null;
     saveConfig({ hosting: { ...cfg, enabled: false } });
   }
+  // Tell the shared drive right away (not at the next heartbeat): after switching back to
+  // single-user mode, other computers must stop being offered "Join" to a host that is gone.
+  if (openFile && !openFile.lost) lockHeartbeat().catch(() => {});
   buildMenu();
   mainWindow?.webContents.send('menu', 'hosting-changed');
   return hostingStatus();
@@ -1779,9 +1850,9 @@ async function openOnHostFlow() {
           error: `Couldn't reach ${n.origin}. Check that the host computer is on, Ironbooks there is hosting multi-user access, and both computers are signed in to Tailscale.`,
         };
       }
-      saveConfig({ remoteHost: n.origin, lastRemoteHost: value.trim(), companyClosed: false });
+      // Applied only once the company file open here has been saved and closed (before-quit).
       setImmediate(() => {
-        relaunchApp();
+        relaunchApp({ remoteHost: n.origin, lastRemoteHost: value.trim(), companyClosed: false });
       });
       return { ok: true };
     },
@@ -2791,7 +2862,20 @@ app.whenReady().then(async () => {
     getAppOrigin: () => serverUrl,
     isDev,
   });
-  await createWindow();
+  try {
+    await createWindow();
+  } catch (err) {
+    // Without this the app kept running with no window (and the company file locked): starting
+    // it again only focused the missing window. Say what happened and quit (before-quit releases
+    // the company file).
+    console.error('[startup] could not start:', err);
+    dialog.showErrorBox(
+      'Ironbooks could not start',
+      `${String((err && err.message) || err)}\n\nClose any other Ironbooks windows and start it again. If this keeps happening, restart the computer.`,
+    );
+    app.quit();
+    return;
+  }
   checkForUpdates();
   setInterval(() => checkForUpdates(), UPDATE_CHECK_INTERVAL_MS).unref?.();
 });
@@ -2821,10 +2905,16 @@ app.on('before-quit', (event) => {
       })
       .then((goOn) => {
         if (goOn === false) {
-          // The person chose to keep working (the save failed): don't quit, don't relaunch.
+          // The person chose to keep working (the save failed): don't quit, don't relaunch, and
+          // keep the config pointing at the file they are still working in.
           quittingAfterBackup = false;
           relaunchAfterQuit = false;
+          configAfterClose = null;
           return;
+        }
+        if (configAfterClose) {
+          saveConfig(configAfterClose);
+          configAfterClose = null;
         }
         if (relaunchAfterQuit) app.relaunch();
         app.quit();

@@ -19,6 +19,13 @@ contextBridge.exposeInMainWorld('bookkeeper', {
   saveFile: (opts) => ipcRenderer.invoke('dialog:saveFile', opts),
   /** Save binary data (ArrayBuffer) to a user-chosen path; returns the path or null. */
   saveBytes: (opts) => ipcRenderer.invoke('file:saveBytes', opts),
+  /**
+   * Back Up and Restore: the backup chosen in File > Open or Restore Company (or double-clicked),
+   * handed over once for the token in /backup?restore=<token>. Resolves { name, data } or null.
+   */
+  backup: {
+    takePending: (token) => ipcRenderer.invoke('backup:takePending', String(token)),
+  },
   /** Portable Company File (.bkp): open/restore flow runs in the main process. */
   portable: {
     open: () => ipcRenderer.invoke('portable:open'),

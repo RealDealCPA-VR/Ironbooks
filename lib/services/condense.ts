@@ -787,6 +787,7 @@ async function condensePeriodUnlocked(
     filename: path.basename(archivePath),
     createdAt: new Date().toISOString(),
     dataDir: resolveDataDir(input.dataDir),
+    fileId: fileIdOf(resolveDataDir(input.dataDir), true),
     companyId: ctx.companyId,
     companyName: co?.name ?? null,
     beforeDate: condensed.beforeDate,
@@ -1128,9 +1129,52 @@ function countFiles(dir: string, root = false): number {
 // Archive copies (QB "archive copy" written before condensing)
 // ---------------------------------------------------------------------------
 
-/** Folder holding condense archive copies: a sibling `archives` folder of the data dir. */
+/**
+ * Folder holding condense archive copies: a sibling `archives` folder of the data dir — or, for
+ * the open SINGLE company file, an `archives` folder next to the company file itself. Its
+ * database runs from a working copy in this computer's local app data, which nobody looks in
+ * and which other computers that open the file do not have; like QuickBooks' "Archive Copy"
+ * beside the .QBW, the archive goes where the company file is.
+ */
 export function condenseArchiveDir(dataDir?: string): string {
-  return path.join(path.dirname(resolveDataDir(dataDir)), 'archives');
+  const dir = resolveDataDir(dataDir);
+  return path.join(singleCompanyFileHome(dir) ?? path.dirname(dir), 'archives');
+}
+
+/**
+ * The folder holding the open single company file when `dir` is its working copy's database
+ * folder (electron/companySession.js: <working copy>/data next to state.json); else null.
+ */
+function singleCompanyFileHome(dir: string): string | null {
+  const file = process.env.BKA_COMPANY_FILE;
+  const state = process.env.BKA_COMPANY_STATE;
+  if (!file || !state) return null;
+  const working = path.join(path.dirname(path.resolve(state)), 'data');
+  const same = process.platform === 'win32' ? working.toLowerCase() === dir.toLowerCase() : working === dir;
+  return same ? path.dirname(path.resolve(file)) : null;
+}
+
+/**
+ * The company file's own identity (`.file-id`, the one session tokens are bound to; lib/auth.ts):
+ * it travels inside the file, so an archive copy is found again on any computer — the data
+ * folder's path differs on each. Made here when the file has none yet (same format as lib/auth).
+ */
+function fileIdOf(dir: string, create = false): string | null {
+  const file = path.join(dir, '.file-id');
+  try {
+    const id = fs.readFileSync(file, 'utf8').trim();
+    if (id) return id;
+  } catch {
+    /* none yet */
+  }
+  if (!create) return null;
+  try {
+    const id = randomUUID();
+    fs.writeFileSync(file, id, { mode: 0o600, flag: 'wx' });
+    return id;
+  } catch {
+    return fileIdOf(dir, false);
+  }
 }
 
 const ARCHIVE_INDEX = 'condense-archives.json';
@@ -1143,6 +1187,8 @@ export interface CondenseArchive {
   createdAt: string;
   /** Data dir the archive was taken from (several company files may share an archives folder). */
   dataDir: string;
+  /** The company file's identity (.file-id): the same on every computer, unlike dataDir. */
+  fileId?: string | null;
   companyId: string;
   companyName: string | null;
   beforeDate: string;
@@ -1169,10 +1215,36 @@ function recordCondenseArchive(entry: CondenseArchive): void {
 /** Archive copies recorded for this company file (newest first; missing files flagged). */
 export function listCondenseArchives(dataDir?: string): Array<CondenseArchive & { available: boolean }> {
   const dir = resolveDataDir(dataDir);
-  return readArchiveIndex(condenseArchiveDir(dir))
-    .filter((a) => path.resolve(a.dataDir) === dir)
-    .map((a) => ({ ...a, available: fs.existsSync(a.path) }))
-    .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+  const archDir = condenseArchiveDir(dir);
+  const fileId = fileIdOf(dir);
+  const ours = (a: CondenseArchive) => (a.fileId && fileId ? a.fileId === fileId : path.resolve(a.dataDir) === dir);
+  // The archives folder as this computer reaches it (a share mapped to another drive letter here,
+  // or reached by its \\server name there).
+  const located = (folder: string) => (a: CondenseArchive) => {
+    const here = path.join(folder, path.basename(a.filename || a.path));
+    const p = fs.existsSync(a.path) ? a.path : here;
+    return { ...a, path: p, available: fs.existsSync(p) };
+  };
+  const list = readArchiveIndex(archDir).filter(ours).map(located(archDir));
+  // A single company file condensed by v1.6.0 had its archive copies (and their index) beside its
+  // working copy, <working copy>/archives: they stay listed and restorable from there.
+  const legacyDir = path.join(path.dirname(dir), 'archives');
+  if (singleCompanyFileHome(dir) !== null && !samePath(legacyDir, archDir)) {
+    const seen = new Set(list.map((a) => a.id));
+    for (const a of readArchiveIndex(legacyDir).filter(ours).map(located(legacyDir))) {
+      if (!seen.has(a.id)) {
+        seen.add(a.id);
+        list.push(a);
+      }
+    }
+  }
+  return list.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+}
+
+function samePath(a: string, b: string): boolean {
+  const x = path.resolve(a);
+  const y = path.resolve(b);
+  return process.platform === 'win32' ? x.toLowerCase() === y.toLowerCase() : x === y;
 }
 
 /**

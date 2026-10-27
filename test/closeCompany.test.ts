@@ -112,7 +112,8 @@ describe('desktop wiring (source pins)', () => {
   });
 
   it('closing releases the file: the next launch shows the start screen without starting a server', () => {
-    expect(main).toMatch(/saveConfig\(\{ companyClosed: true, remoteHost: null, remotePin: null, remoteFile: null \}\);\s*\n\s*relaunchApp\(\);/);
+    // Written once the open file has closed (a failed save + Keep Working leaves it as it was).
+    expect(main).toMatch(/relaunchApp\(\{ companyClosed: true, remoteHost: null, remotePin: null, remoteFile: null \}\);/);
     // An open single company file is saved into itself and its lock released on the way out.
     expect(main).toMatch(/\.then\(\(\) => closeOpenCompanyFile\(\)\)/);
     const create = main.indexOf('async function createWindow()');
@@ -125,7 +126,8 @@ describe('desktop wiring (source pins)', () => {
   it('opening a file or a host ends the closed state', () => {
     expect(main).toMatch(/single \? \{ companyFile: location \} : \{ dataDir: location, companyFile: null \}/);
     expect(main).toMatch(/remoteFile: null,\s*\n\s*companyClosed: false,/);
-    expect(main).toMatch(/saveConfig\(\{ remoteHost: n\.origin, lastRemoteHost: value\.trim\(\), companyClosed: false \}\)/);
+    // (applied once the open company file has closed: relaunchApp hands it to before-quit)
+    expect(main).toMatch(/relaunchApp\(\{ remoteHost: n\.origin, lastRemoteHost: value\.trim\(\), companyClosed: false \}\)/);
   });
 
   it('the start screen opens and reveals only folders on the recent list, only from its own window', () => {

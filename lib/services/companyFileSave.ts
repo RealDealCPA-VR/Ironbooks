@@ -27,8 +27,11 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { sql } from 'drizzle-orm';
 import format from '@/electron/companyFileFormat';
-import { closeDb, firstOpenWalPosition, getDb, holdDbOpen, isDbOpen, resolveDataDir, withDamagedFileAccess } from '@/lib/db';
+import lockFormat from '@/electron/companyLock';
+import { closeDb, firstOpenWalPosition, getDb, holdDbOpen, isDbOpen, resolveDataDir, withDamagedFileAccess, type DB } from '@/lib/db';
 import { currentFingerprint } from './backupFingerprint';
+import { BACKUP_HISTORY_FILE } from './backupHistory';
+import { isRestoreInProgress, whenRestoreDone } from './restoreState';
 import { APP_VERSION } from '@/lib/appVersion';
 
 /** How often the autosave timer looks for changes. */
@@ -94,6 +97,10 @@ interface SaveState {
   status: SaveStatusKind;
   error: string | null;
   conflictCopy: string | null;
+  /** The save this process last wrote into `conflictCopy` (later work goes into the same copy). */
+  conflictSaveId: string | null;
+  /** The database layout the working copy has (its newest migration), stamped into every save. */
+  dbSchema: DbSchemaStamp | null;
   timer: ReturnType<typeof setInterval> | null;
   closed: boolean;
 }
@@ -134,6 +141,8 @@ function state(): SaveState | null {
     status: 'saved',
     error: null,
     conflictCopy: null,
+    conflictSaveId: null,
+    dbSchema: null,
     timer: null,
     closed: false,
   };
@@ -227,6 +236,39 @@ async function currentLsn(s: SaveState): Promise<string | null> {
   }
 }
 
+/**
+ * The database layout of a company file, in its manifest: an older Ironbooks that finds a newer
+ * layout there refuses to open the file (electron/companySession.js) instead of downgrading it.
+ */
+export interface DbSchemaStamp {
+  migrations: number;
+  /** `when` of the newest migration applied (drizzle journal), ms. */
+  lastMigrationAt: number;
+}
+
+async function dbSchemaOf(db: DB): Promise<DbSchemaStamp | null> {
+  try {
+    const res = (await db.execute(
+      sql`select count(*)::int as n, max(created_at)::text as last from drizzle.__drizzle_migrations`,
+    )) as unknown as { rows?: Array<{ n?: number | string; last?: string | null }> };
+    const row = res.rows?.[0];
+    const last = row?.last == null ? NaN : Number(row.last);
+    return Number.isFinite(last) ? { migrations: Number(row?.n ?? 0), lastMigrationAt: last } : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The working copy's layout right now (null when it is not the open, active database). */
+async function currentDbSchema(s: SaveState): Promise<DbSchemaStamp | null> {
+  if (!workingCopyActive(s) || !isDbOpen(s.dataDir)) return null;
+  try {
+    return await dbSchemaOf(await withDamagedFileAccess(() => getDb(s.dataDir)));
+  } catch {
+    return null;
+  }
+}
+
 /** The company name for the manifest: what the app recorded in the working copy, else the file name. */
 function companyNameFor(s: SaveState, dataDir: string): string {
   try {
@@ -265,7 +307,10 @@ function friendlyIoError(err: unknown, file: string): string {
 export async function saveCompanyFile(opts: { force?: boolean; final?: boolean; reason?: string } = {}): Promise<SaveResult> {
   const s = state();
   if (!s) return { saved: false, outcome: 'not-single-file' };
-  if (s.inflight) {
+  // One save at a time: several callers waiting on the same save must not then all start their
+  // own side by side (each would claim to follow the same save, and the file and this working
+  // copy's record of it could end up naming different saves).
+  while (s.inflight) {
     await s.inflight.catch(() => undefined);
     if (!opts.final && !opts.force) return { saved: false, outcome: 'unchanged' };
   }
@@ -281,6 +326,10 @@ export async function saveCompanyFile(opts: { force?: boolean; final?: boolean; 
 async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }): Promise<SaveResult> {
   const dataDir = s.dataDir;
   const started = Date.now();
+  // A restore is replacing the working copy (its books are swapped in before they are verified,
+  // and rolled back if they fail): nothing is saved out of it until the restore has finished.
+  // The close-time save (quit, Close Company, handing the file over) waits for it.
+  await waitOutRestore(dataDir, opts);
 
   // Still ours? (A computer that slept past the lock's stale time may have lost it.)
   if (s.lockDir && s.lockToken) {
@@ -289,6 +338,13 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
       s.status = 'lost';
       const who = owner.appUser || owner.osUser;
       s.error = `${who ? `${who} on ` : ''}${owner.computer ?? 'another computer'} has opened this company file since this computer last saved it, so Ironbooks stopped saving here to protect their work. Your changes are kept on this computer.`;
+      // What is here and not in the company file stays recorded as unsaved — also changes no
+      // autosave check has seen yet (the close-time save) — so the next open here keeps them apart.
+      const fp = currentFingerprint(dataDir);
+      const lsn = await currentLsn(s);
+      if (fp !== s.savedFingerprint || s.unsavedSince !== null || (lsn !== null && lsn !== baselineLsn(s))) {
+        noteUnsaved(s, Date.now(), fp !== s.savedFingerprint);
+      }
       throw Object.assign(new Error(s.error), { code: 'LOCK_LOST' });
     }
   }
@@ -326,19 +382,28 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
     // The company file must still be the save this working copy started from.
     const ws = readWorkingState(s.statePath);
     const baseSaveId = ws?.base?.saveId ?? null;
-    const onDisk = format.readCompanyManifest(s.file) as { saveId?: string; fileId?: string } | null;
+    const onDisk = format.readCompanyManifest(s.file) as { saveId?: string; fileId?: string; dbSchema?: DbSchemaStamp | null } | null;
     if (!onDisk && fs.existsSync(path.dirname(s.file)) && fs.existsSync(s.file)) {
       throw Object.assign(new Error('The company file on disk can no longer be read (it may have been replaced by another program).'), {
         code: 'UNREADABLE',
       });
     }
     const conflict = Boolean(onDisk && baseSaveId && onDisk.saveId !== baseSaveId);
-    const target = conflict ? conflictCopyPath(s.file) : s.file;
+    // After a conflict, later work keeps going into the copy made for it (never a new full copy of
+    // the company file on every autosave check).
+    const target = conflict ? (reusableConflictCopy(s) ?? conflictCopyPath(s.file)) : s.file;
 
-    // Consistent snapshot: the LSN first, then the files in this same synchronous turn.
-    const lsn = await currentLsn(s);
+    // Consistent snapshot: the LSN first, then the files in this same synchronous turn — never
+    // while a restore that started during this save is replacing them (this save waits for it).
+    let lsn = await currentLsn(s);
+    while (isRestoreInProgress(dataDir)) {
+      await whenRestoreDone(dataDir);
+      lsn = await currentLsn(s);
+    }
     const fingerprint = currentFingerprint(dataDir);
-    const entries = format.snapshotDir(dataDir);
+    // A copy kept apart is a separate company file: it never carries this file's backup history
+    // (its own rotation would delete this file's backup versions).
+    const entries = conflict ? withoutBackupHistory(format.snapshotDir(dataDir)) : format.snapshotDir(dataDir);
     const savedAt = new Date().toISOString();
     const saveId = randomUUID();
     const companyName = companyNameFor(s, dataDir);
@@ -351,6 +416,9 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
       }
     }
     const owner = s.lockDir ? readOwner(s.lockDir) : null;
+    // The layout this save holds (an older Ironbooks refuses a newer one): measured while the
+    // working copy is open, else the one last measured, else what the file said when it was opened.
+    s.dbSchema = (await currentDbSchema(s)) ?? s.dbSchema ?? onDisk?.dbSchema ?? null;
     const result = await format.writeCompanyFile(target, {
       manifest: {
         formatVersion: format.COMPANY_FILE_FORMAT_VERSION,
@@ -364,6 +432,7 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
         passwordProtected: Boolean(readDesktopManifest(dataDir)?.passwordProtected),
         // The transaction-log head this save holds: the next open knows exactly what is saved.
         fingerprint,
+        ...(s.dbSchema ? { dbSchema: s.dbSchema } : {}),
       },
       backupManifest: {
         app: 'bookkeeper-ai',
@@ -372,6 +441,7 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
         companyName,
         createdAt: savedAt,
         appVersion: APP_VERSION,
+        ...(s.dbSchema ? { dbSchemaAt: s.dbSchema.lastMigrationAt } : {}),
       },
       entries,
       cache: s.cache,
@@ -379,9 +449,29 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
 
     if (conflict) {
       s.conflictCopy = target;
+      s.conflictSaveId = saveId;
+      // Everything up to this snapshot is safe in the copy: changes are tracked from here on (and
+      // saved into the same copy), and the working copy no longer counts them as unsaved — so the
+      // next open of the company file does not keep them apart a second time.
+      s.savedFingerprint = fingerprint;
+      s.lastSeenFingerprint = fingerprint;
+      s.savedLsn = lsn;
+      s.booksUnsaved = false;
+      s.unsavedSince = null;
+      s.lastSaveMs = Date.now() - started;
+      s.lastSaveEndedAt = Date.now();
       s.status = 'error';
       s.error = `Someone else saved this company file while it was open here, so your changes were saved to a separate copy instead: ${target}. Compare the two before you continue working.`;
-      return { saved: true, outcome: 'conflict', path: target, bytes: result.bytes, durationMs: Date.now() - started };
+      writeWorkingState(s, {
+        unsavedSince: null,
+        conflictCopy: target,
+        // What the copy holds (the transaction-log head): after a crash, a working copy still at
+        // exactly this point has nothing the copy lacks, so it is not kept apart a second time
+        // (electron/companySession.js crashedWithUnsavedBooks).
+        conflictFingerprint: fingerprint,
+        ...(opts.final ? { closedCleanly: true, lastUsedAt: savedAt } : {}),
+      });
+      return { saved: true, outcome: 'conflict', path: target, bytes: result.bytes, durationMs: s.lastSaveMs };
     }
 
     s.savedFingerprint = fingerprint;
@@ -398,6 +488,7 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
     writeWorkingState(s, {
       base: { saveId, savedAt, fingerprint },
       unsavedSince: null,
+      conflictFingerprint: null,
       lastSavedAt: savedAt,
       fileId,
       companyName,
@@ -413,12 +504,40 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
   }
 }
 
+/**
+ * While a restore into `dataDir` runs: the close-time save (`final`) waits for it to finish; any
+ * other save is refused (RESTORING) — the autosave tries again after it, and Save Now says why.
+ */
+async function waitOutRestore(dataDir: string, opts: { final?: boolean }): Promise<void> {
+  while (isRestoreInProgress(dataDir)) {
+    if (!opts.final) {
+      throw Object.assign(new Error('A backup is being restored into this company file. It is saved as soon as the restore has finished.'), {
+        code: 'RESTORING',
+      });
+    }
+    await whenRestoreDone(dataDir);
+  }
+}
+
 function readDesktopManifest(dataDir: string): { passwordProtected?: boolean } | null {
   try {
     return JSON.parse(fs.readFileSync(path.join(dataDir, 'bookkeeper-company.json'), 'utf8'));
   } catch {
     return null;
   }
+}
+
+/**
+ * The copy this process already saved unsaved changes into, when it is still exactly what was
+ * written there: not saved since by anyone else, and not open anywhere (its own lock folder).
+ * Otherwise null: a new copy is made rather than overwriting someone's work.
+ */
+function reusableConflictCopy(s: SaveState): string | null {
+  if (!s.conflictCopy || !s.conflictSaveId) return null;
+  const m = format.readCompanyManifest(s.conflictCopy) as { saveId?: string } | null;
+  if (!m || m.saveId !== s.conflictSaveId) return null;
+  if (fs.existsSync(lockFormat.lockDirFor(s.conflictCopy))) return null;
+  return s.conflictCopy;
 }
 
 function conflictCopyPath(file: string): string {
@@ -442,7 +561,9 @@ export async function autosaveTick(now = Date.now()): Promise<'idle' | 'waiting'
   const s = state();
   if (!s || s.closed) return 'idle';
   if (s.inflight) return 'busy';
-  if (s.status === 'lost') return 'idle';
+  // A restore is replacing the working copy: its books are verified only after they are swapped
+  // in (and rolled back if they fail), so nothing is saved until it has finished.
+  if (isRestoreInProgress(s.dataDir)) return 'busy';
   const dataDir = s.dataDir;
   const fp = currentFingerprint(dataDir);
   if (fp !== s.lastSeenFingerprint) {
@@ -460,6 +581,10 @@ export async function autosaveTick(now = Date.now()): Promise<'idle' | 'waiting'
   }
   if (!anyChanged) return 'idle';
   noteUnsaved(s, now, booksChanged);
+  // Another computer has the file now: never save into it, but the changes made here stay
+  // recorded as unsaved (above), so the next open here keeps them as a separate copy instead of
+  // replacing this working copy with the company file.
+  if (s.status === 'lost') return 'idle';
 
   // Don't spend more than about a fifth of the time saving a big file over a slow network.
   if (now - s.lastSaveEndedAt < s.lastSaveMs * 4) return 'waiting';
@@ -553,24 +678,45 @@ export function getCompanyFileSaveStatus(): CompanyFileSaveStatus {
  * File > Save Copy As…, and converting an older folder company file to a single file. The copy
  * gets its own identity (file id), so the two are independent from then on.
  */
-export async function saveCopyAs(target: string, opts: { companyName?: string | null } = {}): Promise<{ path: string; bytes: number }> {
+export async function saveCopyAs(
+  target: string,
+  opts: { companyName?: string | null; keepBackupHistory?: boolean } = {},
+): Promise<{ path: string; bytes: number }> {
   const dataDir = resolveDataDir();
   const abs = path.resolve(target);
   if (!abs.toLowerCase().endsWith(format.COMPANY_FILE_EXT)) {
     throw Object.assign(new Error(`A company file name must end in ${format.COMPANY_FILE_EXT}.`), { code: 'VALIDATION' });
   }
+  // Never replace a company file someone has open (QuickBooks refuses too): their next save would
+  // find a different company in its place.
+  const holder = lockFormat.readHolder(abs) as { owner?: Record<string, unknown> | null; stale?: boolean } | null;
+  if (holder && !holder.stale) {
+    throw Object.assign(
+      new Error(`${path.basename(abs)} is open on ${lockFormat.describeOwner(holder.owner ?? null)}. Choose another name for the copy, or ask them to close it first.`),
+      { code: 'VALIDATION' },
+    );
+  }
+  // A restore is replacing the books (swapped in before they are verified, rolled back if they
+  // fail): the copy is made of what the restore leaves, never of books still being checked.
+  await whenRestoreDone(dataDir);
+  let dbSchema: DbSchemaStamp | null = null;
   if (isDbOpen()) {
     try {
       const db = await withDamagedFileAccess(() => getDb());
       await db.execute(sql`checkpoint`);
+      dbSchema = await dbSchemaOf(db);
     } catch {
       /* the snapshot is consistent without it */
     }
   }
+  while (isRestoreInProgress(dataDir)) await whenRestoreDone(dataDir);
   // The copy is its own company file: a new identity inside (sessions bind to it) and out.
   const fileId = randomUUID();
+  // Nor its backup history: the copy's rotation would otherwise delete this file's backup versions.
+  // Converting a company folder into a single file continues the same company, so it keeps it.
+  const snapshot = format.snapshotDir(dataDir).filter((e: { name: string }) => e.name !== '.file-id');
   const entries = [
-    ...format.snapshotDir(dataDir).filter((e: { name: string }) => e.name !== '.file-id'),
+    ...(opts.keepBackupHistory ? snapshot : withoutBackupHistory(snapshot)),
     { name: '.file-id', data: Buffer.from(fileId) },
   ];
   const now = new Date().toISOString();
@@ -587,11 +733,16 @@ export async function saveCopyAs(target: string, opts: { companyName?: string | 
       savedBy: { computer: os.hostname(), appUser: null },
       appVersion: APP_VERSION,
       passwordProtected: Boolean(readDesktopManifest(dataDir)?.passwordProtected),
+      ...(dbSchema ? { dbSchema } : {}),
     },
     backupManifest: { app: 'bookkeeper-ai', formatVersion: 1, kind: 'full', companyName, createdAt: now, appVersion: APP_VERSION },
     entries,
   });
   return { path: abs, bytes: result.bytes };
+}
+
+function withoutBackupHistory<T extends { name: string }>(entries: T[]): T[] {
+  return entries.filter((e) => e.name !== BACKUP_HISTORY_FILE);
 }
 
 function readDisplayName(dataDir: string): string | null {
