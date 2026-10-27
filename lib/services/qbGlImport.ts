@@ -42,6 +42,7 @@ import { createClass } from './dimensions';
 import { createEmployee } from './payroll';
 import { postJournalEntry, type PostingLine } from './posting';
 import { createVendor } from './vendors';
+import { fiscalYearStartFor } from './reports';
 import { controlSideOfAccount, customerKey, customerKeyIndex, loadQbNameResolver, type QbNameRole } from './qbNameResolver';
 import { loadGrid } from './qbGlFiles';
 import { dataExceptionMessage, isDataException } from './qbImportErrors';
@@ -440,6 +441,42 @@ async function importedBalances(ctx: ServiceContext, asOf: Date, onlyImported = 
   return new Map(rows.map((r) => [r.accountId, Money.of(r.dr).minus(Money.of(r.cr))]));
 }
 
+/**
+ * The imported balances as QuickBooks prints them on its Trial Balance (as of `asOf`): income and
+ * expense accounts (cost of goods sold, other income / expense included) only for the fiscal year
+ * that contains `asOf`, and the net income of the years before in Retained Earnings. Returns a
+ * function of the all-time balances (debit-positive) that gives the Trial Balance view; when
+ * there is nothing before the fiscal year it changes nothing.
+ */
+async function trialBalanceView(
+  ctx: ServiceContext,
+  asOf: Date,
+  allBk: Map<string, ExistingAccount>,
+  qbNamesOf: Map<string, string[]>,
+): Promise<(allTime: Map<string, Decimal>) => Promise<Map<string, Decimal>>> {
+  const fyStart = await fiscalYearStartFor(ctx, asOf);
+  const isPnl = (id: string) => {
+    const t = allBk.get(id)?.type;
+    return t === 'revenue' || t === 'expense';
+  };
+  const isRetained = (a: ExistingAccount) =>
+    a.type === 'equity' &&
+    (/^retained earnings$/i.test(a.name.trim()) || (qbNamesOf.get(a.id) ?? []).some((n) => /(^|:)\s*retained earnings$/i.test(n.trim())));
+  const retained = [...allBk.values()].filter(isRetained).sort((a, b) => (a.code === '3900' ? -1 : b.code === '3900' ? 1 : 0))[0] ?? null;
+  return async (allTime) => {
+    const before = await importedBalances(ctx, new Date(fyStart.getTime() - 1));
+    const out = new Map(allTime);
+    let priorNet = Money.zero();
+    for (const [id, bal] of before) {
+      if (!isPnl(id) || bal.isZero()) continue;
+      out.set(id, (out.get(id) ?? Money.zero()).minus(bal));
+      priorNet = priorNet.plus(bal);
+    }
+    if (retained && !priorNet.isZero()) out.set(retained.id, (out.get(retained.id) ?? Money.zero()).plus(priorNet));
+    return out;
+  };
+}
+
 /** Total debits and credits of the whole ledger (all posted entries) up to `asOf`. */
 async function ledgerTotals(ctx: ServiceContext, asOf: Date) {
   const [row] = await ctx.db
@@ -794,12 +831,18 @@ async function runGlImportUnanalyzed(
           tbOf.set(id, (tbOf.get(id) ?? Money.zero()).plus(a.tbBalance ?? 0));
         }
       }
+      // QuickBooks prints its Trial Balance with income and expense accounts for the fiscal year to
+      // date and the earlier years' net income in Retained Earnings, so the imported books are read
+      // the same way for that comparison (a GL spanning several fiscal years otherwise never matched).
+      const tbView = tbCompared ? await trialBalanceView(tx, asOf, allBk, qbNamesOf) : null;
       const buildProof = async (): Promise<GlProof> => {
         const actual = await importedBalances(tx, asOf);
+        const tbActual = tbView ? await tbView(actual) : null;
         const rows: GlProofRow[] = [...expectedEnd.entries()].map(([id, exp]) => {
           const act = actual.get(id) ?? Money.zero();
           const acct = allBk.get(id)!;
           const tb = tbCompared ? tbOf.get(id) ?? Money.zero() : null;
+          const tbAct = tbActual?.get(id) ?? act;
           return {
             accountId: id,
             code: acct.code,
@@ -809,7 +852,7 @@ async function runGlImportUnanalyzed(
             actual: toAmountString(act),
             difference: toAmountString(exp.minus(act)),
             trialBalance: tb ? toAmountString(tb) : null,
-            trialBalanceDifference: tb ? toAmountString(tb.minus(act)) : null,
+            trialBalanceDifference: tb ? toAmountString(tb.minus(tbAct)) : null,
           };
         });
         rows.sort((x, y) => x.code.localeCompare(y.code, undefined, { numeric: true }));
