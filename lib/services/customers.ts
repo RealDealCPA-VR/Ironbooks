@@ -545,3 +545,46 @@ export async function customerBalanceSummary(
   }
   return result;
 }
+
+// ---------------------------------------------------------------------------
+// Customer Center list with balances (home currency, from the A/R ledger)
+// ---------------------------------------------------------------------------
+
+/**
+ * Customers with their balance as the A/R ledger has it (home currency, by name — the same figure
+ * as Customer Balance Summary): `balance` is the customer's own, `balanceTotal` adds its
+ * sub-customers and jobs (QB's "Balance Total" column). The stored customers.balance column is
+ * never maintained by the posting engine, so the Customer Center showed 0.00 for everyone.
+ */
+export async function listCustomersWithBalances(ctx: ServiceContext, opts?: { includeInactive?: boolean }) {
+  const rows = await listCustomers(ctx, opts);
+  // Lazy import: the report engine imports the document services, which import this module.
+  const { ledgerTotalsByName, loadAccountMeta } = await import('./reportEngine');
+  const meta = await loadAccountMeta(ctx);
+  const own = new Map<string, ReturnType<typeof Money.zero>>();
+  for (const t of await ledgerTotalsByName(ctx, meta, { sections: ['ar'] })) {
+    if (t.nameType !== 'customer' || !t.nameId) continue;
+    own.set(t.nameId, (own.get(t.nameId) ?? Money.zero()).plus(t.natural));
+  }
+  // Every customer (also inactive ones) carries its balance up to its parents.
+  const all = await ctx.db
+    .select({ id: customers.id, parentId: customers.parentId })
+    .from(customers)
+    .where(eq(customers.companyId, ctx.companyId));
+  const parentOf = new Map(all.map((c) => [c.id, c.parentId]));
+  const total = new Map<string, ReturnType<typeof Money.zero>>();
+  for (const [id, amt] of own) {
+    const seen = new Set<string>();
+    let cur: string | null | undefined = id;
+    while (cur && !seen.has(cur)) {
+      seen.add(cur);
+      total.set(cur, (total.get(cur) ?? Money.zero()).plus(amt));
+      cur = parentOf.get(cur);
+    }
+  }
+  return rows.map((r) => ({
+    ...r,
+    balance: toAmountString(own.get(r.id) ?? Money.zero()),
+    balanceTotal: toAmountString(total.get(r.id) ?? Money.zero()),
+  }));
+}

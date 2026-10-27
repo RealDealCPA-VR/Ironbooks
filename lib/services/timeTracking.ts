@@ -24,6 +24,7 @@ import {
 } from './_base';
 import { createInvoice } from './invoices';
 import { assertAccountantMayBillCosts } from './accountantCopy/guard';
+import { assertLineJobs } from './jobCustomers';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -122,6 +123,10 @@ export async function createTimeEntry(ctx: ServiceContext, input: TimeEntryInput
     if (!cust) throw notFound('Customer');
   }
   await assertTimeRefsOwned(ctx, input);
+  // The job must be one of the customer's (time with only a job is that job's customer's).
+  const jobLine = { customerId: input.customerId ?? null, jobId: input.jobId ?? null };
+  await assertLineJobs(ctx, [jobLine], { fill: true, what: 'time entry' });
+  input = { ...input, customerId: jobLine.customerId };
 
   const rate = input.rate != null ? toAmountString(input.rate) : null;
 
@@ -203,6 +208,13 @@ export async function updateTimeEntry(
     if (!cust) throw notFound('Customer');
   }
   await assertTimeRefsOwned(ctx, update);
+  if (update.jobId !== undefined || update.customerId !== undefined) {
+    await assertLineJobs(
+      ctx,
+      [{ customerId: update.customerId !== undefined ? update.customerId : existing.customerId, jobId: update.jobId !== undefined ? update.jobId : existing.jobId }],
+      { what: 'time entry' },
+    );
+  }
 
   const patch: Partial<typeof timeEntries.$inferInsert> = {};
   if (update.employeeId !== undefined) patch.employeeId = update.employeeId;

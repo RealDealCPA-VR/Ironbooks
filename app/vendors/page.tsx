@@ -167,7 +167,8 @@ function VendorsPageContent() {
   async function fetchVendors() {
     setLoading(true);
     try {
-      const data = await api.get<Vendor[]>('/api/vendors');
+      // Balances come from the A/P ledger (the stored vendors.balance column is not kept up to date).
+      const data = await api.get<Vendor[]>('/api/vendors?withBalances=true');
       setVendors(data);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Failed to load vendors';

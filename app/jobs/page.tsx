@@ -52,7 +52,7 @@ interface Customer {
 }
 
 interface ProfitabilityLine {
-  source: 'invoice_line' | 'bill_line' | 'expense_line';
+  source: 'invoice_line' | 'credit_memo_line' | 'bill_line' | 'expense_line';
   id: string;
   description: string | null;
   amount: string;
@@ -97,13 +97,14 @@ function profitTone(profit: string): 'success' | 'danger' | 'neutral' {
 function sourceLabel(source: ProfitabilityLine['source']): string {
   switch (source) {
     case 'invoice_line': return 'Revenue';
+    case 'credit_memo_line': return 'Credit Memo';
     case 'bill_line': return 'Bill Cost';
     case 'expense_line': return 'Direct Expense';
   }
 }
 
 function sourceTone(source: ProfitabilityLine['source']): 'success' | 'danger' {
-  return source === 'invoice_line' ? 'success' : 'danger';
+  return source === 'invoice_line' || source === 'credit_memo_line' ? 'success' : 'danger';
 }
 
 // ---------------------------------------------------------------------------
@@ -202,8 +203,10 @@ function ProfitabilityPanel({
   }, [jobId, onClose]);
 
   const p = data?.profitability;
-  const revLines = p?.lines.filter((l) => l.source === 'invoice_line') ?? [];
-  const costLines = p?.lines.filter((l) => l.source !== 'invoice_line') ?? [];
+  // Credit memo lines (returns, write-offs) are negative revenue of the job.
+  const isRevenue = (l: ProfitabilityLine) => l.source === 'invoice_line' || l.source === 'credit_memo_line';
+  const revLines = p?.lines.filter(isRevenue) ?? [];
+  const costLines = p?.lines.filter((l) => !isRevenue(l)) ?? [];
 
   return (
     <Modal

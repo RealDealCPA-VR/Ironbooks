@@ -14,7 +14,7 @@
 import { assertAccountantMayConvert, assertDividingDateOpen } from './accountantCopy/guard';
 import { and, eq, inArray } from 'drizzle-orm';
 import { Money, toAmountString } from '@/lib/money';
-import { estimates, estimateLines, customers, taxRates, classes, items } from '@/lib/db/schema';
+import { estimates, estimateLines, customers, taxRates, classes, items, invoiceLines } from '@/lib/db/schema';
 import {
   type ServiceContext,
   ServiceError,
@@ -43,6 +43,8 @@ import {
 // ---------------------------------------------------------------------------
 
 export interface EstimateLineInput {
+  /** Edit only: the saved estimate line this row updates (it keeps its id, and the links of invoices made from it). */
+  id?: string | null;
   itemId?: string | null;
   description?: string | null;
   quantity: string | number;
@@ -803,9 +805,35 @@ export async function updateEstimate(ctx: ServiceContext, id: string, input: Cre
       tx, 'estimate', id, { refNumber: current.refNumber, number: current.estimateNumber },
       input.refNumber, { allowDuplicate: input.allowDuplicateNumber === true },
     );
+    // Each row keeps the id of the saved line it edits (the id it sends, else the line at the same
+    // place with the same item), so pending invoices linked to it (estimateLineId) keep their links;
+    // replacing every line with new ids left those links pointing at deleted lines. Links to lines
+    // the edit removes are cleared (only pending invoices can have them: a billed estimate is locked).
+    const savedIds = new Set(existing.lines.map((l) => l.id));
+    const keptIds = new Map<number, string>();
+    const used = new Set<string>();
+    input.lines.forEach((l, i) => {
+      if (l.id && savedIds.has(l.id) && !used.has(l.id)) {
+        keptIds.set(i, l.id);
+        used.add(l.id);
+      }
+    });
+    input.lines.forEach((l, i) => {
+      if (keptIds.has(i) || l.id) return;
+      const o = existing.lines.find((x) => x.lineOrder === i);
+      if (o && !used.has(o.id) && (o.itemId ?? null) === (l.itemId ?? null)) {
+        keptIds.set(i, o.id);
+        used.add(o.id);
+      }
+    });
+    const removedIds = existing.lines.filter((l) => !used.has(l.id)).map((l) => l.id);
+    if (removedIds.length) {
+      await tx.db.update(invoiceLines).set({ estimateLineId: null }).where(inArray(invoiceLines.estimateLineId, removedIds));
+    }
     await tx.db.delete(estimateLines).where(eq(estimateLines.estimateId, id));
     await tx.db.insert(estimateLines).values(
       computedLines.map((cl) => ({
+        ...(keptIds.has(cl.lineOrder) ? { id: keptIds.get(cl.lineOrder)! } : {}),
         estimateId: id,
         itemId: cl.itemId,
         description: cl.description,

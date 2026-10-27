@@ -44,6 +44,8 @@ interface Customer {
   email: string | null;
   phone: string | null;
   balance: string;
+  /** Own balance plus sub-customers and jobs (QB "Balance Total"), from the A/R ledger. */
+  balanceTotal?: string;
   isActive: boolean;
   terms: string | null;
   notes: string | null;
@@ -505,9 +507,10 @@ function CustomersPageContent() {
   async function fetchCustomers() {
     setLoading(true);
     try {
+      // Balances come from the A/R ledger (the stored customers.balance column is not kept up to date).
       const url = includeInactive
-        ? '/api/customers?includeInactive=true'
-        : '/api/customers';
+        ? '/api/customers?includeInactive=true&withBalances=true'
+        : '/api/customers?withBalances=true';
       const data = await api.get<Customer[]>(url);
       setCustomers(data);
     } catch (err) {
@@ -801,7 +804,7 @@ function CustomersPageContent() {
                 <Th>Terms</Th>
                 {showCustomCols &&
                   customFieldNames.map((name) => <Th key={name}>{name}</Th>)}
-                <Th numeric>Balance</Th>
+                <Th numeric>Balance Total</Th>
                 <Th>Status</Th>
                 <Th className="text-right">Actions</Th>
               </tr>
@@ -832,7 +835,7 @@ function CustomersPageContent() {
                       </Td>
                     ))}
                   <Td numeric className="font-semibold text-navy">
-                    {formatCurrency(c.balance)}
+                    {formatCurrency(c.balanceTotal ?? c.balance)}
                   </Td>
                   <Td>
                     {c.isActive ? (

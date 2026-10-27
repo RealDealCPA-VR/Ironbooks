@@ -73,6 +73,7 @@ import {
 } from './_base';
 import { billHasReceiptLinks, releaseReceiptBilling } from './receivingLinks';
 import { assertRedateAfterVendorCreditSteps, clearSettledForeignApplications } from './vendorCreditsFx';
+import { assertLineJobs } from './jobCustomers';
 
 // ---------------------------------------------------------------------------
 // Input / output types
@@ -434,6 +435,9 @@ async function prepareBill(ctx: ServiceContext, input: CreateBillInput): Promise
       total = total.plus(amt);
     }
   }
+
+  // A billable line's job must belong to its customer (a line with only a job takes its customer).
+  await assertLineJobs(ctx, resolvedLines, { fill: true });
 
   if (!total.greaterThan(0)) {
     throw validation('The bill total must be more than zero.');
@@ -1194,6 +1198,10 @@ export async function updateBill(ctx: ServiceContext, id: string, input: CreateB
     // offered for billing again) when the edit leaves them financially unchanged; changing one
     // is refused, as for checks/expenses (expenses.ts).
     const billedLinkByNewIdx = new Map<number, string>();
+    // The re-inserted line keeps the billed line's id: the invoice line that bills it names it
+    // (invoice_lines.billable_source), so removing the cost from the invoice later still finds and
+    // releases it. A new id left the invoice pointing at a deleted line, and the cost stayed billed.
+    const billedIdByNewIdx = new Map<number, string>();
     const billedOld = oldLines.filter((l) => l.billedInvoiceId);
     if (billedOld.length) {
       const sameCurrency = (prep.currency ?? null) === (bill.currency ?? null);
@@ -1215,6 +1223,7 @@ export async function updateBill(ctx: ServiceContext, id: string, input: CreateB
           );
         }
         billedLinkByNewIdx.set(idx, o.billedInvoiceId!);
+        billedIdByNewIdx.set(idx, o.id);
       }
     }
 
@@ -1243,6 +1252,7 @@ export async function updateBill(ctx: ServiceContext, id: string, input: CreateB
     await tx.db.delete(billLines).where(eq(billLines.billId, id));
     await tx.db.insert(billLines).values(
       prep.resolvedLines.map((line, idx) => ({
+        ...(billedIdByNewIdx.has(idx) ? { id: billedIdByNewIdx.get(idx)! } : {}),
         billId: id,
         accountId: line.accountId,
         itemId: line.itemId,

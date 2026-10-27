@@ -6,6 +6,8 @@ import { zDate, zDecimal, zDocNumber, zLines, zUuid } from './helpers';
 import { sendFlagFields, zShipTo } from './sales';
 
 export const estimateLineSchema = z.object({
+  /** Edit only: the saved estimate line this row updates (keeps its id). */
+  id: zUuid.nullish(),
   itemId: zUuid.nullish(),
   description: z.string().nullish(),
   quantity: zDecimal,

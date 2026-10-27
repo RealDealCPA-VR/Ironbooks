@@ -109,6 +109,8 @@ interface TaxRate {
 }
 
 interface EstimateLineForm {
+  /** The saved line this row edits (sent back so the line keeps its id and its invoice links). */
+  id?: string;
   itemId: string;
   description: string;
   quantity: string;
@@ -503,6 +505,7 @@ export default function EstimatesPage() {
         taxRateId: detail.taxRateId ?? '',
         memo: detail.memo ?? '',
         lines: detail.lines.map((l) => ({
+          id: l.id,
           itemId: l.itemId ?? '',
           description: l.description ?? '',
           quantity: String(Number(l.quantity)),
@@ -562,6 +565,7 @@ export default function EstimatesPage() {
         taxRateId: addForm.taxRateId || null,
         memo: addForm.memo || null,
         lines: addForm.lines.map((l, i) => ({
+          ...(editingId && l.id ? { id: l.id } : {}),
           itemId: l.itemId || null,
           description: l.description.trim(),
           // Blank rate on an item line: the server prices it (advanced pricing).

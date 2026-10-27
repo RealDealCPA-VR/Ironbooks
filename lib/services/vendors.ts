@@ -13,6 +13,7 @@
  */
 import { and, asc, eq, ne, sql } from 'drizzle-orm';
 import { accounts, vendors } from '@/lib/db/schema';
+import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, assertRefInCompany, inTransaction, notFound, validation, writeAudit } from './_base';
 import { getPreferences } from './preferences';
 import { maskForContext } from './access';
@@ -307,4 +308,22 @@ export async function reactivateVendor(ctx: ServiceContext, id: string) {
 /** Unmasked vendor row for internal snapshots (Undo restores it through updateVendor). */
 export async function loadVendorUnmasked(ctx: ServiceContext, id: string) {
   return loadVendor(ctx, id);
+}
+
+/**
+ * Vendors with what is owed to each as the A/P ledger has it (home currency, by name — the same
+ * figure as Vendor Balance Summary). The stored vendors.balance column is never maintained by the
+ * posting engine, so the Vendor Center showed 0.00 for everyone.
+ */
+export async function listVendorsWithBalances(ctx: ServiceContext, opts?: { includeInactive?: boolean }) {
+  const rows = await listVendors(ctx, opts);
+  // Lazy import: the report engine imports the document services, which import this module.
+  const { ledgerTotalsByName, loadAccountMeta } = await import('./reportEngine');
+  const meta = await loadAccountMeta(ctx);
+  const owed = new Map<string, ReturnType<typeof Money.zero>>();
+  for (const t of await ledgerTotalsByName(ctx, meta, { sections: ['ap'] })) {
+    if (t.nameType !== 'vendor' || !t.nameId) continue;
+    owed.set(t.nameId, (owed.get(t.nameId) ?? Money.zero()).plus(t.natural));
+  }
+  return rows.map((r) => ({ ...r, balance: toAmountString(owed.get(r.id) ?? Money.zero()) }));
 }

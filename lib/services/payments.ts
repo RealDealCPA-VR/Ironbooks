@@ -73,6 +73,7 @@ import {
   validateJournalChargesForPayment,
 } from './journalApplications';
 import { clearPaymentFxReliefs, ensureLegacyFxRelief, homeAt, invoiceHomeOpenNow, recordPaymentFxRelief } from './fxSubledger'; // p1 fx
+import { companyToday } from './salesDates';
 
 // ---- Types ------------------------------------------------------------------
 
@@ -1660,7 +1661,8 @@ export async function recordBouncedCheck(ctx: ServiceContext, input: RecordBounc
   if (bankFee.lessThan(0) || customerFee.lessThan(0)) throw validation('Fees cannot be negative.');
   if (input.bankFeeAccountId) await assertAccount(ctx, input.bankFeeAccountId, 'Bank fee account', ['expense']);
   if (input.customerFeeAccountId) await assertAccount(ctx, input.customerFeeAccountId, 'Customer fee account', ['revenue']);
-  const date = input.date ?? new Date();
+  // No date: today on the company's calendar (the UTC day of this instant is tomorrow in a US evening).
+  const date = input.date ?? (await companyToday(ctx));
 
   return inTransaction(ctx, async (tx) => {
     // Every check runs on the payment as it is INSIDE the transaction: a void, edit, refund or
@@ -1975,7 +1977,8 @@ async function unapplyFromInvoiceInTx(ctx: ServiceContext, input: UnapplyFromInv
       paymentRate: payment.exchangeRate,
       unappliedBefore: payment.unapplied,
       arAccountId,
-      date: new Date(),
+      // Today on the company's calendar (with the relief record it writes), never the UTC day.
+      date: await companyToday(tx),
       sign: -1,
       description: 'FX adjustment — payment unapplied from invoice',
       sourceRef: `payment:${input.paymentId}`,
@@ -2158,7 +2161,8 @@ async function applyPaymentInTx(ctx: ServiceContext, input: ApplyPaymentInput) {
         paymentRate: payment.exchangeRate,
         unappliedBefore: unappliedLeft,
         arAccountId,
-        date: new Date(),
+        // Today on the company's calendar (with the relief record it writes), never the UTC day.
+        date: await companyToday(tx),
         sign: 1,
         description: 'FX adjustment — unapplied payment applied to invoice',
         sourceRef: `payment:${input.paymentId}`,
@@ -2289,7 +2293,7 @@ async function refundPaymentInTx(ctx: ServiceContext, input: RefundPaymentInput)
   // `todayAmount` telescopes today's credit; the refund itself telescopes the credit AS OF its own
   // date (a refund backdated before applies / later refunds entered earlier), and dated plugs
   // (postPaymentCreditFxPlugs) re-telescope the later steps, so A/R equals the aging on every date.
-  const refundDate = input.date ?? new Date();
+  const refundDate = input.date ?? (await companyToday(ctx));
   // The credit only exists from the payment's date: a refund dated earlier would debit A/R on
   // days when the customer held no credit (A/R and the aging would disagree in between).
   if (ymd(refundDate) < ymd(payment.date)) {

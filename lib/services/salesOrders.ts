@@ -573,10 +573,12 @@ export async function convertToInvoice(
         status: newStatus,
         invoiceId: invoice.id,
         // Read back by releaseSalesOrderInvoicingForInvoice when this invoice is voided.
-        invoicedQuantities: plan.map(({ line, qty }) => ({
+        invoicedQuantities: plan.map(({ line, qty }, i) => ({
           lineId: line.id,
           itemId: line.itemId ?? null,
           quantity: qty.toFixed(4),
+          // The invoice line that bills it (createInvoice keeps the plan order).
+          invoiceLineOrder: i,
         })),
       },
     });
@@ -594,17 +596,23 @@ function soStatusFromLines(lines: Array<{ quantity: string; quantityInvoiced: st
   return invoiced.some((q) => q.greaterThan(0)) ? ('partial' as const) : ('open' as const);
 }
 
+/** One sales-order line quantity an invoice holds (its conversion claim, net of later invoice edits). */
+export interface SoInvoiceClaim {
+  soId: string;
+  lineId: string;
+  itemId: string | null | undefined;
+  /** The invoice line (lineOrder) that invoices it. */
+  invoiceLineOrder: number;
+  quantity: ReturnType<typeof Money.zero>;
+}
+
 /**
- * Voiding an invoice made by convertToInvoice gives the sales-order lines back the quantities it
- * invoiced, so the order can be invoiced again (QB reopens the sales order) — the same approach
- * as releasePoBillingForBill for purchase orders. The claim is read from convertToInvoice's audit
- * row ({ invoiceId, invoicedQuantities }), written in the same transaction as the claim. Editing
- * the invoice later does not change what it claimed, so the void releases the original claim
- * (never below zero). A line that no longer has its id (orders edited before ids were kept) is
- * matched by item. An order the user closed by hand (backorder cancelled) stays closed; otherwise
- * the status is recomputed from the lines.
+ * The sales-order line quantities an invoice holds: convertToInvoice's audit row ({ invoiceId,
+ * invoicedQuantities }) plus the signed adjustments later edits of the invoice recorded
+ * (syncSoInvoicingForInvoiceEdit), netted per order line and invoice line. Rows written before
+ * invoiceLineOrder was recorded map by their position in the conversion (createInvoice keeps it).
  */
-export async function releaseSalesOrderInvoicingForInvoice(ctx: ServiceContext, invoiceId: string): Promise<void> {
+export async function soClaimsForInvoice(ctx: ServiceContext, invoiceId: string): Promise<SoInvoiceClaim[]> {
   const rows = await ctx.db
     .select({ entityId: auditLogs.entityId, newValues: auditLogs.newValues })
     .from(auditLogs)
@@ -615,14 +623,192 @@ export async function releaseSalesOrderInvoicingForInvoice(ctx: ServiceContext, 
         sql`${auditLogs.newValues}->>'invoiceId' = ${invoiceId}`,
         sql`${auditLogs.newValues}->'invoicedQuantities' IS NOT NULL`,
       ),
-    );
+    )
+    .orderBy(asc(auditLogs.createdAt));
+  const net = new Map<string, SoInvoiceClaim>();
   for (const row of rows) {
-    const soId = row.entityId;
     const nv = (row.newValues ?? {}) as {
-      invoicedQuantities?: Array<{ lineId?: string; itemId?: string | null; quantity?: string }>;
+      invoicedQuantities?: Array<{ lineId?: string; itemId?: string | null; quantity?: string; invoiceLineOrder?: number }>;
     };
-    const claims = (nv.invoicedQuantities ?? []).filter((c) => Money.of(c.quantity ?? 0).greaterThan(0));
-    if (!soId || claims.length === 0) continue;
+    (nv.invoicedQuantities ?? []).forEach((c, i) => {
+      if (!row.entityId) return;
+      let qty;
+      try {
+        qty = Money.of(c.quantity ?? 0);
+      } catch {
+        return; // malformed history
+      }
+      const invoiceLineOrder = Number.isInteger(c.invoiceLineOrder) ? (c.invoiceLineOrder as number) : i;
+      const key = `${row.entityId}|${c.lineId ?? `item:${c.itemId ?? ''}`}|${invoiceLineOrder}`;
+      const prev = net.get(key);
+      net.set(key, {
+        soId: row.entityId,
+        lineId: c.lineId ?? '',
+        itemId: c.itemId,
+        invoiceLineOrder,
+        quantity: (prev?.quantity ?? Money.zero()).plus(qty),
+      });
+    });
+  }
+  return [...net.values()];
+}
+
+/**
+ * An invoice made from a sales order is being edited (call INSIDE updateInvoice's transaction,
+ * with its saved lines and the new ones): the order's invoiced quantity follows the invoice, as in
+ * QuickBooks. It used to keep the original claim, so an invoice cut from 10 units to 6 left the
+ * order closed with 10 invoiced — the 4 still to ship could never be invoiced, and voiding the
+ * invoice gave back 10.
+ *
+ * Each order line stays with the invoice line that invoices it (same position and item; a line
+ * that moved is found by its item). A line taken off the invoice gives its quantity back. An edit
+ * that would invoice more than the order has left is refused; the customer can't change.
+ */
+export async function syncSoInvoicingForInvoiceEdit(
+  ctx: ServiceContext,
+  input: {
+    invoiceId: string;
+    customerChanged: boolean;
+    oldLines: ReadonlyArray<{ lineOrder: number; itemId: string | null; quantity: string }>;
+    newLines: ReadonlyArray<{ itemId: string | null; quantity: string }>;
+  },
+): Promise<void> {
+  const claims = (await soClaimsForInvoice(ctx, input.invoiceId)).filter((c) => c.lineId && c.quantity.greaterThan(0));
+  if (claims.length === 0) return;
+  const soIds = [...new Set(claims.map((c) => c.soId))];
+  const orders = await ctx.db
+    .select()
+    .from(salesOrders)
+    .where(and(eq(salesOrders.companyId, ctx.companyId), inArray(salesOrders.id, soIds)));
+  const byId = new Map(orders.map((o) => [o.id, o] as const));
+  const label = (soId: string) => {
+    const o = byId.get(soId);
+    return o ? `sales order #${docRef(o.refNumber, o.orderNumber)}` : 'a sales order';
+  };
+  if (input.customerChanged) {
+    throw new ServiceError(
+      'CONFLICT',
+      `This invoice was created from ${label(claims[0].soId)}, so its customer can't change. Void it and invoice the other customer instead.`,
+    );
+  }
+  // 1. Where each claimed order line is on the edited invoice, and how far its quantity moves.
+  const oldByOrder = new Map(input.oldLines.map((l) => [l.lineOrder, l] as const));
+  const taken = new Set<number>();
+  type Move = { claim: SoInvoiceClaim; newOrder: number; newQty: ReturnType<typeof Money.zero> };
+  const moves: Move[] = [];
+  const sameItem = (i: number, itemId: string | null | undefined) => (input.newLines[i]?.itemId ?? null) === (itemId ?? null);
+  for (const c of claims) {
+    const before = oldByOrder.get(c.invoiceLineOrder);
+    const itemId = before?.itemId ?? c.itemId ?? null;
+    let at =
+      !taken.has(c.invoiceLineOrder) && input.newLines[c.invoiceLineOrder] && sameItem(c.invoiceLineOrder, itemId)
+        ? c.invoiceLineOrder
+        : -1;
+    if (at < 0 && itemId) at = input.newLines.findIndex((_, i) => !taken.has(i) && sameItem(i, itemId));
+    if (at >= 0) taken.add(at);
+    moves.push({ claim: c, newOrder: at, newQty: at >= 0 ? Money.of(input.newLines[at].quantity) : Money.zero() });
+  }
+  const changed = moves.filter(
+    (m) => !m.newQty.equals(m.claim.quantity) || (m.newOrder >= 0 && m.newOrder !== m.claim.invoiceLineOrder),
+  );
+  if (changed.length === 0) return;
+
+  // 2. Move the counters (guarded: never past the ordered quantity or below zero) and re-derive the
+  //    order status; a status the user set by hand (backorder closed) is kept, as on a void.
+  const linesOf = async (soId: string) =>
+    ctx.db
+      .select({ quantity: salesOrderLines.quantity, quantityInvoiced: salesOrderLines.quantityInvoiced })
+      .from(salesOrderLines)
+      .where(eq(salesOrderLines.salesOrderId, soId));
+  for (const soId of soIds) {
+    const mine = changed.filter((m) => m.claim.soId === soId);
+    if (mine.length === 0) continue;
+    const order = byId.get(soId);
+    if (!order || order.status === 'void') continue;
+    const derivedBefore = soStatusFromLines(await linesOf(soId));
+    for (const m of mine) {
+      const delta = m.newQty.minus(m.claim.quantity);
+      if (delta.isZero()) continue;
+      const d = delta.toFixed(4);
+      const moved = await ctx.db
+        .update(salesOrderLines)
+        .set({ quantityInvoiced: sql`${salesOrderLines.quantityInvoiced} + ${d}::numeric` })
+        .where(
+          and(
+            eq(salesOrderLines.id, m.claim.lineId),
+            eq(salesOrderLines.salesOrderId, soId),
+            sql`${salesOrderLines.quantityInvoiced} + ${d}::numeric <= ${salesOrderLines.quantity}`,
+            sql`${salesOrderLines.quantityInvoiced} + ${d}::numeric >= 0`,
+          ),
+        )
+        .returning({ id: salesOrderLines.id });
+      if (moved.length === 0) {
+        const [sl] = await ctx.db.select().from(salesOrderLines).where(eq(salesOrderLines.id, m.claim.lineId));
+        const open = sl ? Money.of(sl.quantity).minus(Money.of(sl.quantityInvoiced ?? '0')) : Money.zero();
+        throw validation(
+          `Line ${(m.newOrder >= 0 ? m.newOrder : m.claim.invoiceLineOrder) + 1}: ${label(soId)} has ${m.claim.quantity.plus(open).toFixed(2)} on order for this line that this invoice can take (${m.claim.quantity.toFixed(2)} invoiced here, ${open.toFixed(2)} not yet invoiced). Change the sales order first to invoice more.`,
+        );
+      }
+    }
+    const derivedAfter = soStatusFromLines(await linesOf(soId));
+    const status = order.status !== derivedBefore ? order.status : derivedAfter;
+    await ctx.db
+      .update(salesOrders)
+      .set({
+        status: status as never,
+        ...(status !== 'closed' && order.convertedInvoiceId === input.invoiceId ? { convertedInvoiceId: null } : {}),
+        ...(status === 'closed' && !order.convertedInvoiceId ? { convertedInvoiceId: input.invoiceId } : {}),
+      })
+      .where(and(eq(salesOrders.id, soId), eq(salesOrders.companyId, ctx.companyId)));
+    // The signed adjustment, read back by soClaimsForInvoice (a later edit or the invoice's void):
+    // the old claim comes off its invoice line and the new quantity goes on the line that has it now.
+    await writeAudit(ctx, {
+      action: 'update',
+      entityType: 'sales_order',
+      entityId: soId,
+      oldValues: { status: order.status },
+      newValues: {
+        status,
+        reason: 'invoice_edited',
+        invoiceId: input.invoiceId,
+        invoicedQuantities: mine.flatMap((m) => [
+          {
+            lineId: m.claim.lineId,
+            itemId: m.claim.itemId ?? null,
+            quantity: m.claim.quantity.negated().toFixed(4),
+            invoiceLineOrder: m.claim.invoiceLineOrder,
+          },
+          ...(m.newOrder >= 0 && m.newQty.greaterThan(0)
+            ? [{ lineId: m.claim.lineId, itemId: m.claim.itemId ?? null, quantity: m.newQty.toFixed(4), invoiceLineOrder: m.newOrder }]
+            : []),
+        ]),
+      },
+    });
+  }
+}
+
+/**
+ * Voiding an invoice made by convertToInvoice gives the sales-order lines back the quantities it
+ * holds, so the order can be invoiced again (QB reopens the sales order) — the same approach as
+ * releasePoBillingForBill for purchase orders. What it holds is its conversion claim net of the
+ * adjustments its edits recorded (soClaimsForInvoice); never released below zero. A line that no
+ * longer has its id (orders edited before ids were kept) is matched by item. An order the user
+ * closed by hand (backorder cancelled) stays closed; otherwise the status is recomputed.
+ */
+export async function releaseSalesOrderInvoicingForInvoice(ctx: ServiceContext, invoiceId: string): Promise<void> {
+  // Net per order line across the conversion and any later edits of the invoice.
+  type Held = { lineId: string; itemId: string | null | undefined; quantity: ReturnType<typeof Money.zero> };
+  const bySo = new Map<string, Held[]>();
+  for (const c of await soClaimsForInvoice(ctx, invoiceId)) {
+    const list = bySo.get(c.soId) ?? [];
+    const same = list.find((x) => (c.lineId ? x.lineId === c.lineId : !x.lineId && (x.itemId ?? null) === (c.itemId ?? null)));
+    if (same) same.quantity = same.quantity.plus(c.quantity);
+    else list.push({ lineId: c.lineId, itemId: c.itemId, quantity: c.quantity });
+    bySo.set(c.soId, list);
+  }
+  for (const [soId, held] of bySo) {
+    const claims = held.filter((c) => c.quantity.greaterThan(0));
+    if (claims.length === 0) continue;
     const [order] = await ctx.db
       .select()
       .from(salesOrders)
@@ -660,7 +846,7 @@ export async function releaseSalesOrderInvoicingForInvoice(ctx: ServiceContext, 
       return q;
     };
     for (const c of claims) {
-      let rest = Money.of(c.quantity!);
+      let rest = c.quantity;
       if (c.lineId && left.has(c.lineId)) {
         rest = rest.minus(await take(c.lineId, rest));
         continue;

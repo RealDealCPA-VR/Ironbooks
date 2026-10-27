@@ -511,6 +511,8 @@ export const estimates = pgTable('estimates', {
   toBePrinted: boolean('to_be_printed').notNull().default(false),
   toBeEmailed: boolean('to_be_emailed').notNull().default(false),
   lastEmailedAt: timestamp('last_emailed_at'),
+  /** salesar (0080): Customer Message list entry printed at the foot of the form (B8). */
+  customerMessageId: uuid('customer_message_id').references((): any => customerMessages.id),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });
@@ -532,6 +534,8 @@ export const estimateLines = pgTable('estimate_lines', {
   /** fix/sales (0036): billed before per-line links existed (backfill); new billing is linked. */
   priorQtyInvoiced: decimal('prior_qty_invoiced', { precision: 15, scale: 4 }).notNull().default('0'),
   priorAmountInvoiced: decimal('prior_amount_invoiced', { precision: 15, scale: 2 }).notNull().default('0'),
+  /** salesar (0080): the line's Sales Tax Code (B9); `taxable` follows it. */
+  salesTaxCodeId: uuid('sales_tax_code_id').references((): any => salesTaxCodes.id),
 });
 
 // ---- Invoices (A/R) ----
@@ -578,6 +582,8 @@ export const invoices = pgTable('invoices', {
   lastEmailedAt: timestamp('last_emailed_at'),
   /** wave2 sales (C5): a customer-register statement charge (single line, appears on statements/aging). */
   isStatementCharge: boolean('is_statement_charge').notNull().default(false),
+  /** salesar (0080): Customer Message list entry printed at the foot of the form (B8). */
+  customerMessageId: uuid('customer_message_id').references((): any => customerMessages.id),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });
@@ -602,6 +608,8 @@ export const invoiceLines = pgTable('invoice_lines', {
   estimateLineId: uuid('estimate_line_id'),
   /** r5 sales (0064): the billable cost / time this line bills (released when an edit drops it). */
   billableSource: jsonb('billable_source').$type<{ kind: 'bill_line' | 'expense_line' | 'time_entry'; id: string }>(),
+  /** salesar (0080): the line's Sales Tax Code (B9); `taxable` follows it. */
+  salesTaxCodeId: uuid('sales_tax_code_id').references((): any => salesTaxCodes.id),
 });
 
 // ---- Payments received (A/R) ----
@@ -613,6 +621,8 @@ export const paymentsReceived = pgTable('payments_received', {
   customerId: uuid('customer_id').references(() => customers.id).notNull(),
   date: timestamp('date').notNull(),
   method: paymentMethodEnum('method').notNull().default('check'),
+  /** salesar (0080): Payment Method list entry (B7); `method` keeps its type. */
+  paymentMethodId: uuid('payment_method_id').references((): any => paymentMethods.id),
   reference: varchar('reference', { length: 100 }),
   amount: decimal('amount', { precision: 15, scale: 2 }).notNull(),
   unapplied: decimal('unapplied', { precision: 15, scale: 2 }).notNull().default('0'),
@@ -645,6 +655,8 @@ export const salesReceipts = pgTable('sales_receipts', {
   /** Receipt-level sales tax rate (wave2 accountant: sales-tax liability attribution). */
   taxRateId: uuid('tax_rate_id').references(() => taxRates.id),
   method: paymentMethodEnum('method').notNull().default('cash'),
+  /** salesar (0080): Payment Method list entry (B7); `method` keeps its type. */
+  paymentMethodId: uuid('payment_method_id').references((): any => paymentMethods.id),
   reference: varchar('reference', { length: 100 }),
   status: docStatusEnum('status').notNull().default('paid'),
   classId: uuid('class_id').references(() => classes.id),
@@ -664,6 +676,8 @@ export const salesReceipts = pgTable('sales_receipts', {
   toBePrinted: boolean('to_be_printed').notNull().default(false),
   toBeEmailed: boolean('to_be_emailed').notNull().default(false),
   lastEmailedAt: timestamp('last_emailed_at'),
+  /** salesar (0080): Customer Message list entry printed at the foot of the form (B8). */
+  customerMessageId: uuid('customer_message_id').references((): any => customerMessages.id),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -683,6 +697,8 @@ export const salesReceiptLines = pgTable('sales_receipt_lines', {
   lineOrder: integer('line_order').notNull().default(0),
   /** Advanced pricing: which price rule/level priced this line (lib/services/pricing.ts). */
   pricing: jsonb('pricing').$type<Record<string, unknown>>(),
+  /** salesar (0080): the line's Sales Tax Code (B9); `taxable` follows it. */
+  salesTaxCodeId: uuid('sales_tax_code_id').references((): any => salesTaxCodes.id),
 });
 
 export const paymentApplications = pgTable('payment_applications', {
@@ -1127,6 +1143,11 @@ export const creditMemos = pgTable('credit_memos', {
   toBePrinted: boolean('to_be_printed').notNull().default(false),
   toBeEmailed: boolean('to_be_emailed').notNull().default(false),
   lastEmailedAt: timestamp('last_emailed_at'),
+  /** salesar (0080): class and Customer:Job of the memo (lines without their own take these). */
+  classId: uuid('class_id').references(() => classes.id),
+  jobId: uuid('job_id').references((): any => jobs.id),
+  /** salesar (0080): Customer Message list entry printed at the foot of the form (B8). */
+  customerMessageId: uuid('customer_message_id').references((): any => customerMessages.id),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -1145,6 +1166,11 @@ export const creditMemoLines = pgTable('credit_memo_lines', {
   restock: boolean('restock').notNull().default(true),
   /** drizzle/0055 (B12): which price rule/level priced this line (lib/services/pricing.ts). */
   pricing: jsonb('pricing').$type<Record<string, unknown>>(),
+  /** salesar (0080): class and Customer:Job of the line (job costing, P&L by class). */
+  classId: uuid('class_id').references(() => classes.id),
+  jobId: uuid('job_id').references((): any => jobs.id),
+  /** salesar (0080): the line's Sales Tax Code (B9); `taxable` follows it. */
+  salesTaxCodeId: uuid('sales_tax_code_id').references((): any => salesTaxCodes.id),
 });
 
 // ---- Vendor credits (A/P credits) ----
@@ -1220,6 +1246,8 @@ export const salesOrders = pgTable('sales_orders', {
   toBePrinted: boolean('to_be_printed').notNull().default(false),
   toBeEmailed: boolean('to_be_emailed').notNull().default(false),
   lastEmailedAt: timestamp('last_emailed_at'),
+  /** salesar (0080): Customer Message list entry printed at the foot of the form (B8). */
+  customerMessageId: uuid('customer_message_id').references((): any => customerMessages.id),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -1238,6 +1266,8 @@ export const salesOrderLines = pgTable('sales_order_lines', {
   pricing: jsonb('pricing').$type<Record<string, unknown>>(),
   /** p1/salesforms: QB "Tax" column (drizzle/0040). */
   taxable: boolean('taxable').notNull().default(true),
+  /** salesar (0080): the line's Sales Tax Code (B9); `taxable` follows it. */
+  salesTaxCodeId: uuid('sales_tax_code_id').references((): any => salesTaxCodes.id),
 });
 
 // ---- Jobs / Projects (job costing) ----
@@ -2826,4 +2856,23 @@ export const accountantCopyBaseline = pgTable('accountant_copy_baseline', {
   digest: text('digest'),
   /** 0058: 'void' | 'draft' | 'live', or the status of an estimate / sales order / purchase order. */
   state: varchar('state', { length: 20 }),
+});
+
+// ---- salesar (0080): Billing Groups (C6) ----
+
+/** QB Batch Invoicing "Billing Group": a named group of customers billed together. */
+export const billingGroups = pgTable('billing_groups', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  name: varchar('name', { length: 100 }).notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
+export const billingGroupMembers = pgTable('billing_group_members', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  groupId: uuid('group_id').references(() => billingGroups.id, { onDelete: 'cascade' }).notNull(),
+  customerId: uuid('customer_id').references(() => customers.id).notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
 });

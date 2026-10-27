@@ -114,15 +114,15 @@ export async function incomeTracker(
     .select({ id: estimates.id, customerId: estimates.customerId, num: estimates.estimateNumber, ref: estimates.refNumber, date: estimates.date, exp: estimates.expirationDate, total: estimates.total, invoiced: estimates.amountInvoiced, status: estimates.status, convertedInvoiceId: estimates.convertedInvoiceId })
     .from(estimates)
     .where(and(...estConds));
-  // Amounts billed from each estimate by invoices dated AFTER the day (not yet billed on it).
+  // Amounts billed from each estimate by invoices dated AFTER the day (not yet billed on it), in
+  // the same terms as estimates.amountInvoiced: the posted invoices' totals, sales tax included
+  // (estimateBilling.refreshEstimateBilling). Summing their pre-tax line amounts instead left the
+  // tax of a later bill counted as billed on the day.
   const estBilledLater = new Map<string, ReturnType<typeof Money.zero>>();
   const convertedLater = new Set<string>();
   if (ests.length > 0) {
-    for (const r of await ctx.db
-      .select({
-        estimateId: estimateLines.estimateId,
-        amount: sql<string>`COALESCE(SUM(CAST(${invoiceLines.amount} AS NUMERIC)), 0)`,
-      })
+    const laterBills = await ctx.db
+      .selectDistinct({ estimateId: estimateLines.estimateId, invoiceId: invoices.id, total: invoices.total })
       .from(invoiceLines)
       .innerJoin(estimateLines, eq(estimateLines.id, invoiceLines.estimateLineId))
       .innerJoin(invoices, eq(invoices.id, invoiceLines.invoiceId))
@@ -130,12 +130,13 @@ export async function incomeTracker(
         and(
           eq(invoices.companyId, ctx.companyId),
           nonVoidInvoice,
+          ne(invoices.status, 'draft'),
           gt(invoices.date, cutoff),
           inArray(estimateLines.estimateId, ests.map((e) => e.id)),
         ),
-      )
-      .groupBy(estimateLines.estimateId)) {
-      estBilledLater.set(r.estimateId, Money.of(r.amount));
+      );
+    for (const r of laterBills) {
+      estBilledLater.set(r.estimateId, (estBilledLater.get(r.estimateId) ?? Money.zero()).plus(Money.of(r.total)));
     }
     const convIds = ests.map((e) => e.convertedInvoiceId).filter((x): x is string => !!x);
     if (convIds.length > 0) {

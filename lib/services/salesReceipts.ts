@@ -397,6 +397,8 @@ async function postSalesReceiptDocument(
   receipt: { id: string; receiptNumber: number; refNumber?: string | null },
   input: CreateSalesReceiptInput,
   prep: PreparedSalesReceipt,
+  /** Edit: a line that sends no site / bin / serial / lot keeps the one it was saved with. */
+  opts: { carryForward?: boolean } = {},
 ) {
   const { depositAccountId, taxPayableId, itemMap, computedLines, grossIncome, taxAmount, total } = prep;
   // The number shown on the GL: the typed ref number, else the legacy integer.
@@ -553,6 +555,9 @@ async function postSalesReceiptDocument(
       };
     }),
     memo: `Sales Receipt #${shownNumber}`,
+    // An edit from a client that does not send the line detail must not move the stock to the
+    // default site (invoices carry it forward the same way).
+    carryForward: opts.carryForward === true,
   });
 
   return { insertedLines, entry, cogsEntries };
@@ -1004,6 +1009,7 @@ async function updateSalesReceiptInTx(
       },
       input,
       prep,
+      { carryForward: true },
     );
 
     const [updated] = await tx.db

@@ -59,10 +59,10 @@ export async function POST(req: NextRequest) {
         chargeLineId: b.chargeLineId ?? null,
         amount: b.amount,
         date: b.date ?? null,
-      });
+      }, { side: 'ap' }); // this screen's side only (an A/R credit is not applied here)
       return NextResponse.json({ application }, { status: 201 });
     }
-    const application = await unapplyJournalApplication(ctx, b.applicationId);
+    const application = await unapplyJournalApplication(ctx, b.applicationId, { side: 'ap' });
     return NextResponse.json({ application });
   } catch (err) {
     return routeError(err, 'POST /api/bill-payments/journal-items');

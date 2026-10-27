@@ -1,10 +1,11 @@
 /**
- * GET  /api/vendors   — list vendors (optional ?includeInactive=true)
+ * GET  /api/vendors   — list vendors (optional ?includeInactive=true; ?withBalances=true adds each
+ *                       vendor's A/P ledger balance, for the Vendor Center)
  * POST /api/vendors   — create a new vendor
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
-import { createVendor, listVendors } from '@/lib/services/vendors';
+import { createVendor, listVendors, listVendorsWithBalances } from '@/lib/services/vendors';
 import { ServiceError } from '@/lib/services/_base';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { createVendorSchema } from '@/lib/validation/vendors';
@@ -23,7 +24,10 @@ export async function GET(req: NextRequest) {
   try {
     const ctx = await getServerContext();
     const includeInactive = req.nextUrl.searchParams.get('includeInactive') === 'true';
-    const rows = await listVendors(ctx, { includeInactive });
+    const rows =
+      req.nextUrl.searchParams.get('withBalances') === 'true'
+        ? await listVendorsWithBalances(ctx, { includeInactive })
+        : await listVendors(ctx, { includeInactive });
     return NextResponse.json(rows);
   } catch (err) {
     return errorResponse(err);

@@ -16,6 +16,7 @@
  */
 import { and, eq, inArray, like, sql } from 'drizzle-orm';
 import {
+  billingGroupMembers,
   bouncedChecks,
   collectionNotes,
   customers,
@@ -209,6 +210,28 @@ export async function mergeCustomers(
       .update(collectionNotes)
       .set({ customerId: toId })
       .where(and(eq(collectionNotes.customerId, fromId), eq(collectionNotes.companyId, tx.companyId)));
+    // salesar (C6): Billing Groups keep the survivor (dropped where it is already a member).
+    const survivorGroups = (
+      await tx.db
+        .select({ g: billingGroupMembers.groupId })
+        .from(billingGroupMembers)
+        .where(and(eq(billingGroupMembers.customerId, toId), eq(billingGroupMembers.companyId, tx.companyId)))
+    ).map((r) => r.g);
+    if (survivorGroups.length) {
+      await tx.db
+        .delete(billingGroupMembers)
+        .where(
+          and(
+            eq(billingGroupMembers.customerId, fromId),
+            eq(billingGroupMembers.companyId, tx.companyId),
+            inArray(billingGroupMembers.groupId, survivorGroups),
+          ),
+        );
+    }
+    await tx.db
+      .update(billingGroupMembers)
+      .set({ customerId: toId })
+      .where(and(eq(billingGroupMembers.customerId, fromId), eq(billingGroupMembers.companyId, tx.companyId)));
 
     // customerPrices: drop any from-customer price whose item is already priced for the
     // survivor (no unique constraint exists, but we avoid creating duplicate price rows),

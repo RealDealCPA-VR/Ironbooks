@@ -28,6 +28,8 @@ import {
   items,
   salesReceipts,
   salesReceiptLines,
+  creditMemos,
+  creditMemoLines,
 } from '@/lib/db/schema';
 import { toAmountString, Money } from '@/lib/money';
 import {
@@ -55,7 +57,8 @@ export interface CreateJobInput {
 export type UpdateJobInput = Partial<CreateJobInput> & { status?: string };
 
 export interface JobProfitabilityLineItem {
-  source: 'invoice_line' | 'bill_line' | 'expense_line';
+  /** credit_memo_line: a credit memo line for the job (a return or a write-off) — negative revenue. */
+  source: 'invoice_line' | 'credit_memo_line' | 'bill_line' | 'expense_line';
   id: string;
   description: string | null;
   amount: string;
@@ -340,6 +343,36 @@ async function jobFacts(ctx: ServiceContext, jobIds: string[]): Promise<JobFact[
     });
   }
 
+  // Credit memo lines for the job (returns, write-offs) reduce its revenue, as in the Job
+  // Profitability reports (reportsJobsTime.ts) and QuickBooks.
+  const memoJob = sql<string | null>`COALESCE(${creditMemoLines.jobId}, ${creditMemos.jobId})`;
+  const memoLines = await ctx.db
+    .select({
+      id: creditMemoLines.id,
+      jobId: memoJob,
+      description: creditMemoLines.description,
+      amount: creditMemoLines.amount,
+    })
+    .from(creditMemoLines)
+    .innerJoin(creditMemos, eq(creditMemoLines.creditMemoId, creditMemos.id))
+    .leftJoin(items, and(eq(creditMemoLines.itemId, items.id), eq(items.companyId, ctx.companyId)))
+    .where(
+      and(
+        eq(creditMemos.companyId, ctx.companyId),
+        sql`${memoJob} IN (${sql.join(jobIds.map((id) => sql`${id}::uuid`), sql`, `)})`,
+        ne(creditMemos.status, 'void'),
+        REVENUE_LINE_ONLY,
+      ),
+    );
+  for (const l of memoLines) {
+    if (!l.jobId) continue;
+    out.push({
+      jobId: l.jobId,
+      kind: 'revenue',
+      line: { source: 'credit_memo_line', id: l.id, description: l.description, amount: toAmountString(Money.of(l.amount).negated()) },
+    });
+  }
+
   // Cost: bill lines and check / expense lines tagged to the job.
   const billCostLines = await ctx.db
     .select({
@@ -404,7 +437,7 @@ export async function jobProfitability(ctx: ServiceContext, jobId: string): Prom
   const budgetVariance = job.budget != null ? profit.minus(Money.of(job.budget)) : null;
 
   // Revenue lines first, then bill costs, then direct expenses (as before).
-  const order = { invoice_line: 0, bill_line: 1, expense_line: 2 } as const;
+  const order = { invoice_line: 0, credit_memo_line: 1, bill_line: 2, expense_line: 3 } as const;
   const lines = facts.map((f) => f.line).sort((a, b) => order[a.source] - order[b.source]);
 
   return {

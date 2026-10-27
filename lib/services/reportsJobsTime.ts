@@ -128,12 +128,13 @@ async function jobFacts(ctx: ServiceContext, range: { from?: Date; to?: Date }):
     if (k) out.push({ kind: 'revenue', jobKey: k, date: r.date, type: 'Sales Receipt', num: docRef(r.ref, r.num), sourceRef: `salesreceipt:${r.id}`, itemOrAccount: r.item ?? r.memo ?? '', memo: r.memo ?? '', qty: Money.of(r.qty), amount: Money.of(r.amount) });
   }
   for (const r of await ctx.db
-    .select({ id: creditMemos.id, num: creditMemos.memoNumber, ref: creditMemos.refNumber, date: creditMemos.date, customerId: creditMemos.customerId, item: items.name, memo: creditMemoLines.description, qty: creditMemoLines.quantity, amount: creditMemoLines.amount })
+    .select({ id: creditMemos.id, num: creditMemos.memoNumber, ref: creditMemos.refNumber, date: creditMemos.date, customerId: creditMemos.customerId, headJob: creditMemos.jobId, jobId: creditMemoLines.jobId, item: items.name, memo: creditMemoLines.description, qty: creditMemoLines.quantity, amount: creditMemoLines.amount })
     .from(creditMemoLines)
     .innerJoin(creditMemos, eq(creditMemoLines.creditMemoId, creditMemos.id))
     .leftJoin(items, and(eq(creditMemoLines.itemId, items.id), eq(items.companyId, c)))
     .where(and(eq(creditMemos.companyId, c), ne(creditMemos.status, 'void'), REVENUE_LINE_ONLY, ...dateConds(creditMemos.date)))) {
-    out.push({ kind: 'revenue', jobKey: `cust:${r.customerId}`, date: r.date, type: 'Credit Memo', num: docRef(r.ref, r.num), sourceRef: `credit_memo:${r.id}`, itemOrAccount: r.item ?? r.memo ?? '', memo: r.memo ?? '', qty: Money.of(r.qty).negated(), amount: Money.of(r.amount).negated() });
+    // salesar: a credit memo (a write-off too) counts against its own Customer:Job when it has one.
+    out.push({ kind: 'revenue', jobKey: keyOf(r.jobId ?? r.headJob, r.customerId)!, date: r.date, type: 'Credit Memo', num: docRef(r.ref, r.num), sourceRef: `credit_memo:${r.id}`, itemOrAccount: r.item ?? r.memo ?? '', memo: r.memo ?? '', qty: Money.of(r.qty).negated(), amount: Money.of(r.amount).negated() });
   }
   for (const r of await ctx.db
     .select({ id: bills.id, num: bills.billNumber, date: bills.date, customerId: billLines.customerId, jobId: billLines.jobId, item: items.name, account: accounts.name, memo: billLines.description, qty: billLines.quantity, amount: billLines.amount, fx: bills.exchangeRate })
