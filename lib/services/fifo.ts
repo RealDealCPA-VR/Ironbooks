@@ -96,27 +96,35 @@ export interface LayersWorthInput {
  */
 export async function insertLayersWorth(tx: ServiceContext, input: LayersWorthInput) {
   const { itemId, date, qty } = input;
-  const value = Money.round2(input.value);
   const base = { companyId: tx.companyId, itemId, date, sourceRef: input.sourceRef ?? null };
+  return tx.db
+    .insert(inventoryLayers)
+    .values(
+      layersWorth(qty, input.value).map((p) => ({ ...base, quantityRemaining: p.qty.toFixed(4), unitCost: p.unitCost.toFixed(4) })),
+    )
+    .returning();
+}
+
+/**
+ * The (quantity, 4dp unit cost) pieces insertLayersWorth stores for `qty` units worth `value`:
+ * one piece at the nearest cost when that is worth exactly `value` (or the quantity is one unit
+ * or less), else (qty - 1) units at the cost rounded DOWN (never worth more than `value`) and one
+ * unit at the cents that leaves — together exactly `value`. Pure; used to find / re-cost a
+ * document's layers (receiving.ts).
+ */
+export function layersWorth(qty: Decimal, value0: Decimal): Array<{ qty: Decimal; unitCost: Decimal }> {
+  const value = Money.round2(value0);
   const nearest = qty.isZero() ? Money.zero() : Money.of(value.dividedBy(qty).toFixed(4));
   if (fifoLayerValue(qty, nearest).equals(value) || !qty.greaterThan(1) || value.isNegative()) {
-    return tx.db
-      .insert(inventoryLayers)
-      .values({ ...base, quantityRemaining: qty.toFixed(4), unitCost: nearest.toFixed(4) })
-      .returning();
+    return [{ qty, unitCost: nearest }];
   }
-  // (qty - 1) units at the cost rounded DOWN (never worth more than `value`), and one unit at the
-  // cents that leaves — together exactly `value`.
   const rest = qty.minus(1);
   const restCost = value.dividedBy(qty).toDecimalPlaces(4, Decimal.ROUND_DOWN);
   const lastCost = value.minus(fifoLayerValue(rest, restCost));
-  return tx.db
-    .insert(inventoryLayers)
-    .values([
-      { ...base, quantityRemaining: rest.toFixed(4), unitCost: restCost.toFixed(4) },
-      { ...base, quantityRemaining: '1.0000', unitCost: lastCost.toFixed(4) },
-    ])
-    .returning();
+  return [
+    { qty: rest, unitCost: restCost },
+    { qty: Money.of('1'), unitCost: lastCost },
+  ];
 }
 
 // ---------------------------------------------------------------------------

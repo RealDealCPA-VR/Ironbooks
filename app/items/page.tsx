@@ -224,7 +224,9 @@ function ItemsPageContent() {
   const incomeAccounts = accounts.filter((a) => a.type === 'revenue');
   const expenseAccounts = accounts.filter((a) => a.type === 'expense');
   // QB: an inventory item's Asset Account is an Other Current Asset (never a bank / Undeposited Funds).
-  const assetAccounts = accounts.filter((a) => isInventoryAssetAccount(a));
+  // The item being edited keeps its current account in the list (older files allowed any asset
+  // account), so the form shows it and saves unchanged.
+  const assetAccounts = accounts.filter((a) => isInventoryAssetAccount(a) || a.id === editingItem?.assetAccountId);
 
   // ── Modal helpers ──────────────────────────────────────────────────────────
 

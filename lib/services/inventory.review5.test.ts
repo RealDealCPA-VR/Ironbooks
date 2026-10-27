@@ -51,6 +51,8 @@ import { listSites, siteQuantities } from './inventorySites';
 import { quantityOnHandBySite, reorderBySite, serialLotInStock, transactionsBySerialLot } from './inventorySiteReports';
 import { listSiteReorderPoints, setSiteReorderPoint } from './inventorySiteOps';
 import { physicalCount, reorderReport } from './inventoryOps';
+import { enterBillForReceivedItems } from './receiving';
+import { inventoryLayers, itemReceiptLines } from '@/lib/db/schema';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-inventory-review5');
 let db: DB;
@@ -825,6 +827,11 @@ describe('review5 inventory', () => {
     expect(rep.grandTotalValue).toBe(val.grandTotal);
     const siteSum = rep.sites.reduce((s, x) => s.plus(Money.of(x.totalValue)), Money.zero());
     expect(siteSum.toFixed(2)).toBe(val.grandTotal);
+    // ...and to the GL: each widget is worth exactly the $1,000.00 its adjustment posted.
+    expect(rep.rows.find((r) => r.itemId === avg.id)!.totalValue).toBe('1000.00');
+    expect(rep.rows.find((r) => r.itemId === fifo.id)!.totalValue).toBe('1000.00');
+    expect(rep.grandTotalValue).toBe(await gl('1300'));
+    expect(siteSum.toFixed(2)).toBe(await gl('1300'));
   });
 
   it('merge: two serial-tracked items that both hold the same serial number in stock cannot be merged', async () => {
@@ -912,5 +919,155 @@ describe('review5 inventory', () => {
     expect(chk).toBeTruthy();
     const rows = (await transactionsBySerialLot(ctx, { lotNumber: 'G-1' })).rows;
     expect(rows.map((r) => [r.sourceLabel, r.sourceNumber])).toEqual([['Check', '1001']]);
+  });
+
+  // ---- round 5 fix-up: item receipts billed at another price (FIFO), legacy asset accounts ----
+
+  async function receiptLineId(receiptId: string) {
+    const [l] = await db.select().from(itemReceiptLines).where(eq(itemReceiptLines.itemReceiptId, receiptId));
+    return l.id;
+  }
+  async function openLayers(itemId: string) {
+    return (await db.select().from(inventoryLayers).where(eq(inventoryLayers.itemId, itemId)))
+      .filter((l) => Money.gt(l.quantityRemaining, 0))
+      .map((l) => `${Money.of(l.quantityRemaining).toFixed(0)}@${l.unitCost}`)
+      .sort();
+  }
+
+  it('FIFO: 3000 received for $2,000.00 and billed at 0.70 capitalize the $100 variance (every unit is on hand); GL = valuation', async () => {
+    const item = await invItem('Receipt thirds');
+    await receiveStock(ctx, { itemId: item.id, quantity: 1, unitCost: '1.00', date: d('2026-01-01') }); // FIFO from the start
+    const v = await createVendor(ctx, { displayName: 'Thirds vendor' } as never);
+    const r = await createItemReceipt(ctx, { vendorId: v.id, date: d('2026-01-02'), lines: [{ itemId: item.id, quantity: 3000, unitCost: '0.66666667' }] } as never);
+    expect(await gl('1300')).toBe('2001.00');
+    const bill = await enterBillForReceivedItems(ctx, {
+      vendorId: v.id,
+      date: d('2026-01-05'),
+      lines: [{ receiptLineId: await receiptLineId(r.id), quantity: 3000, unitCost: '0.70' }],
+    });
+    expect(bill.preview.lines[0].inventoryVariance).toBe('100.00');
+    expect(bill.preview.lines[0].expensedVariance).toBe('0.00');
+    expect(await gl('5000')).toBe('0.00');
+    expect(await gl('1300')).toBe('2101.00');
+    expect((await inventoryValuation(ctx)).grandTotal).toBe('2101.00');
+    // Voiding the bill takes exactly the variance back off the layers.
+    await voidBill(ctx, bill.id);
+    expect(await gl('1300')).toBe('2001.00');
+    expect((await inventoryValuation(ctx)).grandTotal).toBe('2001.00');
+    await consumeStock(ctx, { itemId: item.id, quantity: 3001, date: d('2026-01-06') });
+    expect(await gl('1300')).toBe('0.00');
+    expect((await inventoryValuation(ctx)).grandTotal).toBe('0.00');
+  });
+
+  it('FIFO: a price variance re-costs received layers to the cent (partial and full bills); voiding restores the receipt layer', async () => {
+    const item = await invItem('Receipt variance cents');
+    await receiveStock(ctx, { itemId: item.id, quantity: 1, unitCost: '1.00', date: d('2026-01-01') });
+    const v = await createVendor(ctx, { displayName: 'Cents vendor' } as never);
+    const r = await createItemReceipt(ctx, { vendorId: v.id, date: d('2026-01-02'), lines: [{ itemId: item.id, quantity: 3000, unitCost: '0.70' }] } as never);
+    const lineId = await receiptLineId(r.id);
+    // 1000 of the 3000 billed at 0.73333333: $733.33 against $700.00 accrued.
+    const part = await enterBillForReceivedItems(ctx, { vendorId: v.id, date: d('2026-01-03'), lines: [{ receiptLineId: lineId, quantity: 1000, unitCost: '0.73333333' }] });
+    expect(part.preview.lines[0].inventoryVariance).toBe('33.33');
+    expect(await gl('1300')).toBe('2134.33');
+    expect((await inventoryValuation(ctx)).grandTotal).toBe('2134.33');
+    await voidBill(ctx, part.id);
+    expect(await openLayers(item.id)).toEqual(['1@1.0000', '3000@0.7000']);
+    expect(await gl('1300')).toBe('2101.00');
+    expect((await inventoryValuation(ctx)).grandTotal).toBe('2101.00');
+    // All 3000 billed at 0.73333333 ($2,200.00): the whole $100.00 is capitalized, to the cent.
+    const full = await enterBillForReceivedItems(ctx, { vendorId: v.id, date: d('2026-01-04'), lines: [{ receiptLineId: lineId, quantity: 3000, unitCost: '0.73333333' }] });
+    expect(full.preview.lines[0].inventoryVariance).toBe('100.00');
+    expect(await gl('5000')).toBe('0.00');
+    expect(await gl('1300')).toBe('2201.00');
+    expect((await inventoryValuation(ctx)).grandTotal).toBe('2201.00');
+    await voidBill(ctx, full.id);
+    expect(await openLayers(item.id)).toEqual(['1@1.0000', '3000@0.7000']);
+    expect((await inventoryValuation(ctx)).grandTotal).toBe(await gl('1300'));
+  });
+
+  it('items: an item already on a Fixed Asset account (older company files) with stock still saves from Edit Item and Add/Edit Multiple', async () => {
+    const fixed = await createAccount(ctx, { code: '1590', name: 'Shop Equipment', type: 'asset' as never, subtype: 'fixed_assets' });
+    const [legacy] = await db
+      .insert(itemsTable)
+      .values({ companyId: ctx.companyId, name: 'Legacy shelf', type: 'inventory', salesPrice: '10.00', assetAccountId: fixed.id, incomeAccountId: acct['4000'], expenseAccountId: acct['5000'], quantityOnHand: '0', averageCost: '0' })
+      .returning();
+    await adjustInventory(ctx, { itemId: legacy.id, quantityChange: 5, unitCost: '2.00', date: d('2026-01-02') });
+    // The Edit Item form sends the (unchanged) asset account with every save.
+    const saved = await updateItem(ctx, legacy.id, { salesPrice: '12.00', assetAccountId: fixed.id });
+    expect(saved.salesPrice).toBe('12.00');
+    const row = (await bulkLoad(ctx, 'items')).find((x) => x.id === legacy.id)!;
+    const res = await bulkSave(ctx, 'items', [{ ...row, salesPrice: '13.00' }]);
+    expect(res.errors).toEqual([]);
+    expect((await itemRow(legacy.id)).salesPrice).toBe('13.00');
+    // Choosing a non-Other-Current-Asset account is still refused (an item with no stock, so the
+    // stock-on-hand rule does not apply).
+    const fresh = await invItem('Fresh shelf');
+    await expect(updateItem(ctx, fresh.id, { assetAccountId: fixed.id })).rejects.toMatchObject({ code: 'VALIDATION' });
+    // The Edit Item window keeps offering the item's current account so the form can be saved.
+    const src = fs.readFileSync(path.resolve(process.cwd(), 'app/items/page.tsx'), 'utf8');
+    expect(/isInventoryAssetAccount\(a\) \|\| a\.id === editingItem\?\.assetAccountId/.test(src)).toBe(true);
+  });
+
+  it("Inventory Center: an item's history reads only the audit rows of its adjustments (not one per FIFO sale)", async () => {
+    const item = await invItem('Busy FIFO part');
+    await adjustQuantityAtSite(ctx, { itemId: item.id, quantityChange: '100', unitCost: '1.00', date: d('2026-01-01'), costing: 'fifo' });
+    // A FIFO removal with no site movement: its quantity comes from its audit row.
+    await consumeStock(ctx, { itemId: item.id, quantity: 2, date: d('2026-01-02'), purpose: 'adjustment' });
+    const c = await createCustomer(ctx, { displayName: 'Busy buyer' } as never);
+    for (let i = 0; i < 12; i += 1) {
+      await createInvoice(ctx, { customerId: c.id, date: d('2026-01-03'), lines: [{ itemId: item.id, quantity: 1, rate: '5.00' }] } as never);
+    }
+    let auditRowsRead = 0;
+    const wrap = <T extends object>(builder: T, isAudit: boolean): T =>
+      new Proxy(builder, {
+        get(target, prop, receiver) {
+          const v = Reflect.get(target, prop, receiver);
+          if (prop === 'then' && typeof v === 'function') {
+            return (res: (x: unknown) => unknown, rej: (e: unknown) => unknown) =>
+              (v as (a: unknown, b: unknown) => Promise<unknown>).call(
+                target,
+                (rows: unknown) => {
+                  if (isAudit && Array.isArray(rows)) auditRowsRead += rows.length;
+                  return res(rows);
+                },
+                rej,
+              );
+          }
+          if (typeof v !== 'function') return v;
+          return (...args: unknown[]) => {
+            const out = (v as (...a: unknown[]) => unknown).apply(target, args);
+            return out && typeof out === 'object' ? wrap(out as object, isAudit || (prop === 'from' && args[0] === auditLogs)) : out;
+          };
+        },
+      });
+    const counting: ServiceContext = {
+      ...ctx,
+      db: new Proxy(db, {
+        get(target, prop, receiver) {
+          const v = Reflect.get(target, prop, receiver);
+          if (prop === 'select') return (...args: unknown[]) => wrap((v as (...a: unknown[]) => object).apply(target, args), false);
+          return typeof v === 'function' ? v.bind(target) : v;
+        },
+      }),
+    };
+    const detail = await inventoryItemDetail(counting, item.id);
+    const adj = detail.transactions.filter((x) => x.type === 'Inventory Adjustment').map((x) => x.quantity).sort();
+    expect(adj).toEqual(['-2.0000', '100.0000']);
+    expect(detail.transactions.filter((x) => x.type === 'Invoice')).toHaveLength(12);
+    // Only the FIFO removal needs its audit row (the adjustment has a site movement); the 12 FIFO
+    // sales' audit rows (with their layer draws) are not read.
+    expect(auditRowsRead).toBeLessThanOrEqual(1);
+  });
+
+  it('Inventory Center: the history rows of checks and vendor credits open the transaction (pages read ?focus=)', () => {
+    const center = fs.readFileSync(path.resolve(process.cwd(), 'lib/services/lists/inventoryCenter.ts'), 'utf8');
+    expect(center).toMatch(/path: 'expenses'/);
+    expect(center).toMatch(/path: 'vendor-credits'/);
+    for (const page of ['app/expenses/page.tsx', 'app/vendor-credits/page.tsx']) {
+      const src = fs.readFileSync(path.resolve(process.cwd(), page), 'utf8');
+      expect(/useFocusParam\(/.test(src), `${page} reads ?focus=`).toBe(true);
+      // useSearchParams needs a Suspense boundary around the page (Next.js app router).
+      expect(/<Suspense[\s\S]{0,200}<\/Suspense>/.test(src), `${page} has a Suspense boundary`).toBe(true);
+    }
   });
 });

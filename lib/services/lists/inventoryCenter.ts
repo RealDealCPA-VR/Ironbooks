@@ -2,7 +2,7 @@
  * Inventory Center (QB Enterprise): every inventory item with its stock picture, and for one item
  * its details plus every transaction that used it. Read-only.
  */
-import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, or, sql } from 'drizzle-orm';
 import Decimal from 'decimal.js';
 import {
   auditLogs,
@@ -267,10 +267,32 @@ export async function inventoryItemDetail(ctx: ServiceContext, itemId: string) {
       if (m.sourceId) movedBy.set(m.sourceId, new Decimal(m.qty));
     }
     const num = (v: unknown) => (typeof v === 'string' || typeof v === 'number' ? new Decimal(v) : null);
-    for (const a of await ctx.db
-      .select({ oldValues: auditLogs.oldValues, newValues: auditLogs.newValues })
-      .from(auditLogs)
-      .where(and(eq(auditLogs.companyId, c), eq(auditLogs.entityType, 'item'), eq(auditLogs.entityId, itemId)))) {
+    // Only the audit rows of the entries still without a quantity (physical counts, opening stock,
+    // FIFO removals with no site movement) — never the item's whole audit history, which holds a
+    // row (with its layer draws) for every FIFO sale and receipt.
+    const missing = adjustmentEntries.filter((r) => r.status === 'posted' && !movedBy.has(r.id)).map((r) => r.id);
+    const auditRows: Array<{ oldValues: unknown; newValues: unknown }> = [];
+    for (let at = 0; at < missing.length; at += 500) {
+      const ids = missing.slice(at, at + 500);
+      auditRows.push(
+        ...(await ctx.db
+          .select({ oldValues: auditLogs.oldValues, newValues: auditLogs.newValues })
+          .from(auditLogs)
+          .where(
+            and(
+              eq(auditLogs.companyId, c),
+              eq(auditLogs.entityType, 'item'),
+              eq(auditLogs.entityId, itemId),
+              or(
+                inArray(sql<string>`${auditLogs.newValues}->>'postedEntryId'`, ids),
+                inArray(sql<string>`${auditLogs.newValues}->>'entryId'`, ids),
+                inArray(sql<string>`${auditLogs.newValues}->'openingStock'->>'entryId'`, ids),
+              ),
+            ),
+          )),
+      );
+    }
+    for (const a of auditRows) {
       const nv = (a.newValues ?? {}) as Record<string, unknown>;
       const ov = (a.oldValues ?? {}) as Record<string, unknown>;
       const opening = nv.openingStock as Record<string, unknown> | undefined;

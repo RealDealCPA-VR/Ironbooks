@@ -50,7 +50,7 @@ import { todayISO } from '@/lib/dates';
 import { fetchVendorPrefill, PREFILL_SOURCE_LABEL } from '@/lib/aiClient';
 import { Money, formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
-import { useNewParam } from '@/lib/useFocusParam';
+import { useFocusParam, useNewParam } from '@/lib/useFocusParam';
 import { type PurchaseVendor, vendorPrefillAccountIds } from '@/lib/purchasesClient';
 import { useErrorFixes } from '@/components/ErrorFixPanel';
 import { FieldError, fieldA11y, focusFirstError } from '@/components/FieldError';
@@ -431,6 +431,12 @@ function ExpensesPageContent() {
   // visible, so jump focus to the start of it (the payee field).
   useNewParam(() => {
     document.getElementById('exp-payee')?.focus();
+  });
+
+  // Links such as the Inventory Center's item history (/expenses?focus=<id>) open that check /
+  // charge in the form, as double-clicking a transaction does in QB. A void one stays in the list.
+  useFocusParam(expenses, loading, (e) => {
+    if (!e.voidedAt) void startEdit(e);
   });
 
   // cmdbar: "check to Shell $45 fuel" fills in a NEW check / expense (once the lists have

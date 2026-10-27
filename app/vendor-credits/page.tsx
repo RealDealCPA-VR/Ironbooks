@@ -1,7 +1,8 @@
 'use client';
 
 import { isDepositTargetAccount } from '@/lib/accountTypes';
-import { useEffect, useState, useCallback } from 'react';
+import { Suspense, useEffect, useState, useCallback } from 'react';
+import { useFocusParam } from '@/lib/useFocusParam';
 import { RotateCcw, Plus, Trash2, PlusCircle, MinusCircle, CheckCircle, Banknote, Pencil, Printer } from 'lucide-react';
 import {
   Button,
@@ -879,7 +880,7 @@ function RefundModal({ open, credit, accounts, onClose, onRefunded }: RefundModa
 // Main page
 // ---------------------------------------------------------------------------
 
-export default function VendorCreditsPage() {
+function VendorCreditsPageContent() {
   const [credits, setCredits] = useState<VendorCredit[]>([]);
   const [vendors, setVendors] = useState<Vendor[]>([]);
   const [accounts, setAccounts] = useState<Account[]>([]);
@@ -927,6 +928,12 @@ export default function VendorCreditsPage() {
   useEffect(() => {
     fetchData();
   }, [fetchData]);
+
+  // Links such as the Inventory Center's item history (/vendor-credits?focus=<id>) open that
+  // credit, as double-clicking a transaction does in QB. A void one stays in the list.
+  useFocusParam(credits, loading, (c) => {
+    if (c.status !== 'void') goTo(c);
+  });
 
   async function handleVoid() {
     if (!voidTarget) return;
@@ -1140,5 +1147,14 @@ export default function VendorCreditsPage() {
         onClose={() => setVoidTarget(null)}
       />
     </main>
+  );
+}
+
+export default function VendorCreditsPage() {
+  // useFocusParam reads the URL (useSearchParams), which needs a Suspense boundary.
+  return (
+    <Suspense fallback={null}>
+      <VendorCreditsPageContent />
+    </Suspense>
   );
 }

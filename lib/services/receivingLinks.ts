@@ -14,7 +14,7 @@
  *     bill — receipt line billed quantities, PO received-unbilled counters, and any inventory
  *     cost adjustments the price variance made (the GL side is reversed by voidJournalEntry).
  */
-import { and, asc, eq, gt, sql } from 'drizzle-orm';
+import { and, asc, eq, gt, inArray, sql } from 'drizzle-orm';
 import {
   auditLogs,
   companies,
@@ -23,6 +23,8 @@ import {
   itemReceiptLines,
   itemReceipts,
   items,
+  landedCostAllocationLines,
+  landedCostAllocations,
   purchaseOrderLines,
   purchaseOrders,
 } from '@/lib/db/schema';
@@ -265,6 +267,8 @@ export async function releaseReceiptBilling(ctx: ServiceContext, billId: string)
 
   const receiptIds = new Set<string>();
   const poItemDeltas = new Map<string, ReturnType<typeof Money.zero>>(); // `${poId}|${itemId}`
+  /** Layers the bill split off a receipt layer, merged back once every cost is restored. */
+  const merges: Array<{ layerId: string; splitFrom: string; quantity: string; receiptId: string }> = [];
 
   for (const link of links) {
     receiptIds.add(link.itemReceiptId);
@@ -307,6 +311,7 @@ export async function releaseReceiptBilling(ctx: ServiceContext, billId: string)
             .update(inventoryLayers)
             .set({ unitCost: Money.of(layer.unitCost).minus(adj.unitDelta).toFixed(4) })
             .where(eq(inventoryLayers.id, layer.id));
+          if (adj.splitFrom) merges.push({ layerId: adj.layerId, splitFrom: adj.splitFrom, quantity: adj.quantity, receiptId: link.itemReceiptId });
         }
       } else {
         const [item] = await ctx.db
@@ -357,6 +362,50 @@ export async function releaseReceiptBilling(ctx: ServiceContext, billId: string)
       const key = `${receipt.purchaseOrderId}|${link.itemId}`;
       poItemDeltas.set(key, (poItemDeltas.get(key) ?? Money.zero()).plus(qty));
     }
+  }
+
+  // The units the bill re-costed were split off the receipt's layer (receiving.ts); with their
+  // cost restored they go back into it, so the layer is again worth exactly what it was (two
+  // layers each rounded to the cent need not add up to the one they came from). Only an untouched
+  // split is merged, and never while landed cost (which records layer ids) sits on the receipt.
+  const landedOn = new Map<string, boolean>();
+  for (const m of [...merges].reverse()) {
+    if (!landedOn.has(m.receiptId)) {
+      const [row] = await ctx.db
+        .select({ id: landedCostAllocationLines.id })
+        .from(landedCostAllocationLines)
+        .innerJoin(landedCostAllocations, eq(landedCostAllocationLines.allocationId, landedCostAllocations.id))
+        .where(
+          and(
+            eq(landedCostAllocations.companyId, ctx.companyId),
+            eq(landedCostAllocations.status, 'posted'),
+            eq(landedCostAllocationLines.itemReceiptId, m.receiptId),
+          ),
+        )
+        .limit(1);
+      landedOn.set(m.receiptId, Boolean(row));
+    }
+    if (landedOn.get(m.receiptId)) continue;
+    const pair = await ctx.db
+      .select()
+      .from(inventoryLayers)
+      .where(and(eq(inventoryLayers.companyId, ctx.companyId), inArray(inventoryLayers.id, [m.layerId, m.splitFrom])));
+    const split = pair.find((x) => x.id === m.layerId);
+    const into = pair.find((x) => x.id === m.splitFrom);
+    if (
+      !split ||
+      !into ||
+      split.itemId !== into.itemId ||
+      !Money.of(split.quantityRemaining).equals(Money.of(m.quantity)) ||
+      !Money.of(split.unitCost).equals(Money.of(into.unitCost))
+    ) {
+      continue;
+    }
+    await ctx.db
+      .update(inventoryLayers)
+      .set({ quantityRemaining: Money.of(into.quantityRemaining).plus(Money.of(split.quantityRemaining)).toFixed(4) })
+      .where(eq(inventoryLayers.id, into.id));
+    await ctx.db.delete(inventoryLayers).where(eq(inventoryLayers.id, split.id));
   }
 
   const poIds = new Set<string>();

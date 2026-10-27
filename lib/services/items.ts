@@ -119,6 +119,7 @@ async function requireAccount(
   accountId: string,
   label: string,
   expectedType?: string,
+  opts: { inventoryAsset?: boolean } = {},
 ): Promise<void> {
   const [row] = await ctx.db
     .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype, name: accounts.name })
@@ -134,7 +135,7 @@ async function requireAccount(
   }
   // QB lists only Other Current Asset accounts as an item's Asset Account: stock value posted to a
   // bank, Undeposited Funds or a fixed asset would land in that register / the deposit picker.
-  if (label === 'Asset' && !isInventoryAssetAccount(row)) {
+  if (opts.inventoryAsset && !isInventoryAssetAccount(row)) {
     throw validation(
       `"${row.name}" is ${qbAccountTypeLabel(row) === 'Other Current Asset' ? 'Undeposited Funds' : `a ${qbAccountTypeLabel(row)} account`}. ` +
         "An item's asset account must be an Other Current Asset account such as Inventory Asset.",
@@ -152,6 +153,12 @@ async function resolveAccountLinks(
     CreateItemInput,
     'type' | 'incomeAccountId' | 'expenseAccountId' | 'assetAccountId'
   >,
+  /**
+   * Whether the asset account is being chosen (a new item, or an edit that changes it): only then
+   * must it be an Other Current Asset. An item already on another asset account (older files,
+   * whose Edit Item offered every asset account) saves unchanged — its forms resend the account.
+   */
+  opts: { assetAccountChosen?: boolean } = { assetAccountChosen: true },
 ): Promise<void> {
   if (input.incomeAccountId) {
     await requireAccount(ctx, input.incomeAccountId, 'Income', 'revenue');
@@ -160,7 +167,7 @@ async function resolveAccountLinks(
     await requireAccount(ctx, input.expenseAccountId, 'Expense/COGS', 'expense');
   }
   if (input.assetAccountId) {
-    await requireAccount(ctx, input.assetAccountId, 'Asset', 'asset');
+    await requireAccount(ctx, input.assetAccountId, 'Asset', 'asset', { inventoryAsset: opts.assetAccountChosen !== false });
   }
 
   // Inventory items should have an asset account so inventory tracking is
@@ -480,7 +487,7 @@ async function updateItemInTx(ctx: ServiceContext, id: string, patch: UpdateItem
       patch.expenseAccountId !== undefined ? patch.expenseAccountId : undefined,
     assetAccountId:
       patch.assetAccountId !== undefined ? patch.assetAccountId : undefined,
-  });
+  }, { assetAccountChosen: patch.assetAccountId !== before.assetAccountId });
 
   // ── Advanced Inventory fields ───────────────────────────────────────────
   const barcode =
