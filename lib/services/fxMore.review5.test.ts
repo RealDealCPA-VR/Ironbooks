@@ -221,4 +221,27 @@ describe('review5 fx (second batch)', () => {
       createExpense(ctx, { payeeName: 'Card Co', date: d('2026-03-10'), method: 'check', paymentAccountId: acct['1020'], lines: [{ accountId: acct['2150'], amount: '100.00' }] } as never),
     ).resolves.toBeTruthy();
   });
+
+  it('paying off a foreign loan leaves nothing on its liability account (no rounding cents)', async () => {
+    const { createLoan, setUpLoanPayment } = await import('./loans');
+    const { postJournalEntry } = await import('./posting');
+    const lender = await eurVendor('EUR lender');
+    const liab = (await createAccount(ctx, { code: '2610', name: 'EUR Note', type: 'liability' as never, subtype: 'long_term_liability' })).id;
+    const interest = (await createAccount(ctx, { code: '6810', name: 'Interest', type: 'expense' as never, subtype: 'operating_expenses' })).id;
+    const loan = await createLoan(ctx, {
+      name: `EUR note ${seq}`, lenderVendorId: lender.id, liabilityAccountId: liab, interestAccountId: interest, paymentAccountId: acct['1020'],
+      originalAmount: '1000.00', annualRate: '0', termMonths: 3, originDate: d('2026-01-01'), firstPaymentDate: d('2026-02-01'), exchangeRate: '1.2345',
+    });
+    // The loan proceeds: EUR 1,000 into the Euro bank at the loan's rate (USD 1,234.50).
+    await postJournalEntry(ctx, {
+      date: d('2026-01-01'), description: 'Loan proceeds', currency: 'EUR', exchangeRate: '1.2345',
+      lines: [{ accountId: acct['1020'], debit: '1234.50', foreignAmount: '1000.00' }, { accountId: liab, credit: '1234.50' }],
+    });
+    for (const [i, p] of ['333.33', '333.33', '333.34'].entries()) {
+      await setUpLoanPayment(ctx, loan.id, { kind: 'check', date: d(`2026-0${i + 2}-01`), principal: p, interest: '0', exchangeRate: '1.2345' });
+    }
+    const [l] = await db.select().from(accounts).where(eq(accounts.id, liab));
+    expect(Money.of(l.balance).toFixed(2)).toBe('0.00');
+    expect((await trialBalance(ctx)).balanced).toBe(true);
+  });
 });
