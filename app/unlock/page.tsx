@@ -10,17 +10,13 @@ import { Suspense, useEffect, useRef, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { Lock } from 'lucide-react';
 import { Button, Card, Input, Label } from '@/components/ui';
-
-function safeNext(raw: string | null): string {
-  // Only allow same-app absolute paths (never an open redirect).
-  if (raw && raw.startsWith('/') && !raw.startsWith('//') && raw !== '/unlock') return raw;
-  return '/';
-}
+import { safeNext } from '@/lib/safeNext';
 
 function UnlockInner() {
   const router = useRouter();
   const params = useSearchParams();
-  const next = safeNext(params.get('next'));
+  // Only same-app paths (never an open redirect — lib/safeNext.ts).
+  const next = safeNext(params.get('next'), '/', ['/unlock']);
 
   const [phase, setPhase] = useState<'checking' | 'prompt'>('checking');
   const [companyName, setCompanyName] = useState<string | null>(null);
