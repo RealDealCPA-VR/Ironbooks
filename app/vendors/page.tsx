@@ -34,6 +34,7 @@ import { api } from '@/lib/client';
 import { usePreferences } from '@/lib/usePreferences';
 import AttachmentPanel from '@/components/AttachmentPanel';
 import { formatCurrency } from '@/lib/money';
+import { HIDDEN_BALANCE_TITLE } from '@/lib/permissions/balances';
 import { useFocusParam } from '@/lib/useFocusParam';
 import { EntityNotes } from '@/components/lists/EntityNotes';
 import Link from 'next/link';
@@ -415,7 +416,12 @@ function VendorsPageContent() {
                           : 'text-navy/60'
                       }
                     >
-                      {formatCurrency(v.balance)}
+                      {/* QB View Balance: the server blanks balances the role may not see. */}
+                      {(v as { balanceHidden?: boolean }).balanceHidden ? (
+                        <span title={HIDDEN_BALANCE_TITLE}>Hidden</span>
+                      ) : (
+                        formatCurrency(v.balance)
+                      )}
                     </span>
                   </Td>
                   <Td className="text-right">

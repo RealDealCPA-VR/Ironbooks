@@ -4,6 +4,7 @@
 import { z } from 'zod';
 import { MIN_PASSWORD_LENGTH } from '@/lib/passwordPolicy';
 import { ACTIONS, AREA_KEYS, FLAGS } from '@/lib/permissions/model';
+import { isActivityKey } from '@/lib/permissions/activities';
 
 const login = z
   .string()
@@ -72,13 +73,15 @@ export const loginSchema = z.object({
   totp: z.union([z.string(), z.number()]).optional().nullable(),
 });
 
-const grantAction = z.enum([...ACTIONS, 'full'] as [string, ...string[]]);
+// prefsperms: keys are areas (old style: the whole area) or QB Enterprise activities
+// ('customers.invoices'); 'view_balance' is the QB View Balance right of an activity.
+const grantAction = z.enum([...ACTIONS, 'full', 'view_balance'] as [string, ...string[]]);
 export const permissionGrantSchema = z
-  .record(z.string(), z.array(grantAction))
+  .record(z.string(), z.array(grantAction).max(10))
   .superRefine((v, ctx) => {
     for (const k of Object.keys(v)) {
-      if (!(AREA_KEYS as string[]).includes(k)) {
-        ctx.addIssue({ code: z.ZodIssueCode.custom, message: `unknown permission area '${k}'` });
+      if (!(AREA_KEYS as string[]).includes(k) && !isActivityKey(k)) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: `unknown permission area or activity '${k}'` });
       }
     }
   });

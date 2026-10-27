@@ -1076,7 +1076,8 @@ async function nameActivity(
 // ---------------------------------------------------------------------------
 
 function executeNavigate(ctx: ServiceContext, intent: NavigateIntent): CommandOutcome {
-  const permissions = ctx.access?.permissions ?? null;
+  // prefsperms: area and activity rights in one map (pages and actions check their activity).
+  const permissions = ctx.access ? { ...ctx.access.activities, ...ctx.access.permissions } : null;
   // Only a page that really answers to the words typed — every word in its name, QuickBooks name
   // or keywords, or a whole plain-language phrase. A loose partial hit ("go to nowhere-page" →
   // Home) is not a match: the user is told the page wasn't found instead.
@@ -1084,7 +1085,7 @@ function executeNavigate(ctx: ServiceContext, intent: NavigateIntent): CommandOu
   if (page) return { type: 'navigate', href: page.href, title: page.label, summary: page.description };
   const q = intent.target.toLowerCase();
   const act = COMMAND_ACTIONS.find(
-    (a) => (a.label.toLowerCase().includes(q) || a.keywords.includes(q)) && canOpenHref(a.href, permissions) && canDoAction(a.needs, permissions),
+    (a) => (a.label.toLowerCase().includes(q) || a.keywords.includes(q)) && canOpenHref(a.href, permissions) && canDoAction(a.needs, permissions, a.href),
   );
   if (act) return { type: 'navigate', href: act.href, title: act.label, summary: act.description };
   return {

@@ -178,6 +178,7 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/users/[id]': r('users', 'GET PATCH'),
   '/api/users/[id]/reset-password': r('users', 'POST:modify'),
   '/api/users/password-policy': r('users', 'GET PUT:modify'), // gapsb K: Admin-only save (requireFileAdmin)
+  '/api/users/permissions-report': r('users', 'GET'), // prefsperms K: View Permissions / user & role lists (CSV needs Print, service)
   '/api/roles': r('users', 'GET POST'),
   '/api/roles/[id]': r('users', 'GET PATCH DELETE'),
   // Multi-user hosting (team hosting): who is logged in / sign-out / single-user mode. Every

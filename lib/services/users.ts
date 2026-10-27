@@ -22,8 +22,10 @@ import {
   ADMIN_ROLE_KEY,
   BUILTIN_ROLES,
   builtinRole,
+  normalizeActivities,
   normalizeGrant,
   unionRoles,
+  type ActivitySet,
   isSubset,
   legacyRoleFor,
   type EffectiveAccess,
@@ -31,6 +33,7 @@ import {
   type RoleDefinition,
   type RoleFlags,
 } from '@/lib/permissions/model';
+import { isActivityKey } from '@/lib/permissions/activities';
 import {
   definitionsFor,
   effectiveRoleKeys,
@@ -69,6 +72,11 @@ export interface CompanyUserDetail extends CompanyUser {
 export interface RoleSummary extends RoleDefinition {
   /** Number of members (active or not) holding the role. */
   userCount: number;
+  /**
+   * prefsperms: the role's rights per QB Enterprise activity (an area grant expanded to every
+   * activity of the area), for the role editor and the permissions reports.
+   */
+  activities: ActivitySet;
 }
 
 const normLogin = (s: string) => s.trim().toLowerCase();
@@ -518,6 +526,7 @@ export async function listRoles(ctx: ServiceContext): Promise<RoleSummary[]> {
   return defs.map((d) => ({
     ...d,
     userCount: members.filter((m) => m.roleKeys.includes(d.key)).length,
+    activities: normalizeActivities(d.permissions),
   }));
 }
 
@@ -531,10 +540,18 @@ export async function getRoleDefinition(
 }
 
 function cleanGrant(grant: PermissionGrant): PermissionGrant {
-  // Store the normalized (expanded) form so the matrix shows exactly what is granted.
-  const n = normalizeGrant(grant);
+  // Store the normalized (expanded) form so the matrix shows exactly what is granted. An AREA key
+  // (the format every role had before activities) stays an area grant — it covers every activity
+  // of the area; an ACTIVITY key (prefsperms, the role editor) keeps only that activity's rights.
+  const areaPart: PermissionGrant = {};
+  const activityPart: PermissionGrant = {};
+  for (const [key, actions] of Object.entries(grant ?? {})) {
+    if (isActivityKey(key)) activityPart[key] = actions;
+    else areaPart[key as keyof PermissionGrant] = actions;
+  }
   const out: PermissionGrant = {};
-  for (const [area, actions] of Object.entries(n)) if (actions.length) out[area as keyof PermissionGrant] = actions;
+  for (const [area, actions] of Object.entries(normalizeGrant(areaPart))) if (actions.length) out[area as keyof PermissionGrant] = actions;
+  for (const [key, actions] of Object.entries(normalizeActivities(activityPart))) if (actions.length) out[key as keyof PermissionGrant] = actions;
   return out;
 }
 

@@ -4,6 +4,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
+import { balancesForContext } from '@/lib/services/access';
 import { listAccounts, createAccount, getAccountTree } from '@/lib/services/accounts';
 import { ServiceError } from '@/lib/services/_base';
 import { zodErrorBody } from '@/lib/validation/helpers';
@@ -24,10 +25,10 @@ export async function GET(req: NextRequest) {
     const ctx = await getServerContext();
     const { searchParams } = new URL(req.url);
     if (searchParams.get('tree') === 'true') {
-      return NextResponse.json(await getAccountTree(ctx));
+      return NextResponse.json(balancesForContext(ctx, 'lists.chart_of_accounts', await getAccountTree(ctx))); // QB View Balance
     }
     const includeInactive = searchParams.get('includeInactive') === 'true';
-    return NextResponse.json(await listAccounts(ctx, { includeInactive }));
+    return NextResponse.json(balancesForContext(ctx, 'lists.chart_of_accounts', await listAccounts(ctx, { includeInactive }))); // QB View Balance
   } catch (err) {
     return errorResponse(err);
   }

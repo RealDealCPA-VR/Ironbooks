@@ -36,8 +36,8 @@ import {
   CalendarClock,
   Search,
 } from 'lucide-react';
-import { REPORT_CATALOG, REPORT_GROUPS } from '@/lib/reports/catalog';
-import { canDo, useMe } from '@/lib/usePermissions';
+import { REPORT_CATALOG, REPORT_GROUPS, reportActivity } from '@/lib/reports/catalog';
+import { canDoActivity, useMe } from '@/lib/usePermissions';
 import { Card, PageHeader } from '@/components/ui';
 import { Help } from '@/components/Help';
 
@@ -405,7 +405,7 @@ const OTHER_REPORTS: ReportCardProps[] = [
 
 function AllStandardReports() {
   const { me } = useMe();
-  const visible = REPORT_CATALOG.filter((r) => !r.hidden && canDo(me, r.area, 'view'));
+  const visible = REPORT_CATALOG.filter((r) => !r.hidden && canDoActivity(me, reportActivity(r), 'view'));
   return (
     <>
       <SectionHeading>All reports</SectionHeading>

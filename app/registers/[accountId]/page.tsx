@@ -312,6 +312,11 @@ function RegisterPageInner() {
   const config = columnConfig(account?.subtype ?? '');
   // p1 fx: a foreign-currency bank / card register is shown in the account's currency.
   const fxCur = result?.currency ?? null;
+  // QB View Balance: the server blanked every balance for this role (lib/permissions/balances.ts).
+  const balancesHidden = Boolean(
+    (result as { balanceHidden?: boolean } | null)?.balanceHidden || (account as { balanceHidden?: boolean } | null)?.balanceHidden,
+  );
+  const bal = (v: string | null | undefined, cur?: string) => (balancesHidden ? 'Hidden' : formatCurrency(v ?? '0', cur));
 
   return (
     <main className="min-h-screen bg-offwhite p-8 font-sans">
@@ -345,7 +350,7 @@ function RegisterPageInner() {
                   Number(account.balance) < 0 ? 'text-red-600' : 'text-navy'
                 }`}
               >
-                {formatCurrency(account.balance)}
+                {bal(account.balance)}
               </span>{' '}
               <WhyChanged
                 title={`the ${account.name} balance`}
@@ -446,9 +451,9 @@ function RegisterPageInner() {
                           Number(fxCur ? result.foreignOpeningBalance : result.openingBalance) < 0 ? 'text-red-600' : 'text-navy'
                         }`}
                       >
-                        {fxCur ? formatCurrency(result.foreignOpeningBalance ?? '0', fxCur) : formatCurrency(result.openingBalance)}
+                        {fxCur ? bal(result.foreignOpeningBalance, fxCur) : bal(result.openingBalance)}
                       </Td>
-                      {fxCur && <Td numeric className="text-navy/60">{formatCurrency(result.openingBalance)}</Td>}
+                      {fxCur && <Td numeric className="text-navy/60">{bal(result.openingBalance)}</Td>}
                     </tr>
                   )}
 
@@ -532,11 +537,11 @@ function RegisterPageInner() {
                             Number(fxCur ? row.foreignRunningBalance : row.runningBalance) < 0 ? 'text-red-600' : 'text-navy'
                           }`}
                         >
-                          {fxCur ? formatCurrency(row.foreignRunningBalance ?? '0', fxCur) : formatCurrency(row.runningBalance)}
+                          {fxCur ? bal(row.foreignRunningBalance, fxCur) : bal(row.runningBalance)}
                         </Td>
                         {fxCur && (
                           <Td numeric className="text-navy/60" title={row.exchangeRate ? `Rate ${Number(row.exchangeRate)}` : undefined}>
-                            {formatCurrency(row.runningBalance)}
+                            {bal(row.runningBalance)}
                           </Td>
                         )}
                       </tr>
@@ -567,11 +572,11 @@ function RegisterPageInner() {
                     Number(result.closingBalance) < 0 ? 'text-red-600' : 'text-emerald'
                   }`}
                 >
-                  {fxCur ? formatCurrency(result.foreignClosingBalance ?? '0', fxCur) : formatCurrency(result.closingBalance)}
+                  {fxCur ? bal(result.foreignClosingBalance, fxCur) : bal(result.closingBalance)}
                 </span>
                 {fxCur && (
                   <span className="ml-3 text-sm font-semibold text-navy/60">
-                    ({formatCurrency(result.closingBalance)} {result.homeCurrency ?? ''})
+                    ({bal(result.closingBalance)} {result.homeCurrency ?? ''})
                   </span>
                 )}
               </span>

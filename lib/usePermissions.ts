@@ -5,7 +5,8 @@
  */
 import { useEffect, useState } from 'react';
 import { api } from '@/lib/client';
-import type { Action, Area, Flag, PermissionSet } from '@/lib/permissions/model';
+import type { Action, ActivityAction, ActivityKey, ActivitySet, Area, Flag, PermissionSet } from '@/lib/permissions/model';
+import { canUseActivity } from '@/lib/permissions/pageAccess';
 
 export interface Me {
   id: string;
@@ -14,7 +15,13 @@ export interface Me {
   totpEnabled: boolean;
   companyId: string | null;
   roleKeys: string[] | null;
-  permissions: PermissionSet | null;
+  /**
+   * Area rights, plus (prefsperms) every ACTIVITY's rights merged in under its key
+   * ('customers.invoices'), so the menus and pages can check activities with one map.
+   */
+  permissions: (PermissionSet & Partial<Record<ActivityKey, ActivityAction[]>>) | null;
+  /** QB Enterprise per-activity rights (prefsperms). */
+  activities?: ActivitySet | null;
   flags: Record<Flag, boolean> | null;
   isAdmin: boolean;
 }
@@ -28,7 +35,9 @@ export function useMe(enabled = true): { me: Me | null; loading: boolean } {
     api
       .get<Me | null>('/api/auth/me')
       .then((m) => {
-        if (!cancelled) setMe(m);
+        if (cancelled) return;
+        // prefsperms: one map with areas and activities (see Me.permissions).
+        setMe(m && m.permissions && m.activities ? { ...m, permissions: { ...m.activities, ...m.permissions } } : m);
       })
       .catch(() => {
         /* treat as unknown — UI shows everything, server still enforces */
@@ -41,6 +50,11 @@ export function useMe(enabled = true): { me: Me | null; loading: boolean } {
     };
   }, [enabled]);
   return { me, loading };
+}
+
+/** One activity right for UI gating (prefsperms); unknown permissions → true (server decides). */
+export function canDoActivity(me: Me | null, activity: ActivityKey, action: ActivityAction): boolean {
+  return canUseActivity(me?.permissions as Partial<Record<string, readonly string[]>> | null | undefined, activity, action);
 }
 
 /** can(me, area, action) for UI gating; unknown permissions → true (server decides). */

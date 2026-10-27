@@ -22,6 +22,7 @@ import { pageHelpFor } from '@/lib/pageHelp';
 import type { Area } from '@/lib/permissions/model';
 import { blockingFeatureGate, featureHiddenPaths, multiCurrencyHiddenPaths } from '@/lib/preferences';
 import FeatureOff from './FeatureOff';
+import { NoAccess, pageBlocked, useActivityButtons } from './ActivityGuard';
 import AccountantCopyBanner from './AccountantCopyBanner';
 import PreferenceBehaviors from './PreferenceBehaviors';
 import AttentionBadge from './AttentionBadge'; // team home: count on the "Needs attention" link
@@ -734,6 +735,9 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   const blockedGate = prefs.loaded ? blockingFeatureGate(pathname, prefs.company) : null;
   const [assistantOpen, setAssistantOpen] = React.useState(false);
   const closeAssistant = React.useCallback(() => setAssistantOpen(false), []);
+  // prefsperms K: QB Enterprise activities in the screens (components/ActivityGuard.tsx).
+  useActivityButtons(pathname, me?.permissions);
+  const noAccess = !blockedGate && pageBlocked(pathname, me?.permissions);
 
   if (bare) return <>{children}</>;
 
@@ -828,7 +832,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         </header>
         <BackupWarningBanner />
         <AccountantCopyBanner pathname={pathname} />
-        {blockedGate ? <FeatureOff gate={blockedGate} /> : children}
+        {blockedGate ? <FeatureOff gate={blockedGate} /> : noAccess ? <NoAccess pathname={pathname} /> : children}
       </main>
       <CommandPalette permissions={me?.permissions} hiddenPaths={hiddenPaths} />
       <AssistantPanel open={assistantOpen} onClose={closeAssistant} />

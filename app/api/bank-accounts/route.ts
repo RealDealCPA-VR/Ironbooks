@@ -4,6 +4,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
+import { balancesForContext } from '@/lib/services/access';
 import { listBankAccounts, createBankAccount } from '@/lib/services/bankAccounts';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
@@ -22,7 +23,7 @@ export async function GET() {
     const ctx = await getServerContext();
     // Account numbers are masked by the service for roles without the 'view full bank/account
     // numbers' flag (lib/services/bankAccounts.ts).
-    return NextResponse.json(await listBankAccounts(ctx));
+    return NextResponse.json(balancesForContext(ctx, 'banking.bank_accounts', await listBankAccounts(ctx))); // QB View Balance
   } catch (err) {
     return errorResponse(err);
   }

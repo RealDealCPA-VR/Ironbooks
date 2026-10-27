@@ -30,6 +30,7 @@ import {
 } from '@/lib/permissions/model';
 import { maskAccountNumber, maskSensitive, maskSsn, stripSecrets } from '@/lib/permissions/mask';
 import { activityDef, activityLabel } from '@/lib/permissions/activities';
+import { hideBalances } from '@/lib/permissions/balances';
 import { ServiceError, type ServiceContext } from './_base';
 
 export interface ResolvedAccess {
@@ -172,6 +173,15 @@ export function requireActivity(ctx: ServiceContext, activity: ActivityKey, acti
 export function canSeeBalances(ctx: Pick<ServiceContext, 'access'>, activity: ActivityKey): boolean {
   if (!ctx.access) return true;
   return canActivity(ctx.access, activity, 'view_balance');
+}
+
+/**
+ * QB "View Balance": an API answer for a screen of `activity` (registers, chart of accounts,
+ * customer / vendor centers) with every balance blanked unless the caller has View Balance there
+ * (lib/permissions/balances.ts). Trusted contexts see everything.
+ */
+export function balancesForContext<T>(ctx: Pick<ServiceContext, 'access'>, activity: ActivityKey, data: T): T {
+  return canSeeBalances(ctx, activity) ? data : hideBalances(data);
 }
 
 /**
