@@ -60,3 +60,32 @@ describe('rotating the versions of a company file opened on several computers', 
     for (const r of theirs) expect(after.get(r.id)?.prunedAt).toBeUndefined();
   });
 });
+
+describe('the backup folder chosen on another computer', () => {
+  it('when it cannot be reached here, the backup goes to this computer\'s default folder instead of failing', async () => {
+    const { runVersionedBackup } = await import('./backupSchedule');
+    const data = path.join(ROOT, 'data-moved');
+    fs.mkdirSync(data, { recursive: true });
+    fs.writeFileSync(path.join(data, 'PG_VERSION'), '17\n');
+    // Chosen on FRONT-DESK: a folder that cannot exist here (its parent is a file on this disk,
+    // like a drive letter or user profile this computer does not have).
+    const blocker = path.join(ROOT, 'blocker');
+    fs.writeFileSync(blocker, 'not a folder');
+    const chosen = path.join(blocker, 'Ironbooks Backups');
+    fs.writeFileSync(path.join(data, '.backup-settings.json'), JSON.stringify({ schedule: 'daily', everyHours: 24, keep: 14, folder: chosen }));
+    const fallback = path.join(ROOT, 'this-computer-backups');
+    const prev = process.env.BKA_BACKUP_DIR;
+    process.env.BKA_BACKUP_DIR = fallback;
+    try {
+      const r = await runVersionedBackup('scheduled', { dataDir: data, companyName: 'Moved Co' });
+      expect(r.status).toBe('created');
+      if (r.status !== 'created') return;
+      expect(path.dirname(r.record.path!)).toBe(fallback);
+      expect(fs.existsSync(r.record.path!)).toBe(true);
+      expect(r.record.note).toMatch(/could not be reached/);
+    } finally {
+      if (prev === undefined) delete process.env.BKA_BACKUP_DIR;
+      else process.env.BKA_BACKUP_DIR = prev;
+    }
+  });
+});

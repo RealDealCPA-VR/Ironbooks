@@ -34,6 +34,7 @@ import { readSandboxMarker, sandboxBlockedError } from './sandboxState';
 import {
   backupFolder,
   backupHealth,
+  defaultBackupFolder,
   findBackupRecord,
   isBackupDue,
   markPruned,
@@ -127,8 +128,21 @@ async function doVersionedBackup(source: VersionedSource, opts: VersionedBackupO
     return { status: 'unchanged', lastBackupAt: records[0]?.at ?? null };
   }
 
-  const folder = backupFolder(settings, dir);
-  fs.mkdirSync(folder, { recursive: true });
+  let folder = backupFolder(settings, dir);
+  let unreachable = false;
+  try {
+    fs.mkdirSync(folder, { recursive: true });
+  } catch (err) {
+    // The settings travel inside a single company file, so the chosen folder may be on a drive or
+    // user profile only the computer that chose it has (or a share that is offline right now).
+    // An automatic backup then goes to this computer's default folder rather than not at all;
+    // "Back up now" still reports the problem.
+    if (!settings.folder || source === 'manual') throw err;
+    console.warn(`[backup] the backup folder ${folder} cannot be reached from this computer; using the default folder:`, (err as Error).message);
+    folder = defaultBackupFolder(dir);
+    fs.mkdirSync(folder, { recursive: true });
+    unreachable = true;
+  }
   const { buffer } = createBackup(opts.companyName ?? undefined, dir);
   const filename = versionFilename(source, opts.companyName ?? null, now);
   const outPath = path.join(folder, filename);
@@ -147,11 +161,12 @@ async function doVersionedBackup(source: VersionedSource, opts: VersionedBackupO
       sizeBytes: buffer.byteLength,
       fingerprint,
       note:
-        source === 'scheduled'
+        (source === 'scheduled'
           ? 'Automatic backup'
           : source === 'quit'
             ? 'Automatic backup when the app closed'
-            : 'Backed up now',
+            : 'Backed up now') +
+        (unreachable ? ' (the chosen backup folder could not be reached from this computer, so it went to the default folder)' : ''),
     },
     dir,
   );
