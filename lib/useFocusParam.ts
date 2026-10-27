@@ -35,6 +35,27 @@ export function useFocusParam<T extends { id: string }>(
 }
 
 /**
+ * useFocusId — like useFocusParam, for pages that open a record by its id (they fetch it
+ * themselves, so a record not on the loaded list — an older or voided one — still opens). Calls
+ * `onFocus(id)` once, as soon as `ready` (the page can open forms) is true.
+ *
+ * Callers use useSearchParams, so the page component must be rendered inside a <Suspense>.
+ */
+export function useFocusId(ready: boolean, onFocus: (id: string) => void): void {
+  const searchParams = useSearchParams();
+  const focusId = searchParams.get('focus');
+  const consumedRef = useRef(false);
+  const onFocusRef = useRef(onFocus);
+  onFocusRef.current = onFocus;
+
+  useEffect(() => {
+    if (consumedRef.current || !focusId || !ready) return;
+    consumedRef.current = true;
+    if (/^[0-9a-f-]{36}$/i.test(focusId)) onFocusRef.current(focusId);
+  }, [focusId, ready]);
+}
+
+/**
  * useNewParam — reads the `?new=1` query param produced by the global
  * keyboard shortcuts and Quick Actions (e.g. Ctrl+I → /invoices?new=1) and
  * invokes `onNew` (typically: open the page's create modal). The param is

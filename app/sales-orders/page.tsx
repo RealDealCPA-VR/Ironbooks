@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { Suspense, useEffect, useRef, useState, useCallback } from 'react';
 import { FileCheck, Plus, ArrowRight, Printer, PackageCheck, Pencil } from 'lucide-react';
 import Link from 'next/link';
 import {
@@ -21,6 +21,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api } from '@/lib/client';
+import { useFocusId, useNewParam } from '@/lib/useFocusParam';
 import { todayISO } from '@/lib/dates';
 import { recallNote, useSmartDefaults } from '@/lib/useSmartDefaults';
 import { salesRowsFromRecall } from '@/lib/smartDefaults';
@@ -614,6 +615,15 @@ function InvoiceModal({ open, order, onClose, onInvoiced }: InvoiceModalProps) {
 // ---------------------------------------------------------------------------
 
 export default function SalesOrdersPage() {
+  // useFocusId / useNewParam read the URL (useSearchParams), which needs a Suspense boundary.
+  return (
+    <Suspense fallback={null}>
+      <SalesOrdersPageContent />
+    </Suspense>
+  );
+}
+
+function SalesOrdersPageContent() {
   const [orders, setOrders] = useState<SalesOrder[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [items, setItems] = useState<PricedLineItem[]>([]);
@@ -678,6 +688,18 @@ export default function SalesOrdersPage() {
     fetchData();
   }, [fetchData]);
 
+  // Quick Actions / Ctrl shortcuts land here with ?new=1; drill-downs (Inventory Center, the
+  // transaction log) with ?focus=<id> — open that order.
+  useNewParam(() => {
+    setEditTarget(null);
+    setShowNew(true);
+  });
+  const [focusedId, setFocusedId] = useState<string | null>(null);
+  useFocusId(true, (id) => {
+    setFocusedId(id);
+    void openEdit({ id } as SalesOrder);
+  });
+
   return (
     <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader
@@ -727,7 +749,7 @@ export default function SalesOrdersPage() {
             </thead>
             <tbody>
               {orders.map((order) => (
-                <Tr key={order.id}>
+                <Tr key={order.id} className={order.id === focusedId ? 'bg-electric/10' : undefined}>
                   <Td className="font-semibold text-navy">#{docNo(order.refNumber, order.orderNumber)}</Td>
                   <Td>{customerMap[order.customerId] ?? '—'}</Td>
                   <Td className="text-navy/70">{formatDate(order.date)}</Td>

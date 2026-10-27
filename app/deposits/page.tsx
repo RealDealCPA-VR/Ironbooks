@@ -28,7 +28,7 @@ import { api } from '@/lib/client';
 import MemorizeButton from '@/components/MemorizeButton';
 import { formatCurrency } from '@/lib/money';
 import { formatDate, todayISO } from '@/lib/dates';
-import { useNewParam } from '@/lib/useFocusParam';
+import { useFocusId, useNewParam } from '@/lib/useFocusParam';
 // wave2 prefs: Checking > default account for Make Deposits; date warnings
 import { usePreferences } from '@/lib/usePreferences';
 import { useErrorFixes } from '@/components/ErrorFixPanel';
@@ -727,6 +727,8 @@ function DepositsPageContent() {
 
   // Quick Actions navigate here with ?new=1 — open the Make Deposit modal.
   useNewParam(openModal);
+  // Drill-downs (the transaction log) link here with ?focus=<id> — open that deposit.
+  useFocusId(true, (id) => void openEdit(id));
 
   function handleCreated() {
     fetchDeposits();

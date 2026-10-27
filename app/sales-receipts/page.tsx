@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { Suspense, useEffect, useRef, useState, useCallback } from 'react';
 import { Receipt, Plus, Trash2, PlusCircle, MinusCircle, Pencil } from 'lucide-react';
 import {
   AmountInput,
@@ -25,6 +25,7 @@ import {
 } from '@/components/ui';
 import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
+import { useFocusId, useNewParam } from '@/lib/useFocusParam';
 import { todayISO } from '@/lib/dates';
 import { formatCurrency } from '@/lib/money';
 import {
@@ -787,6 +788,15 @@ function NewReceiptModal({
 // ---------------------------------------------------------------------------
 
 export default function SalesReceiptsPage() {
+  // useNewParam / useFocusId read the URL (useSearchParams), which needs a Suspense boundary.
+  return (
+    <Suspense fallback={null}>
+      <SalesReceiptsPageContent />
+    </Suspense>
+  );
+}
+
+function SalesReceiptsPageContent() {
   const [receipts, setReceipts] = useState<SalesReceipt[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [items, setItems] = useState<Item[]>([]);
@@ -850,6 +860,19 @@ export default function SalesReceiptsPage() {
     fetchData();
   }, [fetchData]);
 
+  // The command bar's "Record a sale" and the keyboard shortcuts land here with ?new=1 (a new
+  // sales receipt); drill-downs (Inventory Center, the transaction log) with ?focus=<id>.
+  useNewParam(() => {
+    setEditTarget(null);
+    setPrefill(null);
+    setShowNew(true);
+  });
+  const [focusedId, setFocusedId] = useState<string | null>(null);
+  useFocusId(true, (id) => {
+    setFocusedId(id);
+    void openEdit({ id } as SalesReceipt);
+  });
+
   async function handleVoid() {
     if (!voidTarget) return;
     setVoiding(true);
@@ -911,7 +934,7 @@ export default function SalesReceiptsPage() {
             </thead>
             <tbody>
               {receipts.map((r) => (
-                <Tr key={r.id} id={`sales-receipt-row-${r.id}`}>
+                <Tr key={r.id} id={`sales-receipt-row-${r.id}`} className={r.id === focusedId ? 'bg-electric/10' : undefined}>
                   <Td className="font-semibold text-navy">#{docNo(r.refNumber, r.receiptNumber)}</Td>
                   <Td>{r.customerName ?? 'Walk-in'}</Td>
                   <Td className="text-navy/70">{formatDate(r.date)}</Td>

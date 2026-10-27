@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
+import { Suspense, useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import Link from 'next/link';
 import { Banknote, Pencil, Plus, Receipt, Trash2 } from 'lucide-react';
 import {
@@ -28,6 +28,7 @@ import { Help } from '@/components/Help';
 import { TypeaheadSelect } from '@/components/TypeaheadSelect';
 import type { TypeaheadChoice } from '@/lib/typeahead';
 import { api } from '@/lib/client';
+import { useFocusId } from '@/lib/useFocusParam';
 import { todayISO } from '@/lib/dates';
 import { fetchVendorPrefill, PREFILL_SOURCE_LABEL } from '@/lib/aiClient';
 import {
@@ -251,6 +252,15 @@ function lineAmount(line: LineRow): number {
 // ---------------------------------------------------------------------------
 
 export default function BillsPage() {
+  // useFocusId reads the URL (useSearchParams), which needs a Suspense boundary.
+  return (
+    <Suspense fallback={null}>
+      <BillsPageContent />
+    </Suspense>
+  );
+}
+
+function BillsPageContent() {
   const [bills, setBills] = useState<Bill[]>([]);
   const [vendors, setVendors] = useState<Vendor[]>([]);
   const prefs = usePreferences();
@@ -472,6 +482,9 @@ export default function BillsPage() {
     });
     setPrefillNote(`Accounts pre-filled ${PREFILL_SOURCE_LABEL[pf.source]}.`);
   }
+
+  // Drill-downs (Home, the Inventory Center, the transaction log) link here with ?focus=<id>.
+  useFocusId(true, (id) => void openEditModal({ id } as Bill));
 
   /** Prefill the form from a saved bill and open the modal in edit mode. */
   async function openEditModal(bill: Bill) {

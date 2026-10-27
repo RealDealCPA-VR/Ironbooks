@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { Suspense, useEffect, useState, useCallback } from 'react';
 import {
   ShoppingCart,
   Plus,
@@ -33,6 +33,7 @@ import {
   useGridKeys,
 } from '@/components/ui';
 import { api } from '@/lib/client';
+import { useFocusParam } from '@/lib/useFocusParam';
 import { todayISO } from '@/lib/dates';
 // wave2 prefs: Memorize (Ctrl+M)
 import MemorizeButton from '@/components/MemorizeButton';
@@ -759,6 +760,15 @@ function ReceiveBillModal({ po, onClose, onBilled, accounts, items }: ReceiveBil
 // ---------------------------------------------------------------------------
 
 export default function PurchaseOrdersPage() {
+  // useFocusParam reads the URL (useSearchParams), which needs a Suspense boundary.
+  return (
+    <Suspense fallback={null}>
+      <PurchaseOrdersPageContent />
+    </Suspense>
+  );
+}
+
+function PurchaseOrdersPageContent() {
   const [pos, setPos] = useState<PurchaseOrder[]>([]);
   const [vendors, setVendors] = useState<Vendor[]>([]);
   const [accounts, setAccounts] = useState<Account[]>([]);
@@ -809,6 +819,18 @@ export default function PurchaseOrdersPage() {
   useEffect(() => {
     fetchData();
   }, [fetchData]);
+
+  // Links such as the Inventory Center's item history (/purchase-orders?focus=<id>): highlight the
+  // PO, and open it when it can still be edited.
+  const [focusedId, setFocusedId] = useState<string | null>(null);
+  useFocusParam(pos, loading, (po) => {
+    setFocusedId(po.id);
+    document.getElementById(`po-row-${po.id}`)?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    if (po.status === 'open' || po.status === 'partial') {
+      setEditId(po.id);
+      setShowNew(true);
+    }
+  });
 
   async function handleVoid() {
     if (!voidTarget) return;
@@ -883,7 +905,7 @@ export default function PurchaseOrdersPage() {
             </thead>
             <tbody>
               {pos.map((po) => (
-                <Tr key={po.id}>
+                <Tr key={po.id} id={`po-row-${po.id}`} className={po.id === focusedId ? 'bg-electric/10' : undefined}>
                   <Td className="font-semibold text-navy">#{docNo(po.refNumber, po.poNumber)}</Td>
                   <Td>{vendorMap[po.vendorId] ?? '—'}</Td>
                   <Td className="text-navy/70">{po.date ? formatDate(po.date, 'MMM d, yyyy') : '—'}</Td>

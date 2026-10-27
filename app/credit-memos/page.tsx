@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { Suspense, useEffect, useState, useCallback } from 'react';
 import { RotateCcw, Plus, PlusCircle, MinusCircle, Pencil } from 'lucide-react';
 import {
   AmountInput,
@@ -24,6 +24,7 @@ import {
   useGridKeys,
 } from '@/components/ui';
 import { api } from '@/lib/client';
+import { useFocusId, useNewParam } from '@/lib/useFocusParam';
 import { todayISO } from '@/lib/dates';
 // wave2 prefs: Memorize (Ctrl+M)
 import MemorizeButton from '@/components/MemorizeButton';
@@ -905,6 +906,15 @@ function RefundModal({ open, memo, accounts, onClose, onRefunded }: RefundModalP
 // ---------------------------------------------------------------------------
 
 export default function CreditMemosPage() {
+  // useNewParam / useFocusId read the URL (useSearchParams), which needs a Suspense boundary.
+  return (
+    <Suspense fallback={null}>
+      <CreditMemosPageContent />
+    </Suspense>
+  );
+}
+
+function CreditMemosPageContent() {
   const [memos, setMemos] = useState<CreditMemo[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [accounts, setAccounts] = useState<Account[]>([]);
@@ -963,6 +973,18 @@ export default function CreditMemosPage() {
   useEffect(() => {
     fetchData();
   }, [fetchData]);
+
+  // Keyboard shortcuts / Quick Actions land here with ?new=1; drill-downs (Inventory Center, the
+  // Client Data Review, the transaction log) with ?focus=<id> — open that credit memo.
+  useNewParam(() => {
+    setEditTarget(null);
+    setShowNew(true);
+  });
+  const [focusedId, setFocusedId] = useState<string | null>(null);
+  useFocusId(true, (id) => {
+    setFocusedId(id);
+    void openEdit({ id } as CreditMemo);
+  });
 
   async function handleVoid() {
     if (!voidTarget) return;
@@ -1027,7 +1049,7 @@ export default function CreditMemosPage() {
             </thead>
             <tbody>
               {memos.map((m) => (
-                <Tr key={m.id}>
+                <Tr key={m.id} className={m.id === focusedId ? 'bg-electric/10' : undefined}>
                   <Td className="font-semibold text-navy">#{docNo(m.refNumber, m.memoNumber)}</Td>
                   <Td>{customerMap[m.customerId] ?? '—'}</Td>
                   <Td className="text-navy/70">{formatDate(m.date)}</Td>

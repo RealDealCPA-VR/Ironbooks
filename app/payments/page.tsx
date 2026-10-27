@@ -27,7 +27,7 @@ import { api } from '@/lib/client';
 import { todayISO } from '@/lib/dates';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
-import { useNewParam } from '@/lib/useFocusParam';
+import { useFocusId, useNewParam } from '@/lib/useFocusParam';
 import { isDepositTargetAccount } from '@/lib/accountTypes';
 // wave2 prefs: Payments > auto-apply / auto-calculate / Undeposited Funds; date warnings
 import { usePreferences } from '@/lib/usePreferences';
@@ -1773,6 +1773,8 @@ function PaymentsPageContent() {
 
   // Quick Actions navigate here with ?new=1 — open the Receive Payment modal.
   useNewParam(() => setModalOpen(true));
+  // Drill-downs (the transaction log, Client Data Review) link here with ?focus=<id>.
+  useFocusId(true, (id) => void openEdit({ id } as Payment));
   const [prefillCustomerId, setPrefillCustomerId] = useState<string | null>(null);
   usePrefill('payment', (p) => {
     setEditTarget(null);

@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { Suspense, useEffect, useRef, useState, useCallback } from 'react';
 import { ClipboardList, Plus, ArrowRight, Percent, Pencil } from 'lucide-react';
 import { previewSalesTotals } from '@/lib/salesLineMath';
 import { estimateLineNumbers } from './estimateLines';
@@ -24,6 +24,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { useFocusId } from '@/lib/useFocusParam';
 import { todayISO } from '@/lib/dates';
 import { usePreferences } from '@/lib/usePreferences';
 import { recallNote, useSmartDefaults } from '@/lib/useSmartDefaults';
@@ -307,6 +308,15 @@ function EstimateFormBody({
 // ---------------------------------------------------------------------------
 
 export default function EstimatesPage() {
+  // useFocusId reads the URL (useSearchParams), which needs a Suspense boundary.
+  return (
+    <Suspense fallback={null}>
+      <EstimatesPageContent />
+    </Suspense>
+  );
+}
+
+function EstimatesPageContent() {
   // Preferences > Jobs & Estimates 'Use progress invoicing' (the server refuses it when off).
   const progressOn = usePreferences().company.progressInvoicingEnabled;
   const [estimates, setEstimates] = useState<Estimate[]>([]);
@@ -493,6 +503,9 @@ export default function EstimatesPage() {
     setAddOpen(true);
     setLoadCount((n) => n + 1);
   }
+
+  // Drill-downs (the transaction log, the Income Tracker) link here with ?focus=<id>.
+  useFocusId(true, (id) => void openEditModal({ id } as Estimate));
 
   /** Edit a saved estimate (allowed until it has been turned into an invoice). */
   async function openEditModal(estimate: Estimate) {
