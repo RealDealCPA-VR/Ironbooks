@@ -436,6 +436,40 @@ export function isEditableTarget(target: EventTarget | null): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Leaving a form: the app shows one page at a time where QB would open a second window
+// ---------------------------------------------------------------------------
+
+/**
+ * Leaving the page now could drop typed work: a form dialog (with fields) is open, or the cursor
+ * is in a field on the page (not a search box). `root` is the document (a stand-in in tests).
+ */
+export function mightLoseWork(target: EventTarget | null, root: Pick<ParentNode, 'querySelectorAll'> = document): boolean {
+  const dialogs = Array.from(root.querySelectorAll<HTMLElement>('[role="dialog"][data-modal]'));
+  if (dialogs.some((d) => d.querySelector('input:not([type="hidden"]), select, textarea'))) return true;
+  const el = target as HTMLElement | null;
+  return isEditableTarget(el) && !!el?.closest?.('main') && (el as HTMLInputElement).type !== 'search';
+}
+
+/**
+ * Asks the app shell (components/AppShell.tsx GlobalShortcuts) to open a page: it asks "Leave
+ * this form?" first when typed work could be lost, exactly like the QuickBooks keys (Ctrl+W, …).
+ */
+export const NAVIGATE_REQUEST_EVENT = 'ironbooks:navigate';
+
+/**
+ * Open `href` the way the QuickBooks keys do — through the app shell's leave-this-form check —
+ * for the desktop menus and the command bar. Falls back to `push` when no app shell is listening
+ * (sign-in screens, which have no work to lose). Returns whether the shell took it.
+ */
+export function navigateGuarded(href: string, push: (href: string) => void, target: EventTarget = window): boolean {
+  const ev = new CustomEvent(NAVIGATE_REQUEST_EVENT, { detail: { href }, cancelable: true });
+  target.dispatchEvent(ev);
+  if (ev.defaultPrevented) return true;
+  push(href);
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // Pure key classification (unit-tested; the DOM wiring lives in useGridKeys, useListKeys,
 // components/FormShortcuts.tsx and components/KeyboardCommands.tsx)
 // ---------------------------------------------------------------------------
