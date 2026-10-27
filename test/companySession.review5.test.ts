@@ -188,3 +188,41 @@ describe('closing a file another computer took over (source pins)', () => {
     expect(fn.slice(0, 900)).toMatch(/if \(openFile\.lost\) \{[\s\S]*?\/api\/company-file\/close[\s\S]*?return true;\s*\}/);
   });
 });
+
+describe('a crash before the first autosave check', () => {
+  it('still keeps the work that only the working copy has (its transaction log moved on since the last save)', async () => {
+    const format = require('../electron/companyFileFormat.js');
+    const src = path.join(root, 'crash-src');
+    fs.mkdirSync(src, { recursive: true });
+    fs.writeFileSync(path.join(src, 'PG_VERSION'), '17\n');
+    fs.writeFileSync(path.join(src, 'transactions.bktlg'), JSON.stringify({ seq: 1, hash: 'h1' }) + '\n');
+    const cf = path.join(root, 'Crashed.ironbooks');
+    const manifest = { formatVersion: 1, fileId: 'c', companyName: 'Crashed Co', saveId: 's1', savedAt: 'x', fingerprint: 'log:1:h1' };
+    await format.writeCompanyFile(cf, { manifest, entries: format.snapshotDir(src) });
+    const wr = path.join(root, 'Working-crash');
+    const prep = await session.prepareWorkingCopy(cf, { root: wr });
+    expect(session.readState(prep.workDir).base.fingerprint).toBe('log:1:h1');
+    // An invoice is saved in the working copy (transaction log moves on), then the power goes
+    // before any autosave check noted it: state says nothing is unsaved, and it never closed.
+    fs.appendFileSync(path.join(prep.dataDir, 'transactions.bktlg'), JSON.stringify({ seq: 2, hash: 'h2' }) + '\n');
+    expect(session.readState(prep.workDir)).toMatchObject({ unsavedSince: null, closedCleanly: false });
+
+    // Same company file, nobody saved meanwhile: recovered (and saved right away).
+    const rec = await session.prepareWorkingCopy(cf, { root: wr });
+    expect(rec.plan).toBe('recover');
+    expect(session.readState(rec.workDir).unsavedSince).toBeTruthy();
+
+    // Someone else saved meanwhile: the work is kept as a separate copy, never thrown away.
+    session.writeState(rec.workDir, { unsavedSince: null, closedCleanly: false });
+    await format.writeCompanyFile(cf, { manifest: { ...manifest, saveId: 's2', fingerprint: 'log:1:h1' }, entries: format.snapshotDir(src) });
+    const conf = await session.prepareWorkingCopy(cf, { root: wr, onConflict: async () => true });
+    expect(conf.plan).toBe('conflict');
+    const kept = path.join(root, 'crash-kept');
+    await format.extractCompanyFile(conf.conflictCopy, kept);
+    expect(fs.readFileSync(path.join(kept, 'transactions.bktlg'), 'utf8')).toContain('"seq":2');
+
+    // A copy that was closed cleanly (or only housekeeping changed) is simply reused / refreshed.
+    session.writeState(conf.workDir, { closedCleanly: true });
+    expect((await session.prepareWorkingCopy(cf, { root: wr })).plan).toBe('reuse');
+  });
+});

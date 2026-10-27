@@ -97,14 +97,67 @@ function hasData(workDir) {
  *               file since: the two can't be combined; keep the unsaved changes as a separate
  *               copy, then open the company file as it is
  */
-function planOpen({ companyFile, state, manifest, dataExists }) {
+function planOpen({ companyFile, state, manifest, dataExists, workingFingerprint }) {
   if (!dataExists || !state || !state.companyFile || pathKey(state.companyFile) !== pathKey(companyFile)) {
     return 'extract';
   }
   const baseSaveId = state.base && state.base.saveId;
   const sameSave = Boolean(baseSaveId && manifest && manifest.saveId === baseSaveId);
-  if (state.unsavedSince) return sameSave ? 'recover' : 'conflict';
+  if (state.unsavedSince || crashedWithUnsavedBooks(state, workingFingerprint)) return sameSave ? 'recover' : 'conflict';
   return sameSave ? 'reuse' : 'extract';
+}
+
+/**
+ * The app stopped (crash, power cut) before its first autosave check recorded a change: the
+ * working copy never closed, and its transaction log has moved on from the one its last save
+ * holds — so it has book changes the company file does not, whatever the state says.
+ * `workingFingerprint` is logFingerprint(<working copy>/data); undefined when unknown.
+ */
+function crashedWithUnsavedBooks(state, workingFingerprint) {
+  if (workingFingerprint === undefined || state.closedCleanly !== false) return false;
+  const base = state.base;
+  if (!base || !Object.prototype.hasOwnProperty.call(base, 'fingerprint')) return false;
+  return workingFingerprint !== (base.fingerprint ?? null);
+}
+
+/** lib/services/transactionLog.ts TRANSACTION_LOG_FILE. */
+const TRANSACTION_LOG_FILE = 'transactions.bktlg';
+
+/**
+ * The head of a data folder's running transaction log, exactly as lib/services/backupFingerprint.ts
+ * currentFingerprint() words it (the save logic records it with each save); null without a log.
+ */
+function logFingerprint(dataDir) {
+  const file = path.join(dataDir, TRANSACTION_LOG_FILE);
+  let fd;
+  try {
+    const { size } = fs.statSync(file);
+    if (size === 0) return null;
+    const length = Math.min(size, 256 * 1024);
+    const buf = Buffer.alloc(length);
+    fd = fs.openSync(file, 'r');
+    fs.readSync(fd, buf, 0, length, size - length);
+    const lines = buf.toString('utf8').split('\n').map((l) => l.trim()).filter(Boolean);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      try {
+        const rec = JSON.parse(lines[i]);
+        if (rec && typeof rec.seq === 'number' && typeof rec.hash === 'string') return `log:${rec.seq}:${rec.hash}`;
+      } catch {
+        /* a partial line */
+      }
+    }
+    return `log-size:${size}`;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
 }
 
 /** "ABC Company (unsaved changes from FRONT-DESK, 2026-10-24 1032).ironbooks" next to the file. */
@@ -198,7 +251,14 @@ async function prepareWorkingCopy(companyFile, { root, onConflict, appVersion, k
   }
   const workDir = workingDirFor(companyFile, root);
   const state = readState(workDir);
-  const plan = planOpen({ companyFile, state, manifest, dataExists: hasData(workDir) });
+  const dataExists = hasData(workDir);
+  const plan = planOpen({
+    companyFile,
+    state,
+    manifest,
+    dataExists,
+    workingFingerprint: dataExists ? logFingerprint(dataDirOf(workDir)) : undefined,
+  });
   let conflictCopy = null;
   if (plan === 'conflict') {
     const keep = onConflict ? await onConflict({ state, manifest, workDir }) : true;
@@ -226,7 +286,7 @@ async function prepareWorkingCopy(companyFile, { root, onConflict, appVersion, k
       plan === 'recover'
         ? state.base
         : { saveId: manifest.saveId || null, savedAt: manifest.savedAt || null, fingerprint: manifest.fingerprint || null },
-    unsavedSince: plan === 'recover' ? state.unsavedSince : null,
+    unsavedSince: plan === 'recover' ? state.unsavedSince || now : null,
     openedAt: now,
     lastUsedAt: now,
     closedCleanly: false,
@@ -295,4 +355,5 @@ module.exports = {
   pruneWorkingCopies,
   latestMigrationAt,
   savedByNewerVersion,
+  logFingerprint,
 };
