@@ -446,7 +446,8 @@ export function tieOut(
   // Every row must be read: an amount this can't parse ("5" without cents, "1.5", garbage) must
   // never count as zero — the /api/import route ties out the rows it is about to import, and a
   // row left out of the sum would let an untied statement through as "tied out".
-  const cents = rows.map((r) => amountCents(r.amount));
+  // A row that is not an object (a hand-made request) is unreadable too — never a TypeError (500).
+  const cents = rows.map((r) => amountCents(r && typeof r === 'object' ? r.amount : undefined));
   const sum = cents.reduce<number>((s, c) => s + (c ?? 0), 0);
   const o = openingBalance === null ? null : amountCents(openingBalance);
   const c = closingBalance === null ? null : amountCents(closingBalance);

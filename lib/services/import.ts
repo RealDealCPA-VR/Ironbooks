@@ -28,7 +28,7 @@ import { csvUnsafeText } from '@/lib/csv';
 import { refreshPlannerStats } from '@/lib/db/plannerStats';
 import { bankAccounts, bankTransactions, fileImports } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
-import { type ServiceContext, ServiceError, notFound, validation, writeAudit } from './_base';
+import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
 import { listRules, matchRule } from './rules';
 import { foreignCurrencyOfAccount } from './fxLedger';
 import { homeCode } from './fxLines';
@@ -136,6 +136,47 @@ function legacyOFXDate(raw: string): Date {
 /** `legacy` when it is a valid date different from `date` (else undefined). */
 function legacyIfDifferent(date: Date, legacy: Date): Date | undefined {
   return !isNaN(legacy.getTime()) && legacy.getTime() !== date.getTime() ? legacy : undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Amounts and calendar days
+// ---------------------------------------------------------------------------
+
+/**
+ * A bank file's amount cell → a 2dp string: "1,234.56", "$1,234.56", "-12.50", "12.50-",
+ * "(12.50)", "+5". `null` for a cell with no digits at all (blank, or the "-" / "—" / "N/A" some
+ * banks print in an empty Debit or Credit cell); 'bad' for anything else that is not a number.
+ * decimal.js reads "NaN" and "Infinity" as numbers, and Postgres stores NaN in a numeric
+ * column, so a cell is only money when it really looks like money.
+ */
+export function readBankAmount(raw: unknown): string | null | 'bad' {
+  if (typeof raw !== 'string' && typeof raw !== 'number') return raw == null ? null : 'bad';
+  let s = String(raw).replace(/[\s $,]/g, '');
+  if (!/\d/.test(s)) return s === '' || /^[-–—]+$|^n\/?a$/i.test(s) ? null : 'bad';
+  let neg = false;
+  if (s.startsWith('(') && s.endsWith(')')) {
+    neg = true;
+    s = s.slice(1, -1);
+  }
+  if (s.endsWith('-')) {
+    neg = !neg;
+    s = s.slice(0, -1);
+  }
+  if (s.startsWith('-')) {
+    neg = !neg;
+    s = s.slice(1);
+  } else if (s.startsWith('+')) {
+    s = s.slice(1);
+  }
+  if (!/^(\d+(\.\d+)?|\.\d+)$/.test(s)) return 'bad';
+  const v = Money.round2(s);
+  return toAmountString(neg && !v.isZero() ? v.negated() : v);
+}
+
+/** True when y-m-d (1-based month) names a real calendar day (no Feb 30, no 31 April). */
+function isCalendarDay(y: number, m: number, d: number): boolean {
+  if (!Number.isInteger(y) || !Number.isInteger(m) || !Number.isInteger(d) || m < 1 || m > 12 || d < 1) return false;
+  return d <= new Date(Date.UTC(y, m, 0)).getUTCDate();
 }
 
 // ---------------------------------------------------------------------------
@@ -287,8 +328,13 @@ export function parseOFX(content: string): ParsedTransaction[] {
     const dtPosted = t.DTPOSTED ?? t.DTUSER ?? '';
     if (!dtPosted) throw new ServiceError('VALIDATION', `Transaction ${i + 1}: missing DTPOSTED.`);
     const date = parseOFXDate(String(dtPosted));
-    const trnAmt = t.TRNAMT ?? '0';
-    const amount = toAmountString(String(trnAmt));
+    // OFX amounts are plain decimals ("-12.50"). decimal.js would also read "NaN" / "Infinity",
+    // which Postgres stores in a numeric column — refuse anything that is not a number.
+    const trnAmt = String(t.TRNAMT ?? '0').trim();
+    if (!/^[+-]?(\d+(\.\d+)?|\.\d+)$/.test(trnAmt)) {
+      throw new ServiceError('VALIDATION', `Transaction ${i + 1}: "${trnAmt}" is not an amount.`);
+    }
+    const amount = toAmountString(trnAmt);
     const name = String(t.NAME ?? t.PAYEE ?? '');
     const memo = String(t.MEMO ?? '');
     const description = [name, memo].filter(Boolean).join(' — ') || 'Imported transaction';
@@ -345,7 +391,8 @@ function parseWithFormat(rawDate: string, format: string): Date {
     else if (t.startsWith('M')) month = v;
     else if (t.startsWith('Y')) year = raw.length === 2 ? 2000 + v : v;
   }
-  if (month < 1 || month > 12 || day < 1 || day > 31) return new Date(NaN);
+  // A real calendar day only: Date.UTC would move "31/04" to May 1 and "02/30" into March.
+  if (!isCalendarDay(year, month, day)) return new Date(NaN);
   return new Date(Date.UTC(year, month - 1, day));
 }
 
@@ -363,7 +410,14 @@ function parseLooseDate(rawDate: string): Date {
   if (isNaN(d.getTime())) return d;
   const s = rawDate.trim();
   const iso = /^(\d{4})-(\d{2})-(\d{2})(?!\d)/.exec(s);
-  if (iso) return new Date(Date.UTC(Number(iso[1]), Number(iso[2]) - 1, Number(iso[3])));
+  if (iso) {
+    // The engine rolls an impossible day over ("2026-02-30" → March 2): refuse it instead.
+    if (!isCalendarDay(Number(iso[1]), Number(iso[2]), Number(iso[3]))) return new Date(NaN);
+    return new Date(Date.UTC(Number(iso[1]), Number(iso[2]) - 1, Number(iso[3])));
+  }
+  // "02/30/2026" (read by the engine as month/day/year) rolls over the same way.
+  const mdy = /^(\d{1,2})[/-](\d{1,2})[/-](\d{2}|\d{4})$/.exec(s);
+  if (mdy && (d.getMonth() + 1 !== Number(mdy[1]) || d.getDate() !== Number(mdy[2]))) return new Date(NaN);
   // The zone must follow a time of day, so a date part like "01-31-2024" is never read as one.
   const zone = /\d:\d{2}(?::\d{2}(?:\.\d+)?)?\s*(?:(Z|GMT|UTC)|(?:GMT|UTC)?([+-])(\d{2}):?(\d{2}))$/i.exec(s);
   if (zone) {
@@ -413,18 +467,27 @@ export function parseCSV(content: string, mapping: CsvMapping): ParsedTransactio
     }
 
     // Amount: prefer separate debit/credit columns if specified.
+    // Amounts through readBankAmount (decimal, never parseFloat): an unreadable cell refuses the
+    // file with its row number instead of staging NaN.
+    const money = (raw: string): string | null => {
+      const v = readBankAmount(raw);
+      if (v === 'bad') throw new ServiceError('VALIDATION', `CSV row ${i + 1}: "${raw}" is not an amount.`);
+      return v;
+    };
     let amount: string;
     if (mapping.debitCol !== undefined && mapping.creditCol !== undefined) {
-      const debitRaw = col(mapping.debitCol).replace(/[,$]/g, '');
-      const creditRaw = col(mapping.creditCol).replace(/[,$]/g, '');
-      const debit = debitRaw ? parseFloat(debitRaw) : 0;
-      const credit = creditRaw ? parseFloat(creditRaw) : 0;
-      // Credit = money coming IN (positive); Debit = money going OUT (negative).
-      amount = toAmountString(credit - debit);
+      // The column says the direction: Credit = money coming IN (positive), Debit = money going
+      // OUT (negative) — also when the bank prints the debit signed ("-25.00") or bracketed.
+      const debit = Money.abs(money(col(mapping.debitCol)) ?? 0);
+      const credit = Money.abs(money(col(mapping.creditCol)) ?? 0);
+      amount = toAmountString(credit.minus(debit));
     } else {
-      const rawAmt = col(mapping.amountCol).replace(/[,$]/g, '');
-      if (!rawAmt) throw new ServiceError('VALIDATION', `CSV row ${i + 1}: missing amount value.`);
-      amount = toAmountString(rawAmt);
+      const rawAmt = col(mapping.amountCol);
+      const v = money(rawAmt);
+      if (v === null) {
+        throw new ServiceError('VALIDATION', rawAmt ? `CSV row ${i + 1}: "${rawAmt}" is not an amount.` : `CSV row ${i + 1}: missing amount value.`);
+      }
+      amount = v;
     }
 
     // Sign flip — for banks that export withdrawals as positive numbers.
@@ -576,16 +639,14 @@ export function parseRows(rows: ImportRowInput[]): ParsedTransaction[] {
   if (!Array.isArray(rows) || rows.length === 0) throw validation('There are no rows to import.');
   if (rows.length > 5000) throw validation('Import at most 5,000 rows at a time.');
   return rows.map((r, i) => {
+    if (!r || typeof r !== 'object') throw validation(`Row ${i + 1} is not a statement row.`);
     const date = parseLooseDate(String(r?.date ?? ''));
     if (!/^\d{4}-\d{2}-\d{2}$/.test(String(r?.date ?? '')) || isNaN(date.getTime())) {
-      throw validation(`Row ${i + 1}: the date must look like 2026-01-31.`);
+      throw validation(`Row ${i + 1}: the date must be a real day written like 2026-01-31 ("${String(r?.date ?? '')}" is not).`);
     }
-    let amount: string;
-    try {
-      amount = toAmountString(r.amount);
-    } catch {
-      throw validation(`Row ${i + 1}: "${r.amount}" is not an amount.`);
-    }
+    // Never decimal.js directly: it reads "NaN" / "Infinity", which would be staged as such.
+    const amount = readBankAmount(r.amount);
+    if (amount === null || amount === 'bad') throw validation(`Row ${i + 1}: "${String(r.amount ?? '')}" is not an amount.`);
     if (Money.isZero(amount)) throw validation(`Row ${i + 1}: the amount is zero.`);
     const description = String(r.description ?? '').trim().slice(0, 500) || 'Statement transaction';
     const payee = typeof r.payee === 'string' && r.payee.trim() ? r.payee.trim().slice(0, 255) : undefined;
@@ -722,70 +783,78 @@ export async function importTransactions(
     }
   }
 
-  // 4b. Dedupe: collect fitIds already staged for this bank account.
-  const existingFitIds = new Set<string>();
-  {
-    const existing = await ctx.db
-      .select({ fitId: bankTransactions.fitId })
-      .from(bankTransactions)
-      .where(
-        and(
-          eq(bankTransactions.companyId, ctx.companyId),
-          eq(bankTransactions.bankAccountId, input.bankAccountId),
-        ),
-      );
-    for (const row of existing) {
-      if (row.fitId) existingFitIds.add(row.fitId);
+  // 4b–6 run in ONE transaction: reading the fitIds already staged and inserting the new lines
+  // must be atomic, or the same file imported twice at once (a double click, two windows, two
+  // users) stages every line twice. Each line still succeeds or fails on its own (a savepoint
+  // per line), as before.
+  const { skippedDupes, errorLog, importedCount } = await inTransaction(ctx, async (tx) => {
+    // 4b. Dedupe: collect fitIds already staged for this bank account.
+    const existingFitIds = new Set<string>();
+    {
+      const existing = await tx.db
+        .select({ fitId: bankTransactions.fitId })
+        .from(bankTransactions)
+        .where(
+          and(
+            eq(bankTransactions.companyId, tx.companyId),
+            eq(bankTransactions.bankAccountId, input.bankAccountId),
+          ),
+        );
+      for (const row of existing) {
+        if (row.fitId) existingFitIds.add(row.fitId);
+      }
     }
-  }
 
-  // Dedupe against both already-staged rows AND earlier rows in THIS batch, so two rows that
-  // genuinely share a fitId within one file don't both insert.
-  const seenInBatch = new Set<string>();
-  const toInsert = parsed.filter((p) => {
-    if (!p.fitId) return true;
-    if (existingFitIds.has(p.fitId) || seenInBatch.has(p.fitId)) return false;
-    const legacy = legacyKeys.get(p);
-    if (legacy && existingFitIds.has(legacy)) return false;
-    seenInBatch.add(p.fitId);
-    return true;
+    // Dedupe against both already-staged rows AND earlier rows in THIS batch, so two rows that
+    // genuinely share a fitId within one file don't both insert.
+    const seenInBatch = new Set<string>();
+    const toInsert = parsed.filter((p) => {
+      if (!p.fitId) return true;
+      if (existingFitIds.has(p.fitId) || seenInBatch.has(p.fitId)) return false;
+      const legacy = legacyKeys.get(p);
+      if (legacy && existingFitIds.has(legacy)) return false;
+      seenInBatch.add(p.fitId);
+      return true;
+    });
+
+    // 5. Pre-fetch active rules once for bulk application.
+    const rules = await listRules(tx);
+
+    // 6. Insert + apply rules row-by-row.
+    const errors: Array<{ line: number; error: string }> = [];
+    let imported = 0;
+
+    for (let i = 0; i < toInsert.length; i++) {
+      const txn = toInsert[i];
+      try {
+        // Apply rules to get the suggested account and any payee override.
+        const match = await matchRule(
+          tx,
+          { description: txn.description, payee: txn.payee, amount: txn.amount, bankAccountId: input.bankAccountId },
+          rules,
+        );
+
+        await tx.db.transaction(async (sp) => {
+          await sp.insert(bankTransactions).values({
+            companyId: tx.companyId,
+            bankAccountId: input.bankAccountId,
+            fileImportId: importRow.id,
+            fitId: txn.fitId ?? null,
+            date: txn.date,
+            description: txn.description,
+            payee: match?.setPayee ?? txn.payee ?? null,
+            amount: txn.amount,
+            matched: false,
+            suggestedAccountId: match?.setAccountId ?? null,
+          });
+        });
+        imported += 1;
+      } catch (err) {
+        errors.push({ line: i + 1, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+    return { skippedDupes: parsed.length - toInsert.length, errorLog: errors, importedCount: imported };
   });
-  const skippedDupes = parsed.length - toInsert.length;
-
-  // 5. Pre-fetch active rules once for bulk application.
-  const rules = await listRules(ctx);
-
-  // 6. Insert + apply rules row-by-row.
-  const errorLog: Array<{ line: number; error: string }> = [];
-  let importedCount = 0;
-
-  for (let i = 0; i < toInsert.length; i++) {
-    const txn = toInsert[i];
-    try {
-      // Apply rules to get the suggested account and any payee override.
-      const match = await matchRule(
-        ctx,
-        { description: txn.description, payee: txn.payee, amount: txn.amount, bankAccountId: input.bankAccountId },
-        rules,
-      );
-
-      await ctx.db.insert(bankTransactions).values({
-        companyId: ctx.companyId,
-        bankAccountId: input.bankAccountId,
-        fileImportId: importRow.id,
-        fitId: txn.fitId ?? null,
-        date: txn.date,
-        description: txn.description,
-        payee: match?.setPayee ?? txn.payee ?? null,
-        amount: txn.amount,
-        matched: false,
-        suggestedAccountId: match?.setAccountId ?? null,
-      });
-      importedCount += 1;
-    } catch (err) {
-      errorLog.push({ line: i + 1, error: err instanceof Error ? err.message : String(err) });
-    }
-  }
 
   // 7. Update fileImports with final counts.
   const finalStatus = errorLog.length > 0 && importedCount === 0 ? 'failed' : 'completed';
