@@ -217,6 +217,31 @@ describe('after someone else saved the company file', () => {
     expect(await rowsIn(r.path!)).toEqual([1, 2, 3]);
   }, 180_000);
 
+  it('a crash right after the work went into the copy does not keep it apart a second time', async () => {
+    const dataDir = process.env.BKA_DATA_DIR!;
+    const st = sessionMod.readState(workDir);
+    // The power goes now: the working copy never closed, nothing is recorded as unsaved, and its
+    // transaction log is ahead of the company file's last save — but all of it is in the copy.
+    expect(st).toMatchObject({ closedCleanly: false, unsavedSince: null });
+    expect(sessionMod.logFingerprint(dataDir)).not.toBe(st.base.fingerprint);
+    const reopen = () =>
+      sessionMod.planOpen({
+        companyFile: FILE,
+        state: sessionMod.readState(workDir),
+        manifest: format.readCompanyManifest(FILE),
+        dataExists: true,
+        workingFingerprint: sessionMod.logFingerprint(dataDir),
+      });
+    expect(reopen()).toBe('extract'); // no second "unsaved changes" copy of the same work
+    // Work done after that save (not in the copy) is still kept apart.
+    appendLogRecord(dataDir);
+    expect(reopen()).toBe('conflict');
+
+    // A normal save forgets the copy's fingerprint.
+    adoptFileOnDisk();
+    expect((await saveCompanyFile({ force: true })).outcome).toBe('saved');
+    expect(sessionMod.readState(workDir).conflictFingerprint ?? null).toBeNull();
+  }, 120_000);
 });
 
 describe('after another computer took the file over', () => {

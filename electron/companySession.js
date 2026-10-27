@@ -115,6 +115,9 @@ function planOpen({ companyFile, state, manifest, dataExists, workingFingerprint
  */
 function crashedWithUnsavedBooks(state, workingFingerprint) {
   if (workingFingerprint === undefined || state.closedCleanly !== false) return false;
+  // Everything up to here already went into an "unsaved changes" copy (lib/services/companyFileSave.ts
+  // records what it saved there): nothing is left to keep apart a second time.
+  if (state.conflictFingerprint && workingFingerprint === state.conflictFingerprint) return false;
   const base = state.base;
   if (!base || !Object.prototype.hasOwnProperty.call(base, 'fingerprint')) return false;
   return workingFingerprint !== (base.fingerprint ?? null);
@@ -287,6 +290,8 @@ async function prepareWorkingCopy(companyFile, { root, onConflict, appVersion, k
         ? state.base
         : { saveId: manifest.saveId || null, savedAt: manifest.savedAt || null, fingerprint: manifest.fingerprint || null },
     unsavedSince: plan === 'recover' ? state.unsavedSince || now : null,
+    // What an earlier session saved into an "unsaved changes" copy says nothing about this one.
+    conflictFingerprint: null,
     openedAt: now,
     lastUsedAt: now,
     closedCleanly: false,

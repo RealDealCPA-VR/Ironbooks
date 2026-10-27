@@ -227,6 +227,50 @@ describe('a crash before the first autosave check', () => {
   });
 });
 
+describe('a crash after unsaved changes went into a separate copy', () => {
+  const base = { companyFile: 'X:\\Share\\Acme.ironbooks', schema: 'ironbooks-working-copy/v1', base: { saveId: 's1', fingerprint: 'log:1:h1' } };
+  const plan = (state: Record<string, unknown>, workingFingerprint: string) =>
+    session.planOpen({ companyFile: base.companyFile, state, manifest: { saveId: 's2' }, dataExists: true, workingFingerprint });
+
+  it('does not keep the same work apart a second time', () => {
+    const afterCopy = { ...base, closedCleanly: false, unsavedSince: null, conflictCopy: 'X:\\Share\\Acme (unsaved changes).ironbooks', conflictFingerprint: 'log:2:h2' };
+    expect(plan(afterCopy, 'log:2:h2')).toBe('extract');
+    // Work done after it went into the copy is still kept apart.
+    expect(plan(afterCopy, 'log:3:h3')).toBe('conflict');
+    // Without a copy, the crash rule stands.
+    expect(plan({ ...base, closedCleanly: false, unsavedSince: null }, 'log:2:h2')).toBe('conflict');
+  });
+
+  it('opening the file again starts with no copy recorded', async () => {
+    const format = require('../electron/companyFileFormat.js');
+    const src = path.join(root, 'copy-src');
+    fs.mkdirSync(src, { recursive: true });
+    fs.writeFileSync(path.join(src, 'PG_VERSION'), '17\n');
+    fs.writeFileSync(path.join(src, 'transactions.bktlg'), JSON.stringify({ seq: 1, hash: 'h1' }) + '\n');
+    const cf = path.join(root, 'Copied.ironbooks');
+    const manifest = { formatVersion: 1, fileId: 'k', companyName: 'Copied Co', saveId: 's1', savedAt: 'x', fingerprint: 'log:1:h1' };
+    await format.writeCompanyFile(cf, { manifest, entries: format.snapshotDir(src) });
+    const wr = path.join(root, 'Working-copied');
+    const prep = await session.prepareWorkingCopy(cf, { root: wr });
+    // The session saved its work into a separate copy (someone else had saved the file), then crashed.
+    fs.appendFileSync(path.join(prep.dataDir, 'transactions.bktlg'), JSON.stringify({ seq: 2, hash: 'h2' }) + '\n');
+    session.writeState(prep.workDir, { unsavedSince: null, conflictCopy: path.join(root, 'kept.ironbooks'), conflictFingerprint: 'log:2:h2' });
+    await format.writeCompanyFile(cf, { manifest: { ...manifest, saveId: 's2' }, entries: format.snapshotDir(src) });
+    let asked = false;
+    const next = await session.prepareWorkingCopy(cf, {
+      root: wr,
+      onConflict: async () => {
+        asked = true;
+        return true;
+      },
+    });
+    expect(next.plan).toBe('extract');
+    expect(asked).toBe(false);
+    expect(next.conflictCopy).toBeNull();
+    expect(session.readState(next.workDir).conflictFingerprint).toBeNull();
+  });
+});
+
 describe('Save Copy As in the sandbox (source pins)', () => {
   const main = fs.readFileSync(path.resolve(__dirname, '..', 'electron', 'main.js'), 'utf8');
   it('is refused from the Company File page too, not only greyed out in the File menu', () => {

@@ -465,6 +465,10 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
       writeWorkingState(s, {
         unsavedSince: null,
         conflictCopy: target,
+        // What the copy holds (the transaction-log head): after a crash, a working copy still at
+        // exactly this point has nothing the copy lacks, so it is not kept apart a second time
+        // (electron/companySession.js crashedWithUnsavedBooks).
+        conflictFingerprint: fingerprint,
         ...(opts.final ? { closedCleanly: true, lastUsedAt: savedAt } : {}),
       });
       return { saved: true, outcome: 'conflict', path: target, bytes: result.bytes, durationMs: s.lastSaveMs };
@@ -484,6 +488,7 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
     writeWorkingState(s, {
       base: { saveId, savedAt, fingerprint },
       unsavedSince: null,
+      conflictFingerprint: null,
       lastSavedAt: savedAt,
       fileId,
       companyName,
