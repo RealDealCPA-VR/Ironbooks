@@ -255,6 +255,9 @@ export async function previewHomeCurrencyAdjustment(ctx: ServiceContext, input: 
 }
 
 const ymdOf = (d: Date) => new Date(d).toISOString().slice(0, 10);
+/** A real instant's LOCAL calendar day (this machine is the user's), as "YYYY-MM-DD". */
+const localDateISO = (d: Date) =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 
 function hasAccountLines(detail: unknown): boolean {
   return Array.isArray(detail) && detail.some((l) => (l as { kind?: string } | null)?.kind === 'account');
@@ -392,11 +395,20 @@ export async function createHomeCurrencyAdjustment(ctx: ServiceContext, input: H
       .where(eq(homeCurrencyAdjustments.id, row.id))
       .returning();
     if (input.updateCurrencyList !== false) {
+      // review5 fx: the currency list holds ONE rate per currency — the current one new
+      // transactions default to. An adjustment dated before that rate was last set (a late
+      // year-end revaluation) records the old date's rate on the adjustment only; it used to
+      // replace today's rate with it, so every new transaction defaulted to last year's rate.
+      const listed = await tx.db
+        .select({ id: currencies.id, code: currencies.code, updatedAt: currencies.updatedAt })
+        .from(currencies)
+        .where(and(eq(currencies.companyId, tx.companyId), eq(currencies.isBase, false)));
       for (const [code, rate] of Object.entries(preview.rates)) {
-        await tx.db
-          .update(currencies)
-          .set({ rateToBase: rate, updatedAt: new Date() })
-          .where(and(eq(currencies.companyId, tx.companyId), eq(currencies.code, code), eq(currencies.isBase, false)));
+        const row = listed.find((c) => c.code === code);
+        // updatedAt is a real instant: its LOCAL calendar day (the day the user set the rate);
+        // the adjustment's date is a calendar day stored at UTC midnight.
+        if (!row || localDateISO(row.updatedAt) > ymdOf(date)) continue;
+        await tx.db.update(currencies).set({ rateToBase: rate, updatedAt: new Date() }).where(eq(currencies.id, row.id));
       }
     }
     await writeAudit(tx, {

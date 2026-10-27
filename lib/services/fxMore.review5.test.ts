@@ -148,4 +148,22 @@ describe('review5 fx (second batch)', () => {
     expect(all.closingBalance).toBe('1200.00');
     expect((await trialBalance(ctx)).balanced).toBe(true);
   });
+
+  it('a back-dated Home Currency Adjustment does not replace the current currency list rate with an old one', async () => {
+    const { listCurrencies } = await import('./currencies');
+    const c = await createCustomer(ctx, { displayName: `EUR catch-up ${seq}` } as never);
+    await createInvoice(ctx, { customerId: c.id, date: d('2025-11-01'), currency: 'EUR', exchangeRate: '1.20', lines: [{ accountId: acct['4000'], quantity: 1, rate: '1000.00' }] } as never);
+    // Today's rate is 1.17; last year's year-end revaluation is entered late, at that date's 1.10.
+    await upsertCurrency(ctx, { code: 'EUR', name: 'Euro', rateToBase: '1.17' });
+    await createHomeCurrencyAdjustment(ctx, { date: midnight('2025-12-31'), rates: { EUR: '1.10' } });
+    const eur = (await listCurrencies(ctx)).find((x) => x.code === 'EUR')!;
+    expect(Money.of(eur.rateToBase).toFixed(2)).toBe('1.17');
+    // An adjustment dated today does update the list (as before).
+    // (The date picker's today is the LOCAL calendar day, stored at UTC midnight.)
+    const now = new Date();
+    const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+    await createHomeCurrencyAdjustment(ctx, { date: midnight(today), rates: { EUR: '1.15' } });
+    const eur2 = (await listCurrencies(ctx)).find((x) => x.code === 'EUR')!;
+    expect(Money.of(eur2.rateToBase).toFixed(2)).toBe('1.15');
+  });
 });
