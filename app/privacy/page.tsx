@@ -6,9 +6,10 @@
  * (offline / local network + tailnet / allow chosen cloud services), the per-service cloud
  * opt-ins, and the recent outbound activity log. Owners/admins can change it; everyone can see it.
  */
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Network, ShieldCheck, WifiOff, Cloud, Check, X } from 'lucide-react';
 import { Badge, Button, Card, PageHeader, PageSkeleton, toast } from '@/components/ui';
+import LoadFailed from '@/components/LoadFailed';
 import { api, ApiError } from '@/lib/client';
 
 type Mode = 'offline' | 'tailnet-only' | 'allow-cloud';
@@ -77,16 +78,27 @@ export default function PrivacyNetworkPage() {
   });
   const [lookupUrl, setLookupUrl] = useState('');
   const [saving, setSaving] = useState(false);
+  // A failed first load shows "could not be loaded / Try again" instead of an endless skeleton.
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const loaded = useRef(false);
 
   const load = useCallback(async () => {
+    setLoading(true);
     try {
       const d = await api.get<PolicyResponse>('/api/network-policy');
       setData(d);
       setMode(d.policy.mode);
       setOptIn(d.policy.cloudOptIn);
       setLookupUrl(d.policy.vendorLookupUrl ?? '');
+      setLoadError(null);
+      loaded.current = true;
     } catch (err) {
-      toast(err instanceof ApiError ? err.message : 'Could not load privacy settings.', 'danger');
+      const msg = err instanceof ApiError ? err.message : 'Could not load privacy settings.';
+      if (loaded.current) toast(msg, 'danger');
+      else setLoadError(msg);
+    } finally {
+      setLoading(false);
     }
   }, []);
 
@@ -122,7 +134,7 @@ export default function PrivacyNetworkPage() {
     return (
       <div className="p-8 max-w-4xl mx-auto w-full">
         <PageHeader title="Privacy & Network" icon={Network} />
-        <PageSkeleton rows={6} />
+        {loadError ? <LoadFailed message={loadError} onRetry={() => void load()} retrying={loading} /> : <PageSkeleton rows={6} />}
       </div>
     );
   }

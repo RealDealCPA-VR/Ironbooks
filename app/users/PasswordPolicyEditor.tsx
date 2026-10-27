@@ -11,6 +11,7 @@ import { useEffect, useState } from 'react';
 import { KeyRound } from 'lucide-react';
 import { Button, Card, Input, Label, toast } from '@/components/ui';
 import { api } from '@/lib/client';
+import LoadFailed from '@/components/LoadFailed';
 import {
   PASSWORD_POLICY_LIMITS,
   describePasswordPolicy,
@@ -21,15 +22,25 @@ import {
 export default function PasswordPolicyEditor() {
   const [policy, setPolicy] = useState<PasswordPolicy | null>(null);
   const [busy, setBusy] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [attempt, setAttempt] = useState(0);
 
   useEffect(() => {
+    setLoadError(null);
     api
       .get<PasswordPolicy>('/api/users/password-policy')
       .then((p) => setPolicy(normalizePasswordPolicy(p)))
-      .catch((e) => toast(e instanceof Error ? e.message : 'Could not load the password rules.', 'danger'));
-  }, []);
+      .catch((e) => setLoadError(e instanceof Error ? e.message : 'Could not load the password rules.'));
+  }, [attempt]);
 
-  if (!policy) return <Card className="p-6 text-sm text-navy/60">Loading password rules…</Card>;
+  if (!policy) {
+    // A failed load says so and offers Try again (it used to say "Loading…" for ever).
+    return loadError ? (
+      <LoadFailed message={loadError} onRetry={() => setAttempt((n) => n + 1)} />
+    ) : (
+      <Card className="p-6 text-sm text-navy/60">Loading password rules…</Card>
+    );
+  }
 
   const set = <K extends keyof PasswordPolicy>(k: K, v: PasswordPolicy[K]) => setPolicy({ ...policy, [k]: v });
   const num = (v: string) => (v === '' ? 0 : Math.trunc(Number(v)));
