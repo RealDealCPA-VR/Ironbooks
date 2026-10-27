@@ -186,7 +186,7 @@ describe('C: Client Data Review is no side door around Customers / Vendors', () 
       lines: [{ description: 'Work', quantity: 1, rate: '100.00', accountId: acct.i1 }],
     });
     const pay = await receivePayment(ctx, { customerId: cust, date: D('2026-05-03'), method: 'check', amount: '100.00', applications: [] });
-    const payId = (pay as { id?: string; payment?: { id: string } }).payment?.id ?? (pay as { id: string }).id;
+    const payId = pay.payment.id;
     const vend = (await createVendor(ctx, { displayName: 'R5 Review Vendor' })).id;
     await createBill(ctx, { vendorId: vend, date: D('2026-05-01'), lines: [{ accountId: acct.e1, amount: '60.00' }] });
     const credit = await createVendorCredit(ctx, { vendorId: vend, date: D('2026-05-02'), lines: [{ accountId: acct.e1, amount: '20.00' }] });

@@ -66,7 +66,7 @@ describe('review5: error scan findings', () => {
     const entry = await db.transaction(async (tx) => {
       const [e] = await tx
         .insert(journalEntries)
-        .values({ companyId: ctx.companyId, entryNumber: 99001, date: D('2026-03-05'), description: '  ', status: 'void', createdBy: ctx.userId })
+        .values({ companyId: ctx.companyId, entryNumber: 99001, date: D('2026-03-05'), description: '  ', status: 'void', createdBy: ctx.userId! })
         .returning();
       await tx.insert(journalEntryLines).values([
         { journalEntryId: e.id, accountId: acct['1000'], debit: '10.00', credit: null },
