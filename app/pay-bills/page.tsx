@@ -14,6 +14,7 @@
  * duplicate check numbers are warned about; recent payments can be edited or voided.
  */
 import { isPaymentSourceAccount } from '@/lib/accountTypes';
+import { methodForPaymentAccount } from '@/lib/billPaymentMethod';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { HandCoins, Pencil, Trash2 } from 'lucide-react';
 import {
@@ -292,6 +293,12 @@ export default function PayBillsPage() {
     if (def && !paymentAccountId && paymentAccounts.some((a) => a.id === def)) setPaymentAccountId(def);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [accounts, prefs.loaded]);
+  // QB: picking a credit card account sets the method to Credit Card (a check is written on a
+  // bank account only, and the save refuses "Check" from a card); a bank account turns it back.
+  useEffect(() => {
+    const acct = accounts.find((a) => a.id === paymentAccountId);
+    if (acct) setMethod((m) => methodForPaymentAccount(acct, m));
+  }, [paymentAccountId, accounts]);
 
   const discountAccounts = accounts.filter((a) => a.type === 'revenue' || a.type === 'expense');
 

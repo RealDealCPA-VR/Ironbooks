@@ -47,7 +47,7 @@ import { Money, toAmountString } from '@/lib/money';
 import { postJournalEntry } from './posting';
 import { fifoLayerValue, valueRemainderAfter } from './inventory';
 import { dueDateFromTermsList } from './lists/terms';
-import { findAccrualAccount, getOrCreateAccrualAccount } from './itemReceipts';
+import { findAccrualAccount, getOrCreateAccrualAccount, receiptAccrualAccounts } from './itemReceipts';
 import {
   type ReceivingSettings,
   adjustPoReceivedUnbilled,
@@ -312,6 +312,8 @@ interface PlannedLine extends ReceiptBillLinePreview {
   layerPlan: Array<{ layer: typeof inventoryLayers.$inferSelect; take: Dec }>;
   /** FIFO: the 4-decimal unit-cost increment the layers in layerPlan get. */
   layerUnitDelta: Dec | null;
+  /** The account the receipt's entry credited, which this bill relieves (set after planning). */
+  accrualAccountId: string;
 }
 
 async function accountIdByCode(ctx: ServiceContext, code: string): Promise<string> {
@@ -595,6 +597,7 @@ async function planReceiptBill(ctx: ServiceContext, input: EnterReceiptBillInput
       receipt,
       line,
       qtyTouched: touched,
+      accrualAccountId: '', // set once every row is planned (below)
       varianceAccountId,
       inventoryAccountId,
       layerPlan,
@@ -632,8 +635,21 @@ async function planReceiptBill(ctx: ServiceContext, input: EnterReceiptBillInput
     throw validation('The bill total must be greater than zero.');
   }
 
-  // Previews are read-only: never create the 2050 account from one (a receipt already did).
-  const accrualAccountId = dryRun ? await findAccrualAccountOrPlaceholder(ctx) : await getOrCreateAccrualAccount(ctx);
+  // Each receipt line relieves the account its receipt's own entry credited (an older receipt
+  // may have credited the user's own account numbered 2050; see receiptAccrualAccounts). Only a
+  // receipt with no posted entry falls back to the Item Receipts Accrual, and previews are
+  // read-only: they never create that account.
+  const creditedBy = await receiptAccrualAccounts(ctx, planned.map((l) => l.receiptId));
+  let fallbackAccrual: string | null = null;
+  for (const l of planned) {
+    const credited = creditedBy.get(l.receiptId);
+    if (credited) {
+      l.accrualAccountId = credited;
+      continue;
+    }
+    fallbackAccrual ??= dryRun ? await findAccrualAccountOrPlaceholder(ctx) : await getOrCreateAccrualAccount(ctx);
+    l.accrualAccountId = fallbackAccrual;
+  }
   const [apRow] = await ctx.db
     .select({ id: accounts.id })
     .from(accounts)
@@ -652,7 +668,7 @@ async function planReceiptBill(ctx: ServiceContext, input: EnterReceiptBillInput
     const prev = signed.get(accountId);
     signed.set(accountId, { amount: (prev?.amount ?? Money.zero()).plus(amount), memo: prev?.memo ?? memo });
   };
-  add(accrualAccountId, accrualRelieved, 'Item receipts accrual relieved');
+  for (const l of planned) add(l.accrualAccountId, Money.of(l.accrualAmount), 'Item receipts accrual relieved');
   for (const l of planned) {
     if (l.inventoryAccountId) add(l.inventoryAccountId, Money.of(l.inventoryVariance), `Price variance capitalized — ${l.itemName}`);
     if (l.varianceAccountId) {
@@ -689,10 +705,21 @@ async function planReceiptBill(ctx: ServiceContext, input: EnterReceiptBillInput
   return {
     vendor,
     planned,
-    accrualAccountId,
     apAccountId: apRow.id,
     preview: {
-      lines: planned.map(({ receipt: _r, line: _l, qtyTouched: _q, varianceAccountId: _v, inventoryAccountId: _i, layerPlan: _p, layerUnitDelta: _u, ...rest }) => rest),
+      lines: planned.map(
+        ({
+          receipt: _r,
+          line: _l,
+          qtyTouched: _q,
+          varianceAccountId: _v,
+          inventoryAccountId: _i,
+          layerPlan: _p,
+          layerUnitDelta: _u,
+          accrualAccountId: _a,
+          ...rest
+        }) => rest,
+      ),
       billTotal: toAmountString(billTotal),
       accrualRelieved: toAmountString(accrualRelieved),
       totalVariance: toAmountString(billTotal.minus(accrualRelieved)),
@@ -713,7 +740,7 @@ export async function previewReceiptBill(ctx: ServiceContext, input: EnterReceip
 export async function enterBillForReceivedItems(ctx: ServiceContext, input: EnterReceiptBillInput) {
   return inTransaction(ctx, async (tx) => {
     // Plan INSIDE the transaction so quantities/costs/layers cannot shift underneath us.
-    const { vendor, planned, preview, accrualAccountId, apAccountId } = await planReceiptBill(tx, input);
+    const { vendor, planned, preview, apAccountId } = await planReceiptBill(tx, input);
     // QB fills the bill's terms and due date from the vendor (as Enter Bills does): without them
     // A/P aging aged the bill from its own date and Pay Bills' "due on or before" ignored it.
     const terms = vendor.terms?.trim() || null;
@@ -750,7 +777,7 @@ export async function enterBillForReceivedItems(ctx: ServiceContext, input: Ente
       const memo = `${l.itemName} — ${Money.of(l.quantityBilled).toString()} @ ${Money.of(l.billUnitCost).toFixed(2)} (received @ ${Money.of(l.receiptUnitCost).toFixed(2)})`;
       lineRows.push({
         billId: bill.id,
-        accountId: accrualAccountId,
+        accountId: l.accrualAccountId,
         description: memo,
         quantity: l.quantityBilled,
         amount: l.accrualAmount,

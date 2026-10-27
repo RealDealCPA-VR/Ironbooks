@@ -1031,6 +1031,29 @@ async function isLedgerNeutralBillEdit(
   );
 }
 
+/**
+ * The Enter Bills form shows no quantity on an expense (account) line and re-sends it as
+ * { accountId, description, amount }, which prepareBill defaults to quantity 1. A saved account
+ * line keeps its own quantity unless one is sent: a P.O. account line billed for 3 hours stayed
+ * "3" on the bill, but any re-save (a date fix, even no change) turned it into 1, so the P.O.'s
+ * billed quantity dropped from 3 to 1 and the same hours could be billed again; and the re-save
+ * was never ledger-neutral (quantity 3 != 1). Lines map by position (as the edit does).
+ */
+function keepSavedAccountLineQuantities(
+  input: CreateBillInput,
+  prep: PreparedBill,
+  saved: ReadonlyArray<{ lineOrder: number; itemId: string | null; quantity: string | null }>,
+): void {
+  const byOrder = new Map(saved.map((l) => [l.lineOrder, l] as const));
+  prep.resolvedLines.forEach((n, i) => {
+    const src = input.lines[i];
+    if (!src || n.itemId || src.quantity != null) return;
+    const o = byOrder.get(i);
+    if (!o || o.itemId || o.quantity == null) return;
+    n.quantity = Money.of(o.quantity).toFixed(4);
+  });
+}
+
 /** Ledger-neutral bill edit (see isLedgerNeutralBillEdit): header and line text only. */
 async function updateBillHeaderInTx(tx: ServiceContext, id: string, input: CreateBillInput, prep: PreparedBill) {
   const [bill] = await tx.db
@@ -1123,6 +1146,13 @@ export async function updateBill(ctx: ServiceContext, id: string, input: CreateB
     // An input the full edit would refuse anyway (e.g. the negative variance lines of a bill for
     // received items) falls through to it, so its own checks give the usual message.
     const neutralPrep = await prepareBill(ctx, input).catch(() => null);
+    if (neutralPrep) {
+      const saved = await ctx.db
+        .select({ lineOrder: billLines.lineOrder, itemId: billLines.itemId, quantity: billLines.quantity })
+        .from(billLines)
+        .where(eq(billLines.billId, id));
+      keepSavedAccountLineQuantities(input, neutralPrep, saved);
+    }
     if (neutralPrep && (await isLedgerNeutralBillEdit(ctx, existing, input, neutralPrep))) {
       return inTransaction(ctx, async (tx) => {
         const [cur] = await tx.db.select().from(bills).where(and(eq(bills.id, id), eq(bills.companyId, tx.companyId)));
@@ -1194,6 +1224,9 @@ export async function updateBill(ctx: ServiceContext, id: string, input: CreateB
       .from(billLines)
       .where(eq(billLines.billId, id))
       .orderBy(asc(billLines.lineOrder));
+    // An account line sent without a quantity keeps the saved one (the P.O. sync below and the
+    // billed-line match compare quantities).
+    keepSavedAccountLineQuantities(input, prep, oldLines);
 
     // Billable lines already pulled onto a customer invoice keep that link (so they are not
     // offered for billing again) when the edit leaves them financially unchanged; changing one

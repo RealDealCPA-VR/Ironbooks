@@ -42,6 +42,7 @@ import {
   itemReceipts,
   items,
   journalEntries,
+  journalEntryLines,
   vendors,
 } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
@@ -185,6 +186,41 @@ export async function getOrCreateAccrualAccount(ctx: ServiceContext): Promise<st
     })
     .returning();
   return created.id;
+}
+
+/**
+ * The account each receipt's own posted entry credited (its accrual), by receipt id. Billing a
+ * receipt must debit THAT account: receipts saved before findAccrualAccount stopped taking any
+ * account numbered 2050 credited the user's own 2050 (e.g. "2050 Equipment Loan"); billing them
+ * against the Item Receipts Accrual created now left the loan with the receipt's credit and the
+ * accrual with the bill's debit, both for good. A receipt has one credit line (Cr accrual total).
+ * Receipts with no posted entry are left out (the caller falls back to the accrual account).
+ */
+export async function receiptAccrualAccounts(ctx: ServiceContext, receiptIds: string[]): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  if (receiptIds.length === 0) return out;
+  const rows = await ctx.db
+    .select({ receiptId: itemReceipts.id, accountId: journalEntryLines.accountId, credit: journalEntryLines.credit })
+    .from(itemReceipts)
+    .innerJoin(journalEntries, eq(journalEntries.id, itemReceipts.postedEntryId))
+    .innerJoin(journalEntryLines, eq(journalEntryLines.journalEntryId, journalEntries.id))
+    .where(
+      and(
+        eq(itemReceipts.companyId, ctx.companyId),
+        inArray(itemReceipts.id, [...new Set(receiptIds)]),
+        eq(journalEntries.companyId, ctx.companyId),
+        eq(journalEntries.status, 'posted'),
+        sql`${journalEntryLines.credit} > 0`,
+      ),
+    );
+  const best = new Map<string, { accountId: string; credit: ReturnType<typeof Money.zero> }>();
+  for (const r of rows) {
+    const credit = Money.of(r.credit ?? 0);
+    const prev = best.get(r.receiptId);
+    if (!prev || credit.greaterThan(prev.credit)) best.set(r.receiptId, { accountId: r.accountId, credit });
+  }
+  for (const [id, b] of best) out.set(id, b.accountId);
+  return out;
 }
 
 /** True when the item has ever had FIFO cost layers (mirrors bills.ts/inventory). */
@@ -893,7 +929,10 @@ export async function convertToBill(
   await assertHomeCurrencyVendor(ctx, rv?.currency ?? null);
 
   return inTransaction(ctx, async (tx) => {
-    const accrualAccountId = await getOrCreateAccrualAccount(tx);
+    // The bill relieves the account the receipt's own entry credited (an older receipt may have
+    // credited another account numbered 2050; see receiptAccrualAccounts).
+    const accrualAccountId =
+      (await receiptAccrualAccounts(tx, [receiptId])).get(receiptId) ?? (await getOrCreateAccrualAccount(tx));
     // Claim the receipt first (guarded conditional UPDATE) so a concurrent
     // conversion can never post a second bill against the same accrual.
     const claimed = await tx.db
