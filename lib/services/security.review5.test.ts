@@ -53,6 +53,8 @@ import { GET as w2GET } from '@/app/api/payroll/w2/route';
 import { POST as importPOST } from '@/app/api/import/route';
 import { POST as csvPreviewPOST } from '@/app/api/import/csv-preview/route';
 import { POST as portalLoginPOST } from '@/app/api/portal/login/route';
+import { POST as workersCompPOST } from '@/app/api/payroll/workers-comp/route';
+import { POST as stateSettingsPOST } from '@/app/api/payroll/state-settings/route';
 import { createVendor } from './vendors';
 
 let db: DB;
@@ -259,6 +261,26 @@ describe('review5: employee portal sign-in', () => {
 });
 
 describe('review5: text longer than its column is a 400, not a 500', () => {
+  it('a payroll rate that is not a number ("abc", "NaN") is refused, never a 500 or a NaN rate', async () => {
+    for (const ratePer100 of ['abc', 'NaN', '3.4%']) {
+      as(owner, 'POST', '/api/payroll/workers-comp');
+      const res = await workersCompPOST(req('POST', '/api/payroll/workers-comp', { code: 'WC1', ratePer100 }));
+      expect(res.status, ratePer100).toBe(400);
+    }
+    for (const suiRate of ['abc', 'NaN']) {
+      as(owner, 'POST', '/api/payroll/state-settings');
+      const res = await stateSettingsPOST(req('POST', '/api/payroll/state-settings', { state: 'CA', year: 2026, suiRate }));
+      expect(res.status, suiRate).toBe(400);
+    }
+    as(owner, 'POST', '/api/payroll/workers-comp');
+    const ok = await workersCompPOST(req('POST', '/api/payroll/workers-comp', { code: 'WC2', ratePer100: '1.25' }));
+    expect(ok.status).toBe(201);
+    // Any other route whose service meets an unparseable amount answers 400 too.
+    const { routeError } = await import('@/lib/routeErrors');
+    const { MoneyParseError } = await import('@/lib/money');
+    expect(routeError(new MoneyParseError('abc'), 't').status).toBe(400);
+  });
+
   it('a 300-character customer name', async () => {
     as(owner, 'POST', '/api/customers');
     const res = await customersPOST(req('POST', '/api/customers', { displayName: 'A'.repeat(300) }));
