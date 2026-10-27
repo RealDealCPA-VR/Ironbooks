@@ -65,6 +65,11 @@ export async function effectiveHomeCurrency(ctx: Pick<ServiceContext, 'db' | 'co
  */
 export async function hasForeignCurrencyData(db: DB, companyId: string, settings?: Settings): Promise<boolean> {
   const home = await homeCodeOf(db, companyId, settings ?? (await settingsOf(db, companyId)));
+  return hasCurrencyDataOtherThan(db, companyId, home);
+}
+
+/** True when an account, vendor or transaction is recorded in a currency other than `code`. */
+async function hasCurrencyDataOtherThan(db: DB, companyId: string, home: string): Promise<boolean> {
   const foreign = (table: string) =>
     sql`EXISTS (SELECT 1 FROM ${sql.raw(table)} t WHERE t.company_id = ${companyId} AND t.currency IS NOT NULL AND btrim(t.currency) <> '' AND upper(btrim(t.currency)) <> ${home})`;
   const tables = [
@@ -87,6 +92,50 @@ export async function hasForeignCurrencyData(db: DB, companyId: string, settings
   const res = await db.execute(sql`SELECT (${sql.join(checks, sql` OR `)}) AS found`);
   const row = (res.rows as Array<{ found: boolean }>)[0];
   return Boolean(row?.found);
+}
+
+export const HOME_CURRENCY_LOCKED_MESSAGE = (home: string) =>
+  `Your home currency is ${home}. This company already has foreign-currency accounts, names or transactions, so the home currency can no longer be changed (QuickBooks works the same way).`;
+
+/**
+ * review5 fx: the home currency is the unit of the whole ledger. Changing it from the current one
+ * (the currency list's base, else the Preferences currency, else USD — so a list with no base row,
+ * as migration 0056 left older files, is no way around it) is refused once any account, name or
+ * transaction carries a currency: a document in the new currency would silently become a home one,
+ * and one tagged with the old home code a foreign one, so aging would stop agreeing with the GL.
+ * Returns true when `next` is a change (the caller then rebases the currency list).
+ */
+export async function assertHomeCurrencyChangeAllowed(
+  ctx: Pick<ServiceContext, 'db' | 'companyId'>,
+  next: string,
+): Promise<boolean> {
+  const current = await effectiveHomeCurrency(ctx);
+  const code = next.trim().toUpperCase();
+  if (code === current) return false;
+  if (
+    (await hasCurrencyDataOtherThan(ctx.db, ctx.companyId, current)) ||
+    (await hasCurrencyDataOtherThan(ctx.db, ctx.companyId, code))
+  ) {
+    throw new ServiceError('CONFLICT', HOME_CURRENCY_LOCKED_MESSAGE(current), { homeCurrencyLocked: true });
+  }
+  return true;
+}
+
+/**
+ * updateCompany hook (review5 fx): while the currency list has no base row, the Preferences
+ * currency IS the home currency, so changing it is a home-currency change (see above).
+ */
+export async function assertPreferenceCurrencyChangeAllowed(
+  ctx: Pick<ServiceContext, 'db' | 'companyId'>,
+  next: unknown,
+): Promise<void> {
+  const [base] = await ctx.db
+    .select({ id: currencies.id })
+    .from(currencies)
+    .where(and(eq(currencies.companyId, ctx.companyId), eq(currencies.isBase, true)));
+  if (base) return; // the list's base is the home currency; the Preferences value is display only
+  const raw = typeof next === 'string' ? next : '';
+  await assertHomeCurrencyChangeAllowed(ctx, raw.trim() || 'USD');
 }
 
 /** Foreign-currency data, or foreign currencies set up in the currency list. */

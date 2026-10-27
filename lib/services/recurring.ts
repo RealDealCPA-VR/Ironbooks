@@ -38,6 +38,7 @@ import { createSalesReceipt, type CreateSalesReceiptInput } from './salesReceipt
 import { createCreditMemo, type CreateCreditMemoInput } from './creditMemos';
 import { createDeposit, type CreateDepositInput } from './deposits';
 import { createTransfer, type CreateTransferInput } from './transfers';
+import { accountCurrencyOf } from './exchangeRates';
 import { createPurchaseOrder, type CreatePurchaseOrderInput } from './purchaseOrders';
 
 // ---------------------------------------------------------------------------
@@ -160,6 +161,7 @@ export interface RunFailure {
 }
 
 /** Reserved key inside the template jsonb that carries legacy non-payload options. */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const OPTIONS_KEY = '__options';
 
 interface TemplateOptions {
@@ -592,8 +594,9 @@ async function generateFromTemplate(
     );
   }
 
-  // review5 fx: a memorized foreign-currency invoice / bill is entered at the exchange rate of the
-  // day it is entered (the currency list's), as QB does — not the rate memorized months ago.
+  // review5 fx: a memorized foreign-currency invoice / bill / check / deposit / transfer is entered
+  // at the exchange rate of the day it is entered (the currency list's), as QB does — not the rate
+  // memorized months ago.
   const fresh = { exchangeRate: undefined };
   switch (template.docType as DocType) {
     case 'invoice': {
@@ -644,6 +647,7 @@ async function generateFromTemplate(
       // one-time money and are never re-deposited from a memorized deposit.
       const input = {
         ...(payload as unknown as CreateDepositInput),
+        ...fresh,
         paymentIds: [],
         salesReceiptIds: [],
         date: runDate,
@@ -652,7 +656,24 @@ async function generateFromTemplate(
       break;
     }
     case 'transfer': {
-      const input = { ...(payload as unknown as CreateTransferInput), date: runDate };
+      // review5 fx: the memorized home amount is never reused (it is recomputed at today's rate). A
+      // same-currency foreign transfer also drops the memorized rate (home per unit); between two
+      // currencies `exchangeRate` is the cross rate the user memorized with the amounts, so it stays.
+      const memorized = payload as unknown as CreateTransferInput;
+      // A missing / malformed / deleted account is left to createTransfer's own plain message.
+      const currencyOf = async (id: unknown): Promise<string | null | undefined> => {
+        if (typeof id !== 'string' || !UUID_RE.test(id)) return undefined;
+        try {
+          return (await accountCurrencyOf(ctx, id)).currency;
+        } catch (err) {
+          if (err instanceof ServiceError) return undefined;
+          throw err;
+        }
+      };
+      const from = await currencyOf(memorized.fromAccountId);
+      const to = await currencyOf(memorized.toAccountId);
+      const sameCurrency = from !== undefined && to !== undefined && from === to;
+      const input = { ...memorized, ...(sameCurrency ? fresh : {}), homeAmount: undefined, date: runDate };
       docId = (await createTransfer(ctx, input)).id;
       break;
     }

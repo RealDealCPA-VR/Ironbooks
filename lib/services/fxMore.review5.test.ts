@@ -1,5 +1,8 @@
 /**
- * Review round 5 — multi-currency (team fx), second batch. Each test failed before its fix.
+ * Review round 5 — multi-currency (team fx), second batch. Each test failed before its fix, except
+ * the home-currency statement one: it pins statements.ts as the companion of this round's
+ * journalOpenItems change (closed Home Currency Adjustment pairs are no longer open General
+ * Journal items, and the statement still has to list them) - main already showed them.
  */
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import { and, eq } from 'drizzle-orm';
@@ -131,7 +134,7 @@ describe('review5 fx (second batch)', () => {
     expect(Money.of(edited.exchangeRate!).toFixed(2)).toBe('1.20');
   });
 
-  it('a home-currency statement of a foreign customer shows the Home Currency Adjustment and its reversal', async () => {
+  it('a home-currency statement of a foreign customer still shows the Home Currency Adjustment and its reversal (companion of the journalOpenItems change)', async () => {
     const { customerStatement, customerArLedgerBalance } = await import('./statements');
     const c = await createCustomer(ctx, { displayName: `EUR statement ${seq}` } as never);
     await createInvoice(ctx, { customerId: c.id, date: d('2026-02-01'), currency: 'EUR', exchangeRate: '1.20', lines: [{ accountId: acct['4000'], quantity: 1, rate: '1000.00' }] } as never);
@@ -220,6 +223,30 @@ describe('review5 fx (second batch)', () => {
     await expect(
       createExpense(ctx, { payeeName: 'Card Co', date: d('2026-03-10'), method: 'check', paymentAccountId: acct['1020'], lines: [{ accountId: acct['2150'], amount: '100.00' }] } as never),
     ).resolves.toBeTruthy();
+  });
+
+  it('a bill or vendor credit line on a card in the document currency moves the card by the typed amount', async () => {
+    const { createBill, updateBill } = await import('./bills');
+    const { createVendorCredit } = await import('./vendorCredits');
+    const { accountRegister } = await import('./journal');
+    const { withAccountCurrency } = await import('./fxLedger');
+    const cardBalance = async (id: string) => (await withAccountCurrency(ctx, await accountRegister(ctx, id), {})).foreignClosingBalance;
+    // The list rate (0.70) differs from the documents' 0.73 on purpose.
+    await upsertCurrency(ctx, { code: 'CAD', name: 'Canadian Dollar', rateToBase: '0.70' });
+    const card = (await createAccount(ctx, { code: '2160', name: 'CAD Card', type: 'liability' as never, subtype: 'credit_card' })).id;
+    await setAccountCurrency(ctx, card, 'CAD');
+    const v = await createVendor(ctx, { displayName: `CAD card co ${seq}` } as never);
+    await db.update(vendors).set({ currency: 'CAD' }).where(eq(vendors.id, v.id));
+    // CAD 100.02 at 0.73 = USD 73.01; converted back it would be CAD 100.01 (or 104.30 at the list rate).
+    const billIn = { vendorId: v.id, date: d('2026-03-10'), currency: 'CAD', exchangeRate: '0.73', lines: [{ accountId: card, amount: '100.02' }] };
+    const bill = await createBill(ctx, billIn as never);
+    expect(await cardBalance(card)).toBe('-100.02');
+    // A re-posting edit (new date) keeps the exact amount too.
+    await updateBill(ctx, bill.id, { ...billIn, date: d('2026-03-11') } as never);
+    expect(await cardBalance(card)).toBe('-100.02');
+    await createVendorCredit(ctx, { vendorId: v.id, date: d('2026-03-12'), currency: 'CAD', exchangeRate: '0.73', lines: [{ accountId: card, amount: '100.02' }] } as never);
+    expect(await cardBalance(card)).toBe('0.00');
+    expect((await trialBalance(ctx)).balanced).toBe(true);
   });
 
   it('paying off a foreign loan leaves nothing on its liability account (no rounding cents)', async () => {

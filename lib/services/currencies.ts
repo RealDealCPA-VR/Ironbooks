@@ -21,7 +21,7 @@ import { currencies, accounts, billLines, bills, journalEntryLines } from '@/lib
 import { Money, MoneyParseError, allocate, toAmountString } from '@/lib/money';
 import { postJournalEntry } from './posting';
 import { type ServiceContext, ServiceError, inTransaction, validation, notFound, writeAudit } from './_base';
-import { assertForeignCurrencyAllowed, hasForeignCurrencyData } from './multiCurrency';
+import { assertForeignCurrencyAllowed, assertHomeCurrencyChangeAllowed, effectiveHomeCurrency } from './multiCurrency';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -138,17 +138,28 @@ export async function setBaseCurrency(
   return inTransaction(ctx, async (tx) => {
     const rows = await tx.db.select().from(currencies).where(eq(currencies.companyId, tx.companyId));
     const oldBase = rows.find((r) => r.isBase) ?? null;
-    const changing = !!oldBase && oldBase.code.trim().toUpperCase() !== code;
-    if (changing && (await hasForeignCurrencyData(tx.db, tx.companyId))) {
-      throw new ServiceError(
-        'CONFLICT',
-        `Your home currency is ${oldBase!.code}. This company already has foreign-currency accounts, names or transactions, so the home currency can no longer be changed (QuickBooks works the same way).`,
-      );
-    }
+    // review5 fx: the current home currency is the list's base, else (no base row - older files,
+    // migration 0056) the Preferences currency, else USD; a change from it is refused once any
+    // data carries a currency.
+    const currentHome = await effectiveHomeCurrency(tx);
+    const changing = await assertHomeCurrencyChangeAllowed(tx, code);
 
     // Rates of the other currencies are in units of the old home currency: rebase them onto the
     // new one (rate / rate of the new home currency) so the list's default rates stay right.
     const newBaseOld = rows.find((r) => !r.isBase && r.code === code);
+    if (changing && !newBaseOld) {
+      // review5 fx: without the new home currency's rate (in the old one) the other rates can't be
+      // converted - refuse rather than leave them in the old home currency's units.
+      const others = rows.filter((r) => !r.isBase && r.code !== code);
+      if (others.length > 0) {
+        throw validation(
+          `Add ${code} to the currency list first, with its exchange rate in ${currentHome}, so the rates of ${others.map((r) => r.code).join(', ')} can be converted to ${code}. Then set ${code} as the home currency.`,
+        );
+      }
+      // Only the old home currency is listed: its rate in the new one is unknown, so it leaves the
+      // list (no data uses it - checked above) instead of staying at 1. Add it back with its rate.
+      if (oldBase) await tx.db.delete(currencies).where(eq(currencies.id, oldBase.id));
+    }
     const pivot = changing && newBaseOld ? Money.of(newBaseOld.rateToBase) : null;
     if (pivot && pivot.greaterThan(0)) {
       for (const r of rows) {
@@ -660,6 +671,30 @@ export async function assertLineAccountsInDocumentCurrency(
       `"${a.name}" is a ${cur} account, but this transaction is in ${doc ?? (home || 'your home currency')}. Use Transfer Funds or Pay credit card (where you enter the exchange rate), or enter it in ${cur}.`,
     );
   }
+}
+
+/**
+ * review5 fx: the line accounts (bank / credit card) whose currency is the document's own foreign
+ * currency. Their posting lines carry the typed line amount as the account's amount
+ * (`foreignAmount`) - converting the line's home share back at the rate can be a cent off
+ * (CAD 100.02 at 0.73 = USD 73.01 = CAD 100.01), and without an entry rate it was converted at
+ * the list rate. Empty for a home-currency document.
+ */
+export async function sameCurrencyAccountIds(
+  ctx: ServiceContext,
+  accountIds: ReadonlyArray<string | null | undefined>,
+  documentCurrency: string | null,
+): Promise<Set<string>> {
+  const out = new Set<string>();
+  const doc = (documentCurrency ?? '').trim().toUpperCase();
+  const ids = [...new Set(accountIds.filter((x): x is string => !!x))];
+  if (!doc || ids.length === 0) return out;
+  const rows = await ctx.db
+    .select({ id: accounts.id, currency: accounts.currency })
+    .from(accounts)
+    .where(and(eq(accounts.companyId, ctx.companyId), inArray(accounts.id, ids)));
+  for (const a of rows) if ((a.currency ?? '').trim().toUpperCase() === doc) out.add(a.id);
+  return out;
 }
 
 /**

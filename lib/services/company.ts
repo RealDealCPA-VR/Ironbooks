@@ -13,7 +13,7 @@ import { requireEffectivePermission } from './access';
 import type { DB } from '@/lib/db';
 import { logTransaction } from './transactionLog';
 import { assertPreferenceAccounts } from './prefAccounts';
-import { assertMultiCurrencyChangeAllowed, resolveMultiCurrency } from './multiCurrency';
+import { assertMultiCurrencyChangeAllowed, assertPreferenceCurrencyChangeAllowed, resolveMultiCurrency } from './multiCurrency';
 import { setBaseCurrency } from './currencies';
 import {
   COMPANY_PREFERENCE_KEYS,
@@ -322,6 +322,9 @@ export async function updateCompany(ctx: ServiceContext, input: UpdateCompanyInp
     'multiCurrencyEnabled' in settingsPatch
       ? await assertMultiCurrencyChangeAllowed(ctx, existing.settings as Record<string, unknown>, settingsPatch.multiCurrencyEnabled)
       : null;
+  // review5 fx: with no home currency in the currency list, the Preferences currency is the home
+  // currency - it can't change once foreign-currency data exists.
+  if ('currency' in settingsPatch) await assertPreferenceCurrencyChangeAllowed(ctx, settingsPatch.currency);
 
   const mergedSettings = {
     ...(existing.settings ?? {}),

@@ -36,7 +36,7 @@ import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
 import { postJournalEntry, voidJournalEntry, type PostingLine } from './posting';
 import { assertPeriodOpen, recordClosingDateException } from './fiscalPeriods';
-import { assertLineAccountsInDocumentCurrency, homeAmounts, resolveDocumentCurrency } from './currencies';
+import { assertLineAccountsInDocumentCurrency, homeAmounts, resolveDocumentCurrency, sameCurrencyAccountIds } from './currencies';
 import { currencyRate, exchangeGainLossLine, foreignCode, homeCode, toHome } from './exchangeRates';
 import { isDepositTargetAccount } from '@/lib/accountTypes';
 
@@ -49,6 +49,11 @@ export interface VendorCreditFx {
   /** Home amount per line (same order as the input lines). */
   homeLines: string[];
   homeTotal: string;
+  /**
+   * review5 fx: per line, the typed amount when the line's account (a bank / card) is in the
+   * credit's own foreign currency - posted as that account's amount (no rate round trip); else null.
+   */
+  lineForeign?: Array<string | null>;
 }
 
 /**
@@ -80,11 +85,13 @@ export async function resolveVendorCreditFx(
       if (!amt.greaterThan(0)) throw validation(`Line ${i + 1}: the amount is too small to convert to your home currency.`);
     });
   }
+  const same = await sameCurrencyAccountIds(ctx, input.lines.map((l) => l.accountId), fx.currency);
   return {
     currency: fx.currency,
     rate: fx.rate,
     homeLines: h.lines.map((x) => toAmountString(x)),
     homeTotal: toAmountString(h.total),
+    lineForeign: input.lines.map((l) => (l.accountId && same.has(l.accountId) ? toAmountString(Money.round2(l.amount)) : null)),
   };
 }
 

@@ -92,6 +92,52 @@ describe('review5 fx', () => {
     await expect(setBaseCurrency(ctx, { code: 'USD', name: 'United States Dollar' })).resolves.toMatchObject({ isBase: true });
   });
 
+  it('the home currency cannot be changed when the currency list has no base yet (older files: migration 0056)', async () => {
+    const { updateCompany } = await import('./company');
+    // An older file: Multiple Currencies on, EUR in the list, no home currency row.
+    await db.delete(currencies).where(and(eq(currencies.companyId, ctx.companyId), eq(currencies.isBase, true)));
+    const v = await eurVendor('EUR supplier');
+    await createBill(ctx, { vendorId: v.id, date: d('2026-02-01'), currency: 'EUR', exchangeRate: '1.20', lines: [{ accountId: acct['6000'], amount: '100.00' }] } as never);
+    // Currencies page "Set as base currency" on EUR: the EUR bill would become a home bill of 100.
+    await expect(setBaseCurrency(ctx, { code: 'EUR', name: 'Euro' })).rejects.toMatchObject({ code: 'CONFLICT' });
+    expect(await getHomeCurrencyCode(ctx)).toBeNull();
+    // Nor in two steps: Preferences currency EUR first (it is the home currency while the list
+    // has no base), then "Set as base currency".
+    await expect(updateCompany(ctx, { settings: { currency: 'EUR' } })).rejects.toMatchObject({ code: 'CONFLICT' });
+    await expect(setBaseCurrency(ctx, { code: 'EUR', name: 'Euro' })).rejects.toMatchObject({ code: 'CONFLICT' });
+    // Putting the actual home currency (USD) in the list is fine, and so is re-saving USD.
+    await expect(updateCompany(ctx, { settings: { currency: 'USD' } })).resolves.toBeTruthy();
+    await expect(setBaseCurrency(ctx, { code: 'USD', name: 'US Dollar' })).resolves.toMatchObject({ isBase: true, code: 'USD' });
+    expect(await getHomeCurrencyCode(ctx)).toBe('USD');
+    const eur = (await listCurrencies(ctx)).find((c) => c.code === 'EUR');
+    expect(eur?.isBase).toBe(false);
+    expect(Money.of(eur!.rateToBase).toFixed(2)).toBe('1.20');
+  });
+
+  it('a new home currency that is not in the list does not leave the other rates in the old units', async () => {
+    // USD home, EUR 1.20 USD, no foreign data yet. CAD is not in the list: EUR's rate in CAD is
+    // unknown, so the change is refused with a plain message (EUR would read 1.20 CAD).
+    await db.update(accounts).set({ currency: null }).where(eq(accounts.id, acct['1020']));
+    await expect(setBaseCurrency(ctx, { code: 'CAD', name: 'Canadian Dollar' })).rejects.toMatchObject({
+      code: 'VALIDATION',
+      message: expect.stringContaining('Add CAD'),
+    });
+    expect(await getHomeCurrencyCode(ctx)).toBe('USD');
+    // With CAD in the list (its rate in USD) the others are rebased onto CAD.
+    await upsertCurrency(ctx, { code: 'CAD', name: 'Canadian Dollar', rateToBase: '0.80' });
+    await setBaseCurrency(ctx, { code: 'CAD', name: 'Canadian Dollar' });
+    const by = Object.fromEntries((await listCurrencies(ctx)).map((c) => [c.code, c]));
+    expect(by.CAD.isBase).toBe(true);
+    expect(Money.of(by.EUR.rateToBase).toFixed(4)).toBe('1.5000');
+    expect(Money.of(by.USD.rateToBase).toFixed(4)).toBe('1.2500');
+    // Only the old home currency in the list: it leaves the list (its rate in GBP is unknown) instead
+    // of staying at 1 (1 CAD = 1 GBP).
+    await db.delete(currencies).where(and(eq(currencies.companyId, ctx.companyId), eq(currencies.isBase, false)));
+    await setBaseCurrency(ctx, { code: 'GBP', name: 'Pound' });
+    const list = await listCurrencies(ctx);
+    expect(list.map((c) => [c.code, c.isBase, Money.of(c.rateToBase).toFixed(2)])).toEqual([['GBP', true, '1.00']]);
+  });
+
   it('changing the home currency before any foreign data rebases the other rates', async () => {
     // USD home, EUR 1.20 USD. Switching home to EUR: 1 USD = 1/1.2 EUR.
     await upsertCurrency(ctx, { code: 'GBP', name: 'Pound', rateToBase: '1.50' });
@@ -498,7 +544,7 @@ describe('review5 fx', () => {
     expect(await foreignBalance(acct['1020'])).toBe('-100.00');
   });
 
-  it('a memorized foreign invoice / bill is entered at the rate on the day it is entered, not the memorized one', async () => {
+  it('a memorized foreign invoice / bill / deposit / transfer is entered at the rate on the day it is entered, not the memorized one', async () => {
     const { createTemplate, runTemplateNow } = await import('./recurring');
     const { getInvoice } = await import('./invoices');
     const { getBill } = await import('./bills');
@@ -520,11 +566,38 @@ describe('review5 fx', () => {
       mode: 'remind' as never,
       template: { vendorId: v.id, currency: 'EUR', exchangeRate: '1.20', lines: [{ accountId: acct['6400'], amount: '500.00' }] },
     });
+    // A memorized deposit into the Euro bank and a Euro bank -> Euro savings transfer.
+    const { getDeposit } = await import('./deposits');
+    const { getTransfer } = await import('./transfers');
+    acct['1025'] = (await createAccount(ctx, { code: '1025', name: 'Euro Savings', type: 'asset' as never, subtype: 'savings' })).id;
+    await setAccountCurrency(ctx, acct['1025'], 'EUR');
+    const depT = await createTemplate(ctx, {
+      name: `EUR interest ${seq}`,
+      docType: 'deposit',
+      frequency: 'monthly' as never,
+      nextRunDate: '2026-04-01',
+      mode: 'remind' as never,
+      template: { depositAccountId: acct['1020'], exchangeRate: '1.20', extraLines: [{ accountId: acct['3000'], amount: '100.00' }] },
+    });
+    const trT = await createTemplate(ctx, {
+      name: `EUR sweep ${seq}`,
+      docType: 'transfer',
+      frequency: 'monthly' as never,
+      nextRunDate: '2026-04-01',
+      mode: 'remind' as never,
+      template: { fromAccountId: acct['1020'], toAccountId: acct['1025'], amount: '100.00', exchangeRate: '1.20', homeAmount: '120.00' },
+    });
     await upsertCurrency(ctx, { code: 'EUR', name: 'Euro', rateToBase: '1.30' });
     const inv = await runTemplateNow(ctx, invT.id, d('2026-04-01'));
     const bill = await runTemplateNow(ctx, billT.id, d('2026-04-01'));
     expect(Money.of((await getInvoice(ctx, inv.docId)).exchangeRate!).toFixed(4)).toBe('1.3000');
     expect(Money.of((await getBill(ctx, bill.docId)).exchangeRate!).toFixed(4)).toBe('1.3000');
+    const dep = (await getDeposit(ctx, (await runTemplateNow(ctx, depT.id, d('2026-04-01'))).docId)) as unknown as { exchangeRate: string; homeTotal: string };
+    expect(Money.of(dep.exchangeRate).toFixed(4)).toBe('1.3000');
+    expect(dep.homeTotal).toBe('130.00');
+    const tr = (await getTransfer(ctx, (await runTemplateNow(ctx, trT.id, d('2026-04-01'))).docId)) as unknown as { exchangeRate: string; homeAmount: string };
+    expect(Money.of(tr.exchangeRate).toFixed(4)).toBe('1.3000');
+    expect(tr.homeAmount).toBe('130.00');
   });
 
   it('home-currency documents refuse a foreign-currency bank (sales receipt, credit memo refund, payment refund)', async () => {

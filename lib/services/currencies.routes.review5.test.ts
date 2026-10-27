@@ -2,7 +2,8 @@
  * Review round 5 (team fx) — the currency API routes answer bad input with a plain 400 / 404
  * (never a 500) and never read "false" as true. Real route handlers + getServerContext against a
  * temp PGlite file with `next/headers` mocked (bankRules.routes.test.ts pattern). Each test failed
- * before its fix.
+ * before its fix, except the malformed-id one: that already answered 404 on main and pins it now
+ * that the void reads the adjustment inside its transaction.
  */
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import path from 'node:path';
@@ -113,7 +114,7 @@ describe('currency API routes (review5)', () => {
     expect(line.credit).toBe('10.00'); // a loss credits the account
   });
 
-  it('GET / DELETE /api/currencies/home-currency-adjustment/:id with a malformed id is a 404', async () => {
+  it('GET / DELETE /api/currencies/home-currency-adjustment/:id with a malformed id stays a 404 (regression pin, not a bug on main)', async () => {
     const params = { params: Promise.resolve({ id: 'not-a-uuid' }) };
     as('GET', '/api/currencies/home-currency-adjustment/[id]');
     expect((await hcaGET(req('GET', '/api/currencies/home-currency-adjustment/not-a-uuid'), params)).status).toBe(404);
