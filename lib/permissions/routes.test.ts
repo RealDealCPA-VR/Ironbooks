@@ -146,6 +146,7 @@ describe('API permission map coverage', () => {
       [
         '/api/auth/2fa/disable',
         '/api/auth/2fa/enable',
+        '/api/auth/2fa/recovery-codes', // prefsperms: own recovery codes (new ones need a current code)
         '/api/auth/2fa/setup',
         '/api/auth/challenge', // own challenge question (needs the current password to set)
         '/api/auth/change-password', // gapsb K: own password (also when expired)
