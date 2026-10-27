@@ -15,6 +15,7 @@ import { ServiceError } from '@/lib/services/_base';
 import { archiveCompany, renameCompany } from './manage';
 import { serviceErrorStatus } from '@/lib/routeErrors';
 import { stripSecrets } from '@/lib/permissions/mask';
+import { assertSessionAllowed } from '@/lib/services/sessions';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -33,11 +34,13 @@ export async function PATCH(req: NextRequest, { params }: RouteParams) {
   try {
     // File lock, file-bound session and deactivation checks (lib/context.ts getSessionGate);
     // manage.ts then checks the caller's effective permissions in the company named by the URL.
-    const { db, userId } = await getSessionGate();
+    const { db, userId, sessionId } = await getSessionGate();
     if (!userId) {
       return NextResponse.json({ error: 'Unauthorized', code: 'FORBIDDEN' }, { status: 401 });
     }
     const { id } = await params;
+    // Single-user mode keeps everyone but its holder out of the company — renaming it included.
+    await assertSessionAllowed(db, sessionId, id);
     const body = await req.json().catch(() => null);
     if (typeof body?.name !== 'string') {
       return NextResponse.json({ error: 'name is required', code: 'VALIDATION' }, { status: 400 });
@@ -53,11 +56,13 @@ export async function DELETE(req: NextRequest, { params }: RouteParams) {
   try {
     // File lock, file-bound session and deactivation checks (lib/context.ts getSessionGate);
     // manage.ts then checks the caller's effective permissions in the company named by the URL.
-    const { db, userId } = await getSessionGate();
+    const { db, userId, sessionId } = await getSessionGate();
     if (!userId) {
       return NextResponse.json({ error: 'Unauthorized', code: 'FORBIDDEN' }, { status: 401 });
     }
     const { id } = await params;
+    // …and archiving it (lib/services/sessions.ts assertSessionAllowed).
+    await assertSessionAllowed(db, sessionId, id);
     // api.del sends no body, so the typed-name confirmation travels as ?confirm=.
     const confirm = new URL(req.url).searchParams.get('confirm') ?? '';
     const company = await archiveCompany(db, userId, id, confirm);

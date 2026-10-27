@@ -5,6 +5,9 @@
  *     only a code from that authenticator turns it off (/api/auth/2fa/disable), and an Admin's
  *     Reset Password left it on, so the user could never sign in again. The Admin's reset can now
  *     turn it off too (audited), and Users & Roles shows who has it on.
+ *  2. Single-user mode keeps everyone else out of the company — except through the company-file
+ *     routes that act on a company named in the URL: another Admin could rename or archive the
+ *     company while the first one was doing maintenance in single-user mode.
  */
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
@@ -40,6 +43,9 @@ import { addUser } from './users';
 import { POST as resetPasswordPOST } from '@/app/api/users/[id]/reset-password/route';
 import { GET as usersGET } from '@/app/api/users/route';
 import { POST as loginPOST } from '@/app/api/auth/login/route';
+import { DELETE as companyIdDELETE, PATCH as companyIdPATCH } from '@/app/api/companies/[id]/route';
+import { companies } from '@/lib/db/schema';
+import { endUserSessions, enterSingleUserMode, exitSingleUserMode, startSession } from './sessions';
 
 let db: DB;
 let owner: string;
@@ -139,5 +145,50 @@ describe('review5: an Admin can help a user who lost their authenticator', () =>
     const last = audits.map((a) => JSON.stringify(a.newValues)).join('\n');
     expect(last).toContain('twoFactorTurnedOff');
     expect(last).not.toContain('Recovered2026');
+  });
+});
+
+describe('review5: single-user mode also covers renaming and archiving the company', () => {
+  it("another Admin can't rename or archive the company while it is in single-user mode", async () => {
+    const ownerCtx = { db, companyId, userId: owner, access: fullAccess(), role: 'owner' as const };
+    const admin2 = (await addUser(ownerCtx, { name: 'Second Admin', login: 'admin2r5', password: 'adminPass1234', roleKeys: ['admin'] })).userId;
+    // Nobody else is signed in when the owner switches to single-user mode; Admin 2 signs in after.
+    await endUserSessions(db, clerk, 'logout');
+    const ownerSession = await startSession(db, { userId: owner, companyId });
+    // Admin 2 also has another company, so archiving this one would otherwise be allowed.
+    const other = await createCompany(db, { name: 'Other Co', ownerId: admin2 });
+    expect(other.id).toBeTruthy();
+
+    const signedIn = (userId: string, sid: string, method: string, url: string) => {
+      as(null, method, url);
+      h.cookies.set(SESSION_COOKIE, createSessionToken(userId, 'user', sid));
+      h.cookies.set(COMPANY_COOKIE, companyId);
+    };
+
+    await enterSingleUserMode({ ...ownerCtx, sessionId: ownerSession.id });
+    const adminSession = await startSession(db, { userId: admin2, companyId });
+    try {
+      signedIn(admin2, adminSession.id, 'PATCH', `/api/companies/${companyId}`);
+      const rename = await companyIdPATCH(req('PATCH', `/api/companies/${companyId}`, { name: 'Renamed Behind Your Back' }), params({ id: companyId }));
+      expect(rename.status).toBe(403);
+      expect((await rename.json()).error).toMatch(/single-user mode/i);
+
+      signedIn(admin2, adminSession.id, 'DELETE', `/api/companies/${companyId}`);
+      const archive = await companyIdDELETE(
+        req('DELETE', `/api/companies/${companyId}?confirm=${encodeURIComponent('Review5 Users Co')}`),
+        params({ id: companyId }),
+      );
+      expect(archive.status).toBe(403);
+      const [row] = await db.select().from(companies).where(eq(companies.id, companyId));
+      expect(row.name).toBe('Review5 Users Co');
+      expect((row.settings as Record<string, unknown> | null)?.archived).not.toBe(true);
+
+      // The person holding single-user mode can still rename it.
+      signedIn(owner, ownerSession.id, 'PATCH', `/api/companies/${companyId}`);
+      const own = await companyIdPATCH(req('PATCH', `/api/companies/${companyId}`, { name: 'Review5 Users Co' }), params({ id: companyId }));
+      expect(own.status).toBe(200);
+    } finally {
+      await exitSingleUserMode({ ...ownerCtx, sessionId: ownerSession.id });
+    }
   });
 });
