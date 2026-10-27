@@ -5,7 +5,7 @@
  *     name only appears on General Journal lines or mostly on vendor-type transactions (refund
  *     checks), and even when the name already exists on the other list.
  */
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import path from 'node:path';
 import fs from 'node:fs';
 import { and, eq, inArray, isNull, sql } from 'drizzle-orm';
@@ -24,6 +24,10 @@ import { createCustomer } from './customers';
 import { createInvoice } from './invoices';
 import { createBill } from './bills';
 import { exportListCsv } from './listExport';
+
+let routeCtx: ServiceContext;
+vi.mock('@/lib/context', () => ({ getServerContext: vi.fn(async () => routeCtx) }));
+import { POST as glPOST } from '@/app/api/qb-import/gl/route';
 import { importOpenItems, previewOpenItems } from './openItemsImport';
 import AdmZip from 'adm-zip';
 import { readXlsx } from './qbGlFiles';
@@ -451,5 +455,81 @@ describe('G. customer / vendor list export balances', () => {
     expect(c.find((r) => r[0] === 'Paid Up Customer')![cBal]).toBe('0.00');
     const v = rowsOf((await exportListCsv(ctx, 'vendors')).csv);
     expect(v.find((r) => r[0] === 'Balance Vendor')![v[0].indexOf('Balance')]).toBe('40.25');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// H. The General Ledger import is an admin, single-user import like the IIF / open-items ones
+// ---------------------------------------------------------------------------
+
+describe('H. /api/qb-import/gl guards', () => {
+  const post = (body: unknown) => {
+    const u = new URL('http://localhost/api/qb-import/gl');
+    return Object.assign(new Request(u, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }), { nextUrl: u }) as never;
+  };
+
+  it('an accountant (file utilities create, not admin) may preview but not import or dry-run', async () => {
+    const ctx = await newCompany('GL Route Co');
+    const file = upload('gl.csv', glCsv(SAMPLE_GL));
+    routeCtx = { ...ctx, role: 'accountant' };
+    expect((await glPOST(post({ action: 'preview', file }))).status).toBe(200);
+    for (const action of ['import', 'dry-run']) {
+      const res = await glPOST(post({ action, file }));
+      expect([action, res.status]).toEqual([action, 403]);
+      expect((await res.json()).error).toMatch(/owner or admin/);
+    }
+    const [{ n }] = await db.select({ n: sql<number>`count(*)::int` }).from(journalEntries).where(eq(journalEntries.companyId, ctx.companyId));
+    expect(n).toBe(0);
+    routeCtx = { ...ctx, role: 'owner' };
+    const ok = await glPOST(post({ action: 'import', file }));
+    expect(ok.status).toBe(200);
+    expect((await ok.json()).ok).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// I. IIF transactions: A/R and A/P lines keep their name even when the lists lack it
+// ---------------------------------------------------------------------------
+
+describe('I. IIF transactions and missing names', () => {
+  it('an INVOICE for a customer:job and a BILL for a vendor not on the lists add them; the lines are named', async () => {
+    const ctx = await newCompany('IIF Names Co');
+    const iif = [
+      '!ACCNT\tNAME\tACCNTTYPE',
+      'ACCNT\tAccounts Receivable\tAR',
+      'ACCNT\tAccounts Payable\tAP',
+      'ACCNT\tSales\tINC',
+      'ACCNT\tRent\tEXP',
+      '!TRNS\tTRNSTYPE\tDATE\tACCNT\tNAME\tAMOUNT\tDOCNUM',
+      '!SPL\tTRNSTYPE\tDATE\tACCNT\tNAME\tAMOUNT\tDOCNUM',
+      '!ENDTRNS',
+      'TRNS\tINVOICE\t2/5/2024\tAccounts Receivable\tFresh Customer:Job 1\t300.00\t501',
+      'SPL\tINVOICE\t2/5/2024\tSales\tFresh Customer:Job 1\t-300.00\t501',
+      'ENDTRNS',
+      'TRNS\tBILL\t2/6/2024\tAccounts Payable\tFresh Vendor\t-80.00\tB9',
+      'SPL\tBILL\t2/6/2024\tRent\tFresh Vendor\t80.00\tB9',
+      'ENDTRNS',
+    ].join('\r\n');
+    const counts = await importIIF(ctx, iif);
+    expect(counts.transactions).toBe(2);
+    const custs = await db.select().from(customers).where(eq(customers.companyId, ctx.companyId));
+    const job = custs.find((c) => c.displayName === 'Fresh Customer:Job 1')!;
+    expect(job.parentId).toBe(custs.find((c) => c.displayName === 'Fresh Customer')!.id);
+    const [vend] = await db.select().from(vendors).where(eq(vendors.companyId, ctx.companyId));
+    const lines = await db
+      .select({ type: accounts.subtype, entityType: journalEntryLines.entityType, entityId: journalEntryLines.entityId })
+      .from(journalEntryLines)
+      .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+      .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
+      .where(and(eq(journalEntries.companyId, ctx.companyId), inArray(accounts.subtype, ['accounts_receivable', 'accounts_payable'])));
+    expect(lines).toEqual(
+      expect.arrayContaining([
+        { type: 'accounts_receivable', entityType: 'customer', entityId: job.id },
+        { type: 'accounts_payable', entityType: 'vendor', entityId: vend.id },
+      ]),
+    );
+    expect(lines.length).toBe(2);
+    const again = await importIIF(ctx, iif);
+    expect([again.transactions, again.customers, again.vendors]).toEqual([0, 0, 0]);
   });
 });

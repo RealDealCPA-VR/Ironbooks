@@ -20,6 +20,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
+import { assertExclusiveAccess } from '@/lib/services/sessions';
 import { ServiceError } from '@/lib/services/_base';
 import { listGlImports, previewGlImport, runGlImport } from '@/lib/services/qbGlImport';
 import { zodErrorBody } from '@/lib/validation/helpers';
@@ -61,6 +62,11 @@ export async function POST(req: NextRequest) {
     if (action === 'preview') {
       return NextResponse.json(await previewGlImport(ctx, input));
     }
+    // Bringing years of history into the books is an import like the IIF / open-items ones (QB:
+    // File > Utilities > Import is admin-only, in single-user mode): owner/admin, nobody else on.
+    // The dry run does the same work in one long transaction (then rolls it back), which holds
+    // the company file for everyone while it runs — so it needs the same.
+    await assertExclusiveAccess(ctx, 'Import');
     const result = await runGlImport(ctx, input, { dryRun: action === 'dry-run' });
     return NextResponse.json(result);
   } catch (err) {
