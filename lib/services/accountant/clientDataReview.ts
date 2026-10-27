@@ -47,6 +47,7 @@ import { applyToInvoice } from '../creditMemos';
 import { applyToBill } from '../vendorCredits';
 import { journalOpenItems, resolveEntityNames } from '../journal';
 import { requirePermission } from '../access';
+import { isIsoDate } from '@/lib/onboarding';
 
 export const REVIEW_TASKS = [
   { key: 'unapplied_customer_credits', group: 'Customers', title: 'Fix unapplied customer payments and credits' },
@@ -317,7 +318,9 @@ export async function latestSnapshot(ctx: ServiceContext) {
 
 /** "Mark review complete": capture balances as of the review period end. */
 export async function takeReviewSnapshot(ctx: ServiceContext, input: { asOf: string; note?: string | null }) {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(input.asOf ?? '')) throw validation('asOf must be YYYY-MM-DD.');
+  // A real calendar day: "2026-13-01" made endOfDay() an Invalid Date (a 500), and "2026-02-31"
+  // was stored as typed while its balances rolled on to March 3.
+  if (!isIsoDate(input.asOf)) throw validation('The review period end must be a real date (YYYY-MM-DD).');
   const balances = await naturalBalancesAsOf(ctx, endOfDay(input.asOf));
   return inTransaction(ctx, async (tx) => {
     const [row] = await tx.db

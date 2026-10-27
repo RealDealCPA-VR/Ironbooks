@@ -5,6 +5,7 @@
 import { z } from 'zod';
 import { zDate, zLines, zMoneyPositive, zUuid } from './helpers';
 import { postingLineSchema } from './journal';
+import { isIsoDate } from '@/lib/onboarding';
 
 export const salesTaxAdjustmentSchema = z.object({
   date: zDate,
@@ -102,7 +103,10 @@ export const clientReviewActionSchema = z.discriminatedUnion('action', [
   }),
   z.object({
     action: z.literal('snapshot'),
-    asOf: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'asOf must be YYYY-MM-DD'),
+    asOf: z
+      .string()
+      .regex(/^\d{4}-\d{2}-\d{2}$/, 'asOf must be YYYY-MM-DD')
+      .refine((s) => isIsoDate(s), 'The review period end must be a real date.'),
     note: z.string().nullish(),
   }),
   z.object({ action: z.literal('apply_customer_credit'), refType: z.enum(['payment', 'credit_memo']), refId: zUuid }),

@@ -340,12 +340,14 @@ describe('reclassify survives re-saving the source document', () => {
 
   it('refuses a class change a document cannot keep, and lines of documents that rebuild themselves', async () => {
     const cls = await createClass(ctx, { name: 'Durable North' });
-    const vc = await createVendorCredit(ctx, {
-      vendorId,
+    // A credit memo keeps no class per line. (Bill credits do since P1 purchases: their class-only
+    // reclassify is allowed, see accountantLeftovers.feature.test.ts.)
+    const cm = await createCreditMemo(ctx, {
+      customerId,
       date: D('2026-03-10'),
-      lines: [{ accountId: acct['6000'], amount: '12.00', description: 'Credit' }],
+      lines: [{ accountId: acct['4000'], description: 'Credit', quantity: 1, rate: '12.00', taxable: false }],
     });
-    const [line] = await lineOn(await postedEntryOf(vendorCredits, vc.id), acct['6000']);
+    const [line] = await lineOn(await postedEntryOf(creditMemos, cm.id), acct['4000']);
     await expect(reclassifyLines(ctx, { lineIds: [line.id], newClassId: cls.id })).rejects.toThrow(
       /doesn't keep a class on each line/,
     );
