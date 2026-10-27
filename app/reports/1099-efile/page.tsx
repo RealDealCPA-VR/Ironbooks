@@ -152,7 +152,7 @@ export default function Form1099EfilePage() {
         </div>
 
         <p className="mt-3 text-xs text-navy/50">
-          Lists 1099 vendors (marked as 1099 in vendor settings) with $600 or more of nonemployee
+          Lists 1099 vendors (marked as 1099 in vendor settings) with {Number(selectedYear) >= 2026 ? '$2,000' : '$600'} or more of nonemployee
           compensation (1099-NEC box 1, following your 1099 account mapping) in the selected calendar
           year. Sources: bill payments, checks and General Journal amounts paid in Pay Bills.
         </p>
@@ -171,7 +171,8 @@ export default function Form1099EfilePage() {
                   : `${eligibleCount} eligible vendor${eligibleCount !== 1 ? 's' : ''} found for ${selectedYear}.`}
               </p>
               <p className="mt-0.5 text-xs text-navy/60">
-                Only vendors with $600 or more in NEC box 1 are included in the e-file.
+                Only vendors with {Number(selectedYear) >= 2026 ? '$2,000' : '$600'} or more in NEC box 1 are included in the e-file
+                {Number(selectedYear) >= 2026 ? ' (the reporting threshold for payments made from 2026)' : ''}.
               </p>
             </div>
             {eligibleCount > 0 && (

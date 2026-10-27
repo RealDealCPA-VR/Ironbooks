@@ -41,7 +41,14 @@ interface WorksheetRow {
 interface Worksheet {
   year: number;
   mapped: boolean;
+  /** Amount at which a form is required for the year ($600; $2,000 for payments from 2026). */
+  threshold?: string;
   rows: WorksheetRow[];
+}
+
+/** "$2,000" — the worksheet's threshold for display (the $600 of years before 2026 by default). */
+function thresholdLabel(threshold: string | undefined): string {
+  return formatCurrency(threshold ?? '600').replace(/\.00$/, '');
 }
 
 interface MappingBoxMeta {
@@ -64,7 +71,7 @@ interface Account {
 // CSV download
 // ---------------------------------------------------------------------------
 
-function downloadCsv(rows: WorksheetRow[], year: number) {
+function downloadCsv(rows: WorksheetRow[], year: number, threshold?: string) {
   const headers = [
     'Vendor Name',
     'Tax ID (EIN/SSN)',
@@ -79,7 +86,7 @@ function downloadCsv(rows: WorksheetRow[], year: number) {
 
   const lines = [
     `"1099 Worksheet — Calendar Year ${year}"`,
-    `"Forms are required when a box reaches $600. Card-settled payments are excluded (1099-K)."`,
+    `"Forms are required when a box reaches ${thresholdLabel(threshold)}. Card-settled payments are excluded (1099-K)."`,
     '',
     headers.map(escape).join(','),
     ...rows.map((r) =>
@@ -255,14 +262,14 @@ function MappingEditor({
 // Worksheet tables
 // ---------------------------------------------------------------------------
 
-function NecTable({ rows }: { rows: WorksheetRow[] }) {
+function NecTable({ rows, threshold }: { rows: WorksheetRow[]; threshold?: string }) {
   const visible = rows.filter((r) => Number(r.nec1) > 0);
   const total = toAmountString(Money.add(...visible.map((r) => r.nec1), 0));
   return (
     <Card className="p-0 overflow-hidden mb-6">
       <div className="px-4 pt-4 pb-2">
         <h2 className="text-sm font-bold text-navy">1099-NEC Worksheet</h2>
-        <p className="text-xs text-navy/50">Box 1 — Nonemployee compensation. Form required at $600.</p>
+        <p className="text-xs text-navy/50">Box 1 — Nonemployee compensation. Form required at {thresholdLabel(threshold)}.</p>
       </div>
       <Table>
         <thead>
@@ -292,7 +299,7 @@ function NecTable({ rows }: { rows: WorksheetRow[] }) {
                   {row.necEligible ? (
                     <Badge tone="success">Required</Badge>
                   ) : (
-                    <Badge tone="neutral">Under $600</Badge>
+                    <Badge tone="neutral">Under {thresholdLabel(threshold)}</Badge>
                   )}
                 </Td>
               </Tr>
@@ -315,7 +322,7 @@ function NecTable({ rows }: { rows: WorksheetRow[] }) {
   );
 }
 
-function MiscTable({ rows }: { rows: WorksheetRow[] }) {
+function MiscTable({ rows, threshold }: { rows: WorksheetRow[]; threshold?: string }) {
   const visible = rows.filter((r) => Number(r.misc1) > 0 || Number(r.misc3) > 0);
   const totalRents = toAmountString(Money.add(...visible.map((r) => r.misc1), 0));
   const totalOther = toAmountString(Money.add(...visible.map((r) => r.misc3), 0));
@@ -324,7 +331,7 @@ function MiscTable({ rows }: { rows: WorksheetRow[] }) {
       <div className="px-4 pt-4 pb-2">
         <h2 className="text-sm font-bold text-navy">1099-MISC Worksheet</h2>
         <p className="text-xs text-navy/50">
-          Box 1 — Rents; Box 3 — Other income. Form required when a box reaches $600. Map accounts
+          Box 1 — Rents; Box 3 — Other income. Form required when a box reaches {thresholdLabel(threshold)}. Map accounts
           to MISC boxes above to populate this worksheet.
         </p>
       </div>
@@ -358,7 +365,7 @@ function MiscTable({ rows }: { rows: WorksheetRow[] }) {
                   {row.miscEligible ? (
                     <Badge tone="success">Required</Badge>
                   ) : (
-                    <Badge tone="neutral">Under $600</Badge>
+                    <Badge tone="neutral">Under {thresholdLabel(threshold)}</Badge>
                   )}
                 </Td>
               </Tr>
@@ -453,7 +460,7 @@ export default function Report1099Page() {
             variant="secondary"
             size="sm"
             disabled={!worksheet?.rows.length}
-            onClick={() => worksheet && downloadCsv(worksheet.rows, worksheet.year)}
+            onClick={() => worksheet && downloadCsv(worksheet.rows, worksheet.year, worksheet.threshold)}
           >
             <Download className="h-4 w-4" />
             Download CSV
@@ -527,8 +534,8 @@ export default function Report1099Page() {
 
       {!loading && !error && worksheet !== null && (
         <>
-          <NecTable rows={worksheet.rows} />
-          <MiscTable rows={worksheet.rows} />
+          <NecTable rows={worksheet.rows} threshold={worksheet.threshold} />
+          <MiscTable rows={worksheet.rows} threshold={worksheet.threshold} />
         </>
       )}
     </main>

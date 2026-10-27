@@ -14,7 +14,7 @@
  *
  * vendor1099Report — sums payments to 1099-flagged vendors for a calendar year.
  *   Combines bill payments (via bill_payment_applications) and direct expenses.
- *   Only vendors with total >= $600 are included as eligible.
+ *   Only vendors at or above the year's 1099 threshold ($600; $2,000 from 2026) are included.
  */
 import { and, asc, eq, gt, gte, inArray, isNotNull, isNull, lt, ne, not, or, sql } from 'drizzle-orm';
 import {
@@ -1100,7 +1100,16 @@ export interface Vendor1099Row {
   total: string;
 }
 
-const THRESHOLD_1099 = Money.of('600');
+/**
+ * The amount at which a 1099-NEC / 1099-MISC (rents, other income) is required for payments made
+ * in `year`: $600 through 2025; $2,000 for payments made after December 31, 2025 (Public Law
+ * 119-21, sec. 70433 — inflation-adjusted after 2026, so $2,000 is the floor the IRS publishes
+ * from). The worksheet, the e-file and the NEC PDFs used $600 for every year, so for 2026 every
+ * contractor paid $600–$1,999.99 was flagged "Form required" and put in the e-file.
+ */
+export function threshold1099(year: number): ReturnType<typeof Money.zero> {
+  return Money.of(year >= 2026 ? '2000' : '600');
+}
 
 /**
  * Aggregate vendor payments for a calendar year (Jan 1 – Dec 31).
@@ -1112,7 +1121,7 @@ const THRESHOLD_1099 = Money.of('600');
  * by funding account being a credit-card liability): those amounts are reportable
  * on the card processor's 1099-K, not the payer's 1099-NEC — matching QB Desktop.
  *
- * Only vendors with total >= $600 are returned.
+ * Only vendors at or above the year's threshold (threshold1099) are returned.
  */
 /**
  * 1099s report cash paid. A bill payment application stores the FULL settlement of the bill
@@ -1366,10 +1375,10 @@ export async function vendor1099Report(
     accumulate(j.vendorId, j.vendorName, j.taxId, toAmountString(j.amount));
   }
 
-  // --- Filter to >= $600 ---
+  // --- Filter to the year's 1099 threshold ($600; $2,000 from 2026) ---
   const result: Vendor1099Row[] = [];
   for (const [vendorId, { vendorName, taxId, total }] of totals) {
-    if (total.greaterThanOrEqualTo(THRESHOLD_1099)) {
+    if (total.greaterThanOrEqualTo(threshold1099(year))) {
       result.push({
         vendorId,
         vendorName,
@@ -1511,9 +1520,9 @@ export interface Vendor1099WorksheetRow {
   misc3: string;
   /** Sum of all boxes. */
   total: string;
-  /** NEC form required (nec1 >= $600). */
+  /** NEC form required (nec1 >= the year's threshold: $600; $2,000 from 2026). */
   necEligible: boolean;
-  /** MISC form required (misc1 >= $600 or misc3 >= $600). */
+  /** MISC form required (misc1 or misc3 >= the year's threshold). */
   miscEligible: boolean;
 }
 
@@ -1521,6 +1530,8 @@ export interface Vendor1099Worksheet {
   year: number;
   /** True when an account mapping is configured (otherwise everything counts as NEC box 1). */
   mapped: boolean;
+  /** The amount at which a form is required for this year (threshold1099). */
+  threshold: string;
   rows: Vendor1099WorksheetRow[];
 }
 
@@ -1700,7 +1711,7 @@ export async function vendor1099Worksheet(
   }
 
   // --- Build rows + thresholds ---
-  const THRESHOLD = Money.of('600');
+  const THRESHOLD = threshold1099(year);
   const rows: Vendor1099WorksheetRow[] = [];
   for (const [vendorId, acc] of totals) {
     const nec1 = acc.boxes.nec_1;
@@ -1724,5 +1735,5 @@ export async function vendor1099Worksheet(
 
   rows.sort((a, b) => Money.of(b.total).comparedTo(Money.of(a.total)));
 
-  return { year, mapped, rows };
+  return { year, mapped, threshold: toAmountString(THRESHOLD), rows };
 }

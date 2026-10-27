@@ -5,7 +5,7 @@
  * mapping) to look up the vendor's nonemployee compensation for the year, then renders a
  * 1099-NEC PDF and returns it inline.
  *
- * Returns 404 if the vendor gets no 1099-NEC that year (not a 1099 vendor, NEC box 1 below $600,
+ * Returns 404 if the vendor gets no 1099-NEC that year (not a 1099 vendor, NEC box 1 below the year's threshold,
  * or its payments map to 1099-MISC boxes).
  */
 import { NextRequest, NextResponse } from 'next/server';
@@ -59,7 +59,7 @@ export async function GET(req: NextRequest) {
         {
           error:
             'This vendor has no 1099-NEC for this year. ' +
-            'The vendor may not be marked as a 1099 vendor, its nonemployee compensation (NEC box 1 in your 1099 account mapping) may be below $600, ' +
+            'The vendor may not be marked as a 1099 vendor, its nonemployee compensation (NEC box 1 in your 1099 account mapping) may be below the 1099 threshold for that year ($600; $2,000 for payments made from 2026), ' +
             'or its payments map to a 1099-MISC box.',
           code: 'NOT_FOUND',
         },

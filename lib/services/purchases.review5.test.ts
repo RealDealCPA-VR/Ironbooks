@@ -645,7 +645,7 @@ describe('review5 purchases', { timeout: 120_000 }, () => {
     const v = await newVendor({ is1099: true, taxId: '11-2223333' });
     // Opening balance owed to the contractor, entered as a General Journal amount (QB conversions).
     const je = await createManualEntry(ctx, {
-      date: d('2026-02-01'),
+      date: d('2025-02-01'),
       description: 'Opening balance owed',
       lines: [
         { accountId: acct['6300'], debit: '700.00' },
@@ -658,15 +658,15 @@ describe('review5 purchases', { timeout: 120_000 }, () => {
       .where(and(eq(journalEntryLines.journalEntryId, je.id), eq(journalEntryLines.accountId, acct['2000'])));
     await payBills(ctx, {
       vendorId: v.id,
-      date: d('2026-02-15'),
+      date: d('2025-02-15'),
       method: 'check',
       paymentAccountId: acct['1000'],
       applications: [],
       journalItems: [{ journalLineId: apLine.id, amount: '700.00' }],
     });
-    const row = (await vendor1099Report(ctx, { year: 2026 })).find((r) => r.vendorId === v.id);
+    const row = (await vendor1099Report(ctx, { year: 2025 })).find((r) => r.vendorId === v.id);
     expect(row?.total ?? 'omitted').toBe('700.00');
-    const wr = (await vendor1099Worksheet(ctx, { year: 2026 })).rows.find((r) => r.vendorId === v.id);
+    const wr = (await vendor1099Worksheet(ctx, { year: 2025 })).rows.find((r) => r.vendorId === v.id);
     expect(wr?.nec1 ?? 'omitted').toBe('700.00');
   });
 

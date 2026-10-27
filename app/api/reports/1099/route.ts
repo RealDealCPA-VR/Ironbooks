@@ -5,9 +5,9 @@
  *   year       (required) — 4-digit calendar year, e.g. 2025.
  *   worksheet  (optional) — when "1", returns the account-mapped NEC + MISC
  *               worksheet ({ year, mapped, rows }) instead of the legacy
- *               Vendor1099Row[] (NEC-only, >= $600) array.
+ *               Vendor1099Row[] (NEC-only, >= the year's threshold) array.
  *   nec        (optional) — when "1", returns the 1099-NEC recipients (NEC box 1 per the
- *               1099 account mapping, >= $600): exactly the e-file / PDF contents.
+ *               1099 account mapping, >= the year's threshold): exactly the e-file / PDF contents.
  *
  * The legacy array shape (all payments, mapping ignored) is kept as the default for existing
  * consumers; the e-file page, the XML e-file and the NEC PDF use the mapped NEC list.

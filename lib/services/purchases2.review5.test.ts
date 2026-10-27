@@ -193,7 +193,7 @@ describe('review5 purchases (second pass)', { timeout: 180_000 }, () => {
     // Landlord: $12,000 rent (1099-MISC box 1), never nonemployee compensation.
     await createExpense(ctx, {
       vendorId: landlord.id,
-      date: d('2026-04-01'),
+      date: d('2025-04-01'),
       method: 'check',
       paymentAccountId: acct['1000'],
       lines: [{ accountId: rent, amount: '12000.00' }],
@@ -201,7 +201,7 @@ describe('review5 purchases (second pass)', { timeout: 180_000 }, () => {
     // Contractor: $900 of labor (NEC) + $5,000 of materials on an unmapped account, by bill.
     const bill = await createBill(ctx, {
       vendorId: contractor.id,
-      date: d('2026-04-02'),
+      date: d('2025-04-02'),
       lines: [
         { accountId: subs, amount: '900.00' },
         { accountId: supplies, amount: '5000.00' },
@@ -209,17 +209,17 @@ describe('review5 purchases (second pass)', { timeout: 180_000 }, () => {
     });
     await payBills(ctx, {
       vendorId: contractor.id,
-      date: d('2026-04-03'),
+      date: d('2025-04-03'),
       method: 'check',
       paymentAccountId: acct['1000'],
       applications: [{ billId: bill.id, amountApplied: '5900.00' }],
     });
     await set1099Mapping(ctx, { boxes: [{ box: 'nec_1', accountIds: [subs] }, { box: 'misc_1', accountIds: [rent] }] });
 
-    const ws = await vendor1099Worksheet(ctx, { year: 2026 });
+    const ws = await vendor1099Worksheet(ctx, { year: 2025 });
     expect(ws.rows.find((r) => r.vendorId === contractor.id)?.nec1).toBe('900.00');
 
-    const xml = await generate1099NecFile(ctx, { year: 2026 });
+    const xml = await generate1099NecFile(ctx, { year: 2025 });
     // The landlord gets a 1099-MISC, not a 1099-NEC.
     expect(xml).not.toContain(`<Name>${landlord.displayName}</Name>`);
     const rec = xml.slice(xml.indexOf(`<Name>${contractor.displayName}</Name>`));
@@ -330,13 +330,13 @@ describe('review5 purchases (second pass)', { timeout: 180_000 }, () => {
     const v = await newVendor({ is1099: true, taxId: '123-45-6789' });
     await createExpense(ctx, {
       vendorId: v.id,
-      date: d('2026-08-01'),
+      date: d('2025-08-01'),
       method: 'check',
       paymentAccountId: acct['1000'],
       lines: [{ accountId: acct['6300'], amount: '800.00' }],
     });
     const purchasing: ServiceContext = { ...ctx, access: unionRoles(BUILTIN_ROLES.filter((r) => r.key === 'purchasing')) };
-    const err = await generate1099NecFile(purchasing, { year: 2026 }).then(
+    const err = await generate1099NecFile(purchasing, { year: 2025 }).then(
       (xml) => xml,
       (e: unknown) => e,
     );
@@ -344,7 +344,7 @@ describe('review5 purchases (second pass)', { timeout: 180_000 }, () => {
     expect(err).toBeInstanceOf(ServiceError);
     expect((err as ServiceError).code).toBe('FORBIDDEN');
     // A user who may see tax IDs gets the full TIN.
-    const full = await generate1099NecFile(ctx, { year: 2026 });
+    const full = await generate1099NecFile(ctx, { year: 2025 });
     expect(full).toContain('<TaxId>123-45-6789</TaxId>');
   });
 

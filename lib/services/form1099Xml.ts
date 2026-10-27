@@ -2,7 +2,7 @@
  * 1099-NEC e-file XML generation.
  *
  * generate1099NecFile — builds a well-formed XML document containing Form1099NEC records
- * for every is_1099 vendor with $600 or more of NEC box 1 (per the 1099 account mapping) in the
+ * for every is_1099 vendor at or above the 1099 threshold of NEC box 1 (per the 1099 account mapping) in the
  * requested calendar year.
  *
  * The XML is suitable for review and submission to the IRS FIRE (Filing Information
@@ -44,7 +44,7 @@ export interface Nec1099Recipient {
 /**
  * The vendors that get a 1099-NEC for `year`, with their box 1 amount: the 1099 worksheet's NEC
  * box 1 (it follows the 1099 account mapping, as QB's 1099 wizard does — rent mapped to MISC box 1
- * and payments on unmapped accounts are not nonemployee compensation), $600 or more. With no
+ * and payments on unmapped accounts are not nonemployee compensation), at or above the year's threshold ($600; $2,000 from 2026). With no
  * mapping every eligible payment counts toward box 1 (same as the worksheet). The e-file, the
  * NEC PDF and the e-file page all use this list, so they agree with the 1099 worksheet.
  */
@@ -130,7 +130,7 @@ export interface Generate1099NecFileOptions {
 /**
  * Generate a 1099-NEC XML e-file string for all eligible vendors in the given year.
  *
- * Uses nec1099Recipients (the 1099 worksheet's NEC box 1, $600 or more) to pick the payees.
+ * Uses nec1099Recipients (the 1099 worksheet's NEC box 1, at or above the year's threshold) to pick the payees.
  * Payer details are pulled from the active company record.
  *
  * Returns the XML as a UTF-8 string. To submit, upload this file to the IRS FIRE system
@@ -161,7 +161,7 @@ export async function generate1099NecFile(
     throw new ServiceError('NOT_FOUND', 'Company not found');
   }
 
-  // NEC box 1 per the 1099 account mapping (the 1099 worksheet), $600 or more.
+  // NEC box 1 per the 1099 account mapping (the 1099 worksheet), at or above the year's threshold.
   const vendors = await nec1099Recipients(ctx, year);
   const addresses = await recipient1099Addresses(ctx, vendors.map((v) => v.vendorId));
   const payerXml = (indent: string) => [

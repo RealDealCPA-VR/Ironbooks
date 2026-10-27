@@ -2,7 +2,7 @@
  * GET /api/reports/1099-xml?year=YYYY
  *
  * Returns a 1099-NEC XML e-file for all eligible vendors (is_1099 = true,
- * total payments >= $600) in the requested calendar year.
+ * NEC box 1 at or above the year's threshold: $600; $2,000 from 2026) in the requested calendar year.
  *
  * Response headers:
  *   Content-Type: application/xml

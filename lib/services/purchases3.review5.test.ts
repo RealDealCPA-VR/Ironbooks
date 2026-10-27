@@ -590,6 +590,32 @@ describe('review5 purchases (third pass)', { timeout: 180_000 }, () => {
     expect(rows.reduce((s, r) => s + Number(r.d ?? 0) - Number(r.c ?? 0), 0)).toBe(0);
   });
 
+  it('S: a 1099 is required at $2,000 for payments made from 2026 ($600 before)', async () => {
+    const { vendor1099Worksheet, vendor1099Report } = await import('./statements');
+    const { nec1099Recipients } = await import('./form1099Xml');
+    const v = await newVendor({ is1099: true, taxId: '98-7654321' });
+    const pay = (date: string, amount: string) =>
+      createExpense(ctx, {
+        vendorId: v.id,
+        date: d(date),
+        method: 'check',
+        paymentAccountId: acct['1000'],
+        lines: [{ accountId: acct['6000'], amount }],
+      });
+    await pay('2025-06-01', '1500.00');
+    await pay('2026-06-01', '1500.00');
+    const row = async (year: number) => (await vendor1099Worksheet(ctx, { year })).rows.find((r) => r.vendorId === v.id);
+    expect((await row(2025))?.necEligible).toBe(true);
+    // Before: "Form required" (and in the e-file) for $1,500 paid in 2026.
+    expect((await row(2026))?.necEligible).toBe(false);
+    expect((await vendor1099Worksheet(ctx, { year: 2026 })).threshold).toBe('2000.00');
+    expect((await nec1099Recipients(ctx, 2026)).some((r) => r.vendorId === v.id)).toBe(false);
+    expect((await vendor1099Report(ctx, { year: 2026 })).some((r) => r.vendorId === v.id)).toBe(false);
+    await pay('2026-07-01', '500.00'); // $2,000 in 2026
+    expect((await row(2026))?.necEligible).toBe(true);
+    expect((await nec1099Recipients(ctx, 2026)).some((r) => r.vendorId === v.id)).toBe(true);
+  });
+
   it('I: making a vendor inactive does not hand a restricted user the full tax ID', async () => {
     const { BUILTIN_ROLES, unionRoles } = await import('@/lib/permissions/model');
     const restricted: ServiceContext = { ...ctx, access: unionRoles(BUILTIN_ROLES.filter((r) => r.key === 'purchasing')) };
