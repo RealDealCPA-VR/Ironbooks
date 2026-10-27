@@ -437,6 +437,8 @@ async function prepareDeposit(
   excludeDepositId?: string,
   /** Accounts the deposit being edited already uses on its extra / cash-back lines. */
   keepAccountIds: ReadonlySet<string> = new Set(),
+  /** The Deposit To account the deposit being edited was saved with (kept even if now refused). */
+  keepDepositAccountId: string | null = null,
 ): Promise<PreparedDeposit> {
   const paymentIds = input.paymentIds ?? [];
   const salesReceiptIds = input.salesReceiptIds ?? [];
@@ -475,13 +477,25 @@ async function prepareDeposit(
 
   // Verify deposit account belongs to this company.
   const [depAcct] = await ctx.db
-    .select({ id: accounts.id, type: accounts.type, code: accounts.code, currency: accounts.currency })
+    .select({
+      id: accounts.id,
+      type: accounts.type,
+      subtype: accounts.subtype,
+      name: accounts.name,
+      code: accounts.code,
+      currency: accounts.currency,
+    })
     .from(accounts)
     .where(and(eq(accounts.id, input.depositAccountId), eq(accounts.companyId, ctx.companyId)));
   if (!depAcct) throw notFound('Deposit account');
   if (depAcct.type !== 'asset') {
     throw validation('Deposit account must be an asset (bank) account.');
   }
+  // Inventory Asset (or a second Undeposited Funds account) as Deposit To moved a balance that the
+  // inventory valuation / Make Deposits list never shows — the same rule as the deposit's other
+  // lines. A deposit saved there before the rule can still be re-saved as it is.
+  const depReason = depAcct.id === keepDepositAccountId ? null : subledgerAccountReason(depAcct);
+  if (depReason) throw validation(`Deposit To: ${depReason}`, undefined, await bankAccountFix(ctx));
   // p1 fx: the deposit is in the bank account's currency.
   const home = await homeCode(ctx);
   const depCur = foreignCode(depAcct.currency, home);
@@ -777,7 +791,7 @@ async function prepareDeposit(
     glLines.push({
       accountId: input.cashBack.accountId,
       debit: toAmountString(cashBackHome),
-      memo: input.cashBack.memo ? `Cash back — ${input.cashBack.memo}` : 'Cash back',
+      memo: input.cashBack.memo ? `${CASH_BACK_MEMO_PREFIX}${input.cashBack.memo}` : 'Cash back',
       ...(cashBackCur ? { foreignAmount: toAmountString(cashBackAmt) } : {}),
     });
   }
@@ -844,6 +858,25 @@ async function prepareDeposit(
     rate: fx ? fx.rate.toFixed(8) : null,
     homeNetStr: toAmountString(bankHome),
   };
+}
+
+const CASH_BACK_MEMO_PREFIX = 'Cash back — ';
+
+/** The memo typed for a saved deposit's cash back (its entry line reads "Cash back — <memo>"). */
+async function savedCashBackMemo(
+  ctx: ServiceContext,
+  entryId: string,
+  oldLines: ReadonlyArray<{ description: string | null }>,
+): Promise<string | null> {
+  const cb = oldLines.find((l) => l.description?.startsWith(CASHBACK_LINE_PREFIX));
+  if (!cb?.description) return null;
+  const accountId = cb.description.slice(CASHBACK_LINE_PREFIX.length);
+  const rows = await ctx.db
+    .select({ memo: journalEntryLines.memo, debit: journalEntryLines.debit })
+    .from(journalEntryLines)
+    .where(and(eq(journalEntryLines.journalEntryId, entryId), eq(journalEntryLines.accountId, accountId)));
+  const line = rows.find((r) => r.debit != null && r.memo?.startsWith(CASH_BACK_MEMO_PREFIX));
+  return line?.memo ? line.memo.slice(CASH_BACK_MEMO_PREFIX.length) : null;
 }
 
 async function foreignCurrencyOfId(ctx: ServiceContext, accountId: string, home: string | null): Promise<string | null> {
@@ -971,7 +1004,14 @@ export async function updateDeposit(ctx: ServiceContext, id: string, input: Crea
       if (l.accountId) keep.add(l.accountId);
       if (l.description?.startsWith(CASHBACK_LINE_PREFIX)) keep.add(l.description.slice(CASHBACK_LINE_PREFIX.length));
     }
-    const prep = await prepareDeposit(tx, input, id, keep);
+    // The Make Deposits form never sends the cash-back memo (it has no field for it), so an edit
+    // from it rewrote "Cash back — petty cash box" (from the API or an Accountant's Copy) to
+    // "Cash back". Not sending a memo keeps the saved one; sending one (even empty) replaces it.
+    if (input.cashBack && input.cashBack.memo === undefined && existing.postedEntryId) {
+      const savedMemo = await savedCashBackMemo(tx, existing.postedEntryId, oldLines);
+      if (savedMemo) input = { ...input, cashBack: { ...input.cashBack, memo: savedMemo } };
+    }
+    const prep = await prepareDeposit(tx, input, id, keep, existing.depositAccountId);
     let plan = await planPostedEdit(tx, {
       entryId: existing.postedEntryId,
       date: input.date,

@@ -1079,3 +1079,166 @@ describe('CSV import: a day that does not exist', () => {
     expect(ok[0].date.toISOString().slice(0, 10)).toBe('2026-02-28');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Fixer round 2: credit card "pay the balance", Deposit To, cash-back memo, loan payment account
+// ---------------------------------------------------------------------------
+
+describe('credit card reconciliation: write a check for the balance', () => {
+  async function completedCardRecon(balance = '100.00') {
+    const ba = await linkBank('2100');
+    await postJournalEntry(ctx, {
+      date: d('2026-03-05'),
+      description: 'Office supplies on the card',
+      lines: [
+        { accountId: acct['6300'], debit: balance },
+        { accountId: acct['2100'], credit: balance },
+      ],
+    });
+    const recon = await startReconciliation(ctx, { bankAccountId: ba, statementDate: d('2026-03-31'), statementBalance: balance });
+    for (const l of await listClearable(ctx, ba, d('2026-03-31'), recon.id)) {
+      await toggleCleared(ctx, recon.id, l.journalEntryLineId, true);
+    }
+    await completeReconciliation(ctx, recon.id);
+    return recon.id;
+  }
+
+  it('a double submit records the payment once (the second is a CONFLICT)', async () => {
+    const { payCreditCardBalance } = await import('./reconcile');
+    const id = await completedCardRecon();
+    const results = await Promise.allSettled([
+      payCreditCardBalance(ctx, id, { paymentAccountId: acct['1000'], date: '2026-04-01' }),
+      payCreditCardBalance(ctx, id, { paymentAccountId: acct['1000'], date: '2026-04-01' }),
+    ]);
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+    const rejected = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
+    expect(rejected).toHaveLength(1);
+    expect((rejected[0].reason as ServiceError).code).toBe('CONFLICT');
+    const posted = await db
+      .select()
+      .from(journalEntries)
+      .where(and(eq(journalEntries.companyId, ctx.companyId), eq(journalEntries.sourceRef, `cc-payment:${id}`), eq(journalEntries.status, 'posted')));
+    expect(posted).toHaveLength(1);
+    expect(await gl('1000')).toBe('-100.00');
+    expect(await gl('2100')).toBe('0.00');
+  });
+
+  it('is paid from a bank account only (not Undeposited Funds, Inventory Asset, an expense or another card)', async () => {
+    const { payCreditCardBalance } = await import('./reconcile');
+    const id = await completedCardRecon();
+    const { createAccount } = await import('./accounts');
+    const otherCard = (await createAccount(ctx, { code: '2110', name: 'Store Card', type: 'liability' as never, subtype: 'credit_card' })).id;
+    for (const payFrom of [acct['1050'], acct['1300'], acct['6300'], otherCard]) {
+      await expectCode(payCreditCardBalance(ctx, id, { paymentAccountId: payFrom, date: '2026-04-01' }), 'VALIDATION', /bank account/i);
+    }
+    expect(await gl('1050')).toBe('0.00');
+    expect(await gl('1300')).toBe('0.00');
+    expect(await gl('2100')).toBe('-100.00');
+    const paid = await payCreditCardBalance(ctx, id, { paymentAccountId: acct['1010'], date: '2026-04-01' });
+    expect(paid.sourceRef).toBe(`cc-payment:${id}`);
+    expect(await gl('1010')).toBe('-100.00');
+    expect(await gl('2100')).toBe('0.00');
+  });
+});
+
+describe('Make Deposits: the Deposit To account', () => {
+  it('cannot be Inventory Asset (its balance is the inventory valuation)', async () => {
+    const { createDeposit } = await import('./deposits');
+    await expectCode(
+      createDeposit(ctx, { depositAccountId: acct['1300'], date: d('2026-03-02'), extraLines: [{ accountId: acct['3000'], amount: '100.00' }] }),
+      'VALIDATION',
+      /inventory/i,
+    );
+    expect(await gl('1300')).toBe('0.00');
+  });
+
+  it('a deposit saved into such an account before the rule can still be re-saved', async () => {
+    const { createDeposit, updateDeposit } = await import('./deposits');
+    const { deposits } = await import('@/lib/db/schema');
+    const dep = await createDeposit(ctx, { depositAccountId: acct['1000'], date: d('2026-03-02'), extraLines: [{ accountId: acct['3000'], amount: '10.00' }] });
+    await db.update(deposits).set({ depositAccountId: acct['1300'] }).where(eq(deposits.id, dep.id));
+    const re = await updateDeposit(ctx, dep.id, {
+      depositAccountId: acct['1300'],
+      date: d('2026-03-02'),
+      extraLines: [{ accountId: acct['3000'], amount: '10.00' }],
+      memo: 'kept',
+    });
+    expect(re.memo).toBe('kept');
+    // Moving another deposit there is still refused.
+    const other = await createDeposit(ctx, { depositAccountId: acct['1000'], date: d('2026-03-02'), extraLines: [{ accountId: acct['3000'], amount: '5.00' }] });
+    await expectCode(
+      updateDeposit(ctx, other.id, { depositAccountId: acct['1300'], date: d('2026-03-02'), extraLines: [{ accountId: acct['3000'], amount: '5.00' }] }),
+      'VALIDATION',
+      /inventory/i,
+    );
+  });
+});
+
+describe('Make Deposits: editing a deposit with a cash-back memo', () => {
+  it('a memo-only edit from the form (which sends no cash-back memo) keeps the cash-back memo', async () => {
+    const { journalEntryLines } = await import('@/lib/db/schema');
+    const { createDeposit, updateDeposit } = await import('./deposits');
+    const dep = await createDeposit(ctx, {
+      depositAccountId: acct['1000'],
+      date: d('2026-03-02'),
+      extraLines: [{ accountId: acct['3000'], amount: '100.00', description: 'Owner money' }],
+      cashBack: { accountId: acct['1010'], amount: '20.00', memo: 'petty cash box' },
+    });
+    const re = await updateDeposit(ctx, dep.id, {
+      depositAccountId: acct['1000'],
+      date: d('2026-03-02'),
+      extraLines: [{ accountId: acct['3000'], amount: '100.00', description: 'Owner money' }],
+      cashBack: { accountId: acct['1010'], amount: '20.00' },
+      memo: 'New deposit memo',
+    });
+    expect(re.postedEntryId).toBe(dep.postedEntryId);
+    const lines = await db.select().from(journalEntryLines).where(eq(journalEntryLines.journalEntryId, dep.postedEntryId!));
+    expect(lines.find((l) => l.accountId === acct['1010'])?.memo).toBe('Cash back — petty cash box');
+
+    // An edit that re-posts (new amount) keeps it too; a memo that is sent still wins.
+    const re2 = await updateDeposit(ctx, dep.id, {
+      depositAccountId: acct['1000'],
+      date: d('2026-03-02'),
+      extraLines: [{ accountId: acct['3000'], amount: '120.00', description: 'Owner money' }],
+      cashBack: { accountId: acct['1010'], amount: '20.00' },
+    });
+    expect(re2.postedEntryId).not.toBe(dep.postedEntryId);
+    const lines2 = await db.select().from(journalEntryLines).where(eq(journalEntryLines.journalEntryId, re2.postedEntryId!));
+    expect(lines2.find((l) => l.accountId === acct['1010'])?.memo).toBe('Cash back — petty cash box');
+    const re3 = await updateDeposit(ctx, dep.id, {
+      depositAccountId: acct['1000'],
+      date: d('2026-03-02'),
+      extraLines: [{ accountId: acct['3000'], amount: '120.00', description: 'Owner money' }],
+      cashBack: { accountId: acct['1010'], amount: '20.00', memo: 'change fund' },
+    });
+    const lines3 = await db.select().from(journalEntryLines).where(eq(journalEntryLines.journalEntryId, re3.postedEntryId!));
+    expect(lines3.find((l) => l.accountId === acct['1010'])?.memo).toBe('Cash back — change fund');
+  });
+});
+
+describe('Loan Manager: the payment account', () => {
+  it('must be a bank account (Undeposited Funds, Inventory Asset or A/R used to be accepted and every payment then failed)', async () => {
+    const { createLoan, updateLoan } = await import('./loans');
+    const { createAccount } = await import('./accounts');
+    const note = (await createAccount(ctx, { code: '2600', name: 'Truck Loan', type: 'liability' as never, subtype: 'other_current_liability' })).id;
+    const interest = (await createAccount(ctx, { code: '6800', name: 'Interest Expense', type: 'expense' as never, subtype: 'operating_expenses' })).id;
+    const base = {
+      name: 'Truck',
+      liabilityAccountId: note,
+      interestAccountId: interest,
+      originalAmount: '20000.00',
+      annualRate: '6',
+      termMonths: 48,
+      originDate: d('2026-01-01'),
+      firstPaymentDate: d('2026-02-01'),
+    };
+    for (const code of ['1050', '1300', '1200', '1250']) {
+      await expectCode(createLoan(ctx, { ...base, paymentAccountId: acct[code] }), 'VALIDATION', /bank account/i);
+    }
+    const ok = await createLoan(ctx, { ...base, paymentAccountId: acct['1000'] });
+    expect(ok.paymentAccountId).toBe(acct['1000']);
+    await expectCode(updateLoan(ctx, ok.id, { ...base, paymentAccountId: acct['1050'] }), 'VALIDATION', /bank account/i);
+    const none = await createLoan(ctx, { ...base, name: 'No default bank' });
+    expect(none.paymentAccountId).toBeNull();
+  });
+});

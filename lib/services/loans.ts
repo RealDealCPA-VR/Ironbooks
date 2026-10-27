@@ -43,6 +43,7 @@ import { getHomeCurrencyCode, homeAmounts } from './currencies';
 import { postJournalEntry, voidJournalEntry } from './posting';
 import { currencyRate, exchangeGainLossLine, foreignCode, toHome } from './exchangeRates';
 import { subledgerAccountReason } from '@/lib/registerEntryPlan';
+import { isBankAccount } from '@/lib/accountTypes';
 
 export const PAYMENT_FREQUENCIES: Record<number, string> = {
   1: 'Annually',
@@ -223,8 +224,13 @@ async function validateLoanInput(ctx: ServiceContext, input: LoanInput) {
     if (reason) throw validation(`${reason} Pick the escrow (or prepaid) account for the escrow part of each payment.`);
   }
   if (input.paymentAccountId) {
+    // Each loan check is a Write Checks payment, which comes from a bank account. Any asset used
+    // to be accepted here (Undeposited Funds, Inventory Asset, A/R), and then every payment set up
+    // from the loan failed with "Checks ... must be paid from a bank/cash account".
     const pay = await accountOf(ctx, input.paymentAccountId);
-    if (pay.type !== 'asset') throw validation('Loan payments must come from a bank account.');
+    if (!isBankAccount(pay)) {
+      throw validation(`"${pay.name}" is not a bank account. Loan payments must come from a checking or savings (bank) account.`);
+    }
   }
   const escrow = Money.of(input.escrowAmount ?? 0);
   if (escrow.isNegative()) throw validation('Escrow cannot be negative.');

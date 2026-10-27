@@ -24,6 +24,7 @@ import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
 import { formatCurrency, Money } from '@/lib/money';
 import { canFinishReconciliation, statementLineAmount } from '@/lib/reconcileRules';
+import { isBankAccount } from '@/lib/accountTypes';
 import { formatDate as fmtDate, todayISO } from '@/lib/dates';
 // cmdbar: "reconcile checking" opens this page with the account picked.
 import { usePrefill } from '@/lib/commands/usePrefill';
@@ -40,6 +41,9 @@ interface BankAccount {
   accountNumber: string;
   glAccountName: string;
   glAccountCode: string;
+  /** GL type / detail type of the linked account (a card is paid from a bank account only). */
+  glAccountType?: string;
+  glAccountSubtype?: string | null;
   lastReconciledDate: string | null;
   lastReconciledBalance: string | null;
 }
@@ -790,7 +794,14 @@ function ReconcileSession({
             >
               <option value="">Select bank account…</option>
               {bankAccounts
-                .filter((ba) => ba.id !== recon.bankAccountId && ba.accountId !== info?.glAccountId)
+                .filter(
+                  (ba) =>
+                    ba.id !== recon.bankAccountId &&
+                    ba.accountId !== info?.glAccountId &&
+                    // The check is written from a bank account (another card or a loan can't pay it).
+                    (ba.glAccountType === undefined ||
+                      isBankAccount({ type: ba.glAccountType, subtype: ba.glAccountSubtype ?? null })),
+                )
                 .map((ba) => (
                   <option key={ba.id} value={ba.accountId}>
                     {ba.bankName} – {ba.glAccountCode} {ba.glAccountName}

@@ -23,6 +23,9 @@ export async function listBankAccounts(ctx: ServiceContext) {
       lastReconciledBalance: bankAccounts.lastReconciledBalance,
       glAccountName: accounts.name,
       glAccountCode: accounts.code,
+      /** The GL account's type / detail type (e.g. a card's "Pay From" list offers bank accounts only). */
+      glAccountType: accounts.type,
+      glAccountSubtype: accounts.subtype,
       /** p1 fx: the GL account's currency (null = home); feed amounts are in it. */
       currency: accounts.currency,
     })

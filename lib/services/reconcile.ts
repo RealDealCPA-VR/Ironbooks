@@ -28,6 +28,7 @@ import { canFinishReconciliation } from '@/lib/reconcileRules';
 import { MAX_DATE_YEAR, MIN_DATE_YEAR, parseDateInput } from '@/lib/validation/helpers';
 import { todayISO } from '@/lib/dates';
 import { subledgerAccountReason } from '@/lib/registerEntryPlan';
+import { isBankAccount } from '@/lib/accountTypes';
 import {
   type ServiceContext,
   ServiceError,
@@ -1495,16 +1496,17 @@ export interface PayCreditCardBalanceInput {
  * QB "Write a check for the balance" step after completing a credit-card
  * reconciliation: posts Dr CC liability / Cr bank for the statement balance via
  * payCreditCard (sourceRef "cc-payment:<reconciliationId>", duplicate-guarded).
+ *
+ * Runs in one transaction: the "one payment per reconciliation" check and the posting used to run
+ * outside any, so a double-clicked Pay / two windows / a client retry each passed the check and the
+ * card was paid twice (bank down 2x the balance, the card overpaid). PGlite serializes
+ * transactions, so the second call now sees the first payment and gets a CONFLICT.
  */
 export async function payCreditCardBalance(
   ctx: ServiceContext,
   reconciliationId: string,
   input: PayCreditCardBalanceInput,
 ) {
-  const recon = await loadReconciliation(ctx, reconciliationId);
-  if (recon.status !== 'completed') {
-    throw validation('Pay Credit Card is only available after the reconciliation is completed.');
-  }
   // Typed input from the "write a check for the balance" form: a non-number amount or an
   // unparseable date used to escape as MoneyParseError / RangeError → HTTP 500.
   if (typeof input.paymentAccountId !== 'string' || !input.paymentAccountId) throw validation('Choose the account to pay from.');
@@ -1520,26 +1522,47 @@ export async function payCreditCardBalance(
       ? statementDay(input.date, 'The payment date')
       : new Date(`${todayISO()}T00:00:00.000Z`);
   if (input.memo != null && typeof input.memo !== 'string') throw validation('The memo must be text.');
+  const pay = { ...input, date: payDate };
 
-  const [gl] = await ctx.db
-    .select({ type: accounts.type, name: accounts.name })
-    .from(accounts)
-    .where(and(eq(accounts.id, recon.glAccountId), eq(accounts.companyId, ctx.companyId)));
-  if (!gl) throw notFound('Credit card GL account');
-  if (gl.type !== 'liability') {
-    throw validation('This reconciliation is not for a credit card (liability) account.');
-  }
+  return inTransaction(ctx, async (tx) => {
+    const recon = await loadReconciliation(tx, reconciliationId);
+    if (recon.status !== 'completed') {
+      throw validation('Pay Credit Card is only available after the reconciliation is completed.');
+    }
 
-  // p1 fx: a foreign-currency card's statement balance is in the card's currency.
-  const cardCurrency = await foreignCurrencyOfAccount(ctx, recon.glAccountId);
-  if (cardCurrency) return payForeignCreditCard(ctx, recon, gl.name, cardCurrency, { ...input, date: payDate });
+    const [gl] = await tx.db
+      .select({ type: accounts.type, name: accounts.name })
+      .from(accounts)
+      .where(and(eq(accounts.id, recon.glAccountId), eq(accounts.companyId, tx.companyId)));
+    if (!gl) throw notFound('Credit card GL account');
+    if (gl.type !== 'liability') {
+      throw validation('This reconciliation is not for a credit card (liability) account.');
+    }
 
-  return payCreditCard(ctx, {
-    creditCardAccountId: recon.glAccountId,
-    paymentAccountId: input.paymentAccountId,
-    amount: input.amount ?? recon.statementBalance,
-    date: payDate,
-    reconciliationId,
-    memo: input.memo ?? `Credit card payment — ${gl.name}`,
+    // QB "Write a check for the balance": the check comes from a bank account (the same rule as
+    // Write Checks). Paying from Undeposited Funds left every payment in the Make Deposits list
+    // while the account went negative; Inventory Asset moved the valuation's account; an expense
+    // or another card is not a check at all.
+    const [from] = await tx.db
+      .select({ type: accounts.type, subtype: accounts.subtype, name: accounts.name })
+      .from(accounts)
+      .where(and(eq(accounts.id, pay.paymentAccountId), eq(accounts.companyId, tx.companyId)));
+    if (!from) throw notFound('Payment account');
+    if (!isBankAccount(from)) {
+      throw validation(`"${from.name}" is not a bank account. Pay the credit card from a checking or savings (bank) account.`);
+    }
+
+    // p1 fx: a foreign-currency card's statement balance is in the card's currency.
+    const cardCurrency = await foreignCurrencyOfAccount(tx, recon.glAccountId);
+    if (cardCurrency) return payForeignCreditCard(tx, recon, gl.name, cardCurrency, pay);
+
+    return payCreditCard(tx, {
+      creditCardAccountId: recon.glAccountId,
+      paymentAccountId: pay.paymentAccountId,
+      amount: pay.amount ?? recon.statementBalance,
+      date: payDate,
+      reconciliationId,
+      memo: pay.memo ?? `Credit card payment — ${gl.name}`,
+    });
   });
 }
