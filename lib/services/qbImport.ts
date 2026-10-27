@@ -1497,9 +1497,14 @@ async function importIIFRows(
   const lookup = await loadAccountLookup(ctx);
   // Opening balances (OBAMOUNT) are dated the day before the file's first transaction (QB has no
   // opening-balance date in the IIF), or today when the file has no transactions.
-  const txnDates = parsed.transactions.map((t) => parseIifDate(t.date)).filter((d): d is Date => !!d);
-  const obDate = txnDates.length
-    ? new Date(Math.min(...txnDates.map((d) => d.getTime())) - 86_400_000)
+  // (A loop, not Math.min(...dates): spreading 150,000 dates as arguments overflows the stack.)
+  let firstTxn: number | null = null;
+  for (const t of parsed.transactions) {
+    const d = parseIifDate(t.date)?.getTime();
+    if (d !== undefined && (firstTxn === null || d < firstTxn)) firstTxn = d;
+  }
+  const obDate = firstTxn !== null
+    ? new Date(firstTxn - 86_400_000)
     : new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), new Date().getUTCDate()));
   await importIifAccounts(ctx, counts, parsed.accounts, lookup, obDate);
 
@@ -1556,7 +1561,7 @@ async function importIIFRows(
     });
     counts.openItems = { invoices: r.invoices, bills: r.bills, credits: r.credits, skipped: r.skipped };
     counts.skipped += r.skipped;
-    counts.issues.push(...r.issues);
+    for (const i of r.issues) counts.issues.push(i); // one per document: never spread as arguments
     // The open documents now carry the WHOLE A/R and A/P detail (each at its open balance, i.e.
     // already net of every payment QuickBooks applied). Payments, bill payments, deposits or
     // journal rows in the same file that touch A/R or A/P would reduce the control account a
@@ -2472,6 +2477,71 @@ async function collectIifControlRows(
   return out;
 }
 
+/**
+ * Get or create the customer (A/R) / vendor (A/P) an IIF control line names, register it with the
+ * resolver and note it in the import report. "Customer:Job" creates the parent chain first.
+ */
+async function ensureIifName(
+  ctx: ServiceContext,
+  counts: ImportCounts,
+  names: Awaited<ReturnType<typeof loadQbNameResolver>>,
+  side: 'ar' | 'ap',
+  rawName: string,
+): Promise<string | null> {
+  const full = rawName.split(':').map((s) => s.trim()).filter(Boolean).join(':');
+  const role = side === 'ar' ? 'customer' : 'vendor';
+  const hit = names.resolve(full, { side });
+  if (hit) return hit.entityId;
+  try {
+    return await createIifName(ctx, counts, names, side, full);
+  } catch (caught) {
+    // e.g. two customers already share the name (ambiguous): the line stays unnamed, as before.
+    const err = importRowError(caught);
+    if (err?.code !== 'VALIDATION') throw caught;
+    counts.issues.push({ entity: role, name: full, reason: 'validation', message: `Could not add it to your ${role} list: ${err.message}` });
+    return null;
+  }
+}
+
+async function createIifName(
+  ctx: ServiceContext,
+  counts: ImportCounts,
+  names: Awaited<ReturnType<typeof loadQbNameResolver>>,
+  side: 'ar' | 'ap',
+  full: string,
+): Promise<string> {
+  const role = side === 'ar' ? 'customer' : 'vendor';
+  let id: string;
+  if (side === 'ap') {
+    id = (await createVendor(ctx, { displayName: full })).id;
+    counts.vendors++;
+  } else {
+    const segs = full.split(':');
+    let parentId: string | null = null;
+    for (let i = 1; i <= segs.length; i++) {
+      const path = segs.slice(0, i).join(':');
+      const existing = names.resolve(path, { side: 'ar' });
+      if (existing && i < segs.length) {
+        parentId = existing.entityId;
+        continue;
+      }
+      const row = await createCustomer(ctx, { displayName: path, parentId });
+      names.add('customer', path, row.id);
+      counts.customers++;
+      parentId = row.id;
+    }
+    id = parentId!;
+  }
+  names.add(role, full, id);
+  counts.issues.push({
+    entity: role,
+    name: full,
+    reason: 'note',
+    message: `Not on your ${role} list — added so its ${side === 'ar' ? 'Accounts Receivable' : 'Accounts Payable'} lines keep the name.`,
+  });
+  return id;
+}
+
 /** The kind of name a QB transaction type carries (the Name column's list). */
 export function iifRoleOfType(type: string | null | undefined): QbNameRole | null {
   const t = (type ?? '').trim().toUpperCase();
@@ -2507,6 +2577,7 @@ async function importIifTransactions(
     }
 
     const lines: PostingLine[] = [];
+    const missingNames: Array<{ line: number; side: 'ar' | 'ap'; name: string }> = [];
     let totalDebit = Money.zero();
     let problem: string | null = null;
     let redirected = false;
@@ -2540,10 +2611,15 @@ async function importIifTransactions(
       if (toConversion) redirected = true;
       const baseMemo = l.memo ?? (l.name ? `Payee: ${l.name}` : null);
       const side = toConversion ? null : controlSideOfAccount(acct);
-      const named = names.resolve(l.name || (side ? txn.name : null), {
+      const rawName = (l.name || (side ? txn.name : '') || '').trim();
+      const named = names.resolve(rawName, {
         side,
         prefer: iifRoleOfType(txn.type),
       });
+      // An A/R line's name is a customer and an A/P line's a vendor (QB's rule). A name the lists
+      // don't have yet is added just before the entry posts (QuickBooks adds it on import too), so
+      // the line never lands on A/R or A/P without its name.
+      if (side && rawName && !named) missingNames.push({ line: lines.length, side, name: rawName });
       lines.push({
         accountId: toConversion ? redirectControl!.accountId : acct.id,
         ...(named ? { entityType: named.entityType, entityId: named.entityId } : {}),
@@ -2595,6 +2671,10 @@ async function importIifTransactions(
     }
 
     try {
+      for (const m of missingNames) {
+        const id = await ensureIifName(ctx, counts, names, m.side, m.name);
+        if (id) lines[m.line] = { ...lines[m.line], entityType: m.side === 'ar' ? 'customer' : 'vendor', entityId: id };
+      }
       await postJournalEntry(ctx, {
         date,
         description: txn.memo?.trim() || `QB import: ${label}`,

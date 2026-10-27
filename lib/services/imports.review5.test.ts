@@ -573,3 +573,21 @@ describe('J. statement rows tie-out (POST /api/import fileType rows)', () => {
     expect(staged).toHaveLength(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// K. Large files: no argument spreads that overflow the stack
+// ---------------------------------------------------------------------------
+
+describe('K. a large IIF file', () => {
+  it('150,000 transactions do not overflow the stack while dating the opening balances', async () => {
+    const ctx = await newCompany('IIF Big Co');
+    const parts = ['!ACCNT\tNAME\tACCNTTYPE\tOBAMOUNT', 'ACCNT\tChecking\tBANK\t100.00', '!TRNS\tTRNSTYPE\tDATE\tACCNT\tAMOUNT', '!SPL\tTRNSTYPE\tDATE\tACCNT\tAMOUNT', '!ENDTRNS'];
+    for (let i = 0; i < 150_000; i++) parts.push(`TRNS\tCHECK\t${(i % 12) + 1}/${(i % 28) + 1}/2024\tChecking\t0.00`, 'ENDTRNS');
+    const counts = await importIIF(ctx, parts.join('\r\n'));
+    expect(counts.accounts).toBe(1);
+    expect(counts.skipped).toBe(150_000);
+    // Opening balance dated the day before the earliest transaction (Jan 1, 2024).
+    const [ob] = await db.select().from(journalEntries).where(eq(journalEntries.companyId, ctx.companyId));
+    expect(ob.date.toISOString().slice(0, 10)).toBe('2023-12-31');
+  }, 300_000);
+});

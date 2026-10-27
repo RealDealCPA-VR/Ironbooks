@@ -1243,7 +1243,7 @@ export async function importOpenItemsFromIif(
     // Stand-ins of documents already reported above are not counted or reported twice.
     const dups = r.issues.filter((i) => i.reason === 'duplicate').length;
     out.skipped += r.skipped - dups;
-    out.issues.push(...r.issues.filter((i) => i.reason !== 'duplicate'));
+    for (const i of r.issues) if (i.reason !== 'duplicate') out.issues.push(i); // never spread: one per document
   }
   return out;
 }
