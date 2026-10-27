@@ -10,6 +10,7 @@ import { inTransaction, notFound, validation, writeAudit } from './_base';
 import { hashPassword, verifyPassword } from '@/lib/auth';
 import { assertWrite } from './rbac';
 import { requireEffectivePermission } from './access';
+import { stripSecrets } from '@/lib/permissions/mask';
 import type { DB } from '@/lib/db';
 import { logTransaction } from './transactionLog';
 import { assertPreferenceAccounts } from './prefAccounts';
@@ -52,59 +53,8 @@ export const DEFAULT_COA: AccountSeed[] = [
   { code: '6700', name: 'Taxes & Licenses', type: 'expense', subtype: 'taxes' },
 ];
 
-/**
- * Settings keys that never leave the server: the closing-date password hash (bcrypt; anyone who
- * has it can try passwords offline and then post into closed periods). Stripped from every
- * company row handed to a page or written to the audit trail / transaction log.
- */
-const SECRET_SETTINGS_KEYS = ['closingDatePasswordHash'] as const;
-
-/**
- * The per-file sign-in password (lib/services/fileLock.ts) keeps its bcrypt hash in
- * settings.fileLock.hash. Only whether the file is protected is ever handed out.
- */
-const FILE_LOCK_KEY = 'fileLock';
-function redactFileLock(v: unknown): unknown {
-  if (!v || typeof v !== 'object' || Array.isArray(v)) return v;
-  const fl = v as { enabled?: unknown; hash?: unknown };
-  return { enabled: Boolean(fl.enabled && fl.hash) };
-}
-
-/** A copy of `settings` without the secret keys (closing-date and file password hashes). */
-export function redactCompanySettings<T>(settings: T): T {
-  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) return settings;
-  const out = { ...(settings as Record<string, unknown>) };
-  for (const k of SECRET_SETTINGS_KEYS) delete out[k];
-  if (FILE_LOCK_KEY in out) out[FILE_LOCK_KEY] = redactFileLock(out[FILE_LOCK_KEY]);
-  return out as T;
-}
-
-/**
- * A deep copy of arbitrary stored data (audit-trail snapshots, transaction-log records) with
- * every secret settings key removed at any depth. Older builds wrote the whole settings object,
- * closing-date password hash included, into the audit trail and the transaction log; those rows
- * are kept (they are the history), but the hash is never handed out when they are read.
- */
-export function redactSecretsDeep<T>(value: T, depth = 0): T {
-  if (depth > 32 || !value || typeof value !== 'object') return value;
-  if (Array.isArray(value)) return value.map((v) => redactSecretsDeep(v, depth + 1)) as unknown as T;
-  if (value instanceof Date) return value;
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-    if ((SECRET_SETTINGS_KEYS as readonly string[]).includes(k)) continue;
-    out[k] = k === FILE_LOCK_KEY && v && typeof v === 'object' && !Array.isArray(v) ? redactFileLock(v) : redactSecretsDeep(v, depth + 1);
-  }
-  return out as T;
-}
-
-/** A company row as it may be returned to a client: settings without secret keys. */
-export function redactCompany<T extends { settings?: unknown } | null | undefined>(row: T): T {
-  if (!row || typeof row !== 'object') return row;
-  return { ...row, settings: redactCompanySettings(row.settings) };
-}
-
 export async function listCompanies(db: DB) {
-  return (await db.select().from(companies)).map(redactCompany);
+  return (await db.select().from(companies)).map((c) => stripSecrets(c));
 }
 
 /**
@@ -123,7 +73,7 @@ export async function listCompaniesForUser(
     .from(companies)
     .innerJoin(userCompanies, eq(userCompanies.companyId, companies.id))
     .where(and(eq(userCompanies.userId, userId), eq(userCompanies.isActive, true)));
-  const list = rows.map((r) => redactCompany(r.company));
+  const list = rows.map((r) => stripSecrets(r.company));
   if (!opts?.excludeArchived) return list;
   return list.filter(
     (c) => (c.settings as Record<string, unknown> | null)?.archived !== true,
@@ -396,18 +346,19 @@ export async function updateCompany(ctx: ServiceContext, input: UpdateCompanyInp
     // there as soon as the preference is on) so foreign currencies can be added next to it.
     if (multiCurrency === 'on') await ensureHomeCurrency(tx, (row.settings ?? {}) as Record<string, unknown>);
 
-    // The audit trail (and the transaction log it feeds) never carries the password hash.
+    // The audit trail (and the transaction log it feeds) never carries the closing-date or file
+    // password hash (lib/permissions/mask.ts stripSecrets, the one rule for credential material).
     await writeAudit(tx, {
       action: 'update',
       entityType: 'company',
       entityId: tx.companyId,
-      oldValues: { name: existing.name, settings: redactCompanySettings(existing.settings) },
-      newValues: { name: row.name, settings: redactCompanySettings(row.settings) },
+      oldValues: { name: existing.name, settings: stripSecrets(existing.settings) },
+      newValues: { name: row.name, settings: stripSecrets(row.settings) },
     });
     return row;
   });
 
-  return redactCompany(updated);
+  return stripSecrets(updated);
 }
 
 /** Put the home currency (Preferences currency, default USD) in the currency list if missing. */

@@ -9,7 +9,7 @@ import { and, asc, desc, eq, gte, lte, sql } from 'drizzle-orm';
 import { auditLogs, users } from '@/lib/db/schema';
 import { type ServiceContext, notFound } from './_base';
 import { maskForContext } from './access';
-import { redactSecretsDeep } from './company';
+import { stripSecrets } from '@/lib/permissions/mask';
 
 export interface AuditLogRow {
   id: string;
@@ -117,9 +117,10 @@ export async function getAuditLog(ctx: ServiceContext, id: string): Promise<Audi
     actorName: row.actorName ?? null,
     createdAt: row.createdAt.toISOString(),
     // Snapshots can hold SSNs, tax IDs and account numbers -- mask per the caller's flags.
-    // ... and never the closing-date password hash older builds wrote into settings snapshots.
-    oldValues: maskForContext(ctx, redactSecretsDeep(row.oldValues)),
-    newValues: maskForContext(ctx, redactSecretsDeep(row.newValues)),
+    // ... and never the password hashes older builds wrote into settings snapshots, whoever asks
+    // (stripSecrets also for trusted contexts, which maskForContext leaves untouched).
+    oldValues: maskForContext(ctx, stripSecrets(row.oldValues)),
+    newValues: maskForContext(ctx, stripSecrets(row.newValues)),
     llmReasoning: row.llmReasoning ?? null,
   };
 }
