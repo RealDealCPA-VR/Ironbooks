@@ -6,11 +6,20 @@
  *
  * adm-zip operates entirely in memory, keeping the backup path simple and
  * portable across Electron / Next dev / CI.
+ *
+ * A company file protected with passwords (lib/services/fileProtection.ts) is backed up the same
+ * way it is saved: encrypted with its file key, with its key slots in the backup's plain manifest
+ * (electron/companyFileFormat.js buildBackupArchive) — every backup, automatic or downloaded,
+ * every safety copy made before a restore / condense / year-end close, every condense archive and
+ * every per-company backup. A protected backup restores without a question into the file it came
+ * from; anywhere else it needs a user name and password from that file, or its recovery key
+ * (lib/services/sealedArchives.ts).
  */
 import AdmZip from 'adm-zip';
 import fs from 'node:fs';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import format from '@/electron/companyFileFormat';
 import { eq, getTableColumns, getTableName } from 'drizzle-orm';
 import {
   resolveDataDir,
@@ -71,8 +80,17 @@ import { ServiceError, type ServiceContext } from './_base';
 import { cloneAttachmentFileForRestore, normalizeStoragePath, safeAttachmentPath } from './attachments';
 import { allowLedgerRewrite } from './posting';
 import { logTransaction, resetTransactionLogCache } from './transactionLog';
-import { BACKUP_HISTORY_FILE, BACKUP_SETTINGS_FILE, recordBackup } from './backupHistory';
+import { BACKUP_HISTORY_FILE, BACKUP_SETTINGS_FILE, markPruned, readBackupHistory, recordBackup } from './backupHistory';
 import { beginRestore } from './restoreState';
+import {
+  PROTECTED_MARKER,
+  cachedSealProtection,
+  carryProtectionIntoRestore,
+  protectionForDir,
+  snapshotProtection,
+  type SealProtection,
+} from './fileProtection';
+import { backupManifestOf, sealedHeadOf, unsealArchive, writeUnsealedEntries, type ArchiveCredentials } from './sealedArchives';
 import { currentFingerprint } from './backupFingerprint';
 import { APP_VERSION } from '@/lib/appVersion';
 import type { EffectiveAccess } from '@/lib/permissions/model';
@@ -84,6 +102,12 @@ export const BACKUP_MANIFEST_ENTRY = 'bookkeeper-manifest.json';
 export const COMPANY_DATA_ENTRY = 'company-data.json';
 /** Bump when the backup layout changes incompatibly. */
 export const BACKUP_FORMAT_VERSION = 1;
+/**
+ * A protected (encrypted) backup's manifest says 2 (electron/companyFileFormat.js
+ * BACKUP_FORMAT_VERSION): Ironbooks 1.6 refuses it as "made by a newer version" instead of
+ * failing on its encrypted contents. Backups of files without passwords stay at 1.
+ */
+export const SEALED_BACKUP_FORMAT_VERSION = 2;
 
 /** 'full' = zip of the whole PGlite data dir (all companies); 'company' = one company's rows as JSON. */
 export type BackupKind = 'full' | 'company';
@@ -126,6 +150,9 @@ export const FILE_LOCAL_SECRETS = [
   // Sandbox / training-file marker (lib/services/sandboxState.ts SANDBOX_MARKER): a backup made
   // in a sandbox must never turn the real file into a "sandbox" when restored there.
   '.ironbooks-sandbox.json',
+  // "These books are protected" (lib/services/fileProtection.ts): the database's own protection
+  // record is what travels; a restore keeps this location's marker and settles it afterwards.
+  PROTECTED_MARKER,
 ];
 
 /**
@@ -141,6 +168,8 @@ export const FILE_LOCAL_FILES = [...FILE_LOCAL_SECRETS, BACKUP_HISTORY_FILE, BAC
 export interface BackupResult {
   buffer: Buffer;
   filename: string;
+  /** The company file is protected with passwords: the backup is encrypted the same way. */
+  encrypted?: boolean;
 }
 
 /**
@@ -149,13 +178,38 @@ export interface BackupResult {
  * @param companyName  Optional name embedded in the filename for clarity.
  * @param dataDir      Optional path override; defaults to the active company
  *                     data dir via resolveDataDir().
+ * @param opts.protection  The folder's protection (lib/services/fileProtection.ts protectionForDir;
+ *                     null = a file without passwords). When omitted, the slot set of the
+ *                     folder's last save is used — a protected folder whose key is not known
+ *                     here is refused, never backed up in plain text.
  * @returns { buffer, filename } — filename is 'ironbooks-backup-<slug>.bka'.
  */
-export function createBackup(companyName?: string, dataDir?: string): BackupResult {
+export function createBackup(companyName?: string, dataDir?: string, opts: { protection?: SealProtection | null } = {}): BackupResult {
   const dir = resolveDataDir(dataDir);
 
   if (!fs.existsSync(dir)) {
     throw new Error(`Data directory not found: ${dir}`);
+  }
+
+  const protection = opts.protection !== undefined ? opts.protection : cachedSealProtection(dir);
+  if (protection) {
+    // Encrypted like the company file: the backup manifest's listing fields and the key slots stay
+    // readable, everything else (the database, attachments, the transaction log) is sealed.
+    const manifest: BackupManifest = {
+      app: 'bookkeeper-ai',
+      formatVersion: SEALED_BACKUP_FORMAT_VERSION,
+      kind: 'full',
+      companyName: companyName ?? null,
+      createdAt: new Date().toISOString(),
+      appVersion: APP_VERSION,
+      ...schemaStamp(),
+    };
+    const entries = format.snapshotDir(dir).filter((e: { name: string }) => !FILE_LOCAL_FILES.includes(e.name));
+    return {
+      buffer: format.buildBackupArchive({ backupManifest: manifest, entries, protection }),
+      filename: buildBackupFilename('ironbooks-backup', companyName),
+      encrypted: true,
+    };
   }
 
   const zip = new AdmZip();
@@ -251,6 +305,17 @@ function preOpSortKey(filename: string): number {
 }
 
 /**
+ * Which company folder a pre-op copy belongs to, in its file name: older-format company folders
+ * share one pre-op folder (they all live under userData/companies), and each folder's keep-N
+ * rotation only ever counts — and removes — its own copies.
+ */
+export function preOpFolderTag(dataDir?: string): string {
+  const abs = path.resolve(resolveDataDir(dataDir));
+  const key = process.platform === 'win32' || process.platform === 'darwin' ? abs.toLowerCase() : abs;
+  return createHash('sha256').update(key).digest('hex').slice(0, 8);
+}
+
+/**
  * Backup-before-destructive: write a rotating pre-op .bka snapshot of the
  * company data directory, keeping only the newest PRE_OP_BACKUP_KEEP files.
  *
@@ -263,6 +328,8 @@ function preOpSortKey(filename: string): number {
  *                 beyond the signature contract — the snapshot is file-level.
  * @param label    Operation label embedded in the filename (e.g. 'restore', 'condense').
  * @param dataDir  Optional data-dir override; defaults to the active dir.
+ * @param protection  The folder's protection (protectionForDir); omitted: the slot set of its last
+ *                 save. A safety copy of a protected file is encrypted like the file.
  * @returns the written file's path/filename, or null when the data dir does
  *          not exist yet (nothing to protect — e.g. first run).
  */
@@ -270,17 +337,19 @@ export function ensurePreOpBackup(
   _ctx: Pick<ServiceContext, 'companyId'> | null,
   label: string,
   dataDir?: string,
+  protection?: SealProtection | null,
 ): PreOpBackupResult | null {
   const dir = resolveDataDir(dataDir);
   if (!fs.existsSync(dir)) return null;
 
-  const { buffer } = createBackup(undefined, dir);
+  const { buffer } = createBackup(undefined, dir, protection === undefined ? {} : { protection });
 
   const outDir = preOpBackupDir(dataDir);
   fs.mkdirSync(outDir, { recursive: true });
   const slug = label.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'op';
+  const tag = preOpFolderTag(dir);
   preOpSeq = (preOpSeq + 1) % 1_000_000;
-  const filename = `preop-${slug}-${Date.now()}-${preOpSeq}.bka`;
+  const filename = `preop-${slug}-${tag}-${Date.now()}-${preOpSeq}.bka`;
   const outPath = path.join(outDir, filename);
   fs.writeFileSync(outPath, buffer);
   recordBackup(
@@ -296,14 +365,26 @@ export function ensurePreOpBackup(
     dir,
   );
 
-  // Rotate: keep only the newest PRE_OP_BACKUP_KEEP pre-op backups overall.
+  // Rotate: keep only the newest PRE_OP_BACKUP_KEEP pre-op backups OF THIS COMPANY FOLDER (the
+  // folder may be shared with other company folders — their copies are never counted or touched).
+  // Copies made before the folder tag existed carry no tag: they are left alone.
   try {
-    const files = fs
+    const mine = fs
       .readdirSync(outDir)
-      .filter((f) => f.startsWith('preop-') && f.endsWith('.bka'))
+      .filter((f) => f.startsWith('preop-') && f.endsWith('.bka') && f.includes(`-${tag}-`))
       .sort((a, b) => preOpSortKey(b) - preOpSortKey(a));
-    for (const stale of files.slice(PRE_OP_BACKUP_KEEP)) {
+    const removed: string[] = [];
+    for (const stale of mine.slice(PRE_OP_BACKUP_KEEP)) {
       fs.rmSync(path.join(outDir, stale), { force: true });
+      removed.push(stale);
+    }
+    if (removed.length) {
+      // The history must not keep offering a safety copy that is gone.
+      const gone = new Set(removed.map((f) => path.resolve(outDir, f)));
+      const ids = readBackupHistory(dir)
+        .filter((r) => r.source === 'pre-op' && !r.prunedAt && r.path && gone.has(path.resolve(r.path)))
+        .map((r) => r.id);
+      if (ids.length) markPruned(ids, dir);
     }
   } catch {
     /* pruning is best-effort — a leftover file is harmless */
@@ -329,12 +410,75 @@ export interface RestoreResult {
 const notABackup = (detail: string) =>
   new ServiceError('VALIDATION', `Not an Ironbooks backup file (${detail}).`);
 
+/** The refusals of a full backup's manifest: not ours, a newer layout, a one-company backup. */
+function checkFullBackupManifest(manifest: Partial<BackupManifest>, maxFormatVersion: number): void {
+  if (manifest.app !== 'bookkeeper-ai') {
+    throw notABackup('manifest does not identify an Ironbooks backup');
+  }
+  if (typeof manifest.formatVersion !== 'number' || manifest.formatVersion > maxFormatVersion) {
+    throw new ServiceError(
+      'VALIDATION',
+      'This backup was created by a newer version of Ironbooks. Update the app, then restore.',
+    );
+  }
+  refuseNewerBackup(manifest);
+  if (manifest.kind === 'company') {
+    throw new ServiceError(
+      'VALIDATION',
+      'This is a single-company backup. Use "Restore Company" instead of the full restore.',
+    );
+  }
+}
+
+/** A full backup, validated (and decrypted when it is protected) and ready to be written out. */
+export interface OpenedBackup {
+  /** Write the backup's files into `dir` (a new folder). */
+  extractTo(dir: string): void;
+  /** The key a protected backup opened with; null for a backup without passwords. */
+  key: Buffer | null;
+  /** Its manifest (null for a pre-manifest archive). */
+  manifest: Partial<BackupManifest> | null;
+}
+
+/**
+ * Validate a full backup WITHOUT touching any data dir: a backup without passwords as before
+ * (validateBackupZip), a protected one by decrypting and verifying every entry in memory — with
+ * this file's own key, or the `credentials` of the file it was made from (sealedArchives.ts).
+ */
+export async function openBackupBuffer(
+  buffer: Buffer,
+  opts: { credentials?: ArchiveCredentials | null; dataDir?: string } = {},
+): Promise<OpenedBackup> {
+  if (sealedHeadOf(buffer)) {
+    const u = await unsealArchive(buffer, opts.credentials ?? null, resolveDataDir(opts.dataDir));
+    const manifest = backupManifestOf(u) as Partial<BackupManifest> | null;
+    if (manifest) checkFullBackupManifest(manifest, SEALED_BACKUP_FORMAT_VERSION);
+    if (!u.entries.some((e) => e.name === 'PG_VERSION')) throw notABackup('archive does not contain an Ironbooks company file');
+    return { key: u.key, manifest, extractTo: (dir) => writeUnsealedEntries(u.entries, dir) };
+  }
+  const zip = validateBackupZip(buffer);
+  let manifest: Partial<BackupManifest> | null = null;
+  const entry = zip.getEntry(BACKUP_MANIFEST_ENTRY);
+  if (entry) {
+    try {
+      manifest = JSON.parse(zip.readAsText(entry));
+    } catch {
+      manifest = null;
+    }
+  }
+  return { key: null, manifest, extractTo: (dir) => zip.extractAllTo(dir, /* overwrite */ true) };
+}
+
 /**
  * Parse + validate a candidate .bka buffer WITHOUT touching the data dir.
  * Accepts archives with a valid manifest, or (for pre-manifest .bka files)
- * archives whose entry list looks like a PGlite data directory.
+ * archives whose entry list looks like a PGlite data directory. A protected (encrypted) backup
+ * is opened with openBackupBuffer instead.
  */
 export function validateBackupZip(buffer: Buffer): AdmZip {
+  if (sealedHeadOf(buffer)) {
+    throw new ServiceError('VALIDATION', 'This backup is protected with passwords; it is opened with the company file’s passwords.', { protected: true });
+  }
   let zip: AdmZip;
   try {
     zip = new AdmZip(buffer);
@@ -358,25 +502,7 @@ export function validateBackupZip(buffer: Buffer): AdmZip {
     } catch {
       throw notABackup('manifest is unreadable');
     }
-    if (manifest.app !== 'bookkeeper-ai') {
-      throw notABackup('manifest does not identify an Ironbooks backup');
-    }
-    if (
-      typeof manifest.formatVersion !== 'number' ||
-      manifest.formatVersion > BACKUP_FORMAT_VERSION
-    ) {
-      throw new ServiceError(
-        'VALIDATION',
-        'This backup was created by a newer version of Ironbooks. Update the app, then restore.',
-      );
-    }
-    refuseNewerBackup(manifest);
-    if (manifest.kind === 'company') {
-      throw new ServiceError(
-        'VALIDATION',
-        'This is a single-company backup. Use "Restore Company" instead of the full restore.',
-      );
-    }
+    checkFullBackupManifest(manifest, BACKUP_FORMAT_VERSION);
     return zip;
   }
 
@@ -463,30 +589,55 @@ export async function restoredBookNotices(dir: string): Promise<string[]> {
  * After this resolves, the restored file has been verified and closed; the next getDb() reopens
  * it — no process restart is required.
  *
+ * Passwords (lib/services/fileProtection.ts): a protected backup is decrypted — every entry
+ * verified — before anything is written; one made with another key needs `credentials` from the
+ * file it came from. The restored books stay protected: a protected backup brings its own key and
+ * slots (the file is saved with that key from now on), and a backup made before the file was
+ * protected gets the file's current protection copied in.
+ *
  * @param buffer     The raw bytes of a .bka backup file.
  * @param targetDir  Optional path override; defaults to resolveDataDir().
  */
-export async function restoreBackup(buffer: Buffer, targetDir?: string): Promise<RestoreResult> {
+export async function restoreBackup(
+  buffer: Buffer,
+  targetDir?: string,
+  opts: { credentials?: ArchiveCredentials | null } = {},
+): Promise<RestoreResult> {
   // The open single company file's autosave waits until this has finished (restoreState.ts).
   const done = beginRestore(targetDir);
   try {
-    return await restoreBackupInto(resolveDataDir(targetDir), buffer);
+    return await restoreBackupInto(resolveDataDir(targetDir), buffer, opts);
   } finally {
     done();
   }
 }
 
-async function restoreBackupInto(dir: string, buffer: Buffer): Promise<RestoreResult> {
+async function restoreBackupInto(dir: string, buffer: Buffer, opts: { credentials?: ArchiveCredentials | null }): Promise<RestoreResult> {
 
-  // (1) Validate before touching anything on disk.
-  const zip = validateBackupZip(buffer);
+  // (1) Validate before touching anything on disk (a protected backup: decrypted and verified).
+  const opened = await openBackupBuffer(buffer, { credentials: opts.credentials, dataDir: dir });
+
+  // (1a) The file's current protection, to carry into the restored books. `protection` stays
+  // undefined when it can't be read, so a safety copy of a protected folder is then refused
+  // (createBackup) rather than written in plain text.
+  let before: Awaited<ReturnType<typeof snapshotProtection>> = null;
+  let protection: SealProtection | null | undefined;
+  if (fs.existsSync(path.join(dir, 'PG_VERSION'))) {
+    try {
+      const liveDb = await withDamagedFileAccess(() => getDb(dir));
+      before = await snapshotProtection(liveDb);
+      protection = await protectionForDir(dir);
+    } catch (err) {
+      console.warn('[backup] the current protection could not be read before the restore:', (err as Error).message);
+    }
+  }
 
   // (1b) Backup-before-destructive: snapshot the CURRENT data dir as a rotating
   // pre-op .bka so a bad restore is recoverable after the fact. Best-effort —
   // an unreadable live dir must not block restoring a known-good backup (the
   // rename-aside in step 4 still provides in-flight rollback).
   try {
-    ensurePreOpBackup(null, 'restore', dir);
+    ensurePreOpBackup(null, 'restore', dir, protection);
   } catch (err) {
     console.warn('[backup] pre-op backup before restore failed (continuing):', err);
   }
@@ -494,7 +645,7 @@ async function restoreBackupInto(dir: string, buffer: Buffer): Promise<RestoreRe
   // (2) Extract to a sibling temp dir.
   const tmpDir = `${dir}.restore-tmp-${Date.now()}`;
   try {
-    zip.extractAllTo(tmpDir, /* overwrite */ true);
+    opened.extractTo(tmpDir);
 
     // Verify extraction actually produced a PGlite data dir.
     if (!fs.existsSync(path.join(tmpDir, 'PG_VERSION'))) {
@@ -582,6 +733,19 @@ async function restoreBackupInto(dir: string, buffer: Buffer): Promise<RestoreRe
       notices = await restoredBookNotices(dir);
     } catch (err) {
       console.warn('[backup] post-restore Verify Data check failed (continuing):', err);
+    }
+
+    // The restored books stay protected with passwords: a protected backup's own key and slots,
+    // or this file's protection copied into a backup made before it had any.
+    try {
+      await carryProtectionIntoRestore(await withDamagedFileAccess(() => getDb(dir)), dir, before, opened.key);
+    } catch (err) {
+      console.error('[backup] the protection could not be carried into the restored books:', err);
+      await rollBack();
+      throw new ServiceError(
+        'VALIDATION',
+        'This backup was not restored because the company file’s password protection could not be kept. Your current company file has not been changed.',
+      );
     }
 
     // Release the verification handle: callers (and the next request) reopen the file with
@@ -982,6 +1146,8 @@ export async function createCompanyBackup(
     access?: Pick<EffectiveAccess, 'flags'> | null;
     /** Data dir holding the company's attachment files (default: the active company file). */
     dataDir?: string;
+    /** The file's protection (default: read from the folder). A protected file's backup is encrypted. */
+    protection?: SealProtection | null;
   } = {},
 ): Promise<BackupResult> {
   const raw = await exportCompanyData(db, companyId);
@@ -989,11 +1155,12 @@ export async function createCompanyBackup(
   const redacted = Boolean(
     opts.access && !(opts.access.flags.sensitivePayroll && opts.access.flags.fullAccountNumbers),
   );
+  const dir = resolveDataDir(opts.dataDir);
+  const protection = opts.protection !== undefined ? opts.protection : await protectionForDir(dir);
 
-  const zip = new AdmZip();
   const manifest: BackupManifest = {
     app: 'bookkeeper-ai',
-    formatVersion: BACKUP_FORMAT_VERSION,
+    formatVersion: protection ? SEALED_BACKUP_FORMAT_VERSION : BACKUP_FORMAT_VERSION,
     kind: 'company',
     companyName: data.company.name,
     createdAt: new Date().toISOString(),
@@ -1001,12 +1168,10 @@ export async function createCompanyBackup(
     ...schemaStamp(),
     ...(redacted ? { redacted: true } : {}),
   };
-  zip.addFile(BACKUP_MANIFEST_ENTRY, Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'));
-  zip.addFile(COMPANY_DATA_ENTRY, Buffer.from(JSON.stringify(data), 'utf8'));
+  const entries: Array<{ name: string; data: Buffer }> = [{ name: COMPANY_DATA_ENTRY, data: Buffer.from(JSON.stringify(data), 'utf8') }];
   // The attachment FILES travel too (files/<stored path>): restored on another PC, the rows
   // would otherwise point at files that do not exist there. Only files inside the attachments
   // folder are read (safeAttachmentPath), so a crafted row cannot pull another file in.
-  const dir = resolveDataDir(opts.dataDir);
   const added = new Set<string>();
   for (const row of raw.tables.attachments ?? []) {
     const stored = String(row.storagePath ?? '');
@@ -1015,37 +1180,65 @@ export async function createCompanyBackup(
     if (!abs || added.has(key)) continue;
     try {
       if (!fs.statSync(abs).isFile()) continue;
-      zip.addFile(`${COMPANY_FILES_PREFIX}${key}`, fs.readFileSync(abs));
+      entries.push({ name: `${COMPANY_FILES_PREFIX}${key}`, data: fs.readFileSync(abs) });
       added.add(key);
     } catch {
       /* a file missing on this disk restores as a missing file, as before */
     }
   }
+  const filename = buildBackupFilename('ironbooks-company', data.company.name);
+  if (protection) {
+    // Encrypted like the company file it came from (its key slots in the plain manifest).
+    return { buffer: format.buildBackupArchive({ backupManifest: manifest, entries, protection }), filename, encrypted: true };
+  }
 
-  return {
-    buffer: zip.toBuffer(),
-    filename: buildBackupFilename('ironbooks-company', data.company.name),
-  };
+  const zip = new AdmZip();
+  zip.addFile(BACKUP_MANIFEST_ENTRY, Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'));
+  for (const e of entries) zip.addFile(e.name, e.data);
+  return { buffer: zip.toBuffer(), filename };
 }
 
 /** Folder inside a per-company .bka holding the attachment files, by stored path. */
 const COMPANY_FILES_PREFIX = 'files/';
 
 /** The attachment files carried in a per-company .bka (normalized stored path → bytes). */
-function readCompanyBackupFiles(buffer: Buffer): Map<string, Buffer> {
+function companyBackupFilesOf(entries: Array<{ name: string; data?: Buffer; dir?: boolean }>): Map<string, Buffer> {
   const out = new Map<string, Buffer>();
+  for (const e of entries) {
+    const name = e.name.replace(/\\/g, '/');
+    if (e.dir || !e.data || !name.startsWith(COMPANY_FILES_PREFIX)) continue;
+    out.set(normalizeStoragePath(name.slice(COMPANY_FILES_PREFIX.length)), e.data);
+  }
+  return out;
+}
+
+/** The attachment files carried in a per-company .bka without passwords. */
+function readCompanyBackupFiles(buffer: Buffer): Map<string, Buffer> {
   let zip: AdmZip;
   try {
     zip = new AdmZip(buffer);
   } catch {
-    return out;
+    return new Map();
   }
-  for (const e of zip.getEntries()) {
-    const name = e.entryName.replace(/\\/g, '/');
-    if (e.isDirectory || !name.startsWith(COMPANY_FILES_PREFIX)) continue;
-    out.set(normalizeStoragePath(name.slice(COMPANY_FILES_PREFIX.length)), e.getData());
-  }
-  return out;
+  return companyBackupFilesOf(
+    zip.getEntries().map((e) => (e.isDirectory ? { name: e.entryName, dir: true } : { name: e.entryName, data: e.getData() })),
+  );
+}
+
+/**
+ * Open a per-company backup — with or without passwords — and parse it. A protected one is
+ * decrypted (every entry verified) with this file's key or the `credentials` of the file it was
+ * made from (sealedArchives.ts).
+ */
+export async function openCompanyBackup(
+  buffer: Buffer,
+  opts: { credentials?: ArchiveCredentials | null; dataDir?: string } = {},
+): Promise<{ data: CompanyExportData; files: Map<string, Buffer> }> {
+  if (!sealedHeadOf(buffer)) return { data: readCompanyBackup(buffer), files: readCompanyBackupFiles(buffer) };
+  const u = await unsealArchive(buffer, opts.credentials ?? null, resolveDataDir(opts.dataDir));
+  const manifest = backupManifestOf(u) as Partial<BackupManifest> | null;
+  const text = (name: string) => u.entries.find((e) => e.name === name && e.data)?.data?.toString('utf8') ?? null;
+  return { data: parseCompanyBackup(manifest, text(COMPANY_DATA_ENTRY), SEALED_BACKUP_FORMAT_VERSION), files: companyBackupFilesOf(u.entries) };
 }
 
 /**
@@ -1070,8 +1263,14 @@ function writeRestoredAttachment(dataDir: string, storagePath: string, bytes: Bu
   return { storagePath: `attachments/${diskName}`, createdPath };
 }
 
-/** Validate + parse a per-company .bka buffer. Throws VALIDATION for anything else. */
+/**
+ * Validate + parse a per-company .bka buffer. Throws VALIDATION for anything else. A protected
+ * one is opened with openCompanyBackup.
+ */
 export function readCompanyBackup(buffer: Buffer): CompanyExportData {
+  if (sealedHeadOf(buffer)) {
+    throw new ServiceError('VALIDATION', 'This backup is protected with passwords; it is opened with the company file’s passwords.', { protected: true });
+  }
   let zip: AdmZip;
   try {
     zip = new AdmZip(buffer);
@@ -1086,6 +1285,13 @@ export function readCompanyBackup(buffer: Buffer): CompanyExportData {
   } catch {
     throw notABackup('manifest is unreadable');
   }
+  const dataEntry = zip.getEntry(COMPANY_DATA_ENTRY);
+  return parseCompanyBackup(manifest, dataEntry ? zip.readAsText(dataEntry) : null, BACKUP_FORMAT_VERSION);
+}
+
+/** The checks and parse shared by per-company backups with and without passwords. */
+function parseCompanyBackup(manifest: Partial<BackupManifest> | null, dataText: string | null, maxFormatVersion: number): CompanyExportData {
+  if (!manifest) throw notABackup('missing manifest — is this a full backup?');
   if (manifest.app !== 'bookkeeper-ai') throw notABackup('manifest does not identify an Ironbooks backup');
   if (manifest.kind !== 'company') {
     throw new ServiceError(
@@ -1093,7 +1299,7 @@ export function readCompanyBackup(buffer: Buffer): CompanyExportData {
       'This is a full data-directory backup. Use the full Restore instead of Restore Company.',
     );
   }
-  if (typeof manifest.formatVersion !== 'number' || manifest.formatVersion > BACKUP_FORMAT_VERSION) {
+  if (typeof manifest.formatVersion !== 'number' || manifest.formatVersion > maxFormatVersion) {
     throw new ServiceError(
       'VALIDATION',
       'This backup was created by a newer version of Ironbooks. Update the app, then restore.',
@@ -1101,11 +1307,10 @@ export function readCompanyBackup(buffer: Buffer): CompanyExportData {
   }
   // Rows of tables and columns this version does not have would be dropped without a word.
   refuseNewerBackup(manifest);
-  const dataEntry = zip.getEntry(COMPANY_DATA_ENTRY);
-  if (!dataEntry) throw notABackup('archive does not contain company data');
+  if (dataText === null) throw notABackup('archive does not contain company data');
   let data: CompanyExportData;
   try {
-    data = JSON.parse(zip.readAsText(dataEntry));
+    data = JSON.parse(dataText);
   } catch {
     throw notABackup('company data is unreadable');
   }
@@ -1230,15 +1435,17 @@ export async function restoreCompanyBackup(
     name?: string;
     /** Data dir of `db` (where attachment files are written; default: the active company file). */
     dataDir?: string;
+    /** Opens a backup protected with another company file's passwords (sealedArchives.ts). */
+    credentials?: ArchiveCredentials | null;
   },
 ): Promise<RestoreCompanyResult> {
-  const data = readCompanyBackup(buffer);
-  const files = readCompanyBackupFiles(buffer);
+  const { data, files } = await openCompanyBackup(buffer, { credentials: opts.credentials, dataDir: opts.dataDir });
 
   // Backup-before-destructive: company restore only inserts a brand-new company,
-  // but it still mutates the shared data dir — snapshot it first (best-effort).
+  // but it still mutates the shared data dir — snapshot it first (best-effort; a protected file's
+  // safety copy is encrypted like the file).
   try {
-    ensurePreOpBackup(null, 'restore-company', opts.dataDir);
+    ensurePreOpBackup(null, 'restore-company', opts.dataDir, await protectionForDir(opts.dataDir));
   } catch (err) {
     console.warn('[backup] pre-op backup before company restore failed (continuing):', err);
   }

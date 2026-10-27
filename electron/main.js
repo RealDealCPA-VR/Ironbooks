@@ -785,6 +785,11 @@ async function openSingleFileForLaunch(filePath) {
     plan: prep.plan,
     appUser: info.appUser,
     conflictCopy: prep.conflictCopy || null,
+    // A file protected with passwords: the shell never has its key, so the server starts sealed
+    // and the sign-in decrypts it ('extract' / 'conflict' / 'key' — electron/companySession.js).
+    sealed: prep.sealed || null,
+    training: Boolean(prep.manifest && prep.manifest.training),
+    keptOnThisComputer: prep.keptOnThisComputer || null,
   };
   try {
     companySession.pruneWorkingCopies(workingRoot(), [prep.workDir]);
@@ -1143,6 +1148,13 @@ async function closeOpenCompanyFile() {
       data = { error: String((err && err.message) || err) };
     }
     if (ok) {
+      if (data.unsavedKept) {
+        // A protected file nobody signed in to this time, with unsaved work from an earlier session
+        // on this computer: it could not be saved (it is never decrypted without a sign-in). Leave
+        // the lock in place as "unsaved" (it goes stale), so whoever opens the file next is warned.
+        companyLock.heartbeat(openFile.lock, { unsavedSince: new Date().toISOString() });
+        return true;
+      }
       companyLock.release(openFile.lock);
       return true;
     }
@@ -1324,6 +1336,9 @@ async function startNextServer() {
       BKA_COMPANY_STATE: openFile ? path.join(openFile.workDir, companySession.STATE_FILE) : '',
       BKA_COMPANY_LOCK: openFile ? openFile.lock.dir : '',
       BKA_COMPANY_LOCK_TOKEN: openFile ? openFile.lock.token : '',
+      // Protected with passwords (lib/db/sealed.ts): what the sign-in must do before the books open.
+      // Never a key or a password — only the open plan.
+      BKA_COMPANY_SEALED: openFile && openFile.sealed ? openFile.sealed : '',
       // Where the real company file lives (training copies are kept next to it), also in the sandbox.
       BKA_REAL_COMPANY_FILE: openFile ? openFile.path : (loadConfig().sandbox && loadConfig().sandbox.realFile) || '',
       // Scheduled report exports of a single company file go next to the company file, as they do
@@ -2115,9 +2130,24 @@ function noteRecoveredWork() {
       type: 'info',
       message: `Ironbooks recovered your unsaved work in ${name}.`,
       detail:
-        'The last time this company file was open on this computer, Ironbooks closed before it could save everything into the file (the computer may have restarted or lost its connection to the file server). Nothing was lost: those changes are here and are being saved into the company file now.',
+        'The last time this company file was open on this computer, Ironbooks closed before it could save everything into the file (the computer may have restarted or lost its connection to the file server). Nothing was lost: those changes are here and ' +
+        (openFile.sealed ? 'are saved into the company file as soon as you sign in.' : 'are being saved into the company file now.'),
       buttons: ['OK'],
     });
+  } else if (openFile.keptOnThisComputer) {
+    const kept = openFile.keptOnThisComputer;
+    dialog
+      .showMessageBox(mainWindow, {
+        noLink: true,
+        type: 'info',
+        message: 'Your unsaved changes were kept on this computer.',
+        detail:
+          `${kept}\n\nThey are protected with passwords, so Ironbooks never copies them next to the company file in plain text. Open them with File > Open Company Folder (Older Format) and sign in with your user name and password, then compare them with ${name} and re-enter anything that is missing.`,
+        buttons: ['OK', 'Show in Folder'],
+      })
+      .then(({ response }) => {
+        if (response === 1) shell.showItemInFolder(kept);
+      });
   } else if (openFile.conflictCopy) {
     const copy = openFile.conflictCopy;
     dialog

@@ -190,6 +190,12 @@ function conflictCopyPath(companyFile, computer, when = new Date()) {
  * that can't be merged, and to pack a restored portable company file.
  */
 async function writeWorkingCopyAs(workDir, target, { companyName, appVersion, fileId, dataDir, protection } = {}) {
+  // Books protected with passwords are only ever written encrypted (with their own key and slots).
+  if (!protection && isProtectedData(dataDir || dataDirOf(workDir))) {
+    const err = new Error('These books are protected with passwords; they can only be copied by the app after someone signs in.');
+    err.code = 'PROTECTED';
+    throw err;
+  }
   // A separate company file: never with the original's backup history (lib/services/backupHistory.ts
   // BACKUP_HISTORY_FILE), or the copy's backup rotation would delete the original's versions.
   const entries = format
@@ -280,14 +286,23 @@ async function prepareWorkingCopy(companyFile, { root, onConflict, appVersion, k
   });
   if (format.isSealedManifest(manifest)) return prepareSealed(companyFile, { workDir, state, manifest, plan, onConflict });
   let conflictCopy = null;
+  let keptOnThisComputer = null;
   if (plan === 'conflict') {
     const keep = onConflict ? await onConflict({ state, manifest, workDir }) : true;
     if (!keep) return { workDir, dataDir: dataDirOf(workDir), plan: 'cancelled', manifest };
-    conflictCopy = conflictCopyPath(companyFile, require('node:os').hostname());
-    await writeWorkingCopyAs(workDir, conflictCopy, {
-      companyName: `${manifest.companyName || format.companyFileBaseName(companyFile)} (unsaved changes)`,
-      appVersion,
-    });
+    if (isProtectedData(dataDirOf(workDir))) {
+      // The unsaved changes are of books protected with passwords, and this shell never has their
+      // key: they are never written out in plain text next to the company file. They stay on this
+      // computer as a company folder of their own (it opens with the same user names and passwords).
+      keptOnThisComputer = path.join(workDir, `unsaved changes ${stampOf(new Date())}`);
+      fs.renameSync(dataDirOf(workDir), keptOnThisComputer);
+    } else {
+      conflictCopy = conflictCopyPath(companyFile, require('node:os').hostname());
+      await writeWorkingCopyAs(workDir, conflictCopy, {
+        companyName: `${manifest.companyName || format.companyFileBaseName(companyFile)} (unsaved changes)`,
+        appVersion,
+      });
+    }
   }
   if (plan === 'extract' || plan === 'conflict') {
     fs.rmSync(dataDirOf(workDir), { recursive: true, force: true });
@@ -313,7 +328,25 @@ async function prepareWorkingCopy(companyFile, { root, onConflict, appVersion, k
     lastUsedAt: now,
     closedCleanly: false,
   });
-  return { workDir, dataDir: dataDirOf(workDir), plan, manifest, conflictCopy, sealed: null };
+  return { workDir, dataDir: dataDirOf(workDir), plan, manifest, conflictCopy, keptOnThisComputer, sealed: null };
+}
+
+/** lib/services/fileProtection.ts PROTECTED_MARKER: the folder's books are protected with passwords. */
+const PROTECTED_MARKER = '.ironbooks-protected';
+
+/** True when a data folder holds books protected with passwords (they are never written out in plain text). */
+function isProtectedData(dataDir) {
+  try {
+    return fs.existsSync(path.join(dataDir, PROTECTED_MARKER));
+  } catch {
+    return false;
+  }
+}
+
+/** "2026-10-24 1032" (local time). */
+function stampOf(when) {
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${when.getFullYear()}-${pad(when.getMonth() + 1)}-${pad(when.getDate())} ${pad(when.getHours())}${pad(when.getMinutes())}`;
 }
 
 /**
@@ -404,6 +437,16 @@ function pruneWorkingCopies(root, keep = [], now = Date.now()) {
     const st = readState(dir);
     // Never throw away unsaved work, whatever its age.
     if (!st || st.unsavedSince) continue;
+    // A protected file's plain-text books the app server could not remove right after a clean
+    // close (a file was busy for a moment): remove them now (lib/services/companyFileSave.ts).
+    if (st.dataRemovePending === true && st.closedCleanly === true) {
+      try {
+        fs.rmSync(dataDirOf(dir), { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+        writeState(dir, { dataRemovePending: null, dataRemovedAt: new Date(now).toISOString() });
+      } catch {
+        /* still busy: next time */
+      }
+    }
     const last = Date.parse(st.lastUsedAt || st.openedAt || '') || 0;
     if (now - last < WORKING_COPY_MAX_AGE_MS) continue;
     try {
@@ -441,4 +484,6 @@ module.exports = {
   latestMigrationAt,
   savedByNewerVersion,
   logFingerprint,
+  isProtectedData,
+  PROTECTED_MARKER,
 };

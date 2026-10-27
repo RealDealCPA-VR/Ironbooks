@@ -13,6 +13,8 @@ import { assertExclusiveAccess } from '@/lib/services/sessions';
 import { restoreBackup } from '@/lib/services/backup';
 import { ServiceError } from '@/lib/services/_base';
 import { readBackupVersion } from '@/lib/services/backupSchedule';
+import { archiveCredentialsFrom, withArchiveCredentialLimit } from '@/lib/net/archiveCredentials';
+import { originFromHeaders } from '@/lib/net/requestInfo';
 
 export async function POST(req: NextRequest) {
   return withDamagedFileAccess(async () => {
@@ -25,7 +27,12 @@ export async function POST(req: NextRequest) {
       if (typeof body.id !== 'string' || !body.id) {
         throw new ServiceError('VALIDATION', 'Choose a backup to restore.');
       }
-      const result = await restoreBackup(readBackupVersion(body.id));
+      const buffer = readBackupVersion(body.id);
+      // A version protected with another key (made before a restore brought one in): credentials in headers.
+      const credentials = archiveCredentialsFrom(req.headers);
+      const result = await withArchiveCredentialLimit(credentials, originFromHeaders(req.headers).addr, () =>
+        restoreBackup(buffer, undefined, { credentials }),
+      );
       return NextResponse.json(result);
     } catch (err) {
       return routeError(err, 'backups/restore');

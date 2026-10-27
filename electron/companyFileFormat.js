@@ -64,13 +64,15 @@ const SEALED_PREFIX = 'sealed/';
 /**
  * Paths in the working folder that never go into the company file: the working copy's own open
  * lock and clock probes (lib/db/dirLock.ts), this computer's session-signing key (lib/auth.ts —
- * every computer makes its own), a sandbox marker, PostgreSQL's per-run scratch files, and
- * leftovers of an earlier save.
+ * every computer makes its own), a sandbox marker, the "this folder is protected" marker (the
+ * database's own protection record is what counts; lib/services/fileProtection.ts writes the
+ * marker wherever the books are decrypted), PostgreSQL's per-run scratch files, and leftovers of
+ * an earlier save.
  */
 function isExcludedPath(rel) {
   const p = rel.replace(/\\/g, '/');
   const base = p.split('/').pop() || '';
-  if (p === 'ironbooks.lock' || p === '.auth-secret' || p === '.ironbooks-sandbox.json' || p === 'postmaster.pid') {
+  if (p === 'ironbooks.lock' || p === '.auth-secret' || p === '.ironbooks-sandbox.json' || p === '.ironbooks-protected' || p === 'postmaster.pid') {
     return true;
   }
   if (base.startsWith('.ironbooks-clock-')) return true;

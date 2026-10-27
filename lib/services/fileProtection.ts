@@ -38,7 +38,7 @@ import { and, eq } from 'drizzle-orm';
 import fileCrypto from '@/electron/fileCrypto';
 import format from '@/electron/companyFileFormat';
 import session from '@/electron/companySession';
-import { getDb, resolveDataDir, type DB } from '@/lib/db';
+import { getDb, resolveDataDir, withDamagedFileAccess, type DB } from '@/lib/db';
 import { markUnsealed, sealedDataDir, sealedMode } from '@/lib/db/sealed';
 import { companies, fileKeySlots, fileProtection, userCompanies, users } from '@/lib/db/schema';
 import { verifyPassword } from '@/lib/auth';
@@ -421,76 +421,129 @@ export function companyFileForProtection(): string | null {
 
 async function makeRecoverySlot(db: DB, key: Buffer): Promise<string> {
   const recoveryKey = fileCrypto.generateRecoveryKey();
-  const slot = await fileCrypto.makeSlot({ kind: 'recovery', secret: fileCrypto.normalizeRecoveryKey(recoveryKey), fileKey: key });
+  const slot = await fileCrypto.makeSlot({ kind: 'recovery', secret: fileCrypto.normalizeRecoveryKey(recoveryKey) as string, fileKey: key });
   await upsertSlot(db, { kind: 'recovery', userId: null, secretRef: null, slot });
   await db.update(fileProtection).set({ recoveryCreatedAt: new Date() }).where(eq(fileProtection.id, 1));
   return recoveryKey;
 }
 
+/** A new file key for protecting the open company file, held in this server's memory from now on. */
+export interface PendingProtection {
+  key: Buffer;
+  keyCheck: string;
+  lookupSalt: string;
+  dataDir: string;
+}
+
+const ONLY_SINGLE_FILE_MESSAGE =
+  'Only a single company file (.ironbooks) can be protected with passwords. Save it as a single company file first (File > Save as a Single Company File).';
+
+/** Start protecting the open company file: a fresh random file key (never written anywhere). */
+export function newFileProtection(dataDir: string = resolveDataDir()): PendingProtection {
+  if (!companyFileForProtection()) throw new ServiceError('VALIDATION', ONLY_SINGLE_FILE_MESSAGE);
+  const key = fileCrypto.generateFileKey();
+  rememberFileKey(dataDir, key);
+  return { key, keyCheck: fileCrypto.keyCheckOf(key), lookupSalt: fileCrypto.newLookupSalt(), dataDir };
+}
+
+/** The protection was never written (its transaction failed): forget its key again. */
+export function abandonFileProtection(p: PendingProtection): void {
+  const held = keyState().keys.get(dirKey(p.dataDir));
+  if (held && held.equals(p.key)) keyState().keys.delete(dirKey(p.dataDir));
+}
+
+/**
+ * Write the protection of the company file inside the caller's transaction: the protection row,
+ * the user's password slot (and challenge slot when the answer is given) and the recovery slot.
+ * Returns the recovery key — ONCE, to be shown, printed or saved; it is never stored readable.
+ * Called in the same transaction as a new file's first Admin (app/api/auth/signup), so no save
+ * can ever hold that Admin without the protection that seals it.
+ */
+export async function writeFileProtection(
+  tx: DB,
+  p: PendingProtection,
+  input: { userId: string; password: string; challenge?: { question: string; answer: string } | null },
+): Promise<string> {
+  await tx.insert(fileProtection).values({ id: 1, keyCheck: p.keyCheck, lookupSalt: p.lookupSalt, protectedBy: input.userId });
+  const [u] = await tx.select({ email: users.email, hash: users.passwordHash, answerHash: users.challengeAnswerHash }).from(users).where(eq(users.id, input.userId));
+  if (!u) throw new ServiceError('NOT_FOUND', 'User not found.');
+  const tag = fileCrypto.lookupTag(p.lookupSalt, u.email);
+  await upsertSlot(tx, {
+    kind: 'password',
+    userId: input.userId,
+    tag,
+    secretRef: secretRef(u.hash),
+    slot: await fileCrypto.makeSlot({ kind: 'password', secret: input.password, fileKey: p.key, tag }),
+  });
+  if (input.challenge && u.answerHash) {
+    await upsertSlot(tx, {
+      kind: 'challenge',
+      userId: input.userId,
+      tag,
+      question: input.challenge.question,
+      secretRef: secretRef(u.answerHash),
+      slot: await fileCrypto.makeSlot({ kind: 'challenge', secret: normalizeChallengeAnswer(input.challenge.answer), fileKey: p.key, tag, question: input.challenge.question }),
+    });
+  }
+  const recoveryKey = await makeRecoverySlot(tx, p.key);
+  await logTransaction(tx, {
+    userId: input.userId,
+    action: 'update',
+    entityType: 'company_file',
+    entityId: null,
+    summary: 'Protected the company file with passwords (encrypted)',
+    data: { new: { protected: true } }, // never a key or a password
+  });
+  return recoveryKey;
+}
+
+/** After the protection's transaction committed: the folder's marker and the slot set for saves. */
+export async function fileProtectionWritten(db: DB, p: PendingProtection): Promise<void> {
+  writeMarker(p.dataDir, p.keyCheck);
+  await sealProtectionFor(db, p.dataDir).catch(() => null);
+}
+
 /**
  * Protect the company file with passwords: a new file key, the caller's password slot (and their
  * challenge slot when the answer is given), a recovery key (returned ONCE — shown to be printed or
- * saved) and the protection row. The next save writes the file encrypted. Other users get their
- * slot the next time they sign in while the file is open, or when an Admin sets their password.
+ * saved) and the protection row. The next save writes the file encrypted (the change moves the
+ * transaction log, so the autosave writes it within seconds). Other users get their slot the next
+ * time they sign in while the file is open, or when an Admin sets their password.
  */
 export async function protectCompanyFile(
   db: DB,
   input: { userId: string; password: string; challenge?: { question: string; answer: string } | null },
 ): Promise<{ recoveryKey: string }> {
-  if (!companyFileForProtection()) {
-    throw new ServiceError(
-      'VALIDATION',
-      'Only a single company file (.ironbooks) can be protected with passwords. Save it as a single company file first (File > Save as a Single Company File).',
-    );
-  }
+  if (!companyFileForProtection()) throw new ServiceError('VALIDATION', ONLY_SINGLE_FILE_MESSAGE);
   if (await readProtection(db)) throw new ServiceError('CONFLICT', 'This company file is already protected with passwords.');
-  const dataDir = resolveDataDir();
-  const key = fileCrypto.generateFileKey();
-  const keyCheck = fileCrypto.keyCheckOf(key);
-  const lookupSalt = fileCrypto.newLookupSalt();
-  rememberFileKey(dataDir, key);
+  const p = newFileProtection();
   let recoveryKey = '';
   try {
     await db.transaction(async (txRaw) => {
-      const tx = txRaw as unknown as DB;
-      await tx.insert(fileProtection).values({ id: 1, keyCheck, lookupSalt, protectedBy: input.userId });
-      const [u] = await tx.select({ email: users.email, hash: users.passwordHash, answerHash: users.challengeAnswerHash }).from(users).where(eq(users.id, input.userId));
-      if (!u) throw new ServiceError('NOT_FOUND', 'User not found.');
-      const tag = fileCrypto.lookupTag(lookupSalt, u.email);
-      await upsertSlot(tx, {
-        kind: 'password',
-        userId: input.userId,
-        tag,
-        secretRef: secretRef(u.hash),
-        slot: await fileCrypto.makeSlot({ kind: 'password', secret: input.password, fileKey: key, tag }),
-      });
-      if (input.challenge && u.answerHash) {
-        await upsertSlot(tx, {
-          kind: 'challenge',
-          userId: input.userId,
-          tag,
-          question: input.challenge.question,
-          secretRef: secretRef(u.answerHash),
-          slot: await fileCrypto.makeSlot({ kind: 'challenge', secret: normalizeChallengeAnswer(input.challenge.answer), fileKey: key, tag, question: input.challenge.question }),
-        });
-      }
-      recoveryKey = await makeRecoverySlot(tx, key);
-      await logTransaction(tx, {
-        userId: input.userId,
-        action: 'update',
-        entityType: 'company_file',
-        entityId: null,
-        summary: 'Protected the company file with passwords (encrypted)',
-        data: { new: { protected: true } }, // never a key or a password
-      });
+      recoveryKey = await writeFileProtection(txRaw as unknown as DB, p, input);
     });
   } catch (err) {
-    keyState().keys.delete(dirKey(dataDir));
+    abandonFileProtection(p);
     throw err;
   }
-  writeMarker(dataDir, keyCheck);
-  await sealProtectionFor(db, dataDir).catch(() => null);
+  await fileProtectionWritten(db, p);
   return { recoveryKey };
+}
+
+/**
+ * What a backup or copy of the company folder `dataDir` is sealed with (lib/services/backup.ts and
+ * friends): its protection, or null for a file without passwords. Throws for a protected folder
+ * whose key is not known here (never written in plain text).
+ */
+export async function protectionForDir(dataDir?: string): Promise<SealProtection | null> {
+  const dir = resolveDataDir(dataDir);
+  // No database there (nothing to back up yet): never create one just to ask.
+  if (!fs.existsSync(path.join(dir, 'PG_VERSION'))) {
+    if (isMarkedProtected(dir)) throw new ServiceError('FORBIDDEN', KEY_MISSING_MESSAGE, { fileKeyMissing: true });
+    return null;
+  }
+  const db = await withDamagedFileAccess(() => getDb(dir));
+  return sealProtectionFor(db, dir);
 }
 
 /** Company > Security: Protect this company file (an Admin of every company, with their password). */

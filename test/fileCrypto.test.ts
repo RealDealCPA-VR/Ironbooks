@@ -204,7 +204,7 @@ describe('sealed company file', () => {
   it('a tampered key slot does not open (and a slot from another file is refused by the key check)', async () => {
     const prot = await protectionFor({ mary: 'pw-12345678' });
     const slot = prot.slots[0];
-    const flipped = { ...slot, wrapped: Buffer.from(slot.wrapped, 'base64url').map((b: number, i: number) => (i === 3 ? b ^ 1 : b)).toString('base64url') };
+    const flipped = { ...slot, wrapped: Buffer.from(Buffer.from(slot.wrapped, 'base64url').map((b: number, i: number) => (i === 3 ? b ^ 1 : b))).toString('base64url') };
     expect(await crypto.openSlot(flipped, 'pw-12345678')).toBeNull();
     expect(await crypto.openSlot({ ...slot, kind: 'recovery' }, 'pw-12345678')).toBeNull(); // kind is authenticated
     expect(await crypto.openSlot({ ...slot, salt: crypto.newLookupSalt() }, 'pw-12345678')).toBeNull();

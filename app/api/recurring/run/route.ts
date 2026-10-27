@@ -9,7 +9,7 @@ import { timingSafeEqual } from 'node:crypto';
 import { NextRequest, NextResponse } from 'next/server';
 import { asc } from 'drizzle-orm';
 import { getServerContext, isArchivedCompany } from '@/lib/context';
-import { getDb } from '@/lib/db';
+import { getDb, sealedMode } from '@/lib/db';
 import { companies } from '@/lib/db/schema';
 import { runDue, runGroup, runTemplateNow, todayUtcMidnight } from '@/lib/services/recurring';
 import { ServiceError, type ServiceContext } from '@/lib/services/_base';
@@ -31,6 +31,9 @@ async function internalContexts(req: NextRequest): Promise<ServiceContext[] | nu
   const a = Buffer.from(header);
   const b = Buffer.from(token);
   if (a.length !== b.length || !timingSafeEqual(a, b)) return null;
+  // A protected company file nobody has signed in to yet (lib/db/sealed.ts): its books are not
+  // open, so there is nothing to run yet — the timer runs again after the sign-in.
+  if (sealedMode()) return [];
   const db = await getDb();
   const rows = await db
     .select({ id: companies.id, ownerId: companies.ownerId, settings: companies.settings })

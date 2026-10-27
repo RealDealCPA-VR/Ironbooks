@@ -102,7 +102,12 @@ function normalizeLogin(login) {
   return String(login || '').trim().toLowerCase();
 }
 
-/** The lookup tag of a user name: which slots are that user's, without naming them. */
+/**
+ * The lookup tag of a user name: which slots are that user's, without naming them.
+ * @param {string | null | undefined} lookupSalt
+ * @param {string | null | undefined} login
+ * @returns {string}
+ */
 function lookupTag(lookupSalt, login) {
   const salt = unb64(lookupSalt) || Buffer.alloc(0);
   return crypto.createHmac('sha256', salt).update(`login\n${normalizeLogin(login)}`).digest('base64url').slice(0, 22);
@@ -120,6 +125,8 @@ function keyCheckOf(fileKey) {
  * Wrap `fileKey` into a new slot for `secret` (a password, a normalized challenge answer, or a
  * normalized recovery key). `tag` (lookupTag) names whose slot it is; `question` is shown before
  * the challenge answer is asked (it comes from a fixed list, lib/challengeQuestions.ts).
+ * @param {{ kind: string, secret: string, fileKey: Buffer, tag?: string | null, question?: string | null, kdf?: { name: string, N: number, r: number, p: number } }} opts
+ * @returns {Promise<Record<string, any>>}
  */
 async function makeSlot({ kind, secret, fileKey, tag = null, question = null, kdf = currentKdf() }) {
   if (!SLOT_KINDS.has(kind)) throw new Error(`unknown key slot kind ${kind}`);
@@ -158,6 +165,9 @@ function wellFormedSlot(slot) {
 /**
  * Unwrap a slot with `secret`: the file key, or null when the secret is wrong or the slot was
  * tampered with (the GCM tag covers the key, the kind and the salt).
+ * @param {any} slot
+ * @param {string | null | undefined} secret
+ * @returns {Promise<Buffer | null>}
  */
 async function openSlot(slot, secret) {
   if (!wellFormedSlot(slot) || typeof secret !== 'string' || !secret) return null;
@@ -182,6 +192,9 @@ async function openSlot(slot, secret) {
 /**
  * Spend exactly what opening a slot costs, for a user name that has none: a wrong user name and
  * a wrong password take the same time (no way to find out which user names exist).
+ * @param {unknown} secret
+ * @param {{ name: string, N: number, r: number, p: number }} [kdf]
+ * @returns {Promise<null>}
  */
 async function burnKdf(secret, kdf = currentKdf()) {
   try {
@@ -192,7 +205,13 @@ async function burnKdf(secret, kdf = currentKdf()) {
   return null;
 }
 
-/** The slots of `encryption` (a manifest's block) for one kind and, for user slots, one tag. */
+/**
+ * The slots of `encryption` (a manifest's block) for one kind and, for user slots, one tag.
+ * @param {any} encryption
+ * @param {string} kind
+ * @param {string | null} [tag]
+ * @returns {Array<Record<string, any>>}
+ */
 function findSlots(encryption, kind, tag = null) {
   const slots = encryption && Array.isArray(encryption.slots) ? encryption.slots : [];
   return slots.filter((s) => s && s.kind === kind && (kind === 'recovery' || (tag && s.tag === tag)));
@@ -202,6 +221,9 @@ function findSlots(encryption, kind, tag = null) {
  * Try `secret` on the slots of one kind (and user, by `login`): the file key or null. Always
  * spends at least one derivation, so the answer takes as long whether or not the user exists.
  * A key that does not match the block's keyCheck (a slot pasted in from another file) is refused.
+ * @param {any} encryption
+ * @param {{ kind: string, login?: string | null, secret: string }} opts
+ * @returns {Promise<Buffer | null>}
  */
 async function unlockWith(encryption, { kind, login = null, secret }) {
   const tag = kind === 'recovery' ? null : lookupTag(encryption && encryption.lookupSalt, login || '');

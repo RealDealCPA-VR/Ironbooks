@@ -6,7 +6,7 @@ import { timingSafeEqual } from 'node:crypto';
 import path from 'node:path';
 import type { NextRequest } from 'next/server';
 import { asc } from 'drizzle-orm';
-import { getDb } from '@/lib/db';
+import { getDb, sealedMode } from '@/lib/db';
 import { companies } from '@/lib/db/schema';
 import type { ServiceContext } from '@/lib/services/_base';
 import { reportExportRoot, runDueSchedules, type ScheduleRunResult } from '@/lib/services/memorizedReports';
@@ -33,6 +33,8 @@ function hasInternalToken(req: NextRequest): boolean {
  */
 export async function internalContexts(req: NextRequest): Promise<ServiceContext[] | null> {
   if (!hasInternalToken(req)) return null;
+  // Sealed (a protected file nobody has signed in to yet): nothing is open to run yet.
+  if (sealedMode()) return [];
   const db = await getDb();
   const rows = await db
     .select({ id: companies.id, ownerId: companies.ownerId, settings: companies.settings })

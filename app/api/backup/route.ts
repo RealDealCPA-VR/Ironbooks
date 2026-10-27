@@ -10,6 +10,11 @@
  * user's login — so beyond the route map's File Utilities check in the active company they
  * require the caller to be an active Admin of every company in the file (requireFileAdmin).
  *
+ * PASSWORDS: a protected company file's backup is encrypted like the file (lib/services/backup.ts);
+ * restoring a protected backup made with another key needs a user name + password from the file it
+ * came from, or its recovery key, in the x-ironbooks-* headers (lib/net/archiveCredentials.ts) —
+ * answered 403 with details.credentialsRequired until then.
+ *
  * NOTE (POST): restoreBackup validates the archive, closes the live PGlite
  * handle, swaps the data directory, then re-installs the ledger guards and verifies the
  * restored books; damaged books are refused (400, plain-language reason) and the original file
@@ -25,13 +30,16 @@ import { requireFileAdmin } from '@/lib/services/access';
 import { withDamagedFileAccess } from '@/lib/db';
 import { recordBackup } from '@/lib/services/backupHistory';
 import { currentFingerprint } from '@/lib/services/backupFingerprint';
-import { serviceErrorStatus } from '@/lib/routeErrors';
+import { serviceErrorBody, serviceErrorStatus } from '@/lib/routeErrors';
+import { protectionForDir } from '@/lib/services/fileProtection';
+import { archiveCredentialsFrom, withArchiveCredentialLimit } from '@/lib/net/archiveCredentials';
+import { originFromHeaders } from '@/lib/net/requestInfo';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
     const status =
       serviceErrorStatus(err.code);
-    return NextResponse.json({ error: err.message, code: err.code }, { status });
+    return NextResponse.json(serviceErrorBody(err), { status });
   }
   // Do not leak raw error text (may contain absolute data-dir paths / OS details).
   console.error('[backup] unexpected error:', err);
@@ -71,7 +79,7 @@ async function handleGet(_req: NextRequest) {
     }
 
     const fingerprint = currentFingerprint();
-    const { buffer, filename } = createBackup(companyName);
+    const { buffer, filename } = createBackup(companyName, undefined, { protection: await protectionForDir() });
     // Backup history ("Last backup: …" indicator): a browser download has no path on this machine.
     recordBackup({ source: 'manual', kind: 'full', filename, path: null, sizeBytes: buffer.byteLength, fingerprint, note: 'Downloaded' });
 
@@ -115,7 +123,10 @@ async function handlePost(req: NextRequest) {
     const buffer = Buffer.from(arrayBuffer);
     // Validates the archive, closes the live DB handle, swaps the data dir, re-installs the
     // ledger guards and verifies the books (rolls back and throws VALIDATION if damaged).
-    const result = await restoreBackup(buffer);
+    const credentials = archiveCredentialsFrom(req.headers);
+    const result = await withArchiveCredentialLimit(credentials, originFromHeaders(req.headers).addr, () =>
+      restoreBackup(buffer, undefined, { credentials }),
+    );
 
     return NextResponse.json(result, { status: 200 });
   } catch (err) {

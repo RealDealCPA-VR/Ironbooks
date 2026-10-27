@@ -20,6 +20,7 @@ import { accounts, companies, journalEntries, journalEntryLines } from '@/lib/db
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError, inTransaction } from './_base';
 import { ensurePreOpBackup } from './backup';
+import { protectionForDir } from './fileProtection';
 import { type PostingLine, postJournalEntry } from './posting';
 
 export interface YearEndCloseInput {
@@ -132,7 +133,8 @@ export async function yearEndClose(
   // bad close is recoverable. Best-effort — a backup failure must never block closing
   // (mirrors how restoreBackup treats its pre-op snapshot).
   try {
-    ensurePreOpBackup(ctx, 'year-end-close');
+    // A protected company file's safety copy is encrypted like the file (lib/services/fileProtection.ts).
+    ensurePreOpBackup(ctx, 'year-end-close', undefined, await protectionForDir());
   } catch (err) {
     console.warn('[fiscalClose] pre-op backup before year-end close failed (continuing):', err);
   }

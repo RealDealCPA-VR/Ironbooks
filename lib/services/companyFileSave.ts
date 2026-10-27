@@ -20,6 +20,14 @@
  *
  * The status (saved / saving / unsaved / error / lost) is shown in the app's title bar
  * (components/CompanyFileStatus.tsx via GET /api/company-file/status).
+ *
+ * A company file protected with passwords (lib/services/fileProtection.ts) is written encrypted
+ * with its file key and its current key slots — every save, the "unsaved changes" copy and Save
+ * Copy As alike. A protected file whose key is not known here is never written in plain text: the
+ * save is refused. While the server is still sealed (nobody has signed in yet, lib/db/sealed.ts)
+ * nothing is saved — the database was never opened. After a clean close the plain-text working
+ * copy on this computer is removed (it is kept whenever the company file lacks something, so
+ * crash recovery still works).
  */
 import fs from 'node:fs';
 import os from 'node:os';
@@ -29,9 +37,11 @@ import { sql } from 'drizzle-orm';
 import format from '@/electron/companyFileFormat';
 import lockFormat from '@/electron/companyLock';
 import { closeDb, firstOpenWalPosition, getDb, holdDbOpen, isDbOpen, resolveDataDir, withDamagedFileAccess, type DB } from '@/lib/db';
+import { sealedMode } from '@/lib/db/sealed';
 import { currentFingerprint } from './backupFingerprint';
 import { BACKUP_HISTORY_FILE } from './backupHistory';
 import { isRestoreInProgress, whenRestoreDone } from './restoreState';
+import { KEY_MISSING_MESSAGE, cachedSealProtection, sealProtectionFor, type SealProtection } from './fileProtection';
 import { APP_VERSION } from '@/lib/appVersion';
 
 /** How often the autosave timer looks for changes. */
@@ -69,6 +79,20 @@ export interface SaveResult {
   path?: string;
   bytes?: number;
   durationMs?: number;
+  /** The company file is protected with passwords: this save was written encrypted. */
+  encrypted?: boolean;
+}
+
+/** What closing the company file did (closeCompanyFile). */
+export interface CloseResult extends SaveResult {
+  /**
+   * The working copy holds changes the company file does not have and could not get (nobody
+   * signed in to the protected file, so it was never decrypted here): the shell keeps its lock as
+   * "unsaved" (it goes stale), so whoever opens the file next is warned.
+   */
+  unsavedKept?: boolean;
+  /** The plain-text working copy of a protected file was removed from this computer. */
+  workingCopyRemoved?: boolean;
 }
 
 interface SaveState {
@@ -101,6 +125,8 @@ interface SaveState {
   conflictSaveId: string | null;
   /** The database layout the working copy has (its newest migration), stamped into every save. */
   dbSchema: DbSchemaStamp | null;
+  /** The last write (the company file or its "unsaved changes" copy) was encrypted. */
+  lastSealed: boolean;
   timer: ReturnType<typeof setInterval> | null;
   closed: boolean;
 }
@@ -143,6 +169,7 @@ function state(): SaveState | null {
     conflictCopy: null,
     conflictSaveId: null,
     dbSchema: null,
+    lastSealed: false,
     timer: null,
     closed: false,
   };
@@ -290,6 +317,8 @@ function readOwner(lockDir: string): { token?: string; computer?: string; appUse
 }
 
 function friendlyIoError(err: unknown, file: string): string {
+  // A protected file whose key is not known here (lib/services/fileProtection.ts): never saved in plain text.
+  if ((err as { details?: { fileKeyMissing?: boolean } })?.details?.fileKeyMissing) return `${KEY_MISSING_MESSAGE} Your changes are kept on this computer.`;
   const code = (err as NodeJS.ErrnoException)?.code;
   const where = path.dirname(file);
   if (code === 'ENOENT' || code === 'ENOTDIR') return `Ironbooks can't reach ${where}. Check the network connection to the file server; your changes are kept on this computer and will be saved as soon as it is back.`;
@@ -323,9 +352,26 @@ export async function saveCompanyFile(opts: { force?: boolean; final?: boolean; 
   }
 }
 
+/**
+ * What a save of the working copy is sealed with: the file key and the current key slots of a
+ * protected company file, or null for a file without passwords. Read from the open database; a
+ * closed one (the close-time save after the database was closed, a sandbox) uses the slots of the
+ * last save. Throws (FORBIDDEN, fileKeyMissing) for a protected file whose key is not known here.
+ */
+async function saveProtection(s: SaveState): Promise<SealProtection | null> {
+  if (workingCopyActive(s) && isDbOpen(s.dataDir)) {
+    const db = await withDamagedFileAccess(() => getDb(s.dataDir));
+    return sealProtectionFor(db, s.dataDir);
+  }
+  return cachedSealProtection(s.dataDir);
+}
+
 async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }): Promise<SaveResult> {
   const dataDir = s.dataDir;
   const started = Date.now();
+  // A protected file nobody has signed in to yet (lib/db/sealed.ts): the database was never opened
+  // in this server, so nothing it holds came from this session — and there is no key to write it.
+  if (sealedMode()) return { saved: false, outcome: 'unchanged' };
   // A restore is replacing the working copy (its books are swapped in before they are verified,
   // and rolled back if they fail): nothing is saved out of it until the restore has finished.
   // The close-time save (quit, Close Company, handing the file over) waits for it.
@@ -419,6 +465,9 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
     // The layout this save holds (an older Ironbooks refuses a newer one): measured while the
     // working copy is open, else the one last measured, else what the file said when it was opened.
     s.dbSchema = (await currentDbSchema(s)) ?? s.dbSchema ?? onDisk?.dbSchema ?? null;
+    // Read AFTER the snapshot: protection is only ever added, so a snapshot that holds anything
+    // written together with it (a new file's first Admin) is always sealed.
+    const protection = await saveProtection(s);
     const result = await format.writeCompanyFile(target, {
       manifest: {
         formatVersion: format.COMPANY_FILE_FORMAT_VERSION,
@@ -445,7 +494,9 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
       },
       entries,
       cache: s.cache,
+      protection,
     });
+    s.lastSealed = Boolean(protection);
 
     if (conflict) {
       s.conflictCopy = target;
@@ -471,7 +522,7 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
         conflictFingerprint: fingerprint,
         ...(opts.final ? { closedCleanly: true, lastUsedAt: savedAt } : {}),
       });
-      return { saved: true, outcome: 'conflict', path: target, bytes: result.bytes, durationMs: s.lastSaveMs };
+      return { saved: true, outcome: 'conflict', path: target, bytes: result.bytes, durationMs: s.lastSaveMs, encrypted: Boolean(protection) };
     }
 
     s.savedFingerprint = fingerprint;
@@ -494,7 +545,7 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
       companyName,
       ...(opts.final ? { closedCleanly: true, lastUsedAt: savedAt } : {}),
     });
-    return { saved: true, outcome: 'saved', path: s.file, bytes: result.bytes, durationMs: s.lastSaveMs };
+    return { saved: true, outcome: 'saved', path: s.file, bytes: result.bytes, durationMs: s.lastSaveMs, encrypted: Boolean(protection) };
   } catch (err) {
     s.lastSaveEndedAt = Date.now();
     noteUnsaved(s, Date.now(), true);
@@ -560,6 +611,9 @@ function conflictCopyPath(file: string): string {
 export async function autosaveTick(now = Date.now()): Promise<'idle' | 'waiting' | 'saved' | 'failed' | 'busy'> {
   const s = state();
   if (!s || s.closed) return 'idle';
+  // Sealed (nobody signed in to the protected file yet): the working copy is not this session's
+  // to judge — it may not even exist yet — so nothing is marked unsaved and nothing is saved.
+  if (sealedMode()) return 'idle';
   if (s.inflight) return 'busy';
   // A restore is replacing the working copy: its books are verified only after they are swapped
   // in (and rolled back if they fail), so nothing is saved until it has finished.
@@ -619,12 +673,19 @@ export function ensureAutosave(): void {
  * it closed (this server is about to stop). On failure the file stays open and usable so the
  * person can retry or keep working; the error says what happened.
  */
-export async function closeCompanyFile(): Promise<SaveResult> {
+export async function closeCompanyFile(): Promise<CloseResult> {
   const s = state();
   if (!s) return { saved: false, outcome: 'not-single-file' };
   if (s.timer) {
     clearInterval(s.timer);
     s.timer = null;
+  }
+  if (sealedMode()) {
+    // Nobody signed in to the protected file: its database was never opened here, so this session
+    // changed nothing. Unsaved work recovered from an earlier session stays recorded as unsaved
+    // (it is saved the next time someone signs in here).
+    s.closed = true;
+    return { saved: false, outcome: 'unchanged', unsavedKept: Boolean(readWorkingState(s.statePath)?.unsavedSince) };
   }
   let result: SaveResult;
   try {
@@ -638,7 +699,8 @@ export async function closeCompanyFile(): Promise<SaveResult> {
   const active = resolveDataDir();
   const lsnAtSave = baselineLsn(s);
   const lsnNow = await currentLsn(s);
-  holdDbOpen(dir); // never reopened by a late request: this server is about to stop
+  // Never reopened by a late request: this server is about to stop.
+  const releaseHold = holdDbOpen(dir);
   try {
     await closeDb(dir);
     // A sandbox copy the server switched to is closed cleanly too.
@@ -646,11 +708,70 @@ export async function closeCompanyFile(): Promise<SaveResult> {
   } catch (err) {
     console.warn('[company-file] closing the database failed:', (err as Error).message);
   }
-  // Something committed between the snapshot and the close: it is only in the working copy.
+  // Something committed while the final save was writing the file (a teammate on the network, the
+  // open window): it is only in the working copy. The database is closed now — nothing can write
+  // any more — so one more save puts all of it into the company file. It is recorded as unsaved
+  // first: if that save fails, the next open here still keeps it.
   if (lsnNow && lsnAtSave && lsnNow !== lsnAtSave) {
-    writeWorkingState(s, { unsavedSince: new Date().toISOString(), closedCleanly: false });
+    noteUnsaved(s, Date.now(), true);
+    writeWorkingState(s, { closedCleanly: false });
+    try {
+      result = await saveCompanyFile({ final: true, force: true });
+    } catch (err) {
+      // Keep the file usable (Try Again / Keep Working in the shell): the database may reopen.
+      s.closed = false;
+      releaseHold();
+      ensureAutosave();
+      throw err;
+    }
   }
-  return result;
+  return finishClose(s, result);
+}
+
+/**
+ * After the final save: a working copy the company file now holds completely is marked closed
+ * cleanly, and — for a protected file — its plain-text books are removed from this computer
+ * (the company file is the only copy, encrypted). Kept whenever anything may be missing from the
+ * company file, so crash recovery still works.
+ */
+function finishClose(s: SaveState, result: SaveResult): CloseResult {
+  const complete = (result.outcome === 'saved' || result.outcome === 'unchanged' || result.outcome === 'conflict') && s.unsavedSince === null && s.status !== 'lost';
+  if (!complete) return result;
+  if (result.outcome === 'unchanged') writeWorkingState(s, { closedCleanly: true, lastUsedAt: new Date().toISOString() });
+  // Only after an encrypted write (the file is protected) — a file without passwords keeps its
+  // working copy, which makes the next open on this computer quick.
+  const sealed = result.outcome === 'unchanged' ? s.lastSealed || isProtectedWorkingCopy(s) : Boolean(result.encrypted);
+  if (!sealed) return result;
+  return { ...result, workingCopyRemoved: removeWorkingData(s, result.outcome === 'conflict') };
+}
+
+/** The working copy says it belongs to a protected file (lib/services/fileProtection.ts marker). */
+function isProtectedWorkingCopy(s: SaveState): boolean {
+  return fs.existsSync(path.join(s.dataDir, '.ironbooks-protected'));
+}
+
+/**
+ * Remove the plain-text books of a closed working copy: only when its state says the last save
+ * holds everything and names the company file's current save (or, after a conflict, the
+ * "unsaved changes" copy holds everything).
+ */
+function removeWorkingData(s: SaveState, afterConflict: boolean): boolean {
+  const ws = readWorkingState(s.statePath);
+  if (!ws || ws.unsavedSince || ws.closedCleanly !== true) return false;
+  if (!afterConflict) {
+    const onDisk = format.readCompanyManifest(s.file) as { saveId?: string } | null;
+    if (!onDisk || !ws.base?.saveId || onDisk.saveId !== ws.base.saveId) return false;
+  }
+  try {
+    fs.rmSync(s.dataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    writeWorkingState(s, { dataRemovedAt: new Date().toISOString(), dataRemovePending: null });
+    return true;
+  } catch (err) {
+    // Still in use for a moment (antivirus): the shell removes it the next time it starts.
+    console.warn('[company-file] could not remove the working copy yet:', (err as Error).message);
+    writeWorkingState(s, { dataRemovePending: true });
+    return false;
+  }
 }
 
 /** Status for the title bar and the Company File page. */
@@ -681,7 +802,7 @@ export function getCompanyFileSaveStatus(): CompanyFileSaveStatus {
 export async function saveCopyAs(
   target: string,
   opts: { companyName?: string | null; keepBackupHistory?: boolean } = {},
-): Promise<{ path: string; bytes: number }> {
+): Promise<{ path: string; bytes: number; encrypted: boolean }> {
   const dataDir = resolveDataDir();
   const abs = path.resolve(target);
   if (!abs.toLowerCase().endsWith(format.COMPANY_FILE_EXT)) {
@@ -709,6 +830,9 @@ export async function saveCopyAs(
       /* the snapshot is consistent without it */
     }
   }
+  // A copy of a protected file is protected the same way: the same file key and key slots, so the
+  // same user names and passwords (and the recovery key) open it. Never written in plain text.
+  const protection = isDbOpen() ? await sealProtectionFor(await withDamagedFileAccess(() => getDb()), dataDir) : cachedSealProtection(dataDir);
   while (isRestoreInProgress(dataDir)) await whenRestoreDone(dataDir);
   // The copy is its own company file: a new identity inside (sessions bind to it) and out.
   const fileId = randomUUID();
@@ -737,8 +861,9 @@ export async function saveCopyAs(
     },
     backupManifest: { app: 'bookkeeper-ai', formatVersion: 1, kind: 'full', companyName, createdAt: now, appVersion: APP_VERSION },
     entries,
+    protection,
   });
-  return { path: abs, bytes: result.bytes };
+  return { path: abs, bytes: result.bytes, encrypted: Boolean(protection) };
 }
 
 function withoutBackupHistory<T extends { name: string }>(entries: T[]): T[] {

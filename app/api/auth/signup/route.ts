@@ -37,7 +37,13 @@ import { logTransaction } from '@/lib/services/transactionLog';
 import { startSession } from '@/lib/services/sessions';
 import { cookieSecure, originFromHeaders } from '@/lib/net/requestInfo';
 import { MIN_CHALLENGE_ANSWER, isKnownChallengeQuestion, normalizeChallengeAnswer } from '@/lib/challengeQuestions';
-import { companyFileForProtection, protectCompanyFile } from '@/lib/services/fileProtection';
+import {
+  abandonFileProtection,
+  companyFileForProtection,
+  fileProtectionWritten,
+  newFileProtection,
+  writeFileProtection,
+} from '@/lib/services/fileProtection';
 
 /** users.name / users.email / companies.name are varchar(255). */
 const MAX_TEXT = 255;
@@ -143,6 +149,11 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: passwordProblemMessage(problems), code: 'VALIDATION' }, { status: 400 });
   }
 
+  // filecrypto: a new single company file is protected from its first save (default on). The file
+  // key is made now and the protection is written in the SAME transaction as the Admin, so no
+  // save can ever hold the Admin and the company without the protection that encrypts them.
+  const pending = companyFileForProtection() && body.protect !== false ? newFileProtection() : null;
+  let recoveryKey: string | null = null;
   let created: { user: typeof users.$inferSelect; companyId: string; sessionId: string };
   try {
     // One transaction, serialised by an advisory lock: the "no real user yet" check, the Admin,
@@ -187,6 +198,13 @@ export async function POST(req: NextRequest) {
         ownerId: user.id,
         settings: { ...NEW_COMPANY_SETTINGS },
       });
+      if (pending) {
+        recoveryKey = await writeFileProtection(tx, pending, {
+          userId: user.id,
+          password,
+          challenge: wantsChallenge ? { question: challengeQuestion, answer: challengeAnswer } : null,
+        });
+      }
       // startSession nests (a savepoint) inside this transaction.
       const session = await startSession(tx, {
         userId: user.id,
@@ -199,6 +217,7 @@ export async function POST(req: NextRequest) {
     });
     created = result;
   } catch (err) {
+    if (pending) abandonFileProtection(pending);
     if (err instanceof ServiceError && err.code === 'FORBIDDEN') {
       return NextResponse.json({ error: err.message, code: 'FORBIDDEN' }, { status: 403 });
     }
@@ -206,29 +225,16 @@ export async function POST(req: NextRequest) {
   }
 
   const { user, companyId, sessionId } = created;
-  // filecrypto: protected from the first save (default on for a new single company file).
-  let recoveryKey: string | null = null;
-  let protectionError: string | null = null;
-  if (companyFileForProtection() && body.protect !== false) {
-    try {
-      ({ recoveryKey } = await protectCompanyFile(db, {
-        userId: user.id,
-        password,
-        challenge: wantsChallenge ? { question: challengeQuestion, answer: challengeAnswer } : null,
-      }));
-    } catch (err) {
-      console.error('[signup] could not protect the new company file:', (err as Error).message);
-      protectionError = 'The company file could not be protected with passwords yet. Turn it on in Company > Security.';
-    }
-  }
+  if (pending) await fileProtectionWritten(db, pending);
   const res = NextResponse.json(
     {
       id: user.id,
       name: user.name,
       email: user.email,
       companyId,
+      // Shown ONCE by the setup screen (print it or save it to a file): the only way back in if
+      // every password is lost.
       ...(recoveryKey ? { protected: true, recoveryKey } : {}),
-      ...(protectionError ? { protectionError } : {}),
     },
     { status: 201 },
   );
