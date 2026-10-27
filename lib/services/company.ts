@@ -59,11 +59,23 @@ export const DEFAULT_COA: AccountSeed[] = [
  */
 const SECRET_SETTINGS_KEYS = ['closingDatePasswordHash'] as const;
 
-/** A copy of `settings` without the secret keys (closing-date password hash). */
+/**
+ * The per-file sign-in password (lib/services/fileLock.ts) keeps its bcrypt hash in
+ * settings.fileLock.hash. Only whether the file is protected is ever handed out.
+ */
+const FILE_LOCK_KEY = 'fileLock';
+function redactFileLock(v: unknown): unknown {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return v;
+  const fl = v as { enabled?: unknown; hash?: unknown };
+  return { enabled: Boolean(fl.enabled && fl.hash) };
+}
+
+/** A copy of `settings` without the secret keys (closing-date and file password hashes). */
 export function redactCompanySettings<T>(settings: T): T {
   if (!settings || typeof settings !== 'object' || Array.isArray(settings)) return settings;
   const out = { ...(settings as Record<string, unknown>) };
   for (const k of SECRET_SETTINGS_KEYS) delete out[k];
+  if (FILE_LOCK_KEY in out) out[FILE_LOCK_KEY] = redactFileLock(out[FILE_LOCK_KEY]);
   return out as T;
 }
 
@@ -80,7 +92,7 @@ export function redactSecretsDeep<T>(value: T, depth = 0): T {
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
     if ((SECRET_SETTINGS_KEYS as readonly string[]).includes(k)) continue;
-    out[k] = redactSecretsDeep(v, depth + 1);
+    out[k] = k === FILE_LOCK_KEY && v && typeof v === 'object' && !Array.isArray(v) ? redactFileLock(v) : redactSecretsDeep(v, depth + 1);
   }
   return out as T;
 }

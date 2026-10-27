@@ -5,6 +5,9 @@
  *  B. A Preferences save and a Set Closing Date running at the same time never lose each other's
  *     change (both used to read the whole settings object, then write it back).
  *  C. A closing date that is not a real calendar day is refused.
+ *  A3. The per-file sign-in password hash (settings.fileLock.hash) never leaves the server either:
+ *      not in GET /api/company, the company lists, a Preferences save's audit row, or older audit /
+ *      transaction-log rows that carried it.
  */
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import path from 'node:path';
@@ -31,6 +34,7 @@ import { GET as companyGET, PATCH as companyPATCH } from '@/app/api/company/rout
 import { GET as txLogGET } from '@/app/api/transaction-log/route';
 import { writeAudit } from './_base';
 import { getAuditLog } from './auditTrail';
+import { getFileLockStatus, setFilePassword, verifyFilePassword } from './fileLock';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-review5-company');
 let db: DB;
@@ -149,6 +153,61 @@ describe('company settings (review round 5)', () => {
     } finally {
       ctx = saved;
     }
+  });
+
+  it('A3: the file sign-in password hash (settings.fileLock.hash) is not handed out anywhere', async () => {
+    await setFilePassword(db, 'open-sesame');
+    const stored = ((await getCompany(ctx))!.settings as { fileLock?: { hash?: string } }).fileLock?.hash;
+    expect(stored).toMatch(/^\$2[aby]\$/);
+    const leaks = (v: unknown) => JSON.stringify(v ?? null).includes(stored!);
+
+    const res = await companyGET();
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(leaks(body)).toBe(false);
+    // The page may still see that the file is password-protected.
+    expect(body.settings.fileLock).toEqual({ enabled: true });
+    expect(leaks(await listCompanies(db))).toBe(false);
+    expect(leaks(await listCompaniesForUser(db, userId))).toBe(false);
+
+    // A Preferences save: its audit row (Audit Trail, transaction log) has no hash.
+    const saved = await updateCompany(ctx, { settings: { legalName: 'Review Five Holdings LLC' } });
+    expect(leaks(saved)).toBe(false);
+    const [audit] = await db
+      .select()
+      .from(auditLogs)
+      .where(and(eq(auditLogs.companyId, ctx.companyId), eq(auditLogs.entityType, 'company')))
+      .orderBy(desc(auditLogs.createdAt))
+      .limit(1);
+    expect(leaks(audit.oldValues)).toBe(false);
+    expect(leaks(audit.newValues)).toBe(false);
+
+    // Rows an older build wrote with the hash in them are redacted when read.
+    const legacy = { name: 'Review5 Co', settings: { phone: '2', fileLock: { enabled: true, hash: stored } } };
+    await writeAudit(ctx, { action: 'update', entityType: 'company', entityId: ctx.companyId, oldValues: legacy, newValues: legacy });
+    const [row] = await db
+      .select({ id: auditLogs.id })
+      .from(auditLogs)
+      .where(and(eq(auditLogs.companyId, ctx.companyId), eq(auditLogs.entityType, 'company')))
+      .orderBy(desc(auditLogs.createdAt))
+      .limit(1);
+    const detail = await getAuditLog(ctx, row.id);
+    expect(leaks(detail.oldValues)).toBe(false);
+    expect(leaks(detail.newValues)).toBe(false);
+    const outer = ctx;
+    ctx = { ...ctx, role: 'owner' };
+    try {
+      const log = await txLogGET(new NextRequest('http://localhost/api/transaction-log?entityType=company&limit=50'));
+      expect(log.status).toBe(200);
+      expect(leaks((await log.json()).rows)).toBe(false);
+    } finally {
+      ctx = outer;
+    }
+
+    // The file password itself still works.
+    expect((await getFileLockStatus(db)).enabled).toBe(true);
+    expect(await verifyFilePassword(db, 'open-sesame')).toBe(true);
+    expect(await verifyFilePassword(db, 'wrong')).toBe(false);
   });
 
   it('C: a closing date that is not a real day is refused (400), not stored', async () => {
