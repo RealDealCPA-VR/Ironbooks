@@ -31,7 +31,7 @@ import lockFormat from '@/electron/companyLock';
 import { closeDb, firstOpenWalPosition, getDb, holdDbOpen, isDbOpen, resolveDataDir, withDamagedFileAccess, type DB } from '@/lib/db';
 import { currentFingerprint } from './backupFingerprint';
 import { BACKUP_HISTORY_FILE } from './backupHistory';
-import { isRestoreInProgress } from './restoreState';
+import { isRestoreInProgress, whenRestoreDone } from './restoreState';
 import { APP_VERSION } from '@/lib/appVersion';
 
 /** How often the autosave timer looks for changes. */
@@ -326,11 +326,10 @@ export async function saveCompanyFile(opts: { force?: boolean; final?: boolean; 
 async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }): Promise<SaveResult> {
   const dataDir = s.dataDir;
   const started = Date.now();
-  if (!opts.final && isRestoreInProgress(dataDir)) {
-    throw Object.assign(new Error('A backup is being restored into this company file. It is saved as soon as the restore has finished.'), {
-      code: 'RESTORING',
-    });
-  }
+  // A restore is replacing the working copy (its books are swapped in before they are verified,
+  // and rolled back if they fail): nothing is saved out of it until the restore has finished.
+  // The close-time save (quit, Close Company, handing the file over) waits for it.
+  await waitOutRestore(dataDir, opts);
 
   // Still ours? (A computer that slept past the lock's stale time may have lost it.)
   if (s.lockDir && s.lockToken) {
@@ -394,8 +393,13 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
     // the company file on every autosave check).
     const target = conflict ? (reusableConflictCopy(s) ?? conflictCopyPath(s.file)) : s.file;
 
-    // Consistent snapshot: the LSN first, then the files in this same synchronous turn.
-    const lsn = await currentLsn(s);
+    // Consistent snapshot: the LSN first, then the files in this same synchronous turn — never
+    // while a restore that started during this save is replacing them (this save waits for it).
+    let lsn = await currentLsn(s);
+    while (isRestoreInProgress(dataDir)) {
+      await whenRestoreDone(dataDir);
+      lsn = await currentLsn(s);
+    }
     const fingerprint = currentFingerprint(dataDir);
     // A copy kept apart is a separate company file: it never carries this file's backup history
     // (its own rotation would delete this file's backup versions).
@@ -492,6 +496,21 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
     s.status = 'error';
     s.error = friendlyIoError(err, s.file);
     throw err;
+  }
+}
+
+/**
+ * While a restore into `dataDir` runs: the close-time save (`final`) waits for it to finish; any
+ * other save is refused (RESTORING) — the autosave tries again after it, and Save Now says why.
+ */
+async function waitOutRestore(dataDir: string, opts: { final?: boolean }): Promise<void> {
+  while (isRestoreInProgress(dataDir)) {
+    if (!opts.final) {
+      throw Object.assign(new Error('A backup is being restored into this company file. It is saved as soon as the restore has finished.'), {
+        code: 'RESTORING',
+      });
+    }
+    await whenRestoreDone(dataDir);
   }
 }
 
@@ -672,6 +691,9 @@ export async function saveCopyAs(
       { code: 'VALIDATION' },
     );
   }
+  // A restore is replacing the books (swapped in before they are verified, rolled back if they
+  // fail): the copy is made of what the restore leaves, never of books still being checked.
+  await whenRestoreDone(dataDir);
   let dbSchema: DbSchemaStamp | null = null;
   if (isDbOpen()) {
     try {
@@ -682,6 +704,7 @@ export async function saveCopyAs(
       /* the snapshot is consistent without it */
     }
   }
+  while (isRestoreInProgress(dataDir)) await whenRestoreDone(dataDir);
   // The copy is its own company file: a new identity inside (sessions bind to it) and out.
   const fileId = randomUUID();
   // Nor its backup history: the copy's rotation would otherwise delete this file's backup versions.

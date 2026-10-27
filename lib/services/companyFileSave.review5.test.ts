@@ -7,7 +7,7 @@
  *    of throwing the working copy away);
  *  - saves asked for while one is running run one after another, never side by side.
  */
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -16,6 +16,61 @@ import { PGlite } from '@electric-sql/pglite';
 import { getDb, closeDb } from '@/lib/db';
 import { sql } from 'drizzle-orm';
 import { autosaveTick, getCompanyFileSaveStatus, resetCompanyFileSaveState, saveCompanyFile } from './companyFileSave';
+
+/**
+ * A hold on a restore's verification step (restoreBackup -> verifyRestoredBooks -> checkLedgerHealth
+ * with no options; opening a database passes options and is never held): while held, the backup's
+ * books are swapped in but not yet verified. `refuse` makes the verification fail (rolled back).
+ */
+const verifyHold = vi.hoisted(() => ({
+  hold: null as Promise<void> | null,
+  reached: null as (() => void) | null,
+  refuse: false,
+}));
+vi.mock('@/lib/db/ledgerGuards', async (importOriginal) => {
+  const mod = await importOriginal<typeof import('@/lib/db/ledgerGuards')>();
+  return {
+    ...mod,
+    checkLedgerHealth: async (...args: Parameters<typeof mod.checkLedgerHealth>) => {
+      if (args[2] === undefined && verifyHold.hold) {
+        verifyHold.reached?.();
+        await verifyHold.hold;
+        if (verifyHold.refuse) {
+          const real = await mod.checkLedgerHealth(...args);
+          const refused = { detail: 'test: these books are refused' } as (typeof real.problems)[number];
+          return { ...real, ok: false, problems: [...real.problems, refused] };
+        }
+      }
+      return mod.checkLedgerHealth(...args);
+    },
+  };
+});
+
+function within<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(what)), ms);
+  });
+  return Promise.race([p, late]).finally(() => clearTimeout(timer));
+}
+
+/** Hold the next restore between swapping in the backup and verifying it. */
+function holdNextRestore(opts: { refuse?: boolean } = {}) {
+  let release!: () => void;
+  let reached!: () => void;
+  const atVerification = new Promise<void>((r) => (reached = r));
+  verifyHold.hold = new Promise<void>((r) => (release = r));
+  verifyHold.reached = reached;
+  verifyHold.refuse = Boolean(opts.refuse);
+  return {
+    atVerification,
+    release: () => {
+      verifyHold.hold = null;
+      verifyHold.reached = null;
+      release();
+    },
+  };
+}
 
 const require = createRequire(import.meta.url);
 const format = require('../../electron/companyFileFormat.js');
@@ -161,6 +216,7 @@ describe('after someone else saved the company file', () => {
     expect(format.readCompanyManifest(copy).saveId).toBe('edited-elsewhere');
     expect(await rowsIn(r.path!)).toEqual([1, 2, 3]);
   }, 180_000);
+
 });
 
 describe('after another computer took the file over', () => {
@@ -309,6 +365,83 @@ describe('while a backup is being restored into the open company file', () => {
     expect(format.readCompanyManifest(FILE).saveId).toBe(savedBefore);
     // Once restored (and verified), the restored books are saved as usual.
     expect(await autosaveTick(t + 120_000)).toBe('saved');
+  }, 240_000);
+
+  /** A backup of the books as they are now; then a change that is not in it. */
+  async function backupThenChange(id: number) {
+    adoptFileOnDisk();
+    const { createBackup } = await import('./backup');
+    const dataDir = process.env.BKA_DATA_DIR!;
+    const backup = createBackup('Beacon Books', dataDir).buffer;
+    const db = await getDb();
+    await db.execute(sql`insert into save_probe values (${id}, 'not in the backup')`);
+    appendLogRecord(dataDir);
+    return backup;
+  }
+
+  it('closing the company file (quit, Close Company, Hand It Over) waits for the restore: refused books never reach the file', async () => {
+    const backup = await backupThenChange(70);
+    const { restoreBackup } = await import('./backup');
+    const savedBefore = format.readCompanyManifest(FILE).saveId;
+    const held = holdNextRestore({ refuse: true });
+    const restoring = restoreBackup(backup).then(
+      () => 'restored',
+      (err: Error) => err.message,
+    );
+    let closing: Promise<{ outcome: string }> | null = null;
+    try {
+      await within(held.atVerification, 60_000, 'the restore never reached its verification'); // the backup's books are swapped in, not yet verified
+      let closed = false;
+      closing = saveCompanyFile({ final: true }).then((r) => {
+        closed = true;
+        return r;
+      });
+      await new Promise((r) => setTimeout(r, 1500));
+      expect(closed).toBe(false);
+      expect(format.readCompanyManifest(FILE).saveId).toBe(savedBefore);
+      held.release();
+      expect(await restoring).toMatch(/not restored/);
+      expect((await closing).outcome).toBe('saved');
+    } finally {
+      // Never leave the restore (or the save) running into the next test.
+      held.release();
+      await restoring;
+      await closing?.catch(() => undefined);
+    }
+    // The company file holds the books that were kept (the refused backup lacks row 70).
+    expect(await rowsIn(FILE)).toContain(70);
+  }, 240_000);
+
+  it('Save Copy As waits for the restore too', async () => {
+    const backup = await backupThenChange(71);
+    const { restoreBackup } = await import('./backup');
+    const { saveCopyAs } = await import('./companyFileSave');
+    const copy = path.join(SHARE, 'Beacon copy during restore.ironbooks');
+    const held = holdNextRestore({ refuse: true });
+    const restoring = restoreBackup(backup).then(
+      () => 'restored',
+      (err: Error) => err.message,
+    );
+    let copying: Promise<unknown> | null = null;
+    try {
+      await within(held.atVerification, 60_000, 'the restore never reached its verification');
+      let done = false;
+      copying = saveCopyAs(copy).then((r) => {
+        done = true;
+        return r;
+      });
+      await new Promise((r) => setTimeout(r, 1500));
+      expect(done).toBe(false);
+      expect(fs.existsSync(copy)).toBe(false);
+      held.release();
+      expect(await restoring).toMatch(/not restored/);
+      await copying;
+    } finally {
+      held.release();
+      await restoring;
+      await copying?.catch(() => undefined);
+    }
+    expect(await rowsIn(copy)).toContain(71);
   }, 240_000);
 });
 
