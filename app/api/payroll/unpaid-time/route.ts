@@ -10,6 +10,7 @@ import { getServerContext } from '@/lib/context';
 import { unpaidTimeForPayroll } from '@/lib/services/payroll';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus } from '@/lib/routeErrors';
+import { parseDateInput } from '@/lib/validation/helpers';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -34,9 +35,10 @@ export async function GET(req: NextRequest) {
         { status: 400 },
       );
     }
-    const start = new Date(periodStart);
-    const end = new Date(periodEnd);
-    if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+    // Real calendar days only (`new Date('2026-02-30')` rolls over to March 2).
+    const start = parseDateInput(periodStart);
+    const end = parseDateInput(periodEnd);
+    if (!start || !end) {
       return NextResponse.json(
         { error: 'periodStart/periodEnd must be valid dates', code: 'VALIDATION' },
         { status: 400 },

@@ -258,7 +258,9 @@ export default function PayRunsPage() {
 
   function estimatedGross(emp: Employee, row: RowState): Decimal | null {
     if (row.amount) return toDec(row.amount);
-    if (emp.payType === 'hourly' || row.timeEntryIds.length > 0) {
+    // Pulled time sets an HOURLY check's hours; salaried employees get the period's salary
+    // (the server's rule — hours x an annual salary is not a paycheck).
+    if (emp.payType === 'hourly') {
       const hours = row.hours ? toDec(row.hours) : new Decimal(0);
       return hours.times(toDec(emp.payRate));
     }
@@ -496,8 +498,7 @@ export default function PayRunsPage() {
                     const row = rows[emp.id];
                     if (!row) return null;
                     const est = estimatedGross(emp, row);
-                    const hoursEditable =
-                      (emp.payType === 'hourly' || row.timeEntryIds.length > 0) && !row.amount;
+                    const hoursEditable = emp.payType === 'hourly' && !row.amount;
                     return (
                       <Tr key={emp.id} className={row.selected ? undefined : 'opacity-50'}>
                         <Td>

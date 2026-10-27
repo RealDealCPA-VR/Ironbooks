@@ -29,10 +29,14 @@ function errorResponse(err: unknown) {
  * Never send the full SSN to the browser unless the caller's roles grant "view sensitive
  * payroll data" (Users & Roles); everyone else gets the last 4 digits only.
  */
-function maskEmployee<T extends { ssn?: string | null }>(emp: T, showSsn: boolean) {
+function maskEmployee<T extends { ssn?: string | null; portalPasswordHash?: string | null }>(emp: T, showSsn: boolean) {
   const digits = (emp.ssn ?? '').replace(/\D/g, '');
+  // The portal password hash never leaves the server (a bcrypt hash can be cracked offline);
+  // the page only needs to know whether portal access is set up.
+  const { portalPasswordHash, ...rest } = emp;
   return {
-    ...emp,
+    ...rest,
+    hasPortalAccess: Boolean(portalPasswordHash),
     ssn: showSsn ? (emp.ssn ?? null) : undefined,
     ssnLast4: digits.length >= 4 ? digits.slice(-4) : null,
   };

@@ -83,9 +83,9 @@ describe('Mileage service (integration)', () => {
     expect(log.customerName).toBe('Acme Client');
   });
 
-  it('logs miles with default rate (0.67) when ratePerMile omitted', async () => {
+  it('logs miles with the default rate (the IRS 2024 rate, 0.67, for a 2024 trip) when ratePerMile omitted', async () => {
     const log = await logMiles(ctx, {
-      date: new Date('2025-01-20'),
+      date: new Date('2024-01-20'),
       miles: 50,
       purpose: 'Supply run',
     });

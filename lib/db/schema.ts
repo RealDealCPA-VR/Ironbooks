@@ -959,6 +959,12 @@ export const paychecks = pgTable('paychecks', {
   entryType: varchar('entry_type', { length: 30 }).notNull().default('paycheck'),
   memo: text('memo'),
   voidedAt: timestamp('voided_at'),
+  /**
+   * Review round 5 (0068): pay periods per year the withholding was calculated with (52, 26,
+   * 24, 12 ...). Edit Paycheck recalculates with it; NULL (older rows, adjustments) = the
+   * company's payroll pay period preference.
+   */
+  periodsPerYear: integer('periods_per_year'),
   /** wave2 purchases: paycheck queued for Print Checks; number stamped when printed. */
   toPrint: boolean('to_print').notNull().default(false),
   checkNumber: varchar('check_number', { length: 100 }),

@@ -29,6 +29,7 @@ import {
 } from '@/lib/services/payrollReports';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus } from '@/lib/routeErrors';
+import { parseDateInput } from '@/lib/validation/helpers';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -63,15 +64,17 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    // Pay dates are stored as UTC midnight ('YYYY-MM-DD' parses as UTC), so build
-    // the default bounds in UTC too.
+    // Pay dates are stored as UTC midnight ('YYYY-MM-DD' parses as UTC), so the bounds are UTC
+    // midnights of calendar days. Real calendar days only: `new Date('2026-02-30')` silently rolled over to March 2.
+    const fromDate = fromParam ? parseDateInput(fromParam) : null;
+    const toDate = toParam ? parseDateInput(toParam) : null;
+    if ((fromParam && !fromDate) || (toParam && !toDate)) {
+      return NextResponse.json({ error: 'from / to must be real calendar days (YYYY-MM-DD)', code: 'VALIDATION' }, { status: 400 });
+    }
+    // Defaults: Jan 1 .. today of the LOCAL calendar year/day, stored-date style (UTC midnight).
     const now = new Date();
-    const from = fromParam
-      ? new Date(fromParam)
-      : new Date(Date.UTC(now.getUTCFullYear(), 0, 1));
-    const to = toParam
-      ? new Date(toParam)
-      : new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+    const from = fromDate ?? new Date(Date.UTC(now.getFullYear(), 0, 1));
+    const to = toDate ?? new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
 
     // Single-report mode (QB report parity): ?report=earnings-summary | item-detail |
     // transactions-by-payee | workers-comp  (item-detail also takes ?item=<name>).

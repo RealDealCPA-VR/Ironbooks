@@ -10,7 +10,7 @@
  *  - All queries are scoped to ctx.companyId.
  *  - Rate fallback: entry.rate → service item salesPrice → 0.
  */
-import { and, eq, inArray, isNull } from 'drizzle-orm';
+import { and, eq, inArray, isNull, like } from 'drizzle-orm';
 import { Money, toAmountString } from '@/lib/money';
 import { timeEntries, customers, items, employees, jobs } from '@/lib/db/schema';
 import {
@@ -59,6 +59,11 @@ export interface ListTimeEntriesFilter {
   invoiced?: boolean;
 }
 
+/** Today's local calendar day at UTC midnight (the convention every stored document date uses). */
+function todayCalendarDay(now: Date = new Date()): Date {
+  return new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
+}
+
 // ---------------------------------------------------------------------------
 // listTimeEntries
 // ---------------------------------------------------------------------------
@@ -95,9 +100,18 @@ async function assertTimeRefsOwned(
   if (refs.serviceItemId) await assertRefInCompany(ctx, items, refs.serviceItemId, 'Service item');
 }
 
+/** Hours as stored (2 decimals): must be a finite number that is still above zero once rounded. */
+function hoursOf(raw: string | number): ReturnType<typeof Money.of> {
+  const h = Money.of(raw);
+  if (!h.isFinite()) throw validation('Hours must be a number.');
+  // hours is numeric(10,2): 0.004 used to pass the check and be saved as a 0.00-hour entry.
+  const rounded = Money.round2(h);
+  if (rounded.lessThanOrEqualTo(0)) throw validation('Hours must be greater than zero.');
+  return rounded;
+}
+
 export async function createTimeEntry(ctx: ServiceContext, input: TimeEntryInput) {
-  const hours = Money.of(input.hours);
-  if (hours.lessThanOrEqualTo(0)) throw validation('Hours must be greater than zero.');
+  const hours = hoursOf(input.hours);
 
   // Verify customer belongs to company if supplied.
   if (input.customerId) {
@@ -156,9 +170,29 @@ export async function updateTimeEntry(
     throw new ServiceError('CONFLICT', 'Cannot edit a time entry that has already been invoiced.');
   }
 
-  if (update.hours !== undefined) {
-    const h = Money.of(update.hours);
-    if (h.lessThanOrEqualTo(0)) throw validation('Hours must be greater than zero.');
+  if (update.hours !== undefined) hoursOf(update.hours);
+
+  // Time already paid on a paycheck: its hours, day and employee are what the check paid, so they
+  // stay as they are until the paycheck is voided (which releases the entry). The description may
+  // change, but the payroll link travels with it — dropping the tag would let the same hours be
+  // paid a second time.
+  const paidTag = paidPaycheckTag(existing.description);
+  let description = update.description;
+  if (paidTag) {
+    const changed =
+      (update.hours !== undefined && !Money.eq(update.hours, existing.hours)) ||
+      (update.date !== undefined && update.date.getTime() !== existing.date.getTime()) ||
+      (update.employeeId !== undefined && (update.employeeId ?? null) !== existing.employeeId);
+    if (changed) {
+      throw new ServiceError(
+        'CONFLICT',
+        'This time was already paid on a paycheck. Void that paycheck first to change its hours, date or employee.',
+      );
+    }
+    if (description !== undefined) {
+      const text = (description ?? '').replace(PAYROLL_TAG_RE, '').trim();
+      description = text ? `${text} ${paidTag}` : paidTag;
+    }
   }
 
   if (update.customerId !== undefined && update.customerId !== null) {
@@ -179,7 +213,7 @@ export async function updateTimeEntry(
   if (update.hours !== undefined) patch.hours = toAmountString(update.hours);
   if (update.billable !== undefined) patch.billable = update.billable;
   if (update.rate !== undefined) patch.rate = update.rate != null ? toAmountString(update.rate) : null;
-  if (update.description !== undefined) patch.description = update.description;
+  if (description !== undefined) patch.description = description;
 
   const [updated] = await ctx.db
     .update(timeEntries)
@@ -211,6 +245,12 @@ export async function deleteTimeEntry(ctx: ServiceContext, id: string) {
 
   if (existing.invoicedInvoiceId) {
     throw new ServiceError('CONFLICT', 'Cannot delete a time entry that has already been invoiced.');
+  }
+  if (paidPaycheckTag(existing.description)) {
+    throw new ServiceError(
+      'CONFLICT',
+      'This time was already paid on a paycheck. Void that paycheck first, then delete the time.',
+    );
   }
 
   await ctx.db
@@ -296,10 +336,14 @@ export async function billTimeToInvoice(
 
     return {
       itemId: e.serviceItemId ?? null,
-      description: e.description ?? `Time entry — ${e.date.toISOString().slice(0, 10)}`,
+      // The payroll link is internal bookkeeping — it never prints on the customer's invoice.
+      description:
+        (e.description ?? '').replace(PAYROLL_TAG_RE, '').trim() || `Time entry — ${e.date.toISOString().slice(0, 10)}`,
       quantity: e.hours,
       rate: resolvedRate,
       taxable: false as const,
+      // Customer:Job of the time (job costing: the billed time is income of that job).
+      jobId: e.jobId ?? null,
     };
   });
 
@@ -321,7 +365,9 @@ export async function billTimeToInvoice(
   return inTransaction(ctx, async (tx) => {
     const invoice = await createInvoice(tx, {
       customerId,
-      date: new Date(),
+      // Today's calendar day on this computer, stored at UTC midnight like every document date
+      // (`new Date()` is the current instant: in the evening west of UTC it is already tomorrow).
+      date: todayCalendarDay(),
       lines,
     });
     // Re-check "still unbilled" in the UPDATE and count the rows: the entries were read before
@@ -357,6 +403,45 @@ export async function billTimeToInvoice(
  * whose description contains this tag.
  */
 export const PAYROLL_PAID_TAG = '[payroll:';
+
+/** The `[payroll:<paycheckId>]` marker (with the space that precedes it in a description). */
+const PAYROLL_TAG_RE = /\s*\[payroll:[^\]\s]+\]/g;
+
+/** The paycheck marker on a time entry's description, or null when the time is not paid yet. */
+export function paidPaycheckTag(description: string | null | undefined): string | null {
+  const m = /\[payroll:[^\]\s]+\]/.exec(description ?? '');
+  return m ? m[0] : null;
+}
+
+/**
+ * Undo markTimeEntriesPaidInPayroll for a paycheck that is being voided: strip its
+ * `[payroll:<paycheckId>]` tag from every time entry it paid (restoring the description the
+ * entry had before) and audit each release, so the hours show as unpaid again and the corrected
+ * check can pull them. Runs inside the caller's transaction.
+ */
+export async function releaseTimeEntriesFromPaycheck(ctx: ServiceContext, paycheckId: string) {
+  const tag = `${PAYROLL_PAID_TAG}${paycheckId}]`;
+  const rows = await ctx.db
+    .select({ id: timeEntries.id, description: timeEntries.description })
+    .from(timeEntries)
+    .where(and(eq(timeEntries.companyId, ctx.companyId), like(timeEntries.description, `%${tag}%`)));
+  for (const row of rows) {
+    const restored = (row.description ?? '').split(tag).join('').replace(/\s+$/, '').trim();
+    const description = restored === '' ? null : restored;
+    await ctx.db
+      .update(timeEntries)
+      .set({ description })
+      .where(and(eq(timeEntries.companyId, ctx.companyId), eq(timeEntries.id, row.id)));
+    await writeAudit(ctx, {
+      action: 'update',
+      entityType: 'time_entry',
+      entityId: row.id,
+      oldValues: { description: row.description },
+      newValues: { description, releasedFromPaycheckId: paycheckId },
+    });
+  }
+  return rows.length;
+}
 
 /**
  * Mark time entries as consumed by a paycheck. Each entry gets the

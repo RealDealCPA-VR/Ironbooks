@@ -25,6 +25,11 @@ function errorResponse(err: unknown) {
   return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
 }
 
+/** A file name for Content-Disposition: accents dropped, anything else outside [A-Za-z0-9._-] → _. */
+function headerSafeFilename(name: string): string {
+  return name.normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^A-Za-z0-9._-]+/g, '_');
+}
+
 /** Format a Date or timestamp to YYYY-MM-DD. */
 function fmtDate(value: Date | string | null | undefined): string {
   if (!value) return '';
@@ -137,6 +142,7 @@ export async function GET(req: NextRequest) {
       // Sick/vacation balances — rendered only when the employee has an accrual policy.
       accruals: stub.accruals,
       taxableWages: stub.taxableWages,
+      isVoid: stub.isVoid,
     });
 
     // Slice to an owned ArrayBuffer (same pattern as the invoice PDF route).
@@ -146,7 +152,9 @@ export async function GET(req: NextRequest) {
     ) as ArrayBuffer;
 
     const empSlug = `${employee.lastName}-${employee.firstName}`.replace(/\s+/g, '-').toLowerCase();
-    const filename = `paystub-${empSlug}-${fmtDate(paycheck.payDate)}.pdf`;
+    // Header-safe file name: a name like "Nguyễn" or one with quotes is not a valid header value
+    // (the response threw → HTTP 500).
+    const filename = headerSafeFilename(`paystub-${empSlug}-${fmtDate(paycheck.payDate)}.pdf`);
 
     return new NextResponse(arrayBuf, {
       status: 200,
@@ -154,6 +162,8 @@ export async function GET(req: NextRequest) {
         'Content-Type':        'application/pdf',
         'Content-Disposition': `inline; filename="${filename}"`,
         'Content-Length':      String(arrayBuf.byteLength),
+        // Pay data: never cached by the browser.
+        'Cache-Control':       'no-store',
       },
     });
   } catch (err) {

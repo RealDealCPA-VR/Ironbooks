@@ -12,7 +12,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { listMileage, logMiles, mileageSummary } from '@/lib/services/mileage';
 import { ServiceError } from '@/lib/services/_base';
-import { zodErrorBody } from '@/lib/validation/helpers';
+import { queryDate, zodErrorBody } from '@/lib/validation/helpers';
 import { logMilesSchema } from '@/lib/validation/mileage';
 import { serviceErrorStatus } from '@/lib/routeErrors';
 
@@ -31,15 +31,11 @@ export async function GET(req: NextRequest) {
     const { searchParams } = req.nextUrl;
 
     if (searchParams.get('summary') === 'true') {
-      const fromParam = searchParams.get('from');
-      const toParam = searchParams.get('to');
-      const range =
-        fromParam || toParam
-          ? {
-              from: fromParam ? new Date(fromParam) : undefined,
-              to: toParam ? new Date(toParam) : undefined,
-            }
-          : undefined;
+      // queryDate refuses a malformed / impossible date with VALIDATION (400); `new Date('garbage')`
+      // reached the query as an Invalid Date and answered 500.
+      const from = queryDate(searchParams, 'from');
+      const to = queryDate(searchParams, 'to');
+      const range = from || to ? { from, to } : undefined;
       const summary = await mileageSummary(ctx, range);
       return NextResponse.json(summary);
     }
@@ -62,9 +58,12 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
 
+    const now = new Date();
     const log = await logMiles(ctx, {
       ...parsed.data,
-      date: parsed.data.date ?? new Date(),
+      // No date: today's LOCAL calendar day at UTC midnight (the stored-date convention). The
+      // current instant carried a time of day — and the next UTC day in the evening.
+      date: parsed.data.date ?? new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate())),
       billable: parsed.data.billable ?? false,
     });
     return NextResponse.json(log, { status: 201 });

@@ -38,6 +38,7 @@ import {
 } from './payrollTaxTracking';
 import { getCompany } from './company';
 import { payrollLiabilityAccountIds } from './liabilityPayments';
+import { stateInfo } from './statePayrollTax';
 
 // ---------------------------------------------------------------------------
 // Wage bases: the Social Security wage base is YEAR-KEYED data in payrollTax.ts
@@ -294,17 +295,7 @@ export async function w2Data(
   for (const p of yearPaychecks) addCheck(f, p.grossPay, byCheck.get(p.id) ?? []);
 
   const employerInfo = companyProfile(company);
-  // Box 15 state code: the employee's work state — the same state withholding uses
-  // (W-4 state, else address state; employeeWorkState) — otherwise parse a "(XX)" suffix
-  // from a state tax line name (e.g. "State Income Tax (CA)").
-  let stateCode = employeeWorkState(employee as Parameters<typeof employeeWorkState>[0]);
-  if (!stateCode) {
-    for (const n of f.stateLineNames) {
-      const m = n.match(/\(([A-Za-z]{2})\)/);
-      if (m) { stateCode = m[1].toUpperCase(); break; }
-    }
-  }
-  const hasStateInfo = yearPaychecks.length > 0 && (stateCode !== null || f.stateWithheld.greaterThan(0));
+  const state = w2StateBoxes(employee as Parameters<typeof employeeWorkState>[0], f, yearPaychecks.length > 0);
 
   // Box 3: Social Security wages capped at the year's wage base.
   const ssBase = Money.of(ssWageBaseFor(input.year));
@@ -326,11 +317,39 @@ export async function w2Data(
     dependentCare: toAmountString(f.box10),
     box12: box12List(f.box12),
     box14: box14List(f.box14),
-    state: {
-      code: stateCode,
-      wages: hasStateInfo ? toAmountString(f.incomeTaxWages) : '0.00',
-      withheld: toAmountString(f.stateWithheld),
-    },
+    state,
+  };
+}
+
+/**
+ * W-2 Boxes 15-17 for one employee's year — the ONE rule both the W-2 and the W-3 (whose Box 16
+ * must equal the sum of the W-2s) use.
+ *  - Box 15: the employee's work state (W-4 state, else address state; employeeWorkState — the
+ *    state withholding uses), otherwise a "(XX)" suffix parsed from a state tax line name.
+ *  - Box 16: the state wages (Box 1 basis) whenever the employee was paid and the state taxes
+ *    wages — also when nothing was withheld (an exempt employee's wages are still reported) — or
+ *    any state income tax was withheld. A state without income tax on wages (TX, FL, WA, ...)
+ *    with nothing withheld leaves Boxes 15-17 empty.
+ */
+function w2StateBoxes(
+  employee: Parameters<typeof employeeWorkState>[0],
+  f: EmployeeYearFigures,
+  paid: boolean,
+): W2StateBoxes {
+  let stateCode = employeeWorkState(employee);
+  if (!stateCode) {
+    for (const n of f.stateLineNames) {
+      const m = n.match(/\(([A-Za-z]{2})\)/);
+      if (m) { stateCode = m[1].toUpperCase(); break; }
+    }
+  }
+  const withheld = f.stateWithheld.greaterThan(0);
+  const taxesWages = stateCode !== null && stateInfo(stateCode)?.model !== 'none';
+  const hasStateInfo = paid && (withheld || taxesWages);
+  return {
+    code: taxesWages || withheld ? stateCode : null,
+    wages: hasStateInfo ? toAmountString(f.incomeTaxWages) : '0.00',
+    withheld: toAmountString(f.stateWithheld),
   };
 }
 
@@ -1135,11 +1154,20 @@ export async function w3Data(ctx: ServiceContext, input: W3DataInput): Promise<W
     perEmployee.set(c.employeeId, f);
   }
 
+  // Box 16 = the sum of the W-2s' Box 16: the same per-employee state rule as w2Data.
+  const empRows = perEmployee.size
+    ? await ctx.db
+        .select({ id: employees.id, w4: employees.w4, address: employees.address })
+        .from(employees)
+        .where(and(eq(employees.companyId, ctx.companyId), inArray(employees.id, [...perEmployee.keys()])))
+    : [];
+  const empById = new Map(empRows.map((e) => [e.id, e]));
+
   const ssBase = Money.of(ssWageBaseFor(input.year));
   const t = emptyFigures();
   let ssWages = Money.zero();
   let stateWages = Money.zero();
-  for (const f of perEmployee.values()) {
+  for (const [employeeId, f] of perEmployee) {
     t.incomeTaxWages = t.incomeTaxWages.plus(f.incomeTaxWages);
     t.ficaWages = t.ficaWages.plus(f.ficaWages);
     t.federalWithheld = t.federalWithheld.plus(f.federalWithheld);
@@ -1149,8 +1177,8 @@ export async function w3Data(ctx: ServiceContext, input: W3DataInput): Promise<W
     t.box10 = t.box10.plus(f.box10);
     for (const [k, v] of f.box12) t.box12.set(k, (t.box12.get(k) ?? Money.zero()).plus(v));
     ssWages = ssWages.plus(capAt(f.ficaWages, ssBase));
-    // Box 16: state wages of the employees who had state withholding.
-    if (f.stateWithheld.greaterThan(0)) stateWages = stateWages.plus(f.incomeTaxWages);
+    const emp = empById.get(employeeId) ?? { w4: null, address: null };
+    stateWages = stateWages.plus(Money.of(w2StateBoxes(emp, f, true).wages));
   }
   const deferred = ['D', 'E', 'F', 'G', 'H', 'S', 'Y', 'AA', 'BB', 'EE'].reduce(
     (s, code) => s.plus(t.box12.get(code) ?? Money.zero()),
@@ -1686,7 +1714,12 @@ const fmtHours = (d: Dec) => d.toFixed(2);
  */
 export async function sickVacationBalances(
   ctx: ServiceContext,
-  opts?: { employeeId?: string },
+  /**
+   * `through`: only paychecks dated on or before this day accrue (a pay stub shows the balance as
+   * of its own pay date); `throughPaycheck` (with `through`) additionally leaves out checks of the
+   * same day created after that paycheck. Default: every paycheck (the balance today).
+   */
+  opts?: { employeeId?: string; through?: Date; throughPaycheck?: { id: string; createdAt: Date } },
 ): Promise<SickVacationBalanceRow[]> {
   const empConditions = [eq(employees.companyId, ctx.companyId)];
   if (opts?.employeeId) empConditions.push(eq(employees.id, opts.employeeId));
@@ -1706,11 +1739,20 @@ export async function sickVacationBalances(
   ];
   if (opts?.employeeId) checkConditions.push(eq(paychecks.employeeId, opts.employeeId));
 
-  const checks = await ctx.db
-    .select({ id: paychecks.id, employeeId: paychecks.employeeId, payDate: paychecks.payDate })
-    .from(paychecks)
-    .leftJoin(journalEntries, eq(paychecks.postedEntryId, journalEntries.id))
-    .where(and(...checkConditions));
+  if (opts?.through) checkConditions.push(lte(paychecks.payDate, opts.through));
+
+  const checks = (
+    await ctx.db
+      .select({ id: paychecks.id, employeeId: paychecks.employeeId, payDate: paychecks.payDate, createdAt: paychecks.createdAt })
+      .from(paychecks)
+      .leftJoin(journalEntries, eq(paychecks.postedEntryId, journalEntries.id))
+      .where(and(...checkConditions))
+  ).filter((c) => {
+    // Same-day checks entered after the stub's own check are not on that stub.
+    const ref = opts?.throughPaycheck;
+    if (!ref || !opts?.through) return true;
+    return c.payDate.getTime() < opts.through.getTime() || c.id === ref.id || c.createdAt.getTime() <= ref.createdAt.getTime();
+  });
 
   // Hours per paycheck from earning line names (hourly accrual basis).
   const ids = checks.map((c) => c.id);

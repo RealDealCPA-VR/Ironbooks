@@ -4,8 +4,9 @@
  * existing portal sessions (portal tokens are bound to the password; see lib/auth.ts).
  */
 import { NextRequest, NextResponse } from 'next/server';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 import { getServerContext } from '@/lib/context';
+import { inTransaction, writeAudit } from '@/lib/services/_base';
 import { getSessionUserId, hashPassword, MIN_PASSWORD_LENGTH } from '@/lib/auth';
 import { employees } from '@/lib/db/schema';
 import { invalidJsonBody, readJsonObject, routeError } from '@/lib/routeErrors';
@@ -26,14 +27,26 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     }
     const ctx = await getServerContext();
     const [emp] = await ctx.db
-      .select({ id: employees.id })
+      .select({ id: employees.id, hadPassword: sql<boolean>`${employees.portalPasswordHash} IS NOT NULL` })
       .from(employees)
       .where(and(eq(employees.id, id), eq(employees.companyId, ctx.companyId)));
     if (!emp) return NextResponse.json({ error: 'Employee not found', code: 'NOT_FOUND' }, { status: 404 });
-    await ctx.db
-      .update(employees)
-      .set({ portalPasswordHash: await hashPassword(password) })
-      .where(and(eq(employees.id, id), eq(employees.companyId, ctx.companyId)));
+    const portalPasswordHash = await hashPassword(password);
+    // One transaction with an audit row (who gave this employee portal access, and when) — never
+    // the hash itself. inTransaction / writeAudit also apply the view-only role check.
+    await inTransaction(ctx, async (tx) => {
+      await tx.db
+        .update(employees)
+        .set({ portalPasswordHash, updatedAt: new Date() })
+        .where(and(eq(employees.id, id), eq(employees.companyId, tx.companyId)));
+      await writeAudit(tx, {
+        action: 'update',
+        entityType: 'employee',
+        entityId: id,
+        oldValues: { portalPassword: emp.hadPassword ? 'set' : 'none' },
+        newValues: { portalPassword: 'set' },
+      });
+    });
     return NextResponse.json({ ok: true });
   } catch (err) {
     return routeError(err, 'employees/portal-password');

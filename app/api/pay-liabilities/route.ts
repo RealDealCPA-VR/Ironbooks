@@ -29,6 +29,7 @@ import { getServerContext } from '@/lib/context';
 import { payrollLiabilitiesDue, payPayrollLiabilities } from '@/lib/services/liabilityPayments';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
+import { parseDateInput } from '@/lib/validation/helpers';
 
 function errorStatus(code: string): number {
   return serviceErrorStatus(code);
@@ -83,6 +84,10 @@ export async function POST(req: NextRequest) {
     if (!amount || typeof amount !== 'string') {
       return NextResponse.json({ error: 'amount (decimal string) is required.' }, { status: 400 });
     }
+    // "abc" used to reach the money parser and answer 500.
+    if (!/^\d+(\.\d{1,2})?$/.test(amount.trim())) {
+      return NextResponse.json({ error: 'amount must be an amount like 120.00.', code: 'VALIDATION' }, { status: 400 });
+    }
     if (!date || typeof date !== 'string') {
       return NextResponse.json({ error: 'date (ISO string) is required.' }, { status: 400 });
     }
@@ -90,7 +95,12 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'paymentAccountId is required.' }, { status: 400 });
     }
 
-    const parsedDate = new Date(date);
+    // A malformed date ("garbage" → Invalid Date → 500) or an impossible one ("2026-02-30", which
+    // `new Date` rolls over to March 2) is refused.
+    const parsedDate = parseDateInput(date);
+    if (!parsedDate) {
+      return NextResponse.json({ error: `"${date}" is not a valid date.`, code: 'VALIDATION' }, { status: 400 });
+    }
 
     const str = (v: unknown) => (typeof v === 'string' ? v : null);
     const entry = await payPayrollLiabilities(ctx, {

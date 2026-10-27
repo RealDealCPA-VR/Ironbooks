@@ -13,7 +13,8 @@
  * postedEntryId is stored on the expense_reports row after posting.
  */
 import { and, desc, eq } from 'drizzle-orm';
-import { Money, toAmountString } from '@/lib/money';
+import type Decimal from 'decimal.js';
+import { MAX_LEDGER_AMOUNT, Money, toAmountString } from '@/lib/money';
 import { accounts, employees, expenseReports, expenseReportLines } from '@/lib/db/schema';
 import {
   type ServiceContext,
@@ -24,7 +25,7 @@ import {
   validation,
   writeAudit,
 } from './_base';
-import { postJournalEntry } from './posting';
+import { assertNotControlLineAccount, postJournalEntry } from './posting';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -46,6 +47,28 @@ export interface CreateReportInput {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/** Today's local calendar day at UTC midnight. */
+function todayCalendarDay(now: Date = new Date()): Date {
+  return new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
+}
+
+/**
+ * A line amount: a finite decimal rounded to cents. "NaN" / "Infinity" parse as decimals but are
+ * not amounts (NaN used to be stored as the line amount and the report total).
+ */
+function lineAmount(raw: string | number, lineNo: number): Decimal {
+  let d: Decimal;
+  try {
+    d = Money.of(typeof raw === 'string' ? raw.trim() : raw);
+  } catch {
+    throw validation(`Line ${lineNo}: the amount is not a number.`);
+  }
+  if (!d.isFinite()) throw validation(`Line ${lineNo}: the amount is not a number.`);
+  const r = Money.round2(d);
+  if (r.abs().greaterThan(MAX_LEDGER_AMOUNT)) throw validation(`Line ${lineNo}: the amount is larger than the books can hold.`);
+  return r;
+}
 
 /** Resolve Checking account (code 1000) id scoped to company. */
 async function checkingAccountId(ctx: ServiceContext): Promise<string> {
@@ -76,17 +99,32 @@ export async function createReport(ctx: ServiceContext, input: CreateReportInput
     .where(and(eq(employees.companyId, ctx.companyId), eq(employees.id, input.employeeId)));
   if (!emp) throw notFound('Employee');
 
-  // Validate line amounts and compute total.
+  // Validate line amounts and compute total. Each line is rounded to cents FIRST and the total is
+  // the sum of the stored lines, so the report total always equals its lines (and the
+  // reimbursement, which re-adds the stored lines).
   let total = Money.zero();
+  const amounts: string[] = [];
   for (const [i, line] of input.lines.entries()) {
     if (!line.accountId) throw validation(`Line ${i + 1}: accountId is required.`);
     // The account must belong to THIS company (never store another company's account id).
     await assertRefInCompany(ctx, accounts, line.accountId, `Line ${i + 1}: Account`);
-    const amt = Money.of(line.amount);
+    const [acct] = await ctx.db
+      .select({ type: accounts.type, subtype: accounts.subtype, name: accounts.name })
+      .from(accounts)
+      .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, line.accountId)));
+    // A/R and A/P need a customer / vendor name and non-posting accounts take no amounts: the
+    // reimbursement could never post, so refuse the line now rather than at approval.
+    assertNotControlLineAccount(acct, `Line ${i + 1}`);
+    if (acct.subtype === 'non_posting') {
+      throw validation(`Line ${i + 1}: "${acct.name}" is a non-posting account and cannot hold an expense.`);
+    }
+    const amt = lineAmount(line.amount, i + 1);
     if (amt.isNegative()) throw validation(`Line ${i + 1}: amount cannot be negative.`);
     if (amt.isZero()) throw validation(`Line ${i + 1}: amount must be greater than zero.`);
     total = total.plus(amt);
+    amounts.push(toAmountString(amt));
   }
+  if (total.greaterThan(MAX_LEDGER_AMOUNT)) throw validation('The report total is larger than the books can hold.');
 
   return inTransaction(ctx, async (tx) => {
     const [report] = await tx.db
@@ -107,7 +145,7 @@ export async function createReport(ctx: ServiceContext, input: CreateReportInput
         accountId: line.accountId,
         date: line.date ?? null,
         description: line.description?.trim() ?? null,
-        amount: toAmountString(Money.of(line.amount)),
+        amount: amounts[idx],
         lineOrder: idx,
       })),
     );
@@ -252,7 +290,9 @@ export async function approveAndReimburse(ctx: ServiceContext, id: string) {
     });
 
     const entry = await postJournalEntry(tx, {
-      date: new Date(),
+      // Today's calendar day on this computer at UTC midnight (the stored-date convention);
+      // `new Date()` is the current instant, already tomorrow in the evening west of UTC.
+      date: todayCalendarDay(),
       description: `Expense reimbursement — ${report.title ?? report.id.slice(0, 8)}`,
       reference: report.id.slice(0, 8),
       sourceRef: `expense_report:${report.id}`,

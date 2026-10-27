@@ -48,7 +48,7 @@ import {
   writeAudit,
 } from './_base';
 import { postJournalEntry, voidJournalEntry, type PostingLine } from './posting';
-import { getEmployee } from './payroll';
+import { getEmployee, payrollDefaultAccounts } from './payroll';
 import { defaultPayrollLiabilityAccountId } from './liabilityPayments';
 import { getPayrollItemsByIds, resolveItemTracking, type PayrollItem } from './payrollItems';
 import { inferEmployeeTaxTracking, inferEmployerTracking } from './payrollTaxTracking';
@@ -259,11 +259,20 @@ export async function createYtdAdjustment(ctx: ServiceContext, input: YtdAdjustm
   // GL accounts (only when posting).
   let posting: PostingLine[] | null = null;
   if (input.affectsAccounts) {
-    const expense = await accountIdByCode(ctx, '6500');
+    // The same default accounts a paycheck posts to (Preferences wages / liabilities accounts
+    // and paycheck bank, else 6500 / 2300 / 1000) — a historical check must land where the
+    // real checks do, or the P&L splits wages over two accounts.
+    let defaults: { payrollExpenseId: string | null; checkingId: string | null };
+    try {
+      defaults = await payrollDefaultAccounts(ctx);
+    } catch {
+      defaults = { payrollExpenseId: null, checkingId: null };
+    }
+    const expense = defaults.payrollExpenseId;
     const liab = await payrollLiabilityAccountId(ctx);
     const bank = input.bankAccountId
       ? await requireAccount(ctx, input.bankAccountId, 'Bank account', 'bank')
-      : await accountIdByCode(ctx, '1000');
+      : defaults.checkingId;
     if (!expense || !liab || !bank) {
       throw validation('Posting needs accounts 6500 Payroll Expense, 2300 Payroll Liabilities and a bank account.');
     }
@@ -502,8 +511,24 @@ export async function listStateTaxSettings(ctx: ServiceContext) {
     .orderBy(asc(payrollStateSettings.state), desc(payrollStateSettings.year));
 }
 
+/**
+ * A typed number: a finite decimal. "abc" (a MoneyParseError → HTTP 500) and "NaN" / "Infinity"
+ * (which parse as decimals and were STORED — NaN in a rate column silently switched the tax off)
+ * are refused as VALIDATION.
+ */
+function finiteOf(v: string | number | null | undefined, label: string): Dec {
+  let d: Dec;
+  try {
+    d = Money.of(typeof v === 'string' ? v.trim() : v ?? 0);
+  } catch {
+    throw validation(`${label} must be a number.`);
+  }
+  if (!d.isFinite()) throw validation(`${label} must be a number.`);
+  return d;
+}
+
 function rateOf(v: string | number | null | undefined, label: string): string {
-  const d = Money.of(v ?? 0);
+  const d = finiteOf(v, label);
   if (d.isNegative() || d.greaterThanOrEqualTo('0.25')) {
     throw validation(`${label} must be between 0% and 25%.`);
   }
@@ -511,8 +536,9 @@ function rateOf(v: string | number | null | undefined, label: string): string {
 }
 
 function baseOf(v: string | number | null | undefined, label: string): string {
-  const d = Money.round2(v ?? 0);
+  const d = Money.round2(finiteOf(v, label));
   if (d.isNegative()) throw validation(`${label} cannot be negative.`);
+  withinBounds(d, label);
   return toAmountString(d);
 }
 
@@ -608,7 +634,7 @@ function wcValues(input: Partial<WorkersCompCodeInput>) {
   }
   if (input.description !== undefined) out.description = input.description?.trim() || null;
   if (input.ratePer100 !== undefined) {
-    const r = Money.of(input.ratePer100);
+    const r = finiteOf(input.ratePer100, 'Rate per $100');
     if (r.isNegative() || r.greaterThan(100)) throw validation('Rate per $100 must be between 0 and 100.');
     out.ratePer100 = r.toFixed(4);
   }

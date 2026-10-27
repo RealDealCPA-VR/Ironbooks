@@ -67,9 +67,11 @@ import {
   type TaxTracking,
 } from './payrollTaxTracking';
 import { sickVacationBalances } from './payrollReports';
-import { PAYROLL_PAID_TAG, markTimeEntriesPaidInPayroll } from './timeTracking';
+import { PAYROLL_PAID_TAG, markTimeEntriesPaidInPayroll, releaseTimeEntriesFromPaycheck } from './timeTracking';
 import { getPreferences } from './preferences';
 import { type PrefAccountKind, assertPreferenceAccount } from './prefAccounts';
+import { PAY_PERIODS_PER_YEAR } from '@/lib/preferences';
+import { getHomeCurrencyCode } from './currencies';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -211,6 +213,34 @@ export interface RunPaycheckInput {
 }
 
 // ---------------------------------------------------------------------------
+// Pay frequency
+// ---------------------------------------------------------------------------
+
+/**
+ * Pay periods per year for a check: the caller's value, else the check's stored frequency (an
+ * edit), else the company's payroll pay period (Preferences > Payroll & Employees; biweekly = 26
+ * by default). A value that is not a whole number from 1 to 365 is refused — it would divide
+ * the annualized withholding by zero or by nonsense.
+ */
+async function resolvePeriodsPerYear(
+  ctx: ServiceContext,
+  requested: number | null | undefined,
+  stored?: number | null,
+): Promise<number> {
+  let periods: number;
+  if (requested !== undefined && requested !== null) periods = requested;
+  else if (stored !== undefined && stored !== null) periods = stored;
+  else {
+    const prefs = await getPreferences(ctx);
+    periods = PAY_PERIODS_PER_YEAR[prefs.payrollPayPeriod] ?? 26;
+  }
+  if (typeof periods !== 'number' || !Number.isInteger(periods) || periods < 1 || periods > 365) {
+    throw validation('Pay periods per year must be a whole number from 1 to 365 (52 weekly, 26 every two weeks, 24 twice a month, 12 monthly).');
+  }
+  return periods;
+}
+
+// ---------------------------------------------------------------------------
 // Internal helper: resolve account id by COA code, scoped to company
 // ---------------------------------------------------------------------------
 
@@ -237,14 +267,44 @@ async function preferredAccountId(
   kind: PrefAccountKind,
   label: string,
 ): Promise<string> {
+  let id: string | null = null;
   if (preferredId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(preferredId)) {
     const [row] = await ctx.db
       .select({ id: accounts.id, isActive: accounts.isActive })
       .from(accounts)
       .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, preferredId)));
-    if (row?.isActive) return (await assertPreferenceAccount(ctx, row.id, kind, label)).id;
+    if (row?.isActive) id = (await assertPreferenceAccount(ctx, row.id, kind, label)).id;
   }
-  return accountIdByCode(ctx, fallbackCode);
+  id ??= await accountIdByCode(ctx, fallbackCode);
+  // Payroll is paid in the home currency (QB: paychecks and payroll liabilities only from a
+  // home-currency account). A foreign-currency account would be credited the home amount
+  // converted at the list rate — the books would show a euro balance paid in dollars.
+  const [acct] = await ctx.db
+    .select({ name: accounts.name, currency: accounts.currency })
+    .from(accounts)
+    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, id)));
+  const cur = (acct?.currency ?? '').trim().toUpperCase();
+  if (cur) {
+    const home = (await getHomeCurrencyCode(ctx))?.toUpperCase() ?? null;
+    if (home && cur !== home) {
+      throw validation(`${label} "${acct!.name}" is a ${cur} account. Payroll is paid in ${home}: choose a ${home} account in Preferences > Payroll & Employees / Checking.`);
+    }
+  }
+  return id;
+}
+
+/**
+ * The accounts a payroll posting uses when a line has no payroll item account: Preferences >
+ * Payroll & Employees wages / liabilities accounts and Checking's paycheck account, else 6500 /
+ * 2300 / 1000. Paychecks AND historical YTD entries that affect accounts post with these, so
+ * wages and net pay land in the same accounts either way.
+ */
+export async function payrollDefaultAccounts(ctx: ServiceContext) {
+  const payPrefs = await getPreferences(ctx);
+  const payrollExpenseId = await preferredAccountId(ctx, payPrefs.payrollExpenseAccountId, '6500', 'expense', 'The payroll wages account'); // Payroll Expense
+  const payrollLiabId = await preferredAccountId(ctx, payPrefs.payrollLiabilityAccountId, '2300', 'payroll_liability', 'The payroll liabilities account'); // Payroll Liabilities
+  const checkingId = await preferredAccountId(ctx, payPrefs.defaultPaycheckAccountId, '1000', 'bank', 'The paycheck bank account'); // Checking
+  return { payrollExpenseId, payrollLiabId, checkingId };
 }
 
 /**
@@ -534,6 +594,10 @@ export async function voidPaycheck(ctx: ServiceContext, paycheckId: string) {
       .where(eq(paychecks.id, paycheckId))
       .returning();
 
+    // The hours this check paid were never paid after all: release the time entries it pulled in
+    // (their [payroll:<id>] tag) so the corrected check can pay them again.
+    await releaseTimeEntriesFromPaycheck(tx, paycheckId);
+
     await writeAudit(tx, {
       action: 'void',
       entityType: 'paycheck',
@@ -581,6 +645,8 @@ export interface PayStubData {
    * payrollReports.sickVacationBalances). Null when the employee has no accrual policy.
    */
   accruals: { sickBalance: string; vacationBalance: string } | null;
+  /** The check was voided (or its journal entry is no longer posted): the stub prints VOID. */
+  isVoid: boolean;
 }
 
 /**
@@ -602,29 +668,47 @@ export async function payStubData(ctx: ServiceContext, paycheckId: string): Prom
     .from(paycheckLines)
     .where(eq(paycheckLines.paycheckId, paycheckId));
 
+  // Same rule as listPaychecks' isVoid.
+  let isVoid = pc.voidedAt != null || (pc.postedEntryId == null && pc.entryType === 'paycheck');
+  if (!isVoid && pc.postedEntryId) {
+    const [je] = await ctx.db
+      .select({ status: journalEntries.status })
+      .from(journalEntries)
+      .where(and(eq(journalEntries.id, pc.postedEntryId), eq(journalEntries.companyId, ctx.companyId)));
+    isVoid = je?.status !== 'posted';
+  }
+
   const year = pc.payDate.getUTCFullYear();
   const yearStart = new Date(Date.UTC(year, 0, 1));
 
-  const ytdChecks = await ctx.db
-    .select({
-      id: paychecks.id,
-      grossPay: paychecks.grossPay,
-      totalTaxes: paychecks.totalTaxes,
-      totalDeductions: paychecks.totalDeductions,
-      netPay: paychecks.netPay,
-    })
-    .from(paychecks)
-    .leftJoin(journalEntries, eq(paychecks.postedEntryId, journalEntries.id))
-    .where(
-      and(
-        eq(paychecks.companyId, ctx.companyId),
-        eq(paychecks.employeeId, pc.employeeId),
-        // Live checks + historical YTD amounts entered at mid-year setup.
-        paycheckCountsCondition(),
-        gte(paychecks.payDate, yearStart),
-        lte(paychecks.payDate, pc.payDate),
-      ),
-    );
+  const ytdChecks = (
+    await ctx.db
+      .select({
+        id: paychecks.id,
+        grossPay: paychecks.grossPay,
+        totalTaxes: paychecks.totalTaxes,
+        totalDeductions: paychecks.totalDeductions,
+        netPay: paychecks.netPay,
+        payDate: paychecks.payDate,
+        createdAt: paychecks.createdAt,
+      })
+      .from(paychecks)
+      .leftJoin(journalEntries, eq(paychecks.postedEntryId, journalEntries.id))
+      .where(
+        and(
+          eq(paychecks.companyId, ctx.companyId),
+          eq(paychecks.employeeId, pc.employeeId),
+          // Live checks + historical YTD amounts entered at mid-year setup.
+          paycheckCountsCondition(),
+          gte(paychecks.payDate, yearStart),
+          lte(paychecks.payDate, pc.payDate),
+        ),
+      )
+  ).filter(
+    // "Through this check": a check of the same day entered AFTER it (a bonus check) is not on
+    // this stub — the same order listPaychecks' YTD column uses.
+    (c) => c.payDate.getTime() < pc.payDate.getTime() || c.id === pc.id || c.createdAt.getTime() <= pc.createdAt.getTime(),
+  );
 
   const ytdIds = ytdChecks.map((c) => c.id);
   const ytdLines = ytdIds.length
@@ -646,7 +730,13 @@ export async function payStubData(ctx: ServiceContext, paycheckId: string): Prom
   // Sick/vacation balances (hours) — informational only; never block stub rendering.
   let accruals: PayStubData['accruals'] = null;
   try {
-    const [balanceRow] = await sickVacationBalances(ctx, { employeeId: pc.employeeId });
+    // As of THIS check (its pay date), not today: a March stub reprinted in October must show
+    // March's balance.
+    const [balanceRow] = await sickVacationBalances(ctx, {
+      employeeId: pc.employeeId,
+      through: pc.payDate,
+      throughPaycheck: { id: pc.id, createdAt: pc.createdAt },
+    });
     if (balanceRow?.hasPolicy) {
       accruals = {
         sickBalance: balanceRow.sick.balance,
@@ -696,6 +786,7 @@ export async function payStubData(ctx: ServiceContext, paycheckId: string): Prom
       net: sumCol('netPay'),
     },
     accruals,
+    isVoid,
   };
 }
 
@@ -807,6 +898,8 @@ interface PreparedPaycheck {
   /** Plain-language notes about the calculation (state not set up, nearest-year tables, local taxes). */
   notes: string[];
   accountsUsed: { payrollExpenseId: string; payrollTaxExpenseId: string; payrollLiabId: string; checkingId: string };
+  /** Pay periods per year the withholding was calculated with (stored on the check). */
+  periodsPerYear: number;
 }
 
 /**
@@ -816,7 +909,7 @@ interface PreparedPaycheck {
 async function preparePaycheck(
   ctx: ServiceContext,
   input: RunPaycheckInput,
-  opts: { excludePaycheckId?: string | null; allowInactive?: boolean } = {},
+  opts: { excludePaycheckId?: string | null; allowInactive?: boolean; storedPeriodsPerYear?: number | null } = {},
 ): Promise<PreparedPaycheck> {
   // --- Validate employee ---
   const employee = await getEmployee(ctx, input.employeeId);
@@ -826,6 +919,7 @@ async function preparePaycheck(
   if (!(input.payDate instanceof Date) || isNaN(input.payDate.getTime())) {
     throw validation('A valid pay date is required.');
   }
+  const periodsPerYear = await resolvePeriodsPerYear(ctx, input.periodsPerYear, opts.storedPeriodsPerYear);
 
   // --- Compute gross from itemized earnings (or the legacy single amount) ---
   const earningsInput = input.earnings ?? [];
@@ -1044,7 +1138,7 @@ async function preparePaycheck(
     const withholding = computeWithholding({
       grossPerPeriod: incomeTaxWages.toNumber(),
       ficaWagesPerPeriod: ficaWages.toNumber(),
-      periodsPerYear: input.periodsPerYear ?? 26,
+      periodsPerYear,
       filingStatus: input.filingStatus ?? normalizeFilingStatus(w4.filingStatus),
       ytdGrossBefore: ytdFicaBefore,
       year,
@@ -1077,7 +1171,7 @@ async function preparePaycheck(
           wagesPerPeriod: incomeTaxWages,
           ficaWagesPerPeriod: ficaWages,
           ficaTaxPerPeriod: Money.of(withholding.socialSecurity).plus(Money.of(withholding.medicare)),
-          periodsPerYear: input.periodsPerYear ?? 26,
+          periodsPerYear,
           stateW4: (w4 as Record<string, unknown>).stateW4 as StateW4 | undefined,
         });
       } catch (err) {
@@ -1172,10 +1266,7 @@ async function preparePaycheck(
   }
 
   // --- Resolve GL accounts ---
-  const payPrefs = await getPreferences(ctx);
-  const payrollExpenseId = await preferredAccountId(ctx, payPrefs.payrollExpenseAccountId, '6500', 'expense', 'The payroll wages account'); // Payroll Expense
-  const payrollLiabId = await preferredAccountId(ctx, payPrefs.payrollLiabilityAccountId, '2300', 'payroll_liability', 'The payroll liabilities account'); // Payroll Liabilities
-  const checkingId = await preferredAccountId(ctx, payPrefs.defaultPaycheckAccountId, '1000', 'bank', 'The paycheck bank account'); // Checking
+  const { payrollExpenseId, payrollLiabId, checkingId } = await payrollDefaultAccounts(ctx);
 
   // Employer payroll taxes post to 6510 Payroll Tax Expense when the company has one,
   // otherwise fall back to 6500 Payroll Expense (the default COA has no 6510).
@@ -1207,6 +1298,7 @@ async function preparePaycheck(
     itemFor,
     notes,
     accountsUsed: { payrollExpenseId, payrollTaxExpenseId, payrollLiabId, checkingId },
+    periodsPerYear,
   };
 }
 
@@ -1373,10 +1465,12 @@ export async function previewPaycheck(ctx: ServiceContext, input: RunPaycheckInp
 }
 
 export async function runPaycheck(ctx: ServiceContext, input: RunPaycheckInput) {
-  const prep = await preparePaycheck(ctx, input);
-
-  // --- Persist in a single transaction ---
+  // --- Calculate AND persist in a single transaction --- the YTD wages the wage bases (Social
+  // Security, FUTA, SUI, Additional Medicare) are applied against must be read in the same
+  // transaction that posts the check, or two checks entered at once both use the room left
+  // under the base.
   return inTransaction(ctx, async (tx) => {
+    const prep = await preparePaycheck(tx, input);
     // 1) Insert paycheck header.
     const [paycheck] = await tx.db
       .insert(paychecks)
@@ -1392,6 +1486,7 @@ export async function runPaycheck(ctx: ServiceContext, input: RunPaycheckInput) 
         netPay: toAmountString(prep.netPay),
         payRunId: input.payRunId ?? null,
         entryType: 'paycheck',
+        periodsPerYear: prep.periodsPerYear,
         // postedEntryId set below
       })
       .returning();
@@ -1460,12 +1555,6 @@ export async function editPaycheck(ctx: ServiceContext, paycheckId: string, inpu
     throw validation('This is a payroll adjustment, not a paycheck. Edit it from the adjustments list.');
   }
 
-  const prep = await preparePaycheck(
-    ctx,
-    { ...input, employeeId: existing.employeeId, payRunId: existing.payRunId },
-    { excludePaycheckId: paycheckId, allowInactive: true },
-  );
-
   return inTransaction(ctx, async (tx) => {
     const [pc] = await tx.db
       .select()
@@ -1473,6 +1562,15 @@ export async function editPaycheck(ctx: ServiceContext, paycheckId: string, inpu
       .where(and(eq(paychecks.id, paycheckId), eq(paychecks.companyId, tx.companyId)));
     if (!pc) throw notFound('Paycheck');
     if (pc.voidedAt) throw new ServiceError('CONFLICT', 'A voided paycheck cannot be edited.');
+
+    // Recalculate at the check's OWN pay frequency (a monthly check must not be re-withheld as if
+    // it were biweekly) unless the edit names a new one — inside the transaction, so the YTD
+    // wages under the wage bases are the ones this edit commits against.
+    const prep = await preparePaycheck(
+      tx,
+      { ...input, employeeId: pc.employeeId, payRunId: pc.payRunId },
+      { excludePaycheckId: paycheckId, allowInactive: true, storedPeriodsPerYear: pc.periodsPerYear },
+    );
 
     const oldLines = await tx.db
       .select()
@@ -1500,6 +1598,7 @@ export async function editPaycheck(ctx: ServiceContext, paycheckId: string, inpu
         totalTaxes: toAmountString(prep.totalTaxes),
         totalDeductions: toAmountString(prep.totalDeductions),
         netPay: toAmountString(prep.netPay),
+        periodsPerYear: prep.periodsPerYear,
         postedEntryId: entry.id,
       })
       .where(eq(paychecks.id, paycheckId))
@@ -1619,8 +1718,9 @@ export interface PayRunEmployeeInput {
   /** Itemized deductions; lines may carry payrollItemId (pre-tax / garnishment / GL mapping). */
   deductions?: PaycheckLineInput[];
   /**
-   * Time entries pulled into this check. Hours = sum of entry hours, paid at the
-   * employee's pay rate (the hourly earning line). Entries are tagged
+   * Time entries pulled into this check. For an hourly employee, hours = sum of entry hours,
+   * paid at the employee's pay rate (the hourly earning line); a salaried employee is paid the
+   * period's salary. Entries are tagged
    * `[payroll:<paycheckId>]` after the check posts so they cannot be paid twice.
    */
   timeEntryIds?: string[];
@@ -1658,8 +1758,9 @@ export interface PayRunEmployeeResult {
  *
  * Defaults per employee when no override is given:
  *   hourly:     hours (input.hours, or pulled time, or 80) x payRate
- *   salary:     payRate / periodsPerYear (annual salary spread per period)
+ *   salary:     payRate / periodsPerYear (annual salary spread per period), pulled time or not
  *   commission: requires an explicit amount
+ * Pulled time entries are marked as used by the check for every pay type.
  * Withholding uses the employee's W-4 filing status and is auto-computed.
  */
 export async function createPayRun(ctx: ServiceContext, input: CreatePayRunInput) {
@@ -1676,7 +1777,8 @@ export async function createPayRun(ctx: ServiceContext, input: CreatePayRunInput
     }
     seen.add(e.employeeId);
   }
-  const periodsPerYear = input.periodsPerYear ?? 26;
+  // Salary defaults and withholding use the run's frequency, else the company pay period.
+  const periodsPerYear = await resolvePeriodsPerYear(ctx, input.periodsPerYear);
 
   // The header row is created inside the FIRST employee transaction that posts a paycheck, so it
   // commits (or rolls back) with that check: a run where every check is refused leaves no empty
@@ -1745,10 +1847,14 @@ export async function createPayRun(ctx: ServiceContext, input: CreatePayRunInput
         }
 
         // --- Default earnings ---
+        // Pulled time sets the HOURS of an hourly check only. A salaried employee's pay is the
+        // salary for the period whatever the timesheet says (hours x the ANNUAL salary paid
+        // $2,080,000 for a 40-hour week); a commission check still needs its amount. The time is
+        // marked as used by the check either way.
         const earnings: EarningLineInput[] = [];
         if (empInput.amount != null && empInput.amount !== '') {
           earnings.push({ kind: 'regular', amount: empInput.amount });
-        } else if (employee.payType === 'hourly' || timeHours !== null) {
+        } else if (employee.payType === 'hourly') {
           const hours =
             timeHours ??
             (empInput.hours != null && empInput.hours !== ''
