@@ -19,7 +19,7 @@ import {
   previewOpenItems,
   type OpenItemsInput,
 } from '@/lib/services/openItemsImport';
-import { routeError } from '@/lib/routeErrors';
+import { requireJsonObject, routeError } from '@/lib/routeErrors';
 
 export async function GET() {
   try {
@@ -33,7 +33,7 @@ export async function GET() {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = (await req.json().catch(() => ({}))) as OpenItemsInput & { action?: string };
+    const body = (await requireJsonObject(req, { optional: true })) as OpenItemsInput & { action?: string };
     const input: OpenItemsInput = {
       file:
         body.file && typeof body.file === 'object'

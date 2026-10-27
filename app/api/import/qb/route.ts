@@ -35,7 +35,7 @@ import {
   xlsxRows,
   type ListImportKind,
 } from '@/lib/services/qbImport';
-import { routeError } from '@/lib/routeErrors';
+import { requireJsonObject, routeError } from '@/lib/routeErrors';
 
 const LIST_KINDS = ['customers', 'vendors', 'items', 'accounts'] as const;
 
@@ -46,7 +46,7 @@ function decodeBase64(data: string): Uint8Array {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = (await req.json().catch(() => ({}))) as {
+    const body = (await requireJsonObject(req, { optional: true })) as {
       format?: string;
       kind?: string;
       content?: string;
