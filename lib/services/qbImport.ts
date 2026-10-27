@@ -2445,15 +2445,26 @@ async function bucketAccountOrProblem(
 function iifBaseKey(txn: IIFTransaction, date: Date, totalDebit: ReturnType<typeof Money.zero>): string {
   const rawName = (txn.name?.trim() || (txn.lines.find((l) => l.name && l.name.trim())?.name ?? '')).trim();
   const name = rawName.replace(/\s+/g, ' ').toLowerCase();
-  const key = `iif:${txn.type || 'TRNS'}:${txn.num || 'no-num'}:${date.toISOString().slice(0, 10)}:${toAmountString(totalDebit)}${name ? `:${encodeURIComponent(name)}` : ''}`;
-  // journal_entries.source_ref holds 255 characters (with the ':<occurrence>' suffix). A longer
-  // key (long DOCNUM / TRNSTYPE, a long or accented "Customer:Job" name) keeps a readable prefix
-  // and a hash of the whole key, still stable across re-imports. Shorter keys are unchanged, so
-  // files imported before keep matching their entries.
-  if (key.length <= IIF_KEY_MAX) return key;
-  return `${key.slice(0, IIF_KEY_MAX - 33)}#${createHash('sha256').update(key).digest('hex').slice(0, 32)}`;
+  return `iif:${txn.type || 'TRNS'}:${txn.num || 'no-num'}:${date.toISOString().slice(0, 10)}:${toAmountString(totalDebit)}${name ? `:${encodeURIComponent(name)}` : ''}`;
 }
-const IIF_KEY_MAX = 240;
+
+/** journal_entries.source_ref is varchar(255). */
+const SOURCE_REF_MAX = 255;
+
+/**
+ * Source reference an IIF transaction posts under: `<base key>:<occurrence>`. Earlier versions
+ * stored exactly that whenever it fit in the column (a longer one failed with "value too long"),
+ * so every ref of 255 characters or less stays byte-for-byte the same and files imported before
+ * keep matching their entries on re-import. Only a ref that does not fit (long DOCNUM / TRNSTYPE,
+ * a long or accented "Customer:Job" name) keeps a readable prefix plus a hash of the whole key —
+ * still stable across re-imports.
+ */
+function iifSourceRef(baseKey: string, occurrence: number): string {
+  const plain = `${baseKey}:${occurrence}`;
+  if (plain.length <= SOURCE_REF_MAX) return plain;
+  const tail = `#${createHash('sha256').update(baseKey).digest('hex').slice(0, 32)}:${occurrence}`;
+  return `${baseKey.slice(0, SOURCE_REF_MAX - tail.length)}${tail}`;
+}
 
 /**
  * Named A/R and A/P rows of the transactions importIifTransactions will actually post (date
@@ -2521,7 +2532,7 @@ async function collectIifControlRows(
     const occurrence = seenKeys.get(baseKey) ?? 0;
     seenKeys.set(baseKey, occurrence + 1);
     if (!rows.length) continue;
-    const ref = `${baseKey}:${occurrence}`;
+    const ref = iifSourceRef(baseKey, occurrence);
     const [dup] = await ctx.db
       .select({ id: journalEntries.id })
       .from(journalEntries)
@@ -2725,7 +2736,7 @@ async function importIifTransactions(
     const baseKey = iifBaseKey(txn, date, totalDebit);
     const occurrence = seenKeys.get(baseKey) ?? 0;
     seenKeys.set(baseKey, occurrence + 1);
-    const sourceRef = `${baseKey}:${occurrence}`;
+    const sourceRef = iifSourceRef(baseKey, occurrence);
 
     const [dup] = await ctx.db
       .select({ id: journalEntries.id })

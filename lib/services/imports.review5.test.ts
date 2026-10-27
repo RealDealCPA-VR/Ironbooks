@@ -125,6 +125,22 @@ async function controlLines(ctx: ServiceContext) {
     .where(and(eq(journalEntries.companyId, ctx.companyId), inArray(accounts.code, ['11000', '20000'])));
 }
 
+/** A/R or A/P lines (by account subtype — IIF imports number accounts their own way). */
+async function arApLines(ctx: ServiceContext, subtype: 'accounts_receivable' | 'accounts_payable') {
+  return db
+    .select({
+      entityType: journalEntryLines.entityType,
+      entityId: journalEntryLines.entityId,
+      debit: journalEntryLines.debit,
+      credit: journalEntryLines.credit,
+      ref: journalEntries.sourceRef,
+    })
+    .from(journalEntryLines)
+    .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+    .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
+    .where(and(eq(journalEntries.companyId, ctx.companyId), eq(accounts.subtype, subtype)));
+}
+
 describe('A. GL import: A/R lines carry a customer, A/P lines a vendor', () => {
   it('names only seen on General Journal / refund-check lines become customers and vendors', async () => {
     const ctx = await newCompany('Names Co');
@@ -203,12 +219,89 @@ describe('B. IIF import: overlong / oversized values', () => {
     for (const r of refs) expect(r.ref!.length).toBeLessThanOrEqual(255);
     expect(refs.find((r) => r.reference?.startsWith('XXX'))!.reference!.length).toBe(100);
     // The A/R line carries the job.
-    const [arLine] = (await controlLines(ctx)).filter((l) => l.code !== '20000');
-    void arLine;
+    const arLines = await arApLines(ctx, 'accounts_receivable');
+    expect(arLines).toHaveLength(1);
+    const [jobRow] = await db
+      .select({ id: customers.id })
+      .from(customers)
+      .where(and(eq(customers.companyId, ctx.companyId), eq(customers.displayName, job)));
+    expect(jobRow).toBeTruthy();
+    expect(arLines[0]).toMatchObject({ entityType: 'customer', entityId: jobRow.id, debit: '100.00' });
     // Re-import: both are recognised, nothing posts twice.
     const again = await importIIF(ctx, iif);
     expect(again.transactions).toBe(0);
     expect(again.issues.filter((i) => i.reason === 'duplicate' && i.entity === 'transaction').length).toBe(2);
+  });
+
+  it('a file imported with v1.6 whose source ref is 241-255 characters is recognised on re-import (no second posting)', async () => {
+    const ctx = await newCompany('IIF v16 Ref Co');
+    // A two-level accented name: every "é" is 6 characters once URI-encoded, a space 3.
+    const name = `Élan Québec:${'é'.repeat(31)}`;
+    const iif = [
+      '!ACCNT\tNAME\tACCNTTYPE',
+      'ACCNT\tAccounts Receivable\tAR',
+      'ACCNT\tSales\tINC',
+      '!CUST\tNAME',
+      `CUST\t${name}`,
+      '!TRNS\tTRNSTYPE\tDATE\tACCNT\tNAME\tAMOUNT\tDOCNUM',
+      '!SPL\tTRNSTYPE\tDATE\tACCNT\tNAME\tAMOUNT\tDOCNUM',
+      '!ENDTRNS',
+      `TRNS\tINVOICE\t1/5/2024\tAccounts Receivable\t${name}\t100.00\t101`,
+      `SPL\tINVOICE\t1/5/2024\tSales\t${name}\t-100.00\t101`,
+      'ENDTRNS',
+    ].join('\r\n');
+    // Exactly the reference v1.6 stored for this invoice: plain key + ':<occurrence>'.
+    const v16Key = `iif:INVOICE:101:2024-01-05:100.00:${encodeURIComponent(name.toLowerCase())}`;
+    expect(v16Key.length).toBe(246);
+    const v16Ref = `${v16Key}:0`;
+
+    const first = await importIIF(ctx, iif);
+    expect(first.transactions).toBe(1);
+    const [je] = await db
+      .select({ id: journalEntries.id, ref: journalEntries.sourceRef })
+      .from(journalEntries)
+      .where(eq(journalEntries.companyId, ctx.companyId));
+    const postedRef = je.ref;
+    // The books as v1.6 left them: the entry carries v1.6's reference.
+    await db.update(journalEntries).set({ sourceRef: v16Ref }).where(eq(journalEntries.id, je.id));
+
+    // Re-importing finds it: nothing posts a second time, A/R is not doubled.
+    const again = await importIIF(ctx, iif);
+    expect(again.transactions).toBe(0);
+    expect(again.issues.some((i) => i.reason === 'duplicate' && i.entity === 'transaction')).toBe(true);
+    const ar = await arApLines(ctx, 'accounts_receivable');
+    expect(ar).toHaveLength(1);
+    expect(ar[0].debit).toBe('100.00');
+    // And this version posts under the very same reference, so either import is recognised.
+    expect(postedRef).toBe(v16Ref);
+  });
+
+  it('a source ref longer than the column is hashed the same way on every import (and stays within 255)', async () => {
+    const ctx = await newCompany('IIF Long Ref Co');
+    const name = `Élan Québec:${'é'.repeat(40)}`; // URI-encoded key well past 255 characters
+    const iif = [
+      '!TRNS\tTRNSTYPE\tDATE\tACCNT\tNAME\tAMOUNT\tDOCNUM',
+      '!SPL\tTRNSTYPE\tDATE\tACCNT\tNAME\tAMOUNT\tDOCNUM',
+      '!ENDTRNS',
+      `TRNS\tINVOICE\t1/5/2024\tAccounts Receivable\t${name}\t100.00\t101`,
+      `SPL\tINVOICE\t1/5/2024\tSales\t${name}\t-100.00\t101`,
+      'ENDTRNS',
+      `TRNS\tINVOICE\t1/5/2024\tAccounts Receivable\t${name}\t100.00\t101`,
+      `SPL\tINVOICE\t1/5/2024\tSales\t${name}\t-100.00\t101`,
+      'ENDTRNS',
+    ].join('\r\n');
+    const first = await importIIF(ctx, iif);
+    expect(first.transactions).toBe(2);
+    const refs = (await db.select({ ref: journalEntries.sourceRef }).from(journalEntries).where(eq(journalEntries.companyId, ctx.companyId)))
+      .map((r) => r.ref!)
+      .sort();
+    expect(refs).toHaveLength(2);
+    for (const r of refs) expect(r.length).toBeLessThanOrEqual(255);
+    // Two identical invoices in one file are two occurrences of one key: same hash, :0 and :1.
+    expect(refs[0].replace(/:0$/, '')).toBe(refs[1].replace(/:1$/, ''));
+    expect(refs[0]).toMatch(/#[0-9a-f]{32}:0$/);
+    const again = await importIIF(ctx, iif);
+    expect(again.transactions).toBe(0);
   });
 
   it('overlong list values and huge amounts come back as issues; the rest of the file still imports', async () => {
