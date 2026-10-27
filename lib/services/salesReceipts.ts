@@ -745,7 +745,10 @@ async function reverseSalesReceiptPostings(
         .where(and(eq(items.companyId, tx.companyId), eq(items.id, line.itemId)));
     } else {
       // Average cost: weight the restored COGS back into averageCost (the GL gets the original
-      // COGS back, which differs from qty x today's average once the average has moved).
+      // COGS back, which differs from qty x today's average once the average has moved). The base
+      // is the item's BOOK value round2(qty x average) — what the sale's relief was taken from
+      // (inventory.ts bookValueRelief), as invoices.ts reverseInvoiceCOGS does: the unrounded
+      // product moved the average (and the next relief by a cent) on every unchanged re-save.
       const [cur] = await tx.db
         .select({
           qty: items.quantityOnHand,
@@ -758,7 +761,7 @@ async function reverseSalesReceiptPostings(
       const curQty = Money.of(cur?.qty ?? '0');
       const curAvg = Money.of(cur?.avg ?? '0');
       const newQty = curQty.plus(qty);
-      const newAvg = newQty.isZero() ? curAvg : curQty.times(curAvg).plus(cogs).dividedBy(newQty);
+      const newAvg = newQty.isZero() ? curAvg : Money.round2(curQty.times(curAvg)).plus(cogs).dividedBy(newQty);
       await tx.db
         .update(items)
         .set({
@@ -818,7 +821,21 @@ export async function voidSalesReceipt(ctx: ServiceContext, id: string) {
   }
 
   return inTransaction(ctx, async (tx) => {
-    await reverseSalesReceiptPostings(tx, receipt);
+    // Re-checked inside the transaction: a second void at the same moment must not reverse again.
+    const [current] = await tx.db
+      .select()
+      .from(salesReceipts)
+      .where(and(eq(salesReceipts.companyId, tx.companyId), eq(salesReceipts.id, id)));
+    if (!current || current.status === 'void') {
+      throw new ServiceError('CONFLICT', 'Sales receipt is already voided.');
+    }
+    if (await isDeposited(tx, id)) {
+      throw new ServiceError(
+        'CONFLICT',
+        'This sales receipt has been included in a deposit, so it cannot be voided. Remove it from the deposit (or void the deposit) first.',
+      );
+    }
+    await reverseSalesReceiptPostings(tx, current);
 
     // Mark the receipt void.
     const [updated] = await tx.db
@@ -887,7 +904,33 @@ export async function updateSalesReceipt(ctx: ServiceContext, id: string, input:
   await assertSalesTaxAllowed(ctx, input, [existing.taxRateId, ...keptTaxLines.map((l) => l.taxRateId)]);
 
   const prep = await prepareSalesReceipt(ctx, input);
+  await assertDepositedReceiptEdit(ctx, id, existing, prep, input);
 
+  return inTransaction(ctx, async (tx) => {
+    const [receipt] = await tx.db
+      .select()
+      .from(salesReceipts)
+      .where(and(eq(salesReceipts.companyId, tx.companyId), eq(salesReceipts.id, id)));
+    if (!receipt || receipt.status === 'void') {
+      throw new ServiceError('CONFLICT', 'Cannot edit a voided sales receipt.');
+    }
+    // Again inside the transaction: a deposit (or an edit) saved since the check above.
+    await assertDepositedReceiptEdit(tx, id, receipt, prep, input);
+    return updateSalesReceiptInTx(tx, id, input, prep, receipt);
+  });
+}
+
+/**
+ * Once the receipt is in a bank deposit its amount and deposit account are locked (the deposit
+ * moved exactly that money out of Undeposited Funds), and it cannot be dated after the deposit.
+ */
+async function assertDepositedReceiptEdit(
+  ctx: ServiceContext,
+  id: string,
+  existing: { total: string; depositAccountId: string | null },
+  prep: PreparedSalesReceipt,
+  input: CreateSalesReceiptInput,
+) {
   if (await isDeposited(ctx, id)) {
     if (!Money.eq(prep.total, existing.total) || prep.depositAccountId !== existing.depositAccountId) {
       throw new ServiceError(
@@ -917,15 +960,16 @@ export async function updateSalesReceipt(ctx: ServiceContext, id: string, input:
       );
     }
   }
+}
 
-  return inTransaction(ctx, async (tx) => {
-    const [receipt] = await tx.db
-      .select()
-      .from(salesReceipts)
-      .where(and(eq(salesReceipts.companyId, tx.companyId), eq(salesReceipts.id, id)));
-    if (!receipt || receipt.status === 'void') {
-      throw new ServiceError('CONFLICT', 'Cannot edit a voided sales receipt.');
-    }
+async function updateSalesReceiptInTx(
+  tx: ServiceContext,
+  id: string,
+  input: CreateSalesReceiptInput,
+  prep: PreparedSalesReceipt,
+  receipt: typeof salesReceipts.$inferSelect,
+) {
+  {
     const oldLines = await tx.db
       .select()
       .from(salesReceiptLines)
@@ -1003,5 +1047,5 @@ export async function updateSalesReceipt(ctx: ServiceContext, id: string, input:
     });
 
     return { ...updated, lines: insertedLines };
-  });
+  }
 }

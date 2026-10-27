@@ -37,6 +37,7 @@ import {
 } from './_base';
 import { createInvoice, type CreateInvoiceInput, type InvoiceLineInput } from './invoices';
 import { getPreferences } from './company';
+import { homeAmounts } from './currencies';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -111,6 +112,9 @@ export async function listUnbilled(
       accountId: billLines.accountId,
       date: bills.date,
       billNumber: bills.billNumber,
+      docId: bills.id,
+      currency: bills.currency,
+      exchangeRate: bills.exchangeRate,
     })
     .from(billLines)
     .innerJoin(bills, eq(billLines.billId, bills.id))
@@ -135,6 +139,9 @@ export async function listUnbilled(
       date: expenses.date,
       payeeName: expenses.payeeName,
       reference: expenses.reference,
+      docId: expenses.id,
+      currency: expenses.currency,
+      exchangeRate: expenses.exchangeRate,
     })
     .from(expenseLines)
     .innerJoin(expenses, eq(expenseLines.expenseId, expenses.id))
@@ -193,6 +200,36 @@ export async function listUnbilled(
     };
   });
 
+  // A foreign-currency bill / check stores its line amounts in that currency; the expense it
+  // recorded (and so what the customer is billed back, in home currency) is the line's HOME amount:
+  // the document's round2(total x rate) penny-allocated over its lines, exactly as it was posted
+  // (bills.ts / expenses.ts homeAmounts). Billing the foreign figure as dollars under-billed the
+  // customer and left the pass-through expense un-netted.
+  const homeByLine = new Map<string, string>();
+  const foreign = <T extends { docId: string; currency: string | null; exchangeRate: string | null }>(rows: T[]) =>
+    [...new Map(rows.filter((r) => r.currency && r.exchangeRate && !Money.eq(r.exchangeRate, 1)).map((r) => [r.docId, r])).values()];
+  for (const doc of foreign(billRows)) {
+    const lines = await ctx.db
+      .select({ id: billLines.id, amount: billLines.amount })
+      .from(billLines)
+      .where(eq(billLines.billId, doc.docId))
+      .orderBy(billLines.lineOrder);
+    const home = homeAmounts(lines.map((l) => l.amount), doc.exchangeRate!);
+    lines.forEach((l, i) => homeByLine.set(l.id, toAmountString(home.lines[i])));
+  }
+  for (const doc of foreign(expenseRows)) {
+    const lines = await ctx.db
+      .select({ id: expenseLines.id, amount: expenseLines.amount })
+      .from(expenseLines)
+      .where(eq(expenseLines.expenseId, doc.docId))
+      .orderBy(expenseLines.lineOrder);
+    // expenses.ts allocates over the line magnitudes (card credits are negative).
+    const home = homeAmounts(lines.map((l) => Money.of(l.amount).abs()), doc.exchangeRate!);
+    lines.forEach((l, i) =>
+      homeByLine.set(l.id, toAmountString(Money.of(l.amount).isNegative() ? home.lines[i].negated() : home.lines[i])),
+    );
+  }
+
   const costs: UnbilledCost[] = [
     ...billRows.map((r) => ({
       id: r.id,
@@ -200,7 +237,7 @@ export async function listUnbilled(
       date: r.date,
       ref: r.billNumber ?? null,
       description: r.description ?? null,
-      amount: r.amount,
+      amount: homeByLine.get(r.id) ?? r.amount,
       jobId: r.jobId ?? null,
       accountId: r.accountId ?? null,
     })),
@@ -210,7 +247,7 @@ export async function listUnbilled(
       date: r.date,
       ref: r.payeeName ?? r.reference ?? null,
       description: r.description ?? null,
-      amount: r.amount,
+      amount: homeByLine.get(r.id) ?? r.amount,
       jobId: r.jobId ?? null,
       accountId: r.accountId ?? null,
     })),
@@ -275,6 +312,8 @@ async function buildBillableLines(
       rate: t.rate,
       taxable: false,
       jobId: t.jobId,
+      // The line remembers the time it bills: an edit that removes it puts the time back.
+      billableSource: { kind: 'time_entry', id: t.id },
     });
   }
 
@@ -352,6 +391,9 @@ function costToLines(
       rate: toAmountString(base),
       taxable: false,
       jobId: cost.jobId,
+      // The cost line (not its markup line) remembers the cost it bills: an edit that removes it
+      // puts the cost back on the Time/Costs list.
+      billableSource: { kind: cost.source === 'bill' ? 'bill_line' : 'expense_line', id: cost.id },
     },
   ];
   const markupAmount = Money.round2(Money.mul(base, Money.div(markupPercent, 100)));

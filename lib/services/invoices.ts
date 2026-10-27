@@ -29,9 +29,9 @@
  * restoring stock), re-creates the lines, and re-posts — all inside ONE
  * transaction — preserving invoiceNumber and createdAt.
  */
-import { assertAccountantDatesOpen } from './accountantCopy/guard';
+import { assertAccountantDatesOpen, assertAccountantMayBillCosts } from './accountantCopy/guard';
 import { hasAccountantCost } from './accountantCopy/inventoryCost';
-import { and, eq, inArray, isNull, ne, sql } from 'drizzle-orm';
+import { and, eq, inArray, isNull, ne, or, sql } from 'drizzle-orm';
 import { assertSalesTaxAllowed } from '@/lib/featureGate';
 import { creditLimitFixes } from '@/lib/errorFixes';
 import { assertStockAvailable } from './stockWarning';
@@ -53,7 +53,7 @@ import {
   salesReps,
   taxRates,
 } from '@/lib/db/schema';
-import { billLines, depositLines, deposits, expenseLines, timeEntries } from '@/lib/db/schema';
+import { billLines, bills, depositLines, deposits, expenseLines, expenses, timeEntries } from '@/lib/db/schema';
 import {
   type ServiceContext,
   ServiceError,
@@ -89,6 +89,12 @@ import {
 // Types
 // ---------------------------------------------------------------------------
 
+/** The billable cost or time an invoice line bills (Invoice for Time & Expenses). */
+export interface BillableSource {
+  kind: 'bill_line' | 'expense_line' | 'time_entry';
+  id: string;
+}
+
 export interface InvoiceLineInput extends InventoryLineDetail {
   /** Optional product/service item; supplies incomeAccountId as fallback. */
   itemId?: string | null;
@@ -118,6 +124,14 @@ export interface InvoiceLineInput extends InventoryLineDetail {
    *  on an edit means "keep the link the matching old line had". Validated in prepareInvoice:
    *  it must be a line of an estimate for the same company and customer, for the same item. */
   estimateLineId?: string | null;
+  /**
+   * Billable time & costs: the bill line / check line / time entry this line bills. Set when the
+   * line is created from the Time/Costs list (billables.ts, billTimeToInvoice). On an edit the
+   * form sends it back (null = no longer bills it); omitted (undefined) means "keep the link the
+   * matching old line had". A stated link the invoice did not have is billed again only when that
+   * cost / time is unbilled and owed by the invoice's customer (keepBillableLinks).
+   */
+  billableSource?: BillableSource | null;
   /**
    * Internal (progress invoicing): the exact line amount when it differs from quantity × rate
    * only by rounding (a pro-rated quantity is kept at 4 decimals). Never accepted from the API.
@@ -421,6 +435,55 @@ async function invoicePaymentDepositOf(ctx: ServiceContext, invoiceId: string) {
   return row ?? null;
 }
 
+/**
+ * Retainage Receivable (1250) can never go below zero for a customer: what was billed out of it
+ * (invoice lines on the account) cannot exceed what their invoices hold. billRetainage and
+ * voidInvoice check this before they act; an edit (taking the retainage off a held invoice,
+ * raising a retainage billing) or a hand-typed line on 1250 is checked here, after the change is
+ * written, inside the same transaction — so a refused change rolls back. Only runs when the
+ * document touches retainage (`held` amounts or a line on 1250, before or after the change).
+ * Call it BEFORE the change (it records each customer's open retainage) and run the returned
+ * check AFTER it: a change that leaves the open amount below zero, and lower than it was, is
+ * refused (a file already below zero from older data can still be edited back up).
+ */
+async function retainageGuard(
+  tx: ServiceContext,
+  customerIds: string[],
+  touched: { held: Array<string | null | undefined>; lineAccountIds: Array<string | null | undefined> },
+): Promise<() => Promise<void>> {
+  const none = async () => {};
+  const [ret] = await tx.db
+    .select({ id: accounts.id })
+    .from(accounts)
+    .where(and(eq(accounts.companyId, tx.companyId), eq(accounts.code, '1250')));
+  if (!ret) return none;
+  const holds = touched.held.some((h) => h != null && Money.of(h).greaterThan(0));
+  if (!holds && !touched.lineAccountIds.some((id) => id === ret.id)) return none;
+  // Imported lazily: retainage.ts imports this module (createInvoice).
+  const { retainageReport } = await import('./retainage');
+  const ids = [...new Set(customerIds)];
+  const openOf = async (customerId: string) =>
+    Money.of((await retainageReport(tx, { customerId })).rows[0]?.open ?? '0');
+  const before = new Map<string, ReturnType<typeof Money.zero>>();
+  for (const customerId of ids) {
+    // Same lock as billRetainage / voidInvoice, so a release and this change cannot interleave.
+    await tx.db.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`retainage:${tx.companyId}:${customerId}`}))`);
+    before.set(customerId, await openOf(customerId));
+  }
+  return async () => {
+    for (const customerId of ids) {
+      const open = await openOf(customerId);
+      if (open.lessThan(0) && open.lessThan(before.get(customerId)!)) {
+        throw new ServiceError(
+          'CONFLICT',
+          `This would bill ${toAmountString(open.negated())} more retainage than this customer's invoices still hold, which would leave Retainage Receivable below zero. Reduce or void the retainage billing invoice first.`,
+          { retainageOpen: toAmountString(open) },
+        );
+      }
+    }
+  };
+}
+
 /** True when the invoice has payments applied beyond its own payment-item lines. */
 async function hasExternalPayments(
   ctx: ServiceContext,
@@ -513,6 +576,8 @@ type ComputedLine = {
   pricing: AppliedPricing | null;
   /** Estimate line billed by this line (progress invoicing / conversion), else null. */
   estimateLineId: string | null;
+  /** Billable cost / time billed by this line, else null. */
+  billableSource: BillableSource | null;
 };
 
 interface PreparedInvoice {
@@ -815,6 +880,7 @@ async function prepareInvoice(
         kind,
         pricing: null,
         estimateLineId: null,
+        billableSource: null,
       });
       runningBody = Money.zero(); // QB: a subtotal item resets the running group
       continue;
@@ -893,6 +959,7 @@ async function prepareInvoice(
       kind,
       pricing: kind === 'income' ? pricedLines[i].pricing : null,
       estimateLineId: kind === 'income' || kind === 'discount' ? (l.estimateLineId ?? null) : null,
+      billableSource: kind === 'income' ? billableSourceOf(l.billableSource) : null,
     });
   }
 
@@ -1485,6 +1552,10 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
     if (!isDraft) {
       await checkEstimateOverBilling(tx, prep.computedLines, { allowOverBilling: input.allowOverBilling });
     }
+    // A hand-typed line on Retainage Receivable bills retainage: no more than is held.
+    const checkRetainage = isDraft
+      ? async () => {}
+      : await retainageGuard(tx, [input.customerId], { held: [], lineAccountIds: prep.computedLines.map((l) => l.accountId) });
 
     const { refNumber, number: invoiceNumber } = await allocateDocNumber(tx, 'invoice', input.refNumber, {
       allowDuplicate: input.allowDuplicateNumber === true,
@@ -1553,6 +1624,7 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
         lineOrder: cl.lineOrder,
         pricing: cl.pricing as Record<string, unknown> | null,
         estimateLineId: cl.estimateLineId,
+        billableSource: cl.billableSource,
       })),
     );
 
@@ -1599,6 +1671,8 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
       lines: inventoryLinesOf(input.lines, prep),
       memo: `Invoice #${docRef(refNumber, invoiceNumber)}`,
     });
+
+    await checkRetainage();
 
     // 6) Audit trail.
     await writeAudit(tx, {
@@ -1647,46 +1721,6 @@ export async function postDraftInvoice(
     throw new ServiceError('CONFLICT', 'Only pending (draft) invoices can be posted.');
   }
 
-  const storedLines = await ctx.db
-    .select()
-    .from(invoiceLines)
-    .where(eq(invoiceLines.invoiceId, id))
-    .orderBy(invoiceLines.lineOrder);
-
-  // Rebuild the document input from storage. The stored header discount is the
-  // RESOLVED dollar amount, so it re-enters as a flat 'amount' discount.
-  const input: CreateInvoiceInput = {
-    customerId: existing.customerId,
-    date: existing.date,
-    dueDate: existing.dueDate,
-    taxRateId: existing.taxRateId,
-    classId: existing.classId,
-    jobId: existing.jobId,
-    salesRepId: existing.salesRepId,
-    discount: existing.discount,
-    discountType: 'amount',
-    retainagePercent: existing.retainagePercent,
-    currency: existing.currency,
-    exchangeRate: existing.exchangeRate,
-    memo: existing.memo,
-    customFields: existing.customFields ?? null,
-    overrideCreditLimit: opts?.overrideCreditLimit,
-    lines: storedLines.map((l) => ({
-      itemId: l.itemId,
-      accountId: l.accountId,
-      description: l.description,
-      quantity: l.quantity,
-      rate: l.rate,
-      taxable: l.taxable,
-      taxRateId: l.taxRateId,
-      classId: l.classId,
-      jobId: l.jobId,
-      pricing: { origin: (l.pricing as { origin?: string | null } | null)?.origin ?? null },
-    })),
-  };
-
-  const prep = await prepareInvoice(ctx, input, { excludeInvoiceId: id });
-
   return inTransaction(ctx, async (tx) => {
     // Re-load inside the transaction to close the read-then-post race.
     const [invoice] = await tx.db
@@ -1698,6 +1732,50 @@ export async function postDraftInvoice(
       throw new ServiceError('CONFLICT', 'Only pending (draft) invoices can be posted.');
     }
 
+    // The document is rebuilt from the header and lines read HERE: an edit of the draft saved
+    // after the user clicked Post (another user, no version header) must be posted as saved, or
+    // the header total, A/R and the stock relieved would follow the old lines while the lines
+    // show the new ones.
+    const storedLines = await tx.db
+      .select()
+      .from(invoiceLines)
+      .where(eq(invoiceLines.invoiceId, id))
+      .orderBy(invoiceLines.lineOrder);
+
+    // Rebuild the document input from storage. The stored header discount is the
+    // RESOLVED dollar amount, so it re-enters as a flat 'amount' discount.
+    const input: CreateInvoiceInput = {
+      customerId: invoice.customerId,
+      date: invoice.date,
+      dueDate: invoice.dueDate,
+      taxRateId: invoice.taxRateId,
+      classId: invoice.classId,
+      jobId: invoice.jobId,
+      salesRepId: invoice.salesRepId,
+      discount: invoice.discount,
+      discountType: 'amount',
+      retainagePercent: invoice.retainagePercent,
+      currency: invoice.currency,
+      exchangeRate: invoice.exchangeRate,
+      memo: invoice.memo,
+      customFields: invoice.customFields ?? null,
+      overrideCreditLimit: opts?.overrideCreditLimit,
+      lines: storedLines.map((l) => ({
+        itemId: l.itemId,
+        accountId: l.accountId,
+        description: l.description,
+        quantity: l.quantity,
+        rate: l.rate,
+        taxable: l.taxable,
+        taxRateId: l.taxRateId,
+        classId: l.classId,
+        jobId: l.jobId,
+        pricing: { origin: (l.pricing as { origin?: string | null } | null)?.origin ?? null },
+      })),
+    };
+
+    const prep = await prepareInvoice(tx, input, { excludeInvoiceId: id });
+
     // Lines that bill estimate lines start counting now: same over-billing rule as
     // createProgressInvoice (the stored links stay on the stored lines). A rejected estimate
     // is not billed at all.
@@ -1705,6 +1783,10 @@ export async function postDraftInvoice(
     await checkEstimateOverBilling(tx, storedLines, {
       excludeInvoiceId: id,
       allowOverBilling: opts?.allowOverBilling,
+    });
+    const checkRetainage = await retainageGuard(tx, [invoice.customerId], {
+      held: [],
+      lineAccountIds: prep.computedLines.map((l) => l.accountId),
     });
 
     // 1) Post the GL entry (assertPeriodOpen runs here, on the invoice date).
@@ -1741,6 +1823,7 @@ export async function postDraftInvoice(
       memo: `Invoice #${docRef(invoice.refNumber, invoice.invoiceNumber)}`,
       carryForward: true,
     });
+    await checkRetainage();
 
     // 4) Audit trail.
     await writeAudit(tx, {
@@ -1824,6 +1907,288 @@ function keepEstimateLinks(
   }
 }
 
+/** A well-formed billable link, or null. */
+function billableSourceOf(v: unknown): BillableSource | null {
+  if (!v || typeof v !== 'object') return null;
+  const { kind, id } = v as { kind?: unknown; id?: unknown };
+  if ((kind !== 'bill_line' && kind !== 'expense_line' && kind !== 'time_entry') || typeof id !== 'string' || !id) {
+    return null;
+  }
+  return { kind, id };
+}
+
+const sameSource = (a: BillableSource | null, b: BillableSource | null) => !!a && !!b && a.kind === b.kind && a.id === b.id;
+
+/**
+ * Billable time & costs through an invoice edit (QB: deleting a billable line puts the cost back
+ * on the Time/Costs list). A new line keeps the link of the old line it came from:
+ *  - the link it states (the form round-trips it; null = it bills nothing now) when the old lines
+ *    had it;
+ *  - a stated link the old lines did not have is billed again on this invoice when that cost /
+ *    time is unbilled and owed by this invoice's customer (Undo of an edit that removed the line,
+ *    or a form opened before another user's edit removed it); otherwise it is ignored;
+ *  - a line that states nothing (or an ignored link) takes the old linked line with the same item,
+ *    description and rate, then the same item and description, then the same item, account and
+ *    rate.
+ * Moving the invoice to another customer drops every link (those costs are owed by the old
+ * customer). releaseDroppedBillables then unbills what no new line bills.
+ */
+async function keepBillableLinks(
+  tx: ServiceContext,
+  invoiceId: string,
+  customerId: string,
+  lines: ComputedLine[],
+  inputLines: InvoiceLineInput[],
+  oldLines: Array<{
+    itemId: string | null;
+    accountId: string | null;
+    description: string | null;
+    rate: string;
+    billableSource: unknown;
+  }>,
+  customerChanged: boolean,
+) {
+  if (customerChanged) {
+    for (const cl of lines) cl.billableSource = null;
+    return;
+  }
+  const pool = oldLines
+    .map((o) => ({ ...o, source: billableSourceOf(o.billableSource) }))
+    .filter((o) => o.source);
+  // Lines whose link is settled by what they state.
+  const settled = new Set<ComputedLine>();
+  const claims: ComputedLine[] = [];
+  for (const cl of lines) {
+    if (inputLines[cl.lineOrder]?.billableSource === undefined) continue;
+    if (!cl.billableSource) {
+      settled.add(cl);
+      continue;
+    }
+    const at = pool.findIndex((o) => sameSource(o.source, cl.billableSource));
+    if (at < 0) {
+      claims.push(cl);
+      continue;
+    }
+    pool.splice(at, 1);
+    settled.add(cl);
+  }
+  for (const cl of claims) {
+    if (await claimBillable(tx, invoiceId, customerId, cl.billableSource!)) settled.add(cl);
+    else cl.billableSource = null;
+  }
+  const norm = (d: string | null) => (d ?? '').trim();
+  const passes: Array<(o: (typeof pool)[number], cl: ComputedLine) => boolean> = [
+    (o, cl) =>
+      (o.itemId ?? null) === (cl.itemId ?? null) &&
+      norm(o.description) === norm(cl.description) &&
+      Money.of(o.rate).equals(Money.of(cl.rate)),
+    (o, cl) => (o.itemId ?? null) === (cl.itemId ?? null) && norm(o.description) === norm(cl.description),
+    (o, cl) =>
+      (o.itemId ?? null) === (cl.itemId ?? null) &&
+      (o.accountId ?? null) === cl.accountId &&
+      Money.of(o.rate).equals(Money.of(cl.rate)),
+  ];
+  for (const match of passes) {
+    for (const cl of lines) {
+      if (cl.billableSource || settled.has(cl) || cl.kind !== 'income') continue;
+      const at = pool.findIndex((o) => match(o, cl));
+      if (at < 0) continue;
+      cl.billableSource = pool[at].source;
+      pool.splice(at, 1);
+    }
+  }
+}
+
+/**
+ * Bill a cost / time entry on this invoice from an edit (see keepBillableLinks): only when it is
+ * unbilled (or already billed by this invoice), owed by the invoice's customer, and its bill /
+ * check is not void — the same rule as billing it from the Time/Costs list. False when it is not.
+ */
+async function claimBillable(tx: ServiceContext, invoiceId: string, customerId: string, src: BillableSource): Promise<boolean> {
+  if (src.kind === 'bill_line') {
+    const [row] = await tx.db
+      .select({ id: billLines.id })
+      .from(billLines)
+      .innerJoin(bills, eq(bills.id, billLines.billId))
+      .where(
+        and(
+          eq(billLines.id, src.id),
+          eq(bills.companyId, tx.companyId),
+          ne(bills.status, 'void'),
+          eq(billLines.customerId, customerId),
+          or(isNull(billLines.billedInvoiceId), eq(billLines.billedInvoiceId, invoiceId)),
+        ),
+      );
+    if (!row) return false;
+    await assertAccountantMayBillCosts(tx);
+    const r = await tx.db
+      .update(billLines)
+      .set({ billedInvoiceId: invoiceId })
+      .where(and(eq(billLines.id, src.id), or(isNull(billLines.billedInvoiceId), eq(billLines.billedInvoiceId, invoiceId))))
+      .returning({ id: billLines.id });
+    return r.length === 1;
+  }
+  if (src.kind === 'expense_line') {
+    const [row] = await tx.db
+      .select({ id: expenseLines.id })
+      .from(expenseLines)
+      .innerJoin(expenses, eq(expenses.id, expenseLines.expenseId))
+      .where(
+        and(
+          eq(expenseLines.id, src.id),
+          eq(expenses.companyId, tx.companyId),
+          isNull(expenses.voidedAt),
+          eq(expenseLines.customerId, customerId),
+          or(isNull(expenseLines.billedInvoiceId), eq(expenseLines.billedInvoiceId, invoiceId)),
+        ),
+      );
+    if (!row) return false;
+    await assertAccountantMayBillCosts(tx);
+    const r = await tx.db
+      .update(expenseLines)
+      .set({ billedInvoiceId: invoiceId })
+      .where(
+        and(eq(expenseLines.id, src.id), or(isNull(expenseLines.billedInvoiceId), eq(expenseLines.billedInvoiceId, invoiceId))),
+      )
+      .returning({ id: expenseLines.id });
+    return r.length === 1;
+  }
+  const free = and(
+    eq(timeEntries.id, src.id),
+    eq(timeEntries.companyId, tx.companyId),
+    eq(timeEntries.customerId, customerId),
+    eq(timeEntries.billable, true),
+    or(isNull(timeEntries.invoicedInvoiceId), eq(timeEntries.invoicedInvoiceId, invoiceId)),
+  );
+  const [row] = await tx.db.select({ id: timeEntries.id }).from(timeEntries).where(free);
+  if (!row) return false;
+  await assertAccountantMayBillCosts(tx);
+  const r = await tx.db.update(timeEntries).set({ invoicedInvoiceId: invoiceId }).where(free).returning({ id: timeEntries.id });
+  return r.length === 1;
+}
+
+/**
+ * After an edit replaced an invoice's lines: the billable costs / time its OLD lines billed that
+ * no new line bills any more become unbilled again (only rows still stamped with this invoice).
+ * A new customer releases everything stamped with the invoice, as a void does. Returns what was
+ * released (for the audit trail).
+ */
+async function releaseDroppedBillables(
+  tx: ServiceContext,
+  invoiceId: string,
+  oldLines: Array<{ billableSource: unknown }>,
+  newLines: ComputedLine[],
+  customerChanged: boolean,
+): Promise<BillableSource[]> {
+  const released: BillableSource[] = [];
+  if (customerChanged) {
+    const t = await tx.db
+      .update(timeEntries)
+      .set({ invoicedInvoiceId: null })
+      .where(and(eq(timeEntries.companyId, tx.companyId), eq(timeEntries.invoicedInvoiceId, invoiceId)))
+      .returning({ id: timeEntries.id });
+    const b = await tx.db
+      .update(billLines)
+      .set({ billedInvoiceId: null })
+      .where(eq(billLines.billedInvoiceId, invoiceId))
+      .returning({ id: billLines.id });
+    const e = await tx.db
+      .update(expenseLines)
+      .set({ billedInvoiceId: null })
+      .where(eq(expenseLines.billedInvoiceId, invoiceId))
+      .returning({ id: expenseLines.id });
+    released.push(
+      ...b.map((r) => ({ kind: 'bill_line' as const, id: r.id })),
+      ...e.map((r) => ({ kind: 'expense_line' as const, id: r.id })),
+      ...t.map((r) => ({ kind: 'time_entry' as const, id: r.id })),
+    );
+    return released;
+  }
+  const kept = newLines.map((l) => l.billableSource).filter(Boolean) as BillableSource[];
+  const dropped = oldLines
+    .map((o) => billableSourceOf(o.billableSource))
+    .filter((s): s is BillableSource => !!s && !kept.some((k) => sameSource(k, s)));
+  const ids = (kind: BillableSource['kind']) => [...new Set(dropped.filter((s) => s.kind === kind).map((s) => s.id))];
+  const billIds = ids('bill_line');
+  const expenseIds = ids('expense_line');
+  const timeIds = ids('time_entry');
+  if (billIds.length) {
+    const r = await tx.db
+      .update(billLines)
+      .set({ billedInvoiceId: null })
+      .where(and(inArray(billLines.id, billIds), eq(billLines.billedInvoiceId, invoiceId)))
+      .returning({ id: billLines.id });
+    released.push(...r.map((x) => ({ kind: 'bill_line' as const, id: x.id })));
+  }
+  if (expenseIds.length) {
+    const r = await tx.db
+      .update(expenseLines)
+      .set({ billedInvoiceId: null })
+      .where(and(inArray(expenseLines.id, expenseIds), eq(expenseLines.billedInvoiceId, invoiceId)))
+      .returning({ id: expenseLines.id });
+    released.push(...r.map((x) => ({ kind: 'expense_line' as const, id: x.id })));
+  }
+  if (timeIds.length) {
+    const r = await tx.db
+      .update(timeEntries)
+      .set({ invoicedInvoiceId: null })
+      .where(
+        and(
+          eq(timeEntries.companyId, tx.companyId),
+          inArray(timeEntries.id, timeIds),
+          eq(timeEntries.invoicedInvoiceId, invoiceId),
+        ),
+      )
+      .returning({ id: timeEntries.id });
+    released.push(...r.map((x) => ({ kind: 'time_entry' as const, id: x.id })));
+  }
+  return released;
+}
+
+/**
+ * Progress invoices: a line that bills an estimate line can carry an exact pro-rated amount that
+ * differs from quantity × rate by rounding (createProgressInvoice: the line that finishes an
+ * estimate line bills exactly what is left). The invoice form sends quantity and rate only, so an
+ * edit that leaves such a line unchanged — same estimate line, item, quantity and rate — keeps its
+ * stored amount; otherwise re-saving would move the total by a cent and reopen the estimate.
+ * Each stored line is used once. prepareInvoice still checks the amount against quantity × rate.
+ */
+function keepExactProgressAmounts(
+  lines: InvoiceLineInput[],
+  oldLines: Array<{
+    itemId: string | null;
+    description: string | null;
+    quantity: string;
+    rate: string;
+    amount: string;
+    estimateLineId: string | null;
+  }>,
+): InvoiceLineInput[] {
+  const q4 = (v: unknown) => Money.of(v as string).toDecimalPlaces(4);
+  const pool = oldLines.filter(
+    (o) =>
+      o.estimateLineId &&
+      Money.gt(o.amount, 0) &&
+      !Money.round2(Money.mul(q4(o.quantity), q4(o.rate))).equals(Money.of(o.amount)),
+  );
+  if (pool.length === 0) return lines;
+  return lines.map((l) => {
+    if (l.amount != null || l.rate == null || l.rate === '') return l;
+    const at = pool.findIndex(
+      (o) =>
+        (l.estimateLineId === undefined
+          ? (o.description ?? '').trim() === (l.description ?? '').trim()
+          : l.estimateLineId === o.estimateLineId) &&
+        (o.itemId ?? null) === (l.itemId ?? null) &&
+        q4(o.quantity).equals(q4(l.quantity)) &&
+        q4(o.rate).equals(q4(l.rate)),
+    );
+    if (at < 0) return l;
+    const [o] = pool.splice(at, 1);
+    return { ...l, amount: o.amount };
+  });
+}
+
 export async function updateInvoice(ctx: ServiceContext, id: string, input: CreateInvoiceInput) {
   input = await applyCustomerTaxDefaults(ctx, input);
   input = await applyTermsDueDate(ctx, input);
@@ -1835,6 +2200,21 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
   if (!existing) throw notFound('Invoice');
   if (existing.status === 'void') {
     throw new ServiceError('CONFLICT', 'Cannot edit a voided invoice.');
+  }
+  if (input.lines?.length) {
+    const stored = await ctx.db
+      .select({
+        itemId: invoiceLines.itemId,
+        description: invoiceLines.description,
+        quantity: invoiceLines.quantity,
+        rate: invoiceLines.rate,
+        amount: invoiceLines.amount,
+        estimateLineId: invoiceLines.estimateLineId,
+      })
+      .from(invoiceLines)
+      .where(eq(invoiceLines.invoiceId, id))
+      .orderBy(invoiceLines.lineOrder);
+    input = { ...input, lines: keepExactProgressAmounts(input.lines, stored) };
   }
   // Payments/credits already applied stay applied (QB lets you edit a paid invoice) as long as
   // the edit keeps them valid; see assertEditKeepsApplications.
@@ -1899,6 +2279,9 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
         .where(eq(invoiceLines.invoiceId, id))
         .orderBy(invoiceLines.lineOrder);
       keepEstimateLinks(prep.computedLines, input.lines, oldDraftLines);
+      await keepBillableLinks(
+        tx, id, input.customerId, prep.computedLines, input.lines, oldDraftLines, input.customerId !== invoice.customerId,
+      );
       await tx.db.delete(invoiceLines).where(eq(invoiceLines.invoiceId, id));
       await tx.db.insert(invoiceLines).values(
         prep.computedLines.map((cl) => ({
@@ -1916,6 +2299,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
           lineOrder: cl.lineOrder,
           pricing: cl.pricing as Record<string, unknown> | null,
           estimateLineId: cl.estimateLineId,
+          billableSource: cl.billableSource,
         })),
       );
 
@@ -1925,6 +2309,9 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
         lines: inventoryLinesOf(input.lines, prep),
         carryForward: true,
       });
+      const billablesReleased = await releaseDroppedBillables(
+        tx, id, oldDraftLines, prep.computedLines, input.customerId !== invoice.customerId,
+      );
 
       const [updated] = await tx.db
         .update(invoices)
@@ -1969,6 +2356,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
           total: toAmountString(prep.total),
           refNumber: renum?.refNumber ?? invoice.refNumber,
           duplicateNumber: renum?.duplicate || undefined,
+          billablesReleased: billablesReleased.length ? billablesReleased : undefined,
         },
       });
 
@@ -1988,6 +2376,22 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
     }
     const externalPaid = await externalPaidAmount(tx, invoice);
     assertEditKeepsApplications(invoice, input, prep, externalPaid);
+    // Same deposit rule as the pre-check, again inside the transaction: a deposit of the
+    // payment-item lines saved in between (another user, no version header) took exactly their
+    // stored amount out of Undeposited Funds, so the edit may not change it.
+    if (await invoicePaymentDepositOf(tx, id)) {
+      const oldPayments = await storedPaymentLineTotal(tx, id);
+      if (
+        !Money.round2(oldPayments).equals(Money.round2(prep.paymentTotal)) ||
+        (input.currency ?? null) !== (invoice.currency ?? null) ||
+        !Money.eq(prep.exchangeRate, Money.of(invoice.exchangeRate ?? 1))
+      ) {
+        throw new ServiceError(
+          'CONFLICT',
+          'The payment recorded on this invoice is part of a bank deposit, so its amount, currency and exchange rate cannot change. Remove it from the deposit (or void the deposit) first.',
+        );
+      }
+    }
     // QB lets the user change the number on a saved invoice (duplicate → warn + confirm).
     const renum = await renumberDoc(
       tx, 'invoice', id, { refNumber: invoice.refNumber, number: invoice.invoiceNumber },
@@ -2004,12 +2408,20 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
     // Progress invoices: an edited line keeps billing the same estimate line (the form does not
     // send the link back), so the estimate's invoiced-to-date follows the edit.
     keepEstimateLinks(prep.computedLines, input.lines, oldLines);
+    await keepBillableLinks(
+      tx, id, input.customerId, prep.computedLines, input.lines, oldLines, input.customerId !== invoice.customerId,
+    );
     // The edited lines replace this invoice's old ones, so invoiced-to-date leaves it out.
     await checkEstimateOverBilling(tx, prep.computedLines, {
       excludeInvoiceId: id,
       allowOverBilling: input.allowOverBilling,
     });
     const estimatesBefore = await estimatesBilledByInvoice(tx, id);
+    // Retainage held on (or billed by) this invoice: the edit may not release more than is held.
+    const checkRetainage = await retainageGuard(tx, [invoice.customerId, input.customerId], {
+      held: [invoice.retainageAmount],
+      lineAccountIds: [...oldLines.map((l) => l.accountId), ...prep.computedLines.map((l) => l.accountId)],
+    });
 
     // 1) Void the original A/R journal entry (assertPeriodOpen runs on its date).
     if (invoice.postedEntryId) {
@@ -2039,7 +2451,13 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
         lineOrder: cl.lineOrder,
         pricing: cl.pricing as Record<string, unknown> | null,
         estimateLineId: cl.estimateLineId,
+        billableSource: cl.billableSource,
       })),
+    );
+
+    // Billable time & costs whose line the edit removed go back on the Time/Costs list.
+    const billablesReleased = await releaseDroppedBillables(
+      tx, id, oldLines, prep.computedLines, input.customerId !== invoice.customerId,
     );
 
     // 4) Re-post the GL entry from the new document, then update the header in
@@ -2100,6 +2518,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
       memo: `Invoice #${shownRef}`,
       carryForward: true,
     });
+    await checkRetainage();
 
     // 6) Audit trail with old + new values.
     await writeAudit(tx, {
@@ -2137,6 +2556,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
         total: toAmountString(prep.total),
         memo: input.memo ?? null,
         postedEntryId: entry.id,
+        billablesReleased: billablesReleased.length ? billablesReleased : undefined,
         lines: prep.computedLines.map((cl) => ({
           itemId: cl.itemId,
           description: cl.description,
@@ -2204,6 +2624,7 @@ export async function getInvoice(ctx: ServiceContext, id: string) {
       taxRateId: invoiceLines.taxRateId,
       lineOrder: invoiceLines.lineOrder,
       estimateLineId: invoiceLines.estimateLineId,
+      billableSource: invoiceLines.billableSource,
       itemName: items.name,
       itemType: items.type,
       unitOfMeasure: items.unitOfMeasure,
@@ -2250,16 +2671,44 @@ export async function voidInvoice(ctx: ServiceContext, id: string) {
   }
 
   return inTransaction(ctx, async (tx) => {
+    // Re-check inside the transaction (the checks above ran outside it): a second void of the same
+    // invoice (double click, two users) would otherwise run every reversal again — giving its
+    // sales order the invoiced quantities back twice — and a payment applied in between would be
+    // left on a void invoice.
+    const [current] = await tx.db
+      .select()
+      .from(invoices)
+      .where(and(eq(invoices.companyId, tx.companyId), eq(invoices.id, id)));
+    if (!current) throw notFound('Invoice');
+    if (current.status === 'void') {
+      throw new ServiceError('CONFLICT', 'Invoice is already voided.');
+    }
+    if (await hasExternalPayments(tx, current)) {
+      throw new ServiceError(
+        'CONFLICT',
+        'Cannot void an invoice that has payments applied. Unapply payments first.',
+      );
+    }
+    if (await invoicePaymentDepositOf(tx, id)) {
+      throw new ServiceError(
+        'CONFLICT',
+        'The payment recorded on this invoice has been included in a deposit, so the invoice cannot be voided. Remove it from the deposit (or void the deposit) first.',
+      );
+    }
+
     // Retainage held on this invoice that has already been billed (retainage.ts billRetainage):
     // voiding would take more out of Retainage Receivable than is left there for the customer.
-    if (Money.of(invoice.retainageAmount ?? '0').greaterThan(0) && invoice.status !== 'draft') {
+    // Everything below works from `current` (read inside this transaction), never the snapshot
+    // read before it: an edit saved in between voids the entry the snapshot names and posts a new
+    // one, and reversing the snapshot's entry would leave the edit's entry posted on a void invoice.
+    if (Money.of(current.retainageAmount ?? '0').greaterThan(0) && current.status !== 'draft') {
       // Same lock as billRetainage, so a release and this void cannot interleave.
       await tx.db.execute(
-        sql`SELECT pg_advisory_xact_lock(hashtext(${`retainage:${tx.companyId}:${invoice.customerId}`}))`,
+        sql`SELECT pg_advisory_xact_lock(hashtext(${`retainage:${tx.companyId}:${current.customerId}`}))`,
       );
       // Imported lazily: retainage.ts imports this module (createInvoice).
       const { retainageReport } = await import('./retainage');
-      const rep = await retainageReport(tx, { customerId: invoice.customerId });
+      const rep = await retainageReport(tx, { customerId: current.customerId });
       const row = rep.rows[0];
       const held = row?.documents.find((d) => d.kind === 'held' && d.invoiceId === id);
       if (row && held && Money.of(row.open).minus(Money.of(held.amount)).lessThan(0)) {
@@ -2271,13 +2720,13 @@ export async function voidInvoice(ctx: ServiceContext, id: string) {
     }
 
     // Reverse the GL entry.
-    if (invoice.postedEntryId) {
-      await voidJournalEntry(tx, invoice.postedEntryId);
+    if (current.postedEntryId) {
+      await voidJournalEntry(tx, current.postedEntryId);
     }
 
     // Reverse perpetual-inventory effects: void each COGS entry created by
     // createInvoice and put the relieved stock back on hand (and at its site).
-    await reverseInvoiceCOGS(tx, { id, date: invoice.date });
+    await reverseInvoiceCOGS(tx, { id, date: current.date });
     await reverseDocumentInventory(tx, 'invoice', id);
 
     // Invoices made from a sales order give the order back the quantities they invoiced.
@@ -2309,7 +2758,7 @@ export async function voidInvoice(ctx: ServiceContext, id: string) {
       action: 'void',
       entityType: 'invoice',
       entityId: id,
-      oldValues: { status: invoice.status },
+      oldValues: { status: current.status },
       newValues: { status: 'void' },
     });
 

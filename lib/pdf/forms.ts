@@ -183,6 +183,9 @@ export async function buildEstimatePdf(
         total: estimate.total,
         memo: estimate.memo ?? null,
       },
+      // The estimate's ship-to (customer default on create) prints, as on the emailed copy
+      // (salesForms.renderSalesForm) — the printed one left it off.
+      shipTo: (estimate.shipTo as Record<string, string> | null) ?? null,
       lines: lines.map((l) => ({
         description: l.description ?? '',
         quantity: l.quantity,

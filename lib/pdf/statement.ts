@@ -51,7 +51,9 @@ export async function renderStatementPdf(
   template?: PdfTemplate | null,
   company?: { addressLines?: string[]; phone?: string | null; email?: string | null },
 ): Promise<Uint8Array> {
-  const today = new Date().toISOString().slice(0, 10);
+  // This computer's calendar day (the UTC day is already tomorrow on a US evening).
+  const now = new Date();
+  const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
   const period =
     data.from && data.to
       ? `${fmtDate(data.from)} – ${fmtDate(data.to)}`

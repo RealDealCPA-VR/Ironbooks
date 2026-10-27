@@ -28,7 +28,7 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ error: 'customerId query parameter is required.' }, { status: 400 });
     }
 
-    let asOf = new Date();
+    let asOf: Date | undefined; // omitted = today (the company's calendar day, statements.ts)
     const asOfStr = searchParams.get('asOf');
     if (asOfStr) {
       asOf = new Date(asOfStr + 'T00:00:00.000Z');

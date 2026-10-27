@@ -39,6 +39,7 @@ import { convertToInvoice as convertSalesOrder } from './salesOrders';
 import { type SalesFormKind, sendQueuedEmails, setSendFlags } from './salesForms';
 import { docRef } from './docNumbers';
 import { arAgingDetail } from './reportsExtra';
+import { companyToday } from './salesDates';
 
 const DAY_MS = 86_400_000;
 
@@ -92,7 +93,8 @@ export async function incomeTracker(
   ctx: ServiceContext,
   opts?: { asOf?: Date; customerId?: string },
 ): Promise<IncomeTracker> {
-  const asOf = opts?.asOf ?? new Date();
+  // Default: today in the company's time zone (the UTC day is tomorrow in a US evening).
+  const asOf = opts?.asOf ?? (await companyToday(ctx));
   const today = startOfDay(asOf);
   /** Last instant of the as-of day: anything dated that day counts. */
   const cutoff = new Date(today.getTime() + DAY_MS - 1);
@@ -488,7 +490,7 @@ export async function collectionsCenter(
   ctx: ServiceContext,
   opts?: { asOf?: Date; almostDueDays?: number },
 ): Promise<CollectionsCenter> {
-  const today = startOfDay(opts?.asOf ?? new Date());
+  const today = startOfDay(opts?.asOf ?? (await companyToday(ctx)));
   const almostDueDays = Math.max(1, Math.min(90, opts?.almostDueDays ?? 7));
   const inv = await ctx.db
     .select({

@@ -44,6 +44,7 @@ import { taxIdFor } from './access';
 import { journalOpenItems } from './journal';
 import { generalJournalSourceSql } from './posting';
 import { docRef } from './docNumbers';
+import { companyToday } from './salesDates';
 
 // ---------------------------------------------------------------------------
 // Customer Statement
@@ -127,6 +128,29 @@ async function bouncedAmounts(
       (r.applications ?? []).reduce((s, a) => s.plus(Money.of(a.discountAmount ?? '0')), Money.zero()),
     ),
   }));
+}
+
+/**
+ * Early-payment discounts of bounced payments, per payment. recordBouncedCheck deletes the
+ * payment's applications (their discounts with them) and keeps a snapshot on the bounced-check
+ * row; the bounce line charges the payment PLUS those discounts back, so the statement must keep
+ * showing the discount credit the payment took, or it overstates the balance by the discount.
+ */
+async function bouncedPaymentDiscounts(
+  ctx: ServiceContext,
+  paymentIds: string[],
+): Promise<Map<string, ReturnType<typeof Money.zero>>> {
+  const out = new Map<string, ReturnType<typeof Money.zero>>();
+  if (paymentIds.length === 0) return out;
+  const rows = await ctx.db
+    .select({ paymentId: bouncedChecks.paymentId, applications: bouncedChecks.applications })
+    .from(bouncedChecks)
+    .where(and(eq(bouncedChecks.companyId, ctx.companyId), inArray(bouncedChecks.paymentId, paymentIds)));
+  for (const r of rows) {
+    const disc = (r.applications ?? []).reduce((s, a) => s.plus(Money.of(a.discountAmount ?? '0')), Money.zero());
+    if (disc.greaterThan(0)) out.set(r.paymentId, (out.get(r.paymentId) ?? Money.zero()).plus(disc));
+  }
+  return out;
 }
 
 /**
@@ -572,6 +596,25 @@ export async function customerStatement(
       );
     const priorBounced = await bouncedAmounts(ctx, customerId, { before: range.from });
     const priorRefunds = await refundAmounts(ctx, customerId, { before: range.from });
+    // Discounts of earlier payments that bounced since (their applications are gone).
+    const priorPaymentIds = (
+      await ctx.db
+        .select({ id: paymentsReceived.id })
+        .from(paymentsReceived)
+        .where(
+          and(
+            eq(paymentsReceived.companyId, ctx.companyId),
+            eq(paymentsReceived.customerId, customerId),
+            isNull(paymentsReceived.voidedAt),
+            isNotNull(paymentsReceived.bouncedAt),
+            lt(paymentsReceived.date, range.from),
+          ),
+        )
+    ).map((p) => p.id);
+    const priorBouncedDiscounts = [...(await bouncedPaymentDiscounts(ctx, priorPaymentIds)).values()].reduce(
+      (s, v) => s.plus(v),
+      Money.zero(),
+    );
 
     // Credit memos before range start (non-void) — they credit A/R at creation,
     // so they reduce what the customer owes just like payments.
@@ -592,7 +635,7 @@ export async function customerStatement(
     const priorInvoices = Money.of(priorInvoiceRow?.total ?? '0');
     const priorPayments = Money.of(priorPaymentRow?.total ?? '0');
     const priorCreditMemos = Money.of(priorCreditMemoRow?.total ?? '0');
-    const priorDiscounts = Money.of(priorDiscountRow?.total ?? '0');
+    const priorDiscounts = Money.of(priorDiscountRow?.total ?? '0').plus(priorBouncedDiscounts);
     openingBalance = priorInvoices
       .minus(priorPayments)
       .minus(priorCreditMemos)
@@ -671,6 +714,9 @@ export async function customerStatement(
           .groupBy(paymentApplications.paymentId)
       : [];
   const discountByPayment = new Map(discountRows.map((r) => [r.paymentId, Money.of(r.total)]));
+  for (const [paymentId, disc] of await bouncedPaymentDiscounts(ctx, paymentRows.map((p) => p.id))) {
+    discountByPayment.set(paymentId, (discountByPayment.get(paymentId) ?? Money.zero()).plus(disc));
+  }
   const bouncedRows = await bouncedAmounts(ctx, customerId, { from: range?.from, to: range?.to });
   const refundRows = await refundAmounts(ctx, customerId, { from: range?.from, to: range?.to });
 
@@ -869,8 +915,11 @@ function bucketFor(daysPastDue: number): AgingBucket {
 export async function openItemStatement(
   ctx: ServiceContext,
   customerId: string,
-  asOf: Date = new Date(),
+  asOfInput?: Date,
 ): Promise<OpenItemStatement> {
+  // Default: today's calendar day in the company's time zone (the UTC day is tomorrow in a US
+  // evening — the statement was dated tomorrow and an invoice due today aged a day past due).
+  const asOf = asOfInput ?? (await companyToday(ctx));
   const [cust] = await ctx.db
     .select({
       id: customers.id,
@@ -1069,7 +1118,7 @@ export async function batchStatements(
   const out: BatchStatementEntry[] = [];
   for (const c of custRows) {
     if (opts.format === 'open_item') {
-      const stmt = await openItemStatement(ctx, c.id, opts.asOf ?? new Date());
+      const stmt = await openItemStatement(ctx, c.id, opts.asOf);
       if (stmt.lines.length === 0) continue;
       out.push({ customerId: c.id, displayName: c.displayName, format: 'open_item', statement: stmt });
     } else {

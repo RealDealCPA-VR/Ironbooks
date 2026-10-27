@@ -1474,7 +1474,16 @@ export async function voidPayment(ctx: ServiceContext, id: string) {
   await assertPaymentReversible(ctx, payment, 'voided');
 
   return inTransaction(ctx, async (tx) => {
-    const applications = await reversePaymentEffects(tx, payment);
+    // Re-read inside the transaction: an edit saved in between posted a new entry (the snapshot
+    // above names the old one), and a second void must not run the reversal again.
+    const [current] = await tx.db
+      .select()
+      .from(paymentsReceived)
+      .where(and(eq(paymentsReceived.id, id), eq(paymentsReceived.companyId, tx.companyId)));
+    if (!current) throw notFound('Payment');
+    if (current.voidedAt) return { ...current, applications: [] }; // idempotent
+    await assertPaymentReversible(tx, current, 'voided');
+    const applications = await reversePaymentEffects(tx, current);
 
     // Stamp the payment void.
     const [updated] = await tx.db
@@ -1515,7 +1524,7 @@ export async function voidPayment(ctx: ServiceContext, id: string) {
  * The audit trail / transaction log records old and new values.
  */
 export async function updatePayment(ctx: ServiceContext, id: string, input: ReceivePaymentInput) {
-  const [payment] = await ctx.db
+  let [payment] = await ctx.db
     .select()
     .from(paymentsReceived)
     .where(and(eq(paymentsReceived.id, id), eq(paymentsReceived.companyId, ctx.companyId)));
@@ -1527,14 +1536,37 @@ export async function updatePayment(ctx: ServiceContext, id: string, input: Rece
   const takeOut = !!deposit && input.removeFromDeposit === true;
   // A deposited foreign payment keeps its stored rate unless one is typed (the list rate may have
   // moved since, which would change the home amount the deposit took out of Undeposited Funds).
-  if (deposit && !takeOut && (input.exchangeRate === undefined || input.exchangeRate === null || String(input.exchangeRate).trim() === '')) {
+  const typedInput = input;
+  const rateTyped = !(input.exchangeRate === undefined || input.exchangeRate === null || String(input.exchangeRate).trim() === '');
+  if (deposit && !takeOut && !rateTyped) {
     input = { ...input, exchangeRate: payment.exchangeRate };
   }
   if (deposit && !takeOut) await assertDepositedEditAllowed(ctx, payment, deposit, input);
   await assertPaymentReversible(ctx, payment, 'edited', { allowDeposited: !!deposit });
 
   return inTransaction(ctx, async (tx) => {
-    if (deposit && takeOut) await removePaymentFromDeposit(tx, deposit.id, id);
+    // Re-read inside the transaction: the version loaded above can be stale (a second save of the
+    // same edit, another user) — reversing it would leave the newer version's entry posted and
+    // post another one on top (A/R credited twice).
+    const [current] = await tx.db
+      .select()
+      .from(paymentsReceived)
+      .where(and(eq(paymentsReceived.id, id), eq(paymentsReceived.companyId, tx.companyId)));
+    if (!current) throw notFound('Payment');
+    if (current.voidedAt) throw new ServiceError('CONFLICT', 'Cannot edit a voided payment.');
+    if (current.bouncedAt) {
+      throw new ServiceError('CONFLICT', 'This payment was recorded as a bounced check, so it cannot be edited.');
+    }
+    payment = current;
+    // The deposit / refund checks above ran outside the transaction: a deposit (or refund) saved
+    // in between would let the edit change an amount the deposit already took out of Undeposited
+    // Funds. Re-run them against the state this transaction sees.
+    const depositNow = await paymentDepositOf(tx, id);
+    const takeOutNow = !!depositNow && input.removeFromDeposit === true;
+    input = depositNow && !takeOutNow && !rateTyped ? { ...typedInput, exchangeRate: current.exchangeRate } : typedInput;
+    if (depositNow && !takeOutNow) await assertDepositedEditAllowed(tx, current, depositNow, input);
+    await assertPaymentReversible(tx, current, 'edited', { allowDeposited: !!depositNow });
+    if (depositNow && takeOutNow) await removePaymentFromDeposit(tx, depositNow.id, id);
     const oldCredits = await tx.db
       .select({ creditMemoId: creditApplications.creditMemoId, invoiceId: creditApplications.invoiceId, amount: creditApplications.amount })
       .from(creditApplications)
@@ -1557,9 +1589,9 @@ export async function updatePayment(ctx: ServiceContext, id: string, input: Rece
         postedEntryId: payment.postedEntryId,
         applications: oldApps.map((a) => ({ invoiceId: a.invoiceId, amountApplied: a.amountApplied, discountAmount: a.discountAmount })),
         credits: oldCredits,
-        depositId: deposit?.id ?? null,
+        depositId: depositNow?.id ?? null,
       },
-      newValues: { action: 'edit', ...(deposit ? { deposit: takeOut ? 'removed' : 'kept' } : {}) },
+      newValues: { action: 'edit', ...(depositNow ? { deposit: takeOutNow ? 'removed' : 'kept' } : {}) },
     });
     // C4: earlier unapplied payments picked while editing are applied too (they used to be
     // dropped silently). They are applied from their own payment, exactly as on a new payment.
@@ -1602,71 +1634,74 @@ export interface RecordBouncedCheckInput {
  * Funds should simply be voided. Home-currency payments only.
  */
 export async function recordBouncedCheck(ctx: ServiceContext, input: RecordBouncedCheckInput) {
-  const [payment] = await ctx.db
-    .select()
-    .from(paymentsReceived)
-    .where(and(eq(paymentsReceived.id, input.paymentId), eq(paymentsReceived.companyId, ctx.companyId)));
-  if (!payment) throw notFound('Payment');
-  if (payment.voidedAt) throw new ServiceError('CONFLICT', 'This payment is voided — there is nothing to bounce.');
-  if (payment.bouncedAt) throw new ServiceError('CONFLICT', 'This payment is already recorded as bounced.');
-  if (payment.currency || !Money.eq(Money.of(payment.exchangeRate ?? 1), 1)) {
-    throw validation('Bounced checks can only be recorded for payments in your home currency.');
-  }
-  const amount = Money.of(payment.amount);
-  if (!amount.greaterThan(0)) throw validation('This payment received no money, so it cannot bounce.');
-
-  const [refund] = await ctx.db
-    .select({ id: journalEntries.id })
-    .from(journalEntries)
-    .where(
-      and(
-        eq(journalEntries.companyId, ctx.companyId),
-        eq(journalEntries.sourceRef, `refund:${payment.id}`),
-        eq(journalEntries.status, 'posted'),
-      ),
-    )
-    .limit(1);
-  if (refund) {
-    throw new ServiceError('CONFLICT', 'Part of this payment was refunded, so it cannot be recorded as bounced. Void the refund first.');
-  }
-
-  // Which bank did the money reach? Directly, or through a (non-void) deposit.
-  const ufId = await getUndepositedFundsId(ctx).catch(() => null);
-  const [dep] = await ctx.db
-    .select({ bankAccountId: deposits.depositAccountId, depositDate: deposits.date })
-    .from(depositLines)
-    .innerJoin(deposits, eq(deposits.id, depositLines.depositId))
-    .where(and(eq(depositLines.paymentId, payment.id), isNull(deposits.voidedAt)))
-    .limit(1);
-  let bankAccountId: string | null = dep?.bankAccountId ?? null;
-  if (!bankAccountId && payment.depositAccountId && payment.depositAccountId !== ufId) {
-    bankAccountId = payment.depositAccountId;
-  }
-  if (!bankAccountId) {
-    throw new ServiceError(
-      'CONFLICT',
-      'This payment has not been deposited to a bank yet, so it cannot bounce. If the check is no good, void the payment instead.',
-    );
-  }
-
   const bankFee = Money.round2(input.bankFee ?? 0);
   const customerFee = Money.round2(input.customerFee ?? 0);
   if (bankFee.lessThan(0) || customerFee.lessThan(0)) throw validation('Fees cannot be negative.');
   if (input.bankFeeAccountId) await assertAccount(ctx, input.bankFeeAccountId, 'Bank fee account', ['expense']);
   if (input.customerFeeAccountId) await assertAccount(ctx, input.customerFeeAccountId, 'Customer fee account', ['revenue']);
-
-  const arAccountId = await getArAccountId(ctx);
   const date = input.date ?? new Date();
-  // A check cannot come back before it was received (or before the deposit that carried it).
-  const day = (d: Date) => d.toISOString().slice(0, 10);
-  if (day(date) < day(payment.date)) {
-    throw validation(`The bounce date can't be before the payment date (${day(payment.date)}).`);
-  }
-  if (dep?.depositDate && day(date) < day(dep.depositDate)) {
-    throw validation(`The bounce date can't be before the check was deposited (${day(dep.depositDate)}).`);
-  }
 
   return inTransaction(ctx, async (tx) => {
+    // Every check runs on the payment as it is INSIDE the transaction: a void, edit, refund or
+    // deposit change saved after the user opened the payment must not be bounced from the stale
+    // copy (a void + bounce put the amount on A/R twice; an edited amount was reversed at the old one).
+    const [payment] = await tx.db
+      .select()
+      .from(paymentsReceived)
+      .where(and(eq(paymentsReceived.id, input.paymentId), eq(paymentsReceived.companyId, tx.companyId)));
+    if (!payment) throw notFound('Payment');
+    if (payment.voidedAt) throw new ServiceError('CONFLICT', 'This payment is voided — there is nothing to bounce.');
+    if (payment.bouncedAt) throw new ServiceError('CONFLICT', 'This payment is already recorded as bounced.');
+    if (payment.currency || !Money.eq(Money.of(payment.exchangeRate ?? 1), 1)) {
+      throw validation('Bounced checks can only be recorded for payments in your home currency.');
+    }
+    const amount = Money.of(payment.amount);
+    if (!amount.greaterThan(0)) throw validation('This payment received no money, so it cannot bounce.');
+
+    const [refund] = await tx.db
+      .select({ id: journalEntries.id })
+      .from(journalEntries)
+      .where(
+        and(
+          eq(journalEntries.companyId, tx.companyId),
+          eq(journalEntries.sourceRef, `refund:${payment.id}`),
+          eq(journalEntries.status, 'posted'),
+        ),
+      )
+      .limit(1);
+    if (refund) {
+      throw new ServiceError('CONFLICT', 'Part of this payment was refunded, so it cannot be recorded as bounced. Void the refund first.');
+    }
+
+    // Which bank did the money reach? Directly, or through a (non-void) deposit.
+    const ufId = await getUndepositedFundsId(tx).catch(() => null);
+    const [dep] = await tx.db
+      .select({ bankAccountId: deposits.depositAccountId, depositDate: deposits.date })
+      .from(depositLines)
+      .innerJoin(deposits, eq(deposits.id, depositLines.depositId))
+      .where(and(eq(depositLines.paymentId, payment.id), eq(deposits.companyId, tx.companyId), isNull(deposits.voidedAt)))
+      .limit(1);
+    let bankAccountId: string | null = dep?.bankAccountId ?? null;
+    if (!bankAccountId && payment.depositAccountId && payment.depositAccountId !== ufId) {
+      bankAccountId = payment.depositAccountId;
+    }
+    if (!bankAccountId) {
+      throw new ServiceError(
+        'CONFLICT',
+        'This payment has not been deposited to a bank yet, so it cannot bounce. If the check is no good, void the payment instead.',
+      );
+    }
+
+    const arAccountId = await getArAccountId(tx);
+    // A check cannot come back before it was received (or before the deposit that carried it).
+    const day = (d: Date) => d.toISOString().slice(0, 10);
+    if (day(date) < day(payment.date)) {
+      throw validation(`The bounce date can't be before the payment date (${day(payment.date)}).`);
+    }
+    if (dep?.depositDate && day(date) < day(dep.depositDate)) {
+      throw validation(`The bounce date can't be before the check was deposited (${day(dep.depositDate)}).`);
+    }
+
     const applications = await tx.db
       .select()
       .from(paymentApplications)

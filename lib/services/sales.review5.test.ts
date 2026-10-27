@@ -1,0 +1,1291 @@
+/**
+ * Round-5 review regressions (sales / A/R):
+ *  1. Receive Payments / Sales Receipt "Journal" (Ctrl+Y / Ctrl+H): the toolbar names the document
+ *     (payment:<id>, salesreceipt:<id>); the lookup must answer the entry that document posted.
+ *  2. Re-saving an unchanged sales receipt of an average-cost item keeps the average and the COGS.
+ *  3. Retainage: an edit may not leave Retainage Receivable negative (release more than is held).
+ *  4. Finance charges count interest from the last finance charge, not again from the due date.
+ *  5. Commissions: a 2.5% rate is kept at 4 decimals and commission is on sales, not sales tax.
+ *  6. Re-saving an unchanged final progress invoice keeps its exact amount (estimate stays closed).
+ *  7. "Today" on the server is the company's calendar day (estimate conversion, Income Tracker,
+ *     Collections Center, expiring estimates), not the UTC day.
+ *  8. Transaction History (Ctrl+H) of an invoice: undone credit applications are not listed and
+ *     documents show the number the user typed.
+ *  9. Collection letters list invoices by their document number.
+ * 10. Fulfillment packing slips ship to the sales order's own ship-to address.
+ * 11. The emailed / queued invoice PDF prints in the invoice's currency.
+ * 12. Bad amounts / dates on payment, credit-memo and estimate actions answer 400, not 500.
+ * 13. Billable costs from a foreign-currency bill are billed at their home amount.
+ * 14. Customer balance summary: unapplied credit memos and foreign invoices at home value.
+ * 15. Voiding the same invoice twice at once gives its sales order the quantities back only once.
+ * 24. A save that lands between an action's checks and its transaction (no version header): the
+ *     void of an invoice reverses the edited entry; a deposit in between keeps the deposited
+ *     amount of a payment / of an invoice's payment lines.
+ * 25. Record Bounced Check works on the payment as it is inside its transaction: a void, edit or
+ *     refund saved in between is not bounced from the stale copy; a stale version header is a 409.
+ * 26. Posting a pending invoice that was edited in between posts the edited lines.
+ * 27. An invoice edit that removes a billable cost / time line puts it back on the Time/Costs list
+ *     (unchanged re-saves keep it billed; a new customer releases them all).
+ */
+import { describe, it, expect, beforeAll, beforeEach, afterAll, afterEach, vi } from 'vitest';
+import path from 'node:path';
+import fs from 'node:fs';
+import { and, eq, sql } from 'drizzle-orm';
+import { getDb, closeDb, type DB } from '@/lib/db';
+import {
+  accounts,
+  billLines,
+  companies,
+  customers,
+  estimateLines,
+  invoices,
+  items,
+  journalEntryLines,
+  journalEntries,
+  paymentsReceived,
+  salesOrderLines,
+  salesOrders,
+  salesReps,
+  taxRates,
+  users,
+  vendors,
+} from '@/lib/db/schema';
+import type { ServiceContext } from './_base';
+import { createCompany } from './company';
+import { createCustomer, customerBalanceSummary } from './customers';
+import { createInvoice, getInvoice, postDraftInvoice, updateInvoice, voidInvoice } from './invoices';
+import { listBouncedChecks, receivePayment, recordBouncedCheck, refundPayment, updatePayment, voidPayment } from './payments';
+import { createSalesReceipt, getSalesReceipt, updateSalesReceipt } from './salesReceipts';
+import { adjustInventory } from './inventory';
+import { billRetainage, openRetainage } from './retainage';
+import { assessFinanceCharges, previewFinanceCharges } from './financeCharges';
+import { commissionReport, createSalesRep, updateSalesRep } from './salesReps';
+import { convertToInvoice as convertEstimate, createEstimate, createProgressInvoice, getEstimate } from './estimates';
+import { collectionsCenter, incomeTracker } from './incomeTracker';
+import { listExpiringEstimates } from './estimateExpiry';
+import { customerArLedgerBalance, customerStatement, openItemStatement } from './statements';
+import { buildLinkedTree } from './linkedTransactions';
+import { applyToInvoice, createCreditMemo, listCreditApplications, unapplyCreditApplication } from './creditMemos';
+import { listRecipients } from './letters';
+import { convertToInvoice as convertSalesOrder, createSalesOrder, updateSalesOrder, updateStatus as updateSalesOrderStatus } from './salesOrders';
+import { Money } from '@/lib/money';
+import { planShipments } from './fulfillment';
+import { packingSlipData } from '@/lib/fulfillmentPrint';
+import { buildEstimatePdf } from '@/lib/pdf/forms';
+import { renderSalesForm } from './salesForms';
+import { createInvoiceWithBillables, listUnbilled } from './billables';
+import { createBill } from './bills';
+import { setBaseCurrency, upsertCurrency } from './currencies';
+import { postJournalEntry } from './posting';
+import { createDeposit } from './deposits';
+import { createTimeEntry } from './timeTracking';
+import { commitUndo, performUndo, prepareUndo } from './undo';
+
+let routeCtx: ServiceContext;
+vi.mock('@/lib/context', () => ({ getServerContext: vi.fn(async () => routeCtx) }));
+const estPdfCalls: Array<Record<string, unknown>> = [];
+vi.mock('@/lib/pdf/estimate', async (orig) => ({
+  ...(await orig<typeof import('@/lib/pdf/estimate')>()),
+  renderEstimatePdf: vi.fn(async (data: Record<string, unknown>) => {
+    estPdfCalls.push(data);
+    return new Uint8Array([37, 80, 68, 70]);
+  }),
+}));
+const soPdfCalls: Array<Record<string, unknown>> = [];
+vi.mock('@/lib/pdf/salesOrder', async (orig) => ({
+  ...(await orig<typeof import('@/lib/pdf/salesOrder')>()),
+  renderSalesOrderPdf: vi.fn(async (data: Record<string, unknown>) => {
+    soPdfCalls.push(data);
+    return new Uint8Array([37, 80, 68, 70]);
+  }),
+}));
+const pdfCalls: Array<Record<string, unknown>> = [];
+vi.mock('@/lib/pdf/invoice', async (orig) => ({
+  ...(await orig<typeof import('@/lib/pdf/invoice')>()),
+  renderInvoicePdf: vi.fn(async (data: Record<string, unknown>) => {
+    pdfCalls.push(data);
+    return new Uint8Array([37, 80, 68, 70]);
+  }),
+}));
+import { GET as forSourceGET } from '@/app/api/journal-entries/for-source/route';
+import { POST as paymentPOST } from '@/app/api/payments/[id]/route';
+import { POST as creditMemoPOST } from '@/app/api/credit-memos/[id]/route';
+import { POST as estimatePOST } from '@/app/api/estimates/[id]/route';
+import { POST as paymentsPOST } from '@/app/api/payments/route';
+import { POST as customersPOST } from '@/app/api/customers/route';
+import { POST as expirePOST } from '@/app/api/estimates/expire/route';
+import { POST as invoicePostPOST } from '@/app/api/invoices/[id]/post/route';
+
+const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-review5-sales');
+let db: DB;
+let userId: string;
+let ctx: ServiceContext;
+let acct: Record<string, string> = {};
+let seq = 0;
+const d = (s: string) => new Date(`${s}T00:00:00.000Z`);
+const ymd = (x: Date | string) => new Date(x).toISOString().slice(0, 10);
+
+function req(url: string, body?: unknown) {
+  const u = new URL(`http://localhost${url}`);
+  return Object.assign(
+    new Request(u, body === undefined
+      ? { method: 'GET' }
+      : { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }),
+    { nextUrl: u },
+  ) as never;
+}
+const params = (id: string) => ({ params: Promise.resolve({ id }) }) as never;
+
+async function serviceItem(name = 'Consulting', price = '100.00') {
+  const [it] = await db
+    .insert(items)
+    .values({ companyId: ctx.companyId, name: `${name} ${seq}`, type: 'service' as never, salesPrice: price, incomeAccountId: acct['4000'] })
+    .returning();
+  return it.id;
+}
+
+async function inventoryItem(name = 'Widget') {
+  const [it] = await db
+    .insert(items)
+    .values({
+      companyId: ctx.companyId,
+      name: `${name} ${seq}`,
+      type: 'inventory' as never,
+      salesPrice: '10.00',
+      incomeAccountId: acct['4000'],
+      assetAccountId: acct['1300'],
+      expenseAccountId: acct['5000'],
+    })
+    .returning();
+  return it.id;
+}
+
+async function newCustomer(name: string, extra: Record<string, unknown> = {}) {
+  return (await createCustomer(ctx, { displayName: `${name} ${seq}`, ...extra } as never)).id;
+}
+
+async function plainInvoice(customerId: string, amount: string, date = '2026-03-01', extra: Record<string, unknown> = {}) {
+  return createInvoice(ctx, {
+    customerId,
+    date: d(date),
+    taxRateId: null,
+    lines: [{ accountId: acct['4000'], description: 'Work', quantity: 1, rate: amount, taxable: false }],
+    ...extra,
+  } as never);
+}
+
+/**
+ * A ctx for the action under test whose FIRST transaction runs `before` (another user's save,
+ * through the plain ctx) just before it begins — i.e. after the action's own pre-checks read the
+ * record. Makes a "saved in between" race deterministic (no version header on the request).
+ */
+function ctxWithSaveBefore(before: () => Promise<unknown>): ServiceContext {
+  let pending = true;
+  const proxied = new Proxy(db, {
+    get(target, prop) {
+      if (prop === 'transaction') {
+        return async (...args: unknown[]) => {
+          if (pending) {
+            pending = false;
+            await before();
+          }
+          return (target.transaction as (...a: unknown[]) => unknown).apply(target, args);
+        };
+      }
+      const v = Reflect.get(target, prop, target);
+      return typeof v === 'function' ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+    },
+  });
+  return { ...ctx, db: proxied as DB };
+}
+
+beforeAll(async () => {
+  fs.rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  db = await getDb(TEST_DIR);
+  const [u] = await db.insert(users).values({ email: 'r5-sales@test.local', name: 'R5 Sales', passwordHash: 'x' }).returning();
+  userId = u.id;
+});
+
+beforeEach(async () => {
+  seq += 1;
+  const company = await createCompany(db, { name: `R5 Sales ${seq}`, ownerId: userId });
+  ctx = { db, companyId: company.id, userId };
+  routeCtx = ctx;
+  acct = {};
+  for (const r of await db.select().from(accounts).where(eq(accounts.companyId, company.id))) acct[r.code] = r.id;
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+afterAll(async () => {
+  await closeDb(TEST_DIR);
+  try {
+    fs.rmSync(TEST_DIR, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  } catch {
+    /* Windows may hold a handle; the next run wipes it. */
+  }
+});
+
+describe('1. Journal / history lookup for a payment and a sales receipt', () => {
+  it('payment:<id> answers the payment’s own journal entry', async () => {
+    const cust = await newCustomer('Payer');
+    const inv = await plainInvoice(cust, '250.00');
+    const { payment } = await receivePayment(ctx, {
+      customerId: cust,
+      date: d('2026-03-05'),
+      method: 'check',
+      amount: '250.00',
+      depositAccountId: acct['1000'],
+      applications: [{ invoiceId: inv.id, amountApplied: '250.00' }],
+    });
+    const res = await forSourceGET(req(`/api/journal-entries/for-source?ref=payment:${payment.id}`));
+    expect(res.status).toBe(200);
+    expect((await res.json()).entryId).toBe(payment.postedEntryId);
+  });
+
+  it('salesreceipt:<id> answers the receipt entry, not one of its COGS entries', async () => {
+    const widget = await inventoryItem();
+    await adjustInventory(ctx, { itemId: widget, quantityChange: 10, unitCost: '2.00', date: d('2026-03-01') });
+    const sr = await createSalesReceipt(ctx, {
+      date: d('2026-03-02'),
+      depositAccountId: acct['1000'],
+      lines: [
+        { itemId: widget, quantity: 1, rate: '10.00', taxable: false },
+        { itemId: widget, quantity: 2, rate: '10.00', taxable: false },
+      ],
+    });
+    // Another posted entry under the receipt's sourceRef, written after it (a later cost entry):
+    // the newest-by-sourceRef search would answer this one instead of the receipt's own entry.
+    await new Promise((r) => setTimeout(r, 5));
+    const later = await postJournalEntry(ctx, {
+      date: d('2026-03-02'),
+      description: 'Later cost entry',
+      sourceRef: `salesreceipt:${sr.id}`,
+      lines: [
+        { accountId: acct['5000'], debit: '1.00', credit: '0' },
+        { accountId: acct['1000'], debit: '0', credit: '1.00' },
+      ],
+    });
+    expect(later.id).not.toBe(sr.postedEntryId);
+    const res = await forSourceGET(req(`/api/journal-entries/for-source?ref=salesreceipt:${sr.id}`));
+    expect(res.status).toBe(200);
+    expect((await res.json()).entryId).toBe(sr.postedEntryId);
+  });
+});
+
+describe('2. Sales receipt re-save keeps average cost and COGS', () => {
+  it('saving an unchanged sales receipt does not move the average or the cost of goods sold', async () => {
+    const widget = await inventoryItem();
+    // 3 units at 3.3333: average 3.3333, book value 10.00.
+    await adjustInventory(ctx, { itemId: widget, quantityChange: 3, unitCost: '3.3333', date: d('2026-03-01') });
+    const input = {
+      date: d('2026-03-02'),
+      depositAccountId: acct['1000'],
+      lines: [{ itemId: widget, quantity: 1, rate: '10.00', taxable: false }],
+    };
+    const sr = await createSalesReceipt(ctx, input);
+    const cogsOf = async () => {
+      const rows = await db
+        .select({ debit: journalEntryLines.debit })
+        .from(journalEntryLines)
+        .innerJoin(journalEntries, eq(journalEntries.id, journalEntryLines.journalEntryId))
+        .where(
+          and(
+            eq(journalEntries.companyId, ctx.companyId),
+            eq(journalEntries.sourceRef, `salesreceipt:${sr.id}`),
+            eq(journalEntries.status, 'posted'),
+            eq(journalEntryLines.accountId, acct['5000']),
+          ),
+        );
+      return rows.map((r) => r.debit);
+    };
+    expect(await cogsOf()).toEqual(['3.33']);
+    await updateSalesReceipt(ctx, sr.id, input);
+    await updateSalesReceipt(ctx, sr.id, input);
+    const [item] = await db.select().from(items).where(eq(items.id, widget));
+    expect(item.averageCost).toBe('3.3333');
+    expect(item.quantityOnHand).toBe('2.0000');
+    expect(await cogsOf()).toEqual(['3.33']);
+  });
+});
+
+describe('3. Retainage cannot be released twice through an edit', () => {
+  it('removing the retainage from an invoice whose retainage was billed is refused', async () => {
+    const cust = await newCustomer('Contractor');
+    const inv = await plainInvoice(cust, '1000.00', '2026-03-01', { retainagePercent: 10 });
+    expect(inv.retainageAmount).toBe('100.00');
+    await billRetainage(ctx, { customerId: cust, date: d('2026-04-01') });
+    expect(await openRetainage(ctx, cust)).toBe('0.00');
+    await expect(
+      updateInvoice(ctx, inv.id, {
+        customerId: cust,
+        date: d('2026-03-01'),
+        taxRateId: null,
+        retainagePercent: null,
+        lines: [{ accountId: acct['4000'], description: 'Work', quantity: 1, rate: '1000.00', taxable: false }],
+      }),
+    ).rejects.toMatchObject({ code: 'CONFLICT' });
+    expect(await openRetainage(ctx, cust)).toBe('0.00');
+  });
+
+  it('raising a retainage billing invoice above what is held is refused', async () => {
+    const cust = await newCustomer('Contractor B');
+    await plainInvoice(cust, '1000.00', '2026-03-01', { retainagePercent: 10 });
+    const bill = await billRetainage(ctx, { customerId: cust, date: d('2026-04-01'), amount: '60.00' });
+    await expect(
+      updateInvoice(ctx, bill.id, {
+        customerId: cust,
+        date: d('2026-04-01'),
+        taxRateId: null,
+        memo: 'Retainage billed',
+        lines: [{ accountId: acct['1250'], description: 'Retainage billed', quantity: 1, rate: '150.00', taxable: false }],
+      }),
+    ).rejects.toMatchObject({ code: 'CONFLICT' });
+    expect(await openRetainage(ctx, cust)).toBe('40.00');
+  });
+});
+
+describe('4. Finance charges', () => {
+  it('a second assessment charges only the days since the last finance charge', async () => {
+    const cust = await newCustomer('Late payer');
+    await plainInvoice(cust, '1000.00', '2026-01-01', { dueDate: d('2026-01-30') });
+    const settings = { annualRate: '18', minCharge: '0', graceDays: 0 };
+    const first = await assessFinanceCharges(ctx, { asOf: d('2026-03-01'), settings });
+    // 1000 x 18% / 365 x 30 days
+    expect(first.assessed.map((a) => a.charge)).toEqual(['14.79']);
+    const preview = await previewFinanceCharges(ctx, { asOf: d('2026-04-01'), settings });
+    const row = preview.customers.find((c) => c.customerId === cust)!;
+    // Only Mar 1 -> Apr 1 (31 days) is new: 1000 x 18% / 365 x 31 = 15.29.
+    expect(row.overdueInvoices[0].daysOverdue).toBe(61);
+    expect(row.overdueInvoices[0].daysCharged).toBe(31);
+    expect(row.charge).toBe('15.29');
+    // Voiding that earlier finance charge puts those days back in.
+    const [fc] = first.assessed;
+    await voidInvoice(ctx, fc.invoiceId);
+    const again = await previewFinanceCharges(ctx, { asOf: d('2026-04-01'), settings });
+    expect(again.customers.find((c) => c.customerId === cust)!.overdueInvoices[0].daysCharged).toBe(61);
+  });
+});
+
+describe('5. Sales rep commissions', () => {
+  it('keeps a 2.5% rate and pays commission on sales, not on sales tax', async () => {
+    const rep = await createSalesRep(ctx, { name: `Rep ${seq}`, commissionRate: '0.025' });
+    expect(rep.commissionRate).toBe('0.0250');
+    const again = await updateSalesRep(ctx, rep.id, { commissionRate: '0.0125' });
+    expect(again.commissionRate).toBe('0.0125');
+    await updateSalesRep(ctx, rep.id, { commissionRate: '0.025' });
+    const [tax] = await db.insert(taxRates).values({ companyId: ctx.companyId, name: 'State 8%', rate: '0.080000' }).returning();
+    const cust = await newCustomer('Buyer');
+    await createInvoice(ctx, {
+      customerId: cust,
+      date: d('2026-03-10'),
+      salesRepId: rep.id,
+      taxRateId: tax.id,
+      lines: [{ accountId: acct['4000'], quantity: 1, rate: '1000.00', taxable: true }],
+    });
+    const report = await commissionReport(ctx, { from: d('2026-03-01'), to: d('2026-03-31') });
+    const row = report.rows.find((r) => r.repId === rep.id)!;
+    expect(row.salesTotal).toBe('1000.00');
+    expect(row.commission).toBe('25.00');
+  });
+});
+
+describe('6. Final progress invoice re-save', () => {
+  it('an unchanged re-save keeps the exact final amount and the estimate stays closed', async () => {
+    const cust = await newCustomer('Builder');
+    const svc = await serviceItem('Framing', '33.3333');
+    const est = await createEstimate(ctx, {
+      customerId: cust,
+      date: d('2026-03-01'),
+      taxRateId: null,
+      lines: [{ itemId: svc, quantity: 3, rate: '33.3333', taxable: false }],
+    });
+    const line = (await getEstimate(ctx, est.id)).lines[0];
+    expect(line.amount).toBe('100.00');
+    for (const date of ['2026-03-05', '2026-03-10']) {
+      await createProgressInvoice(ctx, est.id, { lines: [{ lineId: line.id, quantity: 1 }], date: d(date) });
+    }
+    const last = await createProgressInvoice(ctx, est.id, { remaining: true, date: d('2026-03-15') });
+    expect(last.invoice.total).toBe('33.34');
+    expect(last.estimate.status).toBe('closed');
+    const saved = await getInvoice(ctx, last.invoice.id);
+    const edited = await updateInvoice(ctx, saved.id, {
+      customerId: cust,
+      date: saved.date,
+      taxRateId: null,
+      memo: 'Final billing',
+      lines: saved.lines.map((l) => ({
+        itemId: l.itemId,
+        description: l.description,
+        quantity: l.quantity,
+        rate: l.rate,
+        taxable: l.taxable,
+        estimateLineId: l.estimateLineId,
+      })),
+    });
+    expect(edited.total).toBe('33.34');
+    const after = await getEstimate(ctx, est.id);
+    expect(after.status).toBe('closed');
+    expect(after.lines[0].amountInvoiced).toBe('100.00');
+  });
+});
+
+describe('7. The server’s "today" is the company’s calendar day', () => {
+  // 9:30 pm on Oct 26 in New York (the company's time zone) is already Oct 27 in UTC.
+  const EVENING = new Date('2026-10-27T01:30:00.000Z');
+  const useEvening = () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(EVENING);
+  };
+
+  it('converting an estimate dates the invoice today', async () => {
+    const cust = await newCustomer('Quote taker');
+    const est = await createEstimate(ctx, {
+      customerId: cust,
+      date: d('2026-10-20'),
+      taxRateId: null,
+      lines: [{ description: 'Job', quantity: 1, rate: '500.00', taxable: false }],
+    });
+    useEvening();
+    const inv = await convertEstimate(ctx, est.id);
+    expect(new Date(inv.date).toISOString()).toBe('2026-10-26T00:00:00.000Z');
+  });
+
+  it('Income Tracker and Collections Center: an invoice due today is not overdue yet', async () => {
+    const cust = await newCustomer('Due today');
+    const inv = await plainInvoice(cust, '300.00', '2026-10-01', { dueDate: d('2026-10-26') });
+    useEvening();
+    const tracker = await incomeTracker(ctx);
+    expect(tracker.asOf).toBe('2026-10-26');
+    expect(tracker.rows.find((r) => r.id === inv.id)?.bucket).toBe('unpaid');
+    const center = await collectionsCenter(ctx);
+    expect(center.asOf).toBe('2026-10-26');
+    expect(center.overdue.find((c) => c.customerId === cust)).toBeUndefined();
+    expect(center.almostDue.find((c) => c.customerId === cust)?.invoices[0].daysPastDue).toBe(0);
+    const stmt = await openItemStatement(ctx, cust);
+    expect(stmt.asOf).toBe('2026-10-26');
+    expect(stmt.lines.find((l) => l.docId === inv.id)?.daysPastDue).toBe(0);
+  });
+
+  it('an estimate that expires today is still listed as expiring, and is not expired yet', async () => {
+    const cust = await newCustomer('Expiring');
+    const est = await createEstimate(ctx, {
+      customerId: cust,
+      date: d('2026-10-01'),
+      expirationDate: d('2026-10-26'),
+      taxRateId: null,
+      lines: [{ description: 'Quote', quantity: 1, rate: '50.00', taxable: false }],
+    });
+    useEvening();
+    expect((await listExpiringEstimates(ctx, 7)).map((e) => e.id)).toContain(est.id);
+    const res = await expirePOST(req('/api/estimates/expire', {}));
+    expect(res.status).toBe(200);
+    expect((await getEstimate(ctx, est.id)).status).toBe('draft');
+  });
+});
+
+describe('8. Transaction History of an invoice', () => {
+  it('lists only the credit applications still in place, with the typed document numbers', async () => {
+    const cust = await newCustomer('History');
+    const inv = await plainInvoice(cust, '400.00', '2026-03-01', { refNumber: 'INV-5001' });
+    const memo = await createCreditMemo(ctx, {
+      customerId: cust,
+      date: d('2026-03-02'),
+      refNumber: 'CM-77',
+      taxRateId: null,
+      lines: [{ accountId: acct['4000'], quantity: 1, rate: '100.00', taxable: false }],
+    });
+    await applyToInvoice(ctx, { creditMemoId: memo.id, invoiceId: inv.id, amount: '60.00' });
+    const [app] = await listCreditApplications(ctx, { invoiceId: inv.id });
+    await unapplyCreditApplication(ctx, app.id);
+    const tree = await buildLinkedTree(ctx, 'invoice', inv.id);
+    expect(tree.label).toBe('Invoice #INV-5001');
+    expect((tree.children ?? []).filter((c) => c.kind === 'credit_memo')).toEqual([]);
+
+    await applyToInvoice(ctx, { creditMemoId: memo.id, invoiceId: inv.id, amount: '25.00' });
+    const again = await buildLinkedTree(ctx, 'invoice', inv.id);
+    const cm = (again.children ?? []).filter((c) => c.kind === 'credit_memo');
+    expect(cm.map((c) => [c.label, c.amount])).toEqual([['Credit Memo #CM-77', '25.00']]);
+    const memoTree = await buildLinkedTree(ctx, 'credit_memo', memo.id);
+    expect(memoTree.label).toBe('Credit Memo #CM-77');
+    expect((memoTree.children ?? []).map((c) => [c.label, c.amount])).toEqual([['Invoice #INV-5001', '25.00']]);
+  });
+});
+
+describe('9. Collection letters', () => {
+  it('list open invoices by the number printed on them', async () => {
+    const cust = await newCustomer('Letter');
+    await plainInvoice(cust, '120.00', '2026-03-01', { refNumber: 'INV-9001', dueDate: d('2026-03-31') });
+    const [r] = await listRecipients(ctx, { type: 'customer', ids: [cust], today: '2026-05-01' });
+    expect(r.invoiceList).toContain('Invoice INV-9001');
+  });
+});
+
+describe('10. Fulfillment packing slips', () => {
+  it('ship to the address on the sales order', async () => {
+    const cust = await newCustomer('Shipper', { shippingAddress: { line1: '1 Main St', city: 'Albany', state: 'NY', zip: '12207' } });
+    const svc = await serviceItem('Install');
+    const so = await createSalesOrder(ctx, {
+      customerId: cust,
+      date: d('2026-03-01'),
+      taxRateId: null,
+      shipTo: { line1: '99 Dock Rd', city: 'Reno', state: 'NV', zip: '89501' },
+      lines: [{ itemId: svc, quantity: 2, rate: '100.00', taxable: false }],
+    });
+    const shipments = await planShipments(ctx, [{ salesOrderId: so.id }]);
+    const [slip] = await packingSlipData(ctx, 'R5 Co', shipments, '2026-03-02');
+    expect(slip.shipToLines?.[0]).toBe('99 Dock Rd');
+  });
+});
+
+describe('11. Invoice PDF for email / print queue', () => {
+  it('prints in the invoice’s currency', async () => {
+    const cust = await newCustomer('Euro buyer');
+    const inv = await plainInvoice(cust, '100.00');
+    await db.update(invoices).set({ currency: 'EUR', exchangeRate: '1.20000000' }).where(eq(invoices.id, inv.id));
+    pdfCalls.length = 0;
+    await renderSalesForm(ctx, 'invoice', inv.id);
+    expect(pdfCalls[0]?.currency).toBe('EUR');
+  });
+});
+
+describe('12. Bad input on A/R actions is a 400', () => {
+  it('payment apply / refund and credit-memo apply / refund with a bad amount or date', async () => {
+    const cust = await newCustomer('Bad input');
+    const inv = await plainInvoice(cust, '100.00');
+    const { payment } = await receivePayment(ctx, {
+      customerId: cust,
+      date: d('2026-03-05'),
+      method: 'check',
+      amount: '150.00',
+      depositAccountId: acct['1000'],
+      applications: [{ invoiceId: inv.id, amountApplied: '100.00' }],
+    });
+    const bad: Array<{ status: number }> = [
+      await paymentPOST(req(`/api/payments/${payment.id}`, { action: 'apply', applications: [{ invoiceId: inv.id, amountApplied: 'abc' }] }), params(payment.id)),
+      await paymentPOST(req(`/api/payments/${payment.id}`, { action: 'unapply', invoiceId: inv.id, amount: 'lots' }), params(payment.id)),
+      await paymentPOST(req(`/api/payments/${payment.id}`, { action: 'refund', bankAccountId: acct['1000'], amount: '10.00', date: 'not-a-date' }), params(payment.id)),
+      await paymentPOST(req(`/api/payments/${payment.id}`, { action: 'refund', bankAccountId: acct['1000'], amount: 'ten' }), params(payment.id)),
+    ];
+    const memo = await createCreditMemo(ctx, {
+      customerId: cust,
+      date: d('2026-03-02'),
+      taxRateId: null,
+      lines: [{ accountId: acct['4000'], quantity: 1, rate: '50.00', taxable: false }],
+    });
+    bad.push(
+      await creditMemoPOST(req(`/api/credit-memos/${memo.id}`, { action: 'apply', invoiceId: inv.id, amount: 'abc' }), params(memo.id)),
+      await creditMemoPOST(req(`/api/credit-memos/${memo.id}`, { action: 'refund', bankAccountId: acct['1000'], amount: '5.00', date: 'garbage' }), params(memo.id)),
+    );
+    expect(bad.map((r) => r.status)).toEqual([400, 400, 400, 400, 400, 400]);
+  });
+
+  it('estimate progress with a percentage that is not a number', async () => {
+    const cust = await newCustomer('Progress bad');
+    const est = await createEstimate(ctx, {
+      customerId: cust,
+      date: d('2026-03-01'),
+      taxRateId: null,
+      lines: [{ description: 'Job', quantity: 1, rate: '500.00', taxable: false }],
+    });
+    const res = await estimatePOST(req(`/api/estimates/${est.id}`, { action: 'progress', percent: 'half' }), params(est.id));
+    expect(res.status).toBe(400);
+  });
+});
+
+describe('13. Billable costs from a foreign-currency bill', () => {
+  it('are billed at the home amount the bill posted', async () => {
+    await setBaseCurrency(ctx, { code: 'USD', name: 'US Dollar' });
+    await upsertCurrency(ctx, { code: 'EUR', name: 'Euro', rateToBase: '1.20' });
+    const cust = await newCustomer('Reimburser');
+    const [v] = await db.insert(vendors).values({ companyId: ctx.companyId, displayName: `Euro vendor ${seq}`, currency: 'EUR' }).returning();
+    await createBill(ctx, {
+      vendorId: v.id,
+      date: d('2026-03-01'),
+      currency: 'EUR',
+      exchangeRate: '1.20',
+      lines: [{ accountId: acct['6300'], amount: '100.00', customerId: cust, description: 'Parts' }],
+    } as never);
+    const unbilled = await listUnbilled(ctx, cust);
+    expect(unbilled.costs.map((c) => c.amount)).toEqual(['120.00']);
+  });
+});
+
+describe('14. Customer balance summary', () => {
+  it('nets unapplied credit memos and converts foreign invoices to home currency', async () => {
+    const cust = await newCustomer('Summary');
+    await plainInvoice(cust, '500.00');
+    await createCreditMemo(ctx, {
+      customerId: cust,
+      date: d('2026-03-02'),
+      taxRateId: null,
+      lines: [{ accountId: acct['4000'], quantity: 1, rate: '100.00', taxable: false }],
+    });
+    const euro = await plainInvoice(cust, '100.00', '2026-03-03');
+    await db.update(invoices).set({ currency: 'EUR', exchangeRate: '1.20000000' }).where(eq(invoices.id, euro.id));
+    const row = (await customerBalanceSummary(ctx)).find((r) => r.customerId === cust)!;
+    // 500 + 120 (EUR 100 at 1.20) - 100 credit
+    expect(row.totalBalanceDue).toBe('520.00');
+  });
+});
+
+describe('15. Double void of an invoice made from a sales order', () => {
+  it('gives the order the invoiced quantity back once', async () => {
+    const cust = await newCustomer('Orderer');
+    const svc = await serviceItem('Units');
+    const so = await createSalesOrder(ctx, {
+      customerId: cust,
+      date: d('2026-03-01'),
+      taxRateId: null,
+      lines: [{ itemId: svc, quantity: 10, rate: '10.00', taxable: false }],
+    });
+    const [line] = await db.select().from(salesOrderLines).where(eq(salesOrderLines.salesOrderId, so.id));
+    const a = await convertSalesOrder(ctx, so.id, { lines: [{ lineId: line.id, quantity: 4 }] });
+    await convertSalesOrder(ctx, so.id);
+    await Promise.allSettled([voidInvoice(ctx, a.id), voidInvoice(ctx, a.id)]);
+    const [after] = await db.select().from(salesOrderLines).where(eq(salesOrderLines.id, line.id));
+    expect(after.quantityInvoiced).toBe('6.0000');
+  });
+});
+
+// Keep unused-import lint quiet for helpers used only in some cases.
+void companies;
+void customers;
+void estimateLines;
+void salesReps;
+void getSalesReceipt;
+
+describe('16. Payment double submits', () => {
+  async function paidInvoice(label: string) {
+    const cust = await newCustomer(label);
+    const inv = await plainInvoice(cust, '200.00');
+    const { payment } = await receivePayment(ctx, {
+      customerId: cust,
+      date: d('2026-03-05'),
+      method: 'check',
+      reference: '1001',
+      amount: '200.00',
+      depositAccountId: acct['1000'],
+      applications: [{ invoiceId: inv.id, amountApplied: '200.00' }],
+    });
+    return { cust, inv, payment };
+  }
+  const arBalance = async () => {
+    const [a] = await db.select({ balance: accounts.balance }).from(accounts).where(eq(accounts.id, acct['1200']));
+    return a.balance;
+  };
+
+  it('recording the same bounced check twice at once reverses the payment once', async () => {
+    const { payment } = await paidInvoice('Bouncer');
+    const res = await Promise.allSettled([
+      recordBouncedCheck(ctx, { paymentId: payment.id, date: d('2026-03-10') }),
+      recordBouncedCheck(ctx, { paymentId: payment.id, date: d('2026-03-10') }),
+    ]);
+    expect(res.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+    expect(await listBouncedChecks(ctx)).toHaveLength(1);
+    expect(await arBalance()).toBe('200.00');
+  });
+
+  it('saving the same payment edit twice at once leaves one posted payment entry', async () => {
+    const { cust, inv, payment } = await paidInvoice('Editor');
+    const edit = {
+      customerId: cust,
+      date: d('2026-03-06'),
+      method: 'check' as const,
+      reference: '1001',
+      amount: '150.00',
+      depositAccountId: acct['1000'],
+      applications: [{ invoiceId: inv.id, amountApplied: '150.00' }],
+    };
+    await Promise.allSettled([updatePayment(ctx, payment.id, edit), updatePayment(ctx, payment.id, edit)]);
+    const live = await db
+      .select({ id: journalEntries.id })
+      .from(journalEntries)
+      .where(
+        and(
+          eq(journalEntries.companyId, ctx.companyId),
+          eq(journalEntries.sourceRef, `customer:${cust}`),
+          eq(journalEntries.status, 'posted'),
+        ),
+      );
+    expect(live).toHaveLength(1);
+    expect(await arBalance()).toBe('50.00');
+    expect((await getInvoice(ctx, inv.id)).balanceDue).toBe('50.00');
+  });
+});
+
+describe('17. Transaction History of partial invoices shows their source document', () => {
+  it('a progress invoice lists its estimate and a partial sales-order invoice lists its order', async () => {
+    const cust = await newCustomer('Sources');
+    const svc = await serviceItem('Phase');
+    const est = await createEstimate(ctx, {
+      customerId: cust,
+      date: d('2026-03-01'),
+      refNumber: 'Q-12',
+      taxRateId: null,
+      lines: [{ itemId: svc, quantity: 4, rate: '100.00', taxable: false }],
+    });
+    const progress = await createProgressInvoice(ctx, est.id, { percent: 25, date: d('2026-03-05') });
+    const pTree = await buildLinkedTree(ctx, 'invoice', progress.invoice.id);
+    expect((pTree.children ?? []).filter((c) => c.kind === 'estimate').map((c) => c.label)).toEqual(['Estimate #Q-12']);
+
+    const so = await createSalesOrder(ctx, {
+      customerId: cust,
+      date: d('2026-03-01'),
+      refNumber: 'SO-7',
+      taxRateId: null,
+      lines: [{ itemId: svc, quantity: 10, rate: '10.00', taxable: false }],
+    });
+    const [line] = await db.select().from(salesOrderLines).where(eq(salesOrderLines.salesOrderId, so.id));
+    const part = await convertSalesOrder(ctx, so.id, { lines: [{ lineId: line.id, quantity: 3 }] });
+    const sTree = await buildLinkedTree(ctx, 'invoice', part.id);
+    expect((sTree.children ?? []).filter((c) => c.kind === 'sales_order').map((c) => c.label)).toEqual(['Sales Order #SO-7']);
+  });
+});
+
+describe('18. Indexes on A/R lines and applications (migration 0064)', () => {
+  it('a document’s lines, its applications and a customer’s invoices are looked up by index', async () => {
+    const rows = (await db.execute(sql`SELECT indexname FROM pg_indexes WHERE schemaname = 'public'`)) as unknown as {
+      rows: Array<{ indexname: string }>;
+    };
+    const names = new Set(rows.rows.map((r) => r.indexname));
+    for (const n of [
+      'invoice_lines_invoice_idx',
+      'invoices_company_customer_idx',
+      'payment_applications_payment_idx',
+      'payment_applications_invoice_idx',
+      'payments_received_company_customer_idx',
+      'credit_memos_company_customer_idx',
+      'credit_memo_lines_memo_idx',
+      'credit_applications_payment_idx',
+      'sales_receipt_lines_receipt_idx',
+      'estimate_lines_estimate_idx',
+      'sales_order_lines_order_idx',
+    ]) {
+      expect(names.has(n), n).toBe(true);
+    }
+  });
+});
+
+describe('19. Sales order edits racing a conversion', () => {
+  async function order(label: string) {
+    const cust = await newCustomer(label);
+    const svc = await serviceItem('Boxes');
+    const so = await createSalesOrder(ctx, {
+      customerId: cust,
+      date: d('2026-03-01'),
+      taxRateId: null,
+      lines: [{ itemId: svc, quantity: 10, rate: '10.00', taxable: false }],
+    });
+    const [line] = await db.select().from(salesOrderLines).where(eq(salesOrderLines.salesOrderId, so.id));
+    return { cust, svc, so, line };
+  }
+
+  it('voiding an order while it is being invoiced never leaves a void order with invoiced quantities', async () => {
+    const { so, line } = await order('Void race');
+    await Promise.allSettled([
+      updateSalesOrderStatus(ctx, so.id, 'void'),
+      convertSalesOrder(ctx, so.id, { lines: [{ lineId: line.id, quantity: 4 }] }),
+    ]);
+    const [after] = await db.select().from(salesOrderLines).where(eq(salesOrderLines.id, line.id));
+    const [hdr] = await db.select().from(salesOrders).where(eq(salesOrders.id, so.id));
+    expect(hdr.status === 'void' && Money.gt(after.quantityInvoiced ?? '0', 0)).toBe(false);
+  });
+
+  it('an edit saved while the order is being invoiced keeps the invoiced quantity', async () => {
+    const { cust, svc, so, line } = await order('Edit race');
+    // Fixed order: the conversion (4 units) commits after the edit read the order and just before
+    // the edit's transaction begins.
+    const ectx = ctxWithSaveBefore(() => convertSalesOrder(ctx, so.id, { lines: [{ lineId: line.id, quantity: 4 }] }));
+    await updateSalesOrder(ectx, so.id, {
+      customerId: cust,
+      date: d('2026-03-01'),
+      taxRateId: null,
+      memo: 'Rush',
+      lines: [{ id: line.id, itemId: svc, quantity: 10, rate: '10.00', taxable: false }],
+    });
+    const [after] = await db.select().from(salesOrderLines).where(eq(salesOrderLines.salesOrderId, so.id));
+    const invoiced = await db.select().from(invoices).where(and(eq(invoices.companyId, ctx.companyId), eq(invoices.customerId, cust)));
+    expect(invoiced).toHaveLength(1);
+    expect(after.quantityInvoiced).toBe('4.0000');
+  });
+});
+
+describe('20. Sales order PDF backorder note', () => {
+  it('prints the backordered quantity exactly', async () => {
+    const cust = await newCustomer('Backorder');
+    const svc = await serviceItem('Rope');
+    const so = await createSalesOrder(ctx, {
+      customerId: cust,
+      date: d('2026-03-01'),
+      taxRateId: null,
+      lines: [{ itemId: svc, description: 'Rope', quantity: '0.3', rate: '10.00', taxable: false }],
+    });
+    const [line] = await db.select().from(salesOrderLines).where(eq(salesOrderLines.salesOrderId, so.id));
+    await convertSalesOrder(ctx, so.id, { lines: [{ lineId: line.id, quantity: '0.1' }] });
+    soPdfCalls.length = 0;
+    await renderSalesForm(ctx, 'sales_order', so.id);
+    const lines = soPdfCalls[0]?.lines as Array<{ description: string }>;
+    expect(lines[0].description).toBe('Rope (backordered: 0.2)');
+  });
+});
+
+describe('21. Text longer than its column is a 400', () => {
+  it('a payment reference / customer name too long for its field answers 400 with a plain message', async () => {
+    const cust = await newCustomer('Long ref');
+    const res = await paymentsPOST(
+      req('/api/payments', {
+        customerId: cust,
+        date: '2026-03-05',
+        method: 'check',
+        reference: 'R'.repeat(150),
+        amount: '10.00',
+        depositAccountId: acct['1000'],
+        applications: [],
+      }),
+    );
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/too long/i);
+    const res2 = await customersPOST(req('/api/customers', { displayName: 'N'.repeat(300) }));
+    expect(res2.status).toBe(400);
+  });
+});
+
+describe('22. Printed estimate', () => {
+  it('prints the estimate’s ship-to address', async () => {
+    const cust = await newCustomer('Quote ship');
+    const est = await createEstimate(ctx, {
+      customerId: cust,
+      date: d('2026-03-01'),
+      taxRateId: null,
+      shipTo: { line1: '5 Site Ln', city: 'Troy', state: 'NY', zip: '12180' },
+      lines: [{ description: 'Deck', quantity: 1, rate: '900.00', taxable: false }],
+    });
+    estPdfCalls.length = 0;
+    await buildEstimatePdf(ctx, est.id);
+    expect((estPdfCalls[0]?.shipTo as Record<string, string> | null)?.line1).toBe('5 Site Ln');
+  });
+});
+
+describe('23. Statement after a bounced check that had taken a discount', () => {
+  it('still shows the discount credit, so the statement ties to the customer’s A/R', async () => {
+    const cust = await newCustomer('Discount bounce');
+    const inv = await plainInvoice(cust, '100.00', '2026-03-01');
+    const { payment } = await receivePayment(ctx, {
+      customerId: cust,
+      date: d('2026-03-05'),
+      method: 'check',
+      reference: '77',
+      amount: '98.00',
+      depositAccountId: acct['1000'],
+      applications: [{ invoiceId: inv.id, amountApplied: '98.00', discountAmount: '2.00' }],
+    });
+    await recordBouncedCheck(ctx, { paymentId: payment.id, date: d('2026-03-12') });
+    const gl = await customerArLedgerBalance(ctx, cust);
+    expect(gl).toBe('100.00');
+    expect((await customerStatement(ctx, cust)).closingBalance).toBe(gl);
+    const ranged = await customerStatement(ctx, cust, { from: d('2026-03-10'), to: d('2026-03-31') });
+    expect(ranged.closingBalance).toBe(gl);
+  });
+});
+
+describe('24. Saves that land between a check and its transaction (no version header)', () => {
+  const balanceOf = async (code: string) => {
+    const [a] = await db.select({ balance: accounts.balance }).from(accounts).where(eq(accounts.id, acct[code]));
+    return a.balance;
+  };
+  const postedFor = (ref: string) =>
+    db
+      .select({ id: journalEntries.id })
+      .from(journalEntries)
+      .where(and(eq(journalEntries.companyId, ctx.companyId), eq(journalEntries.sourceRef, ref), eq(journalEntries.status, 'posted')));
+
+  it('voiding an invoice that someone else just edited reverses the edited entry', async () => {
+    const cust = await newCustomer('Void after edit');
+    const inv = await plainInvoice(cust, '100.00');
+    const vctx = ctxWithSaveBefore(() =>
+      updateInvoice(ctx, inv.id, {
+        customerId: cust,
+        date: d('2026-03-01'),
+        taxRateId: null,
+        lines: [{ accountId: acct['4000'], description: 'Work', quantity: 1, rate: '150.00', taxable: false }],
+      } as never),
+    );
+    const voided = await voidInvoice(vctx, inv.id);
+    expect(voided.status).toBe('void');
+    expect(voided.total).toBe('150.00'); // the edit did land before the void's transaction
+    expect(await postedFor(`invoice:${inv.id}`)).toHaveLength(0);
+    expect(await balanceOf('1200')).toBe('0.00');
+    expect(await balanceOf('4000')).toBe('0.00');
+  });
+
+  async function undepositedPayment(label: string) {
+    expect(acct['1050']).toBeDefined();
+    const cust = await newCustomer(label);
+    const inv = await plainInvoice(cust, '200.00');
+    const { payment } = await receivePayment(ctx, {
+      customerId: cust,
+      date: d('2026-03-05'),
+      method: 'check',
+      reference: '501',
+      amount: '200.00',
+      depositAccountId: acct['1050'],
+      applications: [{ invoiceId: inv.id, amountApplied: '200.00' }],
+    });
+    const edit = (amount: string, extra: Record<string, unknown> = {}) => ({
+      customerId: cust,
+      date: d('2026-03-05'),
+      method: 'check' as const,
+      reference: '501',
+      amount,
+      depositAccountId: acct['1050'],
+      applications: [{ invoiceId: inv.id, amountApplied: amount }],
+      ...extra,
+    });
+    const depositIt = () => createDeposit(ctx, { depositAccountId: acct['1000'], date: d('2026-03-06'), paymentIds: [payment.id] });
+    return { cust, inv, payment, edit, depositIt };
+  }
+
+  it('a payment deposited while it is being edited keeps the amount the deposit took', async () => {
+    const { payment, edit, depositIt } = await undepositedPayment('Deposit race');
+    const pctx = ctxWithSaveBefore(depositIt);
+    await expect(updatePayment(pctx, payment.id, edit('150.00'))).rejects.toMatchObject({ code: 'CONFLICT' });
+    const [p] = await db.select().from(paymentsReceived).where(eq(paymentsReceived.id, payment.id));
+    expect(p.amount).toBe('200.00');
+    expect(await balanceOf('1050')).toBe('0.00');
+    expect(await balanceOf('1000')).toBe('200.00');
+  });
+
+  it('an edit that keeps the amount is still saved when the payment was deposited in between', async () => {
+    const { payment, edit, depositIt } = await undepositedPayment('Deposit race ok');
+    const pctx = ctxWithSaveBefore(depositIt);
+    await updatePayment(pctx, payment.id, edit('200.00', { reference: '502', memo: 'Re-dated' }));
+    const [p] = await db.select().from(paymentsReceived).where(eq(paymentsReceived.id, payment.id));
+    expect(p.reference).toBe('502');
+    expect(await balanceOf('1050')).toBe('0.00');
+    expect(await balanceOf('1000')).toBe('200.00');
+  });
+
+  it('an invoice whose payment line is deposited while it is being edited keeps that amount', async () => {
+    const cust = await newCustomer('Invoice deposit race');
+    const [payItem] = await db
+      .insert(items)
+      .values({ companyId: ctx.companyId, name: `Paid at counter ${seq}`, type: 'payment' as never, salesPrice: '0', incomeAccountId: acct['4000'] })
+      .returning();
+    const lines = (paid: string) => [
+      { accountId: acct['4000'], description: 'Work', quantity: 1, rate: '100.00', taxable: false },
+      { itemId: payItem.id, description: 'Paid at counter', quantity: 1, rate: paid, taxable: false },
+    ];
+    const inv = await createInvoice(ctx, { customerId: cust, date: d('2026-03-01'), taxRateId: null, lines: lines('80.00') } as never);
+    const ictx = ctxWithSaveBefore(() =>
+      createDeposit(ctx, { depositAccountId: acct['1000'], date: d('2026-03-02'), invoicePaymentIds: [inv.id] }),
+    );
+    await expect(
+      updateInvoice(ictx, inv.id, { customerId: cust, date: d('2026-03-01'), taxRateId: null, lines: lines('50.00') } as never),
+    ).rejects.toMatchObject({ code: 'CONFLICT' });
+    expect(await balanceOf('1050')).toBe('0.00');
+    expect(await balanceOf('1000')).toBe('80.00');
+    expect((await getInvoice(ctx, inv.id)).balanceDue).toBe('20.00');
+  });
+});
+
+describe('25. Record Bounced Check after a save that landed in between', () => {
+  const balanceOf = async (code: string) => {
+    const [a] = await db.select({ balance: accounts.balance }).from(accounts).where(eq(accounts.id, acct[code]));
+    return a.balance;
+  };
+  async function bankPayment(label: string, amount = '200.00') {
+    const cust = await newCustomer(label);
+    const inv = await plainInvoice(cust, '200.00');
+    const { payment } = await receivePayment(ctx, {
+      customerId: cust,
+      date: d('2026-03-05'),
+      method: 'check',
+      reference: '901',
+      amount,
+      depositAccountId: acct['1000'],
+      applications: [{ invoiceId: inv.id, amountApplied: '200.00' }],
+    });
+    return { cust, inv, payment };
+  }
+  const editTo150 = (cust: string, invoiceId: string, reference: string) => ({
+    customerId: cust,
+    date: d('2026-03-05'),
+    method: 'check' as const,
+    reference,
+    amount: '150.00',
+    depositAccountId: acct['1000'],
+    applications: [{ invoiceId, amountApplied: '150.00' }],
+  });
+
+  it('refuses to bounce a payment voided in between (A/R is not charged twice)', async () => {
+    const { inv, payment } = await bankPayment('Bounce after void');
+    const bctx = ctxWithSaveBefore(() => voidPayment(ctx, payment.id));
+    await expect(recordBouncedCheck(bctx, { paymentId: payment.id, date: d('2026-03-10') })).rejects.toMatchObject({
+      code: 'CONFLICT',
+    });
+    const [p] = await db.select().from(paymentsReceived).where(eq(paymentsReceived.id, payment.id));
+    expect(p.voidedAt).not.toBeNull();
+    expect(p.bouncedAt).toBeNull();
+    expect((await getInvoice(ctx, inv.id)).balanceDue).toBe('200.00');
+    expect(await balanceOf('1200')).toBe('200.00');
+    expect(await balanceOf('1000')).toBe('0.00');
+    expect(await listBouncedChecks(ctx)).toHaveLength(0);
+  });
+
+  it('bounces the amount an edit saved in between, not the one the user opened', async () => {
+    const { cust, inv, payment } = await bankPayment('Bounce after edit');
+    const bctx = ctxWithSaveBefore(() => updatePayment(ctx, payment.id, editTo150(cust, inv.id, '902')));
+    const bounced = await recordBouncedCheck(bctx, { paymentId: payment.id, date: d('2026-03-10') });
+    expect(bounced.amount).toBe('150.00');
+    const [rev] = await db.select().from(journalEntries).where(eq(journalEntries.id, bounced.reversalEntryId!));
+    expect(rev.reference).toBe('902');
+    expect((await getInvoice(ctx, inv.id)).balanceDue).toBe('200.00');
+    expect(await balanceOf('1200')).toBe('200.00');
+    expect(await balanceOf('1000')).toBe('0.00');
+  });
+
+  it('refuses to bounce a payment refunded in between', async () => {
+    const { payment } = await bankPayment('Bounce after refund', '250.00');
+    const bctx = ctxWithSaveBefore(() =>
+      refundPayment(ctx, { paymentId: payment.id, bankAccountId: acct['1000'], amount: '50.00', date: d('2026-03-06') }),
+    );
+    await expect(recordBouncedCheck(bctx, { paymentId: payment.id, date: d('2026-03-10') })).rejects.toMatchObject({
+      code: 'CONFLICT',
+    });
+    expect(await listBouncedChecks(ctx)).toHaveLength(0);
+    expect(await balanceOf('1000')).toBe('200.00');
+  });
+
+  it('the bounce action refuses a stale version header with a 409', async () => {
+    const { cust, inv, payment } = await bankPayment('Bounce stale version');
+    const opened = new Date(payment.updatedAt).toISOString();
+    await updatePayment(ctx, payment.id, editTo150(cust, inv.id, '903'));
+    const u = new URL(`http://localhost/api/payments/${payment.id}`);
+    const r = Object.assign(
+      new Request(u, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-expected-updated-at': opened },
+        body: JSON.stringify({ action: 'bounce', date: '2026-03-10' }),
+      }),
+      { nextUrl: u },
+    ) as never;
+    const res = await paymentPOST(r, params(payment.id));
+    expect(res.status).toBe(409);
+    expect(await listBouncedChecks(ctx)).toHaveLength(0);
+  });
+});
+
+describe('26. Posting a pending invoice edited in between', () => {
+  it('posts the lines as saved: header total, A/R and lines agree', async () => {
+    const cust = await newCustomer('Draft race');
+    const draft = await plainInvoice(cust, '100.00', '2026-03-01', { status: 'draft' });
+    expect(draft.status).toBe('draft');
+    const pctx = ctxWithSaveBefore(() =>
+      updateInvoice(ctx, draft.id, {
+        customerId: cust,
+        date: d('2026-03-01'),
+        taxRateId: null,
+        lines: [{ accountId: acct['4000'], description: 'Work', quantity: 1, rate: '150.00', taxable: false }],
+      } as never),
+    );
+    const posted = await postDraftInvoice(pctx, draft.id);
+    expect(posted.total).toBe('150.00');
+    const inv = await getInvoice(ctx, draft.id);
+    expect(inv.total).toBe('150.00');
+    expect(inv.balanceDue).toBe('150.00');
+    expect(inv.lines.reduce((s, l) => s.plus(Money.of(l.amount)), Money.zero()).toFixed(2)).toBe('150.00');
+    const [ar] = await db.select({ balance: accounts.balance }).from(accounts).where(eq(accounts.id, acct['1200']));
+    expect(ar.balance).toBe('150.00');
+  });
+
+  it('the post route refuses a stale version header with a 409', async () => {
+    const cust = await newCustomer('Draft stale');
+    const draft = await plainInvoice(cust, '100.00', '2026-03-01', { status: 'draft' });
+    const opened = new Date(draft.updatedAt).toISOString();
+    await updateInvoice(ctx, draft.id, {
+      customerId: cust,
+      date: d('2026-03-01'),
+      taxRateId: null,
+      lines: [{ accountId: acct['4000'], description: 'Work', quantity: 1, rate: '150.00', taxable: false }],
+    } as never);
+    const u = new URL(`http://localhost/api/invoices/${draft.id}/post`);
+    const r = Object.assign(
+      new Request(u, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-expected-updated-at': opened },
+        body: JSON.stringify({}),
+      }),
+      { nextUrl: u },
+    ) as never;
+    const res = await invoicePostPOST(r, params(draft.id));
+    expect(res.status).toBe(409);
+    expect((await getInvoice(ctx, draft.id)).status).toBe('draft');
+  });
+});
+
+describe('27. Billable time and costs removed from an invoice by an edit', () => {
+  async function billableCost(cust: string, amount = '100.00', description = 'Parts') {
+    const [v] = await db
+      .insert(vendors)
+      .values({ companyId: ctx.companyId, displayName: `Supplier ${seq} ${description}` })
+      .returning();
+    await createBill(ctx, {
+      vendorId: v.id,
+      date: d('2026-03-01'),
+      lines: [{ accountId: acct['6300'], amount, customerId: cust, description }],
+    } as never);
+    const cost = (await listUnbilled(ctx, cust)).costs.find((c) => c.description === description)!;
+    expect(cost).toBeDefined();
+    return cost;
+  }
+  const labor = () => ({ accountId: acct['4000'], description: 'Labor', quantity: 1, rate: '50.00', taxable: false });
+  // What the invoice form sends back on an edit (no billable link: content matching keeps it).
+  const formLines = async (invoiceId: string) =>
+    (await getInvoice(ctx, invoiceId)).lines.map((l) => ({
+      itemId: l.itemId,
+      accountId: l.accountId,
+      description: l.description,
+      quantity: l.quantity,
+      rate: l.rate,
+      taxable: l.taxable,
+    }));
+  const header = (customerId: string) => ({ customerId, date: d('2026-03-05'), taxRateId: null });
+
+  it('a removed cost line is listed as unbilled again', async () => {
+    const cust = await newCustomer('Billable edit');
+    const cost = await billableCost(cust);
+    const inv = await createInvoiceWithBillables(ctx, { ...header(cust), lines: [labor()] } as never, { billLineIds: [cost.id] });
+    expect(inv.total).toBe('150.00');
+    expect((await listUnbilled(ctx, cust)).costs).toHaveLength(0);
+    const kept = (await formLines(inv.id)).filter((l) => l.description === 'Labor');
+    const edited = await updateInvoice(ctx, inv.id, { ...header(cust), lines: kept } as never);
+    expect(edited.total).toBe('50.00');
+    expect((await listUnbilled(ctx, cust)).costs.map((c) => c.id)).toEqual([cost.id]);
+  });
+
+  it('re-saves keep the cost billed, also after its line was re-priced or re-worded', async () => {
+    const cust = await newCustomer('Billable resave');
+    const cost = await billableCost(cust);
+    const inv = await createInvoiceWithBillables(ctx, { ...header(cust), lines: [labor()] } as never, { billLineIds: [cost.id] });
+    await updateInvoice(ctx, inv.id, { ...header(cust), lines: await formLines(inv.id) } as never);
+    await updateInvoice(ctx, inv.id, { ...header(cust), lines: await formLines(inv.id) } as never);
+    expect((await listUnbilled(ctx, cust)).costs).toHaveLength(0);
+    const priced = (await formLines(inv.id)).map((l) => (l.description === 'Labor' ? l : { ...l, rate: '90.00' }));
+    await updateInvoice(ctx, inv.id, { ...header(cust), lines: priced } as never);
+    const reworded = (await formLines(inv.id)).map((l) => (l.description === 'Labor' ? l : { ...l, description: 'Parts for job' }));
+    await updateInvoice(ctx, inv.id, { ...header(cust), lines: reworded } as never);
+    expect((await listUnbilled(ctx, cust)).costs).toHaveLength(0);
+    // The form round-trips the link, so even a line both re-priced and re-worded keeps it.
+    const roundTrip = (await getInvoice(ctx, inv.id)).lines.map((l) =>
+      l.description === 'Labor'
+        ? { itemId: l.itemId, accountId: l.accountId, description: l.description, quantity: l.quantity, rate: l.rate, taxable: l.taxable, billableSource: l.billableSource ?? null }
+        : { itemId: l.itemId, accountId: l.accountId, description: 'Reimbursed parts', quantity: l.quantity, rate: '85.00', taxable: l.taxable, billableSource: l.billableSource ?? null },
+    );
+    await updateInvoice(ctx, inv.id, { ...header(cust), lines: roundTrip } as never);
+    expect((await listUnbilled(ctx, cust)).costs).toHaveLength(0);
+    // Then removed: back on the list.
+    const kept = (await formLines(inv.id)).filter((l) => l.description === 'Labor');
+    await updateInvoice(ctx, inv.id, { ...header(cust), lines: kept } as never);
+    expect((await listUnbilled(ctx, cust)).costs.map((c) => c.id)).toEqual([cost.id]);
+  });
+
+  it('removing one of two costs releases only that one; removed time goes back too', async () => {
+    const cust = await newCustomer('Billable two');
+    const a = await billableCost(cust, '100.00', 'Parts A');
+    const b = await billableCost(cust, '40.00', 'Parts B');
+    const svc = await serviceItem('Hourly', '80.00');
+    const te = await createTimeEntry(ctx, {
+      customerId: cust,
+      serviceItemId: svc,
+      date: d('2026-03-02'),
+      hours: '2',
+      billable: true,
+      description: 'On site',
+    } as never);
+    const inv = await createInvoiceWithBillables(ctx, { ...header(cust), lines: [] } as never, {
+      billLineIds: [a.id, b.id],
+      timeEntryIds: [te.id],
+    });
+    expect(inv.total).toBe('300.00');
+    const kept = (await formLines(inv.id)).filter((l) => !(l.description ?? '').includes('Parts B') && l.description !== 'On site');
+    await updateInvoice(ctx, inv.id, { ...header(cust), lines: kept } as never);
+    const unbilled = await listUnbilled(ctx, cust);
+    expect(unbilled.costs.map((c) => c.id)).toEqual([b.id]);
+    expect(unbilled.time.map((t) => t.id)).toEqual([te.id]);
+  });
+
+  it('a stated link to a cost billed elsewhere or owed by another customer is ignored', async () => {
+    const cust = await newCustomer('Billable forged');
+    const stranger = await newCustomer('Billable stranger');
+    const cost = await billableCost(cust);
+    const elsewhere = await billableCost(cust, '30.00', 'Billed elsewhere');
+    const theirs = await billableCost(stranger, '20.00', 'Their parts');
+    const inv = await createInvoiceWithBillables(ctx, { ...header(cust), lines: [labor()] } as never, { billLineIds: [cost.id] });
+    await createInvoiceWithBillables(ctx, { ...header(cust), lines: [] } as never, { billLineIds: [elsewhere.id] });
+    const lines = (await formLines(inv.id)).map((l) =>
+      l.description === 'Labor'
+        ? { ...l, billableSource: { kind: 'bill_line', id: theirs.id } }
+        : { ...l, billableSource: { kind: 'bill_line', id: elsewhere.id } },
+    );
+    await updateInvoice(ctx, inv.id, { ...header(cust), lines } as never);
+    // `cost` stays billed (its line is matched by content), the others are untouched.
+    expect((await listUnbilled(ctx, cust)).costs).toHaveLength(0);
+    expect((await listUnbilled(ctx, stranger)).costs.map((c) => c.id)).toEqual([theirs.id]);
+    const [row] = await db.select({ billedInvoiceId: billLines.billedInvoiceId }).from(billLines).where(eq(billLines.id, elsewhere.id));
+    expect(row.billedInvoiceId).not.toBe(inv.id);
+  });
+
+  it('a save that puts a removed cost line back (Undo of the edit, a form opened before it) bills it again', async () => {
+    const cust = await newCustomer('Billable undo');
+    const cost = await billableCost(cust);
+    const inv = await createInvoiceWithBillables(ctx, { ...header(cust), lines: [labor()] } as never, { billLineIds: [cost.id] });
+    const before = await getInvoice(ctx, inv.id);
+    const prepared = await prepareUndo(ctx, { resource: 'invoices', kind: 'update', id: inv.id });
+    const kept = (await formLines(inv.id)).filter((l) => l.description === 'Labor');
+    await updateInvoice(ctx, inv.id, { ...header(cust), lines: kept } as never);
+    const armed = await commitUndo(ctx, { resource: 'invoices', kind: 'update', token: prepared.token, id: null });
+    expect((await listUnbilled(ctx, cust)).costs.map((c) => c.id)).toEqual([cost.id]);
+    await performUndo(ctx, armed.token);
+    expect((await getInvoice(ctx, inv.id)).total).toBe('150.00');
+    expect((await listUnbilled(ctx, cust)).costs).toHaveLength(0);
+    // Same through the form: the user re-saves the lines they opened before another user's edit.
+    await updateInvoice(ctx, inv.id, { ...header(cust), lines: kept } as never);
+    const stale = before.lines.map((l) => ({
+      itemId: l.itemId,
+      accountId: l.accountId,
+      description: l.description,
+      quantity: l.quantity,
+      rate: l.rate,
+      taxable: l.taxable,
+      billableSource: l.billableSource ?? null,
+    }));
+    await updateInvoice(ctx, inv.id, { ...header(cust), lines: stale } as never);
+    expect((await listUnbilled(ctx, cust)).costs).toHaveLength(0);
+    const [row] = await db.select({ billedInvoiceId: billLines.billedInvoiceId }).from(billLines).where(eq(billLines.id, cost.id));
+    expect(row.billedInvoiceId).toBe(inv.id);
+  });
+
+  it('moving the invoice to another customer releases its billables', async () => {
+    const cust = await newCustomer('Billable mover');
+    const other = await newCustomer('Billable other');
+    const cost = await billableCost(cust);
+    const inv = await createInvoiceWithBillables(ctx, { ...header(cust), lines: [labor()] } as never, { billLineIds: [cost.id] });
+    await updateInvoice(ctx, inv.id, { ...header(other), lines: await formLines(inv.id) } as never);
+    expect((await listUnbilled(ctx, cust)).costs.map((c) => c.id)).toEqual([cost.id]);
+  });
+
+  it('a pending invoice edit releases a removed cost too', async () => {
+    const cust = await newCustomer('Billable draft');
+    const cost = await billableCost(cust);
+    const inv = await createInvoiceWithBillables(ctx, { ...header(cust), status: 'draft', lines: [labor()] } as never, {
+      billLineIds: [cost.id],
+    });
+    expect(inv.status).toBe('draft');
+    const kept = (await formLines(inv.id)).filter((l) => l.description === 'Labor');
+    await updateInvoice(ctx, inv.id, { ...header(cust), lines: kept } as never);
+    expect((await listUnbilled(ctx, cust)).costs.map((c) => c.id)).toEqual([cost.id]);
+  });
+});

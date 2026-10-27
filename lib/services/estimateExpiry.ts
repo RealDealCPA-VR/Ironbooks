@@ -14,6 +14,7 @@
 import { and, eq, isNull, lt, lte, gte, inArray, sql } from 'drizzle-orm';
 import { estimates, customers } from '@/lib/db/schema';
 import { type ServiceContext, writeAudit } from './_base';
+import { companyToday } from './salesDates';
 
 /** Statuses that can still expire (not already terminal). */
 const EXPIRABLE_STATUSES = ['draft', 'open', 'accepted'] as const;
@@ -92,9 +93,10 @@ export async function listExpiringEstimates(
   ctx: ServiceContext,
   withinDays: number,
 ): Promise<ExpiringEstimate[]> {
-  const now = new Date();
-  const cutoff = new Date(now);
-  cutoff.setDate(cutoff.getDate() + withinDays);
+  // Expiration dates are calendar days (UTC midnight). Compare with today's calendar day in the
+  // company's time zone — comparing with this instant left out an estimate expiring today.
+  const today = await companyToday(ctx);
+  const cutoff = new Date(today.getTime() + Math.max(0, Math.floor(withinDays)) * 86_400_000);
 
   const rows = await ctx.db
     .select({
@@ -116,8 +118,8 @@ export async function listExpiringEstimates(
         inArray(estimates.status, [...EXPIRABLE_STATUSES]),
         isNull(estimates.convertedInvoiceId),
         sql`${estimates.expirationDate} IS NOT NULL`,
-        gte(estimates.expirationDate, now),
-        lte(estimates.expirationDate, cutoff),
+        gte(estimates.expirationDate, today),
+        lt(estimates.expirationDate, new Date(cutoff.getTime() + 86_400_000)),
       ),
     );
 

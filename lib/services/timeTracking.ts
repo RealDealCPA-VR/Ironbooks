@@ -344,6 +344,8 @@ export async function billTimeToInvoice(
       taxable: false as const,
       // Customer:Job of the time (job costing: the billed time is income of that job).
       jobId: e.jobId ?? null,
+      // The invoice line remembers its time entry (an invoice edit that removes it unbills it).
+      billableSource: { kind: 'time_entry' as const, id: e.id },
     };
   });
 
