@@ -30,6 +30,7 @@ import format from '@/electron/companyFileFormat';
 import lockFormat from '@/electron/companyLock';
 import { closeDb, firstOpenWalPosition, getDb, holdDbOpen, isDbOpen, resolveDataDir, withDamagedFileAccess, type DB } from '@/lib/db';
 import { currentFingerprint } from './backupFingerprint';
+import { BACKUP_HISTORY_FILE } from './backupHistory';
 import { APP_VERSION } from '@/lib/appVersion';
 
 /** How often the autosave timer looks for changes. */
@@ -383,7 +384,9 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
     // Consistent snapshot: the LSN first, then the files in this same synchronous turn.
     const lsn = await currentLsn(s);
     const fingerprint = currentFingerprint(dataDir);
-    const entries = format.snapshotDir(dataDir);
+    // A copy kept apart is a separate company file: it never carries this file's backup history
+    // (its own rotation would delete this file's backup versions).
+    const entries = conflict ? withoutBackupHistory(format.snapshotDir(dataDir)) : format.snapshotDir(dataDir);
     const savedAt = new Date().toISOString();
     const saveId = randomUUID();
     const companyName = companyNameFor(s, dataDir);
@@ -634,7 +637,10 @@ export function getCompanyFileSaveStatus(): CompanyFileSaveStatus {
  * File > Save Copy As…, and converting an older folder company file to a single file. The copy
  * gets its own identity (file id), so the two are independent from then on.
  */
-export async function saveCopyAs(target: string, opts: { companyName?: string | null } = {}): Promise<{ path: string; bytes: number }> {
+export async function saveCopyAs(
+  target: string,
+  opts: { companyName?: string | null; keepBackupHistory?: boolean } = {},
+): Promise<{ path: string; bytes: number }> {
   const dataDir = resolveDataDir();
   const abs = path.resolve(target);
   if (!abs.toLowerCase().endsWith(format.COMPANY_FILE_EXT)) {
@@ -652,8 +658,11 @@ export async function saveCopyAs(target: string, opts: { companyName?: string | 
   }
   // The copy is its own company file: a new identity inside (sessions bind to it) and out.
   const fileId = randomUUID();
+  // Nor its backup history: the copy's rotation would otherwise delete this file's backup versions.
+  // Converting a company folder into a single file continues the same company, so it keeps it.
+  const snapshot = format.snapshotDir(dataDir).filter((e: { name: string }) => e.name !== '.file-id');
   const entries = [
-    ...format.snapshotDir(dataDir).filter((e: { name: string }) => e.name !== '.file-id'),
+    ...(opts.keepBackupHistory ? snapshot : withoutBackupHistory(snapshot)),
     { name: '.file-id', data: Buffer.from(fileId) },
   ];
   const now = new Date().toISOString();
@@ -676,6 +685,10 @@ export async function saveCopyAs(target: string, opts: { companyName?: string | 
     entries,
   });
   return { path: abs, bytes: result.bytes };
+}
+
+function withoutBackupHistory<T extends { name: string }>(entries: T[]): T[] {
+  return entries.filter((e) => e.name !== BACKUP_HISTORY_FILE);
 }
 
 function readDisplayName(dataDir: string): string | null {

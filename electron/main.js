@@ -1189,7 +1189,7 @@ async function saveCopyAsFlow({ convert = false } = {}) {
     const r = await fetch(`${serverUrl}/api/company-file/save-as?target=${encodeURIComponent(target)}`, {
       method: 'POST',
       headers: { 'x-bka-internal': internalToken, 'content-type': 'application/json' },
-      body: JSON.stringify({ companyName: name }),
+      body: JSON.stringify({ companyName: name, convert }),
       signal: AbortSignal.timeout(30 * 60_000),
     });
     const data = await r.json().catch(() => ({}));

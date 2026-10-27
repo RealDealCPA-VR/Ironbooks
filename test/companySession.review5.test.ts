@@ -116,3 +116,12 @@ describe('a company file saved by a newer Ironbooks (source pins)', () => {
     expect(session.savedByNewerVersion({ dbSchema: { lastMigrationAt: newest + 1 } }, null)).toBe(false);
   });
 });
+
+describe('Save Copy As (source pins)', () => {
+  const main = fs.readFileSync(path.resolve(__dirname, '..', 'electron', 'main.js'), 'utf8');
+  const route = fs.readFileSync(path.resolve(__dirname, '..', 'app', 'api', 'company-file', 'save-as', 'route.ts'), 'utf8');
+  it('only converting a folder to a single file keeps its backup history', () => {
+    expect(main).toMatch(/body: JSON\.stringify\(\{ companyName: name, convert \}\)/);
+    expect(route).toMatch(/keepBackupHistory: body\?\.convert === true/);
+  });
+});

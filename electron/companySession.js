@@ -25,6 +25,8 @@ const crypto = require('node:crypto');
 const format = require('./companyFileFormat');
 
 const STATE_FILE = 'state.json';
+/** lib/services/backupHistory.ts BACKUP_HISTORY_FILE. */
+const BACKUP_HISTORY_FILE = '.backup-history.json';
 const STATE_SCHEMA = 'ironbooks-working-copy/v1';
 /** Working copies of files not opened for this long are removed (they are only caches). */
 const WORKING_COPY_MAX_AGE_MS = 45 * 24 * 3600 * 1000;
@@ -127,7 +129,11 @@ function conflictCopyPath(companyFile, computer, when = new Date()) {
  * that can't be merged, and to pack a restored portable company file.
  */
 async function writeWorkingCopyAs(workDir, target, { companyName, appVersion, fileId, dataDir } = {}) {
-  const entries = format.snapshotDir(dataDir || dataDirOf(workDir), { lazyPrefixes: [] });
+  // A separate company file: never with the original's backup history (lib/services/backupHistory.ts
+  // BACKUP_HISTORY_FILE), or the copy's backup rotation would delete the original's versions.
+  const entries = format
+    .snapshotDir(dataDir || dataDirOf(workDir), { lazyPrefixes: [] })
+    .filter((e) => e.name !== BACKUP_HISTORY_FILE);
   const now = new Date().toISOString();
   const saveId = crypto.randomUUID();
   await format.writeCompanyFile(target, {

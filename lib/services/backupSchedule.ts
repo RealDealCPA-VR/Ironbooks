@@ -89,7 +89,12 @@ function versionFilename(source: VersionedSource, companyName: string | null, at
  */
 export function rotateVersions(keep: number, dataDir?: string, now: Date = new Date()): number {
   const dir = resolveDataDir(dataDir);
-  const stale = planRotation(readBackupHistory(dir), keep);
+  // Only versions whose files this computer can see. A single company file carries its history to
+  // every computer that opens it, and each backs up into its own folder: another computer's
+  // versions are neither deleted nor marked deleted here (that hid them from the list on the
+  // computer that has them, where they were then never rotated again).
+  const visible = readBackupHistory(dir).filter((r) => !r.path || fs.existsSync(r.path));
+  const stale = planRotation(visible, keep);
   const pruned: string[] = [];
   for (const rec of stale) {
     try {

@@ -228,3 +228,44 @@ describe('every save records the database layout it holds', () => {
     expect(sessionMod.savedByNewerVersion(m, newest - 1)).toBe(true);
   }, 120_000);
 });
+
+describe('a copy of the company file is a separate file with its own backups', () => {
+  it("Save Copy As and 'unsaved changes' copies do not carry the original's backup history", async () => {
+    adoptFileOnDisk();
+    const dataDir = process.env.BKA_DATA_DIR!;
+    // The original has a versioned backup on disk, recorded in its history.
+    const backups = path.join(ROOT, 'backups');
+    fs.mkdirSync(backups, { recursive: true });
+    const version = path.join(backups, 'auto-backup-beacon-books-2026-10-01.bka');
+    fs.writeFileSync(version, 'bka');
+    const { recordBackup } = await import('./backupHistory');
+    recordBackup({ source: 'scheduled', kind: 'full', filename: path.basename(version), path: version, sizeBytes: 3, fingerprint: 'x' }, dataDir);
+    expect(fs.existsSync(path.join(dataDir, '.backup-history.json'))).toBe(true);
+
+    const names = (file: string) => format.readCentralDirectory(fs.readFileSync(file)).map((e: { name: string }) => e.name);
+    const { saveCopyAs } = await import('./companyFileSave');
+    const copy = path.join(SHARE, 'Beacon copy.ironbooks');
+    await saveCopyAs(copy);
+    // Its own backups start fresh: its rotation could otherwise delete the original's versions.
+    expect(names(copy)).not.toContain('.backup-history.json');
+    // Turning a company folder into a single file continues the same company: history kept.
+    const converted = path.join(SHARE, 'Beacon converted.ironbooks');
+    await saveCopyAs(converted, { keepBackupHistory: true });
+    expect(names(converted)).toContain('.backup-history.json');
+    // The saved company file itself keeps it.
+    expect((await saveCompanyFile({ force: true })).outcome).toBe('saved');
+    expect(names(FILE)).toContain('.backup-history.json');
+
+    // A copy kept when the working copy could not be saved into the file.
+    const kept = path.join(SHARE, 'Beacon kept.ironbooks');
+    const work = path.dirname(dataDir);
+    await sessionMod.writeWorkingCopyAs(work, kept, { companyName: 'Beacon (unsaved changes)', dataDir });
+    expect(names(kept)).not.toContain('.backup-history.json');
+
+    await someoneElseSaves('their-save-history');
+    const r = await saveCompanyFile({ force: true });
+    expect(r.outcome).toBe('conflict');
+    expect(names(r.path!)).not.toContain('.backup-history.json');
+    expect(fs.existsSync(version)).toBe(true);
+  }, 180_000);
+});

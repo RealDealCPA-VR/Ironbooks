@@ -16,10 +16,12 @@ export async function POST(req: NextRequest) {
   }
   const target = req.nextUrl.searchParams.get('target');
   if (!target) return NextResponse.json({ error: 'target is required', code: 'VALIDATION' }, { status: 400 });
-  const body = (await req.json().catch(() => ({}))) as { companyName?: unknown };
+  const body = (await req.json().catch(() => ({}))) as { companyName?: unknown; convert?: unknown };
   try {
     const result = await saveCopyAs(target, {
       companyName: typeof body?.companyName === 'string' ? body.companyName : null,
+      // Converting a company folder into a single file continues the same company (its backups too).
+      keepBackupHistory: body?.convert === true,
     });
     return NextResponse.json({ ok: true, ...result });
   } catch (err) {
