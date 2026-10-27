@@ -989,9 +989,10 @@ async function joinHostedFile(filePath, host) {
     const n = hostingCore.normalizeHostAddress(url);
     if (!n.ok || !pin) continue;
     if (await probePinnedHost(n.origin, pin)) {
-      saveConfig({ remoteHost: n.origin, remotePin: pin, remoteFile: filePath, lastRemoteHost: n.origin, companyClosed: false });
       rememberRecentCompany(filePath);
-      relaunchApp();
+      // The host is the next launch's only once the file open here has been saved and closed
+      // (before-quit): if that save fails and the person keeps working, they stay in their file.
+      relaunchApp({ remoteHost: n.origin, remotePin: pin, remoteFile: filePath, lastRemoteHost: n.origin, companyClosed: false });
       return true;
     }
   }
@@ -1849,9 +1850,9 @@ async function openOnHostFlow() {
           error: `Couldn't reach ${n.origin}. Check that the host computer is on, Ironbooks there is hosting multi-user access, and both computers are signed in to Tailscale.`,
         };
       }
-      saveConfig({ remoteHost: n.origin, lastRemoteHost: value.trim(), companyClosed: false });
+      // Applied only once the company file open here has been saved and closed (before-quit).
       setImmediate(() => {
-        relaunchApp();
+        relaunchApp({ remoteHost: n.origin, lastRemoteHost: value.trim(), companyClosed: false });
       });
       return { ok: true };
     },

@@ -271,6 +271,22 @@ describe('a crash after unsaved changes went into a separate copy', () => {
   });
 });
 
+describe('connecting to a host (source pins)', () => {
+  const main = fs.readFileSync(path.resolve(__dirname, '..', 'electron', 'main.js'), 'utf8');
+  const body = (start: string) => {
+    const fn = main.slice(main.indexOf(start));
+    return fn.slice(0, fn.indexOf('\n}\n'));
+  };
+  it('the host is only written for the next launch once the open company file has closed', () => {
+    const join = body('async function joinHostedFile(');
+    expect(join).not.toMatch(/saveConfig\(\{[^}]*remoteHost/);
+    expect(join).toMatch(/relaunchApp\(\{\s*remoteHost: n\.origin, remotePin: pin, remoteFile: filePath, lastRemoteHost: n\.origin, companyClosed: false \}\)/);
+    const onHost = body('async function openOnHostFlow(');
+    expect(onHost).not.toMatch(/saveConfig\(\{[^}]*remoteHost/);
+    expect(onHost).toMatch(/relaunchApp\(\{ remoteHost: n\.origin, lastRemoteHost: value\.trim\(\), companyClosed: false \}\)/);
+  });
+});
+
 describe('Save Copy As in the sandbox (source pins)', () => {
   const main = fs.readFileSync(path.resolve(__dirname, '..', 'electron', 'main.js'), 'utf8');
   it('is refused from the Company File page too, not only greyed out in the File menu', () => {
