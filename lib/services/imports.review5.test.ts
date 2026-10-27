@@ -10,7 +10,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { and, eq, inArray, isNull, sql } from 'drizzle-orm';
 import { getDb, closeDb, type DB } from '@/lib/db';
-import { accounts, companies, customers, journalEntries, journalEntryLines, users, vendors } from '@/lib/db/schema';
+import { accounts, bankTransactions, companies, customers, journalEntries, journalEntryLines, users, vendors } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
 import { createVendor } from './vendors';
 import { previewGlImport, runGlImport } from './qbGlImport';
@@ -28,6 +28,9 @@ import { exportListCsv } from './listExport';
 let routeCtx: ServiceContext;
 vi.mock('@/lib/context', () => ({ getServerContext: vi.fn(async () => routeCtx) }));
 import { POST as glPOST } from '@/app/api/qb-import/gl/route';
+import { POST as importPOST } from '@/app/api/import/route';
+import { tieOut } from '@/lib/statements/parse';
+import { createBankAccount } from './bankAccounts';
 import { importOpenItems, previewOpenItems } from './openItemsImport';
 import AdmZip from 'adm-zip';
 import { readXlsx } from './qbGlFiles';
@@ -531,5 +534,42 @@ describe('I. IIF transactions and missing names', () => {
     expect(lines.length).toBe(2);
     const again = await importIIF(ctx, iif);
     expect([again.transactions, again.customers, again.vendors]).toEqual([0, 0, 0]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// J. Statement import: the server-side tie-out counts every row it will import
+// ---------------------------------------------------------------------------
+
+describe('J. statement rows tie-out (POST /api/import fileType rows)', () => {
+  const postImport = (body: unknown) => {
+    const u = new URL('http://localhost/api/import');
+    return Object.assign(new Request(u, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }), { nextUrl: u }) as never;
+  };
+
+  it('a row written "5" (no cents) or garbage is not left out of the sum: an untied statement is refused', async () => {
+    expect(tieOut([{ amount: '12.50' }, { amount: '5' }], '100.00', '112.50', 'bank')).toMatchObject({ ok: false, difference: '-5.00' });
+    expect(tieOut([{ amount: '12.50' }, { amount: 'abc' }], '100.00', '112.50', 'bank').ok).toBe(false);
+    expect(tieOut([{ amount: '12.50' }, { amount: '5' }], '100.00', '117.50', 'bank')).toMatchObject({ ok: true, difference: '0.00' });
+
+    const co = await createCompany(db, { name: 'Statement Co', ownerId: userId });
+    const ctx: ServiceContext = { db, companyId: co.id, userId };
+    const [checking] = await db.select().from(accounts).where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.subtype, 'checking')));
+    const ba = await createBankAccount(ctx, { accountId: checking.id, bankName: 'Bank', accountNumber: '123456789' });
+    routeCtx = ctx;
+    const res = await importPOST(
+      postImport({
+        bankAccountId: ba.id,
+        fileType: 'rows',
+        statement: { kind: 'bank', openingBalance: '100.00', closingBalance: '112.50' },
+        rows: [
+          { date: '2026-03-02', description: 'Deposit', amount: '12.50' },
+          { date: '2026-03-03', description: 'Extra', amount: '5' },
+        ],
+      }),
+    );
+    expect(res.status).toBe(400);
+    const staged = await db.select().from(bankTransactions).where(eq(bankTransactions.bankAccountId, ba.id));
+    expect(staged).toHaveLength(0);
   });
 });
