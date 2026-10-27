@@ -96,3 +96,18 @@ describe('review5: buildCompanyRedactor covers every name list', () => {
     expect(red.restore(out)).toBe(text);
   });
 });
+
+describe('review5: assistant tools need the report area of their data', () => {
+  it('the Banking role (Reports — Financial only) cannot read A/R or A/P aging through the assistant', async () => {
+    const { runTool, ask } = await import('./aiAssistant');
+    const { builtinRole, unionRoles } = await import('@/lib/permissions/model');
+    const banking = { db, companyId, userId, access: unionRoles([builtinRole('banking')!]), role: 'accountant' as const };
+    await expect(runTool(banking, 'ar_aging', {})).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    await expect(runTool(banking, 'ap_aging', {})).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    await expect(runTool(banking, 'profit_and_loss', {})).resolves.toBeTruthy();
+    // No model configured: the offline answer runs the same tools.
+    await expect(ask(banking, [], 'Who owes us money?')).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    const owner = { db, companyId, userId, access: fullAccess(), role: 'owner' as const };
+    expect((await ask(owner, [], 'Who owes us money?')).answer).toMatch(/Customers owe/);
+  });
+});
