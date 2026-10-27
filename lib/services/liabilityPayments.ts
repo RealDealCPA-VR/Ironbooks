@@ -36,7 +36,7 @@ import { effectiveHomeCurrency } from './multiCurrency';
 import { foreignCode } from './fxLines';
 import { getPreferences } from './company';
 import { parseDateInput } from '@/lib/validation/helpers';
-import { localDateISO } from '@/lib/dates';
+import { todayInTimeZone } from '@/lib/preferences';
 import { accountFitsKind } from './prefAccounts';
 import {
   type SalesTaxBasis,
@@ -1186,10 +1186,11 @@ export async function paySalesTaxScreen(
   const prefs = await getPreferences(ctx);
   const basis: SalesTaxBasis = prefs.salesTaxBasis === 'cash' ? 'cash' : 'accrual';
   const frequency = prefs.salesTaxFrequency as SalesTaxFrequency;
-  // Today on the user's calendar (this local-first server runs on their machine), not the UTC
-  // instant: from 8 PM on the last day of a quarter (EDT) the UTC month was already the next one,
-  // so "Show sales tax due through" defaulted to the quarter that had not ended yet.
-  const defaultDueThrough = lastFilingPeriod(frequency, opts.today ?? localDateISO(new Date())).to;
+  // Today on the company's calendar (Preferences > Company time zone), not the UTC instant: from
+  // 8 PM on the last day of a quarter (EDT) the UTC month was already the next one, so "Show sales
+  // tax due through" defaulted to the quarter that had not ended yet. A `today` instant is read on
+  // the same calendar.
+  const defaultDueThrough = lastFilingPeriod(frequency, todayInTimeZone(prefs.timezone, opts.today ?? new Date())).to;
   let dueThrough = defaultDueThrough;
   if (opts.dueThrough && /^\d{4}-\d{2}-\d{2}/.test(opts.dueThrough)) {
     dueThrough = opts.dueThrough.slice(0, 10);

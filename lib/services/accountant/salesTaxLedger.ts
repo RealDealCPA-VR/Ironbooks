@@ -1251,15 +1251,18 @@ const isoDay = (y: number, m0: number, d: number) =>
 /**
  * The last COMPLETE filing period before `today` for a filing frequency (calendar months,
  * quarters and years, as QB uses): on 2026-10-12 monthly → Sep 1–30, quarterly → Jul 1–Sep 30,
- * annually → 2025-01-01–2025-12-31. Dates are YYYY-MM-DD. With no date, "today" is the LOCAL
- * calendar day: the UTC one already ran into the next month from about 8 PM in New York on the
- * last day of a period, so the Sales Tax Liability report defaulted to the period still running.
+ * annually → 2025-01-01–2025-12-31. Dates are YYYY-MM-DD.
+ *
+ * `today` is a CALENDAR DAY ('YYYY-MM-DD'), never an instant: a Date of the current moment read
+ * as its UTC day ran into the next month from about 8 PM in New York on the last day of a period,
+ * so the period still running was offered. Callers pass the company's day
+ * (todayInTimeZone(prefs.timezone)); with no day this machine's local calendar day is used.
  */
 export function lastFilingPeriod(
   frequency: SalesTaxFrequency,
-  today: Date | string = localDateISO(new Date()),
+  today: string = localDateISO(new Date()),
 ): { from: string; to: string } {
-  const t = typeof today === 'string' ? new Date(`${today.slice(0, 10)}T12:00:00.000Z`) : today;
+  const t = new Date(`${today.slice(0, 10)}T12:00:00.000Z`);
   const y = t.getUTCFullYear();
   const m = t.getUTCMonth();
   if (frequency === 'monthly') {

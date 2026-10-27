@@ -17,6 +17,9 @@ export const creditMemoLineSchema = z.object({
   taxable: z.boolean().optional(),
   /** Inventory items only: true (default) restocks; false = damaged write-off. */
   restock: z.boolean().optional(),
+  /** Class and Customer:Job of the line (default: the memo's). */
+  classId: zUuid.nullish(),
+  jobId: zUuid.nullish(),
   /** Advanced Inventory: site/bin/serial/lot returned goods go back to. */
   ...inventoryLineFields,
 });
@@ -29,6 +32,9 @@ export const createCreditMemoSchema = z.object({
   date: zDate,
   taxRateId: zUuid.nullish(),
   memo: z.string().nullish(),
+  /** Class and Customer:Job of the memo (job costing, P&L by class). Edit: omitted = kept. */
+  classId: zUuid.nullish(),
+  jobId: zUuid.nullish(),
   lines: zLines(creditMemoLineSchema),
   ...sendFlagFields,
 });
