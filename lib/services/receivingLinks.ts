@@ -250,13 +250,34 @@ async function stockDecreasedSince(ctx: ServiceContext, itemId: string, since: D
 }
 
 /**
+ * Landed-cost allocation lines on `itemId` recorded after the receipt-bill link `linkId` (active
+ * or void: a split they made is a physical fact either way), oldest first. Compared in SQL so the
+ * timestamps keep their microseconds.
+ */
+async function landedCostAfterLink(ctx: ServiceContext, linkId: string, itemId: string) {
+  return ctx.db
+    .select({ status: landedCostAllocations.status, layerAdjustments: landedCostAllocationLines.layerAdjustments })
+    .from(landedCostAllocationLines)
+    .innerJoin(landedCostAllocations, eq(landedCostAllocationLines.allocationId, landedCostAllocations.id))
+    .where(
+      and(
+        eq(landedCostAllocations.companyId, ctx.companyId),
+        eq(landedCostAllocationLines.itemId, itemId),
+        sql`${landedCostAllocations.createdAt} > (SELECT irbl.created_at FROM item_receipt_bill_lines irbl WHERE irbl.id = ${linkId})`,
+      ),
+    )
+    .orderBy(asc(landedCostAllocations.createdAt), asc(landedCostAllocations.id), asc(landedCostAllocationLines.lineOrder));
+}
+
+/**
  * Unwind everything a receipt-based bill did outside the GL. Call INSIDE voidBill's
  * transaction, after its journal entry was voided:
  *   - receipt lines' quantityBilled and receipt status (billed/partial -> partial/open),
  *   - PO received-not-billed counters and PO status,
  *   - inventory cost adjustments from price variances capitalized into inventory
  *     (CONFLICT when that stock has since been sold — the variance then lives in COGS and the
- *     user must enter a vendor credit instead of voiding).
+ *     user must enter a vendor credit instead of voiding — or while landed cost allocated after
+ *     the bill still sits on the re-costed layers: that allocation must be voided first).
  */
 export async function releaseReceiptBilling(ctx: ServiceContext, billId: string): Promise<void> {
   const links = await ctx.db
@@ -268,7 +289,7 @@ export async function releaseReceiptBilling(ctx: ServiceContext, billId: string)
   const receiptIds = new Set<string>();
   const poItemDeltas = new Map<string, ReturnType<typeof Money.zero>>(); // `${poId}|${itemId}`
   /** Layers the bill split off a receipt layer, merged back once every cost is restored. */
-  const merges: Array<{ layerId: string; splitFrom: string; quantity: string; receiptId: string }> = [];
+  const merges: Array<{ layerId: string; splitFrom: string; quantity: string }> = [];
 
   for (const link of links) {
     receiptIds.add(link.itemReceiptId);
@@ -296,22 +317,77 @@ export async function releaseReceiptBilling(ctx: ServiceContext, billId: string)
       const adjustments = all.filter((a) => a.kind !== 'average');
       const avgSnapshot = all.find((a) => a.kind === 'average');
       if (adjustments.length > 0) {
+        // Landed cost allocated after this bill may have split one unit off a layer the bill
+        // re-costed (landedCost.ts revalueLayer). That unit still carries the bill's increment, so
+        // the layer and its later splits are judged and restored together (as a landed-cost void
+        // does with laterSplits) — a split is not a sale.
+        const later = await landedCostAfterLink(ctx, link.id, link.itemId);
+        const splitsOf = new Map<string, Array<{ layerId: string; quantity: string }>>();
+        const postedOn = new Set<string>();
+        for (const row of later) {
+          for (const a of row.layerAdjustments ?? []) {
+            if (a.splitFrom) {
+              splitsOf.set(a.splitFrom, [...(splitsOf.get(a.splitFrom) ?? []), { layerId: a.layerId, quantity: a.quantity }]);
+            }
+            if (row.status === 'posted') {
+              postedOn.add(a.layerId);
+              if (a.splitFrom) postedOn.add(a.splitFrom);
+            }
+          }
+        }
         for (const adj of adjustments) {
           const [layer] = await ctx.db
             .select()
             .from(inventoryLayers)
             .where(and(eq(inventoryLayers.id, adj.layerId), eq(inventoryLayers.companyId, ctx.companyId)));
-          if (!layer || Money.of(layer.quantityRemaining).lessThan(adj.quantity)) {
+          const splits: Array<{ layer: typeof inventoryLayers.$inferSelect; splitQuantity: string }> = [];
+          const queue = [...(layer ? (splitsOf.get(layer.id) ?? []) : [])];
+          while (queue.length > 0) {
+            const next = queue.shift()!;
+            const [split] = await ctx.db
+              .select()
+              .from(inventoryLayers)
+              .where(and(eq(inventoryLayers.id, next.layerId), eq(inventoryLayers.companyId, ctx.companyId)));
+            if (!split || split.itemId !== link.itemId) continue;
+            splits.push({ layer: split, splitQuantity: next.quantity });
+            queue.push(...(splitsOf.get(split.id) ?? []));
+          }
+          const familyQty = splits.reduce(
+            (sum, f) => sum.plus(Money.of(f.layer.quantityRemaining)),
+            Money.of(layer?.quantityRemaining ?? '0'),
+          );
+          if (!layer || familyQty.lessThan(adj.quantity)) {
             throw new ServiceError(
               'CONFLICT',
               'Cannot void this bill: stock whose cost it adjusted has since been sold. Enter a vendor credit for the difference instead.',
             );
           }
+          // That allocation recorded these layers' ids and sizes; restoring and merging them under
+          // it would leave it impossible to void exactly.
+          const touched = [layer.id, ...splits.map((f) => f.layer.id), ...(adj.splitFrom ? [adj.splitFrom] : [])];
+          if (touched.some((id) => postedOn.has(id))) {
+            throw new ServiceError(
+              'CONFLICT',
+              'Cannot void this bill: landed cost was allocated to these received items after the bill was entered. Void the landed cost allocation on this item receipt first.',
+            );
+          }
+          const restored = Money.of(layer.unitCost).minus(adj.unitDelta);
+          let layerQty = Money.of(layer.quantityRemaining);
+          for (const f of splits) {
+            const cost = Money.of(f.layer.unitCost).minus(adj.unitDelta);
+            if (cost.equals(restored) && Money.of(f.layer.quantityRemaining).equals(Money.of(f.splitQuantity))) {
+              // An untouched split back at the layer's cost goes back into the layer.
+              layerQty = layerQty.plus(Money.of(f.layer.quantityRemaining));
+              await ctx.db.delete(inventoryLayers).where(eq(inventoryLayers.id, f.layer.id));
+            } else {
+              await ctx.db.update(inventoryLayers).set({ unitCost: cost.toFixed(4) }).where(eq(inventoryLayers.id, f.layer.id));
+            }
+          }
           await ctx.db
             .update(inventoryLayers)
-            .set({ unitCost: Money.of(layer.unitCost).minus(adj.unitDelta).toFixed(4) })
+            .set({ unitCost: restored.toFixed(4), quantityRemaining: layerQty.toFixed(4) })
             .where(eq(inventoryLayers.id, layer.id));
-          if (adj.splitFrom) merges.push({ layerId: adj.layerId, splitFrom: adj.splitFrom, quantity: adj.quantity, receiptId: link.itemReceiptId });
+          if (adj.splitFrom) merges.push({ layerId: adj.layerId, splitFrom: adj.splitFrom, quantity: adj.quantity });
         }
       } else {
         const [item] = await ctx.db
@@ -367,25 +443,10 @@ export async function releaseReceiptBilling(ctx: ServiceContext, billId: string)
   // The units the bill re-costed were split off the receipt's layer (receiving.ts); with their
   // cost restored they go back into it, so the layer is again worth exactly what it was (two
   // layers each rounded to the cent need not add up to the one they came from). Only an untouched
-  // split is merged, and never while landed cost (which records layer ids) sits on the receipt.
-  const landedOn = new Map<string, boolean>();
+  // split is merged. Landed cost allocated on these layers after the bill was refused above; an
+  // allocation made before the bill recorded the receipt layer at its size then, which the merge
+  // gives back (so that allocation can still be voided exactly).
   for (const m of [...merges].reverse()) {
-    if (!landedOn.has(m.receiptId)) {
-      const [row] = await ctx.db
-        .select({ id: landedCostAllocationLines.id })
-        .from(landedCostAllocationLines)
-        .innerJoin(landedCostAllocations, eq(landedCostAllocationLines.allocationId, landedCostAllocations.id))
-        .where(
-          and(
-            eq(landedCostAllocations.companyId, ctx.companyId),
-            eq(landedCostAllocations.status, 'posted'),
-            eq(landedCostAllocationLines.itemReceiptId, m.receiptId),
-          ),
-        )
-        .limit(1);
-      landedOn.set(m.receiptId, Boolean(row));
-    }
-    if (landedOn.get(m.receiptId)) continue;
     const pair = await ctx.db
       .select()
       .from(inventoryLayers)

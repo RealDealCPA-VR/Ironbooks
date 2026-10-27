@@ -20,7 +20,7 @@
  * expense account created when missing — inventory.ts ensureInventoryAdjustmentAccount), with
  * Class and Customer:Job on the adjustment line, like QB. Owner's Equity is never the offset.
  */
-import { and, asc, eq, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import Decimal from 'decimal.js';
 import { items, accounts, auditLogs, inventoryLayers } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
@@ -163,6 +163,13 @@ export async function seedOpeningLayer(tx: ServiceContext, itemId: string, date:
   // using the last unit clears the account to $0.
   const value = Money.round2(openingQty.times(Money.of(current.averageCost ?? '0'))).plus(carriedValueRemainder(current));
   const opening = await insertLayersWorth(tx, { itemId, date, qty: openingQty, value });
+  // The stock already on hand is older than whatever this transaction adds next (a receipt or
+  // adjustment on the same date shares created_at, and takeFromLayers would break that tie by the
+  // random id): the opening layer sorts a millisecond earlier, so it is drawn first.
+  await tx.db
+    .update(inventoryLayers)
+    .set({ createdAt: sql`${inventoryLayers.createdAt} - interval '1 millisecond'` })
+    .where(and(eq(inventoryLayers.companyId, tx.companyId), inArray(inventoryLayers.id, opening.map((l) => l.id))));
   if (!Money.of(current.valueRemainder ?? '0').isZero()) {
     await tx.db
       .update(items)

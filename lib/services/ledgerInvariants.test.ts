@@ -353,7 +353,7 @@ describe('ledger invariants enforced by the database', () => {
     const versions = await db.execute(
       sql`SELECT tgname FROM pg_trigger WHERE tgname LIKE 'bka\_version\_%' AND NOT tgisinternal`,
     );
-    expect((versions as unknown as { rows: unknown[] }).rows.length).toBe(15);
+    expect((versions as unknown as { rows: unknown[] }).rows.length).toBe(16); // 15 from 0046 + bka_version_items from 0067
     expect(rows.filter((r) => r.tgenabled !== 'A')).toEqual([]);
 
     // Downgraded to origin mode ('O'), the integrity check must flag it.

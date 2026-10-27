@@ -52,6 +52,8 @@ import { quantityOnHandBySite, reorderBySite, serialLotInStock, transactionsBySe
 import { listSiteReorderPoints, setSiteReorderPoint } from './inventorySiteOps';
 import { physicalCount, reorderReport } from './inventoryOps';
 import { enterBillForReceivedItems } from './receiving';
+import { getBill } from './bills';
+import { allocateLandedCost, voidLandedCostAllocation } from './landedCost';
 import { inventoryLayers, itemReceiptLines } from '@/lib/db/schema';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-inventory-review5');
@@ -1069,5 +1071,98 @@ describe('review5 inventory', () => {
       // useSearchParams needs a Suspense boundary around the page (Next.js app router).
       expect(/<Suspense[\s\S]{0,200}<\/Suspense>/.test(src), `${page} has a Suspense boundary`).toBe(true);
     }
+  });
+
+  // ---- round 5 fix-up 2: a variance bill after landed cost on its receipt ----
+
+  async function freightOnReceipt(vendorId: string, receiptId: string, amount: string) {
+    const freight = await createAccount(ctx, { code: `61${90 + seq % 10}`, name: `Freight In ${seq}`, type: 'expense' as never, subtype: 'operating_expenses' });
+    const fb = await createBill(ctx, { vendorId, billNumber: `FRT-${seq}`, date: d('2026-01-04'), lines: [{ accountId: freight.id, description: 'Freight', amount }] } as never);
+    const lineId = (await getBill(ctx, fb.id)).lines[0].id;
+    return allocateLandedCost(ctx, { billId: fb.id, billLineId: lineId, method: 'quantity', itemReceiptIds: [receiptId] });
+  }
+
+  it('FIFO: a bill that re-costed received units voids once the landed cost later put on the receipt is voided (not "since been sold")', async () => {
+    const item = await invItem('Freighted thirds');
+    await receiveStock(ctx, { itemId: item.id, quantity: 1, unitCost: '1.00', date: d('2026-01-01') });
+    const v = await createVendor(ctx, { displayName: 'Freighted vendor' } as never);
+    const r = await createItemReceipt(ctx, { vendorId: v.id, date: d('2026-01-02'), lines: [{ itemId: item.id, quantity: 3000, unitCost: '0.66666667' }] } as never);
+    const received = await openLayers(item.id);
+    expect(await gl('1300')).toBe('2001.00');
+    const bill = await enterBillForReceivedItems(ctx, { vendorId: v.id, date: d('2026-01-03'), lines: [{ receiptLineId: await receiptLineId(r.id), quantity: 1000, unitCost: '0.70' }] });
+    expect(Money.gt(bill.preview.lines[0].inventoryVariance, 0)).toBe(true);
+    expect(await gl('1300')).toBe((await inventoryValuation(ctx)).grandTotal);
+    const alloc = await freightOnReceipt(v.id, r.id, '10.00');
+    // The freight split the re-costed units' layer (a cent the 4dp cost cannot spread).
+    expect((await openLayers(item.id)).length).toBeGreaterThan(received.length + 1);
+    expect(await gl('1300')).toBe((await inventoryValuation(ctx)).grandTotal);
+    // While the landed cost is on the receipt the bill is refused with the step to take (the
+    // allocation recorded the layers the bill re-costed).
+    await expect(voidBill(ctx, bill.id)).rejects.toMatchObject({
+      code: 'CONFLICT',
+      message: expect.stringMatching(/Void the landed cost allocation on this item receipt first/),
+    });
+    await voidLandedCostAllocation(ctx, alloc.id);
+    expect(await gl('1300')).toBe((await inventoryValuation(ctx)).grandTotal);
+    // Nothing was sold: the void goes through and the receipt's layers are what it stored.
+    await voidBill(ctx, bill.id);
+    // Every received unit is back at a cost the receipt stored (the bill's pieces, and the unit
+    // the freight split off them, went back into the receipt layer).
+    const after = await openLayers(item.id);
+    const costs = new Set(received.map((l) => l.split('@')[1]));
+    expect(after.filter((l) => !costs.has(l.split('@')[1]))).toEqual([]);
+    expect(after.reduce((n, l) => n + Number(l.split('@')[0]), 0)).toBe(3001);
+    expect(await gl('1300')).toBe((await inventoryValuation(ctx)).grandTotal);
+    await voidItemReceipt(ctx, r.id);
+    expect(await gl('1300')).toBe('1.00');
+    expect((await inventoryValuation(ctx)).grandTotal).toBe('1.00');
+    expect(await openLayers(item.id)).toEqual(['1@1.0000']);
+  });
+
+  it('FIFO: a sale of re-costed units still refuses the bill void with the vendor-credit instruction', async () => {
+    const item = await invItem('Freighted sold');
+    await receiveStock(ctx, { itemId: item.id, quantity: 1, unitCost: '1.00', date: d('2026-01-01') });
+    const v = await createVendor(ctx, { displayName: 'Sold vendor' } as never);
+    const r = await createItemReceipt(ctx, { vendorId: v.id, date: d('2026-01-02'), lines: [{ itemId: item.id, quantity: 3000, unitCost: '0.66666667' }] } as never);
+    const bill = await enterBillForReceivedItems(ctx, { vendorId: v.id, date: d('2026-01-03'), lines: [{ receiptLineId: await receiptLineId(r.id), quantity: 3000, unitCost: '0.70' }] });
+    const alloc = await freightOnReceipt(v.id, r.id, '10.00');
+    await voidLandedCostAllocation(ctx, alloc.id);
+    await consumeStock(ctx, { itemId: item.id, quantity: 2500, date: d('2026-01-05') });
+    await expect(voidBill(ctx, bill.id)).rejects.toMatchObject({ code: 'CONFLICT', message: expect.stringMatching(/since been sold/) });
+    expect(await gl('1300')).toBe((await inventoryValuation(ctx)).grandTotal);
+  });
+
+  it('FIFO: a landed cost allocated before the variance bill does not block voiding the bill (and can be voided after it)', async () => {
+    const item = await invItem('Freighted first');
+    await receiveStock(ctx, { itemId: item.id, quantity: 1, unitCost: '1.00', date: d('2026-01-01') });
+    const v = await createVendor(ctx, { displayName: 'First vendor' } as never);
+    const r = await createItemReceipt(ctx, { vendorId: v.id, date: d('2026-01-02'), lines: [{ itemId: item.id, quantity: 3000, unitCost: '0.70' }] } as never);
+    // $0.20 over 3000 units is below a 4dp unit cost: one unit carries it, the rest keep 0.70.
+    const alloc = await freightOnReceipt(v.id, r.id, '0.20');
+    const bill = await enterBillForReceivedItems(ctx, { vendorId: v.id, date: d('2026-01-05'), lines: [{ receiptLineId: await receiptLineId(r.id), quantity: 1000, unitCost: '0.73333333' }] });
+    expect(bill.preview.lines[0].inventoryVariance).toBe('33.33');
+    expect(await gl('1300')).toBe((await inventoryValuation(ctx)).grandTotal);
+    await voidBill(ctx, bill.id);
+    expect(await gl('1300')).toBe((await inventoryValuation(ctx)).grandTotal);
+    await voidLandedCostAllocation(ctx, alloc.id);
+    expect(await gl('1300')).toBe('2101.00');
+    expect((await inventoryValuation(ctx)).grandTotal).toBe('2101.00');
+  });
+
+  it('FIFO: the opening layer seeded for average-cost stock is drawn before units received in the same step', async () => {
+    // Layers written in one transaction share created_at and the id breaks the tie (fifo.ts
+    // takeFromLayers); a random id put the new units ahead of the older stock about half the time.
+    for (let i = 0; i < 8; i += 1) {
+      const item = await invItem(`Mixed costing ${i}`);
+      await adjustInventory(ctx, { itemId: item.id, quantityChange: 10, unitCost: '5.00', date: d('2026-02-01') });
+      if (i % 2 === 0) {
+        await adjustQuantityAtSite(ctx, { itemId: item.id, quantityChange: 5, unitCost: '6.00', date: d('2026-02-02'), costing: 'fifo' });
+      } else {
+        await receiveStock(ctx, { itemId: item.id, quantity: 5, unitCost: '6.00', date: d('2026-02-02') });
+      }
+      const sale = await consumeStock(ctx, { itemId: item.id, quantity: 12, date: d('2026-02-03') });
+      expect(sale.totalCOGS, `item ${i}`).toBe('62.00'); // 10 @ 5.00 + 2 @ 6.00
+    }
+    expect(await gl('1300')).toBe((await inventoryValuation(ctx)).grandTotal);
   });
 });

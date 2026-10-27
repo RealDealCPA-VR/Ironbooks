@@ -369,6 +369,9 @@ export const LEDGER_GUARD_TRIGGERS: Record<string, string> = {
       'estimates',
       'employees',
       'accounts',
+      // drizzle/0067_r5_inventory.sql — items get an edited_at version that stock postings
+      // (quantity on hand / average cost) do not move.
+      'items',
     ].map((t) => [`bka_version_${t}`, `Record locking: changes to ${t.replace(/_/g, ' ')} are detected`]),
   ),
 };

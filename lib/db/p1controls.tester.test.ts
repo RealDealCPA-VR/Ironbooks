@@ -102,7 +102,7 @@ describe('migration 0046 on existing data', () => {
       `SELECT c.relname AS tbl, count(*)::int AS n FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
         WHERE t.tgname LIKE 'bka_version_%' GROUP BY c.relname`,
     );
-    expect(counts.length).toBe(15);
+    expect(counts.length).toBe(16); // 15 tables from 0046 + items (bka_version_items) from 0067
     for (const c of counts) expect(c.n, c.tbl).toBe(1);
     expect((await trialBalance(t.ctx, D('2026-12-31'))).balanced).toBe(true);
   });
