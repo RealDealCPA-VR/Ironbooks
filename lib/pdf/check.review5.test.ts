@@ -43,4 +43,30 @@ describe('review5 check / 1099 PDFs', () => {
     });
     expect(bytes.byteLength).toBeGreaterThan(1000);
   });
+
+  it('a voucher stub that cannot list every bill still totals the whole check', async () => {
+    const { readPdfReceipt } = await import('@/lib/receipts/pdfText');
+    // A bill payment check paying 30 bills of $10.00: $300.00.
+    const voucher = Array.from({ length: 30 }, (_, i) => ({ account: `Bill B-${i + 1}`, description: '2026-06-01', amount: '10.00' }));
+    const bytes = await renderChecksPdf(
+      [
+        {
+          company: { name: 'Stub Co' },
+          payee: 'Many Bills Supply',
+          amountNumeric: '300.00',
+          amountWords: numberToWords('300.00'),
+          date: '2026-07-01',
+          checkNumber: '1001',
+          voucher,
+        },
+      ],
+      { style: 'voucher', stock: 'preprinted' },
+    );
+    const { text } = await readPdfReceipt(bytes);
+    const totals = text.split('\n').filter((l) => /^Total\b/.test(l.trim()));
+    expect(totals.length).toBeGreaterThan(0);
+    // Before: the total of only the bills that fit on the stub.
+    for (const t of totals) expect(t).toMatch(/300\.00/);
+    expect(text).toMatch(/more/);
+  });
 });

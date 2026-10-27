@@ -183,6 +183,29 @@ export interface VoucherLine {
   amount: string;
 }
 
+/**
+ * The voucher rows that fit on a stub with room for `capacity` rows, and the stub total. When the
+ * detail does not fit (a check paying 30 bills), the last row sums what is left ("12 more"), so
+ * the rows still add up to the total — the total is ALWAYS every line's (the check amount). It
+ * used to be the sum of the rows that happened to fit: the stub told the vendor the check paid
+ * less than its amount.
+ */
+export function voucherRows(lines: VoucherLine[], capacity: number): { rows: VoucherLine[]; total: string } {
+  const amountOf = (l: VoucherLine) => (fmtAmount(l.amount) === null ? Money.zero() : Money.of(l.amount));
+  const sum = (ls: VoucherLine[]) => ls.reduce((s, l) => s.plus(amountOf(l)), Money.zero());
+  const total = sum(lines).toFixed(2);
+  if (lines.length <= capacity) return { rows: lines, total };
+  if (capacity <= 0) return { rows: [], total };
+  const rest = lines.slice(capacity - 1);
+  return {
+    rows: [
+      ...lines.slice(0, capacity - 1),
+      { account: `${rest.length} more`, description: 'listed on the payment', amount: sum(rest).toFixed(2) },
+    ],
+    total,
+  };
+}
+
 export interface CheckPdfData extends CheckRenderSettings {
   /** Payer / company name — printed top-left as the drawer. */
   company: { name: string; addressLines?: string[] };
@@ -428,22 +451,21 @@ function drawCheck(a: DrawArgs) {
     hRule(vy, VL, MR, 0.5, C_LIGHT);
     vy -= 12;
 
-    let voucherTotal = Money.zero();
-    for (const line of data.voucher) {
-      if (vy < bottom + 18) break; // never run off the stub
+    // Rows of 14pt from vy down to the stub's last usable baseline (never run off the stub).
+    const capacity = vy < bottom + 18 ? 0 : Math.floor((vy - (bottom + 18)) / 14) + 1;
+    const { rows, total: voucherTotal } = voucherRows(data.voucher, capacity);
+    for (const line of rows) {
       text(line.account.slice(0, 48), VL, vy, { size: 9, color: C_BLACK });
       if (line.description) {
         text(line.description.slice(0, 40), DESC_X, vy, { size: 9, color: C_GRAY });
       }
-      const amtDisplay = fmtAmount(line.amount);
-      if (amtDisplay !== null) voucherTotal = voucherTotal.plus(Money.of(line.amount));
-      text(amtDisplay ?? line.amount, AMT_X, vy, { size: 9, color: C_BLACK, rightAlign: true });
+      text(fmtAmount(line.amount) ?? line.amount, AMT_X, vy, { size: 9, color: C_BLACK, rightAlign: true });
       vy -= 14;
     }
 
     hRule(vy + 6, DESC_X, MR, 0.5, C_LIGHT);
     text('Total', DESC_X, vy - 4, { font: bold, size: 9, color: C_NAVY });
-    text(fmtAmount(voucherTotal.toFixed(2)) ?? '0.00', AMT_X, vy - 4, {
+    text(fmtAmount(voucherTotal) ?? '0.00', AMT_X, vy - 4, {
       font: bold,
       size: 9,
       color: C_NAVY,
