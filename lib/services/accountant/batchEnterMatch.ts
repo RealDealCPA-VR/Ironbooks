@@ -258,7 +258,7 @@ export type ResolvedBatchDoc =
       amount: string;
       classId: string | null;
     }
-  | { kind: 'bill_credit'; vendorId: string; ref: string | null; date: string; memo: string | null; accountId: string; amount: string }
+  | { kind: 'bill_credit'; vendorId: string; ref: string | null; date: string; memo: string | null; accountId: string; amount: string; classId: string | null }
   | {
       kind: 'journal';
       date: string;
@@ -421,8 +421,14 @@ export function resolveBatchRows(input: ResolveBatchInput, M: BatchMatchers, opt
     if (amount === null) errors.push(`${n}: amount "${r.amount ?? ''}" is not a number.`);
     else if (subCent(amount)) errors.push(`${n}: ${SUB_CENT}`);
     else if (!Money.gt(amount, 0)) errors.push(`${n}: amount must be greater than zero.`);
-    const classId = r.className ? M.className(r.className) : null;
-    if (r.className && !classId) errors.push(`${n}: class "${r.className}" was not found.${didYouMean(M.suggest('class', r.className))}`);
+    const classless = t === 'deposit' || t === 'credit_memo';
+    const classId = r.className?.trim() && !classless ? M.className(r.className) : null;
+    if (r.className?.trim() && classless) {
+      // Their lines keep no class: refuse it rather than save the row without it.
+      errors.push(`${n}: ${t === 'deposit' ? 'deposits' : 'credit memos'} don't keep a class on their lines — clear the Class column.`);
+    } else if (r.className?.trim() && !classId) {
+      errors.push(`${n}: class "${r.className}" was not found.${didYouMean(M.suggest('class', r.className))}`);
+    }
     if (needsBank && !bank) errors.push(`${n}: choose the ${t.startsWith('cc') ? 'credit card' : 'bank'} account first.`);
     let customerId: string | null = null;
     let vendorId: string | null = null;
@@ -491,7 +497,7 @@ export function resolveBatchRows(input: ResolveBatchInput, M: BatchMatchers, opt
         doc = { kind: 'bill', vendorId: vendorId!, ref: r.ref?.trim() || null, date: date!, dueDate, memo, accountId: accountId!, amount: amount!, classId };
         break;
       case 'bill_credit':
-        doc = { kind: 'bill_credit', vendorId: vendorId!, ref: r.ref?.trim() || null, date: date!, memo, accountId: accountId!, amount: amount! };
+        doc = { kind: 'bill_credit', vendorId: vendorId!, ref: r.ref?.trim() || null, date: date!, memo, accountId: accountId!, amount: amount!, classId };
         break;
     }
     jobs.push({ rows: [i], errors, warnings, doc });

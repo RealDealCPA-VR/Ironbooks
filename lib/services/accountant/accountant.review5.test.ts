@@ -11,6 +11,8 @@
  *     guarantees Accounting).
  *  D  Voided/Deleted Transactions shows the number on the form (an invoice's typed number, a bill
  *     credit's Ref. No. — not its memo) and a one-time payee's name.
+ *  E  Batch Enter never drops a class typed in the grid: bill credits keep it on their line; deposits
+ *     and credit memos (whose lines keep no class) refuse it instead of saving without it.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
@@ -33,6 +35,9 @@ import { reclassifyLines } from './reclassify';
 import { findMisrecordedSalesTax, reclassifySalesTaxPayment } from './salesTaxTools';
 import { autoApplyCustomerCredit, autoApplyVendorCredit } from './clientDataReview';
 import { voidedDeletedTransactions } from './auditReports';
+import { batchEnterTransactions } from './batchEnter';
+import { createClass } from '../dimensions';
+import { vendorCreditLines } from '@/lib/db/schema';
 import { voidInvoice } from '../invoices';
 import { voidExpense } from '../expenses';
 import { receivePayment } from '../payments';
@@ -223,5 +228,34 @@ describe('D: Voided/Deleted Transactions shows the number the user sees', () => 
     expect(rep.rows.find((r) => r.entityId === inv.id)).toMatchObject({ number: 'INV-R5-77', name: 'R5 Customer' });
     expect(rep.rows.find((r) => r.entityId === vc.id)).toMatchObject({ number: 'VC-9001', name: 'R5 Vendor' });
     expect(rep.rows.find((r) => r.entityId === chk.id)).toMatchObject({ number: '7001', name: 'R5 One-time Plumber' });
+  });
+});
+
+describe('E: Batch Enter never drops a typed class', () => {
+  it('bill credits keep the class; deposits and credit memos (no class on their lines) refuse one', async () => {
+    const cls = await createClass(ctx, { name: 'R5 East' });
+    const credit = await batchEnterTransactions(ctx, {
+      type: 'bill_credit',
+      rows: [{ date: '2026-06-10', ref: 'BC-R5', name: 'R5 Vendor', account: '6810', amount: '12.00', memo: 'Refund', className: 'R5 East' }],
+    });
+    expect(credit.rolledBack).toBe(false);
+    const [vcl] = await db.select().from(vendorCreditLines).where(eq(vendorCreditLines.vendorCreditId, credit.results[0].id!));
+    expect(vcl.classId).toBe(cls.id);
+
+    const dep = await batchEnterTransactions(ctx, {
+      type: 'deposit',
+      bankAccountId: acct['1000'],
+      rows: [{ date: '2026-06-11', name: 'Owner', account: '3000', amount: '50.00', className: 'R5 East' }],
+    });
+    expect(dep.saved).toBe(0);
+    expect(dep.results[0].ok).toBe(false);
+    expect(dep.results[0].errors.join(' ')).toMatch(/class/i);
+
+    const cm = await batchEnterTransactions(ctx, {
+      type: 'credit_memo',
+      rows: [{ date: '2026-06-11', name: 'R5 Customer', account: '4810', amount: '5.00', className: 'R5 East' }],
+    });
+    expect(cm.saved).toBe(0);
+    expect(cm.results[0].errors.join(' ')).toMatch(/class/i);
   });
 });

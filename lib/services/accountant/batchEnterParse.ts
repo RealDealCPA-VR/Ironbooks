@@ -58,8 +58,12 @@ export function batchColumns(type: BatchEnterType): BatchColumn[] {
       return ['date', 'ref', 'account', 'debit', 'credit', 'memo', 'name', 'className'];
     case 'bill':
       return ['date', 'ref', 'name', 'account', 'amount', 'memo', 'className', 'dueDate'];
+    // Deposit and credit memo lines keep no class (lib/services/accountant/reclassifySync.ts), so
+    // their grids offer no Class column (a typed class would be dropped on save).
     case 'deposit':
-      return ['date', 'name', 'account', 'amount', 'memo', 'className'];
+      return ['date', 'name', 'account', 'amount', 'memo'];
+    case 'credit_memo':
+      return ['date', 'ref', 'name', 'account', 'amount', 'memo'];
     default:
       return ['date', 'ref', 'name', 'account', 'amount', 'memo', 'className'];
   }
