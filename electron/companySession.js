@@ -200,7 +200,17 @@ async function prepareWorkingCopy(companyFile, { root, onConflict, appVersion } 
   return { workDir, dataDir: dataDirOf(workDir), plan, manifest, conflictCopy };
 }
 
-/** Remove working copies not used for a long time, except `keep` (best effort). */
+/**
+ * What a working copy folder holds that is only a cache: the database copy, its state and
+ * leftovers of writing them. Anything else in the folder was put there by the app server next to
+ * the database folder — condense archive copies (the only way back after Condense Data), safety
+ * copies made before a restore, scheduled report exports — and is never deleted with the cache.
+ */
+function isCacheEntry(name) {
+  return name === 'data' || name === STATE_FILE || (name.startsWith(`${STATE_FILE}.`) && name.endsWith('.tmp')) || /^data\.(restore-tmp|pre-restore|refused-restore)-\d+$/.test(name);
+}
+
+/** Remove the cache of working copies not used for a long time, except `keep` (best effort). */
 function pruneWorkingCopies(root, keep = [], now = Date.now()) {
   let names = [];
   try {
@@ -219,7 +229,14 @@ function pruneWorkingCopies(root, keep = [], now = Date.now()) {
     const last = Date.parse(st.lastUsedAt || st.openedAt || '') || 0;
     if (now - last < WORKING_COPY_MAX_AGE_MS) continue;
     try {
-      fs.rmSync(dir, { recursive: true, force: true });
+      let entries = fs.readdirSync(dir);
+      if (entries.every(isCacheEntry)) {
+        fs.rmSync(dir, { recursive: true, force: true });
+      } else {
+        // Keep the side files; drop the cache (the state last, so a failure leaves it prunable).
+        entries = entries.filter(isCacheEntry).sort((a, b) => (a === STATE_FILE ? 1 : b === STATE_FILE ? -1 : 0));
+        for (const n of entries) fs.rmSync(path.join(dir, n), { recursive: true, force: true });
+      }
       removed.push(dir);
     } catch {
       /* in use / locked: next time */

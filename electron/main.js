@@ -1000,6 +1000,11 @@ async function askForAccessFlow(filePath, holder) {
   try {
     id = companyLock.requestAccess(filePath, { appUser: lastUserFor(filePath) });
   } catch (err) {
+    // They closed it while the question was on screen: it is free, open it.
+    if (err && err.code === 'NOT_IN_USE') {
+      openCompany(filePath);
+      return;
+    }
     dialog.showErrorBox('Could not send the request', openErrorText(err));
     return;
   }
@@ -1266,6 +1271,12 @@ async function startNextServer() {
       BKA_COMPANY_LOCK_TOKEN: openFile ? openFile.lock.token : '',
       // Where the real company file lives (training copies are kept next to it), also in the sandbox.
       BKA_REAL_COMPANY_FILE: openFile ? openFile.path : (loadConfig().sandbox && loadConfig().sandbox.realFile) || '',
+      // Scheduled report exports of a single company file go next to the company file, as they do
+      // next to a company folder ("Report Exports/<name>") — never into its working copy in this
+      // computer's local app data, which nobody looks in and which is cleared when unused.
+      BKA_REPORT_EXPORT_DIR:
+        process.env.BKA_REPORT_EXPORT_DIR ||
+        (openFile ? path.join(path.dirname(openFile.path), 'Report Exports', companyFileFormat.companyFileBaseName(openFile.path)) : ''),
       // Sandbox mode: where "Try it on a copy" puts copies, and the PDF "SANDBOX" stamp flag.
       BKA_SANDBOX_ROOT: sandboxRoot(),
       BKA_SANDBOX: sandboxActive() ? '1' : '',
