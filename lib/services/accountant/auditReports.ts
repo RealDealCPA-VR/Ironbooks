@@ -9,7 +9,7 @@
  *    the audit trail, who did it and when, with the document number/date/amount and (detail) the
  *    original values.
  */
-import { and, asc, desc, eq, gt, gte, inArray, lte, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, gte, inArray, lt, lte, or, sql } from 'drizzle-orm';
 import { auditLogs, companies, journalEntries, journalEntryLines, users } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import type { ServiceContext } from '../_base';
@@ -81,26 +81,27 @@ export async function closingDateExceptionReport(
     };
   });
 
-  // Entries dated on/before the CURRENT closing date but created after it was set.
+  // Entries dated on/before the CURRENT closing date that were entered while the books were already
+  // closed on their date. Each entry is checked against the closing date IN EFFECT when it was
+  // entered (the closing-date history from the audit trail), not against one start time:
+  //  - an entry made while the period was open again (closing date moved back or cleared, then set
+  //    again) is not an exception;
+  //  - one imported while January was closed stays one after February is closed and reopened;
+  //  - a save that kept the same date (a password change) changes nothing.
   if (cd) {
     const setLogs = await ctx.db
-      .select({ createdAt: auditLogs.createdAt, oldValues: auditLogs.oldValues, newValues: auditLogs.newValues })
+      .select({ createdAt: auditLogs.createdAt, newValues: auditLogs.newValues })
       .from(auditLogs)
       .where(and(eq(auditLogs.companyId, ctx.companyId), eq(auditLogs.entityType, 'company')))
       .orderBy(asc(auditLogs.createdAt));
-    const toCd = setLogs.filter((s) => ((s.newValues ?? {}) as Record<string, unknown>).closingDate === cd);
-    // The books count as closed on `cd` from the LAST time the closing date became `cd`: entries
-    // made while the period was open again (closing date moved back or cleared, then set again)
-    // are not exceptions. A save that kept the same date (a password change) moves nothing.
-    // Older audit rows without the previous value fall back to the first time `cd` was set.
-    const changedTo = toCd.filter((s) => {
-      const old = (s.oldValues ?? null) as Record<string, unknown> | null;
-      return old !== null && 'closingDate' in old && old.closingDate !== cd;
-    });
-    const setAt = changedTo.length ? changedTo[changedTo.length - 1].createdAt : toCd[0]?.createdAt;
-    if (setAt) {
-      const seen = new Set(rows.map((r) => r.entryId));
-      const late = await ctx.db
+    const periods = closedPeriods(setLogs);
+    const seen = new Set(rows.map((r) => r.entryId));
+    const late = new Map<string, { e: LateEntry; closedThrough: string }>();
+    // A handful of closing-date changes in practice; chunked so a long history never builds one
+    // enormous statement.
+    for (let i = 0; i < periods.length; i += 200) {
+      const chunk = periods.slice(i, i + 200);
+      const found = await ctx.db
         .select({
           id: journalEntries.id,
           entryNumber: journalEntries.entryNumber,
@@ -115,33 +116,96 @@ export async function closingDateExceptionReport(
           and(
             eq(journalEntries.companyId, ctx.companyId),
             sql`${journalEntries.status} IN ('posted', 'void')`,
-            lte(journalEntries.date, new Date(`${cd}T23:59:59.999Z`)),
-            gt(journalEntries.createdAt, setAt),
+            range.from ? gte(journalEntries.createdAt, range.from) : undefined,
+            range.to ? lte(journalEntries.createdAt, range.to) : undefined,
+            or(
+              ...chunk.map((p) =>
+                and(
+                  gte(journalEntries.createdAt, p.from),
+                  p.to ? lt(journalEntries.createdAt, p.to) : undefined,
+                  lte(journalEntries.date, new Date(`${p.closingDate < cd ? p.closingDate : cd}T23:59:59.999Z`)),
+                ),
+              ),
+            ),
           ),
         );
-      const lateAmounts = await entryAmounts(ctx, late.map((l) => l.id));
-      for (const e of late) {
-        if (seen.has(e.id)) continue;
-        if (range.from && e.createdAt < range.from) continue;
-        if (range.to && e.createdAt > range.to) continue;
-        rows.push({
-          auditLogId: null,
-          entryId: e.id,
-          entryNumber: e.entryNumber,
-          operation: 'post',
-          transactionDate: e.date.toISOString().slice(0, 10),
-          closingDate: cd,
-          description: e.description,
-          amount: lateAmounts.get(e.id) ?? null,
-          user: e.user ?? null,
-          at: e.createdAt.toISOString(),
-          source: 'entered_after_close',
-        });
+      for (const e of found) {
+        if (seen.has(e.id) || late.has(e.id)) continue;
+        const p = periodAt(periods, e.createdAt);
+        if (p) late.set(e.id, { e, closedThrough: p.closingDate });
       }
+    }
+    const lateAmounts = await entryAmounts(ctx, [...late.keys()]);
+    for (const { e, closedThrough } of late.values()) {
+      rows.push({
+        auditLogId: null,
+        entryId: e.id,
+        entryNumber: e.entryNumber,
+        operation: 'post',
+        transactionDate: e.date.toISOString().slice(0, 10),
+        closingDate: closedThrough,
+        description: e.description,
+        amount: lateAmounts.get(e.id) ?? null,
+        user: e.user ?? null,
+        at: e.createdAt.toISOString(),
+        source: 'entered_after_close',
+      });
     }
   }
   rows.sort((a, b) => b.at.localeCompare(a.at));
   return { closingDate: cd, rows };
+}
+
+interface LateEntry {
+  id: string;
+  entryNumber: number;
+  date: Date;
+  description: string;
+  createdAt: Date;
+  user: string | null;
+}
+
+interface ClosedPeriod {
+  /** When this closing date took effect. */
+  from: Date;
+  /** When it was moved or cleared (null: still in effect). */
+  to: Date | null;
+  closingDate: string;
+}
+
+/**
+ * The closing-date history, oldest first: each span of time during which the books were closed
+ * through one date. Built from the company audit rows that carry a closing date (Set Closing Date
+ * writes { closingDate } — null when cleared); a save that kept the date extends the span.
+ */
+function closedPeriods(logs: { createdAt: Date; newValues: unknown }[]): ClosedPeriod[] {
+  const out: ClosedPeriod[] = [];
+  for (const l of logs) {
+    const v = (l.newValues ?? {}) as Record<string, unknown>;
+    if (!Object.prototype.hasOwnProperty.call(v, 'closingDate')) continue;
+    const next = typeof v.closingDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v.closingDate) ? v.closingDate : null;
+    const last = out[out.length - 1];
+    if (last && last.to === null) {
+      if (last.closingDate === next) continue; // same date saved again (password change)
+      last.to = l.createdAt;
+    }
+    if (next) out.push({ from: l.createdAt, to: null, closingDate: next });
+  }
+  return out;
+}
+
+/** The closing date in effect at `at` (periods sorted and not overlapping). */
+function periodAt(periods: ClosedPeriod[], at: Date): ClosedPeriod | null {
+  let lo = 0;
+  let hi = periods.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const p = periods[mid];
+    if (at < p.from) hi = mid - 1;
+    else if (p.to && at >= p.to) lo = mid + 1;
+    else return p;
+  }
+  return null;
 }
 
 async function entryAmounts(ctx: ServiceContext, ids: string[]): Promise<Map<string, string>> {

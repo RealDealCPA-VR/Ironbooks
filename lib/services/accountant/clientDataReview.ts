@@ -362,8 +362,26 @@ async function compareBalances(ctx: ServiceContext): Promise<{ issues: ReviewIss
       fix: { kind: 'link', href: `/registers/${id}?to=${snap.asOf}`, label: 'Open register' },
     });
   }
-  // The transactions behind the change: dated in the reviewed period, entered, changed in place
-  // (Reclassify Transactions rewrites posted lines and moves the entry's version) or voided later.
+  // The transactions behind the change: dated in the reviewed period, entered, voided or changed in
+  // place later. The only in-place change of posted lines is Reclassify Transactions, and it is
+  // found by its audit row (an account moved on at least one line). The entry's updated_at is no
+  // guide: printing a check, a memo / number edit or a class-only reclassify moves it too, and
+  // none of them changes an account balance.
+  const reclassifiedAfter = sql`(
+    SELECT a.entity_id FROM audit_logs a
+    WHERE a.company_id = ${ctx.companyId}
+      AND a.entity_type = 'journal_entry'
+      AND a.action = 'update'
+      AND a.created_at > ${snap.createdAt}
+      AND jsonb_typeof(a.new_values -> 'reclassify') = 'array'
+      AND EXISTS (
+        SELECT 1
+        FROM jsonb_array_elements(a.new_values -> 'reclassify') AS n(v)
+        JOIN jsonb_array_elements(COALESCE(a.old_values -> 'reclassify', '[]'::jsonb)) AS o(v)
+          ON o.v ->> 'lineId' = n.v ->> 'lineId'
+        WHERE (n.v ->> 'accountId') IS DISTINCT FROM (o.v ->> 'accountId')
+      )
+  )`;
   const late = await ctx.db
     .select({
       id: journalEntries.id,
@@ -372,7 +390,6 @@ async function compareBalances(ctx: ServiceContext): Promise<{ issues: ReviewIss
       description: journalEntries.description,
       status: journalEntries.status,
       createdAt: journalEntries.createdAt,
-      updatedAt: journalEntries.updatedAt,
       voidedAt: journalEntries.voidedAt,
       user: users.name,
     })
@@ -382,7 +399,7 @@ async function compareBalances(ctx: ServiceContext): Promise<{ issues: ReviewIss
       and(
         eq(journalEntries.companyId, ctx.companyId),
         lte(journalEntries.date, endOfDay(snap.asOf)),
-        sql`(${journalEntries.createdAt} > ${snap.createdAt} OR ${journalEntries.voidedAt} > ${snap.createdAt} OR (${journalEntries.status} = 'posted' AND ${journalEntries.updatedAt} > ${snap.createdAt}))`,
+        sql`(${journalEntries.createdAt} > ${snap.createdAt} OR ${journalEntries.voidedAt} > ${snap.createdAt} OR (${journalEntries.status} = 'posted' AND ${journalEntries.id} IN ${reclassifiedAfter}))`,
         sql`${journalEntries.status} IN ('posted', 'void')`,
       ),
     )

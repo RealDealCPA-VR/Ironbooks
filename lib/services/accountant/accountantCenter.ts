@@ -70,7 +70,8 @@ export async function accountantCenterSummary(ctx: ServiceContext) {
     .where(eq(companies.id, ctx.companyId));
   const cd = ((company?.settings ?? {}) as Record<string, unknown>).closingDate;
 
-  const changes = await listListChanges(ctx, { includeReviewed: false, limit: 1000 });
+  // Only the count is shown here (it covers every unreviewed change, whatever the row limit).
+  const changes = await listListChanges(ctx, { includeReviewed: false, limit: 1 });
   const snap = await latestSnapshot(ctx);
   return {
     reconciliationStatus,

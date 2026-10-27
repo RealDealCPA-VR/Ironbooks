@@ -6,7 +6,7 @@
  * fields that changed. The accountant marks changes reviewed; that mark is stored per audit row
  * (list_change_reviews) and is itself audited.
  */
-import { and, desc, eq, gte, inArray } from 'drizzle-orm';
+import { and, desc, eq, gte, inArray, sql } from 'drizzle-orm';
 import { auditLogs, listChangeReviews, users } from '@/lib/db/schema';
 import { type ServiceContext, inTransaction, validation, writeAudit } from '../_base';
 import { maskForContext } from '../access';
@@ -81,6 +81,15 @@ export async function listListChanges(
   if (opts.entityType && !LIST_ENTITY_TYPES[opts.entityType]) throw validation('Unknown list.');
   const conds = [eq(auditLogs.companyId, ctx.companyId), inArray(auditLogs.entityType, types)];
   if (since) conds.push(gte(auditLogs.createdAt, since));
+  const notReviewed = sql`NOT EXISTS (SELECT 1 FROM list_change_reviews r WHERE r.company_id = ${auditLogs.companyId} AND r.audit_log_id = ${auditLogs.id})`;
+  // The count covers every unreviewed change, not just the rows on screen.
+  const [{ n: unreviewed }] = await ctx.db
+    .select({ n: sql<number>`count(*)::int` })
+    .from(auditLogs)
+    .where(and(...conds, notReviewed));
+  // Hide reviewed changes BEFORE the limit: the newest 1,000 changes being reviewed (a large
+  // QuickBooks conversion) must never hide an older one nobody has looked at.
+  if (!opts.includeReviewed) conds.push(notReviewed);
   const rows = await ctx.db
     .select({
       id: auditLogs.id,
@@ -108,11 +117,9 @@ export async function listListChanges(
   const rev = new Map(reviews.map((r) => [r.auditLogId, r]));
   // Labels: latest known snapshot per entity (new values first, then old).
   const out: ListChangeRow[] = [];
-  let unreviewed = 0;
   for (const r of rows) {
     const rv = rev.get(r.id);
-    if (!rv) unreviewed += 1;
-    if (rv && !opts.includeReviewed) continue;
+    if (rv && !opts.includeReviewed) continue; // reviewed since the query above
     const oldV = maskForContext(ctx, r.oldValues);
     const newV = maskForContext(ctx, r.newValues);
     out.push({

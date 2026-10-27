@@ -17,17 +17,22 @@
  *     company's calendar day (Preferences time zone), not the UTC day.
  *  G  Client Data Review "Troubleshoot prior account balances" lists entries changed in place after
  *     the review (Reclassify Transactions), not only entries entered or voided after it — the
- *     balance comparison showed the change but nothing explained it.
+ *     balance comparison showed the change but nothing explained it. Changes that move no account
+ *     balance (printing a check, a memo-only edit, a class-only reclassify) are not listed.
  *  H  Write Off Invoices shows and records the invoice number on the form (a typed ref number such
  *     as INV-1001), not the internal sequence number nobody sees elsewhere.
- *  I  Closing Date Exception report: entries made while the period was open again (closing date moved
- *     back, then closed again) are not exceptions; the books count as closed from the LAST time the
- *     closing date was set to its current value (a password-only change does not move that).
+ *  I  Closing Date Exception report: each entry is checked against the closing date in effect when
+ *     it was entered. Entries made while the period was open again (closing date moved back, then
+ *     closed again) are not exceptions; an entry imported while January was closed stays one after
+ *     February is closed and reopened; a password-only change moves nothing.
+ *  J  Review List Changes hides reviewed changes before the row limit and counts every unreviewed
+ *     change: 1,000 newer reviewed changes never hide an older unreviewed one, and the Accountant
+ *     Center shows the true count.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
-import { and, eq, like } from 'drizzle-orm';
+import { and, eq, inArray, like, sql } from 'drizzle-orm';
 import { closeDb, getDb, type DB } from '@/lib/db';
 import { accounts, bills, expenses, invoices, journalEntries, journalEntryLines, users } from '@/lib/db/schema';
 import type { ServiceContext } from '../_base';
@@ -55,7 +60,7 @@ import { batchEnterTransactions } from './batchEnter';
 import { createClass } from '../dimensions';
 import { vendorCreditLines } from '@/lib/db/schema';
 import { voidInvoice } from '../invoices';
-import { voidExpense } from '../expenses';
+import { markExpensePrinted, updateExpense, voidExpense } from '../expenses';
 import { receivePayment } from '../payments';
 import { createVendorCredit, voidVendorCredit } from '../vendorCredits';
 import { creditMemos, paymentsReceived } from '@/lib/db/schema';
@@ -328,6 +333,51 @@ describe('G: Troubleshoot prior account balances lists entries changed in place'
     expect(hit, 'the reclassified check is listed').toBeDefined();
     expect(hit!.title).toMatch(/changed after the last review/);
   });
+
+  it('printing a check, a memo-only edit or a class-only reclassify after the review changes no reviewed balance', async () => {
+    const queued = await createExpense(ctx, {
+      vendorId,
+      date: D('2026-01-15'),
+      method: 'check',
+      toPrint: true,
+      paymentAccountId: acct['1000'],
+      lines: [{ accountId: acct.e1, amount: '41.00' }],
+    });
+    const memoInput = {
+      vendorId,
+      date: D('2026-01-16'),
+      method: 'check' as const,
+      reference: '5501',
+      paymentAccountId: acct['1000'],
+      memo: 'R5 original memo',
+      lines: [{ accountId: acct.e1, amount: '17.00' }],
+    };
+    const memoCheck = await createExpense(ctx, memoInput);
+    const classCheck = await createExpense(ctx, {
+      vendorId,
+      date: D('2026-01-17'),
+      method: 'check',
+      reference: '5502',
+      paymentAccountId: acct['1000'],
+      lines: [{ accountId: acct.e1, amount: '23.00' }],
+    });
+    await takeReviewSnapshot(ctx, { asOf: '2026-01-31' });
+    await new Promise((r) => setTimeout(r, 20));
+    await markExpensePrinted(ctx, { expenseId: queued.id, checkNumber: '1234' });
+    await updateExpense(ctx, memoCheck.id, { ...memoInput, memo: 'R5 memo fixed after the review' });
+    const cls = await createClass(ctx, { name: 'R5 West' });
+    await reclassifyLines(ctx, { lineIds: [(await lineOn(expenses, classCheck.id, acct.e1)).id], newClassId: cls.id });
+
+    const review = await clientDataReview(ctx);
+    expect(review.tasks.find((t) => t.key === 'compare_balances')!.issues).toEqual([]);
+    const prior = review.tasks.find((t) => t.key === 'prior_balances')!;
+    const entryIds = await db
+      .select({ e: expenses.postedEntryId })
+      .from(expenses)
+      .where(inArray(expenses.id, [queued.id, memoCheck.id, classCheck.id]));
+    expect(entryIds).toHaveLength(3);
+    for (const { e } of entryIds) expect(prior.issues.map((i) => i.id)).not.toContain(`je:${e}`);
+  });
 });
 
 describe('H: Write Off Invoices names invoices by the number on the form', () => {
@@ -385,4 +435,80 @@ describe('I: Closing Date Exception report after reopening the period', () => {
     expect(rows.some((r) => r.entryId === late.id)).toBe(true);
     await setClosingDate(ctx, { closingDate: null });
   });
+});
+describe('I: Closing Date Exception report when the closing date moves forward and back', () => {
+  /** An entry written straight into the ledger (like a QuickBooks GL import): no override row. */
+  async function importEntry(n: number, day: string): Promise<string> {
+    const res = await db.execute(sql`
+      WITH e AS (
+        INSERT INTO journal_entries (company_id, entry_number, date, description, status, source_ref, created_by)
+        VALUES (${ctx.companyId}::uuid, ${n}, ${`${day}T12:00:00Z`}::timestamp, ${`R5 imported ${day}`}, 'posted', ${`qbgl:r5-${n}`}, ${ctx.userId}::uuid)
+        RETURNING id
+      ), l AS (
+        INSERT INTO journal_entry_lines (journal_entry_id, account_id, debit, credit)
+        SELECT id, ${acct.e1}::uuid, 3.00, NULL FROM e
+        UNION ALL
+        SELECT id, ${acct['1000']}::uuid, NULL, 3.00 FROM e
+      )
+      SELECT id FROM e`);
+    return (res.rows[0] as { id: string }).id;
+  }
+
+  it('an entry imported while January was closed stays listed after February is closed and reopened', async () => {
+    const pause = () => new Promise((r) => setTimeout(r, 15));
+    const before = await importEntry(970001, '2025-01-05'); // before any closing date: not an exception
+    await pause();
+    await setClosingDate(ctx, { closingDate: '2025-01-31' });
+    await pause();
+    const jan = await importEntry(970002, '2025-01-10');
+    await pause();
+    expect((await closingDateExceptionReport(ctx)).rows.filter((r) => r.entryId === jan)).toHaveLength(1);
+
+    await setClosingDate(ctx, { closingDate: '2025-02-28' }); // close February
+    await pause();
+    const feb = await importEntry(970003, '2025-02-10'); // into February while it was closed
+    await pause();
+    await setClosingDate(ctx, { closingDate: '2025-01-31' }); // reopen February only
+    await pause();
+
+    const rows = (await closingDateExceptionReport(ctx)).rows;
+    const late = rows.filter((r) => r.source === 'entered_after_close').map((r) => r.entryId);
+    expect(late, 'January was closed the whole time').toContain(jan);
+    expect(late, 'dated after the current closing date').not.toContain(feb);
+    expect(late, 'entered before the books were ever closed').not.toContain(before);
+    expect(rows.find((r) => r.entryId === jan)).toMatchObject({ closingDate: '2025-01-31', transactionDate: '2025-01-10' });
+    await setClosingDate(ctx, { closingDate: null });
+  });
+});
+
+describe('J: Review List Changes never hides older unreviewed changes behind reviewed ones', () => {
+  it('an old unreviewed vendor change is shown and counted when the newest 1,000 are reviewed', async () => {
+    // Its own company: the other tests' list changes stay out of the counts.
+    const [u] = await db.insert(users).values({ email: 'r5-acct-j@test.local', name: 'Accountant J', passwordHash: 'x' }).returning();
+    const co = await createCompany(db, { name: 'Review5 List Changes Co', ownerId: u.id });
+    const jctx: ServiceContext = { db, companyId: co.id, userId: u.id };
+    const v = await createVendor(jctx, { displayName: 'R5 Old Vendor' });
+    await db.update(auditLogs).set({ createdAt: new Date('2020-03-02T15:00:00Z') }).where(and(eq(auditLogs.companyId, co.id), eq(auditLogs.entityId, v.id)));
+    // 1,000 newer vendor changes (a large QuickBooks conversion), all already reviewed.
+    await db.execute(sql`
+      WITH a AS (
+        INSERT INTO audit_logs (company_id, user_id, action, entity_type, entity_id, new_values, created_at)
+        SELECT ${co.id}::uuid, ${u.id}::uuid, 'create', 'vendor', gen_random_uuid(),
+               jsonb_build_object('displayName', 'Imported vendor ' || g), now() - (g || ' minutes')::interval
+        FROM generate_series(1, 1000) AS g
+        RETURNING id
+      )
+      INSERT INTO list_change_reviews (company_id, audit_log_id, reviewed_by)
+      SELECT ${co.id}::uuid, id, ${u.id}::uuid FROM a`);
+
+    const open = await listListChanges(jctx, { includeReviewed: false });
+    expect(open.rows.map((r) => r.entityId)).toEqual([v.id]);
+    expect(open.unreviewed).toBe(1);
+    // With reviewed rows shown the window is the newest 1,000, but the count is still complete.
+    const all = await listListChanges(jctx, { includeReviewed: true });
+    expect(all.rows).toHaveLength(1000);
+    expect(all.unreviewed).toBe(1);
+    const { accountantCenterSummary } = await import('./accountantCenter');
+    expect((await accountantCenterSummary(jctx)).unreviewedListChanges).toBe(1);
+  }, 120_000);
 });
