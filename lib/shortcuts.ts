@@ -2,9 +2,9 @@
  * Desktop-ergonomics primitives shared by the UI kit and the app shell. The keys are QuickBooks
  * Desktop's, so 30 years of muscle memory carry over:
  *
- *  - evaluateAmountExpression / isMathExpression: the safe QuickMath parser behind
- *    <AmountInput> (components/ui.tsx). No eval — a tiny recursive-descent parser
- *    supporting + - * / and parentheses.
+ *  - evaluateAmountDecimal / evaluateAmountExpression / isMathExpression / formatAmountResult:
+ *    the safe QuickMath parser behind <AmountInput> (components/ui.tsx). No eval — a tiny
+ *    recursive-descent parser supporting + - * / and parentheses, in decimal arithmetic.
  *  - adjustDateForKey: QuickBooks date-entry keys (+ - T W K M H Y R [ ] ; ') for date inputs.
  *  - stepDocNumber: + / - in check and invoice number fields (<DocNumberInput>).
  *  - GLOBAL_SHORTCUTS / globalShortcutFor and the *_KEY_HELP tables: the single source of truth
@@ -18,6 +18,7 @@
  *    Home / End, PgUp / PgDn, Enter, type-ahead) for every list, center and register.
  */
 import * as React from 'react';
+import Decimal from 'decimal.js';
 import {
   addDays,
   addMonths,
@@ -55,22 +56,36 @@ function normalizeAmountText(raw: string): string {
   return raw.replace(/[$,\s]/g, '');
 }
 
+/** QuickMath's own decimal context (not the app-wide one): exact enough for any amount. */
+const QDecimal = Decimal.clone({ precision: 40, rounding: Decimal.ROUND_HALF_UP });
+
 /**
- * Safely evaluate an arithmetic expression with + - * / and parentheses.
- * Returns the numeric result, or null when the expression is invalid
- * (syntax error, division by zero, empty input). Never uses eval.
+ * Safely evaluate an arithmetic expression with + - * / and parentheses, in exact decimal
+ * arithmetic (like lib/money — never JS floats, so "1234567.89/2" is exactly 617283.945).
+ * Returns the result, or null when the expression is invalid (syntax error, division by zero,
+ * empty input). Never uses eval.
  *
- *   evaluateAmountExpression('12.5*3+10') === 47.5
+ *   evaluateAmountDecimal('12.5*3+10')?.toString() === '47.5'
  */
-export function evaluateAmountExpression(raw: string): number | null {
+export function evaluateAmountDecimal(raw: string): Decimal | null {
   const s = normalizeAmountText(raw);
   if (!s) return null;
   const state = { src: s, pos: 0, failed: false };
 
   const value = parseExpr(state);
-  if (state.failed || state.pos !== state.src.length) return null;
-  if (!Number.isFinite(value)) return null;
+  if (state.failed || state.pos !== state.src.length || !value || !value.isFinite()) return null;
   return value;
+}
+
+/**
+ * evaluateAmountDecimal as a plain number (for callers that only need the magnitude). Money
+ * fields use evaluateAmountDecimal + formatAmountResult so the cents are rounded exactly.
+ *
+ *   evaluateAmountExpression('12.5*3+10') === 47.5
+ */
+export function evaluateAmountExpression(raw: string): number | null {
+  const value = evaluateAmountDecimal(raw);
+  return value === null ? null : value.toNumber();
 }
 
 interface ParseState {
@@ -84,36 +99,39 @@ function peek(st: ParseState): string {
 }
 
 /** expr := term (('+' | '-') term)* */
-function parseExpr(st: ParseState): number {
+function parseExpr(st: ParseState): Decimal | null {
   let left = parseTerm(st);
-  while (!st.failed) {
+  while (!st.failed && left) {
     const op = peek(st);
     if (op !== '+' && op !== '-') break;
     st.pos++;
     const right = parseTerm(st);
-    left = op === '+' ? left + right : left - right;
+    if (!right) return null;
+    left = op === '+' ? left.plus(right) : left.minus(right);
   }
-  return left;
+  return st.failed ? null : left;
 }
 
 /** term := factor (('*' | '/') factor)* */
-function parseTerm(st: ParseState): number {
+function parseTerm(st: ParseState): Decimal | null {
   let left = parseFactor(st);
-  while (!st.failed) {
+  while (!st.failed && left) {
     const op = peek(st);
     if (op !== '*' && op !== '/') break;
     st.pos++;
     const right = parseFactor(st);
-    if (op === '*') left = left * right;
-    else if (right === 0) {
+    if (!right) return null;
+    if (op === '*') left = left.times(right);
+    else if (right.isZero()) {
       st.failed = true; // division by zero -> invalid expression
-    } else left = left / right;
+      return null;
+    } else left = left.dividedBy(right);
   }
-  return left;
+  return st.failed ? null : left;
 }
 
 /** factor := ('+' | '-') factor | '(' expr ')' | number */
-function parseFactor(st: ParseState): number {
+function parseFactor(st: ParseState): Decimal | null {
   const c = peek(st);
   if (c === '+') {
     st.pos++;
@@ -121,14 +139,15 @@ function parseFactor(st: ParseState): number {
   }
   if (c === '-') {
     st.pos++;
-    return -parseFactor(st);
+    const v = parseFactor(st);
+    return v ? v.negated() : null;
   }
   if (c === '(') {
     st.pos++;
     const v = parseExpr(st);
-    if (peek(st) !== ')') {
+    if (!v || peek(st) !== ')') {
       st.failed = true;
-      return NaN;
+      return null;
     }
     st.pos++;
     return v;
@@ -137,7 +156,7 @@ function parseFactor(st: ParseState): number {
 }
 
 /** number := digits ['.' digits] | '.' digits */
-function parseNumber(st: ParseState): number {
+function parseNumber(st: ParseState): Decimal | null {
   const start = st.pos;
   while (/[0-9]/.test(peek(st))) st.pos++;
   if (peek(st) === '.') {
@@ -148,14 +167,19 @@ function parseNumber(st: ParseState): number {
   // Must contain at least one digit ('.', '' are invalid).
   if (!/[0-9]/.test(text)) {
     st.failed = true;
-    return NaN;
+    return null;
   }
-  return Number(text);
+  return new QDecimal(text);
 }
 
-/** Round an evaluated amount to cents for display in money fields. */
-export function formatAmountResult(n: number): string {
-  return String(Math.round((n + Number.EPSILON) * 100) / 100);
+/**
+ * Round an evaluated amount to cents for a money field the way the books round (lib/money
+ * Money.round2: half away from zero), without trailing zeros, -0 or exponent notation:
+ * 47.5 → '47.5', 617283.945 → '617283.95', -2.555 → '-2.56'.
+ */
+export function formatAmountResult(n: number | string | Decimal): string {
+  const cents = new QDecimal(n).toDecimalPlaces(2, Decimal.ROUND_HALF_UP);
+  return cents.isZero() ? '0' : cents.toFixed();
 }
 
 // ---------------------------------------------------------------------------
