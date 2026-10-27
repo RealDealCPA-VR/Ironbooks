@@ -719,10 +719,11 @@ async function extractCompanyFile(filePath, destDir) {
  * Extract a full backup (.bka: the database folder plus bookkeeper-manifest.json, the format of
  * lib/services/backup.ts createBackup) into `destDir`, to restore it as a NEW company file
  * (QuickBooks: Open or Restore Company > Restore a backup copy). Same checks as
- * extractCompanyFile (CRCs, confined names, nothing left behind on a problem).
+ * extractCompanyFile (CRCs, confined names, nothing left behind on a problem). `knownSchemaAt`
+ * (the newest database migration this app ships): a backup made with a newer layout is refused.
  * Returns { companyName, createdAt }.
  */
-async function extractBackupArchive(filePath, destDir) {
+async function extractBackupArchive(filePath, destDir, { knownSchemaAt } = {}) {
   const reader = await openFileReader(filePath);
   try {
     const list = await readDirectory(reader);
@@ -735,7 +736,9 @@ async function extractBackupArchive(filePath, destDir) {
         throw new NotACompanyFileError('the backup information in it is unreadable');
       }
       if (!manifest || manifest.app !== 'bookkeeper-ai') throw new NotACompanyFileError('it is not an Ironbooks backup');
-      if (typeof manifest.formatVersion !== 'number' || manifest.formatVersion > 1) {
+      const newerLayout =
+        Number.isFinite(knownSchemaAt) && typeof manifest.dbSchemaAt === 'number' && manifest.dbSchemaAt > knownSchemaAt;
+      if (typeof manifest.formatVersion !== 'number' || manifest.formatVersion > 1 || newerLayout) {
         const err = new Error('This backup was made by a newer version of Ironbooks. Update Ironbooks (Help > Check for Updates) to restore it.');
         err.code = 'NEWER_FORMAT';
         throw err;

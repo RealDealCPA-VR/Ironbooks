@@ -424,6 +424,7 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
         companyName,
         createdAt: savedAt,
         appVersion: APP_VERSION,
+        ...(s.dbSchema ? { dbSchemaAt: s.dbSchema.lastMigrationAt } : {}),
       },
       entries,
       cache: s.cache,

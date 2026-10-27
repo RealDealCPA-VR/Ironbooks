@@ -20,6 +20,7 @@ import {
   withDamagedFileAccess,
   MIGRATIONS_FOLDER,
   NewerCompanyFileError,
+  latestShippedMigrationAt,
   type DB,
 } from '@/lib/db';
 import { checkLedgerHealth } from '@/lib/db/ledgerGuards';
@@ -96,6 +97,11 @@ interface BackupManifest {
   /** Ironbooks version that made the backup (absent on backups made before it was stamped). */
   appVersion?: string;
   /**
+   * The database layout it holds: `when` of the newest migration of the app that made it. A
+   * backup from a newer layout is refused (this version would drop what it does not know).
+   */
+  dbSchemaAt?: number;
+  /**
    * Per-company archives only: true when SSNs / tax IDs or account numbers were masked because
    * the exporting user lacked the sensitive-data flags. Those fields restore as empty.
    */
@@ -168,10 +174,28 @@ export function createBackup(companyName?: string, dataDir?: string): BackupResu
     companyName: companyName ?? null,
     createdAt: new Date().toISOString(),
     appVersion: APP_VERSION,
+    ...schemaStamp(),
   };
   zip.addFile(BACKUP_MANIFEST_ENTRY, Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'));
 
   return { buffer: zip.toBuffer(), filename: buildBackupFilename('ironbooks-backup', companyName) };
+}
+
+/** The database layout this app writes (its newest migration), for a backup's manifest. */
+function schemaStamp(): { dbSchemaAt?: number } {
+  const at = latestShippedMigrationAt();
+  return at === null ? {} : { dbSchemaAt: at };
+}
+
+/** Refuse a backup made with a newer database layout than this app knows. */
+function refuseNewerBackup(manifest: Partial<BackupManifest>): void {
+  const known = latestShippedMigrationAt();
+  if (known !== null && typeof manifest.dbSchemaAt === 'number' && manifest.dbSchemaAt > known) {
+    throw new ServiceError(
+      'VALIDATION',
+      'This backup was made with a newer version of Ironbooks, so this version cannot restore it. Update Ironbooks (Help > Check for Updates), then restore it again.',
+    );
+  }
 }
 
 /** Build a timestamped, slugged .bka filename. */
@@ -345,6 +369,7 @@ export function validateBackupZip(buffer: Buffer): AdmZip {
         'This backup was created by a newer version of Ironbooks. Update the app, then restore.',
       );
     }
+    refuseNewerBackup(manifest);
     if (manifest.kind === 'company') {
       throw new ServiceError(
         'VALIDATION',
@@ -961,6 +986,8 @@ export async function createCompanyBackup(
     kind: 'company',
     companyName: data.company.name,
     createdAt: new Date().toISOString(),
+    appVersion: APP_VERSION,
+    ...schemaStamp(),
     ...(redacted ? { redacted: true } : {}),
   };
   zip.addFile(BACKUP_MANIFEST_ENTRY, Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'));
@@ -1061,6 +1088,8 @@ export function readCompanyBackup(buffer: Buffer): CompanyExportData {
       'This backup was created by a newer version of Ironbooks. Update the app, then restore.',
     );
   }
+  // Rows of tables and columns this version does not have would be dropped without a word.
+  refuseNewerBackup(manifest);
   const dataEntry = zip.getEntry(COMPANY_DATA_ENTRY);
   if (!dataEntry) throw notABackup('archive does not contain company data');
   let data: CompanyExportData;

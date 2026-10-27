@@ -105,3 +105,38 @@ describe('a company file upgraded by a newer Ironbooks', () => {
     expect(prep.plan).toBe('extract');
   }, 60_000);
 });
+
+describe('backups made by a newer Ironbooks', () => {
+  it('a one-company backup is refused instead of silently dropping what this version does not know', async () => {
+    const { createCompanyBackup, readCompanyBackup } = await import('./backup');
+    const { seedRichCompany } = await import('./companyFile.fixture');
+    const AdmZip = (await import('adm-zip')).default;
+    const dir = path.join(ROOT, 'company-backup-src');
+    const db = await getDb(dir);
+    const { ctx } = await seedRichCompany(db, dir, 'Export Co');
+    const { buffer } = await createCompanyBackup(db, ctx.companyId, { dataDir: dir });
+    await closeDb(dir);
+    // Made here: it says which database layout it holds, and restores.
+    const zip = new AdmZip(buffer);
+    const manifest = JSON.parse(zip.readAsText('bookkeeper-manifest.json'));
+    expect(manifest.dbSchemaAt).toBe(latestKnown());
+    expect(() => readCompanyBackup(buffer)).not.toThrow();
+    // The same backup as a newer version would have made it.
+    zip.updateFile('bookkeeper-manifest.json', Buffer.from(JSON.stringify({ ...manifest, dbSchemaAt: latestKnown() + 86_400_000 })));
+    expect(() => readCompanyBackup(zip.toBuffer())).toThrow(/newer version of Ironbooks/);
+  }, 180_000);
+
+  it('a whole-file backup is refused before anything is extracted', async () => {
+    const { validateBackupZip } = await import('./backup');
+    const AdmZip = (await import('adm-zip')).default;
+    const dir = path.join(ROOT, 'full-backup-src');
+    await getDb(dir);
+    await closeDb(dir);
+    const zip = new AdmZip(createBackup('Full Co', dir).buffer);
+    const manifest = JSON.parse(zip.readAsText('bookkeeper-manifest.json'));
+    expect(manifest.dbSchemaAt).toBe(latestKnown());
+    expect(() => validateBackupZip(zip.toBuffer())).not.toThrow();
+    zip.updateFile('bookkeeper-manifest.json', Buffer.from(JSON.stringify({ ...manifest, dbSchemaAt: latestKnown() + 1 })));
+    expect(() => validateBackupZip(zip.toBuffer())).toThrow(/newer version of Ironbooks/);
+  }, 120_000);
+});

@@ -1481,7 +1481,9 @@ async function restoreBackupAsNewFileFlow(bkaPath) {
   const scratchWork = path.join(workingRoot(), `restore-${crypto.randomBytes(6).toString('hex')}`);
   const scratch = companySession.dataDirOf(scratchWork);
   try {
-    const info = await companyFileFormat.extractBackupArchive(bkaPath, scratch);
+    const info = await companyFileFormat.extractBackupArchive(bkaPath, scratch, {
+      knownSchemaAt: companySession.latestMigrationAt(migrationsDir()),
+    });
     await companySession.writeWorkingCopyAs(scratchWork, target, {
       companyName: info.companyName || companyFileFormat.companyFileBaseName(target),
       appVersion: app.getVersion(),

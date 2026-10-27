@@ -115,3 +115,22 @@ describe('company files over 2 GB', () => {
     expect(fs.existsSync(out) ? fs.readdirSync(out) : []).toEqual([]);
   });
 });
+
+describe('restoring a backup made by a newer Ironbooks as a new company file', () => {
+  it('is refused before anything is extracted', async () => {
+    const src = path.join(root, 'bka-src');
+    fs.mkdirSync(src, { recursive: true });
+    fs.writeFileSync(path.join(src, 'PG_VERSION'), '17\n');
+    const bka = path.join(root, 'newer.bka');
+    await format.writeZip(bka, [
+      { name: 'bookkeeper-manifest.json', data: Buffer.from(JSON.stringify({ app: 'bookkeeper-ai', formatVersion: 1, kind: 'full', dbSchemaAt: 2_000_000_000_000 })) },
+      ...format.snapshotDir(src),
+    ]);
+    const out = path.join(root, 'newer-out');
+    await expect(format.extractBackupArchive(bka, out, { knownSchemaAt: 1_781_400_062_000 })).rejects.toMatchObject({ code: 'NEWER_FORMAT' });
+    expect(fs.existsSync(out)).toBe(false);
+    // Same backup, this version knows its layout: restored.
+    await format.extractBackupArchive(bka, out, { knownSchemaAt: 2_000_000_000_000 });
+    expect(fs.readFileSync(path.join(out, 'PG_VERSION'), 'utf8')).toBe('17\n');
+  });
+});
