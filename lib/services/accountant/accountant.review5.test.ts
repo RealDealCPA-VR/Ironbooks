@@ -15,6 +15,9 @@
  *     and credit memos (whose lines keep no class) refuse it instead of saving without it.
  *  F  Voided/Deleted Transactions and Review List Changes filter WHEN something happened by the
  *     company's calendar day (Preferences time zone), not the UTC day.
+ *  G  Client Data Review "Troubleshoot prior account balances" lists entries changed in place after
+ *     the review (Reclassify Transactions), not only entries entered or voided after it — the
+ *     balance comparison showed the change but nothing explained it.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
@@ -35,7 +38,7 @@ import { assertCurrentVersion, currentVersion } from '../concurrency';
 import { trialBalance } from '../reports';
 import { reclassifyLines } from './reclassify';
 import { findMisrecordedSalesTax, reclassifySalesTaxPayment } from './salesTaxTools';
-import { autoApplyCustomerCredit, autoApplyVendorCredit } from './clientDataReview';
+import { autoApplyCustomerCredit, autoApplyVendorCredit, clientDataReview, takeReviewSnapshot } from './clientDataReview';
 import { voidedDeletedTransactions } from './auditReports';
 import { listListChanges } from './listChanges';
 import { updateCompany } from '../company';
@@ -291,5 +294,30 @@ describe('F: audit reports filter by the company calendar day', () => {
     expect(since27.rows.map((r) => r.entityId)).not.toContain(v.id);
     const since26 = await listListChanges(ctx, { since: '2026-10-26', includeReviewed: true });
     expect(since26.rows.map((r) => r.entityId)).toContain(v.id);
+  });
+});
+
+describe('G: Troubleshoot prior account balances lists entries changed in place', () => {
+  it('a line reclassified after the review shows as the transaction behind the changed balances', async () => {
+    const exp = await createExpense(ctx, {
+      vendorId,
+      date: D('2026-01-15'),
+      method: 'check',
+      paymentAccountId: acct['1000'],
+      lines: [{ accountId: acct.e1, amount: '64.00' }],
+    });
+    await takeReviewSnapshot(ctx, { asOf: '2026-01-31' });
+    await new Promise((r) => setTimeout(r, 20));
+    const line = await lineOn(expenses, exp.id, acct.e1);
+    await reclassifyLines(ctx, { lineIds: [line.id], newAccountId: acct.e2 });
+
+    const review = await clientDataReview(ctx);
+    const compare = review.tasks.find((t) => t.key === 'compare_balances')!;
+    expect(compare.issues.map((i) => i.id)).toEqual(expect.arrayContaining([`acct:${acct.e1}`, `acct:${acct.e2}`]));
+    const prior = review.tasks.find((t) => t.key === 'prior_balances')!;
+    const [row] = await db.select({ e: expenses.postedEntryId }).from(expenses).where(eq(expenses.id, exp.id));
+    const hit = prior.issues.find((i) => i.id === `je:${row.e}`);
+    expect(hit, 'the reclassified check is listed').toBeDefined();
+    expect(hit!.title).toMatch(/changed after the last review/);
   });
 });

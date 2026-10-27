@@ -362,7 +362,8 @@ async function compareBalances(ctx: ServiceContext): Promise<{ issues: ReviewIss
       fix: { kind: 'link', href: `/registers/${id}?to=${snap.asOf}`, label: 'Open register' },
     });
   }
-  // The transactions behind the change: dated in the reviewed period, entered or voided later.
+  // The transactions behind the change: dated in the reviewed period, entered, changed in place
+  // (Reclassify Transactions rewrites posted lines and moves the entry's version) or voided later.
   const late = await ctx.db
     .select({
       id: journalEntries.id,
@@ -371,6 +372,7 @@ async function compareBalances(ctx: ServiceContext): Promise<{ issues: ReviewIss
       description: journalEntries.description,
       status: journalEntries.status,
       createdAt: journalEntries.createdAt,
+      updatedAt: journalEntries.updatedAt,
       voidedAt: journalEntries.voidedAt,
       user: users.name,
     })
@@ -380,19 +382,23 @@ async function compareBalances(ctx: ServiceContext): Promise<{ issues: ReviewIss
       and(
         eq(journalEntries.companyId, ctx.companyId),
         lte(journalEntries.date, endOfDay(snap.asOf)),
-        sql`(${journalEntries.createdAt} > ${snap.createdAt} OR ${journalEntries.voidedAt} > ${snap.createdAt})`,
+        sql`(${journalEntries.createdAt} > ${snap.createdAt} OR ${journalEntries.voidedAt} > ${snap.createdAt} OR (${journalEntries.status} = 'posted' AND ${journalEntries.updatedAt} > ${snap.createdAt}))`,
         sql`${journalEntries.status} IN ('posted', 'void')`,
       ),
     )
     .orderBy(asc(journalEntries.date));
   const prior: ReviewIssue[] = late
     .filter((e) => !(e.status === 'void' && e.createdAt > snap.createdAt)) // entered and voided after: no net effect
-    .map((e) => ({
-      id: `je:${e.id}`,
-      title: `Entry #${e.n} dated ${e.date.toISOString().slice(0, 10)} was ${e.voidedAt && e.voidedAt > snap.createdAt ? 'voided' : 'entered'} after the last review`,
-      detail: `${e.description}${e.user ? ` — by ${e.user}` : ''}. It changes balances you already reviewed.`,
-      fix: { kind: 'link' as const, href: `/journal?focus=${e.id}`, label: 'Open entry' },
-    }));
+    .map((e) => {
+      const what =
+        e.voidedAt && e.voidedAt > snap.createdAt ? 'voided' : e.createdAt > snap.createdAt ? 'entered' : 'changed';
+      return {
+        id: `je:${e.id}`,
+        title: `Entry #${e.n} dated ${e.date.toISOString().slice(0, 10)} was ${what} after the last review`,
+        detail: `${e.description}${e.user ? ` — by ${e.user}` : ''}. It changes balances you already reviewed.`,
+        fix: { kind: 'link' as const, href: `/journal?focus=${e.id}`, label: 'Open entry' },
+      };
+    });
   return { issues, prior };
 }
 
