@@ -10,6 +10,7 @@ import { and, desc, eq, gte, inArray } from 'drizzle-orm';
 import { auditLogs, listChangeReviews, users } from '@/lib/db/schema';
 import { type ServiceContext, inTransaction, validation, writeAudit } from '../_base';
 import { maskForContext } from '../access';
+import { companyDayBound } from '../preferences';
 
 export const LIST_ENTITY_TYPES: Record<string, string> = {
   account: 'Chart of Accounts',
@@ -72,12 +73,14 @@ function labelOf(v: unknown): string {
 
 export async function listListChanges(
   ctx: ServiceContext,
-  opts: { since?: Date; includeReviewed?: boolean; entityType?: string | null; limit?: number } = {},
+  opts: { since?: Date | string | null; includeReviewed?: boolean; entityType?: string | null; limit?: number } = {},
 ): Promise<{ rows: ListChangeRow[]; unreviewed: number }> {
+  // A 'since' day is the start of that calendar day in the company's time zone.
+  const since = await companyDayBound(ctx, opts.since, 'since');
   const types = opts.entityType ? [opts.entityType] : Object.keys(LIST_ENTITY_TYPES);
   if (opts.entityType && !LIST_ENTITY_TYPES[opts.entityType]) throw validation('Unknown list.');
   const conds = [eq(auditLogs.companyId, ctx.companyId), inArray(auditLogs.entityType, types)];
-  if (opts.since) conds.push(gte(auditLogs.createdAt, opts.since));
+  if (since) conds.push(gte(auditLogs.createdAt, since));
   const rows = await ctx.db
     .select({
       id: auditLogs.id,

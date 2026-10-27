@@ -13,6 +13,8 @@
  *     credit's Ref. No. — not its memo) and a one-time payee's name.
  *  E  Batch Enter never drops a class typed in the grid: bill credits keep it on their line; deposits
  *     and credit memos (whose lines keep no class) refuse it instead of saving without it.
+ *  F  Voided/Deleted Transactions and Review List Changes filter WHEN something happened by the
+ *     company's calendar day (Preferences time zone), not the UTC day.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
@@ -35,6 +37,9 @@ import { reclassifyLines } from './reclassify';
 import { findMisrecordedSalesTax, reclassifySalesTaxPayment } from './salesTaxTools';
 import { autoApplyCustomerCredit, autoApplyVendorCredit } from './clientDataReview';
 import { voidedDeletedTransactions } from './auditReports';
+import { listListChanges } from './listChanges';
+import { updateCompany } from '../company';
+import { auditLogs } from '@/lib/db/schema';
 import { batchEnterTransactions } from './batchEnter';
 import { createClass } from '../dimensions';
 import { vendorCreditLines } from '@/lib/db/schema';
@@ -257,5 +262,34 @@ describe('E: Batch Enter never drops a typed class', () => {
     });
     expect(cm.saved).toBe(0);
     expect(cm.results[0].errors.join(' ')).toMatch(/class/i);
+  });
+});
+
+describe('F: audit reports filter by the company calendar day', () => {
+  it('a void at 9:30 pm New York time on Oct 26 is "on Oct 26", not Oct 27', async () => {
+    await updateCompany(ctx, { settings: { timezone: 'America/New_York' } });
+    const inv = await createInvoice(ctx, {
+      customerId,
+      date: D('2026-10-20'),
+      lines: [{ description: 'Late void', quantity: 1, rate: '33.00', accountId: acct.i1 }],
+    });
+    await voidInvoice(ctx, inv.id);
+    // 9:30 pm EDT on Oct 26 = 01:30 UTC on Oct 27.
+    await db
+      .update(auditLogs)
+      .set({ createdAt: new Date('2026-10-27T01:30:00.000Z') })
+      .where(and(eq(auditLogs.entityId, inv.id), eq(auditLogs.action, 'void')));
+    const on26 = await voidedDeletedTransactions(ctx, { from: '2026-10-26', to: '2026-10-26' });
+    expect(on26.rows.map((r) => r.entityId)).toContain(inv.id);
+    const from27 = await voidedDeletedTransactions(ctx, { from: '2026-10-27' });
+    expect(from27.rows.map((r) => r.entityId)).not.toContain(inv.id);
+
+    // Review List Changes "changed since" follows the same calendar.
+    const v = await createVendor(ctx, { displayName: 'R5 Evening Vendor' });
+    await db.update(auditLogs).set({ createdAt: new Date('2026-10-27T02:00:00.000Z') }).where(eq(auditLogs.entityId, v.id));
+    const since27 = await listListChanges(ctx, { since: '2026-10-27', includeReviewed: true });
+    expect(since27.rows.map((r) => r.entityId)).not.toContain(v.id);
+    const since26 = await listListChanges(ctx, { since: '2026-10-26', includeReviewed: true });
+    expect(since26.rows.map((r) => r.entityId)).toContain(v.id);
   });
 });

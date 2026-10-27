@@ -9,7 +9,6 @@ import { routeError } from '@/lib/routeErrors';
 import { listListChanges, markListChangesReviewed } from '@/lib/services/accountant/listChanges';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { listChangesReviewSchema } from '@/lib/validation/accountant';
-import { dayParam } from '../_lib';
 
 export async function GET(req: NextRequest) {
   try {
@@ -17,7 +16,7 @@ export async function GET(req: NextRequest) {
     const sp = req.nextUrl.searchParams;
     return NextResponse.json(
       await listListChanges(ctx, {
-        since: dayParam(sp.get('since'), 'since'),
+        since: sp.get('since'), // a calendar day in the company's time zone
         includeReviewed: sp.get('includeReviewed') === '1',
         entityType: sp.get('entityType') || null,
       }),

@@ -14,6 +14,10 @@ import { auditLogs, companies, journalEntries, journalEntryLines, users } from '
 import { Money, toAmountString } from '@/lib/money';
 import type { ServiceContext } from '../_base';
 import { maskForContext } from '../access';
+import { companyDayBound } from '../preferences';
+
+/** A 'when it happened' filter: a calendar day is read in the company's time zone (Preferences). */
+export type HappenedBound = Date | string | null | undefined;
 
 // ---------------------------------------------------------------------------
 // J11 — Closing Date Exception report
@@ -35,8 +39,12 @@ export interface ClosingDateExceptionRow {
 
 export async function closingDateExceptionReport(
   ctx: ServiceContext,
-  range: { from?: Date; to?: Date } = {},
+  rangeIn: { from?: HappenedBound; to?: HappenedBound } = {},
 ): Promise<{ closingDate: string | null; rows: ClosingDateExceptionRow[] }> {
+  const range = {
+    from: await companyDayBound(ctx, rangeIn.from, 'from'),
+    to: await companyDayBound(ctx, rangeIn.to, 'to', true),
+  };
   const [company] = await ctx.db
     .select({ settings: companies.settings })
     .from(companies)
@@ -192,8 +200,13 @@ function pickStr(v: Record<string, unknown>, keys: string[]): string | null {
 
 export async function voidedDeletedTransactions(
   ctx: ServiceContext,
-  opts: { from?: Date; to?: Date; detail?: boolean } = {},
+  optsIn: { from?: HappenedBound; to?: HappenedBound; detail?: boolean } = {},
 ): Promise<{ rows: VoidedDeletedRow[]; count: number }> {
+  const opts = {
+    from: await companyDayBound(ctx, optsIn.from, 'from'),
+    to: await companyDayBound(ctx, optsIn.to, 'to', true),
+    detail: optsIn.detail,
+  };
   const types = Object.keys(TRANSACTION_ENTITY_LABELS);
   const conds = [
     eq(auditLogs.companyId, ctx.companyId),

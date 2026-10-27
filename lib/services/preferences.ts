@@ -11,6 +11,7 @@ import {
   MY_PREFERENCE_KEYS,
   resolveMyPreferences,
   todayInTimeZone,
+  zonedDayBound,
   type CompanyPreferences,
   type MyPreferences,
 } from '@/lib/preferences';
@@ -49,6 +50,34 @@ export async function companyTodayIso(ctx: ServiceContext, now: Date = new Date(
  */
 export async function companyToday(ctx: ServiceContext, now: Date = new Date()): Promise<Date> {
   return new Date(`${await companyTodayIso(ctx, now)}T12:00:00.000Z`);
+}
+
+/**
+ * A report filter on WHEN something happened (audit trail timestamps) given as a calendar day
+ * 'YYYY-MM-DD': the instant that day starts (or, with `end`, its last millisecond) in the company's
+ * time zone. A Date passes through unchanged; anything else is a VALIDATION error.
+ */
+export async function companyDayBound(
+  ctx: ServiceContext,
+  value: Date | string | null | undefined,
+  name: string,
+  end = false,
+): Promise<Date | undefined> {
+  if (value === undefined || value === null || value === '') return undefined;
+  if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) throw validation(`Invalid ${name} date.`);
+    return value;
+  }
+  const v = value.trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(v)) {
+    const prefs = await getPreferences(ctx);
+    const d = zonedDayBound(v, prefs.timezone, end);
+    if (!d) throw validation(`Invalid ${name} date.`);
+    return d;
+  }
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) throw validation(`Invalid ${name} date.`);
+  return d;
 }
 
 export async function getAllPreferences(ctx: ServiceContext): Promise<AllPreferences> {

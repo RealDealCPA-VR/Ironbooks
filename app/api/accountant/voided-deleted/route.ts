@@ -4,7 +4,6 @@ import { type NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { routeError } from '@/lib/routeErrors';
 import { voidedDeletedTransactions } from '@/lib/services/accountant/auditReports';
-import { dayParam } from '../_lib';
 
 export async function GET(req: NextRequest) {
   try {
@@ -12,8 +11,9 @@ export async function GET(req: NextRequest) {
     const sp = req.nextUrl.searchParams;
     return NextResponse.json(
       await voidedDeletedTransactions(ctx, {
-        from: dayParam(sp.get('from'), 'from'),
-        to: dayParam(sp.get('to'), 'to', true),
+        // Calendar days are read in the company's time zone (the service resolves them).
+        from: sp.get('from'),
+        to: sp.get('to'),
         detail: sp.get('detail') === '1',
       }),
     );

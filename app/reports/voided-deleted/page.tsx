@@ -9,9 +9,9 @@ import ReportToolbar, { type ExportTable } from '../_components/ReportToolbar';
 
 export const dynamic = 'force-dynamic';
 
-function day(v: string | undefined, end: boolean): Date | undefined {
-  if (!v || !/^\d{4}-\d{2}-\d{2}$/.test(v)) return undefined;
-  return new Date(`${v}T${end ? '23:59:59.999' : '00:00:00.000'}Z`);
+/** A typed day; the report reads it in the company's time zone. */
+function day(v: string | undefined): string | undefined {
+  return v && /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : undefined;
 }
 
 function summarize(original: unknown): string {
@@ -36,7 +36,7 @@ export default async function VoidedDeletedPage({
   const ctx = await getPageContext('/reports/voided-deleted');
   const p = await searchParams;
   const detail = p.detail === '1';
-  const { rows } = await voidedDeletedTransactions(ctx, { from: day(p.from, false), to: day(p.to, true), detail });
+  const { rows } = await voidedDeletedTransactions(ctx, { from: day(p.from), to: day(p.to), detail });
 
   const exportTable: ExportTable = {
     filename: detail ? 'voided-deleted-detail' : 'voided-deleted-summary',

@@ -11,9 +11,9 @@ export const dynamic = 'force-dynamic';
 
 const OP_LABEL: Record<string, string> = { post: 'Added', void: 'Voided', reclassify: 'Reclassified' };
 
-function day(v: string | undefined, end: boolean): Date | undefined {
-  if (!v || !/^\d{4}-\d{2}-\d{2}$/.test(v)) return undefined;
-  return new Date(`${v}T${end ? '23:59:59.999' : '00:00:00.000'}Z`);
+/** A typed day; the report reads it in the company's time zone. */
+function day(v: string | undefined): string | undefined {
+  return v && /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : undefined;
 }
 
 export default async function ClosingDateExceptionsPage({
@@ -23,7 +23,7 @@ export default async function ClosingDateExceptionsPage({
 }) {
   const ctx = await getPageContext('/reports/closing-date-exceptions');
   const p = await searchParams;
-  const report = await closingDateExceptionReport(ctx, { from: day(p.from, false), to: day(p.to, true) });
+  const report = await closingDateExceptionReport(ctx, { from: day(p.from), to: day(p.to) });
 
   const exportTable: ExportTable = {
     filename: 'closing-date-exceptions',
