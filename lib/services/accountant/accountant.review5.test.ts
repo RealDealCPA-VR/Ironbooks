@@ -18,6 +18,8 @@
  *  G  Client Data Review "Troubleshoot prior account balances" lists entries changed in place after
  *     the review (Reclassify Transactions), not only entries entered or voided after it — the
  *     balance comparison showed the change but nothing explained it.
+ *  H  Write Off Invoices shows and records the invoice number on the form (a typed ref number such
+ *     as INV-1001), not the internal sequence number nobody sees elsewhere.
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import fs from 'node:fs';
@@ -40,6 +42,7 @@ import { reclassifyLines } from './reclassify';
 import { findMisrecordedSalesTax, reclassifySalesTaxPayment } from './salesTaxTools';
 import { autoApplyCustomerCredit, autoApplyVendorCredit, clientDataReview, takeReviewSnapshot } from './clientDataReview';
 import { voidedDeletedTransactions } from './auditReports';
+import { listWriteOffCandidates, writeOffInvoices } from './writeOff';
 import { listListChanges } from './listChanges';
 import { updateCompany } from '../company';
 import { auditLogs } from '@/lib/db/schema';
@@ -50,7 +53,7 @@ import { voidInvoice } from '../invoices';
 import { voidExpense } from '../expenses';
 import { receivePayment } from '../payments';
 import { createVendorCredit, voidVendorCredit } from '../vendorCredits';
-import { paymentsReceived } from '@/lib/db/schema';
+import { creditMemos, paymentsReceived } from '@/lib/db/schema';
 import { normalizeGrant, type EffectiveAccess, type PermissionGrant } from '@/lib/permissions/model';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-review5-accountant');
@@ -319,5 +322,26 @@ describe('G: Troubleshoot prior account balances lists entries changed in place'
     const hit = prior.issues.find((i) => i.id === `je:${row.e}`);
     expect(hit, 'the reclassified check is listed').toBeDefined();
     expect(hit!.title).toMatch(/changed after the last review/);
+  });
+});
+
+describe('H: Write Off Invoices names invoices by the number on the form', () => {
+  it('the candidate list, the credit memo and the messages use the typed invoice number', async () => {
+    const cust = (await createCustomer(ctx, { displayName: 'R5 Bad Payer' })).id;
+    const inv = await createInvoice(ctx, {
+      customerId: cust,
+      refNumber: 'INV-R5-901',
+      date: D('2026-01-10'),
+      dueDate: D('2026-02-09'),
+      lines: [{ description: 'Old work', quantity: 1, rate: '80.00', accountId: acct.i1 }],
+    });
+    const cands = await listWriteOffCandidates(ctx, { asOf: D('2026-09-30'), customerId: cust });
+    expect(cands.find((c) => c.invoiceId === inv.id)).toMatchObject({ number: 'INV-R5-901' });
+    const res = await writeOffInvoices(ctx, { invoiceIds: [inv.id], date: D('2026-09-30'), badDebtAccountId: acct.e3 });
+    expect(res.results[0]).toMatchObject({ number: 'INV-R5-901' });
+    const [memo] = await db.select({ memo: creditMemos.memo }).from(creditMemos).where(eq(creditMemos.id, res.results[0].creditMemoId));
+    expect(memo.memo).toContain('INV-R5-901');
+    // Writing it off again: the refusal names the invoice the same way.
+    await expect(writeOffInvoices(ctx, { invoiceIds: [inv.id], date: D('2026-09-30'), badDebtAccountId: acct.e3 })).rejects.toThrow(/INV-R5-901/);
   });
 });

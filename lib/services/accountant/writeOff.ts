@@ -17,10 +17,13 @@ import { accounts, customers, invoices } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from '../_base';
 import { applyToInvoice, createCreditMemo } from '../creditMemos';
+import { docRef } from '../docNumbers';
 
 export interface WriteOffCandidate {
   invoiceId: string;
   invoiceNumber: number;
+  /** The number printed on the invoice (its typed ref number, else the sequence number). */
+  number: string;
   customerId: string;
   customerName: string;
   date: string;
@@ -50,6 +53,7 @@ export async function listWriteOffCandidates(
     .select({
       id: invoices.id,
       invoiceNumber: invoices.invoiceNumber,
+      refNumber: invoices.refNumber,
       customerId: invoices.customerId,
       customerName: customers.displayName,
       date: invoices.date,
@@ -70,6 +74,7 @@ export async function listWriteOffCandidates(
       return {
         invoiceId: r.id,
         invoiceNumber: r.invoiceNumber,
+        number: docRef(r.refNumber, r.invoiceNumber),
         customerId: r.customerId,
         customerName: r.customerName,
         date: r.date.toISOString(),
@@ -93,6 +98,8 @@ export interface WriteOffInput {
 export interface WriteOffResult {
   invoiceId: string;
   invoiceNumber: number;
+  /** The number printed on the invoice (its typed ref number, else the sequence number). */
+  number: string;
   amount: string;
   creditMemoId: string;
 }
@@ -123,26 +130,28 @@ export async function writeOffInvoices(
     const results: WriteOffResult[] = [];
     let total = Money.zero();
     for (const inv of rows.sort((a, b) => a.invoiceNumber - b.invoiceNumber)) {
+      // The number the user knows the invoice by (printed on it, shown in A/R aging).
+      const no = docRef(inv.refNumber, inv.invoiceNumber);
       if (inv.status === 'void' || inv.status === 'draft') {
-        throw new ServiceError('CONFLICT', `Invoice #${inv.invoiceNumber} is ${inv.status} and cannot be written off.`);
+        throw new ServiceError('CONFLICT', `Invoice #${no} is ${inv.status} and cannot be written off.`);
       }
       const balance = Money.round2(inv.balanceDue);
       if (!balance.greaterThan(0)) {
-        throw new ServiceError('CONFLICT', `Invoice #${inv.invoiceNumber} has no open balance.`);
+        throw new ServiceError('CONFLICT', `Invoice #${no} has no open balance.`);
       }
       if (inv.exchangeRate != null && !Money.eq(inv.exchangeRate, 1)) {
-        throw validation(`Invoice #${inv.invoiceNumber} is in a foreign currency — write it off with a credit memo in that currency.`);
+        throw validation(`Invoice #${no} is in a foreign currency — write it off with a credit memo in that currency.`);
       }
       if (input.date < inv.date) {
-        throw validation(`The write-off date is before invoice #${inv.invoiceNumber}'s date.`);
+        throw validation(`The write-off date is before invoice #${no}'s date.`);
       }
       const memo = await createCreditMemo(tx, {
         customerId: inv.customerId,
         date: input.date,
-        memo: input.memo?.trim() || `Write-off of invoice #${inv.invoiceNumber} (bad debt)`,
+        memo: input.memo?.trim() || `Write-off of invoice #${no} (bad debt)`,
         lines: [
           {
-            description: `Bad debt write-off — invoice #${inv.invoiceNumber}`,
+            description: `Bad debt write-off — invoice #${no}`,
             quantity: 1,
             rate: toAmountString(balance),
             accountId: acct.id,
@@ -153,7 +162,7 @@ export async function writeOffInvoices(
       // Dated with the write-off (like its credit memo), not today: the balance is written off on
       // that day in A/R aging, and in an Accountant's Copy "today" is after the dividing date.
       await applyToInvoice(tx, { creditMemoId: memo.id, invoiceId: inv.id, amount: toAmountString(balance), date: input.date });
-      results.push({ invoiceId: inv.id, invoiceNumber: inv.invoiceNumber, amount: toAmountString(balance), creditMemoId: memo.id });
+      results.push({ invoiceId: inv.id, invoiceNumber: inv.invoiceNumber, number: no, amount: toAmountString(balance), creditMemoId: memo.id });
       total = total.plus(balance);
     }
     await writeAudit(tx, {
