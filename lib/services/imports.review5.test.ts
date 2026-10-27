@@ -434,7 +434,7 @@ describe('D. Open items: input robustness', () => {
     const r = await importOpenItems(ctx, { file: { name: 'unpaid.csv', data: b64(csv) }, alreadyInGl: false });
     expect(r.bills).toBe(1);
     expect(r.skipped).toBe(1);
-    expect(r.issues.find((i) => i.reason === 'validation')!.message).toMatch(/longer than 100 characters/);
+    expect(r.issues.find((i) => i.reason === 'validation')!.message).toMatch(/at most 100 characters/);
     expect(r.reconciliation.ap.inBalance).toBe(true);
   });
 });
