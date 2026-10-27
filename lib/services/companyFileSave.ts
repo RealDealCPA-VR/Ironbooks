@@ -31,6 +31,7 @@ import lockFormat from '@/electron/companyLock';
 import { closeDb, firstOpenWalPosition, getDb, holdDbOpen, isDbOpen, resolveDataDir, withDamagedFileAccess, type DB } from '@/lib/db';
 import { currentFingerprint } from './backupFingerprint';
 import { BACKUP_HISTORY_FILE } from './backupHistory';
+import { isRestoreInProgress } from './restoreState';
 import { APP_VERSION } from '@/lib/appVersion';
 
 /** How often the autosave timer looks for changes. */
@@ -325,6 +326,11 @@ export async function saveCompanyFile(opts: { force?: boolean; final?: boolean; 
 async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }): Promise<SaveResult> {
   const dataDir = s.dataDir;
   const started = Date.now();
+  if (!opts.final && isRestoreInProgress(dataDir)) {
+    throw Object.assign(new Error('A backup is being restored into this company file. It is saved as soon as the restore has finished.'), {
+      code: 'RESTORING',
+    });
+  }
 
   // Still ours? (A computer that slept past the lock's stale time may have lost it.)
   if (s.lockDir && s.lockToken) {
@@ -524,6 +530,9 @@ export async function autosaveTick(now = Date.now()): Promise<'idle' | 'waiting'
   const s = state();
   if (!s || s.closed) return 'idle';
   if (s.inflight) return 'busy';
+  // A restore is replacing the working copy: its books are verified only after they are swapped
+  // in (and rolled back if they fail), so nothing is saved until it has finished.
+  if (isRestoreInProgress(s.dataDir)) return 'busy';
   const dataDir = s.dataDir;
   const fp = currentFingerprint(dataDir);
   if (fp !== s.lastSeenFingerprint) {

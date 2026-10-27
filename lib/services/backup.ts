@@ -72,6 +72,7 @@ import { cloneAttachmentFileForRestore, normalizeStoragePath, safeAttachmentPath
 import { allowLedgerRewrite } from './posting';
 import { logTransaction, resetTransactionLogCache } from './transactionLog';
 import { BACKUP_HISTORY_FILE, BACKUP_SETTINGS_FILE, recordBackup } from './backupHistory';
+import { beginRestore } from './restoreState';
 import { currentFingerprint } from './backupFingerprint';
 import { APP_VERSION } from '@/lib/appVersion';
 import type { EffectiveAccess } from '@/lib/permissions/model';
@@ -466,7 +467,16 @@ export async function restoredBookNotices(dir: string): Promise<string[]> {
  * @param targetDir  Optional path override; defaults to resolveDataDir().
  */
 export async function restoreBackup(buffer: Buffer, targetDir?: string): Promise<RestoreResult> {
-  const dir = resolveDataDir(targetDir);
+  // The open single company file's autosave waits until this has finished (restoreState.ts).
+  const done = beginRestore(targetDir);
+  try {
+    return await restoreBackupInto(resolveDataDir(targetDir), buffer);
+  } finally {
+    done();
+  }
+}
+
+async function restoreBackupInto(dir: string, buffer: Buffer): Promise<RestoreResult> {
 
   // (1) Validate before touching anything on disk.
   const zip = validateBackupZip(buffer);

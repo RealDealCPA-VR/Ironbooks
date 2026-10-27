@@ -289,3 +289,25 @@ describe('Save Copy As over an existing company file', () => {
     expect(format.readCompanyManifest(theirs).saveId).not.toBe(before);
   }, 120_000);
 });
+
+describe('while a backup is being restored into the open company file', () => {
+  it('autosave waits: books that are still being verified never go into the company file', async () => {
+    adoptFileOnDisk();
+    const { createBackup, restoreBackup } = await import('./backup');
+    const dataDir = process.env.BKA_DATA_DIR!;
+    const backup = createBackup('Beacon Books', dataDir).buffer;
+    const db = await getDb();
+    await db.execute(sql`insert into save_probe values (40, 'after the backup')`);
+    appendLogRecord(dataDir);
+    const t = Date.now() + 2 * 60 * 60_000;
+    expect(await autosaveTick(t)).toBe('waiting'); // noticed, saved when quiet
+    const savedBefore = format.readCompanyManifest(FILE).saveId;
+    const restoring = restoreBackup(backup);
+    const tick = await autosaveTick(t + 60_000);
+    await restoring;
+    expect(tick).toBe('busy');
+    expect(format.readCompanyManifest(FILE).saveId).toBe(savedBefore);
+    // Once restored (and verified), the restored books are saved as usual.
+    expect(await autosaveTick(t + 120_000)).toBe('saved');
+  }, 240_000);
+});
