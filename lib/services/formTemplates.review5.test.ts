@@ -54,23 +54,35 @@ describe('review5: concurrent saves', () => {
   it('C: saving definitions keeps a closing date saved in the meantime', async () => {
     // Another user's save lands between this save's read of the settings and its write.
     let interleaved = false;
+    // The other save commits after this one read the settings and before it writes them — that is,
+    // just before its write (or the transaction holding its write) starts.
+    const other = async () => {
+      if (interleaved) return;
+      interleaved = true;
+      await t.db.execute(
+        sql`UPDATE companies SET settings = coalesce(settings, '{}'::jsonb) || '{"closingDate":"2026-03-31"}'::jsonb WHERE id = ${t.ctx.companyId}`,
+      );
+    };
     const db = new Proxy(t.db, {
       get(target, prop, receiver) {
         if (prop === 'update') {
           return (table: unknown) => {
             const builder = target.update(table as typeof companies);
-            if (table !== companies || interleaved) return builder;
-            interleaved = true;
+            if (table !== companies) return builder;
             return {
               set: (values: Record<string, unknown>) => ({
                 where: async (where: unknown) => {
-                  await target.execute(
-                    sql`UPDATE companies SET settings = coalesce(settings, '{}'::jsonb) || '{"closingDate":"2026-03-31"}'::jsonb WHERE id = ${t.ctx.companyId}`,
-                  );
+                  await other();
                   return builder.set(values as never).where(where as never);
                 },
               }),
             };
+          };
+        }
+        if (prop === 'transaction') {
+          return async (fn: (tx: unknown) => Promise<unknown>, ...rest: unknown[]) => {
+            await other();
+            return target.transaction(fn as never, ...(rest as []));
           };
         }
         const v = Reflect.get(target, prop, receiver);

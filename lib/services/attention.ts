@@ -51,7 +51,7 @@ import { ServiceError, notFound, validation, writeAudit, type ServiceContext } f
 import { getCompany, getPreferences } from './company';
 import { listUndepositedPayments } from './deposits';
 import { canSeeTodoLink } from './todos';
-import { requireFileAdmin } from './access';
+import { requireFileAdmin, requirePermission } from './access';
 import { isConfigured as emailIsConfigured, sendMail } from './email';
 import { lastFullBackup, readBackupHistory } from './backupHistory';
 import { runVersionedBackup } from './backupSchedule';
@@ -1076,6 +1076,8 @@ export async function sendPaymentReminder(
   to?: string | null,
 ): Promise<{ ok: true; to: string }> {
   if (typeof invoiceId !== 'string' || !/^[0-9a-f-]{36}$/i.test(invoiceId)) throw notFound('Invoice');
+  // Same right as emailing the invoice itself (the route asks for it too).
+  requirePermission(ctx, 'customers', 'print');
   const [inv] = await ctx.db
     .select({
       id: invoices.id,
@@ -1132,7 +1134,11 @@ export async function sendPaymentReminder(
     },
     ctx,
   );
-  await writeAudit(ctx, {
+  // Emailing a reminder changes nothing in the books, so a member who may only view and print
+  // customer forms (the route's Customers: print right — the legacy 'viewer' role) may send one.
+  // Audit it under a context without that role: writeAudit would otherwise refuse the row AFTER
+  // the email went out (an error for a sent reminder, and a retry emails the customer again).
+  await writeAudit({ ...ctx, role: ctx.role === 'viewer' ? undefined : ctx.role }, {
     action: 'create',
     entityType: 'payment_reminder',
     entityId: inv.id,
