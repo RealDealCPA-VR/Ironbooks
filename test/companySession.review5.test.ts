@@ -272,7 +272,8 @@ describe('a crash after unsaved changes went into a separate copy', () => {
 });
 
 describe('connecting to a host (source pins)', () => {
-  const main = fs.readFileSync(path.resolve(__dirname, '..', 'electron', 'main.js'), 'utf8');
+  // A Windows CI checkout has CRLF line endings; the end-of-function search below looks for LF.
+  const main = fs.readFileSync(path.resolve(__dirname, '..', 'electron', 'main.js'), 'utf8').replace(/\r\n/g, '\n');
   const body = (start: string) => {
     const fn = main.slice(main.indexOf(start));
     return fn.slice(0, fn.indexOf('\n}\n'));
