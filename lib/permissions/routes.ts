@@ -395,6 +395,7 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/bank-accounts': r('banking', 'GET POST'),
   '/api/bank-transactions': r('banking', 'GET'),
   '/api/bank-transactions/[id]/matches': r('banking', 'GET'),
+  '/api/bank-transactions/matches': r('banking', 'GET'), // banking r5: every line's candidates in one request
   '/api/bank-transactions/bulk': r('banking', 'POST:modify'),
   '/api/bank-transactions/categorize': r('banking', 'POST'),
   '/api/bank-transactions/exclude': r('banking', 'POST:modify'),

@@ -60,12 +60,34 @@ const FORM_ONLY_SUBTYPES: Record<string, string> = {
   accounts_receivable: 'Enter invoices and customer payments on their own forms (Customers menu).',
   accounts_payable: 'Enter bills and bill payments on their own forms (Vendors menu).',
   inventory: 'Change inventory through purchases, sales or an inventory adjustment.',
+  // Make Deposits lists the payments, sales receipts and invoice payments waiting in Undeposited
+  // Funds — an amount typed into (or out of) it here would be a balance no deposit can ever clear.
+  undeposited_funds:
+    'Undeposited Funds holds customer payments waiting to be deposited. Record them with Receive Payments or Sales Receipts, and deposit them with Make Deposits.',
 };
 
 /** Why this register can't take typed entries, or null when it can. */
 export function registerEntryBlockedReason(account: Pick<PlanAccount, 'subtype'>): string | null {
   if (account.subtype === 'non_posting') return 'Non-posting accounts (estimates, purchase orders) have no register entries.';
   return FORM_ONLY_SUBTYPES[account.subtype] ?? null;
+}
+
+/**
+ * Accounts whose balance is a list another form keeps (QB): Undeposited Funds is the payments
+ * waiting in Make Deposits; an inventory asset account is the value of the inventory items. An
+ * amount posted there any other way — a transfer, a deposit line, cash back, a bank-feed line —
+ * makes the account's balance differ from that list for good. Why `account` can't be used on such
+ * a form, or null when it can.
+ */
+export function subledgerAccountReason(account: { type: string; subtype?: string | null; name?: string | null }): string | null {
+  const name = account.name ? `"${account.name}"` : 'That account';
+  if (isUndepositedFunds(account)) {
+    return `${name} is the Undeposited Funds account: only Receive Payments and Sales Receipts put money there, and Make Deposits takes it out. An amount moved there any other way could never be deposited.`;
+  }
+  if (account.type === 'asset' && account.subtype === 'inventory') {
+    return `${name} is an inventory asset account: its balance is the value of your inventory items, kept by purchases, sales and inventory adjustments. An amount moved there directly would not be in the inventory valuation; use Adjust Quantity/Value on Hand instead.`;
+  }
+  return null;
 }
 
 /** Debit-normal accounts grow with a debit (assets and expenses). */

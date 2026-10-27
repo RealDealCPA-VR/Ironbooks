@@ -23,6 +23,8 @@ import {
 import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
 import { formatCurrency, Money } from '@/lib/money';
+import { canFinishReconciliation, statementLineAmount } from '@/lib/reconcileRules';
+import { isBankAccount } from '@/lib/accountTypes';
 import { formatDate as fmtDate, todayISO } from '@/lib/dates';
 // cmdbar: "reconcile checking" opens this page with the account picked.
 import { usePrefill } from '@/lib/commands/usePrefill';
@@ -39,6 +41,9 @@ interface BankAccount {
   accountNumber: string;
   glAccountName: string;
   glAccountCode: string;
+  /** GL type / detail type of the linked account (a card is paid from a bank account only). */
+  glAccountType?: string;
+  glAccountSubtype?: string | null;
   lastReconciledDate: string | null;
   lastReconciledBalance: string | null;
 }
@@ -126,16 +131,14 @@ function statusLabel(status: string): string {
   return status;
 }
 
-function lineAmount(line: ClearableLine): string {
-  // For display: show debit as positive inflow, credit as outflow (negative).
-  if (line.debit) return line.debit;
-  if (line.credit) return `-${line.credit}`;
-  return '0.00';
+/** The amount as the statement shows it (a card's charges +, its payments −). */
+function lineAmount(line: ClearableLine, isCreditCard: boolean): string {
+  return statementLineAmount(line, isCreditCard);
 }
 
 function differenceClose(difference: string): boolean {
-  // "complete" button is enabled when |difference| <= 0.01
-  return Money.abs(difference).lessThanOrEqualTo('0.01');
+  // "Finish Reconciliation" is enabled exactly when the server completes: a 0.00 difference.
+  return canFinishReconciliation(difference);
 }
 
 // ---------------------------------------------------------------------------
@@ -791,7 +794,14 @@ function ReconcileSession({
             >
               <option value="">Select bank account…</option>
               {bankAccounts
-                .filter((ba) => ba.id !== recon.bankAccountId && ba.accountId !== info?.glAccountId)
+                .filter(
+                  (ba) =>
+                    ba.id !== recon.bankAccountId &&
+                    ba.accountId !== info?.glAccountId &&
+                    // The check is written from a bank account (another card or a loan can't pay it).
+                    (ba.glAccountType === undefined ||
+                      isBankAccount({ type: ba.glAccountType, subtype: ba.glAccountSubtype ?? null })),
+                )
                 .map((ba) => (
                   <option key={ba.id} value={ba.accountId}>
                     {ba.bankName} – {ba.glAccountCode} {ba.glAccountName}
@@ -870,17 +880,14 @@ function ReconcileSession({
                   <Td className="max-w-xs truncate">{line.description}</Td>
                   <Td className="text-navy/60">{line.memo ?? '—'}</Td>
                   <Td numeric>
-                    <span
-                      className={
-                        line.debit
-                          ? 'text-navy'
-                          : line.credit
-                            ? 'text-red-500'
-                            : 'text-navy/40'
-                      }
-                    >
-                      {fmt(lineAmount(line))}
-                    </span>
+                    {(() => {
+                      const amount = lineAmount(line, !!info?.isCreditCard);
+                      return (
+                        <span className={Money.isZero(amount) ? 'text-navy/40' : Money.isNegative(amount) ? 'text-red-500' : 'text-navy'}>
+                          {fmt(amount)}
+                        </span>
+                      );
+                    })()}
                   </Td>
                 </Tr>
               ))}

@@ -301,20 +301,14 @@ export default function BankReviewPage() {
         setAiSugg({});
       }
 
-      // Fetch match candidates for every unreviewed row (small desktop volumes).
+      // Match candidates for every unreviewed row in ONE request (one request per row used to take
+      // minutes after a first import of a year of bank history).
       const unreviewed = data.filter((t) => !t.matched && !t.excluded);
-      const results = await Promise.all(
-        unreviewed.map(async (t) => {
-          try {
-            const candidates = await api.get<MatchCandidate[]>(
-              `/api/bank-transactions/${t.id}/matches`,
-            );
-            return [t.id, candidates] as const;
-          } catch {
-            return [t.id, [] as MatchCandidate[]] as const;
-          }
-        }),
-      );
+      const all = await api
+        .get<{ matches: Record<string, MatchCandidate[]> }>(`/api/bank-transactions/matches?bankAccountId=${bankAccountId}`)
+        .then((r) => r.matches)
+        .catch(() => ({}) as Record<string, MatchCandidate[]>);
+      const results = unreviewed.map((t) => [t.id, all[t.id] ?? []] as const);
 
       const candMap: Record<string, MatchCandidate[]> = {};
       const modeMap: Record<string, RowMode> = {};

@@ -39,6 +39,8 @@ import {
 import { postJournalEntry, voidJournalEntry, type PostingLine } from './posting';
 import { planPostedEdit, retitleEntry } from './postedEdit';
 import { currencyRate, foreignCode, homeCode, parseRate, toHome } from './exchangeRates';
+import { subledgerAccountReason } from '@/lib/registerEntryPlan';
+import { syncLineMemos } from './entryLineMemos';
 import Decimal from 'decimal.js';
 
 // ---------------------------------------------------------------------------
@@ -188,14 +190,22 @@ function transferDescription(input: CreateTransferInput): string {
   return input.memo ? `Transfer: ${input.memo}` : 'Transfer between accounts';
 }
 
-/** Both accounts must belong to this company. */
-async function assertAccountsOwned(ctx: ServiceContext, input: CreateTransferInput) {
+/**
+ * Both accounts must belong to this company, and neither may be Undeposited Funds or an inventory
+ * asset account (subledgerAccountReason): a transfer out of Undeposited Funds took money out
+ * without any payment leaving the Make Deposits list (and into it, money no deposit could ever
+ * clear); one to Inventory Asset changed its balance without the inventory valuation. `keep` are
+ * the accounts a saved transfer already uses — an older transfer can still be re-saved.
+ */
+async function assertAccountsOwned(ctx: ServiceContext, input: CreateTransferInput, keep: ReadonlyArray<string> = []) {
   for (const id of [input.fromAccountId, input.toAccountId]) {
     const [row] = await ctx.db
-      .select({ id: accounts.id })
+      .select({ id: accounts.id, name: accounts.name, type: accounts.type, subtype: accounts.subtype })
       .from(accounts)
       .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, id)));
     if (!row) throw notFound('Account');
+    const reason = keep.includes(id) ? null : subledgerAccountReason(row);
+    if (reason) throw validation(`${reason} It can't be used in Transfer Funds.`);
   }
 }
 
@@ -209,15 +219,11 @@ export async function createTransfer(ctx: ServiceContext, input: CreateTransferI
   const fx = await resolveTransferFx(ctx, input, amountStr);
 
   return inTransaction(ctx, async (tx) => {
-    // Post the journal entry: Dr toAccount, Cr fromAccount.
-    const entry = await postJournalEntry(tx, {
-      date: input.date,
-      description: transferDescription(input),
-      lines: transferLines(input, fx),
-    });
-
-    // Insert the transfer record.
-    const [transfer] = await tx.db
+    // Insert the transfer record first, so its entry can carry `transfer:<id>` as its source:
+    // reports label it "Transfer", QuickZoom opens the transfer, and the Journal screen refuses
+    // to edit / void / reverse it on its own (which would leave the transfer row pointing at a
+    // void entry and a later edit of the transfer posting the money a second time).
+    const [inserted] = await tx.db
       .insert(transfers)
       .values({
         companyId: tx.companyId,
@@ -226,9 +232,21 @@ export async function createTransfer(ctx: ServiceContext, input: CreateTransferI
         toAccountId: input.toAccountId,
         amount: amountStr,
         memo: input.memo ?? null,
-        postedEntryId: entry.id,
         ...fxColumns(fx),
       })
+      .returning();
+
+    // Post the journal entry: Dr toAccount, Cr fromAccount.
+    const entry = await postJournalEntry(tx, {
+      date: input.date,
+      description: transferDescription(input),
+      sourceRef: `transfer:${inserted.id}`,
+      lines: transferLines(input, fx),
+    });
+    const [transfer] = await tx.db
+      .update(transfers)
+      .set({ postedEntryId: entry.id })
+      .where(eq(transfers.id, inserted.id))
       .returning();
 
     await writeAudit(tx, {
@@ -252,16 +270,44 @@ export async function createTransfer(ctx: ServiceContext, input: CreateTransferI
 // updateTransfer / voidTransfer (D1)
 // ---------------------------------------------------------------------------
 
+/**
+ * p1 fx: an edit that states no rate keeps the transfer's OWN rate (QB keeps a transaction's
+ * exchange rate when it is edited). The Transfer Funds form opens with the rate box blank, so a
+ * memo-only edit used to re-price a foreign transfer at today's list rate: a new home value, a
+ * re-post, and a refusal on a reconciled transfer although nothing was changed. Applies only while
+ * both accounts keep their currencies; a stated rate / home amount always wins.
+ */
+async function withSavedRate(
+  ctx: ServiceContext,
+  input: CreateTransferInput,
+  existing: typeof transfers.$inferSelect,
+): Promise<CreateTransferInput> {
+  const stated = (v: unknown) => v !== undefined && v !== null && String(v).trim() !== '';
+  if (stated(input.exchangeRate) || stated(input.homeAmount) || !existing.exchangeRate) return input;
+  const home = await homeCode(ctx);
+  const fromCurrency = await currencyOfAccount(ctx, input.fromAccountId, home);
+  const toCurrency = await currencyOfAccount(ctx, input.toAccountId, home);
+  if (fromCurrency !== (existing.currency ?? null) || toCurrency !== (existing.toCurrency ?? null)) return input;
+  // A home-currency side fixes the home value by itself (what left or arrived there).
+  if (!fromCurrency || !toCurrency) return input;
+  // Same amount: exactly the home value it was saved with (re-deriving it from the 8-decimal
+  // rate could land a cent off and re-post).
+  if (existing.homeAmount && Money.eq(input.amount, existing.amount)) return { ...input, homeAmount: existing.homeAmount };
+  if (fromCurrency === toCurrency) return { ...input, exchangeRate: existing.exchangeRate };
+  // Foreign to another foreign currency: the home value came from the FROM currency's rate.
+  return { ...input, homeAmount: toAmountString(toHome(Money.of(input.amount), existing.exchangeRate)) };
+}
+
 export async function updateTransfer(ctx: ServiceContext, id: string, input: CreateTransferInput) {
   const amountStr = validateTransfer(input);
-  await assertAccountsOwned(ctx, input);
-  const fx = await resolveTransferFx(ctx, input, amountStr);
   const [existing] = await ctx.db
     .select()
     .from(transfers)
     .where(and(eq(transfers.companyId, ctx.companyId), eq(transfers.id, id)));
   if (!existing) throw notFound('Transfer');
   if (existing.voidedAt) throw new ServiceError('CONFLICT', 'This transfer is void and cannot be edited.');
+  await assertAccountsOwned(ctx, input, [existing.fromAccountId, existing.toAccountId]);
+  const fx = await resolveTransferFx(ctx, await withSavedRate(ctx, input, existing), amountStr);
 
   return inTransaction(ctx, async (tx) => {
     const lines = transferLines(input, fx);
@@ -281,11 +327,14 @@ export async function updateTransfer(ctx: ServiceContext, id: string, input: Cre
       const entry = await postJournalEntry(tx, {
         date: input.date,
         description: transferDescription(input),
+        sourceRef: `transfer:${id}`,
         lines,
       });
       entryId = entry.id;
     } else {
       await retitleEntry(tx, entryId, { description: transferDescription(input) });
+      // The memo is on both lines too (the register's Memo column): keep them in step.
+      await syncLineMemos(tx, entryId, lines);
     }
     const [updated] = await tx.db
       .update(transfers)

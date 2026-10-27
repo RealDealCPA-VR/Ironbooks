@@ -13,6 +13,7 @@ import { and, asc, desc, eq } from 'drizzle-orm';
 import { accounts, bankTransactions, transactionRules } from '@/lib/db/schema';
 import { type ServiceContext, notFound, validation, writeAudit } from './_base';
 import { pickRule } from '@/lib/bankRules/core';
+import { subledgerAccountReason } from '@/lib/registerEntryPlan';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -81,16 +82,29 @@ export async function getRule(ctx: ServiceContext, id: string) {
 
 /** Create a new categorization rule. */
 export async function createRule(ctx: ServiceContext, input: CreateRuleInput) {
-  if (!input.name?.trim()) throw validation('Rule name is required.');
-  if (!input.matchValue?.trim()) throw validation('Match value is required.');
+  if (typeof input.name !== 'string' || !input.name.trim()) throw validation('Rule name is required.');
+  if (typeof input.matchValue !== 'string' || !input.matchValue.trim()) throw validation('Match value is required.');
   if (!input.setAccountId) throw validation('setAccountId is required.');
+  // The columns are varchar(255) / integer: refuse what they can't hold with a plain message
+  // (an over-long name or payee used to fail in the database → HTTP 500).
+  if (input.name.trim().length > 255) throw validation('The rule name is too long (max 255 characters).');
+  if (input.matchValue.trim().length > 255) throw validation('The text to match is too long (max 255 characters).');
+  if (input.setPayee != null && (typeof input.setPayee !== 'string' || input.setPayee.length > 255)) {
+    throw validation('The payee is too long (max 255 characters).');
+  }
+  if (input.priority != null && (!Number.isInteger(input.priority) || Math.abs(input.priority) > 1_000_000)) {
+    throw validation('Priority must be a whole number between -1,000,000 and 1,000,000.');
+  }
 
   // Verify the target account belongs to this company.
   const [acct] = await ctx.db
-    .select({ id: accounts.id })
+    .select({ id: accounts.id, name: accounts.name, type: accounts.type, subtype: accounts.subtype })
     .from(accounts)
     .where(and(eq(accounts.id, input.setAccountId), eq(accounts.companyId, ctx.companyId)));
   if (!acct) throw notFound(`Account ${input.setAccountId}`);
+  // Bank-feed lines can't be added to Undeposited Funds / an inventory asset account.
+  const reason = subledgerAccountReason(acct);
+  if (reason) throw validation(`${reason} A bank rule can't put transactions there.`);
 
   const [row] = await ctx.db
     .insert(transactionRules)

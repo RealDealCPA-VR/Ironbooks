@@ -100,7 +100,7 @@ function importing(copy: ActiveCopy): boolean {
 
 /**
  * Ledger sources an accountant may post in an Accountant's Copy (what the changes file carries):
- * General Journal entries and reversals, transfers (which post without a source), checks /
+ * General Journal entries and reversals, transfers (transfer:<id>; older ones have no source), checks /
  * expenses, deposits, sales forms and their COGS, received payments (posted as customer:<id> /
  * payment:<id>), bills, bill payments (vendor:<id>), vendor credits, item receipts, inventory
  * adjustments (item:<id>) and a reconciliation's service charge / interest. Working Trial Balance
@@ -110,6 +110,7 @@ function importing(copy: ActiveCopy): boolean {
 const ACCOUNTANT_SOURCES = [
   'reversal:',
   'adjusting:',
+  'transfer:',
   'expense:',
   'deposit:',
   'invoice:',

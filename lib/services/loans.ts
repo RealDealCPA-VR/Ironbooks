@@ -42,6 +42,8 @@ import { createBill, voidBill } from './bills';
 import { getHomeCurrencyCode, homeAmounts } from './currencies';
 import { postJournalEntry, voidJournalEntry } from './posting';
 import { currencyRate, exchangeGainLossLine, foreignCode, toHome } from './exchangeRates';
+import { subledgerAccountReason } from '@/lib/registerEntryPlan';
+import { isBankAccount } from '@/lib/accountTypes';
 
 export const PAYMENT_FREQUENCIES: Record<number, string> = {
   1: 'Annually',
@@ -209,10 +211,26 @@ async function validateLoanInput(ctx: ServiceContext, input: LoanInput) {
   if (liab.type !== 'liability') throw validation('The loan account must be a liability account (e.g. Notes Payable).');
   const intr = await accountOf(ctx, input.interestAccountId);
   if (intr.type !== 'expense') throw validation('The interest account must be an expense account (e.g. Interest Expense).');
-  if (input.escrowAccountId) await accountOf(ctx, input.escrowAccountId);
+  if (input.escrowAccountId) {
+    // Each payment debits the escrow account on its check / bill line. Undeposited Funds or an
+    // inventory asset account there moved a balance that Make Deposits / the inventory valuation
+    // can never show; A/R or A/P was refused only when the payment was set up.
+    const esc = await accountOf(ctx, input.escrowAccountId);
+    const reason =
+      subledgerAccountReason(esc) ??
+      (esc.subtype === 'accounts_receivable' || esc.subtype === 'accounts_payable'
+        ? `"${esc.name}" needs a customer or vendor on every amount, so it can't be the escrow account.`
+        : null);
+    if (reason) throw validation(`${reason} Pick the escrow (or prepaid) account for the escrow part of each payment.`);
+  }
   if (input.paymentAccountId) {
+    // Each loan check is a Write Checks payment, which comes from a bank account. Any asset used
+    // to be accepted here (Undeposited Funds, Inventory Asset, A/R), and then every payment set up
+    // from the loan failed with "Checks ... must be paid from a bank/cash account".
     const pay = await accountOf(ctx, input.paymentAccountId);
-    if (pay.type !== 'asset') throw validation('Loan payments must come from a bank account.');
+    if (!isBankAccount(pay)) {
+      throw validation(`"${pay.name}" is not a bank account. Loan payments must come from a checking or savings (bank) account.`);
+    }
   }
   const escrow = Money.of(input.escrowAmount ?? 0);
   if (escrow.isNegative()) throw validation('Escrow cannot be negative.');

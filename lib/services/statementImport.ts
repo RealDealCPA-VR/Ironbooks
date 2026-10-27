@@ -128,6 +128,13 @@ export async function extractBankFile(
   const kind: StatementKind = ba.subtype === 'credit_card' ? 'card' : 'bank';
   const fallbackYear = (deps.today ?? new Date()).getFullYear();
   const parsed = parseStatementText(lines, { kind, fallbackYear });
+  // Only the first MAX_PDF_PAGES pages are read: say so, or the rows of the pages left out (and
+  // often the ending balance) would just be missing from the review screen.
+  const pageNote =
+    pages > MAX_PDF_PAGES
+      ? [`Only the first ${MAX_PDF_PAGES} of ${pages} pages were read. Split the statement into smaller files (one month each) and import each one.`]
+      : [];
+  parsed.warnings.unshift(...pageNote);
   let result: ExtractedFile = {
     kind: 'statement',
     statementKind: kind,
@@ -156,6 +163,7 @@ export async function extractBankFile(
           tieOut: t,
           method: 'ai',
           warnings: [
+            ...pageNote,
             'The rows were read by your AI because the statement layout was not recognized. Check them against the statement before importing.',
             ...(t.ok ? [] : ['The AI’s rows do not tie out either.']),
           ],

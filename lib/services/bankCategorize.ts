@@ -13,10 +13,11 @@
  * IMPORTANT: GL writes happen ONLY through `postJournalEntry` (posting.ts).
  * All money arithmetic uses '@/lib/money'.
  */
-import { and, desc, eq, gte, isNotNull, lte, ne } from 'drizzle-orm';
+import { and, desc, eq, gte, isNotNull, lte, ne, or, sql } from 'drizzle-orm';
 import { Money, allocate, toAmountString } from '@/lib/money';
 import {
   accounts,
+  auditLogs,
   bankAccounts,
   bankCategorizationHistory,
   bankTransactions,
@@ -39,6 +40,8 @@ import { postJournalEntry, voidJournalEntry } from './posting';
 import { applyRulesToAccount } from './rules';
 import { accountSigned, foreignCurrencyOfAccount } from './fxLedger';
 import { currencyRate, toHome } from './exchangeRates';
+import { subledgerAccountReason } from '@/lib/registerEntryPlan';
+import { isUndepositedFunds } from '@/lib/accountTypes';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -212,6 +215,11 @@ export async function categorize(ctx: ServiceContext, input: CategorizeInput) {
   if (amt.isZero()) {
     throw validation('Cannot categorize a zero-amount transaction.');
   }
+  // The feed line keeps the payee (varchar 255); refuse a longer one plainly instead of failing
+  // in the database.
+  if (input.payee != null && typeof input.payee !== 'string') throw validation('Payee must be text.');
+  if (input.memo != null && typeof input.memo !== 'string') throw validation('Memo must be text.');
+  if (input.payee && input.payee.length > 255) throw validation('The payee is too long (max 255 characters).');
 
   // p1 fx: a foreign-currency bank / card account's feed is in the account's currency. Post the
   // home value at the stated rate (else the currency list's rate) and keep the feed amount on the
@@ -237,6 +245,29 @@ export async function categorize(ctx: ServiceContext, input: CategorizeInput) {
     throw validation('Choose an account.');
   }
   if (input.classId) await assertRefInCompany(ctx, classes, input.classId, 'Class');
+  // The offset is the OTHER side of the bank line: categorizing to the feed's own account posts
+  // Dr Checking / Cr Checking — the line shows as added but the books never get the money.
+  if ((splits ? splits.map((sp) => sp.accountId) : [input.accountId]).includes(bankGlAccountId)) {
+    throw validation('Choose a different account: this line came from this bank account, so it cannot also be the account it goes to.');
+  }
+  // Undeposited Funds / Inventory Asset belong to their own lists (Make Deposits, the inventory
+  // valuation). Adding a bank deposit "to Undeposited Funds" took money out of it while every
+  // payment stayed in the Make Deposits list — the classic double count; such a line is the bank's
+  // side of a deposit already made with Make Deposits, so it is Matched to it instead.
+  for (const accountId of new Set(splits ? splits.map((sp) => sp.accountId) : [input.accountId])) {
+    const [offset] = await ctx.db
+      .select({ name: accounts.name, type: accounts.type, subtype: accounts.subtype })
+      .from(accounts)
+      .where(and(eq(accounts.id, accountId), eq(accounts.companyId, ctx.companyId)));
+    const reason = offset ? subledgerAccountReason(offset) : null;
+    if (reason) {
+      throw validation(
+        isUndepositedFunds(offset!)
+          ? `${reason} If this bank line is the deposit of those payments, record it with Make Deposits and then Match the line to that deposit.`
+          : reason,
+      );
+    }
+  }
   const offsets: { accountId: string; classId: string | null; amount: string }[] = splits
     ? allocate(homeAmt, splits.map((sp) => sp.percent))
         .map((a, i) => ({
@@ -281,7 +312,9 @@ export async function categorize(ctx: ServiceContext, input: CategorizeInput) {
     const entry = await postJournalEntry(tx, {
       date: new Date(Date.UTC(feedDay.getUTCFullYear(), feedDay.getUTCMonth(), feedDay.getUTCDate())),
       description,
-      reference: input.memo ?? undefined,
+      // journal_entries.reference is varchar(100); the full memo is on every line. A rule's memo
+      // (up to 255) or a long typed memo used to fail the post with a database error.
+      reference: input.memo ? input.memo.slice(0, 100) : undefined,
       sourceRef: `bank_transaction:${txn.id}`,
       lines,
       ...(fx ? { currency: fx.currency, exchangeRate: fx.rate.toFixed(8) } : {}),
@@ -496,16 +529,65 @@ export async function suggestMatches(
   if (txn.excluded) {
     throw new ServiceError('CONFLICT', 'Bank transaction is excluded. Restore it first.');
   }
-
   const ba = await loadBankAccount(ctx, txn.bankAccountId);
-  const amt = Money.of(txn.amount);
-  if (amt.isZero()) return [];
+  return (await matchCandidatesFor(ctx, ba, [txn])).get(txn.id) ?? [];
+}
+
+/**
+ * Match candidates for EVERY line waiting for review on a bank account (or the listed ones), in
+ * one pass: one read of the account's taken entries and one of its register around the lines'
+ * dates. The review screen used to ask suggestMatches once per line — a first import of a year of
+ * bank history fired thousands of requests, each re-reading every matched entry of the account,
+ * and the screen took minutes to open.
+ */
+export async function suggestMatchesForAccount(
+  ctx: ServiceContext,
+  bankAccountId: string,
+  opts: { bankTransactionIds?: string[] } = {},
+): Promise<Record<string, MatchCandidate[]>> {
+  const ba = await loadBankAccount(ctx, bankAccountId);
+  let txns = await ctx.db
+    .select()
+    .from(bankTransactions)
+    .where(
+      and(
+        eq(bankTransactions.companyId, ctx.companyId),
+        eq(bankTransactions.bankAccountId, bankAccountId),
+        eq(bankTransactions.matched, false),
+        eq(bankTransactions.excluded, false),
+      ),
+    );
+  if (opts.bankTransactionIds) {
+    const want = new Set(opts.bankTransactionIds);
+    txns = txns.filter((t) => want.has(t.id));
+  }
+  const byLine = await matchCandidatesFor(ctx, ba, txns);
+  return Object.fromEntries(txns.map((t) => [t.id, byLine.get(t.id) ?? []]));
+}
+
+interface EntryOnBank {
+  entryNumber: number;
+  date: Date;
+  description: string;
+  reference: string | null;
+  sourceRef: string | null;
+  net: ReturnType<typeof Money.of>;
+}
+
+async function matchCandidatesFor(
+  ctx: ServiceContext,
+  ba: { id: string; accountId: string },
+  txns: Array<{ id: string; date: Date; amount: string; description: string | null; payee: string | null }>,
+): Promise<Map<string, MatchCandidate[]>> {
+  const out = new Map<string, MatchCandidate[]>();
+  const live = txns.filter((t) => !Money.of(t.amount).isZero());
+  if (live.length === 0) return out;
   // p1 fx: a foreign-currency account's feed is compared in the account's currency.
   const foreign = !!(await foreignCurrencyOfAccount(ctx, ba.accountId));
 
-  const txnDate = new Date(txn.date);
-  const from = new Date(txnDate.getTime() - MATCH_WINDOW_DAYS * DAY_MS);
-  const to = new Date(txnDate.getTime() + MATCH_WINDOW_DAYS * DAY_MS);
+  const times = live.map((t) => new Date(t.date).getTime());
+  const from = new Date(Math.min(...times) - MATCH_WINDOW_DAYS * DAY_MS);
+  const to = new Date(Math.max(...times) + MATCH_WINDOW_DAYS * DAY_MS);
 
   // Entries already linked by a feed line OF THIS BANK ACCOUNT (whether matched or created via
   // categorize) are taken — a register transaction clears each bank only once. A transfer between
@@ -517,13 +599,13 @@ export async function suggestMatches(
     .where(
       and(
         eq(bankTransactions.companyId, ctx.companyId),
-        eq(bankTransactions.bankAccountId, txn.bankAccountId),
+        eq(bankTransactions.bankAccountId, ba.id),
         isNotNull(bankTransactions.matchedEntryId),
       ),
     );
   const taken = new Set(takenRows.map((r) => r.entryId).filter((id): id is string => !!id));
 
-  // All lines on the bank GL account from posted entries inside the date window.
+  // All lines on the bank GL account from posted entries inside the lines' date window.
   const rows = await ctx.db
     .select({
       entryId: journalEntries.id,
@@ -549,17 +631,7 @@ export async function suggestMatches(
     );
 
   // Net bank-GL effect per entry (an entry may hit the bank account on >1 line).
-  const byEntry = new Map<
-    string,
-    {
-      entryNumber: number;
-      date: Date;
-      description: string;
-      reference: string | null;
-      sourceRef: string | null;
-      net: ReturnType<typeof Money.of>;
-    }
-  >();
+  const byEntry = new Map<string, EntryOnBank>();
   for (const r of rows) {
     const existing = byEntry.get(r.entryId);
     const delta = accountSigned(r, foreign);
@@ -576,39 +648,51 @@ export async function suggestMatches(
       });
     }
   }
-
-  const candidates: MatchCandidate[] = [];
+  // Untaken entries by net amount, so each line only looks at the entries of its own amount.
+  const byAmount = new Map<string, Array<[string, EntryOnBank]>>();
   for (const [entryId, e] of byEntry) {
     if (taken.has(entryId)) continue;
-    if (!Money.eq(e.net, amt)) continue; // amount-equal AND sign-compatible
-
-    const dateDiffDays = Math.round(Math.abs(e.date.getTime() - txnDate.getTime()) / DAY_MS);
-    const refMatch = referenceMatches(e.reference, txn);
-    const score = refMatch ? 100 : Math.max(10, 90 - dateDiffDays * 5);
-    const confidence: MatchConfidence =
-      refMatch || dateDiffDays <= 3 ? 'high' : dateDiffDays <= 7 ? 'medium' : 'low';
-
-    candidates.push({
-      entryId,
-      entryNumber: e.entryNumber,
-      date: e.date,
-      description: e.description,
-      reference: e.reference,
-      sourceRef: e.sourceRef,
-      amount: toAmountString(e.net),
-      dateDiffDays,
-      referenceMatch: refMatch,
-      confidence,
-      score,
-    });
+    const key = toAmountString(e.net);
+    const list = byAmount.get(key);
+    if (list) list.push([entryId, e]);
+    else byAmount.set(key, [[entryId, e]]);
   }
 
-  candidates.sort((a, b) => {
-    if (a.referenceMatch !== b.referenceMatch) return a.referenceMatch ? -1 : 1;
-    if (a.dateDiffDays !== b.dateDiffDays) return a.dateDiffDays - b.dateDiffDays;
-    return b.entryNumber - a.entryNumber;
-  });
-  return candidates;
+  for (const txn of live) {
+    const txnDate = new Date(txn.date);
+    const candidates: MatchCandidate[] = [];
+    // Same amount key = amount-equal AND sign-compatible; then this line's own ±14-day window.
+    for (const [entryId, e] of byAmount.get(toAmountString(txn.amount)) ?? []) {
+      const diffMs = Math.abs(e.date.getTime() - txnDate.getTime());
+      if (diffMs > MATCH_WINDOW_DAYS * DAY_MS) continue;
+      const dateDiffDays = Math.round(diffMs / DAY_MS);
+      const refMatch = referenceMatches(e.reference, txn);
+      const score = refMatch ? 100 : Math.max(10, 90 - dateDiffDays * 5);
+      const confidence: MatchConfidence =
+        refMatch || dateDiffDays <= 3 ? 'high' : dateDiffDays <= 7 ? 'medium' : 'low';
+
+      candidates.push({
+        entryId,
+        entryNumber: e.entryNumber,
+        date: e.date,
+        description: e.description,
+        reference: e.reference,
+        sourceRef: e.sourceRef,
+        amount: toAmountString(e.net),
+        dateDiffDays,
+        referenceMatch: refMatch,
+        confidence,
+        score,
+      });
+    }
+    candidates.sort((a, b) => {
+      if (a.referenceMatch !== b.referenceMatch) return a.referenceMatch ? -1 : 1;
+      if (a.dateDiffDays !== b.dateDiffDays) return a.dateDiffDays - b.dateDiffDays;
+      return b.entryNumber - a.entryNumber;
+    });
+    out.set(txn.id, candidates);
+  }
+  return out;
 }
 
 /**
@@ -792,6 +876,130 @@ export async function restoreExcluded(ctx: ServiceContext, bankTransactionId: st
 
     return updated;
   });
+}
+
+// ---------------------------------------------------------------------------
+// Matched lines follow their transaction (void / edit)
+// ---------------------------------------------------------------------------
+
+/**
+ * The posted entry that replaced `entryId` when its document was edited (void + re-post): the
+ * document's audit row names the old and new postedEntryId, a journal entry edit names
+ * `replacedBy`. Follows a few edits in a row; null when the entry was simply voided.
+ */
+async function replacementEntry(ctx: ServiceContext, entryId: string): Promise<string | null> {
+  let cur = entryId;
+  for (let hop = 0; hop < 10; hop++) {
+    const [row] = await ctx.db
+      .select({ next: sql<string | null>`COALESCE(${auditLogs.newValues}->>'replacedBy', ${auditLogs.newValues}->>'postedEntryId')` })
+      .from(auditLogs)
+      .where(
+        and(
+          eq(auditLogs.companyId, ctx.companyId),
+          eq(auditLogs.action, 'update'),
+          or(
+            and(eq(auditLogs.entityType, 'journal_entry'), eq(auditLogs.entityId, cur), sql`${auditLogs.newValues}->>'replacedBy' IS NOT NULL`),
+            and(
+              sql`${auditLogs.oldValues}->>'postedEntryId' = ${cur}`,
+              sql`${auditLogs.newValues}->>'postedEntryId' IS NOT NULL`,
+              sql`${auditLogs.newValues}->>'postedEntryId' <> ${cur}`,
+            ),
+          ),
+        ),
+      )
+      .orderBy(desc(auditLogs.createdAt))
+      .limit(1);
+    const next = row?.next;
+    if (!next || !/^[0-9a-f-]{36}$/i.test(next)) return null;
+    const [entry] = await ctx.db
+      .select({ status: journalEntries.status })
+      .from(journalEntries)
+      .where(and(eq(journalEntries.id, next), eq(journalEntries.companyId, ctx.companyId)));
+    if (!entry) return null;
+    if (entry.status === 'posted') return next;
+    cur = next;
+  }
+  return null;
+}
+
+/**
+ * QB: deleting or voiding a transaction a downloaded bank line was matched to puts the line back
+ * in "For Review"; editing it keeps the match. Bank-feed lines matched to an entry that has since
+ * been voided used to stay "added" for good — the bank showed money the books no longer had and
+ * the line never came back to review. For every such line of the account: when the transaction
+ * was edited (re-posted) and its new entry still moves the feed amount on this bank account, the
+ * match follows it; otherwise the line returns to review. Runs when the bank feed is opened
+ * (runAutoRules). Returns how many lines were re-pointed / returned.
+ */
+export async function resyncFeedMatches(
+  ctx: ServiceContext,
+  bankAccountId?: string,
+): Promise<{ repointed: number; returned: number }> {
+  const out = { repointed: 0, returned: 0 };
+  const stale = await ctx.db
+    .select({
+      id: bankTransactions.id,
+      bankAccountId: bankTransactions.bankAccountId,
+      amount: bankTransactions.amount,
+      matchedEntryId: bankTransactions.matchedEntryId,
+    })
+    .from(bankTransactions)
+    .innerJoin(journalEntries, eq(journalEntries.id, bankTransactions.matchedEntryId))
+    .where(
+      and(
+        eq(bankTransactions.companyId, ctx.companyId),
+        eq(bankTransactions.matched, true),
+        ne(journalEntries.status, 'posted'),
+        ...(bankAccountId ? [eq(bankTransactions.bankAccountId, bankAccountId)] : []),
+      ),
+    );
+  for (const s of stale) {
+    if (!s.matchedEntryId) continue;
+    await inTransaction(ctx, async (tx) => {
+      const ba = await loadBankAccount(tx, s.bankAccountId);
+      const foreign = !!(await foreignCurrencyOfAccount(tx, ba.accountId));
+      let next = await replacementEntry(tx, s.matchedEntryId!);
+      if (next) {
+        const lines = await tx.db
+          .select({ debit: journalEntryLines.debit, credit: journalEntryLines.credit, foreignAmount: journalEntryLines.foreignAmount })
+          .from(journalEntryLines)
+          .where(and(eq(journalEntryLines.journalEntryId, next), eq(journalEntryLines.accountId, ba.accountId)));
+        let net = Money.zero();
+        for (const l of lines) net = net.plus(accountSigned(l, foreign));
+        const [taken] = await tx.db
+          .select({ id: bankTransactions.id })
+          .from(bankTransactions)
+          .where(
+            and(
+              eq(bankTransactions.companyId, tx.companyId),
+              eq(bankTransactions.bankAccountId, s.bankAccountId),
+              eq(bankTransactions.matchedEntryId, next),
+              ne(bankTransactions.id, s.id),
+            ),
+          )
+          .limit(1);
+        if (lines.length === 0 || !Money.eq(net, s.amount) || taken) next = null;
+      }
+      const [updated] = await tx.db
+        .update(bankTransactions)
+        .set(next ? { matchedEntryId: next } : { matched: false, matchedEntryId: null })
+        .where(and(eq(bankTransactions.id, s.id), eq(bankTransactions.matchedEntryId, s.matchedEntryId!)))
+        .returning({ id: bankTransactions.id });
+      if (!updated) return;
+      await writeAudit(tx, {
+        action: 'update',
+        entityType: 'bank_transaction',
+        entityId: s.id,
+        oldValues: { matched: true, matchedEntryId: s.matchedEntryId },
+        newValues: next
+          ? { matched: true, matchedEntryId: next, matchType: 'followed_edit' }
+          : { matched: false, matchedEntryId: null, matchType: 'returned_to_review', reason: 'matched transaction was voided' },
+      });
+      if (next) out.repointed += 1;
+      else out.returned += 1;
+    });
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------

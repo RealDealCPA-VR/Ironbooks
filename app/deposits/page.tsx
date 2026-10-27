@@ -37,6 +37,17 @@ import { getPath, parseLinePath, type ErrorFix } from '@/lib/errorFixes';
 import { amountMessage, collectErrors, dateMessage, hasErrors, requiredMessage, type FieldErrors } from '@/lib/fieldValidation';
 import { TransactionNav, useAdjacentTransactions } from '@/components/TransactionNav';
 
+import {
+  depositListHomeTotal,
+  depositToEdit,
+  emptyExtraLine,
+  itemsForDepositCurrency,
+  type Deposit,
+  type DepositEdit,
+  type ExtraLine,
+  type UndepositedItem,
+} from '@/lib/depositEdit';
+
 /** Body sent to /api/deposits (fix patches address its paths, e.g. "paymentIds", "depositAccountId"). */
 type DepositBody = Record<string, unknown> & {
   paymentIds: string[];
@@ -55,135 +66,6 @@ interface Account {
   type: string;
   /** p1 fx: bank account currency (null = home). */
   currency?: string | null;
-}
-
-interface UndepositedItem {
-  id: string;
-  /** invoice_payment = payment-item lines recorded on an invoice (id = the invoice). */
-  kind: 'payment' | 'sales_receipt' | 'invoice_payment';
-  customerId: string | null;
-  customerName: string | null;
-  date: string;
-  method: string;
-  reference: string | null;
-  amount: string;
-  /** p1 fx: payment currency (null = home). */
-  currency?: string | null;
-}
-
-interface DepositLine {
-  id: string;
-  depositId: string;
-  paymentId: string | null;
-  description: string | null;
-  amount: string;
-  /** Account an extra line credits (null on payment / receipt / cash-back lines). */
-  accountId?: string | null;
-}
-
-interface Deposit {
-  id: string;
-  depositAccountId: string;
-  accountName: string | null;
-  accountCode: string | null;
-  date: string;
-  total: string;
-  memo: string | null;
-  voidedAt: string | null;
-  createdAt: string;
-  lines: DepositLine[];
-  /** p1 fx: deposit currency (null = home) and its home value. */
-  currency?: string | null;
-  homeTotal?: string | null;
-}
-
-interface ExtraLine {
-  accountId: string;
-  amount: string;
-  description: string;
-}
-
-function emptyExtraLine(): ExtraLine {
-  return { accountId: '', amount: '', description: '' };
-}
-
-const RECEIPT_PREFIX = 'salesReceipt:';
-const INVOICE_PAYMENT_PREFIX = 'invoicePayment:';
-const CASHBACK_PREFIX = 'cashback:';
-
-/** A saved deposit loaded into the modal for editing. */
-interface DepositEdit {
-  id: string;
-  depositAccountId: string;
-  date: string;
-  memo: string;
-  /** Payments / sales receipts already on this deposit (shown in the picker, pre-checked). */
-  items: UndepositedItem[];
-  extraLines: ExtraLine[];
-  cashBackAccountId: string;
-  cashBackAmount: string;
-}
-
-/** Rebuild the form state of a saved deposit from its lines. */
-function depositToEdit(dep: Deposit): DepositEdit {
-  const items: UndepositedItem[] = [];
-  const extraLines: ExtraLine[] = [];
-  let cashBackAccountId = '';
-  let cashBackAmount = '';
-  for (const l of dep.lines) {
-    const desc = l.description ?? '';
-    if (l.paymentId) {
-      items.push({
-        id: l.paymentId,
-        kind: 'payment',
-        customerId: null,
-        customerName: 'Already on this deposit',
-        date: dep.date,
-        method: 'payment',
-        reference: null,
-        amount: l.amount,
-      });
-    } else if (desc.startsWith(RECEIPT_PREFIX)) {
-      items.push({
-        id: desc.slice(RECEIPT_PREFIX.length),
-        kind: 'sales_receipt',
-        customerId: null,
-        customerName: 'Already on this deposit',
-        date: dep.date,
-        method: 'sales receipt',
-        reference: null,
-        amount: l.amount,
-      });
-    } else if (desc.startsWith(INVOICE_PAYMENT_PREFIX)) {
-      items.push({
-        id: desc.slice(INVOICE_PAYMENT_PREFIX.length),
-        kind: 'invoice_payment',
-        customerId: null,
-        customerName: 'Already on this deposit',
-        date: dep.date,
-        method: 'invoice payment',
-        reference: null,
-        amount: l.amount,
-      });
-    } else if (desc.startsWith(CASHBACK_PREFIX)) {
-      cashBackAccountId = desc.slice(CASHBACK_PREFIX.length);
-      cashBackAmount = String(Math.abs(Number(l.amount)).toFixed(2));
-    } else {
-      // Extra lines keep their description and credited account (deposit_lines.account_id, 0037;
-      // older lines without one are re-picked — the form flags it as required).
-      extraLines.push({ accountId: l.accountId ?? '', amount: l.amount, description: desc });
-    }
-  }
-  return {
-    id: dep.id,
-    depositAccountId: dep.depositAccountId,
-    date: dep.date.slice(0, 10),
-    memo: dep.memo ?? '',
-    items,
-    extraLines,
-    cashBackAccountId,
-    cashBackAmount,
-  };
 }
 
 // ---------------------------------------------------------------------------
@@ -222,7 +104,7 @@ function MakeDepositModal({
   const [depositAccountId, setDepositAccountId] = useState('');
   // p1 fx: a deposit is in its bank account's currency — only payments in that currency show.
   const depCur = bankAccounts.find((a) => a.id === depositAccountId)?.currency || null;
-  const undepositedItems = allItems.filter((p) => (p.currency || null) === depCur);
+  const undepositedItems = itemsForDepositCurrency(allItems, depCur);
   const [fxRate, setFxRate] = useState('');
   const money = (v: string | number) => formatCurrency(v, depCur ?? undefined);
   const prefs = usePreferences();
@@ -1003,12 +885,8 @@ function DepositsPageContent() {
           <span>
             Total deposited:{' '}
             <span className="font-semibold text-navy/70">
-              {formatCurrency(
-                deposits
-                  .filter((d) => !d.voidedAt)
-                  .reduce((s, d) => s + Number(d.total), 0)
-                  .toFixed(2),
-              )}
+              {/* In home currency: a foreign deposit counts at its home value (not its EUR amount). */}
+              {formatCurrency(depositListHomeTotal(deposits))}
             </span>
           </span>
         </div>

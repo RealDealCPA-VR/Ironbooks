@@ -498,14 +498,13 @@ export default function BankingPage() {
   }
 
   // Any mapping/content change invalidates the current preview — the user must
-  // re-preview before committing, so the table always reflects what will import.
+  // re-preview before committing, so the table always reflects what will import. Keyed on the
+  // whole mapping that is sent: the payee / memo / check-number columns were left out, so changing
+  // one kept the old "clean" preview and imported descriptions nobody had previewed.
+  const csvMappingKey = JSON.stringify(buildCsvMapping());
   useEffect(() => {
     setCsvPreview(null);
-  }, [
-    importContent, importFileType, csvDateCol, csvDescCol, csvAmountCol,
-    csvSplitDebitCredit, csvDebitCol, csvCreditCol, csvFitIdCol,
-    csvDateFormat, csvSkipRows, csvFlipSign,
-  ]);
+  }, [importContent, importFileType, csvMappingKey]);
 
   // Headers only change with the file content (or skipped preamble rows).
   useEffect(() => {

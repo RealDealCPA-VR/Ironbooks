@@ -40,7 +40,7 @@ export async function POST(
     const entry = await payCreditCardBalance(ctx, id, {
       paymentAccountId,
       amount: amount ?? undefined,
-      date: date ? new Date(date) : undefined,
+      date: date || undefined,
       memo: memo ?? undefined,
       exchangeRate: exchangeRate ?? undefined,
     });

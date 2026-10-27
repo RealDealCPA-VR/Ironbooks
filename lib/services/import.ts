@@ -28,7 +28,7 @@ import { csvUnsafeText } from '@/lib/csv';
 import { refreshPlannerStats } from '@/lib/db/plannerStats';
 import { bankAccounts, bankTransactions, fileImports } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
-import { type ServiceContext, ServiceError, notFound, validation, writeAudit } from './_base';
+import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
 import { listRules, matchRule } from './rules';
 import { foreignCurrencyOfAccount } from './fxLedger';
 import { homeCode } from './fxLines';
@@ -236,25 +236,81 @@ function parseOFXSgml(content: string): OFXNode {
   return root;
 }
 
+/** A value that may be one node or several (SGML repeats become arrays). */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const many = (v: any): any[] => (Array.isArray(v) ? v : v ? [v] : []);
+
 /**
- * Navigate the parsed SGML tree to the BANKTRANLIST node.
- * Handles both bank (BANKMSGSRSV1) and credit-card (CREDITCARDMSGSRSV1) message sets.
+ * Every statement in the file: its account id (ACCTID) and its BANKTRANLIST. Handles bank
+ * (BANKMSGSRSV1) and credit-card (CREDITCARDMSGSRSV1) message sets, each with one or several
+ * statements — a bank's "download all accounts" Web Connect file holds one per account.
  */
-function findBankTranList(doc: OFXNode): OFXNode | null {
+function findStatements(doc: OFXNode): Array<{ acctId: string | null; tranList: OFXNode | null }> {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const d = doc as any;
-  return (
-    d?.OFX?.BANKMSGSRSV1?.STMTTRNRS?.STMTRS?.BANKTRANLIST ??
-    d?.OFX?.CREDITCARDMSGSRSV1?.CCSTMTTRNRS?.CCSTMTRS?.BANKTRANLIST ??
-    null
+  const out: Array<{ acctId: string | null; tranList: OFXNode | null }> = [];
+  for (const rs of many(d?.OFX?.BANKMSGSRSV1?.STMTTRNRS)) {
+    for (const st of many(rs?.STMTRS)) {
+      out.push({ acctId: st?.BANKACCTFROM?.ACCTID != null ? String(st.BANKACCTFROM.ACCTID) : null, tranList: st?.BANKTRANLIST ?? null });
+    }
+  }
+  for (const rs of many(d?.OFX?.CREDITCARDMSGSRSV1?.CCSTMTTRNRS)) {
+    for (const st of many(rs?.CCSTMTRS)) {
+      out.push({ acctId: st?.CCACCTFROM?.ACCTID != null ? String(st.CCACCTFROM.ACCTID) : null, tranList: st?.BANKTRANLIST ?? null });
+    }
+  }
+  return out;
+}
+
+const digitsOf = (s: string | null | undefined) => String(s ?? '').replace(/\D/g, '');
+
+/**
+ * The statement to import. One statement: that one. Several (one per account): the one whose
+ * ACCTID is the bank account's number (or, failing that, the only one ending in the same last
+ * four digits). Several and no match: VALIDATION naming the accounts — the parser used to find
+ * no transaction list at all in such a file and "import" 0 rows without a word.
+ */
+function pickStatement(
+  statements: Array<{ acctId: string | null; tranList: OFXNode | null }>,
+  accountNumber: string | null | undefined,
+): OFXNode | null {
+  if (statements.length === 0) return null;
+  if (statements.length === 1) return statements[0].tranList;
+  const want = digitsOf(accountNumber);
+  if (want) {
+    const exact = statements.filter((st) => digitsOf(st.acctId) === want);
+    if (exact.length === 1) return exact[0].tranList;
+    const last4 = statements.filter((st) => want.length >= 4 && digitsOf(st.acctId).slice(-4) === want.slice(-4));
+    if (exact.length === 0 && last4.length === 1) return last4[0].tranList;
+  }
+  const ends = statements.map((st) => (st.acctId ? `…${digitsOf(st.acctId).slice(-4) || st.acctId}` : 'an unnamed account')).join(', ');
+  throw new ServiceError(
+    'VALIDATION',
+    `This file has statements for ${statements.length} accounts (${ends}), and none of them is this bank account's number. Download one account at a time, or enter this account's number on the bank account.`,
   );
 }
 
 /**
- * Parse an OFX or QBO file and return normalized transaction rows.
- * Handles SGML (unclosed tags) and arbitrary header lines before <OFX>.
+ * An OFX TRNAMT as a 2dp string. The OFX specification lets the decimal symbol be a period OR a
+ * comma ("-12,50" from a European bank's Web Connect file used to fail the whole import with a
+ * parser error); a value that is not a number ("NaN", "", "12.5.1") is a plain VALIDATION error
+ * instead of being staged as NaN.
  */
-export function parseOFX(content: string): ParsedTransaction[] {
+function ofxAmount(raw: unknown, index: number): string {
+  let s = String(raw ?? '').trim();
+  if (/^[+-]?\d*,\d+$/.test(s)) s = s.replace(',', '.');
+  if (!/^[+-]?(\d+(\.\d*)?|\.\d+)$/.test(s)) {
+    throw new ServiceError('VALIDATION', `Transaction ${index + 1}: "${s.slice(0, 40)}" is not an amount (TRNAMT).`);
+  }
+  return toAmountString(s);
+}
+
+/**
+ * Parse an OFX or QBO file and return normalized transaction rows.
+ * Handles SGML (unclosed tags) and arbitrary header lines before <OFX>. A file with statements
+ * for several accounts yields the statement of `accountNumber` (see pickStatement).
+ */
+export function parseOFX(content: string, accountNumber?: string | null): ParsedTransaction[] {
   let doc: OFXNode;
   try {
     doc = parseOFXSgml(content);
@@ -271,7 +327,7 @@ export function parseOFX(content: string): ParsedTransaction[] {
   }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const stmtList = findBankTranList(doc) as any;
+  const stmtList = pickStatement(findStatements(doc), accountNumber) as any;
   if (!stmtList) return []; // valid OFX with no transactions
 
   // STMTTRN: single object (one txn) or array (multiple txns).
@@ -287,8 +343,12 @@ export function parseOFX(content: string): ParsedTransaction[] {
     const dtPosted = t.DTPOSTED ?? t.DTUSER ?? '';
     if (!dtPosted) throw new ServiceError('VALIDATION', `Transaction ${i + 1}: missing DTPOSTED.`);
     const date = parseOFXDate(String(dtPosted));
-    const trnAmt = t.TRNAMT ?? '0';
-    const amount = toAmountString(String(trnAmt));
+    // An unreadable date used to reach the duplicate key (toISOString → RangeError, HTTP 500) or
+    // fail its row in the database; refuse the file plainly, as the CSV reader does.
+    if (isNaN(date.getTime())) {
+      throw new ServiceError('VALIDATION', `Transaction ${i + 1}: "${String(dtPosted).slice(0, 40)}" is not a date (DTPOSTED).`);
+    }
+    const amount = ofxAmount(t.TRNAMT, i);
     const name = String(t.NAME ?? t.PAYEE ?? '');
     const memo = String(t.MEMO ?? '');
     const description = [name, memo].filter(Boolean).join(' — ') || 'Imported transaction';
@@ -346,7 +406,20 @@ function parseWithFormat(rawDate: string, format: string): Date {
     else if (t.startsWith('Y')) year = raw.length === 2 ? 2000 + v : v;
   }
   if (month < 1 || month > 12 || day < 1 || day > 31) return new Date(NaN);
-  return new Date(Date.UTC(year, month - 1, day));
+  const out = new Date(Date.UTC(year, month - 1, day));
+  // A day the month doesn't have (31/02/2026) used to roll over into the next month.
+  return out.getUTCMonth() === month - 1 ? out : new Date(NaN);
+}
+
+/** `d` unless the M/D/Y or Y-M-D digits printed in `raw` name a day that does not exist. */
+function realDayOrInvalid(raw: string, d: Date): Date {
+  const s = raw.trim();
+  const iso = /^(\d{4})-(\d{1,2})-(\d{1,2})(?!\d)/.exec(s);
+  const us = /^(\d{1,2})[/-](\d{1,2})[/-](\d{2}|\d{4})(?!\d)/.exec(s);
+  const [y, m, day] = iso ? [Number(iso[1]), Number(iso[2]), Number(iso[3])] : us ? [Number(us[3]), Number(us[1]), Number(us[2])] : [0, 0, 0];
+  if (!m) return d;
+  const check = new Date(Date.UTC(y < 100 ? 2000 + y : y, m - 1, day));
+  return check.getUTCMonth() === m - 1 && check.getUTCDate() === day ? d : new Date(NaN);
 }
 
 /**
@@ -372,6 +445,31 @@ function parseLooseDate(rawDate: string): Date {
     return new Date(Date.UTC(wall.getUTCFullYear(), wall.getUTCMonth(), wall.getUTCDate()));
   }
   return new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+}
+
+/**
+ * A CSV money cell as a Decimal (null when blank): "$1,234.56", "-45.00", "45.00-", "(45.00)"
+ * (accounting negative). Anything else — "N/A", "NaN", "12,5" … — is a VALIDATION error naming
+ * the row, so the import fails as a whole instead of staging a wrong or NaN amount.
+ */
+function csvAmount(cell: string, rowIndex: number) {
+  let s = cell.replace(/[\s ]/g, '');
+  if (!s) return null;
+  let neg = false;
+  if (/^\(.*\)$/.test(s)) {
+    neg = true;
+    s = s.slice(1, -1);
+  }
+  if (s.endsWith('-')) {
+    neg = !neg;
+    s = s.slice(0, -1);
+  }
+  s = s.replace(/^([+-]?)\$/, '$1').replace(/,(?=\d{3}(?:\D|$))/g, '');
+  if (!/^[+-]?(\d+(\.\d*)?|\.\d+)$/.test(s)) {
+    throw new ServiceError('VALIDATION', `CSV row ${rowIndex + 1}: "${cell}" is not an amount.`);
+  }
+  const v = Money.of(s);
+  return neg ? v.negated() : v;
 }
 
 /** Drop the first `skipRows` physical lines (bank-export preamble before the header). */
@@ -407,7 +505,8 @@ export function parseCSV(content: string, mapping: CsvMapping): ParsedTransactio
     // are not silently misread by the engine's locale-dependent Date parser.
     const rawDate = col(mapping.dateCol);
     if (!rawDate) throw new ServiceError('VALIDATION', `CSV row ${i + 1}: missing date value.`);
-    const date = mapping.dateFormat ? parseWithFormat(rawDate, mapping.dateFormat) : parseLooseDate(rawDate);
+    // An impossible day ("02/30/2026") is refused: the engine rolled it over to March 2.
+    const date = mapping.dateFormat ? parseWithFormat(rawDate, mapping.dateFormat) : realDayOrInvalid(rawDate, parseLooseDate(rawDate));
     if (isNaN(date.getTime())) {
       throw new ServiceError('VALIDATION', `CSV row ${i + 1}: cannot parse date "${rawDate}".`);
     }
@@ -415,16 +514,17 @@ export function parseCSV(content: string, mapping: CsvMapping): ParsedTransactio
     // Amount: prefer separate debit/credit columns if specified.
     let amount: string;
     if (mapping.debitCol !== undefined && mapping.creditCol !== undefined) {
-      const debitRaw = col(mapping.debitCol).replace(/[,$]/g, '');
-      const creditRaw = col(mapping.creditCol).replace(/[,$]/g, '');
-      const debit = debitRaw ? parseFloat(debitRaw) : 0;
-      const credit = creditRaw ? parseFloat(creditRaw) : 0;
-      // Credit = money coming IN (positive); Debit = money going OUT (negative).
-      amount = toAmountString(credit - debit);
+      const debit = csvAmount(col(mapping.debitCol), i);
+      const credit = csvAmount(col(mapping.creditCol), i);
+      // Credit = money coming IN (positive); Debit = money going OUT (negative). The columns say
+      // the direction, so their sign does not: a bank that prints debits as "-45.00" (or
+      // "(45.00)") still means 45.00 out — it used to come in as a +45.00 deposit. Decimal math,
+      // never parseFloat (an unparseable cell used to be staged as NaN).
+      amount = toAmountString(Money.abs(credit ?? 0).minus(Money.abs(debit ?? 0)));
     } else {
-      const rawAmt = col(mapping.amountCol).replace(/[,$]/g, '');
-      if (!rawAmt) throw new ServiceError('VALIDATION', `CSV row ${i + 1}: missing amount value.`);
-      amount = toAmountString(rawAmt);
+      const amt = csvAmount(col(mapping.amountCol), i);
+      if (amt === null) throw new ServiceError('VALIDATION', `CSV row ${i + 1}: missing amount value.`);
+      amount = toAmountString(amt);
     }
 
     // Sign flip — for banks that export withdrawals as positive numbers.
@@ -576,15 +676,20 @@ export function parseRows(rows: ImportRowInput[]): ParsedTransaction[] {
   if (!Array.isArray(rows) || rows.length === 0) throw validation('There are no rows to import.');
   if (rows.length > 5000) throw validation('Import at most 5,000 rows at a time.');
   return rows.map((r, i) => {
-    const date = parseLooseDate(String(r?.date ?? ''));
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(r?.date ?? '')) || isNaN(date.getTime())) {
-      throw validation(`Row ${i + 1}: the date must look like 2026-01-31.`);
+    const raw = String(r?.date ?? '');
+    const date = parseLooseDate(raw);
+    // The day must exist: "2026-02-30" (an OCR misread) would otherwise roll over to March 2.
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(raw) || isNaN(date.getTime()) || date.toISOString().slice(0, 10) !== raw) {
+      throw validation(`Row ${i + 1}: the date must be a real day like 2026-01-31.`);
     }
     let amount: string;
     try {
-      amount = toAmountString(r.amount);
+      const v = typeof r.amount === 'string' || typeof r.amount === 'number' ? Money.of(r.amount) : null;
+      // "NaN" / "Infinity" are valid decimal.js input and Postgres numeric stores NaN — never stage them.
+      if (!v || !v.isFinite()) throw new Error('not finite');
+      amount = toAmountString(v);
     } catch {
-      throw validation(`Row ${i + 1}: "${r.amount}" is not an amount.`);
+      throw validation(`Row ${i + 1}: "${r?.amount}" is not an amount.`);
     }
     if (Money.isZero(amount)) throw validation(`Row ${i + 1}: the amount is zero.`);
     const description = String(r.description ?? '').trim().slice(0, 500) || 'Statement transaction';
@@ -624,7 +729,7 @@ export async function importTransactions(
 ): Promise<ImportSummary> {
   // 1. Verify the bank account belongs to this company.
   const [bankAccount] = await ctx.db
-    .select({ id: bankAccounts.id, glAccountId: bankAccounts.accountId })
+    .select({ id: bankAccounts.id, glAccountId: bankAccounts.accountId, accountNumber: bankAccounts.accountNumber })
     .from(bankAccounts)
     .where(
       and(eq(bankAccounts.id, input.bankAccountId), eq(bankAccounts.companyId, ctx.companyId)),
@@ -656,7 +761,11 @@ export async function importTransactions(
     .insert(fileImports)
     .values({
       companyId: ctx.companyId,
-      filename: input.filename ?? `import.${input.fileType}`,
+      // file_imports.filename is varchar(255): keep the end (the extension) of a longer name.
+      filename: (() => {
+        const name = (typeof input.filename === 'string' && input.filename.trim()) || `import.${input.fileType}`;
+        return name.length > 255 ? `…${name.slice(-254)}` : name;
+      })(),
       fileType: fileTypeForDb as never,
       status: 'processing',
       uploadedBy: ctx.userId ?? '00000000-0000-0000-0000-000000000000',
@@ -677,7 +786,7 @@ export async function importTransactions(
       parsed = parseRows(input.rows ?? []);
     } else {
       // ofx and qbo use the same parser.
-      parsed = parseOFX(input.content);
+      parsed = parseOFX(input.content, bankAccount.accountNumber);
     }
   } catch (err) {
     parseError = err instanceof Error ? err.message : String(err);
@@ -699,6 +808,8 @@ export async function importTransactions(
   //     fitId cell with the formula-guard apostrophe still on. The same line's legacy key counts
   //     as a duplicate too, so re-importing an old file adds nothing. Legacy occurrence numbers
   //     are counted over every row's legacy tuple, exactly as those versions counted them.
+  // fit_id is varchar(255): compare and store the same (shortened) key, so a re-import dedupes.
+  for (const t of parsed) if (t.fitId && t.fitId.length > 255) t.fitId = t.fitId.slice(0, 255);
   const tupleCounts = new Map<string, number>();
   const legacyTupleCounts = new Map<string, number>();
   const legacyKeys = new Map<ParsedTransaction, string>();
@@ -722,101 +833,112 @@ export async function importTransactions(
     }
   }
 
-  // 4b. Dedupe: collect fitIds already staged for this bank account.
-  const existingFitIds = new Set<string>();
-  {
-    const existing = await ctx.db
-      .select({ fitId: bankTransactions.fitId })
-      .from(bankTransactions)
-      .where(
-        and(
-          eq(bankTransactions.companyId, ctx.companyId),
-          eq(bankTransactions.bankAccountId, input.bankAccountId),
-        ),
-      );
-    for (const row of existing) {
-      if (row.fitId) existingFitIds.add(row.fitId);
+  // 4b-7 run in ONE transaction: the duplicate check, the inserts and the counts. Two imports of
+  // the same file at once (a double-clicked Import, two people with the same download) each used
+  // to read "nothing staged yet" before either inserted, and every line was staged twice.
+  const { importedCount, skippedDupes, errorLog } = await inTransaction(ctx, async (tx) => {
+    // 4b. Dedupe: collect fitIds already staged for this bank account.
+    const existingFitIds = new Set<string>();
+    {
+      const existing = await tx.db
+        .select({ fitId: bankTransactions.fitId })
+        .from(bankTransactions)
+        .where(
+          and(
+            eq(bankTransactions.companyId, tx.companyId),
+            eq(bankTransactions.bankAccountId, input.bankAccountId),
+          ),
+        );
+      for (const row of existing) {
+        if (row.fitId) existingFitIds.add(row.fitId);
+      }
     }
-  }
 
-  // Dedupe against both already-staged rows AND earlier rows in THIS batch, so two rows that
-  // genuinely share a fitId within one file don't both insert.
-  const seenInBatch = new Set<string>();
-  const toInsert = parsed.filter((p) => {
-    if (!p.fitId) return true;
-    if (existingFitIds.has(p.fitId) || seenInBatch.has(p.fitId)) return false;
-    const legacy = legacyKeys.get(p);
-    if (legacy && existingFitIds.has(legacy)) return false;
-    seenInBatch.add(p.fitId);
-    return true;
-  });
-  const skippedDupes = parsed.length - toInsert.length;
+    // Dedupe against both already-staged rows AND earlier rows in THIS batch, so two rows that
+    // genuinely share a fitId within one file don't both insert.
+    const seenInBatch = new Set<string>();
+    const toInsert = parsed.filter((p) => {
+      if (!p.fitId) return true;
+      if (existingFitIds.has(p.fitId) || seenInBatch.has(p.fitId)) return false;
+      const legacy = legacyKeys.get(p);
+      if (legacy && existingFitIds.has(legacy)) return false;
+      seenInBatch.add(p.fitId);
+      return true;
+    });
+    const skippedDupes = parsed.length - toInsert.length;
 
-  // 5. Pre-fetch active rules once for bulk application.
-  const rules = await listRules(ctx);
+    // 5. Pre-fetch active rules once for bulk application.
+    const rules = await listRules(tx);
 
-  // 6. Insert + apply rules row-by-row.
-  const errorLog: Array<{ line: number; error: string }> = [];
-  let importedCount = 0;
+    // 6. Insert + apply rules row-by-row. Each row in its own savepoint: a row the database refuses
+    // is logged and skipped without aborting the rest of the import.
+    const errorLog: Array<{ line: number; error: string }> = [];
+    let importedCount = 0;
 
-  for (let i = 0; i < toInsert.length; i++) {
-    const txn = toInsert[i];
-    try {
-      // Apply rules to get the suggested account and any payee override.
-      const match = await matchRule(
-        ctx,
-        { description: txn.description, payee: txn.payee, amount: txn.amount, bankAccountId: input.bankAccountId },
-        rules,
-      );
+    for (let i = 0; i < toInsert.length; i++) {
+      const txn = toInsert[i];
+      try {
+        // Apply rules to get the suggested account and any payee override.
+        const match = await matchRule(
+          tx,
+          { description: txn.description, payee: txn.payee, amount: txn.amount, bankAccountId: input.bankAccountId },
+          rules,
+        );
 
-      await ctx.db.insert(bankTransactions).values({
-        companyId: ctx.companyId,
+        await inTransaction(tx, (sp) =>
+          sp.db.insert(bankTransactions).values({
+            companyId: sp.companyId,
+            bankAccountId: input.bankAccountId,
+            fileImportId: importRow.id,
+            // payee is varchar(255): a longer cell used to fail the row (logged as an error and
+            // left out of the import). Keep it, shortened.
+            fitId: txn.fitId ?? null,
+            date: txn.date,
+            description: txn.description,
+            payee: (match?.setPayee ?? txn.payee)?.slice(0, 255) ?? null,
+            amount: txn.amount,
+            matched: false,
+            suggestedAccountId: match?.setAccountId ?? null,
+          }),
+        );
+        importedCount += 1;
+      } catch (err) {
+        errorLog.push({ line: i + 1, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+
+    // 7. Update fileImports with final counts.
+    const finalStatus = errorLog.length > 0 && importedCount === 0 ? 'failed' : 'completed';
+    await tx.db
+      .update(fileImports)
+      .set({
+        status: finalStatus,
+        totalTransactions: parsed.length,
+        importedTransactions: importedCount,
+        failedTransactions: errorLog.length,
+        errorLog: errorLog.length ? errorLog : null,
+        completedAt: new Date(),
+      })
+      .where(eq(fileImports.id, importRow.id));
+
+    // Audit trail.
+    await writeAudit(tx, {
+      action: 'create',
+      entityType: 'file_import',
+      entityId: importRow.id,
+      newValues: {
+        fileType: input.fileType,
         bankAccountId: input.bankAccountId,
-        fileImportId: importRow.id,
-        fitId: txn.fitId ?? null,
-        date: txn.date,
-        description: txn.description,
-        payee: match?.setPayee ?? txn.payee ?? null,
-        amount: txn.amount,
-        matched: false,
-        suggestedAccountId: match?.setAccountId ?? null,
-      });
-      importedCount += 1;
-    } catch (err) {
-      errorLog.push({ line: i + 1, error: err instanceof Error ? err.message : String(err) });
-    }
-  }
-
-  // 7. Update fileImports with final counts.
-  const finalStatus = errorLog.length > 0 && importedCount === 0 ? 'failed' : 'completed';
-  await ctx.db
-    .update(fileImports)
-    .set({
-      status: finalStatus,
-      totalTransactions: parsed.length,
-      importedTransactions: importedCount,
-      failedTransactions: errorLog.length,
-      errorLog: errorLog.length ? errorLog : null,
-      completedAt: new Date(),
-    })
-    .where(eq(fileImports.id, importRow.id));
-
-  // Audit trail.
-  await writeAudit(ctx, {
-    action: 'create',
-    entityType: 'file_import',
-    entityId: importRow.id,
-    newValues: {
-      fileType: input.fileType,
-      bankAccountId: input.bankAccountId,
-      parsed: parsed.length,
-      imported: importedCount,
-      skippedDupes,
-      errors: errorLog.length,
-      ...(input.statementCheck
-        ? { tiedOut: input.statementCheck.tieOut.ok, difference: input.statementCheck.tieOut.difference, acknowledgedDifference: input.statementCheck.acknowledgedDifference }
-        : {}),
-    },
+        parsed: parsed.length,
+        imported: importedCount,
+        skippedDupes,
+        errors: errorLog.length,
+        ...(input.statementCheck
+          ? { tiedOut: input.statementCheck.tieOut.ok, difference: input.statementCheck.tieOut.difference, acknowledgedDifference: input.statementCheck.acknowledgedDifference }
+          : {}),
+      },
+    });
+    return { importedCount, skippedDupes, errorLog };
   });
   // A bulk load: give the planner fresh statistics (PGlite has no autovacuum; best-effort).
   if (importedCount > 0) await refreshPlannerStats(ctx.db, 'bank import');

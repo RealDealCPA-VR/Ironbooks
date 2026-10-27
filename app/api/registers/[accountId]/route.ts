@@ -11,6 +11,7 @@
  *   search  substring match on description / reference / memo (optional).
  *   limit   page size (optional; omit for all rows).
  *   offset  offset into the filtered ascending row set (optional).
+ *   last    only the newest N rows of the (filtered) set (optional; the page opens on these).
  *
  * POST /api/registers/:accountId
  *
@@ -43,8 +44,13 @@ export async function GET(req: NextRequest, { params }: Params) {
     const search = sp.get('search') ?? undefined;
     const limitRaw = sp.get('limit');
     const offsetRaw = sp.get('offset');
+    const lastRaw = sp.get('last');
     const limit = limitRaw != null && limitRaw !== '' ? Number(limitRaw) : undefined;
     const offset = offsetRaw != null && offsetRaw !== '' ? Number(offsetRaw) : undefined;
+    const last = lastRaw != null && lastRaw !== '' ? Number(lastRaw) : undefined;
+    if (last !== undefined && (!Number.isInteger(last) || last < 1)) {
+      return NextResponse.json({ error: 'last must be a positive whole number.', code: 'VALIDATION' }, { status: 400 });
+    }
 
     if (limit !== undefined && (!Number.isFinite(limit) || limit < 1)) {
       return NextResponse.json({ error: 'limit must be a positive number.' }, { status: 400 });
@@ -56,6 +62,13 @@ export async function GET(req: NextRequest, { params }: Params) {
     const opts = { from, to, search, limit, offset };
     // p1 fx: a foreign-currency bank / card register also carries account-currency columns.
     const register = await withAccountCurrency(ctx, await accountRegister(ctx, accountId, opts), opts);
+    // `last=N`: only the newest N rows (the register page opens on them). A checking account
+    // converted with years of history used to send every row — tens of thousands — to the page.
+    if (last !== undefined && register.rows.length > last) {
+      const dropped = register.rows.length - last;
+      register.rows = register.rows.slice(dropped);
+      register.offset = register.offset + dropped;
+    }
     return NextResponse.json({ register });
   } catch (err) {
     return mapError(err);

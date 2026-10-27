@@ -21,7 +21,7 @@ import { and, desc, eq, inArray } from 'drizzle-orm';
 import { accounts, bankAccounts, bankTransactions } from '@/lib/db/schema';
 import { Money } from '@/lib/money';
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
-import { categorize } from './bankCategorize';
+import { categorize, resyncFeedMatches } from './bankCategorize';
 import { activeBankRules, loadHistory, noteRuleApplied, ruleOffers, type BankRule, type RuleOffer } from './bankRules';
 import {
   HIGH_CONFIDENCE,
@@ -38,6 +38,7 @@ import {
 import { predict, type CategorizerState } from '@/lib/ai/categorizer';
 import { llmSuggestBankCategory, syncModel } from './aiCategorizer';
 import { buildRouter, loadSettings } from './aiSettings';
+import { subledgerAccountReason } from '@/lib/registerEntryPlan';
 
 export interface SuggestionSignal {
   source: SignalSource;
@@ -124,11 +125,16 @@ export async function suggestForAccount(
   if (txns.length === 0) return [];
 
   const acctRows = await ctx.db
-    .select({ id: accounts.id, name: accounts.name, isActive: accounts.isActive })
+    .select({ id: accounts.id, name: accounts.name, isActive: accounts.isActive, type: accounts.type, subtype: accounts.subtype })
     .from(accounts)
     .where(eq(accounts.companyId, ctx.companyId));
   const acctName = new Map(acctRows.map((a) => [a.id, a.name]));
-  const usable = new Set(acctRows.filter((a) => a.isActive && a.id !== ba.accountId).map((a) => a.id));
+  // Accounts a feed line can be added to: not the feed's own account, not Undeposited Funds or an
+  // inventory asset account (categorize refuses those — an older choice there, or the learned
+  // model's guess, used to be offered and then fail when accepted).
+  const usable = new Set(
+    acctRows.filter((a) => a.isActive && a.id !== ba.accountId && !subledgerAccountReason(a)).map((a) => a.id),
+  );
 
   const rules = await activeBankRules(ctx);
   const patterns = new Map(txns.map((t) => [t.id, patternOf(t)]));
@@ -218,7 +224,7 @@ export async function suggestForAccount(
   }
 
   // 4. Optional LLM second opinion (router; only if configured + enabled; low-confidence lines).
-  if (opts.ai) await addLlmOpinions(ctx, out, txns, acctName, opts.aiLimit ?? 10);
+  if (opts.ai) await addLlmOpinions(ctx, out, txns, acctName, opts.aiLimit ?? 10, usable);
   return out;
 }
 
@@ -228,6 +234,7 @@ async function addLlmOpinions(
   txns: { id: string; amount: string }[],
   acctName: Map<string, string>,
   limit: number,
+  usable: ReadonlySet<string>,
 ) {
   const settings = await loadSettings(ctx);
   if (!settings.llmSuggestEnabled) return;
@@ -239,6 +246,7 @@ async function addLlmOpinions(
     if (!t || Money.isZero(t.amount)) continue;
     try {
       const r = await llmSuggestBankCategory(ctx, s.bankTransactionId);
+      if (!usable.has(r.accountId)) continue; // the feed's own account, inactive, Undeposited Funds, inventory
       const prior: Signal[] = s.signals.map((g) => ({ source: g.source, accountId: g.accountId, confidence: g.confidence / 100, reason: g.reason }));
       const llm: Signal = { source: 'ai', accountId: r.accountId, confidence: r.confidence, reason: `AI: ${r.reason || 'picked this account'}` };
       // The LLM replaces the local model's vote (one AI voice).
@@ -410,6 +418,9 @@ export interface AutoRulesResult {
  */
 export async function runAutoRules(ctx: ServiceContext, bankAccountId: string): Promise<AutoRulesResult> {
   await loadBankAccount(ctx, bankAccountId);
+  // Lines matched to a transaction voided / edited since follow it first (back to review, or
+  // the edited transaction's new entry) — bankCategorize.resyncFeedMatches.
+  await resyncFeedMatches(ctx, bankAccountId);
   const rules = await activeBankRules(ctx);
   const result: AutoRulesResult = { applied: [], skipped: [] };
   if (!rules.some((r) => r.mode === 'auto')) return result;

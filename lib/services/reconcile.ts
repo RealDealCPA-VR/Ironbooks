@@ -6,14 +6,14 @@
  *   2. listClearable        — show un-cleared GL lines for the bank account.
  *   3. toggleCleared        — mark / un-mark individual lines as cleared.
  *   4. getProgress          — compare cleared balance to statement balance.
- *   5. completeReconciliation — finalize when difference ≤ $0.01.
+ *   5. completeReconciliation — finalize when the difference is 0.00 (lib/reconcileRules.ts).
  *
  * No journal entries are created by reconciliation itself; it is purely a
  * matching / confirmation step.  The GL lines being reconciled were already
  * posted by other services (invoices, expenses, transfers, etc.).
  */
 import { assertReconciliationDateOpen } from './accountantCopy/guard';
-import { and, desc, eq, inArray, isNull, lt, ne, sql } from 'drizzle-orm';
+import { and, desc, eq, gte, inArray, isNull, lt, ne, notExists, sql } from 'drizzle-orm';
 import { onOrBeforeDay } from './journal';
 import {
   accounts,
@@ -23,7 +23,12 @@ import {
   reconciliationItems,
   reconciliations,
 } from '@/lib/db/schema';
-import { Money, toAmountString } from '@/lib/money';
+import { MAX_LEDGER_AMOUNT, Money, toAmountString } from '@/lib/money';
+import { canFinishReconciliation } from '@/lib/reconcileRules';
+import { MAX_DATE_YEAR, MIN_DATE_YEAR, parseDateInput } from '@/lib/validation/helpers';
+import { todayISO } from '@/lib/dates';
+import { subledgerAccountReason } from '@/lib/registerEntryPlan';
+import { isBankAccount } from '@/lib/accountTypes';
 import {
   type ServiceContext,
   ServiceError,
@@ -45,7 +50,8 @@ import { foreignCode, homeCode } from './fxLines';
 
 export interface StartReconciliationInput {
   bankAccountId: string;
-  statementDate: Date;
+  /** A Date, or the day as typed (YYYY-MM-DD; an impossible day is refused). */
+  statementDate: Date | string;
   /** The ending balance shown on the bank statement (positive = asset balance). */
   statementBalance: string | number;
 }
@@ -80,6 +86,37 @@ export interface ReconciliationProgress {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * A typed statement amount as a 2dp string, or VALIDATION with a plain message (a non-number used
+ * to escape as MoneyParseError → HTTP 500, and "NaN" / "Infinity" reached the database).
+ */
+function statementAmount(value: unknown, label: string): string {
+  if (typeof value !== 'string' && typeof value !== 'number') throw validation(`${label} must be a number.`);
+  let d: ReturnType<typeof Money.of>;
+  try {
+    d = Money.of(value);
+  } catch {
+    throw validation(`${label} must be a number.`);
+  }
+  if (!d.isFinite()) throw validation(`${label} must be a number.`);
+  if (Money.round2(d).abs().greaterThan(MAX_LEDGER_AMOUNT)) throw validation(`${label} is too large.`);
+  return toAmountString(d);
+}
+
+/**
+ * A statement / payment date that is a real calendar day. Typed dates arrive as text and are read
+ * with parseDateInput: `new Date('2026-02-30')` silently rolled an impossible day over to March 2
+ * (the reconciliation then ran against the wrong statement date); an unparseable one used to fail
+ * in the database driver (HTTP 500).
+ */
+function statementDay(value: unknown, label = 'Statement date'): Date {
+  const d = value instanceof Date ? value : typeof value === 'string' ? parseDateInput(value) : null;
+  if (!d || isNaN(d.getTime())) throw validation(`${label} is not a valid date.`);
+  const year = d.getUTCFullYear();
+  if (year < MIN_DATE_YEAR || year > MAX_DATE_YEAR) throw validation(`${label} is not a valid date.`);
+  return d;
+}
 
 /** Load a reconciliation row, enforcing company scope. */
 async function loadReconciliation(ctx: ServiceContext, reconciliationId: string) {
@@ -224,9 +261,11 @@ async function startReconciliationInTx(
   ctx: ServiceContext,
   input: StartReconciliationInput,
 ): Promise<typeof reconciliations.$inferSelect> {
-  if (!input.bankAccountId?.trim()) throw validation('bankAccountId is required.');
+  if (typeof input.bankAccountId !== 'string' || !input.bankAccountId.trim()) throw validation('bankAccountId is required.');
   if (!input.statementDate) throw validation('statementDate is required.');
   if (input.statementBalance == null) throw validation('statementBalance is required.');
+  const statementDate = statementDay(input.statementDate);
+  const statementBalance = statementAmount(input.statementBalance, 'The statement ending balance');
 
   // Verify the bank account belongs to this company.
   const [bankAcct] = await ctx.db
@@ -239,7 +278,7 @@ async function startReconciliationInTx(
       ),
     );
   if (!bankAcct) throw notFound('Bank account');
-  await assertReconciliationDateOpen(ctx, input.statementDate); // Accountant's Copy (I1)
+  await assertReconciliationDateOpen(ctx, statementDate); // Accountant's Copy (I1)
 
   // Guard: only one in_progress reconciliation per bank account at a time.
   const [existing] = await ctx.db
@@ -265,8 +304,8 @@ async function startReconciliationInTx(
       .insert(reconciliations)
       .values({
         bankAccountId: input.bankAccountId,
-        statementDate: input.statementDate,
-        statementBalance: toAmountString(input.statementBalance),
+        statementDate: statementDate,
+        statementBalance: statementBalance,
         status: 'in_progress',
         createdBy: tx.userId ?? '00000000-0000-0000-0000-000000000000',
       })
@@ -278,8 +317,8 @@ async function startReconciliationInTx(
       entityId: row.id,
       newValues: {
         bankAccountId: input.bankAccountId,
-        statementDate: input.statementDate,
-        statementBalance: toAmountString(input.statementBalance),
+        statementDate: statementDate,
+        statementBalance: statementBalance,
       },
     });
 
@@ -318,11 +357,11 @@ export async function listClearable(
   const glAccountId = bankAcct.accountId;
   const foreign = !!(await foreignCurrencyOfAccount(ctx, glAccountId));
 
-  // Fetch all posted lines on the GL account up to asOf that are not yet
-  // permanently cleared (i.e. cleared in a completed reconciliation).
-  //
-  // A line is "permanently cleared" when a reconciliation_items row exists for it
-  // pointing to a completed reconciliation.  We exclude those from the list.
+  // Fetch the posted lines on the GL account up to asOf that are not yet permanently cleared
+  // (a reconciliation_items row of a COMPLETED reconciliation exists for the line). The exclusion
+  // runs in SQL: loading the account's whole history and then naming every line id in an IN
+  // list failed outright past 65,535 lines (a bind-parameter limit) — a ten-year checking account
+  // converted from QuickBooks — and read the entire history on every reconcile screen load.
   const rows = await ctx.db
     .select({
       journalEntryLineId: journalEntryLines.id,
@@ -342,9 +381,21 @@ export async function listClearable(
         eq(journalEntryLines.accountId, glAccountId),
         eq(journalEntries.companyId, ctx.companyId),
         eq(journalEntries.status, 'posted'),
-        ne(journalEntries.status, 'void'),
         // Whole statement day: entries carrying a time of day belong to their own day.
         onOrBeforeDay(asOf),
+        notExists(
+          ctx.db
+            .select({ one: sql`1` })
+            .from(reconciliationItems)
+            .innerJoin(reconciliations, eq(reconciliationItems.reconciliationId, reconciliations.id))
+            .where(
+              and(
+                eq(reconciliationItems.journalEntryLineId, journalEntryLines.id),
+                eq(reconciliationItems.isCleared, true),
+                eq(reconciliations.status, 'completed'),
+              ),
+            ),
+        ),
       ),
     );
 
@@ -363,32 +414,7 @@ export async function listClearable(
     for (const si of sessionItems) clearedSet.add(si.lineId);
   }
 
-  // Identify lines permanently cleared by a *completed* reconciliation so we
-  // can omit them (they are already reconciled and should not appear again).
-  const lineIds = rows.map((r) => r.journalEntryLineId);
-  const permanentlyClearedIds = new Set<string>();
-  if (lineIds.length > 0) {
-    const completed = await ctx.db
-      .select({ lineId: reconciliationItems.journalEntryLineId })
-      .from(reconciliationItems)
-      .innerJoin(
-        reconciliations,
-        eq(reconciliationItems.reconciliationId, reconciliations.id),
-      )
-      .where(
-        and(
-          // Scope to the lines under consideration — without this the query is an
-          // unbounded cross-company scan of every cleared item ever recorded.
-          inArray(reconciliationItems.journalEntryLineId, lineIds),
-          eq(reconciliations.status, 'completed'),
-          eq(reconciliationItems.isCleared, true),
-        ),
-      );
-    for (const c of completed) permanentlyClearedIds.add(c.lineId);
-  }
-
   return rows
-    .filter((r) => !permanentlyClearedIds.has(r.journalEntryLineId))
     // A Home Currency Adjustment line changes only the home value of a foreign account — it is
     // never on the bank's statement, so it is not offered for clearing (p1 fx).
     .filter((r) => !foreign || nz(r.debit) != null || nz(r.credit) != null)
@@ -439,6 +465,8 @@ async function toggleClearedInTx(
       id: journalEntryLines.id,
       accountId: journalEntryLines.accountId,
       companyId: journalEntries.companyId,
+      date: journalEntries.date,
+      status: journalEntries.status,
     })
     .from(journalEntryLines)
     .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
@@ -450,6 +478,35 @@ async function toggleClearedInTx(
       ),
     );
   if (!line) throw notFound('Journal entry line');
+
+  if (isCleared) {
+    // Only what listClearable offers can be ticked: a posted line, dated on or before the
+    // statement date, not already reconciled. A line cleared in an earlier COMPLETED session is
+    // already in the opening balance (lastReconciledBalance) — clearing it again would count it
+    // twice and let the session "balance" against a wrong statement.
+    if (line.status !== 'posted') throw validation('That transaction is void, so it cannot be cleared.');
+    const nextDay = new Date(
+      Date.UTC(recon.statementDate.getUTCFullYear(), recon.statementDate.getUTCMonth(), recon.statementDate.getUTCDate() + 1),
+    );
+    if (line.date.getTime() >= nextDay.getTime()) {
+      throw validation('That transaction is dated after the statement date, so it is not on this statement.');
+    }
+    const [done] = await ctx.db
+      .select({ id: reconciliationItems.id })
+      .from(reconciliationItems)
+      .innerJoin(reconciliations, eq(reconciliationItems.reconciliationId, reconciliations.id))
+      .where(
+        and(
+          eq(reconciliationItems.journalEntryLineId, journalEntryLineId),
+          eq(reconciliationItems.isCleared, true),
+          eq(reconciliations.status, 'completed'),
+        ),
+      )
+      .limit(1);
+    if (done) {
+      throw new ServiceError('CONFLICT', 'That transaction was already reconciled in an earlier reconciliation.');
+    }
+  }
 
   // Manual upsert: check for an existing row and INSERT or UPDATE accordingly.
   // We cannot use onConflictDoUpdate because reconciliation_items does not define
@@ -554,7 +611,7 @@ async function cancelReconciliationInTx(ctx: ServiceContext, reconciliationId: s
 
 export interface UpdateStatementInput {
   statementBalance?: string | number;
-  statementDate?: Date;
+  statementDate?: Date | string;
 }
 
 /**
@@ -566,26 +623,58 @@ export async function updateStatement(
   reconciliationId: string,
   input: UpdateStatementInput,
 ): Promise<typeof reconciliations.$inferSelect> {
-  const recon = await loadReconciliation(ctx, reconciliationId);
-  if (recon.status !== 'in_progress') {
-    throw validation('Cannot modify a reconciliation that is not in_progress.');
-  }
   if (input.statementBalance == null && !input.statementDate) {
     throw validation('Provide statementBalance and/or statementDate to update.');
   }
-  await assertReconciliationDateOpen(ctx, input.statementDate ?? recon.statementDate); // Accountant's Copy (I1)
+  const newBalance = input.statementBalance != null ? statementAmount(input.statementBalance, 'The statement ending balance') : null;
+  const newDate = input.statementDate ? statementDay(input.statementDate) : null;
 
+  // Status check, correction and un-clearing in one transaction (a correction racing the
+  // completion sees the session's current state).
   return inTransaction(ctx, async (tx) => {
+    const recon = await loadReconciliation(tx, reconciliationId);
+    if (recon.status !== 'in_progress') {
+      throw validation('Cannot modify a reconciliation that is not in_progress.');
+    }
+    await assertReconciliationDateOpen(tx, newDate ?? recon.statementDate); // Accountant's Copy (I1)
+
     const [updated] = await tx.db
       .update(reconciliations)
       .set({
-        ...(input.statementBalance != null
-          ? { statementBalance: toAmountString(input.statementBalance) }
-          : {}),
-        ...(input.statementDate ? { statementDate: input.statementDate } : {}),
+        ...(newBalance != null ? { statementBalance: newBalance } : {}),
+        ...(newDate ? { statementDate: newDate } : {}),
       })
       .where(eq(reconciliations.id, reconciliationId))
       .returning();
+
+    // A statement date moved EARLIER: lines cleared in this session that are dated after the new
+    // date are not on that statement. They used to stay cleared — counted in the cleared balance
+    // while hidden from the list (which only shows lines up to the statement date), so the
+    // difference could not be explained or fixed. Un-clear them, as toggleCleared would refuse to
+    // clear them now.
+    let unclearedAfterDate = 0;
+    if (newDate) {
+      const nextDay = new Date(Date.UTC(newDate.getUTCFullYear(), newDate.getUTCMonth(), newDate.getUTCDate() + 1));
+      const after = await tx.db
+        .select({ id: reconciliationItems.id })
+        .from(reconciliationItems)
+        .innerJoin(journalEntryLines, eq(reconciliationItems.journalEntryLineId, journalEntryLines.id))
+        .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+        .where(
+          and(
+            eq(reconciliationItems.reconciliationId, reconciliationId),
+            eq(reconciliationItems.isCleared, true),
+            gte(journalEntries.date, nextDay),
+          ),
+        );
+      if (after.length) {
+        await tx.db
+          .update(reconciliationItems)
+          .set({ isCleared: false, clearedDate: null })
+          .where(inArray(reconciliationItems.id, after.map((r) => r.id)));
+        unclearedAfterDate = after.length;
+      }
+    }
 
     await writeAudit(tx, {
       action: 'update',
@@ -598,6 +687,7 @@ export async function updateStatement(
       newValues: {
         statementBalance: updated.statementBalance,
         statementDate: updated.statementDate,
+        ...(unclearedAfterDate ? { unclearedAfterDate } : {}),
       },
     });
 
@@ -610,7 +700,7 @@ export async function updateStatement(
  *
  * Requirements:
  *   - Status must be in_progress.
- *   - |difference| ≤ $0.01 (one cent tolerance for rounding).
+ *   - the difference is 0.00 (canFinishReconciliation — the page enables Finish on the same rule).
  *
  * On success:
  *   - reconciliations row is set to status = 'completed', completedAt = now.
@@ -640,7 +730,7 @@ async function completeReconciliationInTx(
   const statementBalance = Money.of(recon.statementBalance);
   const difference = statementBalance.minus(clearedBalance).abs();
 
-  if (!Money.equalWithinCent(difference, Money.zero())) {
+  if (!canFinishReconciliation(toAmountString(difference))) {
     throw new ServiceError(
       'VALIDATION',
       `Cannot complete: difference is ${toAmountString(statementBalance.minus(clearedBalance))}. ` +
@@ -887,63 +977,85 @@ export async function addStatementAdjustments(
   reconciliationId: string,
   input: StatementAdjustmentsInput,
 ): Promise<ReconciliationProgress> {
-  const recon = await loadReconciliation(ctx, reconciliationId);
-  if (recon.status !== 'in_progress') {
-    throw validation('Adjustments can only be added to an in-progress reconciliation.');
-  }
   if (!input.serviceCharge && !input.interestEarned) {
     throw validation('Provide a service charge and/or interest earned amount.');
   }
-  // p1 fx: on a foreign-currency account the statement amounts are in the account's currency;
-  // post their home value at the stated rate (else the currency list's rate).
-  const adjCurrency = await foreignCurrencyOfAccount(ctx, recon.glAccountId);
-  const adjFx = adjCurrency ? await currencyRate(ctx, adjCurrency, input.exchangeRate) : null;
-  const homeOf = (amtStr: string) => (adjFx ? toAmountString(toHome(amtStr, adjFx.rate)) : amtStr);
-  const fxEntry = adjFx ? { currency: adjFx.currency, exchangeRate: adjFx.rate.toFixed(8) } : {};
+  // Validate BOTH adjustments before anything is posted, then post them in ONE transaction: a bad
+  // interest line used to leave the service charge posted (and cleared), so retrying the form
+  // posted the charge a second time.
+  const parse = (
+    adj: { amount: string | number; accountId: string } | null | undefined,
+    label: string,
+    accountLabel: string,
+  ) => {
+    if (!adj) return null;
+    if (typeof adj !== 'object') throw validation(`${label}: enter an amount and an account.`);
+    const amtStr = statementAmount(adj.amount, `${label} amount`);
+    if (!Money.gt(amtStr, 0)) throw validation(`${label} amount must be greater than zero.`);
+    if (typeof adj.accountId !== 'string' || !adj.accountId) throw validation(`Choose the ${accountLabel} for the ${label.toLowerCase()}.`);
+    return { amtStr, accountId: adj.accountId };
+  };
+  const charge = parse(input.serviceCharge, 'Service charge', 'expense account');
+  const interest = parse(input.interestEarned, 'Interest earned', 'income account');
 
-  if (input.serviceCharge) {
-    const amt = Money.of(input.serviceCharge.amount);
-    if (!amt.greaterThan(0)) throw validation('Service charge amount must be greater than zero.');
-    if (!input.serviceCharge.accountId) {
-      throw validation('serviceCharge.accountId (expense account) is required.');
+  return inTransaction(ctx, async (tx) => {
+    const recon = await loadReconciliation(tx, reconciliationId);
+    if (recon.status !== 'in_progress') {
+      throw validation('Adjustments can only be added to an in-progress reconciliation.');
     }
-    const amtStr = toAmountString(amt);
-    const homeStr = homeOf(amtStr);
-    const entry = await postJournalEntry(ctx, {
-      date: recon.statementDate,
-      description: 'Bank service charge',
-      sourceRef: `reconciliation:${reconciliationId}`,
-      lines: [
-        { accountId: input.serviceCharge.accountId, debit: homeStr },
-        { accountId: recon.glAccountId, credit: homeStr, ...(adjFx ? { foreignAmount: amtStr } : {}) },
-      ],
-      ...fxEntry,
-    });
-    await autoClearBankLine(ctx, reconciliationId, entry.id, recon.glAccountId);
-  }
-
-  if (input.interestEarned) {
-    const amt = Money.of(input.interestEarned.amount);
-    if (!amt.greaterThan(0)) throw validation('Interest earned amount must be greater than zero.');
-    if (!input.interestEarned.accountId) {
-      throw validation('interestEarned.accountId (income account) is required.');
+    for (const a of [charge, interest]) {
+      if (a?.accountId === recon.glAccountId) {
+        throw validation('Choose an expense or income account, not the account you are reconciling.');
+      }
+      if (!a) continue;
+      // Undeposited Funds / Inventory Asset are kept by their own lists (Make Deposits, the
+      // inventory valuation): a service charge "to" them moved those balances for good.
+      const [acc] = await tx.db
+        .select({ name: accounts.name, type: accounts.type, subtype: accounts.subtype })
+        .from(accounts)
+        .where(and(eq(accounts.id, a.accountId), eq(accounts.companyId, tx.companyId)));
+      const reason = acc ? subledgerAccountReason(acc) : null;
+      if (reason) throw validation(`${reason} Choose an expense or income account.`);
     }
-    const amtStr = toAmountString(amt);
-    const homeStr = homeOf(amtStr);
-    const entry = await postJournalEntry(ctx, {
-      date: recon.statementDate,
-      description: 'Interest earned',
-      sourceRef: `reconciliation:${reconciliationId}`,
-      lines: [
-        { accountId: recon.glAccountId, debit: homeStr, ...(adjFx ? { foreignAmount: amtStr } : {}) },
-        { accountId: input.interestEarned.accountId, credit: homeStr },
-      ],
-      ...fxEntry,
-    });
-    await autoClearBankLine(ctx, reconciliationId, entry.id, recon.glAccountId);
-  }
+    // p1 fx: on a foreign-currency account the statement amounts are in the account's currency;
+    // post their home value at the stated rate (else the currency list's rate).
+    const adjCurrency = await foreignCurrencyOfAccount(tx, recon.glAccountId);
+    const adjFx = adjCurrency ? await currencyRate(tx, adjCurrency, input.exchangeRate) : null;
+    const homeOf = (amtStr: string) => (adjFx ? toAmountString(toHome(amtStr, adjFx.rate)) : amtStr);
+    const fxEntry = adjFx ? { currency: adjFx.currency, exchangeRate: adjFx.rate.toFixed(8) } : {};
 
-  return getProgress(ctx, reconciliationId);
+    if (charge) {
+      const homeStr = homeOf(charge.amtStr);
+      const entry = await postJournalEntry(tx, {
+        date: recon.statementDate,
+        description: 'Bank service charge',
+        sourceRef: `reconciliation:${reconciliationId}`,
+        lines: [
+          { accountId: charge.accountId, debit: homeStr },
+          { accountId: recon.glAccountId, credit: homeStr, ...(adjFx ? { foreignAmount: charge.amtStr } : {}) },
+        ],
+        ...fxEntry,
+      });
+      await autoClearBankLine(tx, reconciliationId, entry.id, recon.glAccountId);
+    }
+
+    if (interest) {
+      const homeStr = homeOf(interest.amtStr);
+      const entry = await postJournalEntry(tx, {
+        date: recon.statementDate,
+        description: 'Interest earned',
+        sourceRef: `reconciliation:${reconciliationId}`,
+        lines: [
+          { accountId: recon.glAccountId, debit: homeStr, ...(adjFx ? { foreignAmount: interest.amtStr } : {}) },
+          { accountId: interest.accountId, credit: homeStr },
+        ],
+        ...fxEntry,
+      });
+      await autoClearBankLine(tx, reconciliationId, entry.id, recon.glAccountId);
+    }
+
+    return getProgress(tx, reconciliationId);
+  });
 }
 
 /**
@@ -1317,7 +1429,7 @@ async function payForeignCreditCard(
   recon: { id: string; glAccountId: string; statementBalance: string },
   cardName: string,
   cardCurrency: string,
-  input: PayCreditCardBalanceInput,
+  input: PayCreditCardBalanceInput & { date: Date },
 ) {
   const amt = Money.round2(input.amount ?? recon.statementBalance);
   if (!amt.greaterThan(0)) throw validation('Payment amount must be greater than zero.');
@@ -1356,7 +1468,7 @@ async function payForeignCreditCard(
   const homeStr = toAmountString(toHome(amt, fx.rate));
   if (!Money.gt(homeStr, 0)) throw validation('This amount is too small to convert to your home currency.');
   return postJournalEntry(ctx, {
-    date: input.date ?? new Date(),
+    date: input.date,
     description: input.memo?.trim() ? input.memo.trim() : `Credit card payment — ${cardName}`,
     sourceRef,
     currency: fx.currency,
@@ -1374,7 +1486,7 @@ export interface PayCreditCardBalanceInput {
   /** Defaults to the reconciliation's statement (ending) balance. */
   amount?: string | number;
   /** Defaults to today. */
-  date?: Date;
+  date?: Date | string;
   memo?: string | null;
   /** p1 fx: foreign-currency card — home units per 1 unit (default: the currency list's rate). */
   exchangeRate?: string | number | null;
@@ -1384,36 +1496,73 @@ export interface PayCreditCardBalanceInput {
  * QB "Write a check for the balance" step after completing a credit-card
  * reconciliation: posts Dr CC liability / Cr bank for the statement balance via
  * payCreditCard (sourceRef "cc-payment:<reconciliationId>", duplicate-guarded).
+ *
+ * Runs in one transaction: the "one payment per reconciliation" check and the posting used to run
+ * outside any, so a double-clicked Pay / two windows / a client retry each passed the check and the
+ * card was paid twice (bank down 2x the balance, the card overpaid). PGlite serializes
+ * transactions, so the second call now sees the first payment and gets a CONFLICT.
  */
 export async function payCreditCardBalance(
   ctx: ServiceContext,
   reconciliationId: string,
   input: PayCreditCardBalanceInput,
 ) {
-  const recon = await loadReconciliation(ctx, reconciliationId);
-  if (recon.status !== 'completed') {
-    throw validation('Pay Credit Card is only available after the reconciliation is completed.');
+  // Typed input from the "write a check for the balance" form: a non-number amount or an
+  // unparseable date used to escape as MoneyParseError / RangeError → HTTP 500.
+  if (typeof input.paymentAccountId !== 'string' || !input.paymentAccountId) throw validation('Choose the account to pay from.');
+  if (input.amount !== undefined && input.amount !== null && String(input.amount).trim() !== '') {
+    input = { ...input, amount: statementAmount(input.amount, 'The payment amount') };
+  } else {
+    input = { ...input, amount: undefined };
   }
+  // Default: today's LOCAL calendar day at UTC midnight (the app's date convention) — `new Date()`
+  // dated an evening payment west of UTC on tomorrow.
+  const payDate =
+    input.date !== undefined && input.date !== null && input.date !== ''
+      ? statementDay(input.date, 'The payment date')
+      : new Date(`${todayISO()}T00:00:00.000Z`);
+  if (input.memo != null && typeof input.memo !== 'string') throw validation('The memo must be text.');
+  const pay = { ...input, date: payDate };
 
-  const [gl] = await ctx.db
-    .select({ type: accounts.type, name: accounts.name })
-    .from(accounts)
-    .where(and(eq(accounts.id, recon.glAccountId), eq(accounts.companyId, ctx.companyId)));
-  if (!gl) throw notFound('Credit card GL account');
-  if (gl.type !== 'liability') {
-    throw validation('This reconciliation is not for a credit card (liability) account.');
-  }
+  return inTransaction(ctx, async (tx) => {
+    const recon = await loadReconciliation(tx, reconciliationId);
+    if (recon.status !== 'completed') {
+      throw validation('Pay Credit Card is only available after the reconciliation is completed.');
+    }
 
-  // p1 fx: a foreign-currency card's statement balance is in the card's currency.
-  const cardCurrency = await foreignCurrencyOfAccount(ctx, recon.glAccountId);
-  if (cardCurrency) return payForeignCreditCard(ctx, recon, gl.name, cardCurrency, input);
+    const [gl] = await tx.db
+      .select({ type: accounts.type, name: accounts.name })
+      .from(accounts)
+      .where(and(eq(accounts.id, recon.glAccountId), eq(accounts.companyId, tx.companyId)));
+    if (!gl) throw notFound('Credit card GL account');
+    if (gl.type !== 'liability') {
+      throw validation('This reconciliation is not for a credit card (liability) account.');
+    }
 
-  return payCreditCard(ctx, {
-    creditCardAccountId: recon.glAccountId,
-    paymentAccountId: input.paymentAccountId,
-    amount: input.amount ?? recon.statementBalance,
-    date: input.date ?? new Date(),
-    reconciliationId,
-    memo: input.memo ?? `Credit card payment — ${gl.name}`,
+    // QB "Write a check for the balance": the check comes from a bank account (the same rule as
+    // Write Checks). Paying from Undeposited Funds left every payment in the Make Deposits list
+    // while the account went negative; Inventory Asset moved the valuation's account; an expense
+    // or another card is not a check at all.
+    const [from] = await tx.db
+      .select({ type: accounts.type, subtype: accounts.subtype, name: accounts.name })
+      .from(accounts)
+      .where(and(eq(accounts.id, pay.paymentAccountId), eq(accounts.companyId, tx.companyId)));
+    if (!from) throw notFound('Payment account');
+    if (!isBankAccount(from)) {
+      throw validation(`"${from.name}" is not a bank account. Pay the credit card from a checking or savings (bank) account.`);
+    }
+
+    // p1 fx: a foreign-currency card's statement balance is in the card's currency.
+    const cardCurrency = await foreignCurrencyOfAccount(tx, recon.glAccountId);
+    if (cardCurrency) return payForeignCreditCard(tx, recon, gl.name, cardCurrency, pay);
+
+    return payCreditCard(tx, {
+      creditCardAccountId: recon.glAccountId,
+      paymentAccountId: pay.paymentAccountId,
+      amount: pay.amount ?? recon.statementBalance,
+      date: payDate,
+      reconciliationId,
+      memo: pay.memo ?? `Credit card payment — ${gl.name}`,
+    });
   });
 }
