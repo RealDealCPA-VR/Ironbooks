@@ -1243,6 +1243,11 @@ export interface GlLineFilter extends ActivityFilter {
   sections?: SectionKey[];
   nameId?: string;
   nameType?: NameType;
+  /**
+   * One Customer:Job column of Profit & Loss by Job: lines named for that customer (on the line
+   * or by their document) and bill / check / vendor-credit lines costed to it (costLineCustomers).
+   */
+  jobCustomerId?: string;
   txnType?: TxnTypeKey;
   amountMin?: string;
   amountMax?: string;
@@ -1287,6 +1292,7 @@ export function glFilterFromParams(
     f.nameId = p.employeeId;
     f.nameType = 'employee';
   }
+  if (p.customerJobId) f.jobCustomerId = p.customerJobId;
   if (p.section) {
     const secs = p.section.split(',').filter((s) => [...PL_SECTIONS, ...BS_SECTIONS].includes(s as SectionKey));
     if (secs.length) f.sections = secs as SectionKey[];
@@ -1330,6 +1336,21 @@ function nameCandidates(companyId: string, nameId: string): SQL {
   );
   const docOf = sql`split_part(${journalEntries.sourceRef}, ':', 2)`;
   return sql`(${journalEntryLines.entityId} = ${nameId} OR (${journalEntryLines.entityId} IS NULL AND (${docOf} = ${nameId} OR ${docOf} IN (${docIds}))))`;
+}
+
+/**
+ * Lines of the bills, checks / credit-card charges and vendor credits with a document line costed
+ * to the customer:job `customerId` (QB job costing; the posted lines carry the vendor's name).
+ * A superset: fetchGlLines matches each posted line to its document line (costLineCustomers).
+ */
+function costedToCandidates(companyId: string, customerId: string): SQL {
+  const c = companyId;
+  const prefix = sql`split_part(${journalEntries.sourceRef}, ':', 1)`;
+  const docOf = sql`split_part(${journalEntries.sourceRef}, ':', 2)`;
+  return sql`(${journalEntryLines.entityId} IS NULL AND (
+    (${prefix} = 'bill' AND ${docOf} IN (SELECT ${billLines.billId}::text FROM ${billLines} JOIN ${bills} ON ${bills.id} = ${billLines.billId} WHERE ${bills.companyId} = ${c} AND ${billLines.customerId} = ${customerId}))
+    OR (${prefix} = 'expense' AND ${docOf} IN (SELECT ${expenseLines.expenseId}::text FROM ${expenseLines} JOIN ${expenses} ON ${expenses.id} = ${expenseLines.expenseId} WHERE ${expenses.companyId} = ${c} AND ${expenseLines.customerId} = ${customerId}))
+    OR (${prefix} = 'vendor_credit' AND ${docOf} IN (SELECT ${vendorCreditLines.vendorCreditId}::text FROM ${vendorCreditLines} JOIN ${vendorCredits} ON ${vendorCredits.id} = ${vendorCreditLines.vendorCreditId} WHERE ${vendorCredits.companyId} = ${c} AND ${vendorCreditLines.customerId} = ${customerId}))))`;
 }
 
 /**
@@ -1379,9 +1400,10 @@ export async function fetchGlLines(
   // first) and filtered those, so on a large file a customer's newer transactions silently fell
   // off Customer Balance Detail and every other name-filtered detail report.
   if (f.nameId) conds.push(nameCandidates(ctx.companyId, f.nameId));
+  if (f.jobCustomerId) conds.push(sql`(${nameCandidates(ctx.companyId, f.jobCustomerId)} OR ${costedToCandidates(ctx.companyId, f.jobCustomerId)})`);
 
-  // Name / number filters are applied after resolution, so read a larger window first.
-  const postFilter = !!(f.nameId || f.number);
+  // Name / number / job filters are applied after resolution, so read a larger window first.
+  const postFilter = !!(f.nameId || f.number || f.jobCustomerId);
   const fetchCap = postFilter ? GL_LIMITS.postFilterScan : limit + 1;
 
   const raw = await ctx.db
@@ -1481,6 +1503,13 @@ export async function fetchGlLines(
   lines = lines.filter((l) => !!l.account);
   if (f.basis === 'cash') lines = await applyCashBasisToGlLines(ctx, meta, { ...f, accountIds }, lines);
   if (f.nameId) lines = lines.filter((l) => l.nameId === f.nameId && (!f.nameType || l.nameType === f.nameType));
+  if (f.jobCustomerId) {
+    // The Profit & Loss by Job column rule (reportsStandard jobBucketOf): the line's customer, or
+    // the customer:job its bill / check / vendor-credit line is costed to.
+    const job = f.jobCustomerId;
+    const costed = await costLineCustomers(ctx, lines);
+    lines = lines.filter((l) => (l.nameType === 'customer' && l.nameId ? l.nameId === job : costed.get(l.lineId) === job));
+  }
   if (f.number) {
     const needle = f.number.toLowerCase();
     lines = lines.filter(

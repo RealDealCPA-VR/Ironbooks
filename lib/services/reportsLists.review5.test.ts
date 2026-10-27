@@ -240,6 +240,50 @@ describe('Profit & Loss by Job', () => {
     const net = await drilldownCell(ctx, 'profit-loss-by-job', params, 'pl:net', col!.key);
     expect(net.ties).toBe(true);
   });
+
+  it("each job cell's QuickZoom lists exactly the lines in that cell (costed bill / check lines and named income)", async () => {
+    const { reportParamsSchema } = await import('@/lib/validation/reports');
+    const { postJournalEntry } = await import('./posting');
+    const { customers } = await import('@/lib/db/schema');
+    const [job] = await db.select().from(customers).where(eq(customers.displayName, 'Kitchen Job'));
+    // Income named to the job on the line itself.
+    await postJournalEntry(ctx, {
+      date: d('2026-04-05'),
+      description: 'Job income',
+      lines: [
+        { accountId: A['1000'], debit: '15.00' },
+        { accountId: A['4100'], credit: '15.00', entityType: 'customer', entityId: job.id },
+      ],
+    });
+    const params = { from: '2026-04-01', to: '2026-04-30' };
+    const r = await runStandardReport(ctx, 'profit-loss-by-job', params);
+    const col = r.columns.find((c) => c.header === 'Kitchen Job')!;
+    const follow = async (rowSuffix: string) => {
+      const row = r.rows.find((x) => x.id.endsWith(rowSuffix))!;
+      const href = row.hrefs?.[col.key];
+      expect(href, JSON.stringify(row)).toBeTruthy();
+      const q = reportParamsSchema.parse(Object.fromEntries(new URL(href!, 'http://local').searchParams));
+      const detail = await runStandardReport(ctx, 'transaction-detail-by-account', q);
+      return { cell: row.cells[col.key], detail };
+    };
+    const supplies = await follow(`:a:${A['6300']}`);
+    expect(supplies.cell).toBe('70.00');
+    const supplyLines = supplies.detail.rows.filter((x) => x.entryId);
+    expect(supplyLines.map((x) => x.cells.amount)).toEqual(['70.00']); // not the uncosted 30.00
+    expect(supplies.detail.rows.find((x) => x.kind === 'grand')?.cells.amount).toBe('70.00');
+    const rent = await follow(`:a:${A['6400']}`);
+    expect(rent.cell).toBe('25.00');
+    expect(rent.detail.rows.find((x) => x.kind === 'grand')?.cells.amount).toBe('25.00');
+    const income = await follow(`:a:${A['4100']}`);
+    expect(income.cell).toBe('15.00');
+    expect(income.detail.rows.find((x) => x.kind === 'grand')?.cells.amount).toBe('15.00');
+    // The viewer and the explanations carry the option from the URL (else the click opened the
+    // whole account unfiltered).
+    const { REPORT_PARAM_KEYS } = await import('@/lib/reports/drilldown');
+    expect(REPORT_PARAM_KEYS).toContain('customerJobId');
+    const view = fs.readFileSync(path.resolve(process.cwd(), 'app', 'reports', '_components', 'StdReportView.tsx'), 'utf8');
+    expect(/const PARAM_KEYS = \[([\s\S]*?)\];/.exec(view)?.[1]).toContain("'customerJobId'");
+  });
 });
 
 describe('Budget vs. Actual by Customer:Job', () => {

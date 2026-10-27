@@ -369,7 +369,9 @@ export async function profitAndLossByJobReport(ctx: ServiceContext, p: ReportPar
     if (!m || r.kind !== 'data') continue;
     r.hrefs = {};
     keys.forEach((k, i) => {
-      if (k) r.hrefs![`c${i}`] = stdHref('transaction-detail-by-account', { accountId: m[1], customerId: k, classId: p.classId, from: dayStr(from), to: dayStr(to), basis });
+      // The job column's own rule (named lines AND costed bill / check lines), not the Name filter:
+      // a costed bill line is named after its vendor, so customerId opened an empty report.
+      if (k) r.hrefs![`c${i}`] = stdHref('transaction-detail-by-account', { accountId: m[1], customerJobId: k, classId: p.classId, from: dayStr(from), to: dayStr(to), basis });
     });
   }
   return {

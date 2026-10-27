@@ -67,6 +67,11 @@ export const reportParamsSchema = z
     employeeId: zId.optional(),
     itemId: zId.optional(),
     jobId: zId.optional(),
+    /**
+     * Lines in one Customer:Job column of Profit & Loss by Job: named for that customer:job, or a
+     * bill / check / vendor-credit line costed to it (its QuickZoom).
+     */
+    customerJobId: zId.optional(),
     classId: zId.optional(),
     budgetId: zId.optional(),
     txnType: z.enum(TXN_TYPE_KEYS).optional(),
