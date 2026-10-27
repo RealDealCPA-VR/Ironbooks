@@ -40,6 +40,9 @@ export const ACCOUNTANT_COPY_ALLOWED_API = [
   '/api/sales-orders',
   '/api/purchase-orders',
   '/api/reconciliations',
+  // Typing into an account register's blank row saves a check, deposit, transfer, credit card
+  // charge / credit or General Journal entry through those forms' own services (all carried).
+  '/api/registers',
   // Names and items (adding them, and editing their everyday fields — guard.ts refuses the rest).
   '/api/customers',
   '/api/vendors',

@@ -10,7 +10,10 @@
  *    /api/todos, which was already allowed);
  *  - switching to single-user mode (a session mode, like signing in);
  *  - asking the AI assistant a question (read-only report tools; proposals it makes still go
- *    through /api/ai/proposals, which stays refused).
+ *    through /api/ai/proposals, which stays refused);
+ *  - a transaction typed into an account register (POST /api/registers/<account>): it is saved as
+ *    a check, deposit, transfer, card charge / credit or General Journal entry — all carried by the
+ *    changes file, exactly as when entered on those forms (which were allowed).
  */
 import { describe, expect, it } from 'vitest';
 import { accountantCopyAllowsApi } from './routeGate';
@@ -25,6 +28,7 @@ describe("Accountant's Copy gate allows housekeeping that never changes the book
       '/api/calendar/todos/abc',
       '/api/single-user',
       '/api/ai/assistant',
+      '/api/registers/0b6c3f0e-3f7b-4b7e-9d1e-2b8a4f6c9d10',
     ]) {
       expect(accountantCopyAllowsApi(p), p).toBe(true);
     }
