@@ -4,8 +4,10 @@
  *  - The report filters and Find (Ctrl+F) loaded their customer / vendor / account / class lists
  *    once per app session: a name added afterwards never appeared in them until a reload, and a
  *    QuickReport (Ctrl+Q) for it showed its filter as "All".
+ *  - A memorized Report Builder report opened a blank builder from the Memorized Report List.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import fs from 'node:fs';
 
 const get = vi.fn();
 vi.mock('@/lib/client', () => ({
@@ -55,5 +57,40 @@ describe('report filter lists stay current', () => {
     get.mockRejectedValueOnce(new Error('offline')).mockResolvedValueOnce(options(['Acme']));
     await expect(loadFilterOptions(3_000_000)).rejects.toThrow('offline');
     expect((await loadFilterOptions(3_000_001)).customers).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Memorized Report Builder reports
+// ---------------------------------------------------------------------------
+//
+// Opening a memorized Report Builder report from the Memorized Report List (or "Open" after
+// Process Multiple Reports) went to a blank builder: the link carried no report, so the saved
+// dates / account types / grouping were never loaded.
+
+describe('opening a memorized report', () => {
+  it('a Report Builder report opens the builder with its id, and the builder finds it', async () => {
+    const { memorizedReportHref, memorizedIdFrom } = await import('@/app/reports/_components/memorizedHref');
+    const href = memorizedReportHref({ id: 'mr-1', reportType: 'custom', config: { params: {} } });
+    expect(href).toBe('/reports/builder?mem=mr-1');
+    expect(memorizedIdFrom(href.slice(href.indexOf('?')))).toBe('mr-1');
+  });
+
+  it('a standard report keeps its saved settings in the link', async () => {
+    const { memorizedReportHref } = await import('@/app/reports/_components/memorizedHref');
+    const href = memorizedReportHref({ id: 'mr-2', reportType: 'profit-loss', config: { params: { dates: 'this_month', basis: 'cash' } } });
+    expect(href.startsWith('/reports/std/profit-loss?')).toBe(true);
+    const q = new URLSearchParams(href.split('?')[1]);
+    expect(q.get('dates')).toBe('this_month');
+    expect(q.get('basis')).toBe('cash');
+    expect(q.get('mem')).toBe('mr-2');
+  });
+
+  it('the list and the builder use it', () => {
+    const list = fs.readFileSync('app/reports/memorized/page.tsx', 'utf8');
+    expect(list).toContain('memorizedReportHref(');
+    expect(list).not.toMatch(/return '\/reports\/builder';/);
+    const builder = fs.readFileSync('app/reports/builder/page.tsx', 'utf8');
+    expect(builder).toContain('memorizedIdFrom(window.location.search)');
   });
 });
