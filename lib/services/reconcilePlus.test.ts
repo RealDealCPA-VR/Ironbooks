@@ -11,7 +11,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import path from 'node:path';
 import fs from 'node:fs';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, like } from 'drizzle-orm';
 import { getDb, closeDb, type DB } from '@/lib/db';
 import {
   users,
@@ -177,11 +177,11 @@ describe('Reconciliation completion features (end-to-end)', () => {
     expect(progress.clearedBalance).toBe('4187.50');
     expect(progress.difference).toBe('0.00');
 
-    // Both adjustment entries carry sourceRef "reconciliation:<id>".
+    // Both adjustment entries carry sourceRef "reconciliation:<id>:charge" / ":interest".
     const adjEntries = await db
       .select()
       .from(journalEntries)
-      .where(eq(journalEntries.sourceRef, `reconciliation:${recon1Id}`));
+      .where(like(journalEntries.sourceRef, `reconciliation:${recon1Id}:%`));
     expect(adjEntries.length).toBe(2);
     expect(adjEntries.every((e) => e.status === 'posted')).toBe(true);
     expect(
