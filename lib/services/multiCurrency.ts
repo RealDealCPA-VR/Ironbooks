@@ -50,6 +50,15 @@ async function homeCodeOf(db: DB, companyId: string, settings: Settings): Promis
 }
 
 /**
+ * review5 fx: the company's home currency code even before a currency list exists (the currency
+ * list's base, else the Preferences currency, else USD) — so the home code typed on a document
+ * (any case) is never taken for a foreign currency in a company that never set up currencies.
+ */
+export async function effectiveHomeCurrency(ctx: Pick<ServiceContext, 'db' | 'companyId'>): Promise<string> {
+  return homeCodeOf(ctx.db, ctx.companyId, await settingsOf(ctx.db, ctx.companyId));
+}
+
+/**
  * True when the company has foreign-currency DATA: a bank / credit-card account or vendor in a
  * foreign currency, or any transaction (invoice, payment, bill, bill payment, check, transfer,
  * vendor credit, deposit, loan, journal line) recorded in one.

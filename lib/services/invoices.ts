@@ -62,9 +62,9 @@ import {
   validation,
   writeAudit,
 } from './_base';
-import { assertForeignCurrencyAllowed } from './multiCurrency';
+import { assertForeignCurrencyAllowed, effectiveHomeCurrency } from './multiCurrency';
 import { currencyRate } from './exchangeRates';
-import { foreignCode, homeCode } from './fxLines';
+import { foreignCode } from './fxLines';
 import { assertNotControlLineAccount, postJournalEntry, voidJournalEntry } from './posting';
 import { recordCOGS, valueRemainderAfter } from './inventory';
 import { consumeStock } from './fifo';
@@ -494,7 +494,8 @@ async function resolveInvoiceCurrency(
   input: CreateInvoiceInput,
   saved?: { currency: string | null; exchangeRate: string | null },
 ): Promise<CreateInvoiceInput> {
-  const home = await homeCode(ctx);
+  // The home code even when no currency list exists yet (a home invoice typed as "usd").
+  const home = await effectiveHomeCurrency(ctx);
   const cur = foreignCode(input.currency ?? null, home);
   const sameAsSaved = !!saved && foreignCode(saved.currency, home) === cur;
   if (!cur) return { ...input, currency: sameAsSaved ? saved!.currency : null, exchangeRate: 1 };
