@@ -153,7 +153,7 @@ export async function setBaseCurrency(
       const others = rows.filter((r) => !r.isBase && r.code !== code);
       if (others.length > 0) {
         throw validation(
-          `Add ${code} to the currency list first, with its exchange rate in ${currentHome}, so the rates of ${others.map((r) => r.code).join(', ')} can be converted to ${code}. Then set ${code} as the home currency.`,
+          `Add ${code} to the currency list first, with its exchange rate in ${currentHome ?? 'your current home currency'}, so the rates of ${others.map((r) => r.code).join(', ')} can be converted to ${code}. Then set ${code} as the home currency.`,
         );
       }
       // Only the old home currency is listed: its rate in the new one is unknown, so it leaves the
@@ -235,13 +235,21 @@ export async function upsertCurrency(
       .where(and(eq(currencies.companyId, tx.companyId), eq(currencies.code, code)));
 
     let row: CurrencyRow;
+    if (existing?.isBase) {
+      throw new ServiceError(
+        'CONFLICT',
+        `${code} is the base currency. Use setBaseCurrency to change the base.`,
+      );
+    }
+    // review5 fx: with no base row the home currency is the Preferences currency, else USD. Listed
+    // with a rate it would be a foreign currency: documents in it booked at that rate, and "Set as
+    // home currency" later would silently turn them into home ones at the wrong amounts.
+    if (code === (await effectiveHomeCurrency(tx))) {
+      throw validation(
+        `${code} is your home currency. Set it as the home currency instead of adding it with an exchange rate. (If your books are kept in another currency, set that one as the home currency first.)`,
+      );
+    }
     if (existing) {
-      if (existing.isBase) {
-        throw new ServiceError(
-          'CONFLICT',
-          `${code} is the base currency. Use setBaseCurrency to change the base.`,
-        );
-      }
       const [updated] = await tx.db
         .update(currencies)
         .set({ name, rateToBase: rate.toFixed(8), updatedAt: new Date() })
@@ -438,7 +446,9 @@ export async function resolveDocumentCurrency(
   const anyForeign = hasText(input.currency) || hasText(input.vendorCurrency) || hasText(input.accountCurrency);
   if (!anyForeign) return { currency: null, rate: Money.of(1) };
 
-  const home = await getHomeCurrencyCode(ctx);
+  // review5 fx: the home code even without a base row (the Preferences currency, else USD), as
+  // invoices resolve it - a bill or check typed "USD" in such a file is a home document.
+  const home = await effectiveHomeCurrency(ctx);
   const norm = (c: string | null | undefined): string | null => {
     const v = (c ?? '').trim().toUpperCase();
     return v === '' || (home != null && v === home) ? null : v;
@@ -605,7 +615,7 @@ export async function setAccountCurrency(
   if (!isBankish && !isCard) {
     throw validation('Only bank and credit card accounts can have their own currency.');
   }
-  const home = await getHomeCurrencyCode(ctx);
+  const home = await effectiveHomeCurrency(ctx); // review5 fx: also without a base row
   let next: string | null = (code ?? '').trim().toUpperCase() || null;
   if (next && home && next === home) next = null;
   if (next) {
@@ -616,7 +626,9 @@ export async function setAccountCurrency(
       .where(and(eq(currencies.companyId, ctx.companyId), eq(currencies.code, next)));
     if (!cur) throw validation(`${next} is not in your currency list. Add it under Currencies first.`);
   }
-  if ((acct.currency ?? null) === next) return { id: acct.id, currency: next };
+  // An account tagged with the home code (saved before the file had a home currency) is already home.
+  const stored = (acct.currency ?? '').trim().toUpperCase() || null;
+  if ((stored && home && stored === home ? null : stored) === next) return { id: acct.id, currency: next };
   const [used] = await ctx.db
     .select({ id: journalEntryLines.id })
     .from(journalEntryLines)

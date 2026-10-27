@@ -16,9 +16,10 @@
  *  - The QB lock: once it is on and foreign-currency data exists, it can't be turned off
  *    (assertMultiCurrencyChangeAllowed, called by updateCompany).
  */
-import { and, eq, sql } from 'drizzle-orm';
+import { and, eq, sql, type SQL } from 'drizzle-orm';
 import { companies, currencies } from '@/lib/db/schema';
 import type { DB } from '@/lib/db';
+import { Money } from '@/lib/money';
 import { ServiceError, validation, type ServiceContext } from './_base';
 
 type Settings = Record<string, unknown> | null | undefined;
@@ -39,22 +40,34 @@ async function settingsOf(db: DB, companyId: string): Promise<Settings> {
   return (row?.settings ?? {}) as Settings;
 }
 
-/** The company's home currency code (currency list base, else Preferences currency, else USD). */
-async function homeCodeOf(db: DB, companyId: string, settings: Settings): Promise<string> {
-  const [base] = await db
-    .select({ code: currencies.code })
+/**
+ * The company's home currency code: the currency list's base, else the Preferences currency, else
+ * USD. review5 fx: in a list with no base row (older files, migration 0056) that holds the
+ * Preferences / USD default as a FOREIGN currency (a rate other than 1, e.g. USD at 1.36 in a
+ * Canadian file), the list's rates are in units of a home currency the file never recorded, so the
+ * default is not the home currency and the code is unknown: null.
+ */
+async function homeCodeOf(db: DB, companyId: string, settings: Settings): Promise<string | null> {
+  const rows = await db
+    .select({ code: currencies.code, rateToBase: currencies.rateToBase, isBase: currencies.isBase })
     .from(currencies)
-    .where(and(eq(currencies.companyId, companyId), eq(currencies.isBase, true)));
-  const fromSettings = typeof settings?.currency === 'string' ? settings.currency : '';
-  return (base?.code || fromSettings || 'USD').trim().toUpperCase();
+    .where(eq(currencies.companyId, companyId));
+  const base = rows.find((r) => r.isBase);
+  if (base) return base.code.trim().toUpperCase();
+  const fromSettings = typeof settings?.currency === 'string' ? settings.currency.trim() : '';
+  const fallback = (fromSettings || 'USD').toUpperCase();
+  const listed = rows.find((r) => r.code.trim().toUpperCase() === fallback);
+  return listed && !Money.of(listed.rateToBase).equals(1) ? null : fallback;
 }
 
 /**
  * review5 fx: the company's home currency code even before a currency list exists (the currency
  * list's base, else the Preferences currency, else USD) — so the home code typed on a document
  * (any case) is never taken for a foreign currency in a company that never set up currencies.
+ * Null when a list without a base row holds that default as a foreign currency (see homeCodeOf):
+ * every code is then foreign, as the list's rates say.
  */
-export async function effectiveHomeCurrency(ctx: Pick<ServiceContext, 'db' | 'companyId'>): Promise<string> {
+export async function effectiveHomeCurrency(ctx: Pick<ServiceContext, 'db' | 'companyId'>): Promise<string | null> {
   return homeCodeOf(ctx.db, ctx.companyId, await settingsOf(ctx.db, ctx.companyId));
 }
 
@@ -68,10 +81,22 @@ export async function hasForeignCurrencyData(db: DB, companyId: string, settings
   return hasCurrencyDataOtherThan(db, companyId, home);
 }
 
-/** True when an account, vendor or transaction is recorded in a currency other than `code`. */
-async function hasCurrencyDataOtherThan(db: DB, companyId: string, home: string): Promise<boolean> {
+/**
+ * True when an account, vendor or transaction is recorded in a currency other than `home` (any
+ * currency at all when `home` is null).
+ */
+function hasCurrencyDataOtherThan(db: DB, companyId: string, home: string | null): Promise<boolean> {
+  return currencyDataExists(db, companyId, (col) => sql`upper(btrim(${sql.raw(col)})) <> ${home ?? ''}`);
+}
+
+/** True when an account, vendor or transaction is recorded in exactly the currency `code`. */
+function hasCurrencyDataIn(db: DB, companyId: string, code: string): Promise<boolean> {
+  return currencyDataExists(db, companyId, (col) => sql`upper(btrim(${sql.raw(col)})) = ${code}`);
+}
+
+async function currencyDataExists(db: DB, companyId: string, test: (col: string) => SQL): Promise<boolean> {
   const foreign = (table: string) =>
-    sql`EXISTS (SELECT 1 FROM ${sql.raw(table)} t WHERE t.company_id = ${companyId} AND t.currency IS NOT NULL AND btrim(t.currency) <> '' AND upper(btrim(t.currency)) <> ${home})`;
+    sql`EXISTS (SELECT 1 FROM ${sql.raw(table)} t WHERE t.company_id = ${companyId} AND t.currency IS NOT NULL AND btrim(t.currency) <> '' AND ${test('t.currency')})`;
   const tables = [
     'accounts',
     'vendors',
@@ -87,7 +112,7 @@ async function hasCurrencyDataOtherThan(db: DB, companyId: string, home: string)
   ];
   const checks = [
     ...tables.map(foreign),
-    sql`EXISTS (SELECT 1 FROM journal_entry_lines l JOIN journal_entries e ON e.id = l.journal_entry_id WHERE e.company_id = ${companyId} AND l.currency IS NOT NULL AND btrim(l.currency) <> '' AND upper(btrim(l.currency)) <> ${home})`,
+    sql`EXISTS (SELECT 1 FROM journal_entry_lines l JOIN journal_entries e ON e.id = l.journal_entry_id WHERE e.company_id = ${companyId} AND l.currency IS NOT NULL AND btrim(l.currency) <> '' AND ${test('l.currency')})`,
   ];
   const res = await db.execute(sql`SELECT (${sql.join(checks, sql` OR `)}) AS found`);
   const row = (res.rows as Array<{ found: boolean }>)[0];
@@ -111,14 +136,42 @@ export async function assertHomeCurrencyChangeAllowed(
 ): Promise<boolean> {
   const current = await effectiveHomeCurrency(ctx);
   const code = next.trim().toUpperCase();
-  if (code === current) return false;
-  if (
-    (await hasCurrencyDataOtherThan(ctx.db, ctx.companyId, current)) ||
-    (await hasCurrencyDataOtherThan(ctx.db, ctx.companyId, code))
-  ) {
-    throw new ServiceError('CONFLICT', HOME_CURRENCY_LOCKED_MESSAGE(current), { homeCurrencyLocked: true });
+  const locked = (message: string) => new ServiceError('CONFLICT', message, { homeCurrencyLocked: true });
+  if (current !== null) {
+    if (code === current) return false;
+    if (
+      (await hasCurrencyDataOtherThan(ctx.db, ctx.companyId, current)) ||
+      (await hasCurrencyDataOtherThan(ctx.db, ctx.companyId, code))
+    ) {
+      throw locked(HOME_CURRENCY_LOCKED_MESSAGE(current));
+    }
+    return true;
   }
-  return true;
+  // No base row, and the list holds the Preferences / USD default as a foreign currency: its rates
+  // are in units of a home currency the file never recorded (homeCodeOf).
+  const [row] = await ctx.db
+    .select({ rateToBase: currencies.rateToBase })
+    .from(currencies)
+    .where(and(eq(currencies.companyId, ctx.companyId), eq(currencies.code, code), eq(currencies.isBase, false)));
+  if (row && !Money.of(row.rateToBase).equals(1)) {
+    // One of the list's foreign currencies: making it the home currency is a change (the list is
+    // rebased onto it), refused like any other once data carries a currency - its documents were
+    // booked at their rates and would silently become home ones.
+    if (await hasCurrencyDataOtherThan(ctx.db, ctx.companyId, null)) {
+      throw locked(
+        `${code} is a foreign currency in your currency list (exchange rate ${Money.of(row.rateToBase).toString()}), and this company already has foreign-currency accounts, names or transactions, so ${code} can no longer become the home currency (QuickBooks works the same way). Set the currency your books are kept in as the home currency instead.`,
+      );
+    }
+    return true;
+  }
+  // Any other code names the currency the list's rates are already in: no rebase. Refused only when
+  // data was recorded in that code as a foreign currency (it would silently become home data).
+  if (await hasCurrencyDataIn(ctx.db, ctx.companyId, code)) {
+    throw locked(
+      `This company already has accounts, names or transactions in ${code} as a foreign currency, so ${code} can no longer become the home currency (QuickBooks works the same way).`,
+    );
+  }
+  return false;
 }
 
 /**

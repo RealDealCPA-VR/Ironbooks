@@ -38,7 +38,8 @@ import { createSalesReceipt, type CreateSalesReceiptInput } from './salesReceipt
 import { createCreditMemo, type CreateCreditMemoInput } from './creditMemos';
 import { createDeposit, type CreateDepositInput } from './deposits';
 import { createTransfer, type CreateTransferInput } from './transfers';
-import { accountCurrencyOf } from './exchangeRates';
+import { accountCurrencyOf, currencyRate } from './exchangeRates';
+import { Money } from '@/lib/money';
 import { createPurchaseOrder, type CreatePurchaseOrderInput } from './purchaseOrders';
 
 // ---------------------------------------------------------------------------
@@ -657,8 +658,10 @@ async function generateFromTemplate(
     }
     case 'transfer': {
       // review5 fx: the memorized home amount is never reused (it is recomputed at today's rate). A
-      // same-currency foreign transfer also drops the memorized rate (home per unit); between two
-      // currencies `exchangeRate` is the cross rate the user memorized with the amounts, so it stays.
+      // same-currency foreign transfer also drops the memorized rate (home per unit). Between a
+      // foreign and a home account the cross rate is the foreign currency's home rate (or its
+      // inverse), so it is today's too - unless the amount that arrived was memorized. Between two
+      // foreign currencies `exchangeRate` is the cross rate the user memorized, so it stays.
       const memorized = payload as unknown as CreateTransferInput;
       // A missing / malformed / deleted account is left to createTransfer's own plain message.
       const currencyOf = async (id: unknown): Promise<string | null | undefined> => {
@@ -672,8 +675,18 @@ async function generateFromTemplate(
       };
       const from = await currencyOf(memorized.fromAccountId);
       const to = await currencyOf(memorized.toAccountId);
-      const sameCurrency = from !== undefined && to !== undefined && from === to;
-      const input = { ...memorized, ...(sameCurrency ? fresh : {}), homeAmount: undefined, date: runDate };
+      const known = from !== undefined && to !== undefined;
+      let rate: { exchangeRate?: string | undefined } = {};
+      if (known && from === to) rate = fresh;
+      else if (known && (from === null) !== (to === null) && (memorized.toAmount == null || String(memorized.toAmount).trim() === '')) {
+        try {
+          const listed = (await currencyRate(ctx, from ?? to)).rate;
+          rate = { exchangeRate: (from ? listed : Money.of(1).dividedBy(listed)).toFixed(8) };
+        } catch (err) {
+          if (!(err instanceof ServiceError)) throw err; // no list rate: the memorized one stays
+        }
+      }
+      const input = { ...memorized, ...rate, homeAmount: undefined, date: runDate };
       docId = (await createTransfer(ctx, input)).id;
       break;
     }

@@ -6,7 +6,7 @@ import { and, eq, sql } from 'drizzle-orm';
 import path from 'node:path';
 import fs from 'node:fs';
 import { getDb, closeDb, type DB } from '@/lib/db';
-import { accounts, currencies, homeCurrencyAdjustments, journalEntries, journalEntryLines, users, vendors } from '@/lib/db/schema';
+import { accounts, companies, currencies, homeCurrencyAdjustments, journalEntries, journalEntryLines, users, vendors } from '@/lib/db/schema';
 import { Money } from '@/lib/money';
 import type { ServiceContext } from './_base';
 import { createCompany } from './company';
@@ -112,6 +112,92 @@ describe('review5 fx', () => {
     const eur = (await listCurrencies(ctx)).find((c) => c.code === 'EUR');
     expect(eur?.isBase).toBe(false);
     expect(Money.of(eur!.rateToBase).toFixed(2)).toBe('1.20');
+  });
+
+  it('without a base row the home currency cannot be listed as a foreign one, and a file already in that state cannot flip it to home', async () => {
+    const { createExpense } = await import('./expenses');
+    await db.delete(currencies).where(and(eq(currencies.companyId, ctx.companyId), eq(currencies.isBase, true)));
+    // No Preferences currency: the home currency is USD. Listed at 1.30, USD documents were booked at 1.30.
+    await expect(upsertCurrency(ctx, { code: 'USD', name: 'US Dollar', rateToBase: '1.30' })).rejects.toMatchObject({
+      code: 'VALIDATION',
+      message: expect.stringContaining('USD is your home currency'),
+    });
+    expect((await listCurrencies(ctx)).map((c) => c.code)).toEqual(['EUR']);
+    // A file an older build let into that state: USD at 1.30, a bank tagged USD, a check of 100 posted at 130.
+    await db.insert(currencies).values({ companyId: ctx.companyId, code: 'USD', name: 'US Dollar', rateToBase: '1.30000000', isBase: false });
+    const bank = (await createAccount(ctx, { code: '1030', name: 'USD Bank', type: 'asset' as never, subtype: 'checking' })).id;
+    await setAccountCurrency(ctx, bank, 'USD');
+    await createExpense(ctx, { payeeName: 'Office Depot', date: d('2026-03-10'), method: 'check', paymentAccountId: bank, lines: [{ accountId: acct['6000'], amount: '100.00' }] } as never);
+    expect(await foreignBalance(bank)).toBe('-100.00');
+    // Making USD the home currency would turn it into a home check of 130 (the register would show -130.00).
+    await expect(setBaseCurrency(ctx, { code: 'USD', name: 'US Dollar' })).rejects.toMatchObject({ code: 'CONFLICT' });
+    expect(await getHomeCurrencyCode(ctx)).toBeNull();
+    expect(await foreignBalance(bank)).toBe('-100.00');
+  });
+
+  it('an older file whose list holds the default currency as a foreign one (CAD home, USD at 1.36) can still set its real home currency', async () => {
+    const { updateCompany } = await import('./company');
+    const { getInvoice } = await import('./invoices');
+    // No base row, no Preferences currency, USD listed at 1.36 (CAD per USD), a USD bill at 1.36.
+    await db.delete(currencies).where(eq(currencies.companyId, ctx.companyId));
+    await db.update(accounts).set({ currency: null }).where(eq(accounts.id, acct['1020']));
+    await db.insert(currencies).values({ companyId: ctx.companyId, code: 'USD', name: 'US Dollar', rateToBase: '1.36000000', isBase: false });
+    const v = await createVendor(ctx, { displayName: `USD supplier ${seq}` } as never);
+    await db.update(vendors).set({ currency: 'USD' }).where(eq(vendors.id, v.id));
+    await createBill(ctx, { vendorId: v.id, date: d('2026-02-01'), currency: 'USD', exchangeRate: '1.36', lines: [{ accountId: acct['6000'], amount: '100.00' }] } as never);
+    // The list says USD is not the home currency: a USD invoice is a foreign one at the list rate,
+    // not a home invoice of 100 (which would put CAD 100 on A/R for USD 100).
+    const c = await createCustomer(ctx, { displayName: `USD customer ${seq}` } as never);
+    const inv = await createInvoice(ctx, { customerId: c.id, date: d('2026-02-02'), currency: 'USD', lines: [{ accountId: acct['4000'], quantity: 1, rate: '100.00' }] } as never);
+    const saved = await getInvoice(ctx, inv.id);
+    expect(saved.currency).toBe('USD');
+    expect(Money.of(saved.exchangeRate!).toFixed(4)).toBe('1.3600');
+    // USD can't become the home currency (the bill and invoice would become home ones)...
+    await expect(setBaseCurrency(ctx, { code: 'USD', name: 'US Dollar' })).rejects.toMatchObject({ code: 'CONFLICT' });
+    await expect(updateCompany(ctx, { settings: { currency: 'USD' } })).rejects.toMatchObject({ code: 'CONFLICT' });
+    // ...nor can a currency that is not listed but carries data (a GBP invoice at a typed rate).
+    await createInvoice(ctx, { customerId: c.id, date: d('2026-02-03'), currency: 'GBP', exchangeRate: '1.80', lines: [{ accountId: acct['4000'], quantity: 1, rate: '10.00' }] } as never);
+    await expect(setBaseCurrency(ctx, { code: 'GBP', name: 'Pound' })).rejects.toMatchObject({ code: 'CONFLICT' });
+    // ...but the real home currency, which no data carries, can: in Preferences or in the list.
+    await expect(updateCompany(ctx, { settings: { currency: 'CAD' } })).resolves.toBeTruthy();
+    await db.update(companies).set({ settings: {} }).where(eq(companies.id, ctx.companyId));
+    await expect(setBaseCurrency(ctx, { code: 'CAD', name: 'Canadian Dollar' })).resolves.toMatchObject({ isBase: true, code: 'CAD' });
+    // USD keeps its rate (it was already in CAD) and is now locked as a foreign currency.
+    const usd = (await listCurrencies(ctx)).find((x) => x.code === 'USD');
+    expect(usd?.isBase).toBe(false);
+    expect(Money.of(usd!.rateToBase).toFixed(4)).toBe('1.3600');
+    await expect(setBaseCurrency(ctx, { code: 'USD', name: 'US Dollar' })).rejects.toMatchObject({ code: 'CONFLICT' });
+    expect((await trialBalance(ctx)).balanced).toBe(true);
+  });
+
+  it('turning Multiple Currencies on does not guess USD as the home currency when the list holds USD as a foreign one', async () => {
+    const { updateCompany } = await import('./company');
+    // An older Canadian file: no base row, USD at 1.36 (CAD per USD); Multiple Currencies was
+    // turned off (no foreign data) and is turned on again.
+    await db.delete(currencies).where(eq(currencies.companyId, ctx.companyId));
+    await db.update(accounts).set({ currency: null }).where(eq(accounts.id, acct['1020']));
+    await db.insert(currencies).values({ companyId: ctx.companyId, code: 'USD', name: 'US Dollar', rateToBase: '1.36000000', isBase: false });
+    await db.update(companies).set({ settings: { multiCurrencyEnabled: false } }).where(eq(companies.id, ctx.companyId));
+    await updateCompany(ctx, { settings: { multiCurrencyEnabled: true } });
+    // USD did not silently become the home currency (every CAD amount would have read as USD).
+    expect(await getHomeCurrencyCode(ctx)).toBeNull();
+    const usd = (await listCurrencies(ctx)).find((x) => x.code === 'USD');
+    expect([usd?.isBase, Money.of(usd!.rateToBase).toFixed(4)]).toEqual([false, '1.3600']);
+  });
+
+  it('without a base row, a bill or check typed in the home currency code is a home document', async () => {
+    const { createExpense } = await import('./expenses');
+    const { getBill } = await import('./bills');
+    await db.delete(currencies).where(and(eq(currencies.companyId, ctx.companyId), eq(currencies.isBase, true)));
+    const v = await createVendor(ctx, { displayName: `Home supplier ${seq}` } as never);
+    const bill = await createBill(ctx, { vendorId: v.id, date: d('2026-03-01'), currency: 'USD', lines: [{ accountId: acct['6000'], amount: '100.00' }] } as never);
+    expect((await getBill(ctx, bill.id)).currency ?? null).toBeNull();
+    const chk = await createExpense(ctx, { vendorId: v.id, date: d('2026-03-02'), method: 'check', paymentAccountId: acct['1000'], currency: 'usd', lines: [{ accountId: acct['6000'], amount: '50.00' }] } as never);
+    expect((chk as { currency?: string | null }).currency ?? null).toBeNull();
+    // Tagging a bank with the home code makes it a home account (it used to ask to add USD to the list).
+    const bank = (await createAccount(ctx, { code: '1030', name: 'Second Checking', type: 'asset' as never, subtype: 'checking' })).id;
+    await expect(setAccountCurrency(ctx, bank, 'USD')).resolves.toMatchObject({ currency: null });
+    expect((await trialBalance(ctx)).balanced).toBe(true);
   });
 
   it('a new home currency that is not in the list does not leave the other rates in the old units', async () => {
@@ -587,7 +673,22 @@ describe('review5 fx', () => {
       mode: 'remind' as never,
       template: { fromAccountId: acct['1020'], toAccountId: acct['1025'], amount: '100.00', exchangeRate: '1.20', homeAmount: '120.00' },
     });
+    // Between the Euro bank and the home Checking account the rate is the Euro's home rate (or its
+    // inverse): it is refreshed too. A memorized amount that arrived pins the rate, so it stays.
+    const memorizedTransfer = (name: string, template: Record<string, unknown>) =>
+      createTemplate(ctx, { name: `${name} ${seq}`, docType: 'transfer', frequency: 'monthly' as never, nextRunDate: '2026-04-01', mode: 'remind' as never, template });
+    const toHomeT = await memorizedTransfer('EUR to home', { fromAccountId: acct['1020'], toAccountId: acct['1000'], amount: '100.00', exchangeRate: '1.20' });
+    const fromHomeT = await memorizedTransfer('home to EUR', { fromAccountId: acct['1000'], toAccountId: acct['1020'], amount: '120.00', exchangeRate: '0.83333333' });
+    const pinnedT = await memorizedTransfer('EUR to home pinned', { fromAccountId: acct['1020'], toAccountId: acct['1000'], amount: '100.00', exchangeRate: '1.20', toAmount: '120.00' });
     await upsertCurrency(ctx, { code: 'EUR', name: 'Euro', rateToBase: '1.30' });
+    type TransferRow = { exchangeRate: string; homeAmount: string; toAmount: string };
+    const runTransfer = async (id: string) => (await getTransfer(ctx, (await runTemplateNow(ctx, id, d('2026-04-01'))).docId)) as unknown as TransferRow;
+    const toHome = await runTransfer(toHomeT.id);
+    expect([Money.of(toHome.exchangeRate).toFixed(4), toHome.toAmount, toHome.homeAmount]).toEqual(['1.3000', '130.00', '130.00']);
+    const fromHome = await runTransfer(fromHomeT.id);
+    expect([fromHome.toAmount, fromHome.homeAmount]).toEqual(['92.31', '120.00']);
+    const pinned = await runTransfer(pinnedT.id);
+    expect([pinned.toAmount, pinned.homeAmount]).toEqual(['120.00', '120.00']);
     const inv = await runTemplateNow(ctx, invT.id, d('2026-04-01'));
     const bill = await runTemplateNow(ctx, billT.id, d('2026-04-01'));
     expect(Money.of((await getInvoice(ctx, inv.docId)).exchangeRate!).toFixed(4)).toBe('1.3000');
