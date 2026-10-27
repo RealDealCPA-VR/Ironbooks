@@ -393,60 +393,126 @@ class NotACompanyFileError extends Error {
   }
 }
 
-/** Parse the central directory of a whole-file buffer: [{ name, method, crc, csize, size, offset }]. */
-function readCentralDirectory(buf) {
-  const min = Math.max(0, buf.length - 65557);
+// A company file is read with positioned reads (the directory at its end, then each entry where
+// it lies), never as one buffer: Node refuses to read a file over 2 GiB in one go, and a company
+// file with many scanned receipts can be larger than that — saving one works (ZIP64), so opening
+// it must too. It also keeps memory to one entry at a time instead of the whole file.
+
+/** Room for the end-of-directory record, its longest comment and the ZIP64 locator before it. */
+const TAIL_BYTES = 22 + 0xffff + 20;
+
+/** Reads `len` bytes at `pos` (fewer at the end of the file). */
+function bufferReader(buf) {
+  return { size: buf.length, read: (pos, len) => buf.subarray(pos, Math.min(buf.length, pos + len)) };
+}
+
+function syncFileReader(fd, size) {
+  return {
+    size,
+    read(pos, len) {
+      const out = Buffer.alloc(Math.max(0, Math.min(len, size - pos)));
+      let done = 0;
+      while (done < out.length) {
+        const n = fs.readSync(fd, out, done, out.length - done, pos + done);
+        if (!n) break;
+        done += n;
+      }
+      return done === out.length ? out : out.subarray(0, done);
+    },
+  };
+}
+
+async function openFileReader(filePath) {
+  const fh = await fs.promises.open(filePath, 'r');
+  try {
+    const { size } = await fh.stat();
+    return {
+      size,
+      async read(pos, len) {
+        const out = Buffer.alloc(Math.max(0, Math.min(len, size - pos)));
+        let done = 0;
+        while (done < out.length) {
+          const { bytesRead } = await fh.read(out, done, out.length - done, pos + done);
+          if (!bytesRead) break;
+          done += bytesRead;
+        }
+        return done === out.length ? out : out.subarray(0, done);
+      },
+      close: () => fh.close(),
+    };
+  } catch (err) {
+    await fh.close().catch(() => {});
+    throw err;
+  }
+}
+
+/**
+ * Where the central directory is, from the last bytes of the file (`tail`, starting at file
+ * offset `tailStart`): { count, cdSize, cdOffset } or { zip64At } when the ZIP64 record must be read.
+ */
+function directoryFromTail(tail, tailStart, size) {
+  const min = Math.max(0, size - (22 + 0xffff) - tailStart);
   let eocd = -1;
-  for (let i = buf.length - 22; i >= min; i--) {
-    if (buf.readUInt32LE(i) === 0x06054b50) {
+  for (let i = tail.length - 22; i >= min; i--) {
+    if (tail.readUInt32LE(i) === 0x06054b50) {
       eocd = i;
       break;
     }
   }
   if (eocd < 0) throw new NotACompanyFileError('no zip directory found — the file may be damaged or incomplete');
-  let count = buf.readUInt16LE(eocd + 10);
-  let cdSize = buf.readUInt32LE(eocd + 12);
-  let cdOffset = buf.readUInt32LE(eocd + 16);
+  const count = tail.readUInt16LE(eocd + 10);
+  const cdSize = tail.readUInt32LE(eocd + 12);
+  const cdOffset = tail.readUInt32LE(eocd + 16);
   if (count === 0xffff || cdSize === UINT32_MAX || cdOffset === UINT32_MAX) {
     const locAt = eocd - 20;
-    if (locAt < 0 || buf.readUInt32LE(locAt) !== 0x07064b50) throw new NotACompanyFileError('damaged ZIP64 directory');
-    const recAt = Number(buf.readBigUInt64LE(locAt + 8));
-    if (buf.readUInt32LE(recAt) !== 0x06064b50) throw new NotACompanyFileError('damaged ZIP64 directory');
-    count = Number(buf.readBigUInt64LE(recAt + 32));
-    cdSize = Number(buf.readBigUInt64LE(recAt + 40));
-    cdOffset = Number(buf.readBigUInt64LE(recAt + 48));
+    if (locAt < 0 || tail.readUInt32LE(locAt) !== 0x07064b50) throw new NotACompanyFileError('damaged ZIP64 directory');
+    return { zip64At: Number(tail.readBigUInt64LE(locAt + 8)) };
   }
-  if (cdOffset + cdSize > buf.length) throw new NotACompanyFileError('the file is incomplete');
+  return { count, cdSize, cdOffset };
+}
+
+function directoryFromZip64(rec) {
+  if (rec.length < 56 || rec.readUInt32LE(0) !== 0x06064b50) throw new NotACompanyFileError('damaged ZIP64 directory');
+  return {
+    count: Number(rec.readBigUInt64LE(32)),
+    cdSize: Number(rec.readBigUInt64LE(40)),
+    cdOffset: Number(rec.readBigUInt64LE(48)),
+  };
+}
+
+/** The central directory's entries: [{ name, method, crc, csize, size, offset }]. */
+function parseCentralEntries(cd, count) {
   const out = [];
-  let p = cdOffset;
+  let p = 0;
   for (let i = 0; i < count; i++) {
-    if (buf.readUInt32LE(p) !== 0x02014b50) throw new NotACompanyFileError('damaged zip directory');
-    const method = buf.readUInt16LE(p + 10);
-    const crc = buf.readUInt32LE(p + 16);
-    let csize = buf.readUInt32LE(p + 20);
-    let size = buf.readUInt32LE(p + 24);
-    const nameLen = buf.readUInt16LE(p + 28);
-    const extraLen = buf.readUInt16LE(p + 30);
-    const commentLen = buf.readUInt16LE(p + 32);
-    let offset = buf.readUInt32LE(p + 42);
-    const name = buf.toString('utf8', p + 46, p + 46 + nameLen);
+    if (p + 46 > cd.length || cd.readUInt32LE(p) !== 0x02014b50) throw new NotACompanyFileError('damaged zip directory');
+    const method = cd.readUInt16LE(p + 10);
+    const crc = cd.readUInt32LE(p + 16);
+    let csize = cd.readUInt32LE(p + 20);
+    let size = cd.readUInt32LE(p + 24);
+    const nameLen = cd.readUInt16LE(p + 28);
+    const extraLen = cd.readUInt16LE(p + 30);
+    const commentLen = cd.readUInt16LE(p + 32);
+    let offset = cd.readUInt32LE(p + 42);
+    if (p + 46 + nameLen + extraLen + commentLen > cd.length) throw new NotACompanyFileError('damaged zip directory');
+    const name = cd.toString('utf8', p + 46, p + 46 + nameLen);
     // ZIP64 extra: replaces the 0xFFFFFFFF fields, in order size, csize, offset.
     let x = p + 46 + nameLen;
     const xEnd = x + extraLen;
     while (x + 4 <= xEnd) {
-      const id = buf.readUInt16LE(x);
-      const len = buf.readUInt16LE(x + 2);
+      const id = cd.readUInt16LE(x);
+      const len = cd.readUInt16LE(x + 2);
       if (id === 0x0001) {
         let q = x + 4;
-        if (size === UINT32_MAX) {
-          size = Number(buf.readBigUInt64LE(q));
+        if (size === UINT32_MAX && q + 8 <= xEnd) {
+          size = Number(cd.readBigUInt64LE(q));
           q += 8;
         }
-        if (csize === UINT32_MAX) {
-          csize = Number(buf.readBigUInt64LE(q));
+        if (csize === UINT32_MAX && q + 8 <= xEnd) {
+          csize = Number(cd.readBigUInt64LE(q));
           q += 8;
         }
-        if (offset === UINT32_MAX) offset = Number(buf.readBigUInt64LE(q));
+        if (offset === UINT32_MAX && q + 8 <= xEnd) offset = Number(cd.readBigUInt64LE(q));
       }
       x += 4 + len;
     }
@@ -456,18 +522,54 @@ function readCentralDirectory(buf) {
   return out;
 }
 
-/** The (still compressed) bytes of one entry. */
-function entryBytes(buf, e) {
-  if (buf.readUInt32LE(e.offset) !== 0x04034b50) throw new NotACompanyFileError(`damaged entry ${e.name}`);
-  const nameLen = buf.readUInt16LE(e.offset + 26);
-  const extraLen = buf.readUInt16LE(e.offset + 28);
-  const start = e.offset + 30 + nameLen + extraLen;
-  if (start + e.csize > buf.length) throw new NotACompanyFileError(`entry ${e.name} is cut short`);
-  return buf.subarray(start, start + e.csize);
+function checkDirectoryBounds(d, size) {
+  if (!Number.isSafeInteger(d.cdOffset) || !Number.isSafeInteger(d.cdSize) || d.cdOffset + d.cdSize > size) {
+    throw new NotACompanyFileError('the file is incomplete');
+  }
 }
 
-async function inflateEntry(buf, e) {
-  const bytes = entryBytes(buf, e);
+/** The central directory of a zip, through a synchronous reader. */
+function readDirectorySync(reader) {
+  const tailStart = Math.max(0, reader.size - TAIL_BYTES);
+  let d = directoryFromTail(reader.read(tailStart, reader.size - tailStart), tailStart, reader.size);
+  if (d.zip64At !== undefined) d = directoryFromZip64(reader.read(d.zip64At, 56));
+  checkDirectoryBounds(d, reader.size);
+  return parseCentralEntries(reader.read(d.cdOffset, d.cdSize), d.count);
+}
+
+/** The central directory of a zip, through an asynchronous reader. */
+async function readDirectory(reader) {
+  const tailStart = Math.max(0, reader.size - TAIL_BYTES);
+  let d = directoryFromTail(await reader.read(tailStart, reader.size - tailStart), tailStart, reader.size);
+  if (d.zip64At !== undefined) d = directoryFromZip64(await reader.read(d.zip64At, 56));
+  checkDirectoryBounds(d, reader.size);
+  return parseCentralEntries(await reader.read(d.cdOffset, d.cdSize), d.count);
+}
+
+/** Parse the central directory of a whole-file buffer: [{ name, method, crc, csize, size, offset }]. */
+function readCentralDirectory(buf) {
+  return readDirectorySync(bufferReader(buf));
+}
+
+/** Where an entry's (still compressed) bytes start, from its local header. */
+function entryDataStart(header, e, size) {
+  if (header.length < 30 || header.readUInt32LE(0) !== 0x04034b50) throw new NotACompanyFileError(`damaged entry ${e.name}`);
+  const start = e.offset + 30 + header.readUInt16LE(26) + header.readUInt16LE(28);
+  if (start + e.csize > size) throw new NotACompanyFileError(`entry ${e.name} is cut short`);
+  return start;
+}
+
+/** The (still compressed) bytes of one entry, read from the file (header and data in one read). */
+async function readEntryBytes(reader, e) {
+  const guess = 30 + Buffer.byteLength(e.name, 'utf8') + 64;
+  const head = await reader.read(e.offset, guess + e.csize);
+  const start = entryDataStart(head, e, reader.size);
+  const rel = start - e.offset;
+  if (rel + e.csize <= head.length) return head.subarray(rel, rel + e.csize);
+  return reader.read(start, e.csize); // a longer local extra field than guessed
+}
+
+async function inflateBytes(bytes, e) {
   let data;
   if (e.method === 0) data = bytes;
   else if (e.method === 8) data = await inflateRaw(bytes);
@@ -489,7 +591,7 @@ function parseManifest(data) {
 
 /**
  * The manifest of a company file, read from the first few kilobytes only (it is the first entry,
- * stored). Falls back to the whole file when it was written by something else. Returns null for
+ * stored). Falls back to the directory when it was written by something else. Returns null for
  * a file that is not a company file (or can't be read).
  */
 function readCompanyManifest(filePath) {
@@ -509,6 +611,14 @@ function readCompanyManifest(filePath) {
         return parseManifest(head.subarray(start, start + csize));
       }
     }
+    // Not where we put it: look it up in the directory (positioned reads: any file size).
+    const reader = syncFileReader(fd, fs.fstatSync(fd).size);
+    const e = readDirectorySync(reader).find((x) => x.name === COMPANY_MANIFEST_ENTRY);
+    if (!e || e.method !== 0) return null;
+    const header = reader.read(e.offset, 30);
+    const start = entryDataStart(header, e, reader.size);
+    const data = reader.read(start, e.csize);
+    return crc32(data) === e.crc ? parseManifest(data) : null;
   } catch {
     return null;
   } finally {
@@ -519,16 +629,6 @@ function readCompanyManifest(filePath) {
         /* ignore */
       }
     }
-  }
-  // Not where we put it: look it up the slow way.
-  try {
-    const buf = fs.readFileSync(filePath);
-    const e = readCentralDirectory(buf).find((x) => x.name === COMPANY_MANIFEST_ENTRY);
-    if (!e || e.method !== 0) return null;
-    const data = entryBytes(buf, e);
-    return crc32(data) === e.crc ? parseManifest(data) : null;
-  } catch {
-    return null;
   }
 }
 
@@ -542,27 +642,8 @@ function isCompanyFile(filePath) {
   return readCompanyManifest(filePath) !== null;
 }
 
-/**
- * Extract a company file into `destDir` (which must not exist or be empty). Every entry is
- * checked against its CRC, names are confined to `destDir`, and nothing is written until the
- * whole directory has been read and verified, so a damaged file never leaves a half-extracted
- * working copy behind. Returns the manifest.
- */
-async function extractCompanyFile(filePath, destDir) {
-  const buf = await fs.promises.readFile(filePath);
-  const list = readCentralDirectory(buf);
-  const manifestEntry = list.find((e) => e.name === COMPANY_MANIFEST_ENTRY);
-  if (!manifestEntry) throw new NotACompanyFileError('no company manifest');
-  const manifest = parseManifest(await inflateEntry(buf, manifestEntry));
-  if (!manifest) throw new NotACompanyFileError('unreadable company manifest');
-  if (Number(manifest.formatVersion) > COMPANY_FILE_FORMAT_VERSION) {
-    const err = new Error(
-      'This company file was saved by a newer version of Ironbooks. Update Ironbooks (Help > Check for Updates) to open it.',
-    );
-    err.code = 'NEWER_FORMAT';
-    throw err;
-  }
-  const root = path.resolve(destDir);
+/** The entries of `list` to extract into `root`: names confined to it, our own manifests left out. */
+function extractionPlan(list, root) {
   const files = [];
   for (const e of list) {
     if (e.name === COMPANY_MANIFEST_ENTRY || e.name === BACKUP_MANIFEST_ENTRY) continue;
@@ -572,77 +653,109 @@ async function extractCompanyFile(filePath, destDir) {
     if (target !== root && !target.startsWith(root + path.sep)) continue;
     files.push({ e, name, target });
   }
-  // Inflate (and verify) everything first.
-  const data = [];
-  for (const f of files) data.push(f.name.endsWith('/') ? null : await inflateEntry(buf, f.e));
+  return files;
+}
+
+/**
+ * Write the planned entries into `root` (which must not exist or be empty), one entry at a time,
+ * each checked against its CRC before it is written. If anything fails — a damaged entry, a full
+ * disk — everything written is removed again, so a damaged file never leaves a half-extracted
+ * folder behind.
+ */
+async function extractInto(reader, files, root, notEmptyMessage) {
+  const existed = fs.existsSync(root);
   fs.mkdirSync(root, { recursive: true });
-  if (fs.readdirSync(root).length) throw new Error(`The working folder is not empty: ${root}`);
-  files.forEach((f, i) => {
-    if (f.name.endsWith('/')) fs.mkdirSync(f.target, { recursive: true });
-    else {
+  if (fs.readdirSync(root).length) throw new Error(`${notEmptyMessage}: ${root}`);
+  try {
+    for (const f of files) {
+      if (f.name.endsWith('/')) {
+        fs.mkdirSync(f.target, { recursive: true });
+        continue;
+      }
+      const data = await inflateBytes(await readEntryBytes(reader, f.e), f.e);
       fs.mkdirSync(path.dirname(f.target), { recursive: true });
-      fs.writeFileSync(f.target, data[i]);
+      fs.writeFileSync(f.target, data);
     }
-  });
-  return manifest;
+  } catch (err) {
+    try {
+      fs.rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+      if (existed) fs.mkdirSync(root, { recursive: true });
+    } catch {
+      /* best effort */
+    }
+    throw err;
+  }
+}
+
+/**
+ * Extract a company file into `destDir` (which must not exist or be empty). Every entry is
+ * checked against its CRC, names are confined to `destDir`, and on any problem nothing is left
+ * behind (a damaged file never leaves a half-extracted working copy). Returns the manifest.
+ */
+async function extractCompanyFile(filePath, destDir) {
+  const reader = await openFileReader(filePath);
+  try {
+    const list = await readDirectory(reader);
+    const manifestEntry = list.find((e) => e.name === COMPANY_MANIFEST_ENTRY);
+    if (!manifestEntry) throw new NotACompanyFileError('no company manifest');
+    const manifest = parseManifest(await inflateBytes(await readEntryBytes(reader, manifestEntry), manifestEntry));
+    if (!manifest) throw new NotACompanyFileError('unreadable company manifest');
+    if (Number(manifest.formatVersion) > COMPANY_FILE_FORMAT_VERSION) {
+      const err = new Error(
+        'This company file was saved by a newer version of Ironbooks. Update Ironbooks (Help > Check for Updates) to open it.',
+      );
+      err.code = 'NEWER_FORMAT';
+      throw err;
+    }
+    const root = path.resolve(destDir);
+    await extractInto(reader, extractionPlan(list, root), root, 'The working folder is not empty');
+    return manifest;
+  } finally {
+    await reader.close();
+  }
 }
 
 /**
  * Extract a full backup (.bka: the database folder plus bookkeeper-manifest.json, the format of
  * lib/services/backup.ts createBackup) into `destDir`, to restore it as a NEW company file
  * (QuickBooks: Open or Restore Company > Restore a backup copy). Same checks as
- * extractCompanyFile (CRCs, confined names, nothing written until everything is verified).
+ * extractCompanyFile (CRCs, confined names, nothing left behind on a problem).
  * Returns { companyName, createdAt }.
  */
 async function extractBackupArchive(filePath, destDir) {
-  const buf = await fs.promises.readFile(filePath);
-  const list = readCentralDirectory(buf);
-  const manifestEntry = list.find((e) => e.name === BACKUP_MANIFEST_ENTRY);
-  let manifest = null;
-  if (manifestEntry) {
-    try {
-      manifest = JSON.parse((await inflateEntry(buf, manifestEntry)).toString('utf8'));
-    } catch {
-      throw new NotACompanyFileError('the backup information in it is unreadable');
+  const reader = await openFileReader(filePath);
+  try {
+    const list = await readDirectory(reader);
+    const manifestEntry = list.find((e) => e.name === BACKUP_MANIFEST_ENTRY);
+    let manifest = null;
+    if (manifestEntry) {
+      try {
+        manifest = JSON.parse((await inflateBytes(await readEntryBytes(reader, manifestEntry), manifestEntry)).toString('utf8'));
+      } catch {
+        throw new NotACompanyFileError('the backup information in it is unreadable');
+      }
+      if (!manifest || manifest.app !== 'bookkeeper-ai') throw new NotACompanyFileError('it is not an Ironbooks backup');
+      if (typeof manifest.formatVersion !== 'number' || manifest.formatVersion > 1) {
+        const err = new Error('This backup was made by a newer version of Ironbooks. Update Ironbooks (Help > Check for Updates) to restore it.');
+        err.code = 'NEWER_FORMAT';
+        throw err;
+      }
+      if (manifest.kind === 'company') {
+        const err = new Error(
+          'This is a backup of one company, not of a whole company file. Open (or create) a company file, then use File > Back Up and Restore > Restore Company.',
+        );
+        err.code = 'COMPANY_BACKUP';
+        throw err;
+      }
+    } else if (!list.some((e) => e.name === 'PG_VERSION')) {
+      throw new NotACompanyFileError('it does not hold a company');
     }
-    if (!manifest || manifest.app !== 'bookkeeper-ai') throw new NotACompanyFileError('it is not an Ironbooks backup');
-    if (typeof manifest.formatVersion !== 'number' || manifest.formatVersion > 1) {
-      const err = new Error('This backup was made by a newer version of Ironbooks. Update Ironbooks (Help > Check for Updates) to restore it.');
-      err.code = 'NEWER_FORMAT';
-      throw err;
-    }
-    if (manifest.kind === 'company') {
-      const err = new Error(
-        'This is a backup of one company, not of a whole company file. Open (or create) a company file, then use File > Back Up and Restore > Restore Company.',
-      );
-      err.code = 'COMPANY_BACKUP';
-      throw err;
-    }
-  } else if (!list.some((e) => e.name === 'PG_VERSION')) {
-    throw new NotACompanyFileError('it does not hold a company');
+    const root = path.resolve(destDir);
+    await extractInto(reader, extractionPlan(list, root), root, 'The folder is not empty');
+    return { companyName: (manifest && manifest.companyName) || null, createdAt: (manifest && manifest.createdAt) || null };
+  } finally {
+    await reader.close();
   }
-  const root = path.resolve(destDir);
-  const files = [];
-  for (const e of list) {
-    if (e.name === BACKUP_MANIFEST_ENTRY || e.name === COMPANY_MANIFEST_ENTRY) continue;
-    const name = safeEntryName(e.name);
-    if (!name || isExcludedPath(name)) continue;
-    const target = path.resolve(root, ...name.split('/').filter(Boolean));
-    if (target !== root && !target.startsWith(root + path.sep)) continue;
-    files.push({ e, name, target });
-  }
-  const data = [];
-  for (const f of files) data.push(f.name.endsWith('/') ? null : await inflateEntry(buf, f.e));
-  fs.mkdirSync(root, { recursive: true });
-  if (fs.readdirSync(root).length) throw new Error(`The folder is not empty: ${root}`);
-  files.forEach((f, i) => {
-    if (f.name.endsWith('/')) fs.mkdirSync(f.target, { recursive: true });
-    else {
-      fs.mkdirSync(path.dirname(f.target), { recursive: true });
-      fs.writeFileSync(f.target, data[i]);
-    }
-  });
-  return { companyName: (manifest && manifest.companyName) || null, createdAt: (manifest && manifest.createdAt) || null };
 }
 
 /** "ABC Company.ironbooks" -> "ABC Company". */

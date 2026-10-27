@@ -27,6 +27,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { sql } from 'drizzle-orm';
 import format from '@/electron/companyFileFormat';
+import lockFormat from '@/electron/companyLock';
 import { closeDb, firstOpenWalPosition, getDb, holdDbOpen, isDbOpen, resolveDataDir, withDamagedFileAccess } from '@/lib/db';
 import { currentFingerprint } from './backupFingerprint';
 import { APP_VERSION } from '@/lib/appVersion';
@@ -94,6 +95,8 @@ interface SaveState {
   status: SaveStatusKind;
   error: string | null;
   conflictCopy: string | null;
+  /** The save this process last wrote into `conflictCopy` (later work goes into the same copy). */
+  conflictSaveId: string | null;
   timer: ReturnType<typeof setInterval> | null;
   closed: boolean;
 }
@@ -134,6 +137,7 @@ function state(): SaveState | null {
     status: 'saved',
     error: null,
     conflictCopy: null,
+    conflictSaveId: null,
     timer: null,
     closed: false,
   };
@@ -265,7 +269,10 @@ function friendlyIoError(err: unknown, file: string): string {
 export async function saveCompanyFile(opts: { force?: boolean; final?: boolean; reason?: string } = {}): Promise<SaveResult> {
   const s = state();
   if (!s) return { saved: false, outcome: 'not-single-file' };
-  if (s.inflight) {
+  // One save at a time: several callers waiting on the same save must not then all start their
+  // own side by side (each would claim to follow the same save, and the file and this working
+  // copy's record of it could end up naming different saves).
+  while (s.inflight) {
     await s.inflight.catch(() => undefined);
     if (!opts.final && !opts.force) return { saved: false, outcome: 'unchanged' };
   }
@@ -333,7 +340,9 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
       });
     }
     const conflict = Boolean(onDisk && baseSaveId && onDisk.saveId !== baseSaveId);
-    const target = conflict ? conflictCopyPath(s.file) : s.file;
+    // After a conflict, later work keeps going into the copy made for it (never a new full copy of
+    // the company file on every autosave check).
+    const target = conflict ? (reusableConflictCopy(s) ?? conflictCopyPath(s.file)) : s.file;
 
     // Consistent snapshot: the LSN first, then the files in this same synchronous turn.
     const lsn = await currentLsn(s);
@@ -379,9 +388,25 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
 
     if (conflict) {
       s.conflictCopy = target;
+      s.conflictSaveId = saveId;
+      // Everything up to this snapshot is safe in the copy: changes are tracked from here on (and
+      // saved into the same copy), and the working copy no longer counts them as unsaved — so the
+      // next open of the company file does not keep them apart a second time.
+      s.savedFingerprint = fingerprint;
+      s.lastSeenFingerprint = fingerprint;
+      s.savedLsn = lsn;
+      s.booksUnsaved = false;
+      s.unsavedSince = null;
+      s.lastSaveMs = Date.now() - started;
+      s.lastSaveEndedAt = Date.now();
       s.status = 'error';
       s.error = `Someone else saved this company file while it was open here, so your changes were saved to a separate copy instead: ${target}. Compare the two before you continue working.`;
-      return { saved: true, outcome: 'conflict', path: target, bytes: result.bytes, durationMs: Date.now() - started };
+      writeWorkingState(s, {
+        unsavedSince: null,
+        conflictCopy: target,
+        ...(opts.final ? { closedCleanly: true, lastUsedAt: savedAt } : {}),
+      });
+      return { saved: true, outcome: 'conflict', path: target, bytes: result.bytes, durationMs: s.lastSaveMs };
     }
 
     s.savedFingerprint = fingerprint;
@@ -421,6 +446,19 @@ function readDesktopManifest(dataDir: string): { passwordProtected?: boolean } |
   }
 }
 
+/**
+ * The copy this process already saved unsaved changes into, when it is still exactly what was
+ * written there: not saved since by anyone else, and not open anywhere (its own lock folder).
+ * Otherwise null: a new copy is made rather than overwriting someone's work.
+ */
+function reusableConflictCopy(s: SaveState): string | null {
+  if (!s.conflictCopy || !s.conflictSaveId) return null;
+  const m = format.readCompanyManifest(s.conflictCopy) as { saveId?: string } | null;
+  if (!m || m.saveId !== s.conflictSaveId) return null;
+  if (fs.existsSync(lockFormat.lockDirFor(s.conflictCopy))) return null;
+  return s.conflictCopy;
+}
+
 function conflictCopyPath(file: string): string {
   const pad = (n: number) => String(n).padStart(2, '0');
   const d = new Date();
@@ -442,7 +480,6 @@ export async function autosaveTick(now = Date.now()): Promise<'idle' | 'waiting'
   const s = state();
   if (!s || s.closed) return 'idle';
   if (s.inflight) return 'busy';
-  if (s.status === 'lost') return 'idle';
   const dataDir = s.dataDir;
   const fp = currentFingerprint(dataDir);
   if (fp !== s.lastSeenFingerprint) {
@@ -460,6 +497,10 @@ export async function autosaveTick(now = Date.now()): Promise<'idle' | 'waiting'
   }
   if (!anyChanged) return 'idle';
   noteUnsaved(s, now, booksChanged);
+  // Another computer has the file now: never save into it, but the changes made here stay
+  // recorded as unsaved (above), so the next open here keeps them as a separate copy instead of
+  // replacing this working copy with the company file.
+  if (s.status === 'lost') return 'idle';
 
   // Don't spend more than about a fifth of the time saving a big file over a slow network.
   if (now - s.lastSaveEndedAt < s.lastSaveMs * 4) return 'waiting';
