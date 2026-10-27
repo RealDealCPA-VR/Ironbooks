@@ -159,6 +159,24 @@ describe('item quantities after the General Ledger import', () => {
   });
 });
 
+describe('list amounts written with a decimal comma', () => {
+  it('a CSV item list saved with ";" and decimal commas is never read 100 times too large', async () => {
+    const ctx = await newCo('Decimal Comma Co');
+    // What Excel writes in a French-Canadian / European locale.
+    const csv = ['Name;Type;Price;Cost;Qty;Value', 'Comma Widget;inventory;12,50;7,25;1,5;10,88', 'Point Widget;inventory;1,250.00;7.25;2;14.50'].join('\n');
+    const r = await importItemsCSV(ctx, csv, { name: 'Name', type: 'Type', salesPrice: 'Price', purchaseCost: 'Cost', quantityOnHand: 'Qty', totalValue: 'Value' });
+    const rows = await db.select().from(items).where(eq(items.companyId, ctx.companyId));
+    const comma = rows.find((i) => i.name === 'Comma Widget')!;
+    expect(comma.salesPrice).not.toBe('1250.00');
+    expect(comma.purchaseCost).not.toBe('725.00');
+    expect(Number(comma.quantityOnHand ?? 0)).not.toBe(15);
+    // Each unreadable amount is reported, not dropped silently.
+    expect(r.issues.filter((i) => i.name === 'Comma Widget' && /12,50|7,25|1,5/.test(i.message)).length).toBeGreaterThanOrEqual(2);
+    const point = rows.find((i) => i.name === 'Point Widget')!;
+    expect([point.salesPrice, point.purchaseCost, Number(point.quantityOnHand)]).toEqual(['1250.00', '7.25', 2]);
+  });
+});
+
 describe('"today" for an item list without an as-of date is the company\'s day', () => {
   it('at 9 pm in New York the opening stock is dated today, not tomorrow (UTC)', async () => {
     const ctx = await newCo('Evening Stock Co');

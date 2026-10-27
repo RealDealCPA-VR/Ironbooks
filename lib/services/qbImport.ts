@@ -774,12 +774,19 @@ export function parseIIF(content: string): ParsedIIF {
 /** Parse an IIF amount string ('1,234.56', '($50.00)', '-50') → 2dp string, or null. */
 export function parseIifAmount(raw: string | undefined): string | null {
   if (raw == null) return null;
-  let s = raw.trim().replace(/[$,]/g, '');
+  let s = raw.trim().replace(/\$/g, '');
   if (!s) return null;
   let negative = false;
   if (s.startsWith('(') && s.endsWith(')')) {
     negative = true;
-    s = s.slice(1, -1);
+    s = s.slice(1, -1).trim();
+  }
+  // A comma only as the US thousands separator (1,250.00). Dropping every comma read a decimal
+  // comma — what Excel writes in a French-Canadian or European locale — 100 times too large
+  // ("12,50" as 1250.00).
+  if (s.includes(',')) {
+    if (!/^[-+]?\d{1,3}(,\d{3})+(\.\d+)?$/.test(s)) return null;
+    s = s.replace(/,/g, '');
   }
   const n = Number(s);
   if (!Number.isFinite(n)) return null;
@@ -2127,8 +2134,13 @@ type ImportedOpening = OpeningStockInput | { error: string } | null;
 
 /** Quantity cell -> decimal string (QNTY is not money: no 2-dp rounding); null = blank, 'bad' = not a number. */
 function parseQuantityCell(raw: string | undefined): string | null | 'bad' {
-  const s = (raw ?? '').trim().replace(/,/g, '');
+  let s = (raw ?? '').trim();
   if (!s) return null;
+  // Thousands separators only in the US form: "1,5" (a decimal comma) is not 15.
+  if (s.includes(',')) {
+    if (!/^\(?-?\d{1,3}(,\d{3})+(\.\d+)?\)?$/.test(s)) return 'bad';
+    s = s.replace(/,/g, '');
+  }
   const neg = /^\(.*\)$/.test(s);
   const body = neg ? s.slice(1, -1) : s;
   if (!/^-?(\d+(\.\d+)?|\.\d+)$/.test(body)) return 'bad';
@@ -2960,7 +2972,18 @@ async function importItemRows(ctx: ServiceContext, rows: Row[], mapping: ItemsCs
       counts.issues.push({ entity: 'item', name: '(blank)', reason: 'validation', message: 'Row has no item name value.' });
       continue;
     }
-    const purchaseCost = parseIifAmount(col('purchaseCost', row)) ?? null;
+    // An amount the file has but that is not a number ("12,50" with a decimal comma) is reported,
+    // never read as something else or dropped without a word.
+    const amountCell = (key: 'salesPrice' | 'purchaseCost', label: string): string | null => {
+      const cell = col(key, row);
+      const v = parseIifAmount(cell);
+      if (cell && v === null) {
+        counts.issues.push({ entity: 'item', name, reason: 'validation', message: `${label} "${cell}" is not an amount (write it like 1,250.00) — left blank.` });
+      }
+      return v;
+    };
+    const purchaseCost = amountCell('purchaseCost', 'Purchase cost');
+    const salesPrice = amountCell('salesPrice', 'Sales price');
     const taxable = col('taxable', row);
     await importItemRow(ctx, counts, lookup, {
       ...(taxable ? { taxable: yes(taxable) } : {}),
@@ -2968,7 +2991,7 @@ async function importItemRows(ctx: ServiceContext, rows: Row[], mapping: ItemsCs
       sku: col('sku', row) || null,
       type: mapIifItemType(col('type', row)),
       description: col('description', row) || null,
-      salesPrice: parseIifAmount(col('salesPrice', row)) ?? null,
+      salesPrice,
       purchaseCost,
       incomeAccountRef: col('incomeAccount', row) || undefined,
       expenseAccountRef: col('expenseAccount', row) || undefined,
