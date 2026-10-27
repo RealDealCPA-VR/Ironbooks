@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { ClipboardList, Plus, ArrowRight, Percent, Pencil } from 'lucide-react';
 import { previewSalesTotals } from '@/lib/salesLineMath';
+import { estimateLineNumbers } from './estimateLines';
 import {
   Button,
   Card,
@@ -542,6 +543,13 @@ export default function EstimatesPage() {
       toast('All lines must have a description', 'danger');
       return;
     }
+    // Quantities and rates as typed (estimateLineNumbers): 0 or text is refused, never saved as 1.
+    const numbers = addForm.lines.map((l, i) => estimateLineNumbers(l, i + 1));
+    const bad = numbers.find((x): x is { error: string } => 'error' in x);
+    if (bad) {
+      toast(bad.error, 'danger');
+      return;
+    }
 
     setAddSaving(true);
     try {
@@ -553,12 +561,11 @@ export default function EstimatesPage() {
         expirationDate: addForm.expirationDate || null,
         taxRateId: addForm.taxRateId || null,
         memo: addForm.memo || null,
-        lines: addForm.lines.map((l) => ({
+        lines: addForm.lines.map((l, i) => ({
           itemId: l.itemId || null,
           description: l.description.trim(),
-          quantity: parseFloat(l.quantity) || 1,
           // Blank rate on an item line: the server prices it (advanced pricing).
-          rate: l.rate.trim() === '' ? (l.itemId ? null : 0) : parseFloat(l.rate) || 0,
+          ...(numbers[i] as { quantity: string; rate: string | number | null }),
           taxable: l.taxable,
           classId: l.classId || null,
         })),

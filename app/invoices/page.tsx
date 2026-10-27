@@ -1003,7 +1003,8 @@ function InvoiceModal({
 
     if (!editing) payload.status = saveAsPending ? 'draft' : 'open';
     // Invoice # on new AND edited invoices (QB lets you retype it; a duplicate asks first).
-    if (refNumber.trim()) payload.refNumber = refNumber.trim();
+    // A typed number (an untouched suggested number is left to the server: docNumberPayload).
+    if (invNumber.payload) payload.refNumber = invNumber.payload;
     if (allowDuplicateNumber) payload.allowDuplicateNumber = true;
     const retPct = parseFloat(retainagePercent);
     if (retainagePercent.trim() && (!Number.isFinite(retPct) || retPct < 0 || retPct > 100)) {

@@ -21,6 +21,11 @@ export interface FixRunContext<P> {
   resubmit: (patched: P) => Promise<unknown>;
   prepare?: (body: P) => P;
   applyToForm?: (patched: P, fix: ErrorFix) => void;
+  /**
+   * The form was changed after the error was shown. A fix re-sends the body that failed (patched),
+   * so it would save the old form and drop the later changes; it is not run then.
+   */
+  isStale?: () => boolean;
 }
 
 export interface FixRunDeps<P> {
@@ -30,15 +35,21 @@ export interface FixRunDeps<P> {
   onSaved: () => void;
   /** The retry failed: show the new error; `payload` is the body the server saw. */
   onError: (err: unknown, payload: P) => void;
+  /** The form changed since the error (isStale): nothing was sent; ask for a fresh save. */
+  onStale?: () => void;
 }
 
-export type FixRunOutcome = 'navigated' | 'saved' | 'failed' | 'ignored';
+export type FixRunOutcome = 'navigated' | 'saved' | 'failed' | 'ignored' | 'stale';
 
 export async function runFix<P>(fix: ErrorFix, ctx: FixRunContext<P>, deps: FixRunDeps<P>): Promise<FixRunOutcome> {
   if (fix.kind === 'navigate') {
     if (!fix.href) return 'ignored';
     deps.navigate(fix.href);
     return 'navigated';
+  }
+  if (ctx.isStale?.()) {
+    deps.onStale?.();
+    return 'stale';
   }
   const { patched, sent } = retryPayloads(ctx.payload, fix.patch, ctx.prepare);
   ctx.applyToForm?.(patched, fix);

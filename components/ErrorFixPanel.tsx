@@ -30,13 +30,16 @@
 import * as React from 'react';
 import { useRouter } from 'next/navigation';
 import { Wrench, X } from 'lucide-react';
-import { Button, toastError } from '@/components/ui';
+import { Button, toast, toastError } from '@/components/ui';
+import { fieldSnapshot } from '@/components/TransactionNav';
 import { errorFixes } from '@/lib/client';
 import { type ErrorFix } from '@/lib/errorFixes';
 import { reportMode, runFix } from '@/lib/errorFixFlow';
 import { describeError, type FriendlyError } from '@/lib/friendlyErrors';
 
 export interface ErrorFixPanelProps {
+  /** Receives the panel's element (the form it sits in is the one the fixes apply to). */
+  panelRef?: React.Ref<HTMLDivElement>;
   /** Plain-language description of the problem. */
   problem: Pick<FriendlyError, 'title' | 'message' | 'nextStep'>;
   fixes: ErrorFix[];
@@ -48,9 +51,10 @@ export interface ErrorFixPanelProps {
 }
 
 /** Presentational: the message plus one button per fix. Accessible (role="alert", labelled buttons). */
-export function ErrorFixPanel({ problem, fixes, busyId, onFix, onDismiss, className }: ErrorFixPanelProps) {
+export function ErrorFixPanel({ panelRef, problem, fixes, busyId, onFix, onDismiss, className }: ErrorFixPanelProps) {
   const titleId = React.useId();
   const ref = React.useRef<HTMLDivElement>(null);
+  React.useImperativeHandle(panelRef, () => ref.current as HTMLDivElement);
   React.useEffect(() => {
     ref.current?.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' });
   }, [problem.message]);
@@ -105,6 +109,11 @@ export function ErrorFixPanel({ problem, fixes, busyId, onFix, onDismiss, classN
   );
 }
 
+/** The form a fix panel belongs to: its dialog, form or shortcut scope, else the page. */
+function fixScope(el: HTMLElement): HTMLElement | null {
+  return (el.closest('[role="dialog"], form, [data-shortcut-scope]') as HTMLElement | null) ?? el.closest('main');
+}
+
 export interface FixContext<P> {
   /** The request body that failed. Fix patches apply to it. */
   payload: P;
@@ -135,6 +144,18 @@ export function useErrorFixes<P>(opts: { panel?: boolean } = {}) {
   const [busyId, setBusyId] = React.useState<string | null>(null);
   const stateRef = React.useRef<FixState<P> | null>(null);
   stateRef.current = state;
+  // The form's fields when the error was shown (components/TransactionNav.tsx fieldSnapshot): a Fix
+  // re-sends the body that failed, so after the user changed the form it would save the OLD
+  // form — the later changes silently dropped while the form closed as saved.
+  const panelEl = React.useRef<HTMLDivElement | null>(null);
+  const shownWith = React.useRef<string | null>(null);
+  React.useEffect(() => {
+    shownWith.current = state && panelEl.current ? fieldSnapshot(fixScope(panelEl.current)) : null;
+  }, [state]);
+  const isStale = React.useCallback(
+    () => shownWith.current !== null && !!panelEl.current && fieldSnapshot(fixScope(panelEl.current)) !== shownWith.current,
+    [],
+  );
 
   const clear = React.useCallback(() => {
     setState(null);
@@ -179,20 +200,25 @@ export function useErrorFixes<P>(opts: { panel?: boolean } = {}) {
     async (fix: ErrorFix) => {
       const cur = stateRef.current;
       if (!cur) return;
-      await runFix(fix, cur.ctx, {
+      await runFix(fix, { ...cur.ctx, isStale }, {
         navigate: (href) => router.push(href),
         setBusy: setBusyId,
         onSaved: () => setState(null),
+        onStale: () => {
+          setState(null);
+          toast('You changed the form after this message, so nothing was saved yet. Save again — the message comes back if it still applies.', 'info');
+        },
         // Report against the body the server actually saw, so its patch indexes match.
         onError: (err, sent) => report(err, { ...cur.ctx, payload: sent }),
       });
     },
-    [router, report],
+    [router, report, isStale],
   );
   applyRef.current = (fix) => void apply(fix);
 
   const panel = state && hasPanel ? (
     <ErrorFixPanel
+      panelRef={panelEl}
       className="mb-4"
       problem={state.problem}
       fixes={state.fixes}

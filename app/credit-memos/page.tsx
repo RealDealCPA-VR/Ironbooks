@@ -32,6 +32,7 @@ import {
   BarcodeScanInput,
   InventoryLineFields,
   type InvDetail,
+  invFromLine,
   inventoryLinePayload,
   useAdvancedInventory,
 } from '@/components/inventory/AdvancedInventory';
@@ -102,6 +103,12 @@ interface CreditMemoDetail extends CreditMemo {
     rate: string;
     taxable?: boolean;
     restock?: boolean;
+    // Advanced Inventory detail (present only when stored for the line)
+    siteId?: string | null;
+    binId?: string | null;
+    serialNumbers?: string[] | null;
+    lotNumber?: string | null;
+    lotExpiration?: string | null;
   }>;
   applications: Array<{ id: string; invoiceId: string; invoiceNumber: number; invoiceRef?: string | null; amount: string; paymentId: string | null }>;
 }
@@ -234,6 +241,9 @@ function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCr
           restock: l.restock !== false,
           // Saved prices stay as they are; the badge still offers the current quote.
           rateManual: true,
+          // Where the returned stock went back to (site / bin / serials / lot): an edit re-posts
+          // the memo, and a line sent without them was restocked into the default site instead.
+          inv: invFromLine(l),
         })),
       );
       return;

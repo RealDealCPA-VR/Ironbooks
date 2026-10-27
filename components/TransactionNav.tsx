@@ -38,8 +38,8 @@ export interface TransactionNavProps {
 
 const FIELDS = 'input:not([type="hidden"]):not([type="file"]), select, textarea';
 
-/** The form's field values, in page order, as one string. */
-function fieldSnapshot(scope: HTMLElement | null): string {
+/** The form's field values, in page order, as one string (also used by components/ErrorFixPanel). */
+export function fieldSnapshot(scope: HTMLElement | null): string {
   if (!scope) return '';
   return Array.from(scope.querySelectorAll<HTMLInputElement>(FIELDS))
     .filter((el) => !el.closest('[data-nav-ignore]'))

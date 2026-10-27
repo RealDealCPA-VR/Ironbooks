@@ -47,6 +47,11 @@ import { transferAccounts } from '../app/transfers/transferAccounts';
 import { creditItems, rowsOf } from '../app/vendor-credits/lists';
 import { checkNumberSeries, nextCheckNumber } from '../app/print-checks/checkNumbers';
 import { emptyPayForm } from '../app/pay-liabilities/payForm';
+import { docNumberPayload } from '../components/sales/DocNumberField';
+import { estimateLineNumbers } from '../app/estimates/estimateLines';
+import { runFix } from './errorFixFlow';
+import type { ErrorFix } from './errorFixes';
+import { invFromLine } from '../components/inventory/AdvancedInventory';
 import { compareDocNumbers } from '../components/TransactionNav';
 import { importableRows, reviewedPayload, statementAmount } from '../components/StatementReview';
 
@@ -362,7 +367,7 @@ describe('Make Deposits', () => {
       { id: 'ar', code: '1100', name: 'Accounts Receivable', type: 'asset', subtype: 'accounts_receivable' },
       { id: 'inv', code: '1300', name: 'Inventory Asset', type: 'asset', subtype: 'inventory' },
       { id: 'pc', code: '1400', name: 'Petty Cash', type: 'asset', subtype: 'other_current_asset' },
-      { id: 'fa', code: '1500', name: 'Truck', type: 'asset', subtype: 'fixed_asset' },
+      { id: 'fa', code: '1500', name: 'Truck', type: 'asset', subtype: 'fixed_assets' },
     ];
     expect(depositToAccounts(accounts).map((a) => a.id)).toEqual(['chk', 'sav', 'pc']);
     expect(read('app/deposits/page.tsx')).not.toContain("accounts.filter((a) => a.type === 'asset' && a.code !== '1050')");
@@ -615,5 +620,100 @@ describe('Enter Bill for Received Items', () => {
     const src = read('app/receive-bill/page.tsx');
     expect(src).toContain('const mine = ++previewSeq.current;');
     expect(src.match(/if \(mine !== previewSeq\.current\) return;/g)?.length).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Document numbers with two people entering at once
+// ---------------------------------------------------------------------------
+
+describe('document numbers: an untouched suggested number is allocated by the server', () => {
+  it('the number suggested when the form opened is not sent; a typed one is', () => {
+    expect(docNumberPayload('INV-1005', 'INV-1005')).toBeUndefined(); // server allocates under its lock
+    expect(docNumberPayload(' INV-1005 ', 'INV-1005')).toBeUndefined();
+    expect(docNumberPayload('INV-2000', 'INV-1005')).toBe('INV-2000');
+    expect(docNumberPayload('', 'INV-1005')).toBeUndefined();
+    expect(docNumberPayload('1042', null)).toBe('1042'); // editing: the saved number is kept
+    // The server's own allocation (no number given) runs inside the save under an advisory lock:
+    expect(read('lib/services/docNumbers.ts')).toContain('pg_advisory_xact_lock');
+    // The invoice form sends only a typed number.
+    const src = read('app/invoices/page.tsx');
+    expect(src).not.toContain('if (refNumber.trim()) payload.refNumber = refNumber.trim();');
+    expect(src).toContain('if (invNumber.payload) payload.refNumber = invNumber.payload;');
+  });
+});
+
+describe('estimate lines are saved as typed', () => {
+  it('a quantity of 0 or text is refused, never saved as 1; a blank quantity is 1', () => {
+    expect(estimateLineNumbers({ quantity: '0', rate: '50', itemId: '' }, 2)).toEqual({ error: 'Line 2: the quantity must be a number more than zero.' });
+    expect(estimateLineNumbers({ quantity: 'abc', rate: '50', itemId: '' }, 1)).toHaveProperty('error');
+    expect(estimateLineNumbers({ quantity: '', rate: '50', itemId: '' }, 1)).toEqual({ quantity: '1', rate: '50' });
+    expect(estimateLineNumbers({ quantity: '.5', rate: '12.', itemId: '' }, 1)).toEqual({ quantity: '0.5', rate: '12' });
+    expect(estimateLineNumbers({ quantity: '2', rate: '12abc', itemId: '' }, 1)).toHaveProperty('error');
+    expect(estimateLineNumbers({ quantity: '2', rate: '', itemId: 'item-1' }, 1)).toEqual({ quantity: '2', rate: null });
+    expect(estimateLineNumbers({ quantity: '1', rate: '-5', itemId: 'disc' }, 1)).toEqual({ quantity: '1', rate: '-5' });
+    // What the form used to send for a quantity of 0:
+    expect(parseFloat('0') || 1).toBe(1);
+    expect(read('app/estimates/page.tsx')).not.toContain('quantity: parseFloat(l.quantity) || 1');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fix buttons after the form was changed
+// ---------------------------------------------------------------------------
+
+describe('Fix buttons never save an older version of the form', () => {
+  const fix: ErrorFix = {
+    id: 'docnum-keep',
+    kind: 'patch',
+    label: 'Keep it anyway',
+    patch: [{ op: 'set', path: 'allowDuplicateNumber', value: true }],
+  };
+  const payload = { refNumber: 'INV-1', lines: [{ quantity: '1', rate: '100' }] };
+
+  it('a fix is not run when the form changed since the error; nothing is sent', async () => {
+    const resubmit = vi.fn().mockResolvedValue(undefined);
+    const applyToForm = vi.fn();
+    const onStale = vi.fn();
+    const deps = { navigate: vi.fn(), setBusy: vi.fn(), onSaved: vi.fn(), onError: vi.fn(), onStale };
+    // The user changed line 1 to 250 after "Number already used" appeared, then clicked the fix:
+    const out = await runFix(fix, { payload, resubmit, applyToForm, isStale: () => true }, deps);
+    expect(out).toBe('stale');
+    expect(resubmit).not.toHaveBeenCalled(); // the old body (rate 100) would have been saved
+    expect(applyToForm).not.toHaveBeenCalled();
+    expect(onStale).toHaveBeenCalledTimes(1);
+  });
+
+  it('an unchanged form runs the fix as before', async () => {
+    const resubmit = vi.fn().mockResolvedValue(undefined);
+    const deps = { navigate: vi.fn(), setBusy: vi.fn(), onSaved: vi.fn(), onError: vi.fn() };
+    expect(await runFix(fix, { payload, resubmit, isStale: () => false }, deps)).toBe('saved');
+    expect(resubmit).toHaveBeenCalledTimes(1);
+  });
+
+  it('the fix panel compares the form with how it was when the error was shown', () => {
+    const src = read('components/ErrorFixPanel.tsx');
+    expect(src).toContain('runFix(fix, { ...cur.ctx, isStale }');
+    expect(src).toContain('fieldSnapshot(fixScope(panelEl.current))');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Advanced Inventory detail kept through an edit
+// ---------------------------------------------------------------------------
+
+describe('editing a sales receipt or credit memo keeps each line’s site / bin / serials / lot', () => {
+  it('the saved detail is loaded into the line and sent back with the edit', () => {
+    // The services re-post the document from what the edit sends (no carry-forward), so a line
+    // without its detail was relieved from / restocked into the default site, serials dropped.
+    expect(read('lib/services/salesReceipts.ts')).not.toMatch(/sourceType: 'sales_receipt',[\s\S]{0,200}carryForward/);
+    for (const page of ['app/sales-receipts/page.tsx', 'app/credit-memos/page.tsx']) {
+      const src = read(page);
+      expect(src).toContain('inv: invFromLine(l),');
+      expect(src).toContain('inventoryLinePayload(l.inv)');
+    }
+    expect(invFromLine({ siteId: 'east', binId: null, serialNumbers: ['SN1'], lotNumber: null })).toEqual(
+      expect.objectContaining({ siteId: 'east', serialNumbers: ['SN1'] }),
+    );
   });
 });

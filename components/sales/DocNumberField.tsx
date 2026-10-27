@@ -31,11 +31,28 @@ export function docNo(refNumber: string | null | undefined, legacy: number | str
   return legacy === null || legacy === undefined ? '' : String(legacy);
 }
 
+/**
+ * The number to send with a save: the typed number, or undefined — the server then allocates the
+ * next number itself, inside the save, under its per-company lock (lib/services/docNumbers.ts
+ * allocateDocNumber). The number suggested when the form opened is NOT sent while it is
+ * untouched: with two people entering invoices, both forms showed INV-1005, and the second save
+ * was refused as "Number already used" (or, on "Keep this number", saved a duplicate) instead of
+ * simply getting INV-1006 as QB's next number would.
+ */
+export function docNumberPayload(value: string, suggested: string | null): string | undefined {
+  const v = value.trim();
+  if (!v) return undefined;
+  return suggested !== null && v === suggested.trim() ? undefined : v;
+}
+
 export function useDocNumber(docType: DocNumberType, open: boolean, editingRef: string | null | undefined) {
   const [value, setValue] = React.useState('');
+  /** The next number the form was pre-filled with (null when editing or not loaded). */
+  const [suggested, setSuggested] = React.useState<string | null>(null);
   const editing = editingRef !== undefined && editingRef !== null;
   React.useEffect(() => {
     if (!open) return;
+    setSuggested(null);
     if (editing) {
       setValue(editingRef ?? '');
       return;
@@ -45,7 +62,10 @@ export function useDocNumber(docType: DocNumberType, open: boolean, editingRef: 
     api
       .get<{ nextNumber: string }>(`/api/doc-numbers?docType=${docType}`)
       .then((r) => {
-        if (!cancelled) setValue((v) => (v ? v : r.nextNumber ?? ''));
+        if (cancelled) return;
+        const next = r.nextNumber ?? '';
+        setSuggested(next);
+        setValue((v) => (v ? v : next)); // keep a number the user typed already
       })
       .catch(() => {
         // Non-fatal: a blank number still gets the next number on save.
@@ -55,8 +75,8 @@ export function useDocNumber(docType: DocNumberType, open: boolean, editingRef: 
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, docType, editingRef]);
-  /** Request-body value: trimmed, or undefined when blank (server assigns the next number). */
-  const payload = value.trim() ? value.trim() : undefined;
+  /** Request-body value: the typed number, or undefined (server assigns the next number). */
+  const payload = docNumberPayload(value, editing ? null : suggested);
   return { value, setValue, payload };
 }
 
