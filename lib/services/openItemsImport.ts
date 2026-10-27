@@ -66,8 +66,11 @@ import { apAging, arAging } from './reportsExtra';
 import { createVendor } from './vendors';
 import { createVendorCredit } from './vendorCredits';
 import { type GridRow, loadGrid } from './qbGlFiles';
-import { parseAmount, parseQbDate } from './qbGlParse';
+import { isDecimalCommaAmount, parseAmount, parseQbDate } from './qbGlParse';
 import type { IIFTransaction, ImportIssue } from './qbImport';
+import { importRowError } from './qbImportErrors';
+import { withImportLock } from './importLock';
+import { customerKey, customerKeyIndex } from './qbNameResolver';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -103,6 +106,12 @@ export interface OpenItem {
   qbTotal?: string | null;
   /** Date of the newest payment / credit / charge in this file applied to the item. */
   changeDate?: string | null;
+  /**
+   * 1, 2, … for the 2nd, 3rd, … item of a file identical to an earlier one (same kind, name,
+   * number, date and amount: two same-day statement charges, two unapplied payments). Part of
+   * the duplicate tag, so each is brought in once, and only once on a re-import.
+   */
+  occurrence?: number;
 }
 
 export interface ParsedOpenItems {
@@ -261,6 +270,11 @@ export function parseOpenItemsGrid(rows: GridRow[], forceSide?: LedgerSide | nul
       continue;
     }
     if (/^total\b/i.test(typeCell)) continue;
+    if (isDecimalCommaAmount(cells[amountCol])) {
+      throw validation(
+        `"${(cells[amountCol] ?? '').trim()}" is written with a decimal comma, so the report can't be read reliably. Export it from QuickBooks again (Excel .xlsx, or CSV without re-saving it in Excel).`,
+      );
+    }
     const amt = parseAmount(cells[amountCol]);
     if (amt === null || amt.isZero()) continue;
     const date = parseQbDate(cells[col.date]);
@@ -312,28 +326,59 @@ function decodeFile(f: OpenItemsFile): Uint8Array {
 /** Read the open items from the uploaded report (xlsx / csv / pdf) or the typed-in list. */
 export async function loadOpenItems(input: Pick<OpenItemsInput, 'file' | 'items' | 'side'>): Promise<ParsedOpenItems> {
   if (input.items && input.items.length) {
-    const side: LedgerSide = input.side ?? (input.items.every((i) => i.kind === 'bill' || i.kind === 'vendor_credit') ? 'ap' : 'ar');
-    for (const it of input.items) {
-      if (!it.name?.trim()) throw validation('Every balance needs a customer or vendor name.');
-      if (!parseQbDate(it.date)) throw validation(`"${it.date}" is not a valid date.`);
-      let a;
-      try {
-        a = Money.of(it.openBalance);
-      } catch {
-        throw validation(`"${it.openBalance}" is not a valid amount.`);
+    // Typed-in balances arrive straight from the request body: check every field's type before
+    // using it (a JSON number as the invoice number or name must be a 400, never a TypeError).
+    const text = (v: unknown, what: string, max: number): string | null => {
+      if (v === undefined || v === null || v === '') return null;
+      if (typeof v !== 'string' && typeof v !== 'number') throw validation(`${what} must be text.`);
+      const s = String(v).trim();
+      if (s.length > max) throw validation(`${what} "${s.slice(0, 40)}…" is longer than ${max} characters.`);
+      return s || null;
+    };
+    const rows = input.items.map((raw) => {
+      if (!raw || typeof raw !== 'object') throw validation('Each balance must be an object.');
+      const it = raw as unknown as Record<string, unknown>;
+      const name = text(it.name, 'The name', 255);
+      if (!name) throw validation('Every balance needs a customer or vendor name.');
+      const dateText = text(it.date, 'The date', 30);
+      const date = parseQbDate(dateText);
+      if (!date) throw validation(`"${dateText ?? ''}" is not a valid date.`);
+      const dueText = text(it.dueDate, 'The due date', 30);
+      const dueDate = dueText ? parseQbDate(dueText) : null;
+      if (dueText && !dueDate) throw validation(`"${dueText}" is not a valid due date.`);
+      // QuickBooks-style amounts: "1,234.56", "$1,234.56", "(25.00)". A comma only as the US
+      // thousands separator: parseAmount drops every comma, so a decimal comma ("12,50",
+      // "1 250,00") read as 1,250.00 / 125,000.00.
+      const amountText = text(it.openBalance, 'The amount', 40) ?? '';
+      const digits = amountText.replace(/[\s$()+-]/g, '');
+      if (digits.includes(',') && !/^\d{1,3}(,\d{3})+(\.\d+)?$/.test(digits)) {
+        throw validation(`"${amountText}" is not an amount. Write amounts like 1,250.00 (a point before the cents).`);
       }
+      const a = parseAmount(amountText);
+      if (!a) throw validation(`"${amountText}" is not a valid amount.`);
       // Validate the value that will actually be stored (rounded to cents): 0.001 rounds to 0.00.
       // Decimal(0).isPositive() is true in decimal.js — compare explicitly.
-      if (!a.isFinite() || !Money.round2(a).greaterThan(0)) throw validation('Amounts must be at least 0.01.');
-      if (Money.round2(a).greaterThan(MAX_LEDGER_AMOUNT)) throw validation(`"${it.openBalance}" is larger than the books can hold.`);
-      const okKind = side === 'ar' ? ['invoice', 'credit_memo'] : ['bill', 'vendor_credit'];
-      if (!okKind.includes(it.kind)) throw validation('Mixing customer and vendor balances in one import is not allowed.');
-    }
-    return {
-      side,
-      items: input.items.map((i) => ({ ...i, date: parseQbDate(i.date)!, openBalance: toAmountString(i.openBalance), dueDate: i.dueDate ? parseQbDate(i.dueDate) : null })),
-      warnings: [],
-    };
+      if (!Money.round2(a).greaterThan(0)) throw validation('Amounts must be at least 0.01.');
+      if (Money.round2(a).greaterThan(MAX_LEDGER_AMOUNT)) throw validation(`"${amountText}" is larger than the books can hold.`);
+      const kind = it.kind as OpenItemKind;
+      if (!['invoice', 'credit_memo', 'bill', 'vendor_credit'].includes(kind)) throw validation('Each balance needs a kind (invoice, credit, bill or vendor credit).');
+      const item: OpenItem = {
+        kind,
+        name,
+        date,
+        dueDate,
+        number: text(it.number, 'The number', 50),
+        qbType: text(it.qbType, 'The type', 100),
+        terms: text(it.terms, 'The terms', 100),
+        memo: text(it.memo, 'The memo', 1000),
+        openBalance: toAmountString(a),
+      };
+      return item;
+    });
+    const side: LedgerSide = input.side ?? (rows.every((i) => i.kind === 'bill' || i.kind === 'vendor_credit') ? 'ap' : 'ar');
+    const okKind = side === 'ar' ? ['invoice', 'credit_memo'] : ['bill', 'vendor_credit'];
+    if (rows.some((it) => !okKind.includes(it.kind))) throw validation('Mixing customer and vendor balances in one import is not allowed.');
+    return { side, items: numberOccurrences(side, rows), warnings: [] };
   }
   if (!input.file) throw validation('Choose a report file or enter the balances.');
   const bytes = decodeFile(input.file);
@@ -344,7 +389,9 @@ export async function loadOpenItems(input: Pick<OpenItemsInput, 'file' | 'items'
   let lastErr: unknown = null;
   for (const sheet of loaded.sheets) {
     try {
-      return parseOpenItemsGrid(sheet.rows, input.side);
+      const parsed = parseOpenItemsGrid(sheet.rows, input.side);
+      numberOccurrences(parsed.side, parsed.items);
+      return parsed;
     } catch (err) {
       lastErr = err;
     }
@@ -438,13 +485,33 @@ export async function ensureConversionAccount(ctx: ServiceContext, alreadyInGl: 
 // Names
 // ---------------------------------------------------------------------------
 
-async function nameIndex(ctx: ServiceContext, side: LedgerSide) {
+/** A name → id map whose keys are normalised on every get / has / set. */
+class NameMap extends Map<string, string> {
+  constructor(private readonly keyOf: (name: string) => string) {
+    super();
+  }
+  override get(name: string) {
+    return super.get(this.keyOf(name));
+  }
+  override has(name: string) {
+    return super.has(this.keyOf(name));
+  }
+  override set(name: string, id: string) {
+    return super.set(this.keyOf(name), id);
+  }
+}
+
+async function nameIndex(ctx: ServiceContext, side: LedgerSide): Promise<Map<string, string>> {
   if (side === 'ar') {
     const rows = await ctx.db
-      .select({ id: customersTable.id, name: customersTable.displayName })
+      .select({ id: customersTable.id, displayName: customersTable.displayName, parentId: customersTable.parentId })
       .from(customersTable)
       .where(eq(customersTable.companyId, ctx.companyId));
-    return new Map(rows.map((r) => [r.name.trim().toLowerCase(), r.id]));
+    // By display name and full "Customer:Job" path: a job set up in Ironbooks ("Job 1" under "Acme
+    // Corp") is "Acme Corp:Job 1" on the QuickBooks report, never a second customer.
+    const map = new NameMap(customerKey);
+    for (const [k, id] of customerKeyIndex(rows)) map.set(k, id);
+    return map;
   }
   const rows = await ctx.db
     .select({ id: vendorsTable.id, name: vendorsTable.displayName })
@@ -483,9 +550,27 @@ async function ensureName(ctx: ServiceContext, side: LedgerSide, index: Map<stri
 // Duplicate tags
 // ---------------------------------------------------------------------------
 
+function itemKey(side: LedgerSide, it: OpenItem): string {
+  return [side, it.kind, canonicalName(it.name).toLowerCase(), it.number ?? '', it.date, toAmountString(it.openBalance)].join('|');
+}
+
 function itemTag(side: LedgerSide, it: OpenItem): string {
-  const key = [side, it.kind, canonicalName(it.name).toLowerCase(), it.number ?? '', it.date, toAmountString(it.openBalance)].join('|');
+  // The first of identical items keeps the original tag (files imported before still match).
+  const key = itemKey(side, it) + (it.occurrence ? `|#${it.occurrence}` : '');
   return `qbopen:${createHash('sha256').update(key).digest('hex').slice(0, 16)}`;
+}
+
+/** Number identical items in file order (see OpenItem.occurrence). */
+function numberOccurrences(side: LedgerSide, items: OpenItem[]): OpenItem[] {
+  const seen = new Map<string, number>();
+  for (const it of items) {
+    if (it.docKey) continue;
+    const k = itemKey(side, it);
+    const n = seen.get(k) ?? 0;
+    seen.set(k, n + 1);
+    if (n > 0) it.occurrence = n;
+  }
+  return items;
 }
 
 async function tagExists(ctx: ServiceContext, kind: OpenItemKind, tag: string): Promise<boolean> {
@@ -808,7 +893,7 @@ async function convertOne(ctx: ServiceContext, env: ConvertEnv, it: OpenItem, qb
       await postJournalEntry(tx, {
         date,
         description: `QuickBooks conversion offset — ${desc}`,
-        reference: it.number ?? null,
+        reference: it.number ? it.number.slice(0, 100) : null,
         sourceRef: `qbopen-offset:${tag}`,
         lines: controlDebit
           ? [
@@ -890,7 +975,10 @@ async function runConversion(ctx: ServiceContext, side: LedgerSide, items: OpenI
   for (const { item: it, docTag: qbdoc } of plan) {
     const label = labelOf(it);
     try {
-      const r = await convertOne(ctx, env, it, qbdoc).catch((err) => {
+      const r = await convertOne(ctx, env, it, qbdoc).catch((caught) => {
+        // A value the database cannot hold (a 120-character bill number, a 300-character name)
+        // is this row's problem, like any validation error — never a 500 halfway through.
+        const err = importRowError(caught) ?? caught;
         if (qbdoc && err instanceof ServiceError) failedTags.add(qbdoc);
         throw err;
       });
@@ -937,7 +1025,9 @@ async function runConversion(ctx: ServiceContext, side: LedgerSide, items: OpenI
 export async function importOpenItems(ctx: ServiceContext, input: OpenItemsInput): Promise<OpenItemsResult> {
   const parsed = await loadOpenItems(input);
   if (!parsed.items.length) throw validation('No open balances were found in this file.');
-  const result = await runConversion(ctx, parsed.side, parsed.items, input);
+  // One import at a time per company (importLock.ts): two runs at once both created Opening
+  // Balance Equity / the clearing account, and could both pass the duplicate-tag check.
+  const result = await withImportLock(ctx, () => runConversion(ctx, parsed.side, parsed.items, input));
   for (const w of parsed.warnings) result.issues.push({ entity: parsed.side === 'ar' ? 'invoice' : 'bill', name: 'Report', reason: 'note', message: w });
   // A bulk load: fresh planner statistics (PGlite has no autovacuum; best-effort).
   await refreshPlannerStats(ctx.db, 'open items import');
@@ -1214,7 +1304,7 @@ export async function importOpenItemsFromIif(
     // Stand-ins of documents already reported above are not counted or reported twice.
     const dups = r.issues.filter((i) => i.reason === 'duplicate').length;
     out.skipped += r.skipped - dups;
-    out.issues.push(...r.issues.filter((i) => i.reason !== 'duplicate'));
+    for (const i of r.issues) if (i.reason !== 'duplicate') out.issues.push(i); // never spread: one per document
   }
   return out;
 }

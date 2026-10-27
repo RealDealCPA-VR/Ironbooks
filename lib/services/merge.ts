@@ -497,6 +497,20 @@ async function repointJournalNames(
 // mergeAccounts
 // ---------------------------------------------------------------------------
 
+/**
+ * Accounts the posting services find by their NUMBER (accountIdByCode / eq(accounts.code, …)):
+ * invoices / credit memos / receipts (1200 A/R, 4000 income fallback), bills / bill payments /
+ * vendor credits (2000 A/P), payments and deposits (1050 Undeposited Funds), retainage (1250),
+ * inventory (1300 Inventory Asset, 5000 COGS), item receipts (2050 accrual), sales tax (2200),
+ * payroll (2300, 6500, 6510, and 1000 as the fallback bank), fiscal close (3900 Retained
+ * Earnings), realized exchange gain/loss (6900). Merged away, such an account is deactivated
+ * but keeps receiving every new posting — hidden, and split from the survivor again — so it
+ * must be the account that is kept.
+ */
+const CODE_POSTED_ACCOUNTS = new Set([
+  '1000', '1050', '1200', '1250', '1300', '2000', '2050', '2200', '2300', '3900', '4000', '5000', '6500', '6510', '6900',
+]);
+
 export interface MergeAccountsInput {
   /** The duplicate GL account to fold away — will be deactivated with a zero balance. */
   fromId: string;
@@ -570,6 +584,11 @@ export async function mergeAccounts(
   // reconciliation, Home Currency Adjustment read them); QB only merges accounts in the same
   // currency.
   await assertSameCurrency(ctx, fromRow.currency, toRow.currency, `"${fromRow.name}" and "${toRow.name}"`);
+  if (CODE_POSTED_ACCOUNTS.has(fromRow.code)) {
+    throw validation(
+      `"${fromRow.code} ${fromRow.name}" is an account Ironbooks posts to on its own (invoices, bills, payments, inventory, sales tax or payroll), so it is the one to keep. Merge "${toRow.code} ${toRow.name}" into it instead — you can rename it afterwards.`,
+    );
+  }
 
   return inTransaction(ctx, async (tx) => {
     const reassigned: Record<string, number> = {};

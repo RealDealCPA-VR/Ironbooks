@@ -2496,8 +2496,23 @@ ipcMain.handle('dialog:openFile', async (e, filters) => {
   const res = await dialog.showOpenDialog(mainWindow, { properties: ['openFile'], filters: filters || [] });
   if (res.canceled || !res.filePaths[0]) return null;
   const filePath = res.filePaths[0];
-  return { filePath, content: fs.readFileSync(filePath, 'utf8') };
+  return { filePath, content: decodeTextFile(fs.readFileSync(filePath)) };
 });
+
+/**
+ * Text of an opened IIF / CSV / OFX file. QuickBooks Desktop (and many banks) write these in the
+ * Windows code page, not UTF-8: reading them as UTF-8 turned every accented name into "�". Same
+ * rule as lib/textDecode.ts: UTF-16 with a BOM, UTF-8 when the bytes are UTF-8, else Windows-1252.
+ */
+function decodeTextFile(buf) {
+  if (buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xfe) return new TextDecoder('utf-16le').decode(buf.subarray(2));
+  if (buf.length >= 2 && buf[0] === 0xfe && buf[1] === 0xff) return new TextDecoder('utf-16be').decode(buf.subarray(2));
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(buf);
+  } catch {
+    return new TextDecoder('windows-1252').decode(buf);
+  }
+}
 
 ipcMain.handle('dialog:saveFile', async (e, { defaultName, content }) => {
   if (!fromAppOrigin(e)) return null;

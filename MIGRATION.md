@@ -3,10 +3,16 @@
 A practical, step-by-step guide for moving a company file from QuickBooks
 Desktop (Pro/Premier/Enterprise) into Ironbooks.
 
-> **TL;DR:** Export your lists as IIF and a Trial Balance report from QuickBooks,
-> import them in the order *Chart of Accounts → Customers/Vendors → Items →
-> Classes → Employees → opening balances/transactions*, then run the
-> verification checklist at the bottom before retiring the old file.
+> **TL;DR:** Open **Migrate from QuickBooks** (File → Migrate from QuickBooks…).
+> Step 1 brings your lists (IIF / CSV / Excel), step 2 your full history from the
+> QuickBooks **General Ledger** report (proven account by account before anything is
+> saved), step 3 your **open invoices and unpaid bills** as real documents. Then run
+> the verification checklist at the bottom before retiring the old file. (The older
+> route — lists plus one opening entry from a Trial Balance — is in section 3.)
+>
+> Imports change the whole company file, so they need an **owner or admin** and
+> **single-user mode** while anyone else is signed in (Setup → Multi-user), as in
+> QuickBooks.
 
 ---
 
@@ -44,7 +50,7 @@ Desktop (Pro/Premier/Enterprise) into Ironbooks.
 | Set Closing Date + password   | Settings → Closing Date (+ password)           |
 | Condense Data                 | Backup & Restore → Condense / Archive          |
 | Backup (`.QBB`)               | Backup (`.bka`) — full or per-company          |
-| Bank Feeds / Web Connect      | Banking → Import (OFX, QFX, QBO, CSV)          |
+| Bank Feeds / Web Connect      | Banking → Import (OFX, QFX, QBO, CSV, Excel, statement PDF / scan) |
 
 ---
 
@@ -62,8 +68,8 @@ All exports below are from the QuickBooks Desktop menus.
    Dec 31). `Excel → Create New Worksheet` or export to CSV.
 3. **Open invoices / unpaid bills** (so receivables and payables stay
    document-level, not just a lump sum):
-   - `Reports → Customers & Receivables → Open Invoices` → export CSV.
-   - `Reports → Vendors & Payables → Unpaid Bills Detail` → export CSV.
+   - `Reports → Customers & Receivables → Open Invoices` → Excel, CSV or PDF.
+   - `Reports → Vendors & Payables → Unpaid Bills Detail` → Excel, CSV or PDF.
 4. **Inventory valuation** (if you track inventory):
    `Reports → Inventory → Inventory Valuation Summary` as of the cutover date.
 5. **Optional — bank history:** download the last 30–90 days from your bank as
@@ -78,9 +84,12 @@ Order matters: each step references records created by the previous one.
 
 1. **Create the company** (File → New Company / first-run setup). Set the
    fiscal-year start to match QuickBooks.
-2. **Chart of Accounts** — Import page → QuickBooks IIF import (`!ACCNT`
-   sections), or List Import via CSV. Verify account types/subtypes after
-   import; A/R and A/P accounts must keep their special subtypes.
+2. **Chart of Accounts** — *Migrate from QuickBooks → Step 1 (Lists)*: the
+   QuickBooks IIF file (`!ACCNT` sections), or a CSV / Excel list. Verify account
+   types/subtypes after import; A/R and A/P accounts must keep their special
+   subtypes. Pick the IIF file with **Choose file…** as QuickBooks saved it: it is
+   read in QuickBooks' own Windows character set, so accented names (Société,
+   Müller) come over exactly.
 3. **Customers and Vendors** — IIF (`!CUST`, `!VEND`) or CSV list import.
    Jobs/sub-customers come in under their parent customers.
 4. **Items** — IIF (`!INVITEM`) or CSV. Check that each item's income/expense
@@ -98,9 +107,14 @@ Order matters: each step references records created by the previous one.
      to Opening Balance Equity).
    - **Important:** exclude A/R, A/P, and Inventory from that entry if you
      load them at document level in the next steps (otherwise they double).
-   - Re-enter **open invoices** and **unpaid bills** as real documents dated
-     with their original dates (Open Invoices / Unpaid Bills exports are your
-     checklist). Their postings recreate the A/R and A/P balances.
+   - Bring in the **open invoices** and **unpaid bills** with *Migrate from
+     QuickBooks → Step 3* (upload the Open Invoices / Unpaid Bills Detail export,
+     or type each balance in), with "My General Ledger history already has these
+     balances" **unticked**: each becomes a real invoice / bill (credit memo /
+     vendor credit for credits) dated as in QuickBooks, posted against Opening
+     Balance Equity, so their postings recreate the A/R and A/P balances. (With an
+     IIF file, tick "Bring in unpaid invoices and bills as real documents" in
+     step 1 instead.) Re-importing the same report adds nothing.
    - Enter **inventory quantities on hand** (item opening quantities/values
      per the Valuation Summary) to rebuild the Inventory Asset balance.
 9. **Banking** — add bank accounts, then import recent OFX/QFX/QBO/CSV files.
@@ -127,9 +141,12 @@ File → Migrate from QuickBooks…):
    used. Confirm or change them, and map accounts onto ones that already exist (no duplicates).
 5. **Dry run** — the whole import runs and is proven, then rolled back.
 6. **Import** — one database transaction: accounts (numbers and `Parent:Child` hierarchy),
-   classes, customers/vendors/employees (by transaction type), one opening entry dated the day
-   before the period for the beginning balances, and every rebuilt transaction (each verified
-   to balance, posted through the normal posting engine).
+   classes, customers/vendors/employees, one opening entry dated the day before the period for
+   the beginning balances, and every rebuilt transaction (each verified to balance, posted
+   through the normal posting engine). Every line keeps its QuickBooks **Name**: a name on an
+   Accounts Receivable line is always a customer and on an Accounts Payable line always a vendor
+   (created if your lists don't have it yet); other names are sorted by how they are used
+   (invoices and payments → customers, bills and checks → vendors, paychecks → employees).
 7. **Proof** — every account's balance as of the period end must equal the report's ending
    balance (and the Trial Balance, if supplied), and debits must equal credits. If anything
    differs, **nothing is saved** — unless you explicitly choose to post the difference to a
@@ -145,14 +162,35 @@ File → Migrate from QuickBooks…):
    - The proof compares the entries this import posted. If the company file already has other
      entries in a mapped account, the import warns that the account's full balance differs.
 
+8. **Open invoices and bills (Step 3)** — the General Ledger brings your A/R and A/P *balances*,
+   not the documents behind them, so until this step the A/R and A/P aging reports (and Receive
+   Payments / Pay Bills) don't show what each customer and vendor owes. Upload QuickBooks' Open
+   Invoices and Unpaid Bills Detail reports with "My General Ledger history already has these
+   balances" **ticked**: each open item becomes a real document netted against `QB Conversion
+   Clearing`, so the A/R and A/P totals don't change. The step refuses items that add up to more
+   than the A/R or A/P the books hold without documents, and shows the proof that A/R equals the
+   A/R aging and A/P the A/P aging.
+
 Notes:
 
 - Re-importing the same report (or an overlapping one) never duplicates: each transaction has a
   stable fingerprint (`qbgl:` source reference). Import consecutive periods oldest first.
+- Excel files must be saved by Excel (or QuickBooks): a workbook whose formulas were never
+  calculated is refused (the cell is named), and so is one that expands to more than 200 MB —
+  export a shorter date range, or use CSV.
 - Lines that can't be matched into a balanced transaction (usually a filtered report or a
   missing page) are listed for review and never posted.
 - If you use this path, **skip** the opening-balance entry in step 8 above — the GL import
-  creates it.
+  creates it. Item quantities on hand imported afterwards (an IIF or CSV item list with
+  quantities) set up the stock without posting it again: the GL import already holds the
+  Inventory Asset balance.
+- After the import you may have two accounts for the same thing (QuickBooks' "11000 Accounts
+  Receivable - Trade" next to Ironbooks' "1200 Accounts Receivable"). Merge the **QuickBooks**
+  one into the Ironbooks one (sidebar → Admin → Merge Records): invoices, bills, payments, inventory, sales tax and
+  payroll post to Ironbooks' own accounts by number, so those are always the ones to keep
+  (rename them afterwards if you like). The merge refuses the other direction.
+- Running an import twice at once (a double click, two windows) is safe: imports into one
+  company run one after the other, and the second one finds everything already there.
 
 ## 4. Verify-your-data checklist
 
@@ -160,7 +198,10 @@ Run these checks in Ironbooks against the same reports from QuickBooks
 **as of the cutover date** before you stop using the old file:
 
 - [ ] **Trial Balance** matches QuickBooks line for line (run Reports → Trial
-      Balance). Total debits = total credits.
+      Balance). Total debits = total credits. (Invoices and bills always post to
+      Ironbooks' own A/R and A/P accounts: if QuickBooks used several A/R or A/P
+      accounts, the open documents from step 3 move their balances onto those — the
+      totals still match.)
 - [ ] **Balance Sheet** total assets/liabilities/equity match.
 - [ ] **A/R Aging Summary** matches, and the **count and total of open
       invoices** equals QB's Open Invoices report.
@@ -190,6 +231,17 @@ period; historical detail you didn't migrate lives there.
   Restore page: it summarizes closed-period detail to one entry per month and
   always writes a permanent archive `.bka` first. It is irreversible except by
   restoring that archive.
-- **Bank imports:** OFX, QFX, QBO, and CSV are supported; CSV has a full
-  column mapper (separate debit/credit columns, date format, skip rows, sign
-  flip) with a preview before anything is committed.
+- **Bank imports:** OFX, QFX, QBO, CSV and Excel are supported; CSV / Excel
+  have a full column mapper (separate debit/credit columns, date format, skip
+  rows, sign flip) with a preview before anything is committed. Amounts such as
+  `(12.50)`, `12.50-` and `$1,250.00` are understood, a `-` in an empty Debit or
+  Credit cell counts as blank, and a file with an amount or date that is not
+  real (`NaN`, Feb 30) is refused with the row number instead of being imported.
+  Importing the same file again (or twice at once) adds nothing. A statement
+  **PDF, scan or photo** is read on this computer (text layer or offline OCR —
+  your AI is asked only under its usual routing rules), and its rows are shown
+  for review and **tied out** to the statement's opening and closing balances;
+  a statement that doesn't tie out is only imported if you say so.
+- **IIF details:** names an IIF transaction uses on an A/R or A/P line that are
+  not on your lists are added (as QuickBooks does), so those lines keep their
+  name. Budgets (`!BUD`) land in the fiscal year each month belongs to.

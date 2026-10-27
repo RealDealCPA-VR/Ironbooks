@@ -427,6 +427,19 @@ export function parseStatementText(lines: StatementLine[], opts: { kind: Stateme
   };
 }
 
+/** Signed cents of a statement / row amount: parseMoney's forms, or a plain "-12", "12.5"; else null. */
+function amountCents(raw: unknown): number | null {
+  if (typeof raw !== 'string' && typeof raw !== 'number') return null;
+  const s = String(raw).trim();
+  const p = parseMoney(s);
+  if (p) return p.cents;
+  const m = /^([-+]?)(\d+)(?:\.(\d{1,2}))?$/.exec(s);
+  if (!m) return null;
+  const c = Number(m[2]) * 100 + Number((m[3] ?? '').padEnd(2, '0'));
+  if (!Number.isSafeInteger(c)) return null;
+  return m[1] === '-' ? -c : c;
+}
+
 /** Does opening + rows = closing? (For a card, whose balance is what you owe: opening − rows = closing.) */
 export function tieOut(
   rows: Array<Pick<StatementRow, 'amount'>>,
@@ -434,10 +447,17 @@ export function tieOut(
   closingBalance: string | null,
   kind: StatementKind,
 ): TieOut {
-  const sum = rows.reduce((s, r) => s + (parseMoney(r.amount)?.cents ?? 0), 0);
-  const o = openingBalance === null ? null : parseMoney(openingBalance)?.cents ?? null;
-  const c = closingBalance === null ? null : parseMoney(closingBalance)?.cents ?? null;
-  if (o === null || c === null) return { expected: null, extracted: centsToString(sum), difference: null, ok: false };
+  // Every row must be read: an amount this can't parse ("5" without cents, "1.5", garbage) must
+  // never count as zero — the /api/import route ties out the rows it is about to import, and a
+  // row left out of the sum would let an untied statement through as "tied out".
+  // A row that is not an object (a hand-made request) is unreadable too — never a TypeError (500).
+  const cents = rows.map((r) => amountCents(r && typeof r === 'object' ? r.amount : undefined));
+  const sum = cents.reduce<number>((s, c) => s + (c ?? 0), 0);
+  const o = openingBalance === null ? null : amountCents(openingBalance);
+  const c = closingBalance === null ? null : amountCents(closingBalance);
+  if (o === null || c === null || cents.some((x) => x === null)) {
+    return { expected: o === null || c === null ? null : centsToString(kind === 'bank' ? c - o : o - c), extracted: centsToString(sum), difference: null, ok: false };
+  }
   const expected = kind === 'bank' ? c - o : o - c;
   return { expected: centsToString(expected), extracted: centsToString(sum), difference: centsToString(expected - sum), ok: expected === sum };
 }

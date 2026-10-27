@@ -38,6 +38,7 @@ import { Money, toAmountString } from '@/lib/money';
 import { buildXlsx, buildXlsxWorkbook, type XlsxSheetInput } from '@/lib/export/xlsx';
 import { validation, type ServiceContext } from './_base';
 import { exportListsIif, type IifListName } from './iifExport';
+import { apAging, arAging } from './reportsExtra';
 
 // ---------------------------------------------------------------------------
 // CSV helpers
@@ -123,6 +124,14 @@ export function buildCsv(header: string[], rows: unknown[][]): string {
   return '﻿' + lines.join('\r\n') + '\r\n';
 }
 
+/** "Every date" cut-off for the open balances on the customer / vendor lists. */
+const ALL_DATES = new Date(Date.UTC(9999, 0, 1));
+
+/** Aging report → open balance per customer / vendor id (2dp strings). */
+function agingTotals(report: Awaited<ReturnType<typeof arAging>>): Map<string, string> {
+  return new Map(report.rows.map((r) => [r.id, toAmountString(r.total)]));
+}
+
 function flattenAddress(addr: Record<string, string> | null | undefined): string {
   if (!addr) return '';
   const parts = [addr.line1 ?? addr.street, addr.line2, addr.city, addr.state, addr.zip, addr.country];
@@ -164,6 +173,10 @@ async function customersTable(ctx: ServiceContext): Promise<Table> {
   const types = await ctx.db.select().from(customerTypes).where(eq(customerTypes.companyId, ctx.companyId));
   const typePath = pathOf(types);
   const parentName = new Map(rows.map((c) => [c.id, c.displayName]));
+  // customers.balance is not maintained by anything (it is always 0): the Balance column is each
+  // customer's open A/R — the same figure as A/R aging (open invoices, unapplied credits and
+  // payments, named General Journal lines), every date included like QB's Customer list.
+  const balanceOf = agingTotals(await arAging(ctx, ALL_DATES));
   // The billing address goes out in its parts (street lines, city, state, ZIP, country), as in
   // QuickBooks' list export, so a list import can map each part back (a one-column address can't
   // be split again reliably).
@@ -189,7 +202,7 @@ async function customersTable(ctx: ServiceContext): Promise<Table> {
       yn(c.taxable),
       typePath(c.customerTypeId),
       c.parentId ? parentName.get(c.parentId) ?? '' : '',
-      toAmountString(c.balance),
+      balanceOf.get(c.id) ?? '0.00',
       c.notes,
       yn(c.isActive),
     ]),
@@ -204,6 +217,8 @@ async function vendorsTable(ctx: ServiceContext): Promise<Table> {
     .orderBy(asc(vendors.displayName));
   const types = await ctx.db.select().from(vendorTypes).where(eq(vendorTypes.companyId, ctx.companyId));
   const typePath = pathOf(types);
+  // vendors.balance is never maintained (always 0): the Balance column is the vendor's open A/P.
+  const balanceOf = agingTotals(await apAging(ctx, ALL_DATES));
   return {
     header: ['Name', 'Company', 'Email', 'Phone', 'Address', 'Terms', '1099 Vendor', 'Vendor Type', 'Balance', 'Notes', 'Active'],
     rows: rows.map((v) => [
@@ -215,7 +230,7 @@ async function vendorsTable(ctx: ServiceContext): Promise<Table> {
       v.terms,
       yn(v.is1099),
       typePath(v.vendorTypeId),
-      toAmountString(v.balance),
+      balanceOf.get(v.id) ?? '0.00',
       v.notes,
       yn(v.isActive),
     ]),

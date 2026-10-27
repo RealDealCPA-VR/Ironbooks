@@ -139,6 +139,56 @@ function legacyIfDifferent(date: Date, legacy: Date): Date | undefined {
 }
 
 // ---------------------------------------------------------------------------
+// Amounts and calendar days
+// ---------------------------------------------------------------------------
+
+/**
+ * A bank file's amount cell → a 2dp string: "1,234.56", "$1,234.56", "-12.50", "12.50-",
+ * "(12.50)", "+5". `null` for a cell with no digits at all (blank, or the "-" / "—" / "N/A" some
+ * banks print in an empty Debit or Credit cell); 'bad' for anything else that is not a number.
+ * decimal.js reads "NaN" and "Infinity" as numbers, and Postgres stores NaN in a numeric
+ * column, so a cell is only money when it really looks like money.
+ */
+export function readBankAmount(raw: unknown): string | null | 'bad' {
+  if (typeof raw !== 'string' && typeof raw !== 'number') return raw == null ? null : 'bad';
+  // Spaces may surround the sign, brackets and "$"; inside the number a comma is a thousands
+  // separator only in the US form (1,234.56). "12,50" or "1 234,56" (a decimal comma) is refused:
+  // stripping the separators read them as 1250 / 123456.
+  let s = String(raw).trim();
+  if (!/\d/.test(s)) return s === '' || /^[-–—]+$|^n\/?a$/i.test(s) ? null : 'bad';
+  let neg = false;
+  if (s.startsWith('(') && s.endsWith(')')) {
+    neg = true;
+    s = s.slice(1, -1).trim();
+  }
+  if (s.endsWith('-')) {
+    neg = !neg;
+    s = s.slice(0, -1).trim();
+  }
+  if (s.startsWith('-')) {
+    neg = !neg;
+    s = s.slice(1).trim();
+  } else if (s.startsWith('+')) {
+    s = s.slice(1).trim();
+  }
+  s = s.replace(/^\$\s*/, '');
+  if (s.startsWith('-') && !neg) {
+    // "$-12.50"
+    neg = true;
+    s = s.slice(1).trim();
+  }
+  if (!/^((\d{1,3}(,\d{3})+|\d+)(\.\d+)?|\.\d+)$/.test(s)) return 'bad';
+  const v = Money.round2(s.replace(/,/g, ''));
+  return toAmountString(neg && !v.isZero() ? v.negated() : v);
+}
+
+/** True when y-m-d (1-based month) names a real calendar day (no Feb 30, no 31 April). */
+function isCalendarDay(y: number, m: number, d: number): boolean {
+  if (!Number.isInteger(y) || !Number.isInteger(m) || !Number.isInteger(d) || m < 1 || m > 12 || d < 1) return false;
+  return d <= new Date(Date.UTC(y, m, 0)).getUTCDate();
+}
+
+// ---------------------------------------------------------------------------
 // OFX / QBO SGML parser (line-based; does NOT require XML conversion)
 // ---------------------------------------------------------------------------
 
@@ -405,21 +455,9 @@ function parseWithFormat(rawDate: string, format: string): Date {
     else if (t.startsWith('M')) month = v;
     else if (t.startsWith('Y')) year = raw.length === 2 ? 2000 + v : v;
   }
-  if (month < 1 || month > 12 || day < 1 || day > 31) return new Date(NaN);
-  const out = new Date(Date.UTC(year, month - 1, day));
-  // A day the month doesn't have (31/02/2026) used to roll over into the next month.
-  return out.getUTCMonth() === month - 1 ? out : new Date(NaN);
-}
-
-/** `d` unless the M/D/Y or Y-M-D digits printed in `raw` name a day that does not exist. */
-function realDayOrInvalid(raw: string, d: Date): Date {
-  const s = raw.trim();
-  const iso = /^(\d{4})-(\d{1,2})-(\d{1,2})(?!\d)/.exec(s);
-  const us = /^(\d{1,2})[/-](\d{1,2})[/-](\d{2}|\d{4})(?!\d)/.exec(s);
-  const [y, m, day] = iso ? [Number(iso[1]), Number(iso[2]), Number(iso[3])] : us ? [Number(us[3]), Number(us[1]), Number(us[2])] : [0, 0, 0];
-  if (!m) return d;
-  const check = new Date(Date.UTC(y < 100 ? 2000 + y : y, m - 1, day));
-  return check.getUTCMonth() === m - 1 && check.getUTCDate() === day ? d : new Date(NaN);
+  // A real calendar day only: Date.UTC would move "31/04" to May 1 and "02/30" into March.
+  if (!isCalendarDay(year, month, day)) return new Date(NaN);
+  return new Date(Date.UTC(year, month - 1, day));
 }
 
 /**
@@ -436,40 +474,51 @@ function parseLooseDate(rawDate: string): Date {
   if (isNaN(d.getTime())) return d;
   const s = rawDate.trim();
   const iso = /^(\d{4})-(\d{2})-(\d{2})(?!\d)/.exec(s);
-  if (iso) return new Date(Date.UTC(Number(iso[1]), Number(iso[2]) - 1, Number(iso[3])));
+  if (iso) {
+    // The engine rolls an impossible day over ("2026-02-30" → March 2): refuse it instead.
+    if (!isCalendarDay(Number(iso[1]), Number(iso[2]), Number(iso[3]))) return new Date(NaN);
+    return new Date(Date.UTC(Number(iso[1]), Number(iso[2]) - 1, Number(iso[3])));
+  }
   // The zone must follow a time of day, so a date part like "01-31-2024" is never read as one.
   const zone = /\d:\d{2}(?::\d{2}(?:\.\d+)?)?\s*(?:(Z|GMT|UTC)|(?:GMT|UTC)?([+-])(\d{2}):?(\d{2}))$/i.exec(s);
+  let day: Date;
   if (zone) {
     const offsetMin = zone[1] ? 0 : (zone[2] === '-' ? -1 : 1) * (Number(zone[3]) * 60 + Number(zone[4]));
     const wall = new Date(d.getTime() + offsetMin * 60_000);
-    return new Date(Date.UTC(wall.getUTCFullYear(), wall.getUTCMonth(), wall.getUTCDate()));
+    day = new Date(Date.UTC(wall.getUTCFullYear(), wall.getUTCMonth(), wall.getUTCDate()));
+  } else {
+    day = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
   }
-  return new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  // The engine rolls an impossible day over in every other form too ("2026/02/30", "2026.02.30",
+  // "02/30/2026 10:00", "2/30/26", "Feb 30, 2026", "31-Apr-26" all become a day in the next
+  // month): the day read must be the day written, or the date is refused.
+  const written = writtenDayParts(s);
+  if (written) {
+    if (written.y !== undefined && day.getUTCFullYear() !== written.y) return new Date(NaN);
+    if (day.getUTCMonth() + 1 !== written.m || day.getUTCDate() !== written.d) return new Date(NaN);
+  }
+  return day;
 }
 
+const MONTH_PREFIXES = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+
 /**
- * A CSV money cell as a Decimal (null when blank): "$1,234.56", "-45.00", "45.00-", "(45.00)"
- * (accounting negative). Anything else — "N/A", "NaN", "12,5" … — is a VALIDATION error naming
- * the row, so the import fails as a whole instead of staging a wrong or NaN amount.
+ * Month and day (and a 4-digit year when it leads) as written at the start of a date the engine
+ * reads: "2026/02/30", "2026.2.30", "02/30/2026", "2-30-26", "Feb 30, 2026", "Mon Feb 30 2026",
+ * "30 Feb 2026", "Tue, 30 Feb 2026 10:00:00 GMT", "30-Feb-26". Null for a shape it does not know
+ * (then nothing is compared).
  */
-function csvAmount(cell: string, rowIndex: number) {
-  let s = cell.replace(/[\s ]/g, '');
-  if (!s) return null;
-  let neg = false;
-  if (/^\(.*\)$/.test(s)) {
-    neg = true;
-    s = s.slice(1, -1);
-  }
-  if (s.endsWith('-')) {
-    neg = !neg;
-    s = s.slice(0, -1);
-  }
-  s = s.replace(/^([+-]?)\$/, '$1').replace(/,(?=\d{3}(?:\D|$))/g, '');
-  if (!/^[+-]?(\d+(\.\d*)?|\.\d+)$/.test(s)) {
-    throw new ServiceError('VALIDATION', `CSV row ${rowIndex + 1}: "${cell}" is not an amount.`);
-  }
-  const v = Money.of(s);
-  return neg ? v.negated() : v;
+function writtenDayParts(s: string): { y?: number; m: number; d: number } | null {
+  const ymd = /^(\d{4})[/.\-\s]+(\d{1,2})[/.\-\s]+(\d{1,2})(?!\d)/.exec(s);
+  if (ymd) return { y: Number(ymd[1]), m: Number(ymd[2]), d: Number(ymd[3]) };
+  const mdy = /^(\d{1,2})[/.\-\s]+(\d{1,2})[/.\-\s]+(\d{2}|\d{4})(?!\d)/.exec(s);
+  if (mdy) return { m: Number(mdy[1]), d: Number(mdy[2]) };
+  const monthOf = (word: string) => MONTH_PREFIXES.indexOf(word.slice(0, 3).toLowerCase()) + 1;
+  const named = /^(?:[a-z]+\.?,?\s+)?([a-z]{3,})\.?\s+(\d{1,2})(?!\d)/i.exec(s);
+  if (named && monthOf(named[1]) > 0) return { m: monthOf(named[1]), d: Number(named[2]) };
+  const dayFirst = /^(?:[a-z]+\.?,?\s+)?(\d{1,2})[\s\-/.]+([a-z]{3,})\.?(?![a-z])/i.exec(s);
+  if (dayFirst && monthOf(dayFirst[2]) > 0) return { m: monthOf(dayFirst[2]), d: Number(dayFirst[1]) };
+  return null;
 }
 
 /** Drop the first `skipRows` physical lines (bank-export preamble before the header). */
@@ -505,26 +554,42 @@ export function parseCSV(content: string, mapping: CsvMapping): ParsedTransactio
     // are not silently misread by the engine's locale-dependent Date parser.
     const rawDate = col(mapping.dateCol);
     if (!rawDate) throw new ServiceError('VALIDATION', `CSV row ${i + 1}: missing date value.`);
-    // An impossible day ("02/30/2026") is refused: the engine rolled it over to March 2.
-    const date = mapping.dateFormat ? parseWithFormat(rawDate, mapping.dateFormat) : realDayOrInvalid(rawDate, parseLooseDate(rawDate));
+    // An impossible day ("02/30/2026") is refused (parseWithFormat / parseLooseDate): the engine
+    // rolled it over to March 2.
+    const date = mapping.dateFormat ? parseWithFormat(rawDate, mapping.dateFormat) : parseLooseDate(rawDate);
     if (isNaN(date.getTime())) {
       throw new ServiceError('VALIDATION', `CSV row ${i + 1}: cannot parse date "${rawDate}".`);
     }
 
     // Amount: prefer separate debit/credit columns if specified.
+    // Amounts through readBankAmount (decimal, never parseFloat): an unreadable cell refuses the
+    // file with its row number instead of staging NaN.
+    const money = (raw: string): string | null => {
+      const v = readBankAmount(raw);
+      if (v === 'bad') throw new ServiceError('VALIDATION', `CSV row ${i + 1}: "${raw}" is not an amount.`);
+      return v;
+    };
     let amount: string;
     if (mapping.debitCol !== undefined && mapping.creditCol !== undefined) {
-      const debit = csvAmount(col(mapping.debitCol), i);
-      const credit = csvAmount(col(mapping.creditCol), i);
-      // Credit = money coming IN (positive); Debit = money going OUT (negative). The columns say
-      // the direction, so their sign does not: a bank that prints debits as "-45.00" (or
-      // "(45.00)") still means 45.00 out — it used to come in as a +45.00 deposit. Decimal math,
-      // never parseFloat (an unparseable cell used to be staged as NaN).
-      amount = toAmountString(Money.abs(credit ?? 0).minus(Money.abs(debit ?? 0)));
+      // The column says the direction: Credit = money coming IN (positive), Debit = money going
+      // OUT (negative) — also when the bank prints the debit signed ("-25.00") or bracketed.
+      const debitCell = money(col(mapping.debitCol));
+      const creditCell = money(col(mapping.creditCol));
+      // A placeholder ("-", "N/A") is a blank cell, but a row needs a debit or a credit: one
+      // with neither is refused like a blank Amount cell, never staged as 0.00.
+      if (debitCell === null && creditCell === null) {
+        throw new ServiceError('VALIDATION', `CSV row ${i + 1}: missing amount value (no debit or credit).`);
+      }
+      const debit = Money.abs(debitCell ?? 0);
+      const credit = Money.abs(creditCell ?? 0);
+      amount = toAmountString(credit.minus(debit));
     } else {
-      const amt = csvAmount(col(mapping.amountCol), i);
-      if (amt === null) throw new ServiceError('VALIDATION', `CSV row ${i + 1}: missing amount value.`);
-      amount = toAmountString(amt);
+      const rawAmt = col(mapping.amountCol);
+      const v = money(rawAmt);
+      if (v === null) {
+        throw new ServiceError('VALIDATION', rawAmt ? `CSV row ${i + 1}: "${rawAmt}" is not an amount.` : `CSV row ${i + 1}: missing amount value.`);
+      }
+      amount = v;
     }
 
     // Sign flip — for banks that export withdrawals as positive numbers.
@@ -676,21 +741,14 @@ export function parseRows(rows: ImportRowInput[]): ParsedTransaction[] {
   if (!Array.isArray(rows) || rows.length === 0) throw validation('There are no rows to import.');
   if (rows.length > 5000) throw validation('Import at most 5,000 rows at a time.');
   return rows.map((r, i) => {
-    const raw = String(r?.date ?? '');
-    const date = parseLooseDate(raw);
-    // The day must exist: "2026-02-30" (an OCR misread) would otherwise roll over to March 2.
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(raw) || isNaN(date.getTime()) || date.toISOString().slice(0, 10) !== raw) {
-      throw validation(`Row ${i + 1}: the date must be a real day like 2026-01-31.`);
+    if (!r || typeof r !== 'object') throw validation(`Row ${i + 1} is not a statement row.`);
+    const date = parseLooseDate(String(r?.date ?? ''));
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(r?.date ?? '')) || isNaN(date.getTime())) {
+      throw validation(`Row ${i + 1}: the date must be a real day written like 2026-01-31 ("${String(r?.date ?? '')}" is not).`);
     }
-    let amount: string;
-    try {
-      const v = typeof r.amount === 'string' || typeof r.amount === 'number' ? Money.of(r.amount) : null;
-      // "NaN" / "Infinity" are valid decimal.js input and Postgres numeric stores NaN — never stage them.
-      if (!v || !v.isFinite()) throw new Error('not finite');
-      amount = toAmountString(v);
-    } catch {
-      throw validation(`Row ${i + 1}: "${r?.amount}" is not an amount.`);
-    }
+    // Never decimal.js directly: it reads "NaN" / "Infinity", which would be staged as such.
+    const amount = readBankAmount(r.amount);
+    if (amount === null || amount === 'bad') throw validation(`Row ${i + 1}: "${String(r.amount ?? '')}" is not an amount.`);
     if (Money.isZero(amount)) throw validation(`Row ${i + 1}: the amount is zero.`);
     const description = String(r.description ?? '').trim().slice(0, 500) || 'Statement transaction';
     const payee = typeof r.payee === 'string' && r.payee.trim() ? r.payee.trim().slice(0, 255) : undefined;

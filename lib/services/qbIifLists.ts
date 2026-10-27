@@ -28,6 +28,7 @@ import { type ServiceContext, ServiceError } from './_base';
 import { createEntry, listEntries, type SimpleListKey } from './lists/simpleLists';
 import { createPriceLevel } from './pricing';
 import { createTodo } from './todos';
+import { importRowError } from './qbImportErrors';
 
 export type IifListRows = Array<Record<string, string>>;
 
@@ -95,7 +96,8 @@ async function importSimple(
       await createEntry(ctx, key, body);
       names.add(name.toLowerCase());
       n++;
-    } catch (err) {
+    } catch (caught) {
+      const err = importRowError(caught) ?? caught;
       if (err instanceof ServiceError && (err.code === 'VALIDATION' || err.code === 'NOT_FOUND')) {
         issues.push({ name, message: err.message });
         continue;
@@ -233,7 +235,8 @@ export async function importJobTypes(ctx: ServiceContext, rows: IifListRows, iss
           byPath.set(path.toLowerCase(), id);
           names.add(seg.toLowerCase());
           n++;
-        } catch (err) {
+        } catch (caught) {
+          const err = importRowError(caught) ?? caught;
           if (err instanceof ServiceError && err.code === 'VALIDATION') {
             issues.push({ name: r.NAME, message: err.message });
             break;
@@ -259,7 +262,8 @@ export async function importPriceLevels(ctx: ServiceContext, rows: IifListRows, 
       await createPriceLevel(ctx, { name, type: 'fixed_percent', percent: pct, isActive: !yes(r.HIDDEN) });
       names.add(name.toLowerCase());
       n++;
-    } catch (err) {
+    } catch (caught) {
+      const err = importRowError(caught) ?? caught;
       if (err instanceof ServiceError && err.code === 'VALIDATION') {
         issues.push({ name, message: err.message });
         continue;
@@ -313,7 +317,8 @@ export async function importTodos(ctx: ServiceContext, rows: IifListRows, issues
       });
       keys.add(key);
       n++;
-    } catch (err) {
+    } catch (caught) {
+      const err = importRowError(caught) ?? caught;
       if (err instanceof ServiceError && err.code === 'VALIDATION') {
         issues.push({ name: title, message: err.message });
         continue;
