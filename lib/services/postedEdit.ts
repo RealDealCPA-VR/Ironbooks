@@ -17,7 +17,10 @@
  *     closing-date password (QB: any change to a closed-period transaction), and is recorded on
  *     the Closing Date Exception report — see assertClosedPeriodEdit.
  *  2. A ledger-changing edit of an entry that has a line cleared in a COMPLETED reconciliation
- *     is refused up front with a plain-language message (QB warns; we block).
+ *     gives QB's warning; once the user confirms (allowReconciledEdit) it is re-posted and stays
+ *     reconciled at its new amount, with the change on the Previous Reconciliation Discrepancy
+ *     report (reconciledEdits.ts). An edit that keeps the reconciled lines as they are needs no
+ *     confirmation.
  */
 import { and, eq, inArray } from 'drizzle-orm';
 import {
@@ -30,6 +33,7 @@ import { Money } from '@/lib/money';
 import { type ServiceContext, ServiceError } from './_base';
 import type { PostingLine } from './posting';
 import { assertPeriodOpen, recordClosingDateException } from './fiscalPeriods';
+import { prepareReconciledRepost } from './reconciledEdits';
 
 /** Canonical key of a posting line (2dp amounts, nulls normalised). */
 export function lineKey(l: {
@@ -90,12 +94,20 @@ export type EditPlan = 'unchanged' | 'repost';
 /**
  * Decide how to apply an edit to a document whose GL entry is `entryId`:
  *  - 'unchanged' : the new posting is identical (same date + same lines) -> keep the entry.
- *  - 'repost'    : void + repost. Throws CONFLICT when the entry has reconciled lines.
+ *  - 'repost'    : void + repost. An entry with reconciled lines needs `allowReconciledEdit` (the
+ *                  user confirmed QB's warning) unless the edit keeps those lines as they are; the
+ *                  caller then calls reconciledEdits.carryReconciledLines after posting the new entry.
  * A missing / already-void entry always means 'repost' (nothing to compare against).
  */
 export async function planPostedEdit(
   ctx: ServiceContext,
-  params: { entryId: string | null | undefined; date: Date; lines: PostingLine[]; what: string },
+  params: {
+    entryId: string | null | undefined;
+    date: Date;
+    lines: PostingLine[];
+    what: string;
+    allowReconciledEdit?: boolean | null;
+  },
 ): Promise<EditPlan> {
   if (!params.entryId) return 'repost';
   const [entry] = await ctx.db
@@ -122,13 +134,12 @@ export async function planPostedEdit(
     return 'unchanged';
   }
 
-  if (await entryHasReconciledLines(ctx, entry.id)) {
-    throw new ServiceError(
-      'CONFLICT',
-      `This ${params.what} was cleared in a completed bank reconciliation, so its amount, accounts and date can't be changed. ` +
-        'You can still change the memo, payee or number. To change the amount, undo that reconciliation first (Reconcile > Undo last reconciliation).',
-    );
-  }
+  await prepareReconciledRepost(ctx, {
+    entryId: entry.id,
+    lines: params.lines,
+    what: params.what,
+    allowReconciledEdit: params.allowReconciledEdit,
+  });
   return 'repost';
 }
 

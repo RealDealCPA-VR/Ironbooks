@@ -60,6 +60,9 @@ import {
   reverseDocumentInventory,
 } from './inventorySites';
 import { assertClosedPeriodEdit, planPostedEdit, retitleEntry } from './postedEdit';
+import { carryReconciledLines } from './reconciledEdits';
+import { syncLineMemos } from './entryLineMemos';
+import { subledgerAccountReason } from '@/lib/registerEntryPlan';
 import { effectiveHomeCurrency } from './multiCurrency';
 import { foreignCode } from './fxLines';
 import {
@@ -202,6 +205,7 @@ interface PreparedLine {
 async function prepareLines(
   ctx: ServiceContext,
   lines: VendorCreditLineInput[],
+  keepAccountIds?: ReadonlySet<string>,
 ): Promise<{ lines: PreparedLine[]; total: Decimal }> {
   if (!lines || lines.length === 0) throw validation('A vendor credit must have at least one line.');
   const itemIds = [...new Set(lines.map((l) => l.itemId).filter((x): x is string => Boolean(x)))];
@@ -288,6 +292,11 @@ async function prepareLines(
     const a = acctById.get(l.accountId);
     if (!a) throw notFound(`Account on line ${i + 1}`);
     assertNotControlLineAccount(a, `Line ${i + 1}`);
+    // An account line (no item) on Undeposited Funds or an inventory asset account moves a balance
+    // the Make Deposits list / inventory valuation never shows (the same rule as checks and bills);
+    // a saved credit that already has such a line can be re-saved as it is.
+    const reason = l.itemId || keepAccountIds?.has(a.id) ? null : subledgerAccountReason(a);
+    if (reason) throw validation(`Line ${i + 1}: ${reason}`);
   });
 
   // Class / customer / job belong to this company; a job must belong to the line's customer.
@@ -693,7 +702,15 @@ export async function updateVendorCredit(ctx: ServiceContext, id: string, input:
     .from(vendors)
     .where(and(eq(vendors.id, input.vendorId), eq(vendors.companyId, ctx.companyId)));
   if (!vendor) throw notFound('Vendor');
-  const { lines: prep, total } = await prepareLines(ctx, input.lines);
+  const savedLineAccounts = await ctx.db
+    .select({ accountId: vendorCreditLines.accountId })
+    .from(vendorCreditLines)
+    .where(eq(vendorCreditLines.vendorCreditId, id));
+  const { lines: prep, total } = await prepareLines(
+    ctx,
+    input.lines,
+    new Set(savedLineAccounts.map((l) => l.accountId).filter((x): x is string => !!x)),
+  );
   const totalStr = toAmountString(total);
   // p1 fx: a blank rate keeps the credit's saved rate (not today's list rate), so a memo edit of an
   // applied foreign credit stays ledger-neutral.
@@ -767,6 +784,8 @@ export async function updateVendorCredit(ctx: ServiceContext, id: string, input:
       await tx.db.delete(vendorCreditLines).where(eq(vendorCreditLines.vendorCreditId, id));
       await tx.db.insert(vendorCreditLines).values(lineRowsFor(id, prep, costs));
       await retitleEntry(tx, entryId, { description: `Vendor Credit — ${vendor.name}`, reference: refNumber });
+      // The kept entry's line memos follow the edited line descriptions (register / report Memo column).
+      await syncLineMemos(tx, entryId, postingLinesFor(id, apAccountId, cogsAccountId, homePrep(prep, fx), Money.of(fx.homeTotal), costs));
     } else {
       const used = Money.of(cur.total).minus(Money.of(cur.unapplied));
       if (used.greaterThan(0) || Money.of(cur.refundedAmount).greaterThan(0)) {
@@ -789,6 +808,7 @@ export async function updateVendorCredit(ctx: ServiceContext, id: string, input:
         ...vendorCreditEntryFx(fx),
       });
       entryId = entry.id;
+      await carryReconciledLines(tx, { oldEntryId: cur.postedEntryId, newEntryId: entry.id });
       await tx.db
         .update(vendorCredits)
         .set({

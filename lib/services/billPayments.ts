@@ -54,7 +54,8 @@ import { allocateCheckNumber, assertCheckNumberAvailable } from './checkNumbers'
 import { getOrCreateExchangeGainLossAccount, resolveDocumentCurrency } from './currencies';
 import { effectiveHomeCurrency } from './multiCurrency';
 import { foreignCode } from './fxLines';
-import { assertClosedPeriodEdit, entryHasReconciledLines } from './postedEdit';
+import { assertClosedPeriodEdit } from './postedEdit';
+import { carryReconciledLines, prepareReconciledRepost } from './reconciledEdits';
 import { assertPeriodOpen } from './fiscalPeriods';
 import { applyToBill } from './vendorCredits';
 import { vendorCreditHomeOnBill } from './vendorCreditsFx';
@@ -108,6 +109,8 @@ export interface PayBillsInput {
   exchangeRate?: string | number | null;
   /** Refuse a check number already used on the account unless the user confirmed (A3). */
   checkDuplicateNumber?: boolean;
+  /** Edits: the user confirmed QB's "this transaction has been reconciled" warning (reconciledEdits.ts). */
+  allowReconciledEdit?: boolean;
   /**
    * General Journal amounts owed to this vendor paid by this payment (QB I11): named A/P credits
    * from journal entries, listed in Pay Bills next to the bills. Home currency only.
@@ -751,8 +754,8 @@ export async function payBillsWithCredits(
  * Edit a saved bill payment (same vendor). In ONE transaction:
  *  - number / print-flag only (same date, account, method, bills and amounts): header update,
  *    the journal entry is kept (allowed on a check cleared in a completed reconciliation);
- *  - anything else: refused if the check was cleared in a completed reconciliation; otherwise
- *    the old entry is voided (closing date on the OLD date), the bills are rolled back, and the
+ *  - anything else: a check cleared in a completed reconciliation needs the user to confirm QB's
+ *    warning (allowReconciledEdit; it then stays reconciled at its new amount); the old entry is voided (closing date on the OLD date), the bills are rolled back, and the
  *    new payment is validated and posted on the same document (closing date on the NEW date).
  */
 export async function updateBillPayment(ctx: ServiceContext, id: string, input: PayBillsInput) {
@@ -841,13 +844,15 @@ export async function updateBillPayment(ctx: ServiceContext, id: string, input: 
           .where(and(eq(journalEntries.id, entryId), eq(journalEntries.companyId, tx.companyId)));
       }
     } else {
-      if (cur.postedEntryId && (await entryHasReconciledLines(tx, cur.postedEntryId))) {
-        throw new ServiceError(
-          'CONFLICT',
-          "This bill payment was cleared in a completed bank reconciliation, so its amount, bills, account and date can't be changed. " +
-            'You can still change the check number. To change the amount, undo that reconciliation first.',
-        );
-      }
+      // A reconciled payment: QB's warning, then (once the user confirms) it is re-posted and stays
+      // reconciled at its new amount. The new posting is only known after the bills are rolled
+      // back, so any such change asks first (no lines are compared).
+      await prepareReconciledRepost(tx, {
+        entryId: cur.postedEntryId,
+        lines: [],
+        what: 'bill payment',
+        allowReconciledEdit: input.allowReconciledEdit,
+      });
       if (cur.postedEntryId) await voidJournalEntry(tx, cur.postedEntryId);
       await rollbackApplications(tx, id);
       await reverseJournalApplicationsForBillPayment(tx, id);
@@ -862,6 +867,7 @@ export async function updateBillPayment(ctx: ServiceContext, id: string, input: 
         lines: buildPaymentLines(prep, input, reference),
       });
       entryId = entry.id;
+      await carryReconciledLines(tx, { oldEntryId: cur.postedEntryId, newEntryId: entry.id });
       await tx.db
         .update(billPayments)
         .set({

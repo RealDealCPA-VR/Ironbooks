@@ -510,7 +510,8 @@ async function updateStatusInTx(ctx: ServiceContext, id: string, status: 'open' 
 
   const [updated] = await ctx.db
     .update(purchaseOrders)
-    .set({ status })
+    // Mark as Closed by hand: a later receipt edit or bill void that releases quantity keeps it closed.
+    .set({ status, closedManually: status === 'closed' })
     .where(eq(purchaseOrders.id, id))
     .returning();
 
@@ -548,6 +549,11 @@ export interface ConvertToBillOptions {
   date?: Date;
   /** Vendor bill / reference number for the created bill. */
   billNumber?: string | null;
+  /**
+   * The user confirmed QB's "this vendor already has a bill with that reference number" warning
+   * (A4). Without it a reference number already on another bill of the vendor is refused.
+   */
+  allowDuplicateNumber?: boolean;
 }
 
 /**
@@ -738,6 +744,8 @@ export async function convertToBill(
     const bill = await createBill(tx, {
       vendorId: po.vendorId,
       billNumber: opts?.billNumber ?? null,
+      // QB duplicate vendor reference warning (A4), as Enter Bills gives it.
+      checkDuplicateNumber: !opts?.allowDuplicateNumber,
       date: opts?.date ?? po.date,
       // The PO's expected date is a DELIVERY date, not a payment due date: leave it blank so
       // createBill works the due date out from the vendor's terms (QB parity).
@@ -947,7 +955,7 @@ export async function syncPoBillingForBillEdit(
       }
     }
     const derivedAfter = poStatusFromLines(await linesOf(poId), enhancedReceiving);
-    const status = po.status !== derivedBefore ? po.status : derivedAfter;
+    const status = (po.closedManually && po.status === 'closed') || po.status !== derivedBefore ? po.status : derivedAfter;
     await ctx.db
       .update(purchaseOrders)
       .set({
@@ -1016,7 +1024,7 @@ export async function releasePoBillingForBill(ctx: ServiceContext, billId: strin
     }
 
     const derivedAfter = poStatusFromLines(await linesNow(), enhancedReceiving);
-    const keepManualStatus = po.status !== derivedBefore;
+    const keepManualStatus = (po.closedManually && po.status === 'closed') || po.status !== derivedBefore;
     const newStatus = keepManualStatus ? po.status : derivedAfter;
     await ctx.db
       .update(purchaseOrders)
@@ -1078,6 +1086,13 @@ async function recomputePoStatusFromLines(
   prevStatus: string,
   reason: string,
 ): Promise<'open' | 'partial' | 'closed'> {
+  // A P.O. closed by hand (Mark as Closed) stays closed: a receipt edit that releases quantity
+  // used to reopen it, since nothing told a manual close from one the line quantities imply.
+  const [cur] = await ctx.db
+    .select({ status: purchaseOrders.status, closedManually: purchaseOrders.closedManually })
+    .from(purchaseOrders)
+    .where(and(eq(purchaseOrders.id, poId), eq(purchaseOrders.companyId, ctx.companyId)));
+  if (cur?.closedManually && cur.status === 'closed') return 'closed';
   const refreshed = await ctx.db
     .select({
       quantity: purchaseOrderLines.quantity,
@@ -1118,7 +1133,12 @@ export async function claimReceiptQuantities(
   ctx: ServiceContext,
   poId: string,
   requests: ReceiptQuantityRequest[],
-  opts?: { vendorId?: string; sourceRef?: string },
+  opts?: {
+    vendorId?: string;
+    sourceRef?: string;
+    /** An edit of a receipt already against this P.O. re-claims its quantities on a P.O. closed by hand. */
+    reclaimOnManualClose?: boolean;
+  },
 ): Promise<void> {
   const [po] = await ctx.db
     .select()
@@ -1128,7 +1148,7 @@ export async function claimReceiptQuantities(
   if (po.status === 'void') {
     throw new ServiceError('CONFLICT', 'Cannot receive against a voided purchase order.');
   }
-  if (po.status === 'closed') {
+  if (po.status === 'closed' && !(opts?.reclaimOnManualClose && po.closedManually)) {
     throw new ServiceError('CONFLICT', 'Cannot receive against a closed purchase order.');
   }
   if (opts?.vendorId && po.vendorId !== opts.vendorId) {

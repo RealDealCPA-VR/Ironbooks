@@ -28,7 +28,7 @@ import { canFinishReconciliation } from '@/lib/reconcileRules';
 import { MAX_DATE_YEAR, MIN_DATE_YEAR, parseDateInput } from '@/lib/validation/helpers';
 import { todayISO } from '@/lib/dates';
 import { subledgerAccountReason } from '@/lib/registerEntryPlan';
-import { isBankAccount } from '@/lib/accountTypes';
+import { isBankAccount, isCreditCardAccount } from '@/lib/accountTypes';
 import {
   type ServiceContext,
   ServiceError,
@@ -833,8 +833,14 @@ export interface ReconcileInfo {
   glAccountName: string;
   glAccountCode: string;
   glType: string;
-  /** True when the linked GL account is a liability (credit card) account. */
+  /**
+   * True when the linked GL account is a Credit Card account: QB offers "Write a check for the
+   * balance" / Enter a bill after reconciling one. A loan or other liability is not a credit card
+   * (it is paid through Loan Manager or Write Checks).
+   */
   isCreditCard: boolean;
+  /** True for any liability account (statement amounts read credit − debit: charges / borrowings +). */
+  isLiability: boolean;
   lastReconciledDate: Date | null;
   /** Carried-forward beginning balance (last statement balance; "0.00" when never reconciled). */
   beginningBalance: string;
@@ -870,6 +876,7 @@ export async function getReconcileInfo(
       glAccountName: accounts.name,
       glAccountCode: accounts.code,
       glType: accounts.type,
+      glSubtype: accounts.subtype,
     })
     .from(bankAccounts)
     .innerJoin(accounts, eq(bankAccounts.accountId, accounts.id))
@@ -917,7 +924,8 @@ export async function getReconcileInfo(
     glAccountName: ba.glAccountName,
     glAccountCode: ba.glAccountCode,
     glType: ba.glType,
-    isCreditCard: ba.glType === 'liability',
+    isCreditCard: isCreditCardAccount({ type: ba.glType, subtype: ba.glSubtype }),
+    isLiability: ba.glType === 'liability',
     lastReconciledDate: ba.lastReconciledDate,
     beginningBalance: toAmountString(beginning),
     recomputedBalance: toAmountString(recomputed),
@@ -962,9 +970,24 @@ async function autoClearBankLine(
 }
 
 /**
+ * Source ref of a statement adjustment posted from Reconcile: "reconciliation:<id>:charge" for
+ * the service charge, "reconciliation:<id>:interest" for interest earned. Reports show them as a
+ * Check / Deposit (QB) instead of "Other"; entries posted before this carry "reconciliation:<id>".
+ */
+export function reconciliationAdjustmentRef(reconciliationId: string, kind: 'charge' | 'interest'): string {
+  return `reconciliation:${reconciliationId}:${kind}`;
+}
+
+/** True when `sourceRef` is a statement adjustment of reconciliation `reconciliationId` (either form). */
+export function isReconciliationAdjustmentRef(sourceRef: string | null | undefined, reconciliationId: string): boolean {
+  if (!sourceRef) return false;
+  return sourceRef === `reconciliation:${reconciliationId}` || sourceRef.startsWith(`reconciliation:${reconciliationId}:`);
+}
+
+/**
  * Record statement-only adjustments (bank service charge and/or interest earned)
  * during an in-progress reconciliation. Each adjustment posts a journal entry
- * dated the statement date (sourceRef "reconciliation:<id>") and its bank-side
+ * dated the statement date (sourceRef reconciliationAdjustmentRef) and its bank-side
  * line is automatically cleared into the current session, so the reconciliation
  * still balances against the statement.
  *
@@ -1029,7 +1052,7 @@ export async function addStatementAdjustments(
       const entry = await postJournalEntry(tx, {
         date: recon.statementDate,
         description: 'Bank service charge',
-        sourceRef: `reconciliation:${reconciliationId}`,
+        sourceRef: reconciliationAdjustmentRef(reconciliationId, 'charge'),
         lines: [
           { accountId: charge.accountId, debit: homeStr },
           { accountId: recon.glAccountId, credit: homeStr, ...(adjFx ? { foreignAmount: charge.amtStr } : {}) },
@@ -1044,7 +1067,7 @@ export async function addStatementAdjustments(
       const entry = await postJournalEntry(tx, {
         date: recon.statementDate,
         description: 'Interest earned',
-        sourceRef: `reconciliation:${reconciliationId}`,
+        sourceRef: reconciliationAdjustmentRef(reconciliationId, 'interest'),
         lines: [
           { accountId: recon.glAccountId, debit: homeStr, ...(adjFx ? { foreignAmount: interest.amtStr } : {}) },
           { accountId: interest.accountId, credit: homeStr },
@@ -1531,12 +1554,17 @@ export async function payCreditCardBalance(
     }
 
     const [gl] = await tx.db
-      .select({ type: accounts.type, name: accounts.name })
+      .select({ type: accounts.type, subtype: accounts.subtype, name: accounts.name })
       .from(accounts)
       .where(and(eq(accounts.id, recon.glAccountId), eq(accounts.companyId, tx.companyId)));
     if (!gl) throw notFound('Credit card GL account');
-    if (gl.type !== 'liability') {
-      throw validation('This reconciliation is not for a credit card (liability) account.');
+    // QB offers Make Payment only after reconciling a Credit Card account. A reconciled loan, line
+    // of credit or other liability used to be paid off in full from here (Dr Truck Loan 20,000 /
+    // Cr Checking); loans are paid through Loan Manager or Write Checks.
+    if (!isCreditCardAccount(gl)) {
+      throw validation(
+        `"${gl.name}" is not a credit card account, so there is no credit card balance to pay. Pay a loan or other liability with Loan Manager or Write Checks.`,
+      );
     }
 
     // QB "Write a check for the balance": the check comes from a bank account (the same rule as

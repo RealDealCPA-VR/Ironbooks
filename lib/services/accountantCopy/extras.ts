@@ -37,11 +37,16 @@ import { applyJournalCredit, unapplyJournalApplication } from '../journalApplica
 import {
   addStatementAdjustments,
   completeReconciliation,
+  isReconciliationAdjustmentRef,
   startReconciliation,
   toggleCleared,
   undoLastReconciliation,
 } from '../reconcile';
 import { lineRefOf } from './lineRefs';
+
+/** The statement adjustments of a reconciliation: "reconciliation:<id>" or "reconciliation:<id>:<kind>". */
+const reconciliationAdjustmentSql = (reconciliationId: string) =>
+  sql`(${journalEntries.sourceRef} = ${`reconciliation:${reconciliationId}`} OR ${journalEntries.sourceRef} LIKE ${`reconciliation:${reconciliationId}:%`})`;
 import type { ApplicationChange, LineRef, ReconciliationChange } from './format';
 import type { Labels } from './docs';
 
@@ -307,7 +312,7 @@ export async function reconciliationChanges(
       const [adj] = await ctx.db
         .select({ id: journalEntries.id })
         .from(journalEntries)
-        .where(and(eq(journalEntries.companyId, ctx.companyId), eq(journalEntries.sourceRef, `reconciliation:${r.id}`), eq(journalEntries.status, 'posted')))
+        .where(and(eq(journalEntries.companyId, ctx.companyId), reconciliationAdjustmentSql(r.id), eq(journalEntries.status, 'posted')))
         .limit(1);
       if (adj) {
         warnings.push(
@@ -325,13 +330,13 @@ export async function reconciliationChanges(
       .orderBy(asc(journalEntries.date), asc(reconciliationItems.journalEntryLineId));
     const cleared: LineRef[] = [];
     for (const i of items) {
-      if (i.sourceRef === `reconciliation:${r.id}`) continue; // the statement's own adjustments (re-made on import)
+      if (isReconciliationAdjustmentRef(i.sourceRef, r.id)) continue; // the statement's own adjustments (re-made on import)
       cleared.push(await ref(ctx, i.lineId));
     }
     const adjustments = await ctx.db
       .select({ id: journalEntries.id, description: journalEntries.description })
       .from(journalEntries)
-      .where(and(eq(journalEntries.companyId, ctx.companyId), eq(journalEntries.sourceRef, `reconciliation:${r.id}`), eq(journalEntries.status, 'posted')));
+      .where(and(eq(journalEntries.companyId, ctx.companyId), reconciliationAdjustmentSql(r.id), eq(journalEntries.status, 'posted')));
     let serviceCharge: { amount: string; accountId: string } | null = null;
     let interestEarned: { amount: string; accountId: string } | null = null;
     for (const a of adjustments) {

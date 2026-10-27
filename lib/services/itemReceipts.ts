@@ -117,6 +117,8 @@ export interface ConvertReceiptToBillOptions {
   /** Bill date; defaults to the receipt date. */
   date?: Date;
   dueDate?: Date | null;
+  /** The user confirmed QB's duplicate vendor reference number warning (A4). */
+  allowDuplicateNumber?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -793,7 +795,12 @@ async function saveItemReceipt(
         tx,
         input.purchaseOrderId,
         resolved.map((l) => ({ itemId: l.itemId, quantity: l.quantity.toFixed(4) })),
-        { vendorId: input.vendorId, sourceRef: 'item_receipt_claim' },
+        {
+          vendorId: input.vendorId,
+          sourceRef: 'item_receipt_claim',
+          // Editing a receipt of a P.O. closed by hand re-claims on it (the P.O. stays closed).
+          reclaimOnManualClose: Boolean(existing && existing.purchaseOrderId === input.purchaseOrderId),
+        },
       );
     }
 
@@ -1042,6 +1049,8 @@ export async function convertToBill(
     const bill = await createBill(tx, {
       vendorId: receipt.vendorId,
       billNumber: opts?.billNumber ?? receipt.reference ?? null,
+      // QB duplicate vendor reference warning (A4), as Enter Bills gives it.
+      checkDuplicateNumber: !opts?.allowDuplicateNumber,
       date: opts?.date ?? receipt.date,
       dueDate: opts?.dueDate ?? null,
       memo:

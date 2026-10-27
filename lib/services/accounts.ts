@@ -6,7 +6,7 @@
  * sends) or the stored (type, subtype) pair; both are validated against each other.
  */
 import { and, asc, eq, sql } from 'drizzle-orm';
-import { accountSubtypeEnum, accounts, companies, journalEntries, journalEntryLines } from '@/lib/db/schema';
+import { accountSubtypeEnum, accounts, bankAccounts, companies, journalEntries, journalEntryLines } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import {
   type BaseAccountType,
@@ -419,7 +419,12 @@ export async function updateAccount(
   // name. Turning an account with history into (or out of) A/R or A/P would leave unnamed
   // amounts in the control account (or orphan the named open items), so aging would stop
   // matching the GL. QB refuses this for accounts with transactions; so do we.
-  const isSubledger = (s: string) => s === 'accounts_receivable' || s === 'accounts_payable';
+  // Undeposited Funds and Inventory Asset are kept by their own lists too (Make Deposits; the
+  // inventory valuation), and the banking guards find them by subtype while deposits / payments
+  // find Undeposited Funds by its number: turning a used account into (or out of) one of them
+  // splits the two (a 1050 turned into 'checking' took typed register entries and transfers).
+  const isSubledger = (s: string) =>
+    s === 'accounts_receivable' || s === 'accounts_payable' || s === 'undeposited_funds' || s === 'inventory';
   const subledgerChange =
     subtype !== before.subtype && (isSubledger(subtype) || isSubledger(before.subtype));
   if (
@@ -440,6 +445,20 @@ export async function updateAccount(
         'CONFLICT',
         'This account already has transactions, so it cannot be changed to that account type. Create a new account and move the transactions instead.',
       );
+    }
+    // A bank-feed / reconcile link is never allowed on these list-kept accounts (bankAccounts.ts).
+    if (subledgerChange && isSubledger(subtype)) {
+      const [link] = await ctx.db
+        .select({ id: bankAccounts.id })
+        .from(bankAccounts)
+        .where(and(eq(bankAccounts.companyId, ctx.companyId), eq(bankAccounts.accountId, id)))
+        .limit(1);
+      if (link) {
+        throw new ServiceError(
+          'CONFLICT',
+          'This account is linked to a bank feed / reconciliation, so it cannot become that account type. Remove the bank link first.',
+        );
+      }
     }
   }
   const [row] = await ctx.db
