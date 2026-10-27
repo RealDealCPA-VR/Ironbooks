@@ -447,9 +447,43 @@ async function homeCurrencyStatement(
     raw.push({ kind: 'credit_memo', date: m.date, ref: docRef(m.refNumber, m.memoNumber), amount: Money.of(m.total) });
   }
 
-  // Named General Journal lines on A/R.
+  // review5 fx: Home Currency Adjustments (hca:<id>) and their next-day reversals revalue this
+  // customer's A/R in home currency. The opening balance (from the GL) counts them, so the
+  // statement lists them too, as exchange-rate adjustments on their own dates: an adjustment on
+  // 3/31 is in March's closing balance and its 4/1 reversal in April (April used to open with the
+  // revaluation and never take it back, so every later statement was off by it).
+  const hcaRows = await ctx.db
+    .select({
+      entryId: journalEntries.id,
+      date: journalEntries.date,
+      net: sql<string>`COALESCE(SUM(CAST(COALESCE(${journalEntryLines.debit}, '0') AS NUMERIC) - CAST(COALESCE(${journalEntryLines.credit}, '0') AS NUMERIC)), 0)`,
+    })
+    .from(journalEntryLines)
+    .innerJoin(journalEntries, eq(journalEntries.id, journalEntryLines.journalEntryId))
+    .innerJoin(accounts, eq(accounts.id, journalEntryLines.accountId))
+    .where(
+      and(
+        eq(journalEntries.companyId, ctx.companyId),
+        eq(journalEntries.status, 'posted'),
+        sql`(${journalEntries.sourceRef} LIKE 'hca:%' OR ${journalEntries.sourceRef} LIKE 'hca-reversal:%')`,
+        eq(accounts.type, 'asset'),
+        eq(accounts.subtype, 'accounts_receivable'),
+        eq(journalEntryLines.entityType, 'customer'),
+        eq(journalEntryLines.entityId, customerId),
+      ),
+    )
+    .groupBy(journalEntries.id, journalEntries.date);
+  const hcaEntryIds = new Set(hcaRows.map((r) => r.entryId));
+  for (const h of hcaRows) {
+    if ((from && h.date < from) || (toExclusive && h.date >= toExclusive)) continue;
+    const amount = Money.of(h.net);
+    if (!amount.isZero()) raw.push({ kind: 'exchange_adjustment', date: h.date, ref: null, amount });
+  }
+
+  // Named General Journal lines on A/R (the adjustments above are listed once, by date).
   const journalItems = await journalOpenItems(ctx, 'ar', { entityId: customerId, gross: true });
   for (const j of journalItems) {
+    if (hcaEntryIds.has(j.journalEntryId)) continue;
     if ((from && j.date < from) || (toExclusive && j.date >= toExclusive)) continue;
     raw.push({ kind: 'general_journal', date: j.date, ref: `GJ #${j.entryNumber}`, amount: Money.of(j.amount) });
   }
