@@ -442,6 +442,34 @@ async function homeCurrencyStatement(
         .groupBy(paymentApplications.paymentId)
     : [];
   const discountByPayment = new Map(discountRows.map((r) => [r.paymentId, Money.of(r.home)]));
+  // A bounced payment's applications were deleted at the bounce (the bounced-check row keeps a
+  // snapshot): its early-payment discount is still part of what the payment relieved, so it stays
+  // a discount line (it showed as payment) — in home currency at each invoice's own rate.
+  const bouncedIds = payEntries.map((e) => payByEntry.get(e.entryId)!.id);
+  if (bouncedIds.length) {
+    const snaps = await ctx.db
+      .select({ paymentId: bouncedChecks.paymentId, applications: bouncedChecks.applications })
+      .from(bouncedChecks)
+      .where(and(eq(bouncedChecks.companyId, ctx.companyId), inArray(bouncedChecks.paymentId, bouncedIds)));
+    const invIds = [...new Set(snaps.flatMap((sn) => (sn.applications ?? []).map((a) => a.invoiceId)).filter((x): x is string => !!x))];
+    const rateOf = new Map<string, string | null>();
+    if (invIds.length) {
+      for (const r of await ctx.db
+        .select({ id: invoices.id, rate: invoices.exchangeRate })
+        .from(invoices)
+        .where(and(eq(invoices.companyId, ctx.companyId), inArray(invoices.id, invIds)))) {
+        rateOf.set(r.id, r.rate);
+      }
+    }
+    for (const sn of snaps) {
+      let disc = Money.zero();
+      for (const a of sn.applications ?? []) {
+        const rate = rateOf.get(a.invoiceId ?? '') ?? null;
+        disc = disc.plus(Money.round2(Money.of(a.discountAmount ?? '0').times(Money.of(rate ?? '1'))));
+      }
+      if (disc.greaterThan(0)) discountByPayment.set(sn.paymentId, (discountByPayment.get(sn.paymentId) ?? Money.zero()).plus(disc));
+    }
+  }
   for (const e of payEntries) {
     const p = payByEntry.get(e.entryId)!;
     const discount = discountByPayment.get(p.id) ?? Money.zero();

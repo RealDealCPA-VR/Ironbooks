@@ -773,6 +773,7 @@ export const TXN_TYPE_LABELS: Record<TxnTypeKey, string> = {
   journal: 'General Journal',
   inventory: 'Inventory Adjust',
   item_receipt: 'Item Receipt',
+  build_assembly: 'Build Assembly',
   depreciation: 'Depreciation',
   sales_tax_payment: 'Sales Tax Payment',
   cc_payment: 'Credit Card Payment',
@@ -784,7 +785,8 @@ export const TXN_TYPE_LABELS: Record<TxnTypeKey, string> = {
 /** sourceRef prefixes per transaction type (null = manual entries). */
 const TXN_PREFIXES: Record<TxnTypeKey, string[]> = {
   invoice: ['invoice', 'invoice-cogs'],
-  payment: ['payment', 'customer'],
+  // A bounced check reverses the payment it belongs to (QB shows it on the Payment).
+  payment: ['payment', 'customer', 'bounced'],
   sales_receipt: ['salesreceipt', 'sales_receipt'],
   credit_memo: ['credit_memo', 'creditmemo-cogs'],
   refund: ['refund'],
@@ -795,9 +797,17 @@ const TXN_PREFIXES: Record<TxnTypeKey, string[]> = {
   deposit: ['deposit'],
   transfer: ['transfer'],
   paycheck: ['paycheck'],
-  journal: ['manual', 'reversal', 'fiscal-close', 'condense', 'qbgl', 'iif'],
-  inventory: ['item'],
-  item_receipt: ['item_receipt', 'item_receipt_void'],
+  // Home Currency Adjustments, Adjust Sales Tax Due, realized exchange gains / losses on credits
+  // and loans, Working Trial Balance adjustments and conversion offsets are General Journal
+  // entries in QuickBooks (they showed as "Other").
+  journal: [
+    'manual', 'reversal', 'fiscal-close', 'condense', 'qbgl', 'iif', 'adjusting', 'hca', 'hca-reversal', 'fx_adjustment',
+    'sales_tax_adj', 'credit_application', 'vendor_credit_application', 'loan', 'qbopen-offset',
+  ],
+  // Quantity / value adjustments, opening quantities and inventory transfers.
+  inventory: ['item', 'item_opening', 'inventory_transfer'],
+  item_receipt: ['item_receipt', 'item_receipt_void', 'item_receipt_edit', 'item_receipt_claim'],
+  build_assembly: ['assembly_build', 'assembly_unbuild'],
   depreciation: ['fixed_asset'],
   sales_tax_payment: ['tax_agency'],
   cc_payment: ['cc-payment'],
@@ -828,9 +838,13 @@ const transferEntryIds = (companyId: string) =>
 /**
  * Entries posted from a bank-feed / imported-statement line (sourceRef 'bank_transaction:<id>'):
  * money out of the account ('out') shows as a Check, money in as a Deposit (resolveEntryNames).
+ * Reconciliation adjustments (sourceRef 'reconciliation:<id>', shared by the service charge and
+ * the interest of one reconciliation) are told apart by their line on the reconciled account:
+ * a credit is the service charge (QB records a Check), a debit the interest earned (a Deposit).
  */
 const bankFeedEntries = (companyId: string, dir: 'out' | 'in') =>
-  sql`(${journalEntries.sourceRef} LIKE 'bank_transaction:%' AND EXISTS (SELECT 1 FROM ${bankTransactions} WHERE ${bankTransactions.companyId} = ${companyId} AND ${bankTransactions.id}::text = split_part(${journalEntries.sourceRef}, ':', 2) AND ${bankTransactions.amount} ${dir === 'out' ? sql`< 0` : sql`> 0`}))`;
+  sql`((${journalEntries.sourceRef} LIKE 'bank_transaction:%' AND EXISTS (SELECT 1 FROM ${bankTransactions} WHERE ${bankTransactions.companyId} = ${companyId} AND ${bankTransactions.id}::text = split_part(${journalEntries.sourceRef}, ':', 2) AND ${bankTransactions.amount} ${dir === 'out' ? sql`< 0` : sql`> 0`}))
+    OR (${journalEntries.sourceRef} LIKE 'reconciliation:%' AND EXISTS (SELECT 1 FROM journal_entry_lines rl JOIN reconciliations rr ON rr.id::text = split_part(${journalEntries.sourceRef}, ':', 2) JOIN bank_accounts rb ON rb.id = rr.bank_account_id AND rb.company_id = ${companyId} WHERE rl.journal_entry_id = ${journalEntries.id} AND rl.account_id = rb.account_id AND ${dir === 'out' ? sql`rl.credit > 0` : sql`rl.debit > 0`})))`;
 
 function txnTypeCondition(t: TxnTypeKey, companyId: string): SQL {
   const prefixes = TXN_PREFIXES[t];
@@ -899,6 +913,21 @@ async function byIdChunks<T>(ids: string[], q: (slice: string[]) => PromiseLike<
   for (let i = 0; i < ids.length; i += ID_CHUNK) for (const r of await q(ids.slice(i, i + ID_CHUNK))) out.push(r);
   return out;
 }
+
+/**
+ * `column IN (ids)` with ONE bind parameter, whatever the number of ids: Postgres / PGlite bind
+ * at most 65,535 parameters per statement, and `inArray` binds one per id, so a report over a
+ * file with more documents than that (66,000 checks) failed with "bind message has … parameter
+ * formats". The ids travel as one comma-separated text value split back into a uuid[] (an index
+ * on the column is still used). Empty → false.
+ */
+export function inIds(column: SQL | AnyColumnLike, ids: readonly string[]): SQL {
+  if (ids.length === 0) return sql`false`;
+  for (const id of ids) if (!ANY_UUID_RE_STRICT.test(id)) throw validation('Invalid id in a report lookup.');
+  return sql`${column} = ANY(string_to_array(${ids.join(',')}, ',')::uuid[])`;
+}
+type AnyColumnLike = Parameters<typeof eq>[0];
+const ANY_UUID_RE_STRICT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * Resolve the QB "Name" and "Num" of journal entries from their source documents
@@ -1058,6 +1087,24 @@ export async function resolveEntryNames(
       feed.set(r.id, { payee: r.payee, out: Money.of(r.amount).isNegative() });
     }
   }
+  // Reconciliation adjustments: the service charge credits the reconciled account (a Check), the
+  // interest earned debits it (a Deposit). Both share the reconciliation's sourceRef.
+  const reconOut = new Map<string, boolean>();
+  const reconEntryIds = entries.filter((e) => e.sourceRef?.startsWith('reconciliation:')).map((e) => e.id);
+  for (let i = 0; i < reconEntryIds.length; i += 2000) {
+    const slice = reconEntryIds.slice(i, i + 2000);
+    const res = await ctx.db.execute(sql`
+      SELECT l.journal_entry_id AS entry_id, bool_or(COALESCE(l.credit, 0) > 0) AS out
+      FROM journal_entry_lines l
+      JOIN journal_entries e ON e.id = l.journal_entry_id
+      JOIN reconciliations r ON r.id::text = split_part(e.source_ref, ':', 2)
+      JOIN bank_accounts b ON b.id = r.bank_account_id
+      WHERE e.company_id = ${c} AND b.company_id = ${c} AND l.account_id = b.account_id
+        AND l.journal_entry_id = ANY(string_to_array(${slice.join(',')}, ',')::uuid[])
+      GROUP BY l.journal_entry_id`);
+    const rows = ((res as unknown as { rows?: unknown[] }).rows ?? []) as { entry_id: string; out: boolean | string }[];
+    for (const r of rows) reconOut.set(r.entry_id, r.out === true || r.out === 't');
+  }
   const taIds = ids('tax_agency');
   const agencyNames = new Map<string, string>();
   if (taIds.length) {
@@ -1185,6 +1232,11 @@ export async function resolveEntryNames(
         case 'tax_agency':
           if (id) res = { nameType: 'other', nameId: id, name: agencyNames.get(id) ?? '', num: e.reference };
           break;
+        case 'reconciliation': {
+          const out = reconOut.get(e.id);
+          if (out !== undefined) res = { ...res, txnType: out ? 'check' : 'deposit' };
+          break;
+        }
         case 'bank_transaction': {
           // Num stays blank: a feed line carries no check number, and the entry's reference is the
           // memo typed when it was added (bankCategorize) — that shows under Memo, not Num.
@@ -1236,6 +1288,11 @@ export interface GlLine {
   cleared: boolean;
   /** QB "Split": the other account of a two-line entry, or "-SPLIT-". */
   split: string;
+  /**
+   * Cash-basis lines of a bill / vendor credit: the Customer:Job of the document line they come
+   * from (QB keeps a line's Customer:Job on cash-basis reports). Read by costLineCustomers.
+   */
+  jobId?: string | null;
 }
 
 export interface GlLineFilter extends ActivityFilter {
@@ -1272,6 +1329,13 @@ export function glFilterFromParams(
   const f: GlLineFilter = { from: range.from, to: range.to };
   if (p.basis === 'cash') f.basis = 'cash';
   if (p.accountId) f.accountIds = accountWithDescendants(meta, p.accountId);
+  if (p.accountIds) {
+    const picked = new Set<string>();
+    for (const id of p.accountIds.split(',').map((x) => x.trim()).filter(Boolean)) {
+      if (meta.has(id)) for (const a of accountWithDescendants(meta, id)) picked.add(a);
+    }
+    f.accountIds = f.accountIds ? f.accountIds.filter((id) => picked.has(id)) : [...picked];
+  }
   if (p.classId) f.classId = p.classId;
   if (p.txnType) f.txnType = p.txnType;
   if (p.amountMin) f.amountMin = p.amountMin;
@@ -1599,6 +1663,10 @@ export async function costLineCustomers(ctx: ServiceContext, lines: GlLine[]): P
   const docs: Record<Kind, Set<string>> = { bill: new Set(), expense: new Set(), vendor_credit: new Set() };
   for (const l of lines) {
     if ((l.nameType === 'customer' && l.nameId) || !isPLSection(l.account.section)) continue;
+    if (l.jobId) {
+      out.set(l.lineId, l.jobId);
+      continue;
+    }
     const m = /^(bill|expense|vendor_credit):([0-9a-f-]{36})$/i.exec(l.sourceRef ?? '');
     if (!m) continue;
     docs[m[1] as Kind].add(m[2]);
@@ -1825,7 +1893,7 @@ async function applyCashBasisToGlLines(
       split,
     };
   });
-  let extra = synthetic;
+  let extra = await withCashBasisJobs(ctx, picked, synthetic);
   if (f.txnType) extra = extra.filter((l) => l.txnType === f.txnType);
   if (f.memo) {
     const needle = f.memo.toLowerCase();
@@ -1836,6 +1904,101 @@ async function applyCashBasisToGlLines(
     extra = extra.filter((l) => set.has(l.entryId));
   }
   return [...kept, ...extra].sort((x, y) => x.date.getTime() - y.date.getTime() || x.entryNumber - y.entryNumber);
+}
+
+/**
+ * Carry the Customer:Job of a bill's / vendor credit's document lines onto its cash-basis lines.
+ * The cash-basis ledger groups a document's P&L lines by account and class, so each synthetic
+ * line is matched to the document lines on its account (and class, when one matches): one job →
+ * the line takes it; several jobs → the line is split between them in proportion to their home
+ * amounts (cents to the largest share, so the pieces add up exactly). QB keeps a line's
+ * Customer:Job on cash-basis reports; Profit & Loss by Job (and its QuickZoom) read it.
+ */
+async function withCashBasisJobs(
+  ctx: ServiceContext,
+  picked: Awaited<ReturnType<typeof cashBasisLedger>>['adjustments'],
+  synthetic: GlLine[],
+): Promise<GlLine[]> {
+  const want: Record<'bill' | 'vendor_credit', Set<string>> = { bill: new Set(), vendor_credit: new Set() };
+  picked.forEach((a, i) => {
+    if (a.control || (a.doc.kind !== 'bill' && a.doc.kind !== 'vendor_credit')) return;
+    if (!isPLSection(synthetic[i].account.section)) return;
+    want[a.doc.kind].add(a.doc.id);
+  });
+  if (want.bill.size === 0 && want.vendor_credit.size === 0) return synthetic;
+  type DocLine = { accountId: string | null; classId: string | null; customerId: string | null; amount: Decimal };
+  const byDoc = new Map<string, DocLine[]>();
+  for (const kind of ['bill', 'vendor_credit'] as const) {
+    const ids = [...want[kind]];
+    for (let i = 0; i < ids.length; i += 2000) {
+      const chunk = ids.slice(i, i + 2000);
+      const rows =
+        kind === 'bill'
+          ? await ctx.db
+              .select({ id: billLines.id, docId: billLines.billId, accountId: billLines.accountId, classId: billLines.classId, customerId: billLines.customerId, amount: billLines.amount, rate: bills.exchangeRate })
+              .from(billLines)
+              .innerJoin(bills, eq(billLines.billId, bills.id))
+              .where(and(eq(bills.companyId, ctx.companyId), inIds(billLines.billId, chunk)))
+          : await ctx.db
+              .select({ id: vendorCreditLines.id, docId: vendorCreditLines.vendorCreditId, accountId: vendorCreditLines.accountId, classId: vendorCreditLines.classId, customerId: vendorCreditLines.customerId, amount: vendorCreditLines.amount, rate: vendorCredits.exchangeRate })
+              .from(vendorCreditLines)
+              .innerJoin(vendorCredits, eq(vendorCreditLines.vendorCreditId, vendorCredits.id))
+              .where(and(eq(vendorCredits.companyId, ctx.companyId), inIds(vendorCreditLines.vendorCreditId, chunk)));
+      if (!rows.some((r) => r.customerId)) continue;
+      const rateOf = new Map(rows.map((r) => [r.docId, r.rate] as const));
+      const home = await homeAmountsByLine(ctx, kind, [...rateOf].map(([id, rate]) => ({ id, rate })));
+      for (const r of rows) {
+        const k = `${kind}:${r.docId}`;
+        const list = byDoc.get(k) ?? [];
+        list.push({ accountId: r.accountId, classId: r.classId, customerId: r.customerId, amount: (home.get(r.id) ?? Money.of(r.amount)).abs() });
+        byDoc.set(k, list);
+      }
+    }
+  }
+  if (byDoc.size === 0) return synthetic;
+  const out: GlLine[] = [];
+  synthetic.forEach((l, i) => {
+    const a = picked[i];
+    const docLines = a.control ? undefined : byDoc.get(`${a.doc.kind}:${a.doc.id}`);
+    if (!docLines || !isPLSection(l.account.section)) {
+      out.push(l);
+      return;
+    }
+    const onAccount = docLines.filter((d) => d.accountId === l.accountId);
+    const sameClass = onAccount.filter((d) => (d.classId ?? null) === (l.classId ?? null));
+    const candidates = sameClass.length ? sameClass : onAccount;
+    const shares = new Map<string, Decimal>();
+    for (const c of candidates) shares.set(c.customerId ?? '', (shares.get(c.customerId ?? '') ?? Money.zero()).plus(c.amount));
+    const jobs = [...shares].filter(([, v]) => !v.isZero());
+    if (jobs.length === 0 || (jobs.length === 1 && jobs[0][0] === '')) {
+      out.push(l);
+      return;
+    }
+    if (jobs.length === 1) {
+      out.push({ ...l, jobId: jobs[0][0] });
+      return;
+    }
+    // Several jobs on one account: split the line by their share (largest share takes the cents).
+    const total = jobs.reduce((s2, [, v]) => s2.plus(v), Money.zero());
+    jobs.sort((x, y) => y[1].comparedTo(x[1]));
+    let rest = l.amount;
+    jobs.forEach(([job, v], k) => {
+      const part = k === jobs.length - 1 ? rest : Money.round2(l.amount.times(v).dividedBy(total));
+      rest = rest.minus(part);
+      const debit = part.greaterThan(0) ? part : Money.zero();
+      const credit = part.lessThan(0) ? part.negated() : Money.zero();
+      out.push({
+        ...l,
+        lineId: `${l.lineId}:${k}`,
+        jobId: job || null,
+        debit,
+        credit,
+        amount: part,
+        natural: naturalAmount(l.account.section, debit, credit),
+      });
+    });
+  });
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -1892,6 +2055,15 @@ export interface DetailLayoutOptions {
  * A "~" sentinel doesn't work: localeCompare orders punctuation before letters.
  */
 const blankLast = (s: string | null | undefined) => (s ? `0|${s.toLowerCase()}` : '1|');
+
+/**
+ * The payee a detail line is grouped under (QB "Total by Name"): the list name it carries, or a
+ * free-text payee by its own text, '' when it has none. Shared by Expenses by Vendor Summary,
+ * its Detail and its explanations so every row ties.
+ */
+export function payeeGroupOf(l: GlLine): { key: string; label: string; sort: string } {
+  return groupKeyOf(l, 'name');
+}
 
 function groupKeyOf(l: GlLine, g: GroupKey): { key: string; label: string; sort: string } {
   switch (g) {

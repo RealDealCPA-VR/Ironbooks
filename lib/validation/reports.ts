@@ -38,6 +38,8 @@ export const TXN_TYPE_KEYS = [
   'journal',
   'inventory',
   'item_receipt',
+  /** Build / unbuild assembly value moves (QB "Build Assembly"). */
+  'build_assembly',
   'depreciation',
   'sales_tax_payment',
   'cc_payment',
@@ -59,6 +61,16 @@ export const reportParamsSchema = z
     /** Balance sheet comparison: the earlier as-of date (defaults to one year / one month earlier). */
     priorAsOf: zDateStr.optional(),
     accountId: zId.optional(),
+    /**
+     * Several accounts (QB "Account: Selected accounts"), comma-separated ids — each with its
+     * sub-accounts. QuickZoom of a line that adds up several accounts (Statement of Cash Flows
+     * Inventory / Net cash) lists exactly those accounts.
+     */
+    accountIds: z
+      .string()
+      .max(37 * 500, 'too many accounts')
+      .refine((s) => s.split(',').every((x) => UUID_RE.test(x.trim())), 'must be a list of account ids')
+      .optional(),
     /** Restrict detail to accounts of one P&L / balance-sheet section (sectionForAccount key). */
     section: z.string().max(40).optional(),
     nameId: zId.optional(),

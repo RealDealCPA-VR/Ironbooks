@@ -57,6 +57,7 @@ import {
   type GlLineFilter,
   type PLSection,
   type SectionKey,
+  payeeGroupOf,
 } from './reportEngine';
 import { jobBucketOf, previousPeriod, retainedEarningsAccount, shiftMonths, shiftYears } from './reportsStandard';
 import { fiscalYearStartFor } from './reports';
@@ -736,7 +737,8 @@ const expensesFamily: Family = {
       const m = /^ebv:(.+)$/.exec(row.id);
       if (!m) throw validation('This line has no transactions behind it.');
       const id = m[1] === 'none' ? '' : m[1];
-      pick = (l) => (l.nameType === 'vendor' && l.nameId ? l.nameId : '') === id;
+      // The summary's own grouping (payeeGroupOf), so every row explains to exactly its amount.
+      pick = (l) => payeeGroupOf(l).key === id;
     }
     return { items: itemsFrom(got.lines, (l) => (pick(l) ? l.natural : null)), incomplete: got.truncated };
   },

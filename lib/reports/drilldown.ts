@@ -165,7 +165,7 @@ export interface ReportSummaryResult {
 
 /** Report option keys carried in the URL (mirrors StdReportView's PARAM_KEYS). */
 export const REPORT_PARAM_KEYS = [
-  'from', 'to', 'asOf', 'priorAsOf', 'accountId', 'section', 'nameId', 'customerId', 'vendorId', 'employeeId', 'itemId', 'jobId',
+  'from', 'to', 'asOf', 'priorAsOf', 'accountId', 'accountIds', 'section', 'nameId', 'customerId', 'vendorId', 'employeeId', 'itemId', 'jobId',
   // Profit & Loss by Job cell QuickZoom: that Customer:Job column's lines (named or job-costed).
   'customerJobId',
   'classId', 'budgetId', 'txnType', 'amountMin', 'amountMax', 'cleared', 'memo', 'number', 'sortBy', 'sortDir',

@@ -69,6 +69,8 @@ import {
   type GlLine,
   type NameType,
   type SectionKey,
+  payeeGroupOf,
+  inIds,
 } from './reportEngine';
 import { rangeLabel } from './reportsStandard';
 import { docRef } from './docNumbers';
@@ -327,7 +329,7 @@ export async function billsAndAppliedPayments(ctx: ServiceContext, p: ReportPara
         })
         .from(billPaymentApplications)
         .innerJoin(billPayments, eq(billPaymentApplications.billPaymentId, billPayments.id))
-        .where(and(inArray(billPaymentApplications.billId, ids), isNull(billPayments.voidedAt)))
+        .where(and(inIds(billPaymentApplications.billId, ids), isNull(billPayments.voidedAt)))
     : [];
   const entryIds = await entryIdsForSourceRefs(ctx, ids.map((i) => `bill:${i}`));
   const appsByBill = new Map<string, typeof apps>();
@@ -528,7 +530,7 @@ export async function salesLines(
   const c = ctx.companyId;
   const out: SalesLine[] = [];
   const invConds: SQL[] = [eq(invoices.companyId, c), notInArray(invoices.status, ['void', 'draft']), SALES_LINE_ONLY];
-  if (scope) invConds.push(scope.invoiceIds.length ? inArray(invoices.id, scope.invoiceIds) : sql`false`);
+  if (scope) invConds.push(inIds(invoices.id, scope.invoiceIds));
   else invConds.push(gte(invoices.date, range.from), lte(invoices.date, range.to));
   if (filter.customerId) invConds.push(eq(invoices.customerId, filter.customerId));
   if (filter.itemId) invConds.push(eq(invoiceLines.itemId, filter.itemId));
@@ -559,7 +561,7 @@ export async function salesLines(
   // line: it is posted as a debit to income, so the sales reports show it as a negative line.
   if (!filter.itemId) {
     const discConds: SQL[] = [eq(invoices.companyId, c), notInArray(invoices.status, ['void', 'draft']), sql`${invoices.discount} <> 0`];
-    if (scope) discConds.push(scope.invoiceIds.length ? inArray(invoices.id, scope.invoiceIds) : sql`false`);
+    if (scope) discConds.push(inIds(invoices.id, scope.invoiceIds));
     else discConds.push(gte(invoices.date, range.from), lte(invoices.date, range.to));
     if (filter.customerId) discConds.push(eq(invoices.customerId, filter.customerId));
     if (filter.classId) discConds.push(eq(invoices.classId, filter.classId));
@@ -598,7 +600,7 @@ export async function salesLines(
   }
   if (!filter.classId) {
     const cmConds: SQL[] = [eq(creditMemos.companyId, c), ne(creditMemos.status, 'void'), SALES_LINE_ONLY];
-    if (scope) cmConds.push(scope.creditMemoIds.length ? inArray(creditMemos.id, scope.creditMemoIds) : sql`false`);
+    if (scope) cmConds.push(inIds(creditMemos.id, scope.creditMemoIds));
     else cmConds.push(gte(creditMemos.date, range.from), lte(creditMemos.date, range.to));
     if (filter.customerId) cmConds.push(eq(creditMemos.customerId, filter.customerId));
     if (filter.itemId) cmConds.push(eq(creditMemoLines.itemId, filter.itemId));
@@ -936,7 +938,7 @@ export async function salesByItemSummary(ctx: ServiceContext, p: ReportParams): 
       ? await ctx.db
           .select({ id: items.id, name: items.name, type: items.type, averageCost: items.averageCost })
           .from(items)
-          .where(and(eq(items.companyId, ctx.companyId), inArray(items.id, ids)))
+          .where(and(eq(items.companyId, ctx.companyId), inIds(items.id, ids)))
       : []
     ).map((i) => [i.id, i]),
   );
@@ -1114,13 +1116,15 @@ export async function expensesByVendorSummary(ctx: ServiceContext, p: ReportPara
   f.sections = EXPENSE_SECTIONS;
   f.excludeClose = true;
   const { lines, truncated } = await fetchGlLines(ctx, meta, { ...f, limit: 50000 });
-  const byVendor = new Map<string, { name: string; total: Decimal }>();
+  // One row per payee, grouped exactly like Expenses by Vendor Detail ("Total by Name"): vendors,
+  // employees, other names and free-text payees each get their own row (they were all lumped into
+  // "(no vendor)" while the Detail listed them by payee, so the two reports did not agree).
+  const byVendor = new Map<string, { name: string; total: Decimal; nameId: string | null; nameType: string | null }>();
   for (const l of lines) {
-    const key = l.nameType === 'vendor' && l.nameId ? l.nameId : '';
-    const name = key ? l.name : '(no vendor)';
-    const cur = byVendor.get(key) ?? { name, total: Money.zero() };
+    const g = payeeGroupOf(l);
+    const cur = byVendor.get(g.key) ?? { name: g.key ? g.label : '(no name)', total: Money.zero(), nameId: l.nameId, nameType: l.nameType };
     cur.total = cur.total.plus(l.natural);
-    byVendor.set(key, cur);
+    byVendor.set(g.key, cur);
   }
   let total = Money.zero();
   const rows: StdRow[] = [...byVendor.entries()]
@@ -1133,7 +1137,15 @@ export async function expensesByVendorSummary(ctx: ServiceContext, p: ReportPara
         depth: 0,
         kind: 'data' as const,
         cells: { label: v.name, amount: amt(v.total) },
-        href: id ? stdHref('expenses-by-vendor-detail', { vendorId: id, classId: p.classId, from: dayStr(from), to: dayStr(to), basis: p.basis === 'cash' ? 'cash' : undefined }) : null,
+        href: v.nameId
+          ? stdHref('expenses-by-vendor-detail', {
+              ...(v.nameType === 'vendor' ? { vendorId: v.nameId } : { nameId: v.nameId }),
+              classId: p.classId,
+              from: dayStr(from),
+              to: dayStr(to),
+              basis: p.basis === 'cash' ? 'cash' : undefined,
+            })
+          : null,
       };
     });
   rows.push({ id: 'ebv:grand', depth: 0, kind: 'grand', cells: { label: 'TOTAL', amount: amt(total) } });

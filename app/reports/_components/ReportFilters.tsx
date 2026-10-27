@@ -68,6 +68,7 @@ export const TXN_TYPES: [string, string][] = [
   ['journal', 'General Journal'],
   ['inventory', 'Inventory Adjustment'],
   ['item_receipt', 'Item Receipt'],
+  ['build_assembly', 'Build Assembly'],
   ['depreciation', 'Depreciation'],
   ['sales_tax_payment', 'Sales Tax Payment'],
   ['cc_payment', 'Credit Card Payment'],

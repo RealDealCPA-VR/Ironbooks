@@ -10,6 +10,7 @@ import { getServerContext } from '@/lib/context';
 import { openItemStatement } from '@/lib/services/statements';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus } from '@/lib/routeErrors';
+import { parseDateInput } from '@/lib/validation/helpers';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -31,8 +32,9 @@ export async function GET(req: NextRequest) {
     let asOf: Date | undefined; // omitted = today (the company's calendar day, statements.ts)
     const asOfStr = searchParams.get('asOf');
     if (asOfStr) {
-      asOf = new Date(asOfStr + 'T00:00:00.000Z');
-      if (isNaN(asOf.getTime())) {
+      // A real calendar day only: new Date('2026-02-30T00:00:00Z') rolled over to March 2.
+      asOf = /^\d{4}-\d{2}-\d{2}$/.test(asOfStr) ? (parseDateInput(asOfStr) ?? undefined) : undefined;
+      if (!asOf) {
         return NextResponse.json({ error: 'Invalid asOf date.' }, { status: 400 });
       }
     }

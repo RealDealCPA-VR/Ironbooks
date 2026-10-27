@@ -998,7 +998,10 @@ export async function statementOfCashFlows(ctx: ServiceContext, p: ReportParams)
   rows.push({ id: 'scf:adj', parentId: 'scf:op', depth: 1, kind: 'section', cells: { label: 'Adjustments to reconcile Net Income to net cash provided by operations:' } });
   const adj: [string, string, string, string | null][] = [];
   if (!Money.of(cf.operating.changeInAR).isZero()) adj.push(['scf:ar', 'Accounts Receivable', cf.operating.changeInAR, stdHref('transaction-detail-by-account', { section: 'ar', ...q })]);
-  if (!Money.of(cf.operating.changeInInventory).isZero()) adj.push(['scf:inv', 'Inventory Asset', cf.operating.changeInInventory, stdHref('transaction-detail-by-account', { section: 'other_current_asset', ...q })]);
+  // QuickZoom to exactly the accounts a line adds up: the inventory accounts (not every other
+  // current asset), and for Net cash the cash accounts (bank AND Undeposited Funds, not banks only).
+  const idsWhere = (pred: (a: AccountMeta) => boolean) => [...meta.values()].filter(pred).map((a) => a.id).join(',');
+  if (!Money.of(cf.operating.changeInInventory).isZero()) adj.push(['scf:inv', 'Inventory Asset', cf.operating.changeInInventory, stdHref('transaction-detail-by-account', { accountIds: idsWhere((a) => a.type === 'asset' && a.subtype === 'inventory'), ...q })]);
   if (!Money.of(cf.operating.changeInAP).isZero()) adj.push(['scf:ap', 'Accounts Payable', cf.operating.changeInAP, stdHref('transaction-detail-by-account', { section: 'ap', ...q })]);
   for (const l of cf.operating.otherChanges) adj.push([`scf:o:${l.accountId}`, meta.get(l.accountId)?.fullName ?? l.name, l.amount, zoomAcct(l.accountId)]);
   for (const [id, label, v, href] of adj) line(id, label, v, href, 2, 'data', 'scf:op');
@@ -1009,7 +1012,7 @@ export async function statementOfCashFlows(ctx: ServiceContext, p: ReportParams)
   section('scf:fin', 'FINANCING ACTIVITIES');
   for (const l of cf.financing.lines) line(`scf:f:${l.accountId}`, meta.get(l.accountId)?.fullName ?? l.name, l.amount, zoomAcct(l.accountId), 1, 'data', 'scf:fin');
   line('scf:fintotal', 'Net cash provided by Financing Activities', cf.financing.total, null, 0, 'total');
-  line('scf:net', 'Net cash increase for period', cf.netCashChange, stdHref('transaction-detail-by-account', { section: 'bank', ...q }), 0, 'total');
+  line('scf:net', 'Net cash increase for period', cf.netCashChange, stdHref('transaction-detail-by-account', { accountIds: idsWhere((a) => isCashAccount(a)), ...q }), 0, 'total');
   line('scf:begin', 'Cash at beginning of period', toAmountString(cashStart), null, 0, 'data');
   line('scf:end', 'Cash at end of period', toAmountString(cashStart.plus(Money.of(cf.netCashChange))), null, 0, 'grand');
   const ties = Money.eq(cf.netCashChange, cf.cashAccountsChange);

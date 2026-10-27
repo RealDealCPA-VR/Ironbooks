@@ -45,6 +45,8 @@ import { unappliedCustomerPayments } from './customerCredits';
 import { vendorCreditHomeByBill, vendorCreditRefundsAfter } from './vendorCreditsFx';
 import { foreignInvoiceHomeOpen } from './fxSubledger';
 import { foreignCode, homeCode } from './fxLines';
+import { inIds } from './reportEngine';
+import { bankAccounts, bankTransactions } from '@/lib/db/schema';
 
 /**
  * Credit-memo refunds dated AFTER the cutoff, per memo id. creditMemos.unapplied is today's
@@ -1889,7 +1891,8 @@ function homeValue(amount: string, rate: string | null | undefined) {
 }
 
 export interface CheckDetailRow {
-  source: 'expense' | 'bill_payment' | 'payment_check' | 'paycheck';
+  /** 'bank_transaction': money out of a bank account added from the bank feed / a statement. */
+  source: 'expense' | 'bill_payment' | 'payment_check' | 'paycheck' | 'bank_transaction';
   id: string;
   date: string;
   checkNumber: string | null;
@@ -1955,7 +1958,7 @@ export async function checkDetail(
         })
         .from(expenseLines)
         .innerJoin(accounts, eq(expenseLines.accountId, accounts.id))
-        .where(inArray(expenseLines.expenseId, expIds))
+        .where(inIds(expenseLines.expenseId, expIds))
     : [];
   const expLinesById = new Map<string, CheckDetailLine[]>();
   for (const l of [...expLineRows].sort((a, b) => a.lineOrder - b.lineOrder)) {
@@ -2001,7 +2004,7 @@ export async function checkDetail(
         })
         .from(billPaymentApplications)
         .innerJoin(bills, eq(billPaymentApplications.billId, bills.id))
-        .where(inArray(billPaymentApplications.billPaymentId, bpIds))
+        .where(inIds(billPaymentApplications.billPaymentId, bpIds))
     : [];
   const bpLinesById = new Map<string, CheckDetailLine[]>();
   for (const a of bpAppRows) {
@@ -2042,6 +2045,19 @@ export async function checkDetail(
     })),
     ...(await paymentCheckDetailRows(ctx, range)),
     ...(await paycheckDetailRows(ctx, range)),
+    ...(await bankFeedRows(ctx, 'out', range)).map((f): CheckDetailRow => ({
+      source: 'bank_transaction',
+      id: f.id,
+      date: f.date.toISOString(),
+      checkNumber: null,
+      payee: f.payee,
+      bankAccountId: f.bankAccountId,
+      bankAccountName: f.bankAccountName,
+      amount: toAmountString(f.amount),
+      homeAmount: toAmountString(f.homeAmount),
+      voided: f.voided,
+      lines: f.lines.map((l) => ({ description: l.memo, detail: l.accountName, amount: toAmountString(l.amount) })),
+    })),
   ];
   rows.sort(
     (a, b) => a.date.localeCompare(b.date) || (a.checkNumber ?? '').localeCompare(b.checkNumber ?? ''),
@@ -2184,9 +2200,13 @@ export interface DepositDetailLine {
   /** Customer behind the deposited payment, when the line came from a received payment. */
   customerName: string | null;
   amount: string;
+  /** The "From Account" of the line when it is not a received payment (bank-feed deposits). */
+  accountName?: string | null;
 }
 
 export interface DepositDetailRow {
+  /** 'bank_transaction': money into a bank account added from the bank feed / a statement. */
+  source?: 'deposit' | 'bank_transaction';
   id: string;
   date: string;
   accountId: string;
@@ -2246,7 +2266,7 @@ export async function depositDetail(
         .from(depositLines)
         .leftJoin(paymentsReceived, eq(depositLines.paymentId, paymentsReceived.id))
         .leftJoin(customers, eq(paymentsReceived.customerId, customers.id))
-        .where(inArray(depositLines.depositId, depIds))
+        .where(inIds(depositLines.depositId, depIds))
     : [];
   // Lines that are not a received payment carry the deposit service's own codes in their
   // description ('salesReceipt:<id>', 'invoicePayment:<id>', 'cashback:<account id>') — they were
@@ -2266,7 +2286,7 @@ export async function depositDetail(
       .select({ id: salesReceipts.id, num: salesReceipts.receiptNumber, ref: salesReceipts.refNumber, customerName: customers.displayName })
       .from(salesReceipts)
       .leftJoin(customers, eq(salesReceipts.customerId, customers.id))
-      .where(and(eq(salesReceipts.companyId, ctx.companyId), inArray(salesReceipts.id, receiptIds)))) {
+      .where(and(eq(salesReceipts.companyId, ctx.companyId), inIds(salesReceipts.id, receiptIds)))) {
       docOf.set(`${RECEIPT_LINE_PREFIX}${r.id}`, { label: `Sales Receipt #${docRef(r.ref, r.num)}`, customerName: r.customerName });
     }
   }
@@ -2275,7 +2295,7 @@ export async function depositDetail(
       .select({ id: invoices.id, num: invoices.invoiceNumber, ref: invoices.refNumber, customerName: customers.displayName })
       .from(invoices)
       .innerJoin(customers, eq(invoices.customerId, customers.id))
-      .where(and(eq(invoices.companyId, ctx.companyId), inArray(invoices.id, invoiceIds)))) {
+      .where(and(eq(invoices.companyId, ctx.companyId), inIds(invoices.id, invoiceIds)))) {
       docOf.set(`${INVOICE_PAYMENT_LINE_PREFIX}${r.id}`, { label: `Payment on Invoice #${docRef(r.ref, r.num)}`, customerName: r.customerName });
     }
   }
@@ -2283,7 +2303,7 @@ export async function depositDetail(
     for (const a of await ctx.db
       .select({ id: accounts.id, name: accounts.name })
       .from(accounts)
-      .where(and(eq(accounts.companyId, ctx.companyId), inArray(accounts.id, cashBackIds)))) {
+      .where(and(eq(accounts.companyId, ctx.companyId), inIds(accounts.id, cashBackIds)))) {
       docOf.set(`${CASHBACK_LINE_PREFIX}${a.id}`, { label: `Cash back to ${a.name}`, customerName: null });
     }
   }
@@ -2306,6 +2326,7 @@ export async function depositDetail(
     // Home currency: a deposit to a foreign bank account counts at the home value it posted.
     if (!voided) total = total.plus(r.homeTotal != null ? Money.of(r.homeTotal) : homeValue(r.total, r.rate));
     return {
+      source: 'deposit' as const,
       id: r.id,
       date: r.date.toISOString(),
       accountId: r.accountId,
@@ -2317,12 +2338,98 @@ export async function depositDetail(
     };
   });
 
+  // Money into a bank account added from the bank feed / an imported statement (QB "Add" in Bank
+  // Feeds records a Deposit): every GL report lists these as Deposits, so Deposit Detail does too.
+  for (const f of await bankFeedRows(ctx, 'in', range)) {
+    if (!f.voided) total = total.plus(f.homeAmount);
+    rows.push({
+      source: 'bank_transaction',
+      id: f.id,
+      date: f.date.toISOString(),
+      accountId: f.bankAccountId,
+      accountName: f.bankAccountName,
+      memo: f.memo,
+      total: toAmountString(f.amount),
+      voided: f.voided,
+      lines: f.lines.map((l) => ({ description: l.memo, customerName: f.payee, amount: toAmountString(l.amount.negated()), accountName: l.accountName })),
+    });
+  }
+  rows.sort((a, b) => a.date.localeCompare(b.date));
+
   return {
     from: range?.from?.toISOString(),
     to: range?.to?.toISOString(),
     rows,
     total: toAmountString(total),
   };
+}
+
+/**
+ * Bank-feed / imported-statement lines added to a bank account's register (bankCategorize.ts,
+ * sourceRef 'bank_transaction:<id>'): 'out' = money out (a Check), 'in' = money in (a Deposit).
+ * Amount = the feed line (in the account's currency), homeAmount = what the bank line posted, and
+ * the lines are the entry's other lines (signed debit - credit, home currency).
+ */
+async function bankFeedRows(ctx: ServiceContext, dir: 'out' | 'in', range?: { from?: Date; to?: Date }) {
+  const conds = [
+    eq(journalEntries.companyId, ctx.companyId),
+    ne(journalEntries.status, 'draft'),
+    sql`${journalEntries.sourceRef} LIKE 'bank_transaction:%'`,
+    dir === 'out' ? sql`${bankTransactions.amount} < 0` : sql`${bankTransactions.amount} > 0`,
+  ];
+  if (range?.from) conds.push(gte(journalEntries.date, range.from));
+  if (range?.to) conds.push(lte(journalEntries.date, range.to));
+  const heads = await ctx.db
+    .select({
+      entryId: journalEntries.id,
+      date: journalEntries.date,
+      status: journalEntries.status,
+      reference: journalEntries.reference,
+      btId: bankTransactions.id,
+      payee: bankTransactions.payee,
+      description: bankTransactions.description,
+      amount: bankTransactions.amount,
+      bankAccountId: bankAccounts.accountId,
+      bankAccountName: accounts.name,
+    })
+    .from(journalEntries)
+    .innerJoin(bankTransactions, and(eq(bankTransactions.companyId, ctx.companyId), sql`${bankTransactions.id}::text = split_part(${journalEntries.sourceRef}, ':', 2)`))
+    .innerJoin(bankAccounts, eq(bankTransactions.bankAccountId, bankAccounts.id))
+    .innerJoin(accounts, eq(bankAccounts.accountId, accounts.id))
+    .where(and(...conds))
+    .orderBy(asc(journalEntries.date), asc(journalEntries.entryNumber));
+  const entryIds = heads.map((h) => h.entryId);
+  const linesByEntry = new Map<string, { accountId: string; accountName: string; memo: string | null; amount: ReturnType<typeof Money.zero> }[]>();
+  for (let i = 0; i < entryIds.length; i += 5000) {
+    for (const l of await ctx.db
+      .select({ entryId: journalEntryLines.journalEntryId, accountId: journalEntryLines.accountId, accountName: accounts.name, memo: journalEntryLines.memo, debit: journalEntryLines.debit, credit: journalEntryLines.credit })
+      .from(journalEntryLines)
+      .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
+      .where(inIds(journalEntryLines.journalEntryId, entryIds.slice(i, i + 5000)))
+      .orderBy(asc(journalEntryLines.createdAt), asc(journalEntryLines.id))) {
+      const list = linesByEntry.get(l.entryId) ?? [];
+      list.push({ accountId: l.accountId, accountName: l.accountName, memo: l.memo, amount: Money.sub(l.debit ?? 0, l.credit ?? 0) });
+      linesByEntry.set(l.entryId, list);
+    }
+  }
+  return heads.map((h) => {
+    const lines = linesByEntry.get(h.entryId) ?? [];
+    const bankSide = lines.filter((l) => l.accountId === h.bankAccountId).reduce((sum, l) => sum.plus(l.amount), Money.zero()).abs();
+    const memo = (h.reference ?? '').trim() || null;
+    return {
+      id: h.btId,
+      entryId: h.entryId,
+      date: h.date,
+      payee: h.payee?.trim() || h.description?.trim() || null,
+      memo,
+      bankAccountId: h.bankAccountId,
+      bankAccountName: h.bankAccountName,
+      amount: Money.of(h.amount).abs(),
+      homeAmount: bankSide,
+      voided: h.status === 'void',
+      lines: lines.filter((l) => l.accountId !== h.bankAccountId).map((l) => ({ ...l, memo: l.memo && l.memo !== memo ? l.memo : null })),
+    };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -2386,7 +2493,7 @@ export async function salesByItem(
     ? await ctx.db
         .select({ id: items.id, name: items.name, sku: items.sku, type: items.type })
         .from(items)
-        .where(and(eq(items.companyId, ctx.companyId), inArray(items.id, itemIds)))
+        .where(and(eq(items.companyId, ctx.companyId), inIds(items.id, itemIds)))
     : [];
   const itemById = new Map(itemRows.map((i) => [i.id, i]));
 
@@ -2480,7 +2587,7 @@ export async function purchasesByItem(
     for (const r of await ctx.db
       .select({ id: items.id, sku: items.sku })
       .from(items)
-      .where(and(eq(items.companyId, ctx.companyId), inArray(items.id, ids)))) {
+      .where(and(eq(items.companyId, ctx.companyId), inIds(items.id, ids)))) {
       skus.set(r.id, r.sku);
     }
   }
