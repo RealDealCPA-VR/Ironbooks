@@ -10,7 +10,8 @@
  *    numbers) removed. Never amounts, dates, accounts, customers or anything else.
  *  - Every request goes through policyFetch (purpose 'vendor-lookup'), so Offline mode, the
  *    machine-wide ceiling and the outbound activity log all apply.
- *  - Answers (including "no results") are cached per company + name for a day; a failure
+ *  - Answers (including "no results") are cached per company + name for a day (at most 500
+ *    names, least recently used forgotten first); a failure
  *    (blocked, unreachable, timeout) is just "nothing known" and is retried next time.
  *
  * The returned summary is untrusted web text: callers pass it to the AI as reference data only.
@@ -28,7 +29,34 @@ export interface VendorFacts {
 }
 
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+/**
+ * Most names kept (about 2 KB each). The cache lives as long as the desktop process; without a
+ * bound every distinct payee ever looked up stayed in memory. Least recently used go first.
+ */
+const DEFAULT_CACHE_LIMIT = 500;
+let cacheLimit = DEFAULT_CACHE_LIMIT;
 const cache = new Map<string, { at: number; facts: VendorFacts | null }>();
+
+/** Tests: a smaller bound (null restores the default). */
+export function setVendorLookupCacheLimit(limit: number | null): void {
+  cacheLimit = limit != null && limit > 0 ? Math.floor(limit) : DEFAULT_CACHE_LIMIT;
+  trimCache();
+}
+
+/** Names currently cached (tests). */
+export function vendorLookupCacheSize(): number {
+  return cache.size;
+}
+
+/** Drop expired answers, then the least recently used ones beyond the bound (Map keeps use order). */
+function trimCache(now = Date.now()): void {
+  for (const [k, v] of cache) if (now - v.at >= CACHE_TTL_MS) cache.delete(k);
+  while (cache.size > cacheLimit) {
+    const oldest = cache.keys().next().value;
+    if (oldest === undefined) break;
+    cache.delete(oldest);
+  }
+}
 
 /**
  * The part of a bank payee that is safe and useful to search: the business name. Drops store
@@ -64,7 +92,12 @@ export async function lookupVendor(
 
   const key = `${ctx.companyId}|${query.toLowerCase()}`;
   const hit = cache.get(key);
-  if (hit && Date.now() - hit.at < CACHE_TTL_MS) return hit.facts;
+  if (hit && Date.now() - hit.at < CACHE_TTL_MS) {
+    // Most recently used moves to the end, so trimming forgets the names not looked up lately.
+    cache.delete(key);
+    cache.set(key, hit);
+    return hit.facts;
+  }
 
   let facts: VendorFacts | null = null;
   try {
@@ -108,6 +141,8 @@ export async function lookupVendor(
   } catch {
     return null; // blocked, unreachable, timed out or not JSON: nothing known, try again next time
   }
+  cache.delete(key);
   cache.set(key, { at: Date.now(), facts });
+  trimCache();
   return facts;
 }

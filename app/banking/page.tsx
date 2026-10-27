@@ -24,6 +24,7 @@ import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/dates';
 import { StatementReview, type StatementExtract, type ReviewedStatement } from '@/components/StatementReview';
 import { usePreferences } from '@/lib/usePreferences';
+import { openBankFileWithDialog, readBankFileText, type OpenFileBridge } from '@/lib/bankFileClient';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -398,14 +399,10 @@ function ColumnPicker({
 // Main page
 // ---------------------------------------------------------------------------
 
-declare global {
-  interface Window {
-    bookkeeper?: {
-      openFile?: (opts?: { filters?: { name: string; extensions: string[] }[] }) => Promise<
-        { content: string; filename: string } | null
-      >;
-    };
-  }
+/** The desktop bridge's file dialog (electron/preload.js), when running in the desktop app. */
+function desktopFileBridge(): OpenFileBridge | undefined {
+  if (typeof window === 'undefined') return undefined;
+  return (window as unknown as { bookkeeper?: OpenFileBridge }).bookkeeper;
 }
 
 /** OFX / QBO / CSV are text files; a statement (PDF or scan) and Excel are read on the server. */
@@ -690,17 +687,11 @@ export default function BankingPage() {
 
   // Electron file picker (browser <input type=file> fallback below)
   async function handleOpenFile() {
-    // .qfx is accepted everywhere .ofx is.
-    const extensions: Record<string, string[]> = {
-      ofx: ['ofx', 'qfx'],
-      qbo: ['qbo'],
-      csv: ['csv'],
-    };
-    // Binary files (PDF, images, Excel) are read as bytes through the file chooser.
-    if (window.bookkeeper?.openFile && !BINARY_KINDS.includes(importFileType)) {
-      const result = await window.bookkeeper.openFile({
-        filters: [{ name: 'Bank file', extensions: extensions[importFileType] ?? ['*'] }],
-      });
+    // Binary files (PDF, images, Excel) are read as bytes through the file chooser. The desktop
+    // dialog takes the filters list itself and answers { filePath, content } (lib/bankFileClient).
+    const bridge = desktopFileBridge();
+    if (bridge?.openFile && !BINARY_KINDS.includes(importFileType)) {
+      const result = await openBankFileWithDialog(bridge, importFileType);
       if (result) applyLoadedFile(result.content, result.filename);
     } else {
       importFileRef.current?.click();
@@ -717,7 +708,9 @@ export default function BankingPage() {
       return;
     }
     try {
-      const text = await file.text();
+      // Banks often export Windows-1252: decode the bytes like the desktop dialog does, so
+      // accented payees survive (file.text() always reads UTF-8).
+      const text = await readBankFileText(file);
       applyLoadedFile(text, file.name);
     } catch {
       toast('Could not read that file.', 'danger');

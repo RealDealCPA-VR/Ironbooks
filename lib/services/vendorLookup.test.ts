@@ -11,7 +11,7 @@ import { users, companies } from '@/lib/db/schema';
 import { decideOutbound, normalizeLookupUrl, normalizePolicy } from '@/lib/net/policy';
 import type { ServiceContext } from './_base';
 import { setNetworkPolicy } from './networkPolicy';
-import { clearVendorLookupCache, lookupQuery, lookupVendor } from './vendorLookup';
+import { clearVendorLookupCache, lookupQuery, lookupVendor, setVendorLookupCacheLimit, vendorLookupCacheSize } from './vendorLookup';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-vendor-lookup');
 const SEARX = 'http://100.64.1.9:8080';
@@ -128,6 +128,25 @@ describe('lookupVendor', () => {
     const up = searx(FERGUSON);
     expect(await lookupVendor(ctx, 'Acme Hydraulics', { fetchImpl: up.fetchImpl })).not.toBeNull();
     expect(up.calls).toHaveLength(1);
+  });
+
+  it('the cache is bounded: the least recently used names are forgotten first (purchbank)', async () => {
+    await setNetworkPolicy(ctx, { mode: 'tailnet-only', cloudOptIn: { 'vendor-lookup': true }, vendorLookupUrl: SEARX });
+    setVendorLookupCacheLimit(3);
+    try {
+      const s = searx(FERGUSON);
+      for (const name of ['Alpha Supply', 'Beta Supply', 'Gamma Supply']) await lookupVendor(ctx, name, { fetchImpl: s.fetchImpl });
+      await lookupVendor(ctx, 'Alpha Supply', { fetchImpl: s.fetchImpl }); // a hit: Alpha is now the newest
+      expect(s.calls).toHaveLength(3);
+      await lookupVendor(ctx, 'Delta Supply', { fetchImpl: s.fetchImpl }); // evicts Beta (least recently used)
+      expect(vendorLookupCacheSize()).toBe(3);
+      await lookupVendor(ctx, 'Alpha Supply', { fetchImpl: s.fetchImpl });
+      expect(s.calls).toHaveLength(4); // Alpha still cached
+      await lookupVendor(ctx, 'Beta Supply', { fetchImpl: s.fetchImpl });
+      expect(s.calls).toHaveLength(5); // Beta was forgotten
+    } finally {
+      setVendorLookupCacheLimit(null);
+    }
   });
 
   it('offline mode never looks anything up', async () => {

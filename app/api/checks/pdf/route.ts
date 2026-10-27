@@ -20,6 +20,7 @@
  *
  * 2. Ad-hoc (quick check, not recorded):
  *      { payee: string, amount: string, date: string, memo?: string, checkNumber?: string }
+ *    The amount is parsed as money (more than zero, two decimals at most, "1,250.00" allowed).
  *
  * 3. Alignment test page: { alignmentTest: true, style?, stock?, offsetX?, offsetY?, position?,
  *    pageSize?, checkHeight?, firstSheetRemaining?, layout? } — sample check(s) printed with the
@@ -51,6 +52,8 @@ import {
 } from '@/lib/pdf/check';
 import { pdfResponse, routeError, requireJsonObject } from '@/lib/routeErrors';
 import { validation } from '@/lib/services/_base';
+import { amountMessage, parseTypedAmount } from '@/lib/fieldValidation';
+import type Decimal from 'decimal.js';
 
 /** Most checks accepted in one batch PDF. */
 const MAX_BATCH = 300;
@@ -188,14 +191,20 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       if (!body.payee || typeof body.payee !== 'string' || !body.payee.trim()) {
         return NextResponse.json({ error: 'payee is required', code: 'VALIDATION' }, { status: 400 });
       }
-      if (!body.amount || typeof body.amount !== 'string' || isNaN(parseFloat(body.amount))) {
-        return NextResponse.json({ error: 'amount must be a valid decimal string', code: 'VALIDATION' }, { status: 400 });
+      // The money parser, not parseFloat: "12abc" parsed as 12 and was printed, words and all.
+      // Same rules as the forms and zMoney (two decimals at most, thousands commas allowed).
+      const amountProblem =
+        typeof body.amount === 'string' || typeof body.amount === 'number'
+          ? amountMessage(body.amount, { label: 'Amount', required: true })
+          : 'Enter the amount.';
+      if (amountProblem) {
+        return NextResponse.json({ error: amountProblem, code: 'VALIDATION' }, { status: 400 });
       }
       if (!body.date || typeof body.date !== 'string' || !body.date.trim()) {
         return NextResponse.json({ error: 'date is required', code: 'VALIDATION' }, { status: 400 });
       }
       payee = body.payee.trim();
-      amount = body.amount.trim();
+      amount = (parseTypedAmount(body.amount as string | number) as Decimal).toFixed(2);
       date = body.date.trim();
       memo = body.memo && typeof body.memo === 'string' ? body.memo.trim() : undefined;
     }

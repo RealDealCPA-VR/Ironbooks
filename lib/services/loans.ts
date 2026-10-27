@@ -38,6 +38,7 @@ import {
   writeAudit,
 } from './_base';
 import { createExpense, voidExpense } from './expenses';
+import { requirePermission } from './access';
 import { createBill, voidBill } from './bills';
 import { homeAmounts } from './currencies';
 import { effectiveHomeCurrency } from './multiCurrency';
@@ -563,6 +564,8 @@ export async function voidLoanPayment(ctx: ServiceContext, loanId: string, payme
     .from(loanPayments)
     .where(and(eq(loanPayments.companyId, ctx.companyId), eq(loanPayments.loanId, loanId), eq(loanPayments.id, paymentId)));
   if (!lp) throw notFound('Loan payment');
+  // Voiding a payment entered as a bill voids that bill (A/P).
+  if (lp.kind === 'bill') requirePermission(ctx, 'vendors', 'delete');
   return inTransaction(ctx, async (tx) => {
     if (lp.kind === 'check' && lp.expenseId) await voidExpense(tx, lp.expenseId);
     if (lp.kind === 'bill' && lp.billId) await voidBill(tx, lp.billId);
@@ -582,6 +585,9 @@ export async function voidLoanPayment(ctx: ServiceContext, loanId: string, payme
 }
 
 export async function setUpLoanPayment(ctx: ServiceContext, loanId: string, input: SetUpPaymentInput) {
+  // The Loan Manager is a Banking screen, but a payment entered as a bill is an Enter Bills
+  // transaction (A/P): it needs the Vendors & Payables permission, like Enter Bills itself.
+  if (input.kind === 'bill') requirePermission(ctx, 'vendors', 'create');
   // Load the balance / next payment in the same transaction as the payment: a double-submitted
   // payment must see the first one (no second payment #N, no principal beyond what is owed).
   return inTransaction(ctx, (tx) => setUpLoanPaymentInTx(tx, loanId, input));
