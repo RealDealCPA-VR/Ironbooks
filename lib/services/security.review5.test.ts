@@ -34,7 +34,7 @@ process.env.BKA_AUTH_SECRET = 'review5-security-secret';
 delete process.env.BKA_INTERNAL_TOKEN;
 
 import { closeDb, getDb, type DB } from '@/lib/db';
-import { accounts, attachments, employees, users } from '@/lib/db/schema';
+import { accounts, attachments, bankAccounts, employees, users } from '@/lib/db/schema';
 import { createSessionToken, hashPassword, SESSION_COOKIE } from '@/lib/auth';
 import { COMPANY_COOKIE } from '@/lib/context';
 import { ROUTE_METHOD_HEADER, ROUTE_PATH_HEADER } from '@/lib/permissions/routes';
@@ -50,6 +50,8 @@ import { GET as attachmentGET } from '@/app/api/attachments/[id]/route';
 import { POST as customersPOST } from '@/app/api/customers/route';
 import { GET as transactionLogGET } from '@/app/api/transaction-log/route';
 import { GET as w2GET } from '@/app/api/payroll/w2/route';
+import { POST as importPOST } from '@/app/api/import/route';
+import { POST as csvPreviewPOST } from '@/app/api/import/csv-preview/route';
 import { createVendor } from './vendors';
 
 let db: DB;
@@ -211,6 +213,27 @@ describe('review5: payroll PDF downloads with names that are not plain ASCII', (
     const res = await w2GET(req('GET', `/api/payroll/w2?employeeId=${emp.id}&year=2026`));
     expect(res.status).toBe(200);
     expect(res.headers.get('content-disposition')).toMatch(/^inline; filename="W2_O_Brien_Se_n_2026\.pdf"$/);
+  });
+});
+
+describe('review5: importing a bank statement is Banking, not File Utilities', () => {
+  it('a Bookkeeper can preview and import a CSV statement into a bank feed; a View-Only user cannot', async () => {
+    const ownerCtx = { db, companyId, userId: owner, access: fullAccess(), role: 'owner' as const };
+    const keeper = (await addUser(ownerCtx, { name: 'Keeper', login: 'keeper', password: 'keeperPass123', roleKeys: ['bookkeeper'] })).userId;
+    const viewer = (await addUser(ownerCtx, { name: 'Viewer', login: 'viewer5', password: 'viewerPass123', roleKeys: ['view_only'] })).userId;
+    const [bank] = await db.insert(bankAccounts).values({ companyId, accountId: bankId, bankName: 'First Bank', accountNumber: '111222333' }).returning();
+    const content = 'Date,Description,Amount\n2026-03-01,Coffee,-4.50\n2026-03-02,Deposit,100.00\n';
+    const csvMapping = { dateCol: 'Date', descriptionCol: 'Description', amountCol: 'Amount' };
+    as(keeper, 'POST', '/api/import/csv-preview');
+    const preview = await csvPreviewPOST(req('POST', '/api/import/csv-preview', { content, csvMapping }));
+    expect(preview.status).toBe(200);
+    as(keeper, 'POST', '/api/import');
+    const imported = await importPOST(req('POST', '/api/import', { bankAccountId: bank.id, fileType: 'csv', content, csvMapping }));
+    expect(imported.status).toBe(201);
+    expect((await imported.json()).imported).toBe(2);
+    as(viewer, 'POST', '/api/import');
+    const refused = await importPOST(req('POST', '/api/import', { bankAccountId: bank.id, fileType: 'csv', content, csvMapping }));
+    expect(refused.status).toBe(403);
   });
 });
 
