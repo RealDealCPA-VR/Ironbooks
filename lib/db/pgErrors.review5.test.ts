@@ -22,3 +22,12 @@ describe('translatePgError: value too long (review round 5)', () => {
     });
   });
 });
+
+describe('translatePgError: a NUL character in text (integration sweep)', () => {
+  it('maps 22021 to VALIDATION, so a search for a NUL character is a 400, not a 500', () => {
+    expect(translatePgError({ code: '22021', message: 'invalid byte sequence for encoding "UTF8": 0x00' })).toMatchObject({
+      code: 'VALIDATION',
+      message: expect.stringMatching(/NUL character/),
+    });
+  });
+});

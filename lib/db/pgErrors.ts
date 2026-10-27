@@ -14,6 +14,8 @@
  *    displacement — a date Postgres cannot store (e.g. year 10000). VALIDATION.
  *  - 22001 string_data_right_truncation — text longer than a varchar(n) column holds (e.g. a
  *    150-character Entry No.). VALIDATION naming the limit.
+ *  - 22021 character_not_in_repertoire — a NUL character in text (a search box, an imported
+ *    cell). VALIDATION.
  * Every other error passes through unchanged (ledger BK00x codes are translated in
  * lib/services/_base.ts inTransaction, where deferred checks surface at COMMIT).
  */
@@ -48,6 +50,15 @@ export function translatePgError(err: unknown): unknown {
         ? `That text is too long: at most ${limit} characters fit in that field.`
         : 'That text is too long for the field it was entered in.',
       { sqlstate: code, ...(limit ? { maxLength: Number(limit) } : {}) },
+    );
+  }
+  if (code === '22021') {
+    // character_not_in_repertoire: Postgres text cannot hold a NUL character (U+0000), e.g. one
+    // pasted into a search box or present in an imported cell.
+    return new ServiceError(
+      'VALIDATION',
+      'That text contains a character that cannot be stored (a NUL character). Remove it and try again.',
+      { sqlstate: code },
     );
   }
   if (code === '22003') {
