@@ -463,7 +463,9 @@ function RegisterPageInner() {
                           onClick={(e) => {
                             e.stopPropagation();
                             setShowAll(true);
-                            load(from, to, search, true);
+                            // The rest of the rows shown: the dates and search they were loaded
+                            // with, not a half-typed search box (as the entry row's reload).
+                            load(resultFrom, resultTo, resultSearch, true);
                           }}
                         >
                           Show all
