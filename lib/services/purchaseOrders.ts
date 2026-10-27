@@ -676,7 +676,7 @@ export async function convertToBill(
     // Re-check the status inside the transaction: the PO may have been voided or closed since it
     // was read (a void racing this conversion), and a void PO must never get a bill.
     const [cur] = await tx.db
-      .select({ status: purchaseOrders.status })
+      .select({ status: purchaseOrders.status, vendorId: purchaseOrders.vendorId })
       .from(purchaseOrders)
       .where(and(eq(purchaseOrders.id, poId), eq(purchaseOrders.companyId, tx.companyId)));
     if (!cur || cur.status === 'void') {
@@ -684,6 +684,28 @@ export async function convertToBill(
     }
     if (cur.status === 'closed') {
       throw new ServiceError('CONFLICT', 'Purchase order has already been fully billed.');
+    }
+    // The bill is built from the lines read above: an edit saved since (another vendor, a line's
+    // item, account or rate changed) would otherwise be billed at the old item / price while the
+    // claim below still counts against the edited line.
+    const nowLines = await tx.db
+      .select()
+      .from(purchaseOrderLines)
+      .where(eq(purchaseOrderLines.purchaseOrderId, poId));
+    const nowById = new Map(nowLines.map((l) => [l.id, l] as const));
+    const changed =
+      cur.vendorId !== po.vendorId ||
+      plan.some(({ line }) => {
+        const n = nowById.get(line.id);
+        return (
+          !n ||
+          (n.itemId ?? null) !== (line.itemId ?? null) ||
+          (n.accountId ?? null) !== (line.accountId ?? null) ||
+          !Money.of(n.rate).equals(Money.of(line.rate))
+        );
+      });
+    if (changed) {
+      throw new ServiceError('CONFLICT', 'This purchase order was changed by someone else. Reload it and try again.');
     }
     // Claim each line's quantity with a guarded conditional UPDATE. If a
     // concurrent conversion already consumed the quantity, zero rows come back

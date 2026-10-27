@@ -402,6 +402,81 @@ describe('review5 purchases (third pass)', { timeout: 180_000 }, () => {
     expect(err.message).toMatch(/Enter Bill for Received Items/);
   });
 
+  it('M: Convert to Bill never bills a purchase order line at a price someone just changed', async () => {
+    const { updatePurchaseOrder } = await import('./purchaseOrders');
+    const v = await newVendor();
+    const po = await createPurchaseOrder(ctx, {
+      vendorId: v.id,
+      date: d('2026-06-01'),
+      lines: [{ accountId: acct['6000'], quantity: 2, rate: '10.00', description: 'Service' }],
+    });
+    // Convert to Bill reads the P.O., then (before its transaction starts) another user saves a new
+    // price on the line.
+    let open!: () => void;
+    const gate = new Promise<void>((r) => (open = r));
+    const gatedDb = Object.create(db) as DB;
+    (gatedDb as unknown as { transaction: DB['transaction'] }).transaction = (async (fn: never) => {
+      await gate;
+      return db.transaction(fn);
+    }) as never;
+    const converting = convertToBill({ ...ctx, db: gatedDb }, po.id, { date: d('2026-06-05') }).then(
+      (b) => b,
+      (e: unknown) => e,
+    );
+    await new Promise((r) => setTimeout(r, 50));
+    const current = await getPurchaseOrder(ctx, po.id);
+    await updatePurchaseOrder(ctx, po.id, {
+      vendorId: v.id,
+      date: d('2026-06-01'),
+      lines: [{ id: current.lines[0].id, accountId: acct['6000'], quantity: 2, rate: '12.50', description: 'Service' }],
+    });
+    open();
+    const result = await converting;
+    // Before: a $20.00 bill (the old price) against the P.O. now priced at $25.00.
+    expect(result).toBeInstanceOf(ServiceError);
+    expect((result as ServiceError).code).toBe('CONFLICT');
+    const after = await getPurchaseOrder(ctx, po.id);
+    expect(Number(after.lines[0].quantityBilled)).toBe(0);
+    expect((await convertToBill(ctx, po.id, { date: d('2026-06-05') })).total).toBe('25.00');
+  });
+
+  it('N: an item receipt edited while it is being converted is billed as edited', async () => {
+    const { createItemReceipt, convertToBill: convertReceipt, updateItemReceipt, getOrCreateAccrualAccount } = await import(
+      './itemReceipts'
+    );
+    const v = await newVendor();
+    const item = await createItem(ctx, {
+      name: `R5C Bolt ${++seq}`,
+      type: 'inventory',
+      assetAccountId: acct['1300'],
+      incomeAccountId: acct['4000'],
+      cogsAccountId: acct['5000'],
+    } as never);
+    const accrual = await getOrCreateAccrualAccount(ctx);
+    const accrualBefore = await glBalance(accrual);
+    const receipt = await createItemReceipt(ctx, { vendorId: v.id, date: d('2026-06-01'), lines: [{ itemId: item.id, quantity: 10, unitCost: '2.00' }] });
+    let open!: () => void;
+    const gate = new Promise<void>((r) => (open = r));
+    const gatedDb = Object.create(db) as DB;
+    (gatedDb as unknown as { transaction: DB['transaction'] }).transaction = (async (fn: never) => {
+      await gate;
+      return db.transaction(fn);
+    }) as never;
+    const converting = convertReceipt({ ...ctx, db: gatedDb }, receipt.id).then(
+      (b) => b,
+      (e: unknown) => e,
+    );
+    await new Promise((r) => setTimeout(r, 50));
+    // Another user corrects the quantity received: 8, not 10.
+    await updateItemReceipt(ctx, receipt.id, { vendorId: v.id, date: d('2026-06-01'), lines: [{ itemId: item.id, quantity: 8, unitCost: '2.00' }] });
+    open();
+    const bill = await converting;
+    expect(bill).not.toBeInstanceOf(Error);
+    // Before: a $20.00 bill for the 10 units that are no longer on the receipt.
+    expect((bill as { total: string }).total).toBe('16.00');
+    expect(await glBalance(accrual)).toBe(accrualBefore); // the accrual nets to zero
+  });
+
   it('I: making a vendor inactive does not hand a restricted user the full tax ID', async () => {
     const { BUILTIN_ROLES, unionRoles } = await import('@/lib/permissions/model');
     const restricted: ServiceContext = { ...ctx, access: unionRoles(BUILTIN_ROLES.filter((r) => r.key === 'purchasing')) };

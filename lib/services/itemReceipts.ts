@@ -859,21 +859,6 @@ export async function convertToBill(
   const [rv] = await ctx.db.select({ currency: vendors.currency }).from(vendors).where(eq(vendors.id, receipt.vendorId));
   await assertHomeCurrencyVendor(ctx, rv?.currency ?? null);
 
-  const lines = await ctx.db
-    .select()
-    .from(itemReceiptLines)
-    .where(eq(itemReceiptLines.itemReceiptId, receiptId))
-    .orderBy(asc(itemReceiptLines.lineOrder));
-  if (lines.length === 0) throw validation('Item receipt has no lines to bill.');
-
-  // Item names for readable bill-line descriptions.
-  const itemIds = [...new Set(lines.map((l) => l.itemId))];
-  const itemRows = await ctx.db
-    .select({ id: items.id, name: items.name })
-    .from(items)
-    .where(and(eq(items.companyId, ctx.companyId), inArray(items.id, itemIds)));
-  const nameById = new Map(itemRows.map((r) => [r.id, r.name]));
-
   return inTransaction(ctx, async (tx) => {
     const accrualAccountId = await getOrCreateAccrualAccount(tx);
     // Claim the receipt first (guarded conditional UPDATE) so a concurrent
@@ -895,6 +880,31 @@ export async function convertToBill(
         'This item receipt was converted or voided by another transaction. Reload and retry.',
       );
     }
+    // The lines (and the receipt's own fields) are read after the claim, in this transaction: an
+    // edit of the receipt saved between a read before it and the claim replaced the lines, and the
+    // bill was then built from the old quantities / costs (and linked to lines that no longer exist).
+    const [current] = await tx.db.select().from(itemReceipts).where(eq(itemReceipts.id, receiptId));
+    if (current.vendorId !== receipt.vendorId) {
+      throw new ServiceError('CONFLICT', 'This item receipt was changed by someone else. Reload it and try again.');
+    }
+    receipt.reference = current.reference;
+    receipt.memo = current.memo;
+    receipt.date = current.date;
+    receipt.purchaseOrderId = current.purchaseOrderId;
+    const lines = await tx.db
+      .select()
+      .from(itemReceiptLines)
+      .where(eq(itemReceiptLines.itemReceiptId, receiptId))
+      .orderBy(asc(itemReceiptLines.lineOrder));
+    if (lines.length === 0) throw validation('Item receipt has no lines to bill.');
+
+    // Item names for readable bill-line descriptions.
+    const itemIds = [...new Set(lines.map((l) => l.itemId))];
+    const itemRows = await tx.db
+      .select({ id: items.id, name: items.name })
+      .from(items)
+      .where(and(eq(items.companyId, tx.companyId), inArray(items.id, itemIds)));
+    const nameById = new Map(itemRows.map((r) => [r.id, r.name]));
 
     // Bill lines all debit the accrual: Dr 2050 / Cr 2000 A/P. No itemId on the
     // lines: stock was already received by the receipt (and voidBill must not
