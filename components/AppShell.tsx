@@ -41,6 +41,7 @@ import {
   NUMBER_KEY_HELP,
   globalShortcutFor,
   isEditableTarget,
+  isReloadKey,
   mightLoseWork,
 } from '@/lib/shortcuts';
 import { ConfirmDialog, Modal, toast } from '@/components/ui';
@@ -335,6 +336,7 @@ function GlobalShortcuts() {
   const router = useRouter();
   const [helpOpen, setHelpOpen] = React.useState(false);
   const [leaveTo, setLeaveTo] = React.useState<string | null>(null);
+  const [reloadAsk, setReloadAsk] = React.useState(false);
 
   React.useEffect(() => {
     function onNavigateRequest(e: Event) {
@@ -352,6 +354,13 @@ function GlobalShortcuts() {
   React.useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if (e.defaultPrevented || e.isComposing) return;
+      // F5 reloads the desktop window (View > Reload) — QB users press it to refresh a list. With
+      // typed work on screen, ask first instead of wiping the open form.
+      if (isReloadKey(e) && !e.repeat && mightLoseWork(e.target)) {
+        e.preventDefault();
+        setReloadAsk(true);
+        return;
+      }
       const editable = isEditableTarget(e.target);
       const sc = globalShortcutFor(e, editable);
       if (sc?.href) {
@@ -399,6 +408,17 @@ function GlobalShortcuts() {
           if (href) router.push(href);
         }}
         onClose={() => setLeaveTo(null)}
+      />
+      <ConfirmDialog
+        open={reloadAsk}
+        title="Reload this window?"
+        message="Reloading starts this page over. Anything typed here and not saved will be lost."
+        confirmLabel="Reload"
+        onConfirm={() => {
+          setReloadAsk(false);
+          window.location.reload();
+        }}
+        onClose={() => setReloadAsk(false)}
       />
     </>
   );

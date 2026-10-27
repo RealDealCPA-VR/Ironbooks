@@ -451,6 +451,14 @@ export function mightLoseWork(target: EventTarget | null, root: Pick<ParentNode,
 }
 
 /**
+ * F5 (no modifiers): the desktop app's View > Reload. QuickBooks users press it to refresh a list
+ * (QB's F5); here it reloads the whole window, so with typed work on screen the shell asks first.
+ */
+export function isReloadKey(e: KeyLike): boolean {
+  return e.key === 'F5' && !ctrlOrCmd(e) && !e.altKey && !e.shiftKey;
+}
+
+/**
  * Asks the app shell (components/AppShell.tsx GlobalShortcuts) to open a page: it asks "Leave
  * this form?" first when typed work could be lost, exactly like the QuickBooks keys (Ctrl+W, …).
  */

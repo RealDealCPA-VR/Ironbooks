@@ -7,6 +7,7 @@
  *  - Choosing a page from the desktop menu bar or the command bar discarded an open form without
  *    the "Leave this form?" question the QuickBooks keys ask (navigateGuarded).
  *  - Ctrl+PgUp / Ctrl+PgDn (first / last entry of a QB list or register) did nothing.
+ *  - F5 (QB: refresh) reloaded the desktop window and silently discarded an open form.
  */
 import { describe, expect, it } from 'vitest';
 import {
@@ -16,6 +17,7 @@ import {
   evaluateAmountDecimal,
   evaluateAmountExpression,
   formatAmountResult,
+  isReloadKey,
   listKeyAction,
   mightLoseWork,
   navigateGuarded,
@@ -150,5 +152,31 @@ describe('Ctrl+PgUp / Ctrl+PgDn in a list', () => {
 
   it('the shortcuts help lists them', () => {
     expect(LIST_KEY_HELP.map((r) => r.keys).join(' | ')).toContain('Ctrl+PgUp / Ctrl+PgDn');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F5
+// ---------------------------------------------------------------------------
+//
+// QuickBooks users press F5 to refresh a list (multi-user mode). In the desktop app F5 is View >
+// Reload, which restarted the page and silently threw away an invoice being typed. The shell now
+// asks first when work could be lost (the same check as the QuickBooks navigation keys).
+
+describe('F5 with typed work on screen', () => {
+  const key = (k: string, mods: Partial<KeyLike> = {}): KeyLike => ({ key: k, ctrlKey: false, metaKey: false, altKey: false, shiftKey: false, ...mods });
+
+  it('is recognised as the reload key (plain F5 only)', () => {
+    expect(isReloadKey(key('F5'))).toBe(true);
+    expect(isReloadKey(key('F5', { ctrlKey: true }))).toBe(false);
+    expect(isReloadKey(key('F5', { shiftKey: true }))).toBe(false);
+    expect(isReloadKey(key('F1'))).toBe(false);
+  });
+
+  it('the app shell asks before reloading when work could be lost', async () => {
+    const fs = await import('node:fs');
+    const shell = fs.readFileSync('components/AppShell.tsx', 'utf8');
+    expect(shell).toMatch(/isReloadKey\(e\) && !e\.repeat && mightLoseWork\(e\.target\)\) \{\s*e\.preventDefault\(\);\s*setReloadAsk\(true\)/);
+    expect(shell).toContain('title="Reload this window?"');
   });
 });
