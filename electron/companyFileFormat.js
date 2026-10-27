@@ -348,6 +348,34 @@ async function renameWithRetry(from, to, attempts = 12) {
   }
 }
 
+/** A temporary save this old is not in progress: it was cut short (a crash, a power cut). */
+const STALE_SAVE_MS = 60 * 60_000;
+
+/**
+ * Remove temporary files of saves of `filePath` that were cut short (each is as big as the company
+ * file, and would otherwise stay on the file server forever). Only this file's own, and only ones
+ * no save can still be writing. Best effort.
+ */
+function removeStaleSaves(filePath, now = Date.now()) {
+  const dir = path.dirname(filePath);
+  const prefix = `.${path.basename(filePath)}.saving-`;
+  let names = [];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return;
+  }
+  for (const n of names) {
+    if (!n.startsWith(prefix) || !/^[0-9a-f]{8}$/.test(n.slice(prefix.length))) continue;
+    const p = path.join(dir, n);
+    try {
+      if (now - fs.statSync(p).mtimeMs > STALE_SAVE_MS) fs.rmSync(p, { force: true });
+    } catch {
+      /* in use or gone: next time */
+    }
+  }
+}
+
 /**
  * Write a whole company file atomically: build it as `<file>.saving-<random>` in the same folder
  * (same disk / share, so the rename cannot copy), flush it to disk, then rename it over the
@@ -371,6 +399,7 @@ async function writeCompanyFile(filePath, { manifest, backupManifest, entries, c
   try {
     const result = await writeZip(tmp, [...head, ...entries.filter((e) => e.name !== COMPANY_MANIFEST_ENTRY && e.name !== BACKUP_MANIFEST_ENTRY)], { cache });
     await renameWithRetry(tmp, filePath);
+    removeStaleSaves(filePath);
     return result;
   } catch (err) {
     try {

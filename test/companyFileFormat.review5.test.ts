@@ -134,3 +134,29 @@ describe('restoring a backup made by a newer Ironbooks as a new company file', (
     expect(fs.readFileSync(path.join(out, 'PG_VERSION'), 'utf8')).toBe('17\n');
   });
 });
+
+describe('a save cut short by a crash or power cut', () => {
+  it('leaves a temporary copy that the next save clears away (not one per crash, forever, on the server)', async () => {
+    const src = path.join(root, 'leftover-src');
+    fs.mkdirSync(src, { recursive: true });
+    fs.writeFileSync(path.join(src, 'PG_VERSION'), '17\n');
+    const file = path.join(root, 'Leftovers.ironbooks');
+    const manifest = { formatVersion: 1, fileId: 'l', companyName: 'Leftovers', saveId: 's1', savedAt: 'x' };
+    await format.writeCompanyFile(file, { manifest, entries: format.snapshotDir(src) });
+    const old = path.join(root, '.Leftovers.ironbooks.saving-0badf00d');
+    fs.writeFileSync(old, Buffer.alloc(1000));
+    const longAgo = new Date(Date.now() - 2 * 60 * 60_000);
+    fs.utimesSync(old, longAgo, longAgo);
+    const recent = path.join(root, '.Leftovers.ironbooks.saving-1234abcd'); // possibly a save in progress
+    fs.writeFileSync(recent, Buffer.alloc(10));
+    const otherFile = path.join(root, '.Other.ironbooks.saving-0badf00d');
+    fs.writeFileSync(otherFile, Buffer.alloc(10));
+    fs.utimesSync(otherFile, longAgo, longAgo);
+
+    await format.writeCompanyFile(file, { manifest: { ...manifest, saveId: 's2' }, entries: format.snapshotDir(src) });
+    expect(fs.existsSync(old)).toBe(false);
+    expect(fs.existsSync(recent)).toBe(true);
+    expect(fs.existsSync(otherFile)).toBe(true); // another company file's: not ours to clear
+    expect(format.readCompanyManifest(file).saveId).toBe('s2');
+  });
+});
