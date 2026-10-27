@@ -19,7 +19,8 @@ import { CATALOG_BY_KEY } from '@/lib/reports/catalog';
 import { reportToTable, type StdReport } from '@/lib/reports/types';
 import ReportToolbar, { type ExportTable } from './ReportToolbar';
 import StdReportTable, { useCollapse } from './StdReportTable';
-import ReportFilters, { hasAdvancedFilters, type Params } from './ReportFilters';
+import ReportFilters, { DATE_CHOICES, hasAdvancedFilters, type Params } from './ReportFilters';
+import { memorizeDatesNote } from '@/lib/reports/dates';
 import NumberFormatPanel, { useNumberFormat } from './NumberFormatPanel';
 import { ReportWhyChanged } from '@/components/WhyChanged';
 import ReportSummaryBar from './ReportSummaryBar';
@@ -41,6 +42,8 @@ interface Group {
 
 const PARAM_KEYS = [
   'from', 'to', 'asOf', 'priorAsOf', 'accountId', 'section', 'nameId', 'customerId', 'vendorId', 'employeeId', 'itemId', 'jobId',
+  // Profit & Loss by Job cell QuickZoom: that Customer:Job column's lines (named or job-costed).
+  'customerJobId',
   'classId', 'budgetId', 'txnType', 'amountMin', 'amountMax', 'cleared', 'memo', 'number', 'sortBy', 'sortDir',
   'subtotalBy', 'columns', 'compare', 'basis', 'view', 'vehicle', 'dates', 'interval', 'through', 'agingFrom',
   'overDays',
@@ -440,8 +443,8 @@ function MemorizeDialog({
       }
     >
       <p className="text-sm text-navy/60 mb-3">
-        Saves this report with its dates, filters and number format so you can run it again from Memorized Reports.
-        Relative dates are saved as the exact dates shown.
+        Saves this report with its dates, filters and number format so you can run it again from Memorized Reports.{' '}
+        {memorizeDatesNote(((config as { params?: Params }).params ?? {}) as Params, DATE_CHOICES)}
       </p>
       <div className="space-y-3">
         <div>

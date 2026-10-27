@@ -27,6 +27,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { lotExpired } from '@/lib/reports/dates';
 import { formatCurrency } from '@/lib/money';
 import { downloadCsv, fmtDate } from '../_components/shared';
 
@@ -490,7 +491,8 @@ export default function InventoryBySiteReportsPage() {
                 </thead>
                 <tbody>
                   {tracked.lots.map((l) => {
-                    const expired = l.expirationDate && new Date(l.expirationDate) < new Date();
+                    // Expired once its day has passed on this computer's calendar (not the evening before).
+                    const expired = lotExpired(l.expirationDate);
                     return (
                       <Tr key={`${l.itemId}-${l.lotNumber}-${l.siteName}-${l.binName ?? ''}`}>
                         <Td>{l.itemName}</Td>

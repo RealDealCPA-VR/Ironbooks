@@ -16,16 +16,19 @@
  * Everything reads POSTED journal lines (the source of truth) — never cached balances — and
  * every amount is Decimal (lib/money.ts).
  */
-import { and, asc, eq, gte, inArray, lte, sql, type SQL } from 'drizzle-orm';
+import { and, asc, desc, eq, gte, inArray, lte, sql, type SQL } from 'drizzle-orm';
 import type Decimal from 'decimal.js';
 import {
   accounts,
+  bankTransactions,
+  billLines,
   bills,
   classes,
   companies,
   creditMemos,
   customers,
   employees,
+  expenseLines,
   expenseReports,
   expenses,
   invoices,
@@ -37,10 +40,13 @@ import {
   paymentsReceived,
   salesReceipts,
   taxAgencies,
+  transfers,
+  vendorCreditLines,
   vendorCredits,
   vendors,
 } from '@/lib/db/schema';
 import { Money, toAmountString, type MoneyInput } from '@/lib/money';
+import { localDateISO } from '@/lib/dates';
 import type { CellValue, StdColumn, StdRow } from '@/lib/reports/types';
 import type { ReportParams, TxnTypeKey } from '@/lib/validation/reports';
 import type { ServiceContext } from './_base';
@@ -50,6 +56,7 @@ import { notFiscalCloseEntry } from './reports';
 import { docRef } from './docNumbers';
 import { resolveEntityNames } from './journal';
 import { cashActivityRows, cashBasisLedger } from './cashBasisLedger';
+import { homeAmounts } from './currencies';
 
 // ===========================================================================
 // Sections
@@ -444,8 +451,19 @@ export async function resolveRange(
   return { from, to };
 }
 
-export function endOfToday(): Date {
-  return parseDay(dayStr(new Date()), true)!;
+/**
+ * Today's calendar day on this computer ('YYYY-MM-DD'): the desktop app's clock, the same day the
+ * report date fields default to (lib/dates.ts todayISO). The UTC day (`dayStr(new Date())`) is
+ * already tomorrow in US evenings, which ran "Today", "This Month" and the default as-of date a
+ * day ahead.
+ */
+export function localToday(now: Date = new Date()): string {
+  return localDateISO(now);
+}
+
+/** End of today (local calendar day) in the stored-date convention (23:59:59.999 UTC of that day). */
+export function endOfToday(now: Date = new Date()): Date {
+  return parseDay(localToday(now), true)!;
 }
 
 export function resolveAsOf(p: Pick<ReportParams, 'asOf' | 'to'>): Date {
@@ -799,15 +817,36 @@ export function txnTypeOf(sourceRef: string | null | undefined): TxnTypeKey {
   return PREFIX_TO_TYPE.get(prefix) ?? 'other';
 }
 
-function txnTypeCondition(t: TxnTypeKey): SQL {
+/**
+ * Journal entries posted by Transfer Funds. A transfer's entry carries no sourceRef (the transfer
+ * row points at it), so without this it showed as a General Journal entry and the "Transfer"
+ * transaction-type filter matched nothing.
+ */
+const transferEntryIds = (companyId: string) =>
+  sql`SELECT ${transfers.postedEntryId} FROM ${transfers} WHERE ${transfers.companyId} = ${companyId} AND ${transfers.postedEntryId} IS NOT NULL`;
+
+/**
+ * Entries posted from a bank-feed / imported-statement line (sourceRef 'bank_transaction:<id>'):
+ * money out of the account ('out') shows as a Check, money in as a Deposit (resolveEntryNames).
+ */
+const bankFeedEntries = (companyId: string, dir: 'out' | 'in') =>
+  sql`(${journalEntries.sourceRef} LIKE 'bank_transaction:%' AND EXISTS (SELECT 1 FROM ${bankTransactions} WHERE ${bankTransactions.companyId} = ${companyId} AND ${bankTransactions.id}::text = split_part(${journalEntries.sourceRef}, ':', 2) AND ${bankTransactions.amount} ${dir === 'out' ? sql`< 0` : sql`> 0`}))`;
+
+function txnTypeCondition(t: TxnTypeKey, companyId: string): SQL {
   const prefixes = TXN_PREFIXES[t];
   const parts = prefixes.map((p) => sql`${journalEntries.sourceRef} LIKE ${p + ':%'}`);
   parts.push(...prefixes.map((p) => sql`${journalEntries.sourceRef} = ${p}`));
-  if (t === 'journal') parts.push(sql`${journalEntries.sourceRef} IS NULL`);
+  if (t === 'transfer') parts.push(sql`${journalEntries.id} IN (${transferEntryIds(companyId)})`);
+  if (t === 'check') parts.push(bankFeedEntries(companyId, 'out'));
+  if (t === 'deposit') parts.push(bankFeedEntries(companyId, 'in'));
+  if (t === 'journal') {
+    parts.push(sql`${journalEntries.sourceRef} IS NULL`);
+    return sql`((${sql.join(parts, sql` OR `)}) AND ${journalEntries.id} NOT IN (${transferEntryIds(companyId)}))`;
+  }
   if (t === 'other') {
-    // Anything whose prefix is not a known type.
+    // Anything whose prefix is not a known type (bank-feed lines are Checks / Deposits).
     const known = [...PREFIX_TO_TYPE.keys()].filter((p) => !TXN_PREFIXES.other.includes(p));
-    return sql`(${journalEntries.sourceRef} IS NOT NULL AND split_part(${journalEntries.sourceRef}, ':', 1) NOT IN (${sql.join(known.map((k) => sql`${k}`), sql`, `)}))`;
+    return sql`(${journalEntries.sourceRef} IS NOT NULL AND split_part(${journalEntries.sourceRef}, ':', 1) NOT IN (${sql.join(known.map((k) => sql`${k}`), sql`, `)}) AND NOT ${bankFeedEntries(companyId, 'out')} AND NOT ${bankFeedEntries(companyId, 'in')})`;
   }
   return sql`(${sql.join(parts, sql` OR `)})`;
 }
@@ -819,9 +858,12 @@ export interface ResolvedName {
   nameId: string | null;
   name: string;
   num: string | null;
+  /** The QB transaction type when the source alone does not tell (a bank-feed line: Check / Deposit). */
+  txnType?: TxnTypeKey;
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const ANY_UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
 /** Customer full names ("Parent:Job") for the company. */
 export async function customerNames(ctx: ServiceContext): Promise<Map<string, { name: string; parentId: string | null }>> {
@@ -842,6 +884,19 @@ export async function customerNames(ctx: ServiceContext): Promise<Map<string, { 
     }
     out.set(r.id, { name: parts.join(':'), parentId: r.parentId });
   }
+  return out;
+}
+
+/**
+ * Ids per `id IN (...)` lookup. Postgres / PGlite bind at most 65,535 parameters per statement,
+ * so a company file with more documents of one type than that (70,000 invoices) must be read in
+ * slices — one unchunked list made the whole report fail.
+ */
+const ID_CHUNK = 5000;
+async function byIdChunks<T>(ids: string[], q: (slice: string[]) => PromiseLike<T[]>): Promise<T[]> {
+  if (ids.length <= ID_CHUNK) return ids.length ? await q(ids) : [];
+  const out: T[] = [];
+  for (let i = 0; i < ids.length; i += ID_CHUNK) for (const r of await q(ids.slice(i, i + ID_CHUNK))) out.push(r);
   return out;
 }
 
@@ -877,65 +932,79 @@ export async function resolveEntryNames(
 
   const invIds = ids('invoice', 'invoice-cogs');
   if (invIds.length) {
-    const rows = await ctx.db
-      .select({ id: invoices.id, nameId: invoices.customerId, num: invoices.invoiceNumber, ref: invoices.refNumber })
-      .from(invoices)
-      .where(and(eq(invoices.companyId, c), inArray(invoices.id, invIds)));
+    const rows = await byIdChunks(invIds, (slice) =>
+      ctx.db
+        .select({ id: invoices.id, nameId: invoices.customerId, num: invoices.invoiceNumber, ref: invoices.refNumber })
+        .from(invoices)
+        .where(and(eq(invoices.companyId, c), inArray(invoices.id, slice))),
+    );
     for (const r of rows) docs.set(`inv:${r.id}`, { nameType: 'customer', nameId: r.nameId, num: docRef(r.ref, r.num) });
   }
   // 'bounced:<paymentId>': a bounced check's re-charge belongs to the payment's customer.
   const payIds = ids('payment', 'refund', 'bounced');
   if (payIds.length) {
-    const rows = await ctx.db
-      .select({ id: paymentsReceived.id, nameId: paymentsReceived.customerId, num: paymentsReceived.reference })
-      .from(paymentsReceived)
-      .where(and(eq(paymentsReceived.companyId, c), inArray(paymentsReceived.id, payIds)));
+    const rows = await byIdChunks(payIds, (slice) =>
+      ctx.db
+        .select({ id: paymentsReceived.id, nameId: paymentsReceived.customerId, num: paymentsReceived.reference })
+        .from(paymentsReceived)
+        .where(and(eq(paymentsReceived.companyId, c), inArray(paymentsReceived.id, slice))),
+    );
     for (const r of rows) docs.set(`pay:${r.id}`, { nameType: 'customer', nameId: r.nameId, num: r.num });
   }
   const srIds = ids('salesreceipt', 'sales_receipt');
   if (srIds.length) {
-    const rows = await ctx.db
-      .select({ id: salesReceipts.id, nameId: salesReceipts.customerId, num: salesReceipts.receiptNumber, ref: salesReceipts.refNumber })
-      .from(salesReceipts)
-      .where(and(eq(salesReceipts.companyId, c), inArray(salesReceipts.id, srIds)));
+    const rows = await byIdChunks(srIds, (slice) =>
+      ctx.db
+        .select({ id: salesReceipts.id, nameId: salesReceipts.customerId, num: salesReceipts.receiptNumber, ref: salesReceipts.refNumber })
+        .from(salesReceipts)
+        .where(and(eq(salesReceipts.companyId, c), inArray(salesReceipts.id, slice))),
+    );
     for (const r of rows) docs.set(`sr:${r.id}`, { nameType: 'customer', nameId: r.nameId, num: docRef(r.ref, r.num) });
   }
   const cmIds = ids('credit_memo', 'creditmemo-cogs', 'refund');
   if (cmIds.length) {
-    const rows = await ctx.db
-      .select({ id: creditMemos.id, nameId: creditMemos.customerId, num: creditMemos.memoNumber, ref: creditMemos.refNumber })
-      .from(creditMemos)
-      .where(and(eq(creditMemos.companyId, c), inArray(creditMemos.id, cmIds)));
+    const rows = await byIdChunks(cmIds, (slice) =>
+      ctx.db
+        .select({ id: creditMemos.id, nameId: creditMemos.customerId, num: creditMemos.memoNumber, ref: creditMemos.refNumber })
+        .from(creditMemos)
+        .where(and(eq(creditMemos.companyId, c), inArray(creditMemos.id, slice))),
+    );
     for (const r of rows) docs.set(`cm:${r.id}`, { nameType: 'customer', nameId: r.nameId, num: docRef(r.ref, r.num) });
   }
   const billIds = ids('bill');
   if (billIds.length) {
-    const rows = await ctx.db
-      .select({ id: bills.id, nameId: bills.vendorId, num: bills.billNumber })
-      .from(bills)
-      .where(and(eq(bills.companyId, c), inArray(bills.id, billIds)));
+    const rows = await byIdChunks(billIds, (slice) =>
+      ctx.db
+        .select({ id: bills.id, nameId: bills.vendorId, num: bills.billNumber })
+        .from(bills)
+        .where(and(eq(bills.companyId, c), inArray(bills.id, slice))),
+    );
     for (const r of rows) docs.set(`bill:${r.id}`, { nameType: 'vendor', nameId: r.nameId, num: r.num });
   }
   const vcIds = ids('vendor_credit', 'refund');
   if (vcIds.length) {
-    const rows = await ctx.db
-      .select({ id: vendorCredits.id, nameId: vendorCredits.vendorId })
-      .from(vendorCredits)
-      .where(and(eq(vendorCredits.companyId, c), inArray(vendorCredits.id, vcIds)));
+    const rows = await byIdChunks(vcIds, (slice) =>
+      ctx.db
+        .select({ id: vendorCredits.id, nameId: vendorCredits.vendorId })
+        .from(vendorCredits)
+        .where(and(eq(vendorCredits.companyId, c), inArray(vendorCredits.id, slice))),
+    );
     for (const r of rows) docs.set(`vc:${r.id}`, { nameType: 'vendor', nameId: r.nameId, num: null });
   }
   const expIds = ids('expense');
   if (expIds.length) {
-    const rows = await ctx.db
-      .select({
+    const rows = await byIdChunks(expIds, (slice) =>
+      ctx.db
+        .select({
         id: expenses.id,
         nameId: expenses.vendorId,
         otherNameId: expenses.otherNameId,
         payee: expenses.payeeName,
         num: expenses.reference,
       })
-      .from(expenses)
-      .where(and(eq(expenses.companyId, c), inArray(expenses.id, expIds)));
+        .from(expenses)
+        .where(and(eq(expenses.companyId, c), inArray(expenses.id, slice))),
+    );
     // B3: a check written to an Other Names entry carries that name (type 'other').
     for (const r of rows) {
       docs.set(`exp:${r.id}`, {
@@ -948,35 +1017,56 @@ export async function resolveEntryNames(
   }
   const pcIds = ids('paycheck');
   if (pcIds.length) {
-    const rows = await ctx.db
-      .select({ id: paychecks.id, nameId: paychecks.employeeId })
-      .from(paychecks)
-      .where(and(eq(paychecks.companyId, c), inArray(paychecks.id, pcIds)));
-    for (const r of rows) docs.set(`pc:${r.id}`, { nameType: 'employee', nameId: r.nameId, num: null });
+    const rows = await byIdChunks(pcIds, (slice) =>
+      ctx.db
+        .select({ id: paychecks.id, nameId: paychecks.employeeId, checkNumber: paychecks.checkNumber })
+        .from(paychecks)
+        .where(and(eq(paychecks.companyId, c), inArray(paychecks.id, slice))),
+    );
+    // The printed check number, or nothing (the entry's reference is then the paycheck id's prefix).
+    for (const r of rows) docs.set(`pc:${r.id}`, { nameType: 'employee', nameId: r.nameId, num: r.checkNumber?.trim() ?? '' });
   }
   const erIds = ids('expense_report');
   if (erIds.length) {
-    const rows = await ctx.db
-      .select({ id: expenseReports.id, nameId: expenseReports.employeeId })
-      .from(expenseReports)
-      .where(and(eq(expenseReports.companyId, c), inArray(expenseReports.id, erIds)));
-    for (const r of rows) docs.set(`er:${r.id}`, { nameType: 'employee', nameId: r.nameId, num: null });
+    const rows = await byIdChunks(erIds, (slice) =>
+      ctx.db
+        .select({ id: expenseReports.id, nameId: expenseReports.employeeId })
+        .from(expenseReports)
+        .where(and(eq(expenseReports.companyId, c), inArray(expenseReports.id, slice))),
+    );
+    for (const r of rows) docs.set(`er:${r.id}`, { nameType: 'employee', nameId: r.nameId, num: '' });
   }
   const irIds = ids('item_receipt', 'item_receipt_void');
   if (irIds.length) {
-    const rows = await ctx.db
-      .select({ id: itemReceipts.id, nameId: itemReceipts.vendorId })
-      .from(itemReceipts)
-      .where(and(eq(itemReceipts.companyId, c), inArray(itemReceipts.id, irIds)));
+    const rows = await byIdChunks(irIds, (slice) =>
+      ctx.db
+        .select({ id: itemReceipts.id, nameId: itemReceipts.vendorId })
+        .from(itemReceipts)
+        .where(and(eq(itemReceipts.companyId, c), inArray(itemReceipts.id, slice))),
+    );
     for (const r of rows) docs.set(`ir:${r.id}`, { nameType: 'vendor', nameId: r.nameId, num: null });
+  }
+  // Bank-feed / imported-statement lines added to the register (bankCategorize.ts): the payee is
+  // the Name, and money out is a Check, money in a Deposit (QB "Add" from Bank Feeds).
+  const feed = new Map<string, { payee: string | null; out: boolean }>();
+  const btIds = ids('bank_transaction');
+  for (let i = 0; i < btIds.length; i += 2000) {
+    for (const r of await ctx.db
+      .select({ id: bankTransactions.id, payee: bankTransactions.payee, amount: bankTransactions.amount })
+      .from(bankTransactions)
+      .where(and(eq(bankTransactions.companyId, c), inArray(bankTransactions.id, btIds.slice(i, i + 2000))))) {
+      feed.set(r.id, { payee: r.payee, out: Money.of(r.amount).isNegative() });
+    }
   }
   const taIds = ids('tax_agency');
   const agencyNames = new Map<string, string>();
   if (taIds.length) {
-    const rows = await ctx.db
-      .select({ id: taxAgencies.id, name: taxAgencies.name })
-      .from(taxAgencies)
-      .where(and(eq(taxAgencies.companyId, c), inArray(taxAgencies.id, taIds)));
+    const rows = await byIdChunks(taIds, (slice) =>
+      ctx.db
+        .select({ id: taxAgencies.id, name: taxAgencies.name })
+        .from(taxAgencies)
+        .where(and(eq(taxAgencies.companyId, c), inArray(taxAgencies.id, slice))),
+    );
     for (const r of rows) agencyNames.set(r.id, r.name);
   }
 
@@ -994,27 +1084,33 @@ export async function resolveEntryNames(
   }
   const otherNameById = new Map<string, string>();
   if (otherIds.size) {
-    const rows = await ctx.db
-      .select({ id: otherNames.id, name: otherNames.name })
-      .from(otherNames)
-      .where(and(eq(otherNames.companyId, c), inArray(otherNames.id, [...otherIds])));
+    const rows = await byIdChunks([...otherIds], (slice) =>
+      ctx.db
+        .select({ id: otherNames.id, name: otherNames.name })
+        .from(otherNames)
+        .where(and(eq(otherNames.companyId, c), inArray(otherNames.id, slice))),
+    );
     for (const r of rows) otherNameById.set(r.id, r.name);
   }
   const custNames = custIds.size ? await customerNames(ctx) : new Map<string, { name: string }>();
   const vendNames = new Map<string, string>();
   if (vendIds.size) {
-    const rows = await ctx.db
-      .select({ id: vendors.id, name: vendors.displayName })
-      .from(vendors)
-      .where(and(eq(vendors.companyId, c), inArray(vendors.id, [...vendIds])));
+    const rows = await byIdChunks([...vendIds], (slice) =>
+      ctx.db
+        .select({ id: vendors.id, name: vendors.displayName })
+        .from(vendors)
+        .where(and(eq(vendors.companyId, c), inArray(vendors.id, slice))),
+    );
     for (const r of rows) vendNames.set(r.id, r.name);
   }
   const empNames = new Map<string, string>();
   if (empIds.size) {
-    const rows = await ctx.db
-      .select({ id: employees.id, first: employees.firstName, last: employees.lastName })
-      .from(employees)
-      .where(and(eq(employees.companyId, c), inArray(employees.id, [...empIds])));
+    const rows = await byIdChunks([...empIds], (slice) =>
+      ctx.db
+        .select({ id: employees.id, first: employees.firstName, last: employees.lastName })
+        .from(employees)
+        .where(and(eq(employees.companyId, c), inArray(employees.id, slice))),
+    );
     for (const r of rows) empNames.set(r.id, `${r.first} ${r.last}`.trim());
   }
   const nameOf = (t: NameType, id: string | null): string => {
@@ -1026,9 +1122,17 @@ export async function resolveEntryNames(
     return '';
   };
 
+  // The Num column never shows an internal code: references made of an id (a paycheck's id prefix,
+  // "landed-cost:<id>", "fix-line:<id>") are not document numbers.
+  const shownRef = (ref: string | null, sourceRef: string | null): string | null => {
+    if (!ref) return ref;
+    if (ANY_UUID_RE.test(ref)) return '';
+    const docId = sourceRef?.split(':')[1] ?? '';
+    return UUID_RE.test(docId) && ref === docId.slice(0, 8) ? '' : ref;
+  };
   const out = new Map<string, ResolvedName>();
   for (const e of entries) {
-    let res: ResolvedName = { nameType: null, nameId: null, name: '', num: e.reference };
+    let res: ResolvedName = { nameType: null, nameId: null, name: '', num: shownRef(e.reference, e.sourceRef) };
     if (e.sourceRef) {
       const [prefix, id] = e.sourceRef.split(':');
       const pick = (...keys: string[]) => keys.map((k) => docs.get(`${k}:${id}`)).find(Boolean);
@@ -1081,13 +1185,22 @@ export async function resolveEntryNames(
         case 'tax_agency':
           if (id) res = { nameType: 'other', nameId: id, name: agencyNames.get(id) ?? '', num: e.reference };
           break;
+        case 'bank_transaction': {
+          // Num stays blank: a feed line carries no check number, and the entry's reference is the
+          // memo typed when it was added (bankCategorize) — that shows under Memo, not Num.
+          const f = id ? feed.get(id) : undefined;
+          res = f
+            ? { nameType: null, nameId: null, name: f.payee?.trim() ?? '', num: '', txnType: f.out ? 'check' : 'deposit' }
+            : { ...res, num: '' };
+          break;
+        }
       }
       if (d) {
         res = {
           nameType: d.nameType,
           nameId: d.nameId,
           name: nameOf(d.nameType, d.nameId) || d.payee || '',
-          num: d.num ?? e.reference,
+          num: d.num ?? shownRef(e.reference, e.sourceRef),
         };
       }
     }
@@ -1130,6 +1243,11 @@ export interface GlLineFilter extends ActivityFilter {
   sections?: SectionKey[];
   nameId?: string;
   nameType?: NameType;
+  /**
+   * One Customer:Job column of Profit & Loss by Job: lines named for that customer (on the line
+   * or by their document) and bill / check / vendor-credit lines costed to it (costLineCustomers).
+   */
+  jobCustomerId?: string;
   txnType?: TxnTypeKey;
   amountMin?: string;
   amountMax?: string;
@@ -1138,6 +1256,11 @@ export interface GlLineFilter extends ActivityFilter {
   number?: string;
   entryIds?: string[];
   limit?: number;
+  /**
+   * When the read is capped, keep the NEWEST lines (Find): by default a capped read keeps the
+   * oldest, which suits running balances but left a search without this year's transactions.
+   */
+  newestFirst?: boolean;
 }
 
 /** Translate report params into a detail-line filter (account includes its sub-accounts). */
@@ -1169,6 +1292,7 @@ export function glFilterFromParams(
     f.nameId = p.employeeId;
     f.nameType = 'employee';
   }
+  if (p.customerJobId) f.jobCustomerId = p.customerJobId;
   if (p.section) {
     const secs = p.section.split(',').filter((s) => [...PL_SECTIONS, ...BS_SECTIONS].includes(s as SectionKey));
     if (secs.length) f.sections = secs as SectionKey[];
@@ -1177,6 +1301,57 @@ export function glFilterFromParams(
 }
 
 export const DEFAULT_LINE_LIMIT = 10000;
+
+/** Read caps of fetchGlLines (mutable for tests only). */
+export const GL_LIMITS = {
+  /** Most lines one fetchGlLines read returns. */
+  maxLines: 50000,
+  /** Most raw lines a name / number-filtered read scans before filtering. */
+  postFilterScan: 50000,
+};
+
+/**
+ * Lines that can resolve to the name `nameId` (fetchGlLines then checks the resolved name): a
+ * line named on the line itself (General Journal A/R / A/P lines), or an unnamed line of an entry
+ * whose source document belongs to that name, or whose sourceRef names it directly
+ * ('customer:<id>', 'vendor:<id>', 'tax_agency:<id>'). Covers every document type
+ * resolveEntryNames reads, so it is a superset of the exact match.
+ */
+function nameCandidates(companyId: string, nameId: string): SQL {
+  const c = companyId;
+  const docIds = sql.join(
+    [
+      sql`SELECT ${invoices.id}::text FROM ${invoices} WHERE ${invoices.companyId} = ${c} AND ${invoices.customerId} = ${nameId}`,
+      sql`SELECT ${paymentsReceived.id}::text FROM ${paymentsReceived} WHERE ${paymentsReceived.companyId} = ${c} AND ${paymentsReceived.customerId} = ${nameId}`,
+      sql`SELECT ${salesReceipts.id}::text FROM ${salesReceipts} WHERE ${salesReceipts.companyId} = ${c} AND ${salesReceipts.customerId} = ${nameId}`,
+      sql`SELECT ${creditMemos.id}::text FROM ${creditMemos} WHERE ${creditMemos.companyId} = ${c} AND ${creditMemos.customerId} = ${nameId}`,
+      sql`SELECT ${bills.id}::text FROM ${bills} WHERE ${bills.companyId} = ${c} AND ${bills.vendorId} = ${nameId}`,
+      sql`SELECT ${vendorCredits.id}::text FROM ${vendorCredits} WHERE ${vendorCredits.companyId} = ${c} AND ${vendorCredits.vendorId} = ${nameId}`,
+      sql`SELECT ${expenses.id}::text FROM ${expenses} WHERE ${expenses.companyId} = ${c} AND (${expenses.vendorId} = ${nameId} OR ${expenses.otherNameId} = ${nameId})`,
+      sql`SELECT ${itemReceipts.id}::text FROM ${itemReceipts} WHERE ${itemReceipts.companyId} = ${c} AND ${itemReceipts.vendorId} = ${nameId}`,
+      sql`SELECT ${paychecks.id}::text FROM ${paychecks} WHERE ${paychecks.companyId} = ${c} AND ${paychecks.employeeId} = ${nameId}`,
+      sql`SELECT ${expenseReports.id}::text FROM ${expenseReports} WHERE ${expenseReports.companyId} = ${c} AND ${expenseReports.employeeId} = ${nameId}`,
+    ],
+    sql` UNION ALL `,
+  );
+  const docOf = sql`split_part(${journalEntries.sourceRef}, ':', 2)`;
+  return sql`(${journalEntryLines.entityId} = ${nameId} OR (${journalEntryLines.entityId} IS NULL AND (${docOf} = ${nameId} OR ${docOf} IN (${docIds}))))`;
+}
+
+/**
+ * Lines of the bills, checks / credit-card charges and vendor credits with a document line costed
+ * to the customer:job `customerId` (QB job costing; the posted lines carry the vendor's name).
+ * A superset: fetchGlLines matches each posted line to its document line (costLineCustomers).
+ */
+function costedToCandidates(companyId: string, customerId: string): SQL {
+  const c = companyId;
+  const prefix = sql`split_part(${journalEntries.sourceRef}, ':', 1)`;
+  const docOf = sql`split_part(${journalEntries.sourceRef}, ':', 2)`;
+  return sql`(${journalEntryLines.entityId} IS NULL AND (
+    (${prefix} = 'bill' AND ${docOf} IN (SELECT ${billLines.billId}::text FROM ${billLines} JOIN ${bills} ON ${bills.id} = ${billLines.billId} WHERE ${bills.companyId} = ${c} AND ${billLines.customerId} = ${customerId}))
+    OR (${prefix} = 'expense' AND ${docOf} IN (SELECT ${expenseLines.expenseId}::text FROM ${expenseLines} JOIN ${expenses} ON ${expenses.id} = ${expenseLines.expenseId} WHERE ${expenses.companyId} = ${c} AND ${expenseLines.customerId} = ${customerId}))
+    OR (${prefix} = 'vendor_credit' AND ${docOf} IN (SELECT ${vendorCreditLines.vendorCreditId}::text FROM ${vendorCreditLines} JOIN ${vendorCredits} ON ${vendorCredits.id} = ${vendorCreditLines.vendorCreditId} WHERE ${vendorCredits.companyId} = ${c} AND ${vendorCreditLines.customerId} = ${customerId}))))`;
+}
 
 /**
  * Posted journal lines with QB detail columns, filtered. Returns at most `limit` lines (default
@@ -1187,7 +1362,7 @@ export async function fetchGlLines(
   meta: Map<string, AccountMeta>,
   f: GlLineFilter,
 ): Promise<{ lines: GlLine[]; truncated: boolean }> {
-  const limit = Math.max(1, Math.min(f.limit ?? DEFAULT_LINE_LIMIT, 50000));
+  const limit = Math.max(1, Math.min(f.limit ?? DEFAULT_LINE_LIMIT, GL_LIMITS.maxLines));
   const conds: SQL[] = [eq(journalEntries.companyId, ctx.companyId), eq(journalEntries.status, 'posted')];
   if (f.from) conds.push(gte(journalEntries.date, f.from));
   if (f.to) conds.push(lte(journalEntries.date, f.to));
@@ -1206,7 +1381,7 @@ export async function fetchGlLines(
     if (f.entryIds.length === 0) return { lines: [], truncated: false };
     conds.push(inArray(journalEntries.id, f.entryIds));
   }
-  if (f.txnType) conds.push(txnTypeCondition(f.txnType));
+  if (f.txnType) conds.push(txnTypeCondition(f.txnType, ctx.companyId));
   const lineAmt = sql`GREATEST(COALESCE(${journalEntryLines.debit}, 0), COALESCE(${journalEntryLines.credit}, 0))`;
   if (f.amountMin) conds.push(sql`${lineAmt} >= ${f.amountMin}::numeric`);
   if (f.amountMax) conds.push(sql`${lineAmt} <= ${f.amountMax}::numeric`);
@@ -1214,13 +1389,22 @@ export async function fetchGlLines(
     const like = `%${f.memo.replace(/[\\%_]/g, (m) => '\\' + m)}%`;
     conds.push(sql`(${journalEntryLines.memo} ILIKE ${like} OR ${journalEntries.description} ILIKE ${like})`);
   }
-  const clearedExpr = sql<boolean>`EXISTS (SELECT 1 FROM reconciliation_items ri WHERE ri.journal_entry_line_id = ${journalEntryLines.id} AND ri.is_cleared = true)`;
+  // Cleared = marked in a completed (or the open, in-progress) reconciliation. An undone
+  // reconciliation keeps its items for the history report, but they are not cleared any more
+  // (reconcile.ts undoLastReconciliation) — they used to keep their check mark on every report.
+  const clearedExpr = sql<boolean>`EXISTS (SELECT 1 FROM reconciliation_items ri JOIN reconciliations rc ON rc.id = ri.reconciliation_id WHERE ri.journal_entry_line_id = ${journalEntryLines.id} AND ri.is_cleared = true AND rc.status <> 'undone')`;
   if (f.cleared === 'cleared') conds.push(sql`${clearedExpr}`);
   if (f.cleared === 'uncleared') conds.push(sql`NOT ${clearedExpr}`);
+  // A name filter narrows the read in SQL to the lines that can carry that name; the exact name
+  // is checked after resolution. Without it the read took the company's FIRST 50,000 lines (oldest
+  // first) and filtered those, so on a large file a customer's newer transactions silently fell
+  // off Customer Balance Detail and every other name-filtered detail report.
+  if (f.nameId) conds.push(nameCandidates(ctx.companyId, f.nameId));
+  if (f.jobCustomerId) conds.push(sql`(${nameCandidates(ctx.companyId, f.jobCustomerId)} OR ${costedToCandidates(ctx.companyId, f.jobCustomerId)})`);
 
-  // Name / number filters are applied after resolution, so read a larger window first.
-  const postFilter = !!(f.nameId || f.number);
-  const fetchCap = postFilter ? 50000 : limit + 1;
+  // Name / number / job filters are applied after resolution, so read a larger window first.
+  const postFilter = !!(f.nameId || f.number || f.jobCustomerId);
+  const fetchCap = postFilter ? GL_LIMITS.postFilterScan : limit + 1;
 
   const raw = await ctx.db
     .select({
@@ -1245,12 +1429,27 @@ export async function fetchGlLines(
     .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
     .leftJoin(classes, eq(journalEntryLines.classId, classes.id))
     .where(and(...conds))
-    .orderBy(asc(journalEntries.date), asc(journalEntries.entryNumber), asc(journalEntryLines.createdAt), asc(journalEntryLines.id))
+    .orderBy(
+      ...(f.newestFirst
+        ? [desc(journalEntries.date), desc(journalEntries.entryNumber), desc(journalEntryLines.createdAt), desc(journalEntryLines.id)]
+        : [asc(journalEntries.date), asc(journalEntries.entryNumber), asc(journalEntryLines.createdAt), asc(journalEntryLines.id)]),
+    )
     .limit(fetchCap);
 
   const entryMap = new Map<string, { id: string; sourceRef: string | null; reference: string | null }>();
   for (const r of raw) entryMap.set(r.entryId, { id: r.entryId, sourceRef: r.sourceRef, reference: r.reference });
   const names = await resolveEntryNames(ctx, [...entryMap.values()]);
+  // Transfers post entries without a sourceRef: find them so they show as "Transfer".
+  const transferIds = new Set<string>();
+  const plain = [...entryMap.values()].filter((e) => !e.sourceRef).map((e) => e.id);
+  for (let i = 0; i < plain.length; i += 5000) {
+    for (const t of await ctx.db
+      .select({ id: transfers.postedEntryId })
+      .from(transfers)
+      .where(and(eq(transfers.companyId, ctx.companyId), inArray(transfers.postedEntryId, plain.slice(i, i + 5000))))) {
+      if (t.id) transferIds.add(t.id);
+    }
+  }
   // QB "Name" on the line itself (wave2 foundation: named journal-entry lines, e.g. a General
   // Journal line on A/R for a customer) wins over the entry's document-level name.
   const named = raw.filter((r) => r.entityType && r.entityId);
@@ -1274,7 +1473,7 @@ export async function fetchGlLines(
             num: docName.num,
           }
         : docName;
-    const txnType = txnTypeOf(r.sourceRef);
+    const txnType: TxnTypeKey = !r.sourceRef && transferIds.has(r.entryId) ? 'transfer' : (docName.txnType ?? txnTypeOf(r.sourceRef));
     return {
       lineId: r.lineId,
       entryId: r.entryId,
@@ -1304,14 +1503,23 @@ export async function fetchGlLines(
   lines = lines.filter((l) => !!l.account);
   if (f.basis === 'cash') lines = await applyCashBasisToGlLines(ctx, meta, { ...f, accountIds }, lines);
   if (f.nameId) lines = lines.filter((l) => l.nameId === f.nameId && (!f.nameType || l.nameType === f.nameType));
+  if (f.jobCustomerId) {
+    // The Profit & Loss by Job column rule (reportsStandard jobBucketOf): the line's customer, or
+    // the customer:job its bill / check / vendor-credit line is costed to.
+    const job = f.jobCustomerId;
+    const costed = await costLineCustomers(ctx, lines);
+    lines = lines.filter((l) => (l.nameType === 'customer' && l.nameId ? l.nameId === job : costed.get(l.lineId) === job));
+  }
   if (f.number) {
     const needle = f.number.toLowerCase();
     lines = lines.filter(
       (l) => l.num.toLowerCase().includes(needle) || String(l.entryNumber) === f.number,
     );
   }
-  const truncated = lines.length > limit;
-  if (truncated) lines = lines.slice(0, limit);
+  // A post-filtered read that hit its scan cap may have left matching lines unread: say so
+  // (the report shows its "only the first … lines" note) instead of a silently short report.
+  const truncated = lines.length > limit || (postFilter && raw.length >= fetchCap);
+  if (lines.length > limit) lines = lines.slice(0, limit);
 
   // Split column: the other account(s) of each entry.
   const entryIds = [...new Set(lines.map((l) => l.entryId))];
@@ -1336,6 +1544,188 @@ export async function fetchGlLines(
     }
   }
   return { lines, truncated };
+}
+
+/** Home amount of each line of the foreign-currency documents in `docs`, as the documents posted. */
+export async function homeAmountsByLine(
+  ctx: ServiceContext,
+  kind: 'bill' | 'expense' | 'vendor_credit',
+  docs: { id: string; rate: string | null }[],
+): Promise<Map<string, Decimal>> {
+  const out = new Map<string, Decimal>();
+  const foreign = new Map<string, string>();
+  for (const d of docs) if (d.rate && !Money.eq(d.rate, 1)) foreign.set(d.id, d.rate);
+  const ids = [...foreign.keys()];
+  for (let i = 0; i < ids.length; i += 2000) {
+    const chunk = ids.slice(i, i + 2000);
+    const rows =
+      kind === 'bill'
+        ? await ctx.db
+            .select({ id: billLines.id, docId: billLines.billId, amount: billLines.amount, order: billLines.lineOrder })
+            .from(billLines)
+            .where(inArray(billLines.billId, chunk))
+        : kind === 'expense'
+          ? await ctx.db
+              .select({ id: expenseLines.id, docId: expenseLines.expenseId, amount: expenseLines.amount, order: expenseLines.lineOrder })
+              .from(expenseLines)
+              .where(inArray(expenseLines.expenseId, chunk))
+          : await ctx.db
+              .select({ id: vendorCreditLines.id, docId: vendorCreditLines.vendorCreditId, amount: vendorCreditLines.amount, order: vendorCreditLines.lineOrder })
+              .from(vendorCreditLines)
+              .where(inArray(vendorCreditLines.vendorCreditId, chunk));
+    const byDoc = new Map<string, typeof rows>();
+    for (const r of rows) byDoc.set(r.docId, [...(byDoc.get(r.docId) ?? []), r]);
+    for (const [docId, lines] of byDoc) {
+      lines.sort((a, b) => a.order - b.order || a.id.localeCompare(b.id));
+      // The posting converts the absolute line amounts (a credit-card credit is stored negative).
+      const home = homeAmounts(lines.map((l) => Money.of(l.amount).abs()), foreign.get(docId)!).lines;
+      lines.forEach((l, i) => out.set(l.id, Money.of(l.amount).isNegative() ? home[i].negated() : home[i]));
+    }
+  }
+  return out;
+}
+
+/**
+ * The customer:job each P&L line of a bill, check / credit-card charge or vendor credit is
+ * costed to (QB job costing: the line's Customer:Job column). The posted expense lines carry no
+ * name of their own (only A/R / A/P lines are named), so each one is matched to its document
+ * line — same account, same home amount — and gets that line's customer. Lines that already
+ * carry a customer, and document lines with no customer, are left out. lineId → customerId.
+ */
+export async function costLineCustomers(ctx: ServiceContext, lines: GlLine[]): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  type Kind = 'bill' | 'expense' | 'vendor_credit';
+  const groups = new Map<string, GlLine[]>();
+  const docs: Record<Kind, Set<string>> = { bill: new Set(), expense: new Set(), vendor_credit: new Set() };
+  for (const l of lines) {
+    if ((l.nameType === 'customer' && l.nameId) || !isPLSection(l.account.section)) continue;
+    const m = /^(bill|expense|vendor_credit):([0-9a-f-]{36})$/i.exec(l.sourceRef ?? '');
+    if (!m) continue;
+    docs[m[1] as Kind].add(m[2]);
+    const k = `${m[1]}:${m[2]}|${l.accountId}`;
+    const g = groups.get(k);
+    if (g) g.push(l);
+    else groups.set(k, [l]);
+  }
+  for (const kind of ['bill', 'expense', 'vendor_credit'] as const) {
+    const ids = [...docs[kind]];
+    for (let i = 0; i < ids.length; i += 2000) {
+      const chunk = ids.slice(i, i + 2000);
+      const rows =
+        kind === 'bill'
+          ? await ctx.db
+              .select({ id: billLines.id, docId: billLines.billId, accountId: billLines.accountId, customerId: billLines.customerId, amount: billLines.amount, rate: bills.exchangeRate })
+              .from(billLines)
+              .innerJoin(bills, eq(billLines.billId, bills.id))
+              .where(and(eq(bills.companyId, ctx.companyId), inArray(billLines.billId, chunk)))
+          : kind === 'expense'
+            ? await ctx.db
+                .select({ id: expenseLines.id, docId: expenseLines.expenseId, accountId: expenseLines.accountId, customerId: expenseLines.customerId, amount: expenseLines.amount, rate: expenses.exchangeRate })
+                .from(expenseLines)
+                .innerJoin(expenses, eq(expenseLines.expenseId, expenses.id))
+                .where(and(eq(expenses.companyId, ctx.companyId), inArray(expenseLines.expenseId, chunk)))
+            : await ctx.db
+                .select({ id: vendorCreditLines.id, docId: vendorCreditLines.vendorCreditId, accountId: vendorCreditLines.accountId, customerId: vendorCreditLines.customerId, amount: vendorCreditLines.amount, rate: vendorCredits.exchangeRate })
+                .from(vendorCreditLines)
+                .innerJoin(vendorCredits, eq(vendorCreditLines.vendorCreditId, vendorCredits.id))
+                .where(and(eq(vendorCredits.companyId, ctx.companyId), inArray(vendorCreditLines.vendorCreditId, chunk)));
+      if (!rows.some((r) => r.customerId)) continue;
+      const rateOf = new Map(rows.map((r) => [r.docId, r.rate] as const));
+      const home = await homeAmountsByLine(ctx, kind, [...rateOf].map(([id, rate]) => ({ id, rate })));
+      const byDocAccount = new Map<string, { customerId: string | null; amount: Decimal; used: boolean }[]>();
+      for (const r of rows) {
+        const k = `${kind}:${r.docId}|${r.accountId}`;
+        const list = byDocAccount.get(k) ?? [];
+        list.push({ customerId: r.customerId, amount: (home.get(r.id) ?? Money.of(r.amount)).abs(), used: false });
+        byDocAccount.set(k, list);
+      }
+      for (const [k, candidates] of byDocAccount) {
+        if (!candidates.some((c) => c.customerId)) continue;
+        for (const l of groups.get(k) ?? []) {
+          const amount = l.natural.abs();
+          const hit = candidates.find((c) => !c.used && c.amount.equals(amount));
+          if (!hit) continue;
+          hit.used = true;
+          if (hit.customerId) out.set(l.lineId, hit.customerId);
+        }
+      }
+    }
+  }
+  return out;
+}
+
+export interface NameTotal {
+  nameType: NameType | null;
+  nameId: string | null;
+  name: string;
+  /** Natural-sign total of the lines (the accounts' own section sign). */
+  natural: Decimal;
+}
+
+/**
+ * Posted totals per QB "Name" over the accounts of `sections` (accrual), summed in SQL — the
+ * same names fetchGlLines resolves (a line-level name wins over the entry's document name), but
+ * with no line cap: balance summaries on a large company file add up every line, not the first
+ * 50,000 of them. One row per (name, document, account) is read, never one per line.
+ */
+export async function ledgerTotalsByName(
+  ctx: ServiceContext,
+  meta: Map<string, AccountMeta>,
+  f: { sections: SectionKey[]; from?: Date; to?: Date; classId?: string },
+): Promise<NameTotal[]> {
+  const accountIds = [...meta.values()].filter((a) => f.sections.includes(a.section)).map((a) => a.id);
+  if (accountIds.length === 0) return [];
+  const conds: SQL[] = [eq(journalEntries.companyId, ctx.companyId), eq(journalEntries.status, 'posted'), inArray(journalEntryLines.accountId, accountIds)];
+  if (f.from) conds.push(gte(journalEntries.date, f.from));
+  if (f.to) conds.push(lte(journalEntries.date, f.to));
+  if (f.classId) conds.push(eq(journalEntryLines.classId, f.classId));
+  const rows = await ctx.db
+    .select({
+      entityType: journalEntryLines.entityType,
+      entityId: journalEntryLines.entityId,
+      sourceRef: journalEntries.sourceRef,
+      accountId: journalEntryLines.accountId,
+      debit: sql<string>`COALESCE(SUM(${journalEntryLines.debit}), 0)`,
+      credit: sql<string>`COALESCE(SUM(${journalEntryLines.credit}), 0)`,
+    })
+    .from(journalEntryLines)
+    .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+    .where(and(...conds))
+    .groupBy(journalEntryLines.entityType, journalEntryLines.entityId, journalEntries.sourceRef, journalEntryLines.accountId);
+
+  const lineNamed = rows.filter((r) => r.entityType && r.entityId);
+  const docRefs = [...new Set(rows.filter((r) => !(r.entityType && r.entityId) && r.sourceRef).map((r) => r.sourceRef!))];
+  const docNames = await resolveEntryNames(ctx, docRefs.map((ref) => ({ id: ref, sourceRef: ref, reference: null })));
+  // One ref per distinct name, looked up in slices (resolveEntityNames binds one id per name).
+  const nameRefs = [...new Map(lineNamed.map((r) => [`${r.entityType}:${r.entityId}`, { entityType: r.entityType, entityId: r.entityId }])).values()];
+  const lineNames = new Map<string, string>();
+  for (let i = 0; i < nameRefs.length; i += ID_CHUNK) {
+    for (const [k, v] of await resolveEntityNames(ctx, nameRefs.slice(i, i + ID_CHUNK))) lineNames.set(k, v);
+  }
+  const custFull = lineNamed.some((r) => r.entityType === 'customer') ? await customerNames(ctx) : null;
+
+  const out = new Map<string, NameTotal>();
+  for (const r of rows) {
+    const a = meta.get(r.accountId);
+    if (!a) continue;
+    let n: { nameType: NameType | null; nameId: string | null; name: string };
+    if (r.entityType && r.entityId) {
+      n = {
+        nameType: r.entityType as NameType,
+        nameId: r.entityId,
+        name: (r.entityType === 'customer' ? custFull?.get(r.entityId)?.name : undefined) ?? lineNames.get(`${r.entityType}:${r.entityId}`) ?? '',
+      };
+    } else {
+      const d = r.sourceRef ? docNames.get(r.sourceRef) : undefined;
+      n = d ? { nameType: d.nameType, nameId: d.nameId, name: d.name } : { nameType: null, nameId: null, name: '' };
+    }
+    const key = `${n.nameType ?? ''}:${n.nameId ?? ''}`;
+    const cur = out.get(key) ?? { ...n, natural: Money.zero() };
+    cur.natural = cur.natural.plus(naturalAmount(a.section, r.debit, r.credit));
+    if (!cur.name && n.name) cur.name = n.name;
+    out.set(key, cur);
+  }
+  return [...out.values()];
 }
 
 /**
@@ -1488,6 +1878,13 @@ export interface DetailLayoutOptions {
   headers?: boolean;
   /** Column holding the group label (defaults to the first column). */
   hrefForGroup?: (key: string) => string | undefined;
+  /**
+   * Total by account: order the account groups by statement section first (this order), then by
+   * account number — QB's P&L Detail lists Income, COGS, Expense, Other Income, Other Expense
+   * whatever the accounts are numbered (an Other Income account numbered 4950 is not listed
+   * between Income and Cost of Goods Sold).
+   */
+  sectionOrder?: SectionKey[];
 }
 
 /**
@@ -1501,7 +1898,9 @@ function groupKeyOf(l: GlLine, g: GroupKey): { key: string; label: string; sort:
     case 'account':
       return { key: l.accountId, label: l.account.fullName, sort: `${l.account.code}|${l.account.fullName}` };
     case 'name':
-      return { key: l.nameId ?? '', label: l.name || '(no name)', sort: blankLast(l.name) };
+      // A name with no list entry (a check to a free-text payee) is grouped by the name itself:
+      // keyed '' they all fell into ONE group labelled with whichever payee came first.
+      return { key: l.nameId ?? (l.name ? `payee:${l.name.toLowerCase()}` : ''), label: l.name || '(no name)', sort: blankLast(l.name) };
     case 'type':
       return { key: l.txnType, label: l.type, sort: l.type };
     case 'month': {
@@ -1567,8 +1966,13 @@ export function layoutDetail(
   const dir = o.sortDir === 'desc' ? -1 : 1;
   const prefix = o.idPrefix ?? 'd';
   const groups = new Map<string, { key: string; label: string; sort: string; lines: GlLine[] }>();
+  const rank = (s: SectionKey) => {
+    const i = o.sectionOrder!.indexOf(s);
+    return String(i < 0 ? o.sectionOrder!.length : i).padStart(3, '0');
+  };
   for (const l of lines) {
     const g = groupKeyOf(l, o.groupBy);
+    if (o.groupBy === 'account' && o.sectionOrder) g.sort = `${rank(l.account.section)}|${g.sort}`;
     if (!groups.has(g.key)) groups.set(g.key, { ...g, lines: [] });
     groups.get(g.key)!.lines.push(l);
   }
@@ -1705,12 +2109,18 @@ export const DATE_MACROS = [
 ] as const;
 export type DateMacro = (typeof DATE_MACROS)[number];
 
-/** Resolve a relative date range to concrete 'YYYY-MM-DD' from / to (UTC calendar days). */
-export function resolveDateMacro(macro: DateMacro, now: Date, fye?: string | null): { from?: string; to: string } {
+/**
+ * Resolve a relative date range to concrete 'YYYY-MM-DD' from / to. "Today" is `today` when it
+ * is a 'YYYY-MM-DD' calendar day, else the LOCAL calendar day of the moment `now` (localToday):
+ * at 11 pm on Oct 31 in California it is already Nov 1 in UTC, but This Month is still October.
+ */
+export function resolveDateMacro(macro: DateMacro, now: Date | string, fye?: string | null): { from?: string; to: string } {
+  const today = typeof now === 'string' ? now.slice(0, 10) : localToday(now);
+  // Calendar arithmetic on the day itself (UTC midnight of it, the stored-date convention).
+  now = parseDay(today)!;
   const y = now.getUTCFullYear();
   const m = now.getUTCMonth();
   const day = (yy: number, mm: number, dd: number) => dayStr(new Date(Date.UTC(yy, mm, dd)));
-  const today = dayStr(now);
   const q = Math.floor(m / 3);
   switch (macro) {
     case 'today':

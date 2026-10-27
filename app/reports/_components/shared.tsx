@@ -8,7 +8,7 @@
 import { Button, Input, Label } from '@/components/ui';
 import { formatShortDate } from '@/lib/format';
 import { todayISO } from '@/lib/dates';
-import { csvQuoted } from '@/lib/csv';
+import { csvFile, csvQuoted } from '@/lib/csv';
 
 // ---------------------------------------------------------------------------
 // CSV download
@@ -26,7 +26,8 @@ export function downloadCsv(filename: string, title: string, headers: string[], 
     headers.map(escape).join(','),
     ...rows.map((row) => row.map(escape).join(',')),
   ];
-  const blob = new Blob([lines.join('\r\n')], { type: 'text/csv;charset=utf-8;' });
+  // With the UTF-8 byte-order mark, so Excel shows dashes and accented names correctly.
+  const blob = new Blob([csvFile(lines)], { type: 'text/csv;charset=utf-8;' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;

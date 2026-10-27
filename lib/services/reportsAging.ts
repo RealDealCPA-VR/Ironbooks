@@ -178,11 +178,11 @@ export async function openItems(
   const entryIds = await entryIdsForSourceRefs(ctx, refs);
   const payIds = rows.filter((r) => r.docType === 'payment').map((r) => r.docId);
   const payEntry = new Map<string, string | null>();
-  if (payIds.length) {
+  for (let i = 0; i < payIds.length; i += 2000) {
     for (const r of await ctx.db
       .select({ id: paymentsReceived.id, entryId: paymentsReceived.postedEntryId })
       .from(paymentsReceived)
-      .where(and(eq(paymentsReceived.companyId, ctx.companyId), inArray(paymentsReceived.id, payIds)))) {
+      .where(and(eq(paymentsReceived.companyId, ctx.companyId), inArray(paymentsReceived.id, payIds.slice(i, i + 2000))))) {
       payEntry.set(r.id, r.entryId);
     }
   }

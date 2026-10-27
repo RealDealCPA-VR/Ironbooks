@@ -6,13 +6,10 @@ import { getPageContext } from '@/lib/context';
 import { formatCurrency } from '@/lib/money';
 import { voidedDeletedTransactions } from '@/lib/services/accountant/auditReports';
 import ReportToolbar, { type ExportTable } from '../_components/ReportToolbar';
+// The change's own day and time on this computer's calendar and clock (they were UTC).
+import { localDateTime, localDayRange } from '@/lib/reports/dates';
 
 export const dynamic = 'force-dynamic';
-
-function day(v: string | undefined, end: boolean): Date | undefined {
-  if (!v || !/^\d{4}-\d{2}-\d{2}$/.test(v)) return undefined;
-  return new Date(`${v}T${end ? '23:59:59.999' : '00:00:00.000'}Z`);
-}
 
 function summarize(original: unknown): string {
   if (!original || typeof original !== 'object') return '';
@@ -36,7 +33,7 @@ export default async function VoidedDeletedPage({
   const ctx = await getPageContext('/reports/voided-deleted');
   const p = await searchParams;
   const detail = p.detail === '1';
-  const { rows } = await voidedDeletedTransactions(ctx, { from: day(p.from, false), to: day(p.to, true), detail });
+  const { rows } = await voidedDeletedTransactions(ctx, { ...localDayRange(p.from, p.to), detail });
 
   const exportTable: ExportTable = {
     filename: detail ? 'voided-deleted-detail' : 'voided-deleted-summary',
@@ -54,7 +51,7 @@ export default async function VoidedDeletedPage({
     ],
     rows: rows.map((r) => [
       r.action === 'void' ? 'Voided' : 'Deleted',
-      r.at.slice(0, 16).replace('T', ' '),
+      localDateTime(r.at),
       r.user ?? '',
       r.typeLabel,
       r.number ?? '',
@@ -116,7 +113,7 @@ export default async function VoidedDeletedPage({
                 <Fragment key={r.auditLogId}>
                   <Tr>
                     <Td><Badge tone={r.action === 'void' ? 'warning' : 'danger'}>{r.action === 'void' ? 'Voided' : 'Deleted'}</Badge></Td>
-                    <Td className="whitespace-nowrap">{r.at.slice(0, 16).replace('T', ' ')}</Td>
+                    <Td className="whitespace-nowrap">{localDateTime(r.at)}</Td>
                     <Td>{r.user ?? '—'}</Td>
                     <Td>{r.typeLabel}</Td>
                     <Td>{r.number ?? ''}</Td>

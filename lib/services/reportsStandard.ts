@@ -23,7 +23,7 @@ import { notFound, validation } from './_base';
 import { classes, journalEntries } from '@/lib/db/schema';
 import { and, eq, gte, lte } from 'drizzle-orm';
 import { LedgerIntegrityError, assertBalanceSheetBalanced, assertTrialBalanceBalanced } from './ledgerAssert';
-import { balanceSheet, trialBalance, type BalanceSheet } from './reports';
+import { balanceSheet, fiscalYearStartFor, trialBalance, type BalanceSheet } from './reports';
 import { cashBasisBalanceSheet } from './balanceSheetCashBasis';
 import { cashBasisLedger } from './cashBasisLedger';
 import { cashFlow as cashFlowData } from './reportsExtra';
@@ -39,8 +39,11 @@ import {
   buildAccountTree,
   buildPLRows,
   companyFiscalYearEnd,
+  costLineCustomers,
+  customerNames,
   dayStr,
   detailColumns,
+  GL_LIMITS,
   fetchGlLines,
   fiscalWindowFor,
   fmtDay,
@@ -73,7 +76,7 @@ import {
 export const rangeLabel = (from: Date, to: Date) => `${fmtDay(from)} – ${fmtDay(to)}`;
 
 /** QB "Report Basis": 'cash' runs the report on the cash basis (cashBasisLedger.ts). */
-type Basis = 'cash' | undefined;
+export type Basis = 'cash' | undefined;
 const basisOf = (p: Pick<ReportParams, 'basis'>): Basis => (p.basis === 'cash' ? 'cash' : undefined);
 const basisSuffix = (b: Basis) => (b === 'cash' ? ' · Cash Basis' : '');
 /** The balance sheet for one as-of date on the report's basis. */
@@ -333,11 +336,13 @@ export async function profitAndLossByJobReport(ctx: ServiceContext, p: ReportPar
   f.sections = [...PL_SECTIONS];
   f.excludeClose = true;
   const { lines, truncated } = await fetchGlLines(ctx, meta, { ...f, limit: 50000 });
+  const bucketOf = await jobBucketOf(ctx, lines);
+  const custNames = await customerNames(ctx);
   const act = new Map<string, { accountId: string; bucket: string; debit: Decimal; credit: Decimal }>();
   const names = new Map<string, string>();
   for (const l of lines) {
-    const bucket = l.nameType === 'customer' && l.nameId ? l.nameId : '';
-    if (bucket) names.set(bucket, l.name || '(unnamed)');
+    const bucket = bucketOf(l);
+    if (bucket) names.set(bucket, (l.nameType === 'customer' && l.nameId === bucket ? l.name : custNames.get(bucket)?.name) || '(unnamed)');
     const k = `${l.accountId}|${bucket}`;
     const cur = act.get(k) ?? { accountId: l.accountId, bucket, debit: Money.zero(), credit: Money.zero() };
     cur.debit = cur.debit.plus(l.debit);
@@ -364,7 +369,9 @@ export async function profitAndLossByJobReport(ctx: ServiceContext, p: ReportPar
     if (!m || r.kind !== 'data') continue;
     r.hrefs = {};
     keys.forEach((k, i) => {
-      if (k) r.hrefs![`c${i}`] = stdHref('transaction-detail-by-account', { accountId: m[1], customerId: k, classId: p.classId, from: dayStr(from), to: dayStr(to), basis });
+      // The job column's own rule (named lines AND costed bill / check lines), not the Name filter:
+      // a costed bill line is named after its vendor, so customerId opened an empty report.
+      if (k) r.hrefs![`c${i}`] = stdHref('transaction-detail-by-account', { accountId: m[1], customerJobId: k, classId: p.classId, from: dayStr(from), to: dayStr(to), basis });
     });
   }
   return {
@@ -376,6 +383,17 @@ export async function profitAndLossByJobReport(ctx: ServiceContext, p: ReportPar
     truncated,
     notes: truncated ? ['Only the first 50,000 lines were included. Choose a shorter date range.'] : undefined,
   };
+}
+
+/**
+ * The P&L by Job column of a ledger line: its customer (income named by the invoice / sales
+ * receipt, or a named line), or — for a cost on a bill, check or vendor credit — the
+ * Customer:Job its document line is costed to (costLineCustomers); '' = "No customer:job".
+ * Shared with the report explanations so a job column explains to exactly its amount.
+ */
+export async function jobBucketOf(ctx: ServiceContext, lines: GlLine[]): Promise<(l: GlLine) => string> {
+  const costed = await costLineCustomers(ctx, lines);
+  return (l) => (l.nameType === 'customer' && l.nameId ? l.nameId : (costed.get(l.lineId) ?? ''));
 }
 
 // ===========================================================================
@@ -625,37 +643,84 @@ export async function balanceSheetReport(
 // Trial Balance (with sub-account roll-up)
 // ===========================================================================
 
+/** The account Retained Earnings is reported on (the first equity account of that kind), if any. */
+export function retainedEarningsAccount(meta: Map<string, AccountMeta>): AccountMeta | undefined {
+  return [...meta.values()]
+    .filter((a) => a.section === 'equity' && /retained/.test(a.subtype))
+    .sort((a, b) => a.code.localeCompare(b.code))[0];
+}
+
+/**
+ * Trial balance amounts as QuickBooks shows them, as of a date on either basis: balance-sheet
+ * accounts at their balance; income and expense accounts at their FISCAL-YEAR-TO-DATE amount
+ * (year-end closing entries left out, as on the balance sheet); and the income of every earlier
+ * fiscal year rolled into Retained Earnings (QB closes the books implicitly at each fiscal year
+ * end — the trial balance never shows several years of income on the income accounts). The
+ * Retained Earnings roll-in is booked on the company's retained-earnings account, or returned
+ * separately (`retainedEarnings`) when there is none. Values are debit − credit.
+ */
+export async function trialBalanceAmounts(
+  ctx: ServiceContext,
+  meta: Map<string, AccountMeta>,
+  asOf: Date,
+  basis: Basis,
+): Promise<{ amounts: Map<string, Decimal>; retainedEarnings: Decimal; fyStart: Date; ledgerBalanced: boolean }> {
+  const [tb, sheet] = await Promise.all([trialBalance(ctx, asOf), balanceSheet(ctx, asOf)]);
+  const fyStart = sheet.fiscalYearStart ? new Date(sheet.fiscalYearStart) : await fiscalYearStartFor(ctx, asOf);
+  // Cash basis: the balanced cash-basis adjustments (cashBasisLedger.ts), computed ONCE and split
+  // here exactly as the cash-basis balance sheet splits them (balanceSheetCashBasis.ts).
+  const adjustments = basis === 'cash' ? (await cashBasisLedger(ctx, { to: asOf })).adjustments.filter((a) => a.date <= asOf) : [];
+  const amounts = new Map<string, Decimal>();
+  const add = (id: string, v: Decimal) => amounts.set(id, (amounts.get(id) ?? Money.zero()).plus(v));
+  const isPL = (id: string) => {
+    const a = meta.get(id);
+    return !!a && isPLSection(a.section);
+  };
+  // Balance-sheet accounts: the balance as of the date (closing entries included — they are part
+  // of Retained Earnings), plus their cash-basis adjustments.
+  for (const r of tb.rows) if (!isPL(r.accountId)) add(r.accountId, Money.sub(r.debit, r.credit));
+  for (const a of adjustments) if (!isPL(a.accountId)) add(a.accountId, a.net);
+  // Income and expense accounts: this fiscal year only (and its cash-basis adjustments).
+  for (const r of await activityByAccount(ctx, { from: fyStart, to: asOf, excludeClose: true })) {
+    if (isPL(r.accountId)) add(r.accountId, Money.sub(r.debit, r.credit));
+  }
+  let priorAdj = Money.zero();
+  for (const a of adjustments) {
+    if (!isPL(a.accountId)) continue;
+    if (a.date >= fyStart) add(a.accountId, a.net);
+    else priorAdj = priorAdj.plus(a.net);
+  }
+  // Earlier fiscal years' income (credit = positive earnings → a credit on Retained Earnings).
+  const prior = Money.of(sheet.priorYearsEarnings).negated().plus(priorAdj);
+  const re = retainedEarningsAccount(meta);
+  let retainedEarnings = Money.zero();
+  if (re) add(re.id, prior);
+  else retainedEarnings = prior;
+  for (const [id, v] of amounts) if (v.isZero()) amounts.delete(id);
+  return { amounts, retainedEarnings, fyStart, ledgerBalanced: tb.balanced };
+}
+
 export async function trialBalanceReport(ctx: ServiceContext, p: ReportParams): Promise<StdReport> {
   const asOf = resolveAsOf(p);
   const meta = await loadAccountMeta(ctx);
   const basis = basisOf(p);
-  const tb = await trialBalance(ctx, asOf);
+  const tbAmounts = await trialBalanceAmounts(ctx, meta, asOf, basis);
   const amounts = new Map<string, Amounts>();
-  for (const r of tb.rows) amounts.set(r.accountId, [Money.sub(r.debit, r.credit)]);
-  let totalDebit = Money.of(tb.totalDebit);
-  let totalCredit = Money.of(tb.totalCredit);
-  if (basis === 'cash') {
-    // Cash basis: layer the balanced cash-basis adjustments (cashBasisLedger.ts) on the ledger.
-    const { adjustments } = await cashBasisLedger(ctx, { to: asOf });
-    for (const a of adjustments) {
-      const v = amounts.get(a.accountId) ?? [Money.zero()];
-      v[0] = v[0].plus(a.net);
-      amounts.set(a.accountId, v);
-    }
-    totalDebit = Money.zero();
-    totalCredit = Money.zero();
-    for (const [id, v] of amounts) {
-      if (v[0].isZero()) amounts.delete(id);
-      else if (v[0].greaterThan(0)) totalDebit = totalDebit.plus(v[0]);
-      else totalCredit = totalCredit.minus(v[0]);
-    }
-    assertTrialBalanceBalanced('Cash-basis trial balance', totalDebit, totalCredit);
+  for (const [id, v] of tbAmounts.amounts) amounts.set(id, [v]);
+  let totalDebit = Money.zero();
+  let totalCredit = Money.zero();
+  for (const v of [...tbAmounts.amounts.values(), tbAmounts.retainedEarnings]) {
+    if (v.greaterThan(0)) totalDebit = totalDebit.plus(v);
+    else totalCredit = totalCredit.minus(v);
   }
+  // Unreachable while the ledger guards hold: the roll-in moves earnings, it never adds any.
+  assertTrialBalanceBalanced(basis === 'cash' ? 'Cash-basis trial balance' : 'Trial balance', totalDebit, totalCredit);
   const cells = (label: string, v: Amounts): Record<string, CellValue> => ({
     label,
     debit: v[0].greaterThan(0) ? toAmountString(v[0]) : null,
     credit: v[0].lessThan(0) ? toAmountString(v[0].negated()) : null,
   });
+  const fyFrom = dayStr(tbAmounts.fyStart);
   const tree = buildAccountTree({
     meta,
     amounts,
@@ -664,8 +729,19 @@ export async function trialBalanceReport(ctx: ServiceContext, p: ReportParams): 
     parentRowId: null,
     depth: 0,
     cells,
-    hrefFor: (a) => stdHref('transaction-detail-by-account', { accountId: a.id, to: dayStr(asOf), basis }),
+    // QuickZoom: an income / expense account opens this fiscal year's transactions.
+    hrefFor: (a) =>
+      stdHref('transaction-detail-by-account', { accountId: a.id, from: isPLSection(a.section) ? fyFrom : undefined, to: dayStr(asOf), basis }),
   });
+  if (!tbAmounts.retainedEarnings.isZero()) {
+    tree.rows.push({
+      id: 'tb:re',
+      depth: 0,
+      kind: 'data',
+      cells: cells('Retained Earnings', [tbAmounts.retainedEarnings]),
+      href: stdHref('profit-loss', { from: '1900-01-01', to: dayStr(new Date(tbAmounts.fyStart.getTime() - 1)), basis }),
+    });
+  }
   tree.rows.push({
     id: 'tb:total',
     depth: 0,
@@ -682,7 +758,8 @@ export async function trialBalanceReport(ctx: ServiceContext, p: ReportParams): 
       { key: 'credit', header: 'Credit', type: 'money' },
     ],
     rows: tree.rows,
-    balanced: tb.balanced && Money.eq(totalDebit, totalCredit),
+    balanced: tbAmounts.ledgerBalanced && Money.eq(totalDebit, totalCredit),
+    notes: [`Income and expense accounts show this fiscal year (from ${fmtDay(tbAmounts.fyStart)}); earlier years’ net income is in Retained Earnings.`],
   };
 }
 
@@ -745,9 +822,6 @@ export async function profitAndLossDetail(ctx: ServiceContext, p: ReportParams):
   f.excludeClose = true;
   f.sections = f.sections ? f.sections.filter(isPLSection) : [...PL_SECTIONS];
   const { lines, truncated } = await fetchGlLines(ctx, meta, f);
-  // Order account groups in statement order (Income, COGS, Expense, Other Income, Other Expense).
-  const order = (l: GlLine) => PL_SECTIONS.indexOf(l.account.section as PLSection);
-  lines.sort((a, b) => order(a) - order(b));
   const laid = layoutDetail(lines, {
     columns: detailColumns(DEFAULT_DETAIL_KEYS),
     groupBy: (p.subtotalBy as GroupKey) ?? 'account',
@@ -756,8 +830,10 @@ export async function profitAndLossDetail(ctx: ServiceContext, p: ReportParams):
     natural: true,
     running: (p.subtotalBy ?? 'account') === 'account',
     idPrefix: 'pld',
+    // Account groups in statement order (Income, COGS, Expense, Other Income, Other Expense), then
+    // by number — never by number alone.
+    sectionOrder: PL_SECTIONS,
   });
-  // Re-order account groups into statement order (layoutDetail sorts by code).
   const rows = laid.rows;
   // Net income line: income-type naturals minus expense-type naturals.
   let net = Money.zero();
@@ -784,7 +860,11 @@ export async function balanceSheetDetail(ctx: ServiceContext, p: ReportParams): 
   const f = glFilterFromParams(meta, p, { from, to });
   f.sections = f.sections ? f.sections.filter((s) => !isPLSection(s)) : [...BS_SECTIONS];
   const { lines, truncated } = await fetchGlLines(ctx, meta, f);
-  const before = await activityByAccount(ctx, { to: new Date(from.getTime() - 1), accountIds: f.accountIds, basis: f.basis });
+  // Beginning balances are whole-account balances: with a line filter on (a name, class, type,
+  // amount …) they would add every other name's balance to the filtered lines, so — as on the
+  // General Ledger — they are left out then.
+  const lineFiltered = hasLineFilter(p);
+  const before = lineFiltered ? [] : await activityByAccount(ctx, { to: new Date(from.getTime() - 1), accountIds: f.accountIds, basis: f.basis });
   const opening = new Map<string, Decimal>();
   for (const r of before) {
     const a = meta.get(r.accountId);
@@ -816,9 +896,15 @@ export async function balanceSheetDetail(ctx: ServiceContext, p: ReportParams): 
     truncated,
     notes: [
       ...detailNotes(truncated),
+      ...(lineFiltered ? ['Beginning balances are left out because a filter is on.'] : []),
       'Retained Earnings and Net Income are calculated lines; see the Balance Sheet for them.',
     ],
   };
+}
+
+/** A filter that picks individual lines (so whole-account beginning balances no longer apply). */
+function hasLineFilter(p: ReportParams): boolean {
+  return !!(p.customerId || p.vendorId || p.employeeId || p.nameId || p.txnType || p.amountMin || p.amountMax || p.memo || p.number || (p.cleared && p.cleared !== 'any') || p.classId);
 }
 
 /**
@@ -836,7 +922,7 @@ export async function generalLedgerReport(ctx: ServiceContext, p: ReportParams):
   const dayBefore = new Date(from.getTime() - 1);
   const fyStart = fiscalWindowFor(from, await companyFiscalYearEnd(ctx)).start;
   // Opening balances only make sense when no line-level filter (name, type, amount…) is on.
-  const lineFiltered = !!(p.customerId || p.vendorId || p.employeeId || p.nameId || p.txnType || p.amountMin || p.amountMax || p.memo || p.number || (p.cleared && p.cleared !== 'any') || p.classId);
+  const lineFiltered = hasLineFilter(p);
   const opening = new Map<string, Decimal>();
   if (!lineFiltered) {
     const [bsBefore, plBefore] = await Promise.all([
@@ -1042,10 +1128,13 @@ export async function transactionList(
   const meta = await loadAccountMeta(ctx);
   const f = glFilterFromParams(meta, p, { from, to });
   if (by === 'customer' || by === 'vendor') f.nameType = by;
-  const { lines: hits, truncated } = await fetchGlLines(ctx, meta, f);
+  const { lines: hits, truncated: hitsCut } = await fetchGlLines(ctx, meta, f);
   const wanted = by === 'date' ? hits : hits.filter((l) => l.nameType === by);
   const entryIds = [...new Set(wanted.map((l) => l.entryId))];
-  const { lines } = await fetchGlLines(ctx, meta, { entryIds });
+  // Every line of those transactions (their total and Split). This read is capped too: when it
+  // is cut, some totals are built from part of their lines, so the report must say so.
+  const { lines, truncated: linesCut } = await fetchGlLines(ctx, meta, { entryIds, limit: GL_LIMITS.maxLines });
+  const truncated = hitsCut || linesCut;
   const byEntry = new Map<string, GlLine[]>();
   for (const l of lines) byEntry.set(l.entryId, [...(byEntry.get(l.entryId) ?? []), l]);
   // One synthetic "line" per transaction for the shared detail layout.

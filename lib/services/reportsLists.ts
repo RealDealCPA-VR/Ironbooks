@@ -10,7 +10,7 @@
  *    Account Listing.
  *  - Income Tax Preparation / Summary / Detail (by tax line, via a mapping function).
  */
-import { and, asc, eq, gte, inArray, isNull, lte, ne, notInArray, sql, type SQL } from 'drizzle-orm';
+import { and, asc, eq, gte, inArray, isNotNull, isNull, lte, ne, notInArray, sql, type SQL } from 'drizzle-orm';
 import type Decimal from 'decimal.js';
 import {
   accounts,
@@ -21,6 +21,8 @@ import {
   creditMemoLines,
   creditMemos,
   customers,
+  expenseLines,
+  expenses,
   invoiceLines,
   invoices,
   items,
@@ -32,6 +34,8 @@ import {
   salesOrders,
   salesReceiptLines,
   salesReceipts,
+  vendorCreditLines,
+  vendorCredits,
   vendors,
 } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
@@ -51,8 +55,10 @@ import {
   fetchGlLines,
   fmtDay,
   glFilterFromParams,
+  homeAmountsByLine,
   isPLSection,
   layoutDetail,
+  ledgerTotalsByName,
   loadAccountMeta,
   naturalAmount,
   resolveAsOf,
@@ -87,7 +93,7 @@ async function ledgerByName(
 }
 
 function balanceSummary(
-  lines: GlLine[],
+  lines: Pick<GlLine, 'nameType' | 'nameId' | 'name' | 'natural'>[],
   nameType: NameType,
   detailKey: string,
   asOf: Date,
@@ -119,9 +125,22 @@ function balanceSummary(
   return { rows, total };
 }
 
+/**
+ * Balance per name on the A/R or A/P accounts as of a date. Accrual: summed in SQL per name
+ * (ledgerTotalsByName — every line, however large the file); cash basis: the cash-basis lines.
+ */
+async function balancesByName(ctx: ServiceContext, section: 'ar' | 'ap', p: ReportParams, asOf: Date) {
+  if (p.basis === 'cash') {
+    const { lines, truncated } = await ledgerByName(ctx, section, { ...p, customerId: undefined, vendorId: undefined }, { to: asOf });
+    return { totals: lines, truncated };
+  }
+  const meta = await loadAccountMeta(ctx);
+  return { totals: await ledgerTotalsByName(ctx, meta, { sections: [section], to: asOf, classId: p.classId }), truncated: false };
+}
+
 export async function customerBalanceSummary(ctx: ServiceContext, p: ReportParams): Promise<StdReport> {
   const asOf = resolveAsOf(p);
-  const { lines, truncated } = await ledgerByName(ctx, 'ar', { ...p, customerId: undefined }, { to: asOf });
+  const { totals: lines, truncated } = await balancesByName(ctx, 'ar', p, asOf);
   const { rows } = balanceSummary(lines, 'customer', 'customer-balance-detail', asOf);
   return {
     key: 'customer-balance-summary',
@@ -135,7 +154,7 @@ export async function customerBalanceSummary(ctx: ServiceContext, p: ReportParam
 
 export async function vendorBalanceSummary(ctx: ServiceContext, p: ReportParams): Promise<StdReport> {
   const asOf = resolveAsOf(p);
-  const { lines, truncated } = await ledgerByName(ctx, 'ap', { ...p, vendorId: undefined }, { to: asOf });
+  const { totals: lines, truncated } = await balancesByName(ctx, 'ap', p, asOf);
   const { rows } = balanceSummary(lines, 'vendor', 'vendor-balance-detail', asOf);
   return {
     key: 'vendor-balance-summary',
@@ -200,8 +219,29 @@ export async function unpaidBillsDetail(ctx: ServiceContext, p: ReportParams): P
   const docs = aging.rows.filter(
     (r) => (!p.vendorId || r.entityId === p.vendorId) && (overDays === null || r.daysPastDue > overDays),
   );
-  const refs = docs.map((r) => `${r.docType === 'bill' ? 'bill' : 'vendor_credit'}:${r.docId}`);
-  const entryIds = await entryIdsForSourceRefs(ctx, refs);
+  // QuickZoom: a bill / credit opens its posted entry; a named General Journal A/P line IS its
+  // entry (it used to be looked up as a "vendor_credit:" document, so it never opened, and was
+  // labelled "Bill Credit").
+  const refOf = (r: (typeof docs)[number]) => (r.docType === 'bill' ? `bill:${r.docId}` : r.docType === 'vendor_credit' ? `vendor_credit:${r.docId}` : '');
+  const entryIds = await entryIdsForSourceRefs(ctx, docs.map(refOf));
+  const creditIds = docs.filter((r) => r.docType === 'vendor_credit').map((r) => r.docId);
+  const creditRefs = new Map<string, string | null>();
+  for (let i = 0; i < creditIds.length; i += 2000) {
+    for (const c of await ctx.db
+      .select({ id: vendorCredits.id, ref: vendorCredits.refNumber })
+      .from(vendorCredits)
+      .where(and(eq(vendorCredits.companyId, ctx.companyId), inArray(vendorCredits.id, creditIds.slice(i, i + 2000))))) {
+      creditRefs.set(c.id, c.ref);
+    }
+  }
+  const TYPE: Record<string, string> = { bill: 'Bill', vendor_credit: 'Credit', journal_entry: 'General Journal' };
+  /** The Num column: the document's own number (QB), never "Bill …" / "Vendor Credit". */
+  const numOf = (r: (typeof docs)[number]) =>
+    r.docType === 'bill'
+      ? r.docNumber.replace(/^Bill ?/, '')
+      : r.docType === 'vendor_credit'
+        ? (creditRefs.get(r.docId) ?? '')
+        : r.docNumber.replace(/^General Journal /, '');
   const byVendor = new Map<string, typeof docs>();
   for (const r of docs) byVendor.set(r.entityId, [...(byVendor.get(r.entityId) ?? []), r]);
   const rows: StdRow[] = [];
@@ -211,23 +251,24 @@ export async function unpaidBillsDetail(ctx: ServiceContext, p: ReportParams): P
     let sub = Money.zero();
     const header: StdRow = { id: hid, depth: 0, kind: 'section', collapseKind: 'group', cells: { label: list[0].entityName } };
     rows.push(header);
-    for (const r of list.sort((a, b) => (a.dueDate ?? a.date).localeCompare(b.dueDate ?? b.date))) {
+    for (const [i, r] of list.sort((a, b) => (a.dueDate ?? a.date).localeCompare(b.dueDate ?? b.date)).entries()) {
       sub = sub.plus(Money.of(r.openBalance));
       rows.push({
-        id: `ub:d:${r.docId}`,
+        // A General Journal entry can name the vendor on several A/P lines: keep row ids unique.
+        id: `ub:d:${r.docType}:${r.docId}:${i}`,
         parentId: hid,
         depth: 1,
         kind: 'data',
         cells: {
           label: '',
-          type: r.docType === 'bill' ? 'Bill' : 'Bill Credit',
+          type: TYPE[r.docType] ?? 'General Journal',
           date: r.date.slice(0, 10),
-          num: r.docNumber,
+          num: numOf(r),
           due: r.dueDate ? r.dueDate.slice(0, 10) : '',
           aging: r.daysPastDue > 0 ? r.daysPastDue : null,
           open: r.openBalance,
         },
-        entryId: entryIds.get(refs[docs.indexOf(r)]) ?? null,
+        entryId: r.docType === 'journal_entry' ? r.docId : (entryIds.get(refOf(r)) ?? null),
       });
     }
     total = total.plus(sub);
@@ -266,6 +307,7 @@ export async function billsAndAppliedPayments(ctx: ServiceContext, p: ReportPara
       total: bills.total,
       credited: bills.amountCredited,
       balanceDue: bills.balanceDue,
+      rate: bills.exchangeRate,
     })
     .from(bills)
     .innerJoin(vendors, eq(bills.vendorId, vendors.id))
@@ -281,48 +323,60 @@ export async function billsAndAppliedPayments(ctx: ServiceContext, p: ReportPara
           ref: billPayments.reference,
           method: billPayments.method,
           applied: billPaymentApplications.amountApplied,
+          appliedHome: billPaymentApplications.amountHome,
         })
         .from(billPaymentApplications)
         .innerJoin(billPayments, eq(billPaymentApplications.billPaymentId, billPayments.id))
         .where(and(inArray(billPaymentApplications.billId, ids), isNull(billPayments.voidedAt)))
     : [];
   const entryIds = await entryIdsForSourceRefs(ctx, ids.map((i) => `bill:${i}`));
+  const appsByBill = new Map<string, typeof apps>();
+  for (const a of apps) appsByBill.set(a.billId, [...(appsByBill.get(a.billId) ?? []), a]);
   const rows: StdRow[] = [];
   let tBill = Money.zero();
   let tPaid = Money.zero();
+  let tCredited = Money.zero();
   for (const b of billRows) {
     const hid = `bap:${b.id}`;
-    tBill = tBill.plus(Money.of(b.total));
+    // Home currency, as the bill and its payments posted to A/P: a foreign bill's own amounts
+    // were added to the dollar bills' (EUR 350 counted as 350.00).
+    const home = (v: string) => homeOf(Money.of(v), b.rate);
+    const billHome = home(b.total);
+    tBill = tBill.plus(billHome);
     const header: StdRow = {
       id: hid,
       depth: 0,
       kind: 'data',
       collapseKind: 'group',
-      cells: { label: b.vendor, type: 'Bill', date: dayStr(b.date), num: b.num ?? '', amount: toAmountString(b.total), open: toAmountString(b.balanceDue) },
+      cells: { label: b.vendor, type: 'Bill', date: dayStr(b.date), num: b.num ?? '', amount: amt(billHome), open: amt(home(b.balanceDue)) },
       entryId: entryIds.get(`bill:${b.id}`) ?? null,
     };
     rows.push(header);
-    for (const a of apps.filter((x) => x.billId === b.id).sort((x, y) => x.date.getTime() - y.date.getTime())) {
-      tPaid = tPaid.plus(Money.of(a.applied));
+    for (const a of (appsByBill.get(b.id) ?? []).sort((x, y) => x.date.getTime() - y.date.getTime())) {
+      const paid = a.appliedHome != null ? Money.of(a.appliedHome) : home(a.applied);
+      tPaid = tPaid.plus(paid);
       rows.push({
         id: `bap:p:${b.id}:${a.paymentId}`,
         parentId: hid,
         depth: 1,
         kind: 'data',
-        cells: { label: '', type: 'Bill Pmt', date: dayStr(a.date), num: a.ref ?? '', memo: a.method, amount: toAmountString(Money.of(a.applied).negated()) },
+        cells: { label: '', type: 'Bill Pmt', date: dayStr(a.date), num: a.ref ?? '', memo: a.method, amount: amt(paid.negated()) },
       });
     }
     if (!Money.isZero(b.credited)) {
+      const credited = home(b.credited);
+      tCredited = tCredited.plus(credited);
       rows.push({
         id: `bap:c:${b.id}`,
         parentId: hid,
         depth: 1,
         kind: 'data',
-        cells: { label: '', type: 'Bill Credit', memo: 'Credits applied', amount: toAmountString(Money.of(b.credited).negated()) },
+        cells: { label: '', type: 'Bill Credit', memo: 'Credits applied', amount: amt(credited.negated()) },
       });
     }
   }
-  rows.push({ id: 'bap:grand', depth: 0, kind: 'grand', cells: { label: 'TOTAL', amount: amt(tBill.minus(tPaid)) } });
+  // The TOTAL is the sum of the rows above it: bills less the payments AND credits applied.
+  rows.push({ id: 'bap:grand', depth: 0, kind: 'grand', cells: { label: 'TOTAL', amount: amt(tBill.minus(tPaid).minus(tCredited)) } });
   return {
     key: 'bills-applied-payments',
     title: 'Bills & Applied Payments',
@@ -1131,7 +1185,8 @@ function addressLine(a: Record<string, string> | null | undefined): string {
 
 async function nameBalances(ctx: ServiceContext, section: 'ar' | 'ap', nameType: NameType): Promise<Map<string, Decimal>> {
   const meta = await loadAccountMeta(ctx);
-  const { lines } = await fetchGlLines(ctx, meta, { sections: [section], limit: 50000 });
+  // Every A/R / A/P line, summed per name in SQL (no line cap on a large file).
+  const lines = await ledgerTotalsByName(ctx, meta, { sections: [section] });
   const out = new Map<string, Decimal>();
   for (const l of lines) {
     if (l.nameType !== nameType || !l.nameId) continue;
@@ -1367,27 +1422,114 @@ export { incomeTaxPreparation, incomeTaxReport, defaultTaxLineMapper, type TaxLi
 
 export type { CellValue, StdColumn };
 
-/** Purchases by Item Detail — item lines on bills (void bills excluded), by item. */
-export async function purchasesByItemDetail(ctx: ServiceContext, p: ReportParams): Promise<StdReport> {
-  const { from, to } = await resolveRange(ctx, p);
-  const conds: SQL[] = [eq(bills.companyId, ctx.companyId), ne(bills.status, 'void'), gte(bills.date, from), lte(bills.date, to), sql`${billLines.itemId} IS NOT NULL`];
-  if (p.itemId) conds.push(eq(billLines.itemId, p.itemId));
-  if (p.vendorId) conds.push(eq(bills.vendorId, p.vendorId));
-  const rowsDb = await ctx.db
-    .select({ id: billLines.id, billId: bills.id, num: bills.billNumber, date: bills.date, vendor: vendors.displayName, itemId: billLines.itemId, item: items.name, memo: billLines.description, qty: billLines.quantity, amount: billLines.amount })
+/**
+ * One purchase of an item (QB Reports > Purchases): an item line on a bill, on a check or
+ * credit-card charge (Write Checks / Enter Credit Card Charges, Items tab), or on a vendor credit
+ * (a return: negative quantity and amount). Amounts are in HOME currency, exactly as the
+ * document posted them (homeAmounts: one round2(total x rate) anchor penny-allocated over the
+ * document's lines), so a EUR bill never adds euros to dollars.
+ */
+export interface PurchaseLine {
+  id: string;
+  type: 'Bill' | 'Check' | 'Credit Card Charge' | 'Credit';
+  sourceRef: string;
+  date: Date;
+  num: string;
+  vendorId: string | null;
+  vendor: string;
+  itemId: string;
+  item: string | null;
+  memo: string;
+  qty: Decimal;
+  amount: Decimal;
+}
+
+/** Item purchases in [from, to] (void documents excluded), optionally for one item / vendor. */
+export async function purchaseLines(
+  ctx: ServiceContext,
+  p: Pick<ReportParams, 'itemId' | 'vendorId'>,
+  from: Date,
+  to: Date,
+): Promise<PurchaseLine[]> {
+  const c = ctx.companyId;
+  const out: PurchaseLine[] = [];
+
+  const billConds: SQL[] = [eq(bills.companyId, c), ne(bills.status, 'void'), gte(bills.date, from), lte(bills.date, to), isNotNull(billLines.itemId)];
+  if (p.itemId) billConds.push(eq(billLines.itemId, p.itemId));
+  if (p.vendorId) billConds.push(eq(bills.vendorId, p.vendorId));
+  const billRows = await ctx.db
+    .select({ id: billLines.id, docId: bills.id, num: bills.billNumber, date: bills.date, vendorId: bills.vendorId, vendor: vendors.displayName, itemId: billLines.itemId, item: items.name, memo: billLines.description, qty: billLines.quantity, amount: billLines.amount, rate: bills.exchangeRate })
     .from(billLines)
     .innerJoin(bills, eq(billLines.billId, bills.id))
     .innerJoin(vendors, eq(bills.vendorId, vendors.id))
     .leftJoin(items, eq(billLines.itemId, items.id))
-    .where(and(...conds))
-    .orderBy(asc(items.name), asc(bills.date));
-  const entryIds = await entryIdsForSourceRefs(ctx, rowsDb.map((r) => `bill:${r.billId}`));
+    .where(and(...billConds));
+  const billHome = await homeAmountsByLine(ctx, 'bill', billRows.map((r) => ({ id: r.docId, rate: r.rate })));
+  for (const r of billRows) {
+    out.push({ id: r.id, type: 'Bill', sourceRef: `bill:${r.docId}`, date: r.date, num: r.num ?? '', vendorId: r.vendorId, vendor: r.vendor, itemId: r.itemId!, item: r.item, memo: r.memo ?? '', qty: Money.of(r.qty), amount: billHome.get(r.id) ?? Money.of(r.amount) });
+  }
+
+  // Checks and credit-card charges with item lines (a card credit cannot carry items).
+  const expConds: SQL[] = [eq(expenses.companyId, c), isNull(expenses.voidedAt), gte(expenses.date, from), lte(expenses.date, to), isNotNull(expenseLines.itemId)];
+  if (p.itemId) expConds.push(eq(expenseLines.itemId, p.itemId));
+  if (p.vendorId) expConds.push(eq(expenses.vendorId, p.vendorId));
+  const expRows = await ctx.db
+    .select({ id: expenseLines.id, docId: expenses.id, num: expenses.reference, date: expenses.date, method: expenses.method, vendorId: expenses.vendorId, vendor: vendors.displayName, payee: expenses.payeeName, itemId: expenseLines.itemId, item: items.name, memo: expenseLines.description, qty: expenseLines.quantity, amount: expenseLines.amount, rate: expenses.exchangeRate })
+    .from(expenseLines)
+    .innerJoin(expenses, eq(expenseLines.expenseId, expenses.id))
+    .leftJoin(vendors, eq(expenses.vendorId, vendors.id))
+    .leftJoin(items, eq(expenseLines.itemId, items.id))
+    .where(and(...expConds));
+  const expHome = await homeAmountsByLine(ctx, 'expense', expRows.map((r) => ({ id: r.docId, rate: r.rate })));
+  for (const r of expRows) {
+    out.push({
+      id: r.id,
+      type: r.method === 'credit_card' ? 'Credit Card Charge' : 'Check',
+      sourceRef: `expense:${r.docId}`,
+      date: r.date,
+      num: r.num ?? '',
+      vendorId: r.vendorId,
+      vendor: r.vendor ?? r.payee ?? '',
+      itemId: r.itemId!,
+      item: r.item,
+      memo: r.memo ?? '',
+      qty: Money.of(r.qty ?? '1'),
+      amount: expHome.get(r.id) ?? Money.of(r.amount),
+    });
+  }
+
+  // Vendor credits (returns) reduce what was bought.
+  const vcConds: SQL[] = [eq(vendorCredits.companyId, c), ne(vendorCredits.status, 'void'), gte(vendorCredits.date, from), lte(vendorCredits.date, to), isNotNull(vendorCreditLines.itemId)];
+  if (p.itemId) vcConds.push(eq(vendorCreditLines.itemId, p.itemId));
+  if (p.vendorId) vcConds.push(eq(vendorCredits.vendorId, p.vendorId));
+  const vcRows = await ctx.db
+    .select({ id: vendorCreditLines.id, docId: vendorCredits.id, num: vendorCredits.refNumber, date: vendorCredits.date, vendorId: vendorCredits.vendorId, vendor: vendors.displayName, itemId: vendorCreditLines.itemId, item: items.name, memo: vendorCreditLines.description, qty: vendorCreditLines.quantity, amount: vendorCreditLines.amount, rate: vendorCredits.exchangeRate })
+    .from(vendorCreditLines)
+    .innerJoin(vendorCredits, eq(vendorCreditLines.vendorCreditId, vendorCredits.id))
+    .innerJoin(vendors, eq(vendorCredits.vendorId, vendors.id))
+    .leftJoin(items, eq(vendorCreditLines.itemId, items.id))
+    .where(and(...vcConds));
+  const vcHome = await homeAmountsByLine(ctx, 'vendor_credit', vcRows.map((r) => ({ id: r.docId, rate: r.rate })));
+  for (const r of vcRows) {
+    out.push({ id: r.id, type: 'Credit', sourceRef: `vendor_credit:${r.docId}`, date: r.date, num: r.num ?? '', vendorId: r.vendorId, vendor: r.vendor, itemId: r.itemId!, item: r.item, memo: r.memo ?? '', qty: Money.of(r.qty ?? '1').negated(), amount: (vcHome.get(r.id) ?? Money.of(r.amount)).negated() });
+  }
+  return out.sort((a, b) => a.date.getTime() - b.date.getTime() || a.num.localeCompare(b.num, undefined, { numeric: true }) || a.id.localeCompare(b.id));
+}
+
+/**
+ * Purchases by Item Detail — every purchase of an item (bills, checks, credit-card charges and
+ * vendor credits as returns; void documents excluded), by item, in home currency.
+ */
+export async function purchasesByItemDetail(ctx: ServiceContext, p: ReportParams): Promise<StdReport> {
+  const { from, to } = await resolveRange(ctx, p);
+  const lines = await purchaseLines(ctx, p, from, to);
+  const entryIds = await entryIdsForSourceRefs(ctx, lines.map((r) => r.sourceRef));
   const rows: StdRow[] = [];
   let tQty = Money.zero();
   let tAmt = Money.zero();
-  const groups = new Map<string, typeof rowsDb>();
-  for (const r of rowsDb) groups.set(r.itemId ?? '', [...(groups.get(r.itemId ?? '') ?? []), r]);
-  for (const [k, list] of groups) {
+  const groups = new Map<string, PurchaseLine[]>();
+  for (const r of lines) groups.set(r.itemId, [...(groups.get(r.itemId) ?? []), r]);
+  for (const [k, list] of [...groups.entries()].sort((a, b) => (a[1][0].item ?? '').localeCompare(b[1][0].item ?? ''))) {
     const label = list[0].item ?? '(no item)';
     const hid = `pid:${k}`;
     const header: StdRow = { id: hid, depth: 0, kind: 'section', collapseKind: 'group', cells: { label } };
@@ -1395,15 +1537,15 @@ export async function purchasesByItemDetail(ctx: ServiceContext, p: ReportParams
     let q = Money.zero();
     let a = Money.zero();
     for (const r of list) {
-      q = q.plus(Money.of(r.qty));
-      a = a.plus(Money.of(r.amount));
+      q = q.plus(r.qty);
+      a = a.plus(r.amount);
       rows.push({
         id: `pid:l:${r.id}`,
         parentId: hid,
         depth: 1,
         kind: 'data',
-        cells: { label: '', type: 'Bill', date: dayStr(r.date), num: r.num ?? '', name: r.vendor, memo: r.memo ?? '', qty: Money.of(r.qty).toFixed(4), amount: toAmountString(r.amount), balance: amt(a) },
-        entryId: entryIds.get(`bill:${r.billId}`) ?? null,
+        cells: { label: '', type: r.type, date: dayStr(r.date), num: r.num, name: r.vendor, memo: r.memo, qty: r.qty.toFixed(4), amount: amt(r.amount), balance: amt(a) },
+        entryId: entryIds.get(r.sourceRef) ?? null,
       });
     }
     tQty = tQty.plus(q);
@@ -1433,31 +1575,18 @@ export async function purchasesByItemDetail(ctx: ServiceContext, p: ReportParams
 }
 
 /**
- * Purchases by Item Summary / Purchases by Vendor Summary (QB Reports > Purchases): item lines on
- * bills in the period (voided bills excluded), totalled per item or per vendor.
+ * Purchases by Item Summary / Purchases by Vendor Summary (QB Reports > Purchases): item
+ * purchases in the period (purchaseLines), totalled per item or per vendor.
  */
-async function purchaseLines(ctx: ServiceContext, p: ReportParams, from: Date, to: Date) {
-  const conds: SQL[] = [eq(bills.companyId, ctx.companyId), ne(bills.status, 'void'), gte(bills.date, from), lte(bills.date, to), sql`${billLines.itemId} IS NOT NULL`];
-  if (p.itemId) conds.push(eq(billLines.itemId, p.itemId));
-  if (p.vendorId) conds.push(eq(bills.vendorId, p.vendorId));
-  return ctx.db
-    .select({ vendorId: bills.vendorId, vendor: vendors.displayName, itemId: billLines.itemId, item: items.name, qty: billLines.quantity, amount: billLines.amount })
-    .from(billLines)
-    .innerJoin(bills, eq(billLines.billId, bills.id))
-    .innerJoin(vendors, eq(bills.vendorId, vendors.id))
-    .leftJoin(items, eq(billLines.itemId, items.id))
-    .where(and(...conds));
-}
-
 async function purchasesSummary(ctx: ServiceContext, p: ReportParams, by: 'item' | 'vendor'): Promise<StdReport> {
   const { from, to } = await resolveRange(ctx, p);
   const lines = await purchaseLines(ctx, p, from, to);
   const acc = new Map<string, { label: string; qty: Decimal; amount: Decimal }>();
   for (const l of lines) {
     const k = (by === 'item' ? l.itemId : l.vendorId) ?? '';
-    const cur = acc.get(k) ?? { label: (by === 'item' ? l.item : l.vendor) ?? '(none)', qty: Money.zero(), amount: Money.zero() };
-    cur.qty = cur.qty.plus(Money.of(l.qty));
-    cur.amount = cur.amount.plus(Money.of(l.amount));
+    const cur = acc.get(k) ?? { label: (by === 'item' ? l.item : l.vendorId ? l.vendor : '(no vendor)') ?? '(none)', qty: Money.zero(), amount: Money.zero() };
+    cur.qty = cur.qty.plus(l.qty);
+    cur.amount = cur.amount.plus(l.amount);
     acc.set(k, cur);
   }
   const grandAmt = [...acc.values()].reduce((s, v) => s.plus(v.amount), Money.zero());

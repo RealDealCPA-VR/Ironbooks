@@ -11,9 +11,10 @@ import { and, eq, isNotNull, isNull } from 'drizzle-orm';
 import { accounts, budgetLines, budgets, classes, customers } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { profitAndLoss } from '@/lib/services/reports';
+import { jobBucketOf } from './reportsStandard';
 import { fiscalYearWindow } from './fiscalClose';
 import type { ServiceContext } from './_base';
-import { notFound, validation, writeAudit } from './_base';
+import { inTransaction, notFound, validation, writeAudit } from './_base';
 import type Decimal from 'decimal.js';
 import type { CellValue, StdColumn, StdReport, StdRow } from '@/lib/reports/types';
 import type { ReportParams } from '@/lib/validation/reports';
@@ -158,19 +159,22 @@ export async function createBudget(
     throw validation('fiscalYear must be a 4-digit year between 2000 and 2100');
   }
 
-  const [row] = await ctx.db
-    .insert(budgets)
-    .values({ companyId: ctx.companyId, name: name.trim(), fiscalYear, kind, isForecast: input.isForecast ?? false })
-    .returning();
+  // One transaction: a refused audit (view-only role, Accountant's Copy) leaves no budget behind.
+  return inTransaction(ctx, async (tx) => {
+    const [row] = await tx.db
+      .insert(budgets)
+      .values({ companyId: tx.companyId, name: name.trim(), fiscalYear, kind, isForecast: input.isForecast ?? false })
+      .returning();
 
-  await writeAudit(ctx, {
-    action: 'create',
-    entityType: input.isForecast ? 'forecast' : 'budget',
-    entityId: row.id,
-    newValues: { name: row.name, fiscalYear: row.fiscalYear, kind, isForecast: row.isForecast },
+    await writeAudit(tx, {
+      action: 'create',
+      entityType: input.isForecast ? 'forecast' : 'budget',
+      entityId: row.id,
+      newValues: { name: row.name, fiscalYear: row.fiscalYear, kind, isForecast: row.isForecast },
+    });
+
+    return row;
   });
-
-  return row;
 }
 
 // ---------------------------------------------------------------------------
@@ -209,6 +213,16 @@ export async function setBudgetLine(
     customerId?: string | null;
     classId?: string | null;
   },
+): Promise<BudgetLine> {
+  // One transaction for the whole read-modify-write: two saves of the same cell at once (double
+  // submit, two people) serialize instead of both inserting a line (which doubled the budget in
+  // Budget vs. Actual), and a refused audit leaves no line behind.
+  return inTransaction(ctx, (tx) => setBudgetLineInTx(tx, input));
+}
+
+async function setBudgetLineInTx(
+  ctx: ServiceContext,
+  input: Parameters<typeof setBudgetLine>[1],
 ): Promise<BudgetLine> {
   const { budgetId, accountId, month, amount } = input;
   const customerId = input.customerId ?? null;
@@ -684,10 +698,19 @@ export async function budgetVsActualReport(ctx: ServiceContext, p: ReportParams)
   const fy = await budgetFiscalYear(ctx, year);
   const lastFm = fy.months[11];
   const fmOf = (month: number) => fy.months.find((m) => m.month === month) ?? lastFm;
+  // Columns: by month, by fiscal quarter (the toolbar offers it; it used to fall back to the
+  // year total silently), or the year. A balance-sheet budget compares balances, so a quarter
+  // (or the year) shows its LAST month's balance and budget, never their sum.
+  const quarter = (q: number): BvaPeriod => {
+    const ms = fy.months.slice(q * 3, q * 3 + 3);
+    return { key: `q${q + 1}`, months: isBs ? [ms[ms.length - 1].month] : ms.map((m) => m.month), label: `Q${q + 1}` };
+  };
   const periods: BvaPeriod[] =
     p.columns === 'month'
       ? fy.months.map((m) => ({ key: MONTH_KEYS[m.month - 1], months: [m.month], label: `${MONTH_LABELS[m.month - 1]} ${m.year}` }))
-      : [
+      : p.columns === 'quarter'
+        ? [0, 1, 2, 3].map(quarter)
+        : [
           {
             key: 'total',
             months: isBs ? [lastFm.month] : fy.months.map((m) => m.month),
@@ -715,6 +738,8 @@ export async function budgetVsActualReport(ctx: ServiceContext, p: ReportParams)
   // Actual amounts (even slots).
   const yearFrom = fy.from;
   const yearTo = fy.to;
+  // A ledger read that hit its cap leaves the actuals short: the report must say so.
+  let truncated = false;
   if (isBs) {
     for (let i = 0; i < periods.length; i++) {
       const lastMonth = periods[i].months[periods[i].months.length - 1];
@@ -725,16 +750,20 @@ export async function budgetVsActualReport(ctx: ServiceContext, p: ReportParams)
       }
     }
   } else if (p.customerId) {
-    const { lines: gl } = await fetchGlLines(ctx, meta, {
+    // The Customer:Job's income AND its job costs: an expense on a bill / check / vendor credit
+    // is costed to the job on its document line (the posted line is named after the vendor), so
+    // the lines are read unfiltered and given their job column like Profit & Loss by Job.
+    const { lines: gl, truncated: cut } = await fetchGlLines(ctx, meta, {
       from: yearFrom,
       to: yearTo,
       sections: [...PL_SECTIONS],
       excludeClose: true,
-      nameId: p.customerId,
-      nameType: 'customer',
+      classId: p.classId,
       limit: 50000,
     });
-    for (const l of gl) addForMonth(l.accountId, l.date.getUTCMonth() + 1, 0, l.natural);
+    truncated = cut;
+    const jobOf = await jobBucketOf(ctx, gl);
+    for (const l of gl) if (jobOf(l) === p.customerId) addForMonth(l.accountId, l.date.getUTCMonth() + 1, 0, l.natural);
   } else {
     const act = await activityByAccount(ctx, { from: yearFrom, to: yearTo, classId: p.classId, excludeClose: true }, 'month');
     for (const r of act) {
@@ -779,5 +808,6 @@ export async function budgetVsActualReport(ctx: ServiceContext, p: ReportParams)
     subtitle: `${budget.name} · FY${year}`,
     columns,
     rows,
+    truncated,
   };
 }

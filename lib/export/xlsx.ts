@@ -32,9 +32,17 @@ export interface XlsxSheetInput {
   totals?: XlsxCell[][];
 }
 
-/** Escape a string for use inside XML text/attributes. */
+/**
+ * Characters XML 1.0 cannot carry at all (C0 controls other than tab / line feed / carriage
+ * return, U+FFFE / U+FFFF and unpaired surrogates). One of them anywhere in a memo (imported bank
+ * or IIF data, pasted text) made Excel refuse to open the whole workbook.
+ */
+const XML_INVALID = /[\u0000-\u0008\u000B\u000C\u000E-\u001F￾￿]|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+
+/** Escape a string for use inside XML text/attributes (dropping the characters XML forbids). */
 function xmlEscape(value: string): string {
   return value
+    .replace(XML_INVALID, '')
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
@@ -53,10 +61,15 @@ export function columnRef(index: number): string {
   return ref;
 }
 
-/** Excel forbids []:*?/\ in sheet names and caps them at 31 chars. */
+/**
+ * Excel forbids []:*?/\ and control characters in sheet names, a name that starts or ends with
+ * an apostrophe, and more than 31 characters.
+ */
 function sanitizeSheetName(name: string): string {
-  const cleaned = name.replace(/[[\]:*?/\\]/g, ' ').trim();
-  return (cleaned || 'Report').slice(0, 31);
+  const cleaned = name.replace(XML_INVALID, '').replace(/[[\]:*?/\\\u0000-\u001F]/g, ' ').trim();
+  // Cut by characters, not UTF-16 units, so an emoji is never split into a lone surrogate.
+  const cut = Array.from(cleaned || 'Report').slice(0, 31).join('');
+  return cut.replace(/^'+|'+$/g, '').trim() || 'Report';
 }
 
 /** True when the cell should be emitted as a real number cell. */

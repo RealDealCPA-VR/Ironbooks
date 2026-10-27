@@ -14,6 +14,7 @@ import { getServerContext } from '@/lib/context';
 import { customerStatement } from '@/lib/services/statements';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus } from '@/lib/routeErrors';
+import { parseDateParam } from '../_lib';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -37,24 +38,9 @@ export async function GET(req: NextRequest) {
       );
     }
 
-    const fromParam = searchParams.get('from');
-    const toParam = searchParams.get('to');
-
-    let from: Date | undefined;
-    let to: Date | undefined;
-
-    if (fromParam) {
-      from = new Date(fromParam);
-      if (isNaN(from.getTime())) {
-        return NextResponse.json({ error: 'Invalid from date.' }, { status: 400 });
-      }
-    }
-    if (toParam) {
-      to = new Date(toParam);
-      if (isNaN(to.getTime())) {
-        return NextResponse.json({ error: 'Invalid to date.' }, { status: 400 });
-      }
-    }
+    // Real calendar days only (400 otherwise): new Date('2026-02-30') rolled over to March 2.
+    const from = parseDateParam(searchParams.get('from'), 'from');
+    const to = parseDateParam(searchParams.get('to'), 'to');
 
     const statement = await customerStatement(ctx, customerId, { from, to });
     return NextResponse.json(statement);

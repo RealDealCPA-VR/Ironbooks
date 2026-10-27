@@ -9,6 +9,7 @@
  */
 import { type NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
+import { parseDateInput } from '@/lib/validation/helpers';
 import { balanceSheetClassified } from '@/lib/services/balanceSheetClassified';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus } from '@/lib/routeErrors';
@@ -20,8 +21,8 @@ export async function GET(req: NextRequest) {
     const asOfParam = req.nextUrl.searchParams.get('asOf');
     let asOf: Date | undefined;
     if (asOfParam) {
-      asOf = new Date(asOfParam);
-      if (isNaN(asOf.getTime())) {
+      asOf = parseDateInput(asOfParam) ?? undefined; // a real calendar day (2026-02-30 is refused)
+      if (!asOf) {
         return NextResponse.json({ error: 'Invalid asOf date.' }, { status: 400 });
       }
     }

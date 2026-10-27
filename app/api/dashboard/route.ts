@@ -13,19 +13,17 @@ import { getServerContext } from '@/lib/context';
 import { getDashboardInsights } from '@/lib/services/dashboard';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus } from '@/lib/routeErrors';
+import { parseDateParam } from '../reports/_lib';
 
 export async function GET(req: NextRequest) {
   try {
     const ctx = await getServerContext();
 
-    const asOfParam = req.nextUrl.searchParams.get('asOf');
-    let asOf: Date | undefined;
-    if (asOfParam) {
-      asOf = new Date(asOfParam);
-      if (isNaN(asOf.getTime())) {
-        return NextResponse.json({ error: 'Invalid asOf date.' }, { status: 400 });
-      }
-    }
+    // A real calendar day (2026-02-30 is refused), taken as that day on this computer's calendar:
+    // the dashboard reads "today" from the moment in local time, and UTC midnight of the day is
+    // still the evening before west of UTC (the dashboard ran a day early).
+    const day = parseDateParam(req.nextUrl.searchParams.get('asOf'), 'asOf');
+    const asOf = day ? new Date(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate(), 12) : undefined;
 
     const insights = await getDashboardInsights(ctx, asOf);
     return NextResponse.json(insights);

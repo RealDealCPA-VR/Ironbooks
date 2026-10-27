@@ -1,8 +1,9 @@
 'use client';
 
 /**
- * Check Detail — every check written in the period (write-check expenses AND
- * bill payments by check), with split lines indented under each check.
+ * Check Detail — every check written in the period (write-check expenses, bill payments by
+ * check, sales tax / liability / refund checks and paychecks), with split lines indented under
+ * each check.
  */
 import { Fragment, useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
@@ -20,7 +21,7 @@ interface CheckDetailLine {
 }
 
 interface CheckDetailRow {
-  source: 'expense' | 'bill_payment' | 'payment_check';
+  source: 'expense' | 'bill_payment' | 'payment_check' | 'paycheck';
   id: string;
   date: string;
   checkNumber: string | null;
@@ -37,6 +38,14 @@ interface CheckDetailData {
   to?: string;
   rows: CheckDetailRow[];
   total: string;
+}
+
+/** QB's Type column: Check, Bill Payment, Paycheck, Sales Tax Payment / Liability Check / Refund. */
+function typeLabel(r: CheckDetailRow): string {
+  if (r.source === 'expense') return 'Check / Expense';
+  if (r.source === 'paycheck') return 'Paycheck';
+  if (r.source === 'payment_check') return r.lines[0]?.detail ?? 'Check';
+  return 'Bill Payment';
 }
 
 export default function CheckDetailPage() {
@@ -74,7 +83,7 @@ export default function CheckDetailPage() {
         r.checkNumber ?? '',
         r.payee ?? '',
         r.bankAccountName,
-        r.source === 'expense' ? 'Check / Expense' : r.source === 'payment_check' ? (r.lines[0]?.detail ?? 'Check') : 'Bill Payment',
+        typeLabel(r),
         r.voided ? 'VOID' : '',
         r.amount,
       ]);
@@ -162,7 +171,7 @@ export default function CheckDetailPage() {
                           {r.bankAccountName}
                         </Link>
                       </Td>
-                      <Td>{r.source === 'expense' ? 'Check / Expense' : r.source === 'payment_check' ? (r.lines[0]?.detail ?? 'Check') : 'Bill Payment'}</Td>
+                      <Td>{typeLabel(r)}</Td>
                       <Td className="text-right tabular-nums font-semibold">{formatCurrency(r.amount)}</Td>
                     </Tr>
                     {r.lines.map((l, i) => (

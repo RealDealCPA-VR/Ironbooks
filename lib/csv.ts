@@ -46,3 +46,20 @@ export function csvMinimal(value: CsvValue): string {
   const s = csvSafeText(value);
   return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
+
+/**
+ * UTF-8 byte-order mark. Excel opens a UTF-8 CSV without it as Windows-1252, so "—", "–" and
+ * accented names show up as "â€”" / "Ã©".
+ */
+export const CSV_BOM = '\uFEFF';
+
+/** A whole CSV file's text: the byte-order mark, then the lines joined with CRLF (RFC 4180). */
+export function csvFile(lines: string[]): string {
+  const body = lines.join('\r\n');
+  return `${CSV_BOM}${body.startsWith(CSV_BOM) ? body.slice(1) : body}\r\n`;
+}
+
+/** Prefix the byte-order mark to CSV text built elsewhere (once). */
+export function withCsvBom(csv: string): string {
+  return csv.startsWith(CSV_BOM) ? csv : `${CSV_BOM}${csv}`;
+}

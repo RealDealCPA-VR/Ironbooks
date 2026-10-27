@@ -9,7 +9,7 @@
  * A "job" is either a row in the jobs list (invoice / bill / expense lines tagged with jobId) or a
  * customer / sub-customer (lines tagged with the customer but no job), shown as "Customer:Job".
  * Revenue comes from invoices and sales receipts (credit memos reduce it); cost from bills and
- * direct expenses (checks / card charges). Void documents never count.
+ * direct expenses (checks / card charges), less vendor credits. Void documents never count.
  */
 import { and, eq, gte, isNull, lte, ne, notInArray, or, isNotNull, sql, type SQL } from 'drizzle-orm';
 import type Decimal from 'decimal.js';
@@ -33,6 +33,8 @@ import {
   salesReceipts,
   timeEntries,
   vehicles,
+  vendorCreditLines,
+  vendorCredits,
 } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import type { StdColumn, StdReport, StdRow } from '@/lib/reports/types';
@@ -151,6 +153,17 @@ async function jobFacts(ctx: ServiceContext, range: { from?: Date; to?: Date }):
     .where(and(eq(expenses.companyId, c), isNull(expenses.voidedAt), or(isNotNull(expenseLines.jobId), isNotNull(expenseLines.customerId)), ...dateConds(expenses.date)))) {
     const k = keyOf(r.jobId, r.customerId);
     if (k) out.push({ kind: 'cost', jobKey: k, date: r.date, type: 'Check', num: r.num ?? '', sourceRef: `expense:${r.id}`, itemOrAccount: r.account ?? '', memo: r.memo ?? '', qty: Money.of(1), amount: homeOf(r.amount, r.fx) });
+  }
+  // Vendor credits costed to a job (returns, rebates) reduce its cost, as in QuickBooks.
+  for (const r of await ctx.db
+    .select({ id: vendorCredits.id, num: vendorCredits.refNumber, date: vendorCredits.date, customerId: vendorCreditLines.customerId, jobId: vendorCreditLines.jobId, item: items.name, account: accounts.name, memo: vendorCreditLines.description, qty: vendorCreditLines.quantity, amount: vendorCreditLines.amount, fx: vendorCredits.exchangeRate })
+    .from(vendorCreditLines)
+    .innerJoin(vendorCredits, eq(vendorCreditLines.vendorCreditId, vendorCredits.id))
+    .leftJoin(items, and(eq(vendorCreditLines.itemId, items.id), eq(items.companyId, c)))
+    .leftJoin(accounts, and(eq(vendorCreditLines.accountId, accounts.id), eq(accounts.companyId, c)))
+    .where(and(eq(vendorCredits.companyId, c), ne(vendorCredits.status, 'void'), or(isNotNull(vendorCreditLines.jobId), isNotNull(vendorCreditLines.customerId)), ...dateConds(vendorCredits.date)))) {
+    const k = keyOf(r.jobId, r.customerId);
+    if (k) out.push({ kind: 'cost', jobKey: k, date: r.date, type: 'Credit', num: r.num ?? '', sourceRef: `vendor_credit:${r.id}`, itemOrAccount: r.item ?? r.account ?? '', memo: r.memo ?? '', qty: Money.of(r.qty ?? '1').negated(), amount: homeOf(r.amount, r.fx).negated() });
   }
   return out;
 }
@@ -388,20 +401,21 @@ export async function unbilledCostsByJob(ctx: ServiceContext, p: ReportParams): 
   const out: U[] = [];
   const toCond = (col: Parameters<typeof lte>[0]) => (to ? [lte(col, to)] : []);
   for (const r of await ctx.db
-    .select({ id: bills.id, num: bills.billNumber, date: bills.date, customerId: billLines.customerId, jobId: billLines.jobId, memo: billLines.description, amount: billLines.amount })
+    .select({ id: bills.id, num: bills.billNumber, date: bills.date, customerId: billLines.customerId, jobId: billLines.jobId, memo: billLines.description, amount: billLines.amount, fx: bills.exchangeRate })
     .from(billLines)
     .innerJoin(bills, eq(billLines.billId, bills.id))
     .where(and(eq(bills.companyId, c), ne(bills.status, 'void'), isNotNull(billLines.customerId), isNull(billLines.billedInvoiceId), ...toCond(bills.date)))) {
     const k = keyOf(r.jobId, r.customerId)!;
-    out.push({ jobKey: k, date: r.date, type: 'Bill', num: r.num ?? '', memo: r.memo ?? '', amount: Money.of(r.amount), sourceRef: `bill:${r.id}` });
+    // Home currency, like Job Profitability (a EUR bill line is never added as dollars).
+    out.push({ jobKey: k, date: r.date, type: 'Bill', num: r.num ?? '', memo: r.memo ?? '', amount: homeOf(r.amount, r.fx), sourceRef: `bill:${r.id}` });
   }
   for (const r of await ctx.db
-    .select({ id: expenses.id, num: expenses.reference, date: expenses.date, customerId: expenseLines.customerId, jobId: expenseLines.jobId, memo: expenseLines.description, amount: expenseLines.amount })
+    .select({ id: expenses.id, num: expenses.reference, date: expenses.date, customerId: expenseLines.customerId, jobId: expenseLines.jobId, memo: expenseLines.description, amount: expenseLines.amount, fx: expenses.exchangeRate })
     .from(expenseLines)
     .innerJoin(expenses, eq(expenseLines.expenseId, expenses.id))
     .where(and(eq(expenses.companyId, c), isNull(expenses.voidedAt), isNotNull(expenseLines.customerId), isNull(expenseLines.billedInvoiceId), ...toCond(expenses.date)))) {
     const k = keyOf(r.jobId, r.customerId)!;
-    out.push({ jobKey: k, date: r.date, type: 'Check', num: r.num ?? '', memo: r.memo ?? '', amount: Money.of(r.amount), sourceRef: `expense:${r.id}` });
+    out.push({ jobKey: k, date: r.date, type: 'Check', num: r.num ?? '', memo: r.memo ?? '', amount: homeOf(r.amount, r.fx), sourceRef: `expense:${r.id}` });
   }
   for (const r of await ctx.db
     .select({ id: timeEntries.id, date: timeEntries.date, customerId: timeEntries.customerId, jobId: timeEntries.jobId, hours: timeEntries.hours, rate: timeEntries.rate, memo: timeEntries.description })

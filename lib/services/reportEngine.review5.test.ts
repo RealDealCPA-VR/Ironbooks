@@ -1,0 +1,259 @@
+/**
+ * Review round 5 — report dates follow the LOCAL calendar day (the desktop app's clock, the same
+ * "today" the report date fields default to), not the UTC day.
+ *
+ * Pinned to US Pacific time. At 11:30 pm on Oct 31 it is already Nov 1 in UTC: "Today",
+ * "This Month", "Last Month", the default as-of date and the default To date must all still be
+ * October 31 there, and a monthly schedule set to start Nov 1 must not run (and export "last
+ * month" = September) the evening before.
+ */
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
+import { eq } from 'drizzle-orm';
+import { closeDb, getDb, type DB } from '@/lib/db';
+import { accounts, users } from '@/lib/db/schema';
+import type { ServiceContext } from './_base';
+import { createCompany } from './company';
+import { postJournalEntry } from './posting';
+import { GL_LIMITS, endOfToday, resolveDateMacro } from './reportEngine';
+import { createCustomer } from './customers';
+import { createInvoice } from './invoices';
+import { createTransfer } from './transfers';
+import { createExpense } from './expenses';
+import { createBankAccount } from './bankAccounts';
+import { completeReconciliation, startReconciliation, toggleCleared, undoLastReconciliation } from './reconcile';
+import { runStandardReport } from './reportRegistry';
+import { arAging, collectionsReport } from './reportsExtra';
+import { createReportSchedule, listReportSchedules, nextRunAfter, runDueSchedules, saveMemorizedReport } from './memorizedReports';
+import { balanceSheet } from './reports';
+
+const origTz = process.env.TZ;
+process.env.TZ = 'America/Los_Angeles';
+
+const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-review5-report-dates');
+const OUT_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-review5-report-dates-out');
+let db: DB;
+let ctx: ServiceContext;
+const A: Record<string, string> = {};
+const d = (s: string) => new Date(`${s}T00:00:00.000Z`);
+
+/** Oct 31 2026, 11:30 pm Pacific (PDT) = Nov 1 06:30 UTC. */
+const OCT31_LATE = new Date('2026-11-01T06:30:00.000Z');
+/** Nov 1 2026, 1:30 am Pacific. */
+const NOV1_EARLY = new Date('2026-11-01T08:30:00.000Z');
+
+beforeAll(async () => {
+  fs.rmSync(TEST_DIR, { recursive: true, force: true });
+  fs.rmSync(OUT_DIR, { recursive: true, force: true });
+  db = await getDb(TEST_DIR);
+  const [user] = await db.insert(users).values({ email: 'r5-dates@test.local', name: 'R5 Dates', passwordHash: 'x' }).returning();
+  const company = await createCompany(db, { name: 'Dates Co', ownerId: user.id });
+  ctx = { db, companyId: company.id, userId: user.id };
+  for (const a of await db.select().from(accounts).where(eq(accounts.companyId, company.id))) A[a.code] = a.id;
+  const sale = (date: string, amount: string) =>
+    postJournalEntry(ctx, {
+      date: d(date),
+      description: `sale ${date}`,
+      lines: [
+        { accountId: A['1000'], debit: amount },
+        { accountId: A['4000'], credit: amount },
+      ],
+    });
+  await sale('2026-09-15', '50.00');
+  await sale('2026-10-15', '100.00');
+  await sale('2026-11-01', '7.00'); // tomorrow, locally
+});
+
+afterAll(async () => {
+  vi.useRealTimers();
+  if (origTz === undefined) delete process.env.TZ;
+  else process.env.TZ = origTz;
+  await closeDb(TEST_DIR);
+  fs.rmSync(TEST_DIR, { recursive: true, force: true });
+  fs.rmSync(OUT_DIR, { recursive: true, force: true });
+});
+
+const at = (now: Date) => vi.useFakeTimers({ toFake: ['Date'], now });
+
+describe('relative dates use the local calendar day', () => {
+  it('Today / This Month / Last Month at 11:30 pm on Oct 31 (Pacific)', () => {
+    expect(resolveDateMacro('today', OCT31_LATE)).toEqual({ from: '2026-10-31', to: '2026-10-31' });
+    expect(resolveDateMacro('this_month', OCT31_LATE)).toEqual({ from: '2026-10-01', to: '2026-10-31' });
+    expect(resolveDateMacro('last_month', OCT31_LATE)).toEqual({ from: '2026-09-01', to: '2026-09-30' });
+    expect(resolveDateMacro('this_year_to_date', OCT31_LATE)).toEqual({ from: '2026-01-01', to: '2026-10-31' });
+  });
+
+  it('a report run with Dates = This month covers October', async () => {
+    const r = await runStandardReport(ctx, 'profit-loss', { dates: 'this_month' }, { now: OCT31_LATE });
+    expect(r.range).toMatchObject({ from: '2026-10-01', to: '2026-10-31' });
+    expect(r.rows.find((x) => x.id === 'pl:net')?.cells.total).toBe('100.00');
+  });
+});
+
+describe('default as-of / To date is today on this computer', () => {
+  afterAll(() => vi.useRealTimers());
+
+  it('endOfToday is the end of the local day', () => {
+    at(OCT31_LATE);
+    expect(endOfToday().toISOString()).toBe('2026-10-31T23:59:59.999Z');
+  });
+
+  it('Balance Sheet with no date is as of Oct 31 and leaves out tomorrow', async () => {
+    at(OCT31_LATE);
+    const r = await runStandardReport(ctx, 'balance-sheet', {});
+    expect(r.subtitle).toContain('10/31/2026');
+    expect(r.range?.asOf).toBe('2026-10-31');
+    expect(r.rows.find((x) => x.id === 'bs:ni')?.cells.total).toBe('150.00');
+  });
+
+  it('Profit & Loss with no dates runs fiscal year to Oct 31', async () => {
+    at(OCT31_LATE);
+    const r = await runStandardReport(ctx, 'profit-loss', {});
+    expect(r.range).toMatchObject({ from: '2026-01-01', to: '2026-10-31' });
+    expect(r.rows.find((x) => x.id === 'pl:net')?.cells.total).toBe('150.00');
+  });
+
+  it('A/R aging and Collections with no date are as of Oct 31', async () => {
+    at(OCT31_LATE);
+    expect((await arAging(ctx)).asOf.slice(0, 10)).toBe('2026-10-31');
+    expect((await collectionsReport(ctx)).asOf.slice(0, 10)).toBe('2026-10-31');
+  });
+
+  it('the legacy balance sheet with no date splits Net Income at the local fiscal year (Dec 31 evening)', async () => {
+    // Dec 31 2026, 9 pm Pacific = Jan 1 2027 05:00 UTC: still fiscal 2026 here.
+    at(new Date('2027-01-01T05:00:00.000Z'));
+    const bs = await balanceSheet(ctx);
+    expect(bs.fiscalYearStart?.slice(0, 10)).toBe('2026-01-01');
+    expect(bs.currentYearNetIncome).toBe('157.00');
+  });
+});
+
+describe('scheduled reports run on the local calendar day', () => {
+  it('a monthly "last month" schedule starting Nov 1 waits for Nov 1 and exports October', async () => {
+    const m = await saveMemorizedReport(ctx, { name: 'Monthly P&L', reportType: 'profit-loss', config: { params: { dates: 'last_month' } } });
+    const s = await createReportSchedule(ctx, { name: 'Month end P&L', memorizedReportId: m.id, frequency: 'monthly', startDate: '2026-11-01' });
+    // 11:30 pm on Oct 31 locally: not due yet.
+    expect((await runDueSchedules(ctx, { now: OCT31_LATE, outDir: OUT_DIR })).map((x) => x.scheduleId)).not.toContain(s.id);
+    // 1:30 am on Nov 1: due; the export covers October and is stamped Nov 1.
+    const res = (await runDueSchedules(ctx, { now: NOV1_EARLY, outDir: OUT_DIR })).find((x) => x.scheduleId === s.id)!;
+    expect(res.status).toBe('ok');
+    expect(path.basename(res.files[0])).toContain('2026-11-01');
+    const csv = fs.readFileSync(res.files[0], 'utf8');
+    expect(csv).toContain('10/01/2026');
+    expect(csv).toContain('10/31/2026');
+    // The next run is Dec 1 (local), still the anchor day.
+    const next = (await listReportSchedules(ctx)).find((x) => x.id === s.id)!.nextRunAt;
+    expect(next.getDate()).toBe(1);
+    expect(next.getMonth()).toBe(11);
+  });
+
+  it('monthly runs stay on the same local day across the DST change', () => {
+    const start = new Date(2026, 9, 31, 0, 0, 0); // Oct 31 local midnight (PDT)
+    const nov = nextRunAfter(start, 'monthly', 31);
+    expect([nov.getMonth(), nov.getDate(), nov.getHours()]).toEqual([10, 30, 0]); // Nov 30 midnight (PST)
+    const daily = nextRunAfter(new Date(2026, 10, 1, 0, 0, 0), 'daily');
+    expect([daily.getMonth(), daily.getDate(), daily.getHours()]).toEqual([10, 2, 0]);
+  });
+});
+
+describe('name-filtered detail reports on a large file', () => {
+  it("Customer Balance Detail shows a customer's newest transactions when the file has more lines than the read cap", async () => {
+    vi.useRealTimers();
+    const old = await createCustomer(ctx, { displayName: 'Old Customer' } as never);
+    const recent = await createCustomer(ctx, { displayName: 'Recent Customer' } as never);
+    // Many older A/R lines for one customer (named General Journal lines)...
+    for (let i = 0; i < 6; i++) {
+      await postJournalEntry(ctx, {
+        date: d(`2026-03-0${i + 1}`),
+        description: 'old charge',
+        lines: [
+          { accountId: A['1200'], debit: '10.00', entityType: 'customer', entityId: old.id },
+          { accountId: A['4000'], credit: '10.00' },
+        ],
+      });
+    }
+    // ...then the other customer's invoice (named by its document) and a named journal line.
+    await createInvoice(ctx, { customerId: recent.id, date: d('2026-04-01'), lines: [{ accountId: A['4000'], quantity: 1, rate: '25.00', taxable: false }] } as never);
+    await postJournalEntry(ctx, {
+      date: d('2026-04-02'),
+      description: 'recent charge',
+      lines: [
+        { accountId: A['1200'], debit: '5.00', entityType: 'customer', entityId: recent.id },
+        { accountId: A['4000'], credit: '5.00' },
+      ],
+    });
+    const cap = GL_LIMITS.postFilterScan;
+    GL_LIMITS.postFilterScan = 5; // stands in for the 50,000-line read on a big company file
+    try {
+      const r = await runStandardReport(ctx, 'customer-balance-detail', { customerId: recent.id, asOf: '2026-12-31' });
+      const total = r.rows.find((x) => x.id.endsWith(':total'));
+      expect(total?.cells.amount).toBe('30.00');
+      expect(r.truncated).toBeFalsy();
+      // A read that does hit the cap says so instead of showing a short report.
+      const all = await runStandardReport(ctx, 'customer-balance-detail', { customerId: old.id, asOf: '2026-12-31' });
+      expect(all.truncated).toBe(true);
+    } finally {
+      GL_LIMITS.postFilterScan = cap;
+    }
+  });
+});
+
+describe('transfers on the reports', () => {
+  it('show as Transfer and the Transaction type filter finds them', async () => {
+    vi.useRealTimers();
+    await createTransfer(ctx, { date: d('2026-05-05'), fromAccountId: A['1000'], toAccountId: A['1010'], amount: '40.00', memo: 'to savings' });
+    const all = await runStandardReport(ctx, 'transaction-detail-by-account', { from: '2026-05-05', to: '2026-05-05', subtotalBy: 'none' });
+    const lines = all.rows.filter((x) => x.kind === 'data');
+    expect(lines.length).toBe(2);
+    expect(lines.every((x) => x.cells.type === 'Transfer')).toBe(true);
+    const filtered = await runStandardReport(ctx, 'transaction-detail-by-account', { from: '2026-01-01', to: '2026-12-31', txnType: 'transfer', subtotalBy: 'none' });
+    expect(filtered.rows.filter((x) => x.kind === 'data').length).toBe(2);
+    const journal = await runStandardReport(ctx, 'transaction-detail-by-account', { from: '2026-05-05', to: '2026-05-05', txnType: 'journal', subtotalBy: 'none' });
+    expect(journal.rows.filter((x) => x.kind === 'data').length).toBe(0);
+  });
+});
+
+describe('cleared status after Undo Last Reconciliation', () => {
+  it('lines of an undone reconciliation are no longer cleared on the reports', async () => {
+    vi.useRealTimers();
+    // A separate bank account with one deposit, reconciled and then undone.
+    const { createAccount } = await import('./accounts');
+    const bank = await createAccount(ctx, { code: '1020', name: 'Second Bank', type: 'asset' as never, subtype: 'checking' });
+    const je = await postJournalEntry(ctx, {
+      date: d('2026-06-10'),
+      description: 'deposit to second bank',
+      lines: [
+        { accountId: bank.id, debit: '80.00' },
+        { accountId: A['4000'], credit: '80.00' },
+      ],
+    });
+    const lineId = (await db.select().from((await import('@/lib/db/schema')).journalEntryLines).where(eq((await import('@/lib/db/schema')).journalEntryLines.journalEntryId, je.id))).find((l) => l.accountId === bank.id)!.id;
+    const ba = await createBankAccount(ctx, { accountId: bank.id, bankName: 'Second', accountNumber: '000999' } as never);
+    const rec = await startReconciliation(ctx, { bankAccountId: ba.id, statementDate: d('2026-06-30'), statementBalance: '80.00' } as never);
+    await toggleCleared(ctx, rec.id, lineId, true);
+    await completeReconciliation(ctx, rec.id);
+    const run = (cleared?: string) =>
+      runStandardReport(ctx, 'transaction-detail-by-account', { accountId: bank.id, from: '2026-06-01', to: '2026-06-30', subtotalBy: 'none', ...(cleared ? { cleared } : {}) });
+    expect((await run()).rows.find((x) => x.kind === 'data')?.cells.clr).toBe('✓');
+    await undoLastReconciliation(ctx, ba.id);
+    const after = (await run()).rows.find((x) => x.kind === 'data');
+    expect(after?.cells.clr).toBe('');
+    expect((await run('cleared')).rows.filter((x) => x.kind === 'data').length).toBe(0);
+    expect((await run('uncleared')).rows.filter((x) => x.kind === 'data').length).toBe(1);
+  });
+});
+
+describe('detail reports grouped by name', () => {
+  it('checks to different free-text payees are not lumped under the first payee', async () => {
+    vi.useRealTimers();
+    await createExpense(ctx, { payeeName: "Joe's Diner", date: d('2026-07-01'), method: 'check', paymentAccountId: A['1000'], lines: [{ accountId: A['6000'], amount: '12.00' }] });
+    await createExpense(ctx, { payeeName: 'Shell Gas', date: d('2026-07-02'), method: 'check', paymentAccountId: A['1000'], lines: [{ accountId: A['6000'], amount: '30.00' }] });
+    const r = await runStandardReport(ctx, 'expenses-by-vendor-detail', { from: '2026-07-01', to: '2026-07-31' });
+    const groups = r.rows.filter((x) => x.kind === 'section').map((x) => x.cells.label);
+    expect(groups).toEqual(expect.arrayContaining(["Joe's Diner", 'Shell Gas']));
+    const total = (label: string) => r.rows.find((x) => x.kind === 'subtotal' && x.cells.label === `Total ${label}`)?.cells.amount;
+    expect(total("Joe's Diner")).toBe('12.00');
+    expect(total('Shell Gas')).toBe('30.00');
+  });
+});

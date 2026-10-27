@@ -58,7 +58,7 @@ import {
   type PLSection,
   type SectionKey,
 } from './reportEngine';
-import { previousPeriod, shiftMonths, shiftYears } from './reportsStandard';
+import { jobBucketOf, previousPeriod, retainedEarningsAccount, shiftMonths, shiftYears } from './reportsStandard';
 import { fiscalYearStartFor } from './reports';
 import { openItems, type OpenItem } from './reportsAging';
 import { salesLinesOnBasis } from './reportsLists';
@@ -214,7 +214,7 @@ interface Window {
 }
 
 /** The date windows (and column buckets) a P&L column covers. */
-async function plWindows(i: ResolveInput, filterLines: GlLine[] | null): Promise<Window[]> {
+async function plWindows(i: ResolveInput, filterLines: GlLine[] | null, jobOf?: (l: GlLine) => string): Promise<Window[]> {
   const { ctx, key, column } = i;
   let p = i.p;
   if (key === 'profit-loss-prev-year') p = { ...p, compare: p.compare ?? 'prev_year' };
@@ -228,13 +228,14 @@ async function plWindows(i: ResolveInput, filterLines: GlLine[] | null): Promise
     if (column === 'total') return [whole];
     const m = /^c(\d+)$/.exec(column);
     if (m) {
-      const keys = key === 'pl-by-class' ? await classColumnKeys(i) : jobColumnKeys(filterLines ?? []);
+      const bucket = jobOf ?? ((l: GlLine) => (l.nameType === 'customer' && l.nameId ? l.nameId : ''));
+      const keys = key === 'pl-by-class' ? await classColumnKeys(i) : await jobColumnKeys(i.ctx, filterLines ?? [], bucket);
       const k = keys[Number(m[1])];
       if (k !== undefined) {
         const keep =
           key === 'pl-by-class'
             ? (l: GlLine) => (l.classId ?? '') === k
-            : (l: GlLine) => (l.nameType === 'customer' && l.nameId ? l.nameId : '') === k;
+            : (l: GlLine) => bucket(l) === k;
         return [{ ...whole, keep }];
       }
     }
@@ -268,13 +269,14 @@ async function classColumnKeys(i: ResolveInput): Promise<string[]> {
   return keys;
 }
 
-/** profit-loss-by-job column order: customers:jobs by name, then "No customer:job". */
-function jobColumnKeys(all: GlLine[]): string[] {
+/** profit-loss-by-job column order (as profitAndLossByJobReport): customers:jobs by name, then "No customer:job". */
+async function jobColumnKeys(ctx: ServiceContext, all: GlLine[], bucket: (l: GlLine) => string): Promise<string[]> {
+  const custNames = await customerNames(ctx);
   const names = new Map<string, string>();
   let none = false;
   for (const l of all) {
-    const b = l.nameType === 'customer' && l.nameId ? l.nameId : '';
-    if (b) names.set(b, l.name || '(unnamed)');
+    const b = bucket(l);
+    if (b) names.set(b, (l.nameType === 'customer' && l.nameId === b ? l.name : custNames.get(b)?.name) || '(unnamed)');
     else none = true;
   }
   const keys = [...names.entries()].sort((a, b) => a[1].localeCompare(b[1])).map(([id]) => id);
@@ -299,6 +301,7 @@ const plFamily: Family = {
     const accountIds = [...meta.values()].filter((a) => isPLSection(a.section) && signs(a) !== 0).map((a) => a.id);
     // By Job needs the whole period's lines to rebuild its column order.
     let jobLines: GlLine[] | null = null;
+    let jobOf: ((l: GlLine) => string) | undefined;
     let incomplete = false;
     if (key === 'profit-loss-by-job') {
       const { from, to } = await resolveRange(ctx, p);
@@ -307,9 +310,11 @@ const plFamily: Family = {
       f.excludeClose = true;
       const all = await lines(ctx, meta, cap, f);
       jobLines = all.lines;
+      // The same column of each line the report used (costs on their document line's job).
+      jobOf = await jobBucketOf(ctx, all.lines);
       incomplete = all.truncated; // the column order itself may be off
     }
-    const windows = await plWindows(i, jobLines);
+    const windows = await plWindows(i, jobLines, jobOf);
     const items: DrillItem[] = [];
     for (const w of windows) {
       const got = await lines(ctx, meta, cap, { from: w.from, to: w.to, classId, excludeClose: true, basis, accountIds });
@@ -426,7 +431,11 @@ const bsFamily: Family = {
       items.push(
         ...itemsFrom(got.lines, (l) => {
           if (isPL(l.account)) {
-            const wanted = l.date < fyStart ? sel.priorPL : sel.currentPL;
+            // A year-end closing entry is dated on the closed year's last day, but the balance
+            // sheet keeps that year's Net Income and books the close in prior years' earnings
+            // (reports.ts balanceSheet): it belongs to Retained Earnings, never to Net Income.
+            const closing = !!l.sourceRef?.startsWith('fiscal-close:');
+            const wanted = l.date < fyStart || closing ? sel.priorPL : sel.currentPL;
             // Earnings are credits − debits (they raise equity).
             return wanted ? l.credit.minus(l.debit).times(w.mult) : null;
           }
@@ -442,27 +451,45 @@ const bsFamily: Family = {
 // Trial balance
 // ===========================================================================
 
+/** Row id of the Retained Earnings line a trial balance shows when there is no such account. */
+const TB_RE_ROW = 'tb:re';
+
 const tbFamily: Family = {
   resolve: async ({ ctx, p, row, column, meta, cap }) => {
     if (column !== 'debit' && column !== 'credit') throw validation('That column has no amounts to explain.');
     const asOf = resolveAsOf(p);
     const basis = p.basis === 'cash' ? 'cash' : undefined;
     const sign = column === 'debit' ? 1 : -1;
+    // The trial balance line each ledger line lands on (reportsStandard.ts trialBalanceAmounts):
+    // income and expense of earlier fiscal years — and year-end closing entries — roll into
+    // Retained Earnings; this fiscal year's stay on their own account.
+    const fyStart = await fiscalYearStartFor(ctx, asOf);
+    const re = retainedEarningsAccount(meta);
+    const lineOf = (l: GlLine): string => {
+      if (!isPLSection(l.account.section)) return l.accountId;
+      const prior = l.date < fyStart || !!l.sourceRef?.startsWith('fiscal-close:');
+      return prior ? (re?.id ?? TB_RE_ROW) : l.accountId;
+    };
     if (row.id === 'tb:total') {
       const got = await lines(ctx, meta, cap, { to: asOf, basis });
       const bal = new Map<string, Decimal>();
-      for (const l of got.lines) bal.set(l.accountId, (bal.get(l.accountId) ?? Money.zero()).plus(l.amount));
-      // TOTAL Debit = every account with a debit balance; TOTAL Credit = every credit balance.
+      for (const l of got.lines) bal.set(lineOf(l), (bal.get(lineOf(l)) ?? Money.zero()).plus(l.amount));
+      // TOTAL Debit = every line with a debit balance; TOTAL Credit = every credit balance.
       const keep = (id: string) => {
         const b = bal.get(id) ?? Money.zero();
         return column === 'debit' ? b.greaterThan(0) : b.lessThan(0);
       };
-      return { items: itemsFrom(got.lines, (l) => (keep(l.accountId) ? l.amount.times(sign) : null)), incomplete: got.truncated };
+      return { items: itemsFrom(got.lines, (l) => (keep(lineOf(l)) ? l.amount.times(sign) : null)), incomplete: got.truncated };
     }
-    const members = accountRowMembers(row, meta);
+    const members: Set<string> | null = row.id === TB_RE_ROW ? new Set([TB_RE_ROW]) : accountRowMembers(row, meta);
     if (!members) throw validation('This line has no transactions behind it.');
-    const got = await lines(ctx, meta, cap, { to: asOf, basis, accountIds: [...members] });
-    return { items: itemsFrom(got.lines, (l) => l.amount.times(sign)), incomplete: got.truncated };
+    // Retained Earnings also gathers earlier years' income: read the P&L accounts too.
+    const withPL = members.has(TB_RE_ROW) || (!!re && members.has(re.id));
+    const accountIds = withPL
+      ? [...meta.values()].filter((a) => members.has(a.id) || isPLSection(a.section)).map((a) => a.id)
+      : [...members];
+    const got = await lines(ctx, meta, cap, { to: asOf, basis, accountIds });
+    return { items: itemsFrom(got.lines, (l) => (members.has(lineOf(l)) ? l.amount.times(sign) : null)), incomplete: got.truncated };
   },
 };
 
@@ -580,6 +607,11 @@ function agingFamily(side: 'ar' | 'ap', kind: 'summary' | 'detail' | 'open-invoi
       const params = kind === 'open-invoices' || kind === 'collections-report' ? { ...p, agingFrom: 'due_date' as const } : p;
       let { items } = await openItems(ctx, side, params);
       if (kind === 'collections-report') items = items.filter((i) => i.aging !== null && i.aging > 0);
+      // The same "more than N days past due" filter the report applied (reportsAging.ts).
+      if ((kind === 'open-invoices' || kind === 'collections-report') && p.overDays !== undefined) {
+        const over = Number(p.overDays);
+        items = items.filter((i) => i.aging !== null && i.aging > over);
+      }
       let pick: (it: OpenItem) => boolean;
       if (kind === 'summary') {
         const cols = report.columns.filter((c) => c.type === 'money').map((c) => c.key);
@@ -620,8 +652,10 @@ function salesFamily(by: 'customer' | 'item'): Family {
       const f: Record<string, string> = {
         pct: 'This item’s sales divided by total sales',
         avgPrice: 'Average price: the amount divided by the quantity sold',
-        cogs: 'Cost of goods sold: the quantity sold times the item’s average cost',
-        avgCogs: 'Average cost: COGS divided by the quantity sold',
+        // The report uses the COGS each sale posted (reportsLists.ts postedCogsBySalesLine), never
+        // today's average cost.
+        cogs: 'Cost of goods sold: the cost each sale took out of inventory when the sale was recorded',
+        avgCogs: 'Average COGS: COGS divided by the quantity sold',
         margin: 'Gross margin: the amount minus COGS',
         marginPct: 'Gross margin divided by the amount',
       };

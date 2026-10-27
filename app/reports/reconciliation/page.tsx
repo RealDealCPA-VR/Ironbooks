@@ -25,7 +25,7 @@ import {
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatShortDate } from '@/lib/format';
-import { csvMinimal } from '@/lib/csv';
+import { csvMinimal, withCsvBom } from '@/lib/csv';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -91,7 +91,7 @@ function toCsvRow(...cells: (string | number | null | undefined)[]): string {
 }
 
 function downloadCsv(csv: string, filename: string) {
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  const blob = new Blob([withCsvBom(csv)], { type: 'text/csv;charset=utf-8;' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;

@@ -37,8 +37,21 @@ const bodySchema = z.object({
 
 /** Strip path separators / control chars so the filename is download-safe. */
 function safeFilename(name: string, ext: string): string {
-  const base = name.replace(/[\\/:*?"<>|\u0000-\u001F]/g, '-').trim() || 'report';
+  const base = name.replace(/[\\/:*?"<>|\u0000-\u001F\u007F]/g, '-').trim() || 'report';
   return base.endsWith(`.${ext}`) ? base : `${base}.${ext}`;
+}
+
+/**
+ * Content-Disposition for a download. A header value must be Latin-1 (a ByteString): a name with
+ * "利润表", an emoji or an em dash threw and the export answered 500. The plain `filename` is an
+ * ASCII fallback; `filename*` (RFC 6266 / 5987) carries the real UTF-8 name.
+ */
+function attachment(name: string, ext: string): string {
+  const file = safeFilename(name, ext);
+  const ascii = file.replace(/[^\x20-\x7E]/g, '_').replace(/"/g, "'");
+  if (ascii === file) return `attachment; filename="${file}"`;
+  const encoded = encodeURIComponent(file).replace(/['()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encoded}`;
 }
 
 export async function POST(req: NextRequest) {
@@ -66,7 +79,7 @@ export async function POST(req: NextRequest) {
         headers: {
           'Content-Type':
             'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-          'Content-Disposition': `attachment; filename="${safeFilename(body.filename, 'xlsx')}"`,
+          'Content-Disposition': attachment(body.filename, 'xlsx'),
         },
       });
     }
@@ -85,7 +98,7 @@ export async function POST(req: NextRequest) {
     return new NextResponse(new Uint8Array(bytes), {
       headers: {
         'Content-Type': 'application/pdf',
-        'Content-Disposition': `attachment; filename="${safeFilename(body.filename, 'pdf')}"`,
+        'Content-Disposition': attachment(body.filename, 'pdf'),
       },
     });
   } catch (err) {

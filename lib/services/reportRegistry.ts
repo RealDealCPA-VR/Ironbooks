@@ -15,6 +15,7 @@ import {
   companyFiscalYearEnd,
   dayStr,
   fiscalWindowFor,
+  localToday,
   parseDay,
   resolveDateMacro,
   type AccountMeta,
@@ -237,6 +238,10 @@ export async function runStandardReport(
   return executePreparedReport(ctx, key, await prepareStandardReport(ctx, key, rawParams, opts));
 }
 
+/** Note added to a report that hit a line cap without saying so itself. */
+export const TRUNCATED_NOTE =
+  'This report has too many transactions to include them all, so its amounts are incomplete. Narrow the dates or filters to see everything.';
+
 /**
  * Run a report already checked and normalized by prepareStandardReport, and remember the run
  * (recentReportRun) so the amount tooltips on the page explain exactly the numbers it shows.
@@ -248,6 +253,11 @@ export async function executePreparedReport(
 ): Promise<StdReport> {
   const { entry, runner, params } = prepared;
   const report = await runner(ctx, params);
+  // A report cut short by a read cap must say so on the page (the viewer shows notes, not the
+  // flag): several summaries set `truncated` without a note, so a partial total looked complete.
+  if (report.truncated && !(report.notes ?? []).some((n) => /narrow|shorter/i.test(n))) {
+    report.notes = [...(report.notes ?? []), TRUNCATED_NOTE];
+  }
   if (entry.basis) report.basis = params.basis === 'cash' ? 'cash' : 'accrual';
   report.range = await resolvedRange(ctx, params);
   rememberReportRun(ctx, key, params, report);
@@ -330,7 +340,8 @@ export function clearReportRunMemo() {
  */
 async function resolvedRange(ctx: ServiceContext, p: ReportParams): Promise<StdReport['range']> {
   try {
-    const today = dayStr(new Date());
+    // Today on this computer's calendar, like the runners' defaults (reportEngine endOfToday).
+    const today = localToday();
     const to = p.to ?? today;
     const asOf = p.asOf ?? p.to ?? today;
     const from = p.from ?? dayStr(fiscalWindowFor(parseDay(to, true)!, await companyFiscalYearEnd(ctx)).start);

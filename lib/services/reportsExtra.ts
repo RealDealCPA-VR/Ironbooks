@@ -8,7 +8,6 @@ import {
   accounts,
   auditLogs,
   bouncedChecks,
-  billLines,
   billPaymentApplications,
   billPayments,
   bills,
@@ -17,6 +16,7 @@ import {
   customers,
   deposits,
   depositLines,
+  employees,
   expenseLines,
   expenses,
   invoiceLines,
@@ -26,6 +26,7 @@ import {
   paymentChecks,
   journalEntryLines,
   paymentApplications,
+  paychecks,
   paymentsReceived,
   salesReceiptLines,
   salesReceipts,
@@ -34,6 +35,7 @@ import {
   vendors,
 } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
+import { localDateISO } from '@/lib/dates';
 import { balanceSheet, notFiscalCloseEntry, type BalanceSheet } from '@/lib/services/reports';
 import type { ServiceContext } from './_base';
 import { isCashAccount, isCurrentLiability } from '@/lib/accountTypes';
@@ -306,6 +308,15 @@ function endOfAsOfDay(d: Date): Date {
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1) - 1);
 }
 
+/**
+ * End of TODAY on this computer's calendar (23:59:59.999 UTC of the local day), the default as-of
+ * date. `new Date()` is a UTC moment: in US evenings its UTC day is already tomorrow, which aged
+ * every item a day early and counted documents dated tomorrow.
+ */
+function endOfLocalToday(now: Date = new Date()): Date {
+  return new Date(`${localDateISO(now)}T23:59:59.999Z`);
+}
+
 function ms_to_days(ms: number): number {
   return Math.floor(ms / (1000 * 60 * 60 * 24));
 }
@@ -401,7 +412,7 @@ function bouncedExcessCredits(amount: ReturnType<typeof Money.zero>, payers: Bou
  * creditMemoApplicationsAfter) and General Journal credits applied after it are added back.
  */
 export async function arAging(ctx: ServiceContext, asOf?: Date): Promise<AgingReport> {
-  const cutoff = endOfAsOfDay(asOf ?? new Date());
+  const cutoff = endOfAsOfDay(asOf ?? endOfLocalToday());
   const ageFromTxnDate = (await getPreferences(ctx)).agingFrom === 'transaction_date';
 
   // Invoices dated on/before the cutoff. Do NOT exclude 'paid' — an invoice paid
@@ -735,7 +746,7 @@ async function vendorCreditsOpenAsOf(
 }
 
 export async function apAging(ctx: ServiceContext, asOf?: Date): Promise<AgingReport> {
-  const cutoff = endOfAsOfDay(asOf ?? new Date());
+  const cutoff = endOfAsOfDay(asOf ?? endOfLocalToday());
   const ageFromTxnDate = (await getPreferences(ctx)).agingFrom === 'transaction_date';
 
   const rows = await ctx.db
@@ -1172,14 +1183,15 @@ export async function expensesByVendor(
     .select({
       vendorId: bills.vendorId,
       vendorName: vendors.displayName,
-      totalExpenses: sql<string>`COALESCE(SUM(CAST(${bills.total} AS NUMERIC)), 0)`,
+      // Home currency: a foreign bill counts at its own exchange rate (as salesByCustomer does).
+      totalExpenses: sql<string>`COALESCE(SUM(ROUND(CAST(${bills.total} AS NUMERIC) * COALESCE(${bills.exchangeRate}, 1), 2)), 0)`,
       billCount: sql<number>`COUNT(${bills.id})`,
     })
     .from(bills)
     .innerJoin(vendors, eq(bills.vendorId, vendors.id))
     .where(and(...conds))
     .groupBy(bills.vendorId, vendors.displayName)
-    .orderBy(sql`SUM(CAST(${bills.total} AS NUMERIC)) DESC`);
+    .orderBy(sql`SUM(ROUND(CAST(${bills.total} AS NUMERIC) * COALESCE(${bills.exchangeRate}, 1), 2)) DESC`);
 
   return rows.map((r) => ({
     vendorId: r.vendorId,
@@ -1271,7 +1283,7 @@ function buildAgingDetailReport(rows: AgingDetailRow[], cutoff: Date): AgingDeta
  * 'current' rows, mirroring QB's AR Aging Detail.
  */
 export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<AgingDetailReport> {
-  const cutoff = endOfAsOfDay(asOf ?? new Date());
+  const cutoff = endOfAsOfDay(asOf ?? endOfLocalToday());
   const ageFromTxnDate = (await getPreferences(ctx)).agingFrom === 'transaction_date';
 
   const rows = await ctx.db
@@ -1441,7 +1453,7 @@ export async function arAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<A
  * negative 'current' rows.
  */
 export async function apAgingDetail(ctx: ServiceContext, asOf?: Date): Promise<AgingDetailReport> {
-  const cutoff = endOfAsOfDay(asOf ?? new Date());
+  const cutoff = endOfAsOfDay(asOf ?? endOfLocalToday());
   const ageFromTxnDate = (await getPreferences(ctx)).agingFrom === 'transaction_date';
 
   const rows = await ctx.db
@@ -1574,7 +1586,9 @@ export interface OpenInvoicesReport {
  * balance due, sorted by customer then date. QB parity: "Open Invoices" report.
  */
 export async function openInvoices(ctx: ServiceContext): Promise<OpenInvoicesReport> {
-  const now = new Date();
+  // Days overdue count from the end of TODAY on this computer's calendar (as the aging does), not
+  // from the UTC moment (a day ahead in US evenings).
+  const now = endOfLocalToday();
   const rows = await ctx.db
     .select({
       invoiceId: invoices.id,
@@ -1665,7 +1679,7 @@ export interface CollectionsReport {
  * the invoice date) is strictly before the as-of date and it still has a balance.
  */
 export async function collectionsReport(ctx: ServiceContext, asOf?: Date): Promise<CollectionsReport> {
-  const cutoff = endOfAsOfDay(asOf ?? new Date());
+  const cutoff = endOfAsOfDay(asOf ?? endOfLocalToday());
   const rows = await ctx.db
     .select({
       invoiceId: invoices.id,
@@ -1678,6 +1692,7 @@ export async function collectionsReport(ctx: ServiceContext, asOf?: Date): Promi
       date: invoices.date,
       dueDate: invoices.dueDate,
       balanceDue: invoices.balanceDue,
+      exchangeRate: invoices.exchangeRate,
     })
     .from(invoices)
     .innerJoin(customers, eq(invoices.customerId, customers.id))
@@ -1719,8 +1734,11 @@ export async function collectionsReport(ctx: ServiceContext, asOf?: Date): Promi
       daysOverdue,
       balanceDue: toAmountString(r.balanceDue),
     });
-    cust.totalDue = toAmountString(Money.of(cust.totalDue).plus(Money.of(r.balanceDue)));
-    totalDue = totalDue.plus(Money.of(r.balanceDue));
+    // Each invoice is listed in its own currency; the totals are home currency (a foreign balance at
+    // the invoice's booked rate, as openInvoices does), so currencies are never added together.
+    const home = homeValue(r.balanceDue, r.exchangeRate);
+    cust.totalDue = toAmountString(Money.of(cust.totalDue).plus(home));
+    totalDue = totalDue.plus(home);
   }
 
   return {
@@ -1808,9 +1826,17 @@ export async function missingChecks(ctx: ServiceContext, accountId?: string): Pr
       ),
     );
 
+  // Paychecks printed with a check number (Print Checks numbers them in the bank account's check
+  // sequence, checkNumbers.ts): left out, their numbers were reported as missing checks.
+  const payRows = (await paycheckChecks(ctx, { accountId, numberedOnly: true })).map((p) => ({
+    accountId: p.bankAccountId,
+    accountName: p.bankAccountName,
+    reference: p.checkNumber,
+  }));
+
   // Collect distinct numeric check numbers per account.
   const byAccount = new Map<string, { name: string; numbers: Set<number> }>();
-  for (const r of [...expRows, ...bpRows, ...pcRows]) {
+  for (const r of [...expRows, ...bpRows, ...pcRows, ...payRows]) {
     if (!r.accountId || !r.reference) continue;
     const trimmed = r.reference.trim();
     if (!/^\d+$/.test(trimmed)) continue;
@@ -1859,8 +1885,13 @@ export interface CheckDetailLine {
   amount: string;
 }
 
+/** Home-currency value of a document amount at its own exchange rate (none / 1 = home). */
+function homeValue(amount: string, rate: string | null | undefined) {
+  return rate && !Money.eq(rate, 1) ? Money.round2(Money.of(amount).times(Money.of(rate))) : Money.of(amount);
+}
+
 export interface CheckDetailRow {
-  source: 'expense' | 'bill_payment' | 'payment_check';
+  source: 'expense' | 'bill_payment' | 'payment_check' | 'paycheck';
   id: string;
   date: string;
   checkNumber: string | null;
@@ -1868,6 +1899,8 @@ export interface CheckDetailRow {
   bankAccountId: string;
   bankAccountName: string;
   amount: string;
+  /** Home-currency amount (a check on a foreign bank account is in its own currency). */
+  homeAmount?: string;
   voided: boolean;
   lines: CheckDetailLine[];
 }
@@ -1903,6 +1936,7 @@ export async function checkDetail(
       accountId: expenses.paymentAccountId,
       accountName: accounts.name,
       total: expenses.total,
+      rate: expenses.exchangeRate,
       voidedAt: expenses.voidedAt,
     })
     .from(expenses)
@@ -1951,6 +1985,7 @@ export async function checkDetail(
       accountId: billPayments.paymentAccountId,
       accountName: accounts.name,
       amount: billPayments.amount,
+      rate: billPayments.exchangeRate,
       voidedAt: billPayments.voidedAt,
     })
     .from(billPayments)
@@ -1990,6 +2025,7 @@ export async function checkDetail(
       bankAccountId: r.accountId,
       bankAccountName: r.accountName,
       amount: toAmountString(r.total),
+      homeAmount: toAmountString(homeValue(r.total, r.rate)),
       voided: r.voidedAt !== null,
       lines: expLinesById.get(r.id) ?? [],
     })),
@@ -2002,17 +2038,20 @@ export async function checkDetail(
       bankAccountId: r.accountId!,
       bankAccountName: r.accountName,
       amount: toAmountString(r.amount),
+      homeAmount: toAmountString(homeValue(r.amount, r.rate)),
       voided: r.voidedAt !== null,
       lines: bpLinesById.get(r.id) ?? [],
     })),
     ...(await paymentCheckDetailRows(ctx, range)),
+    ...(await paycheckDetailRows(ctx, range)),
   ];
   rows.sort(
     (a, b) => a.date.localeCompare(b.date) || (a.checkNumber ?? '').localeCompare(b.checkNumber ?? ''),
   );
 
+  // Home currency: a foreign bank account's check counts at its own rate (its row keeps its currency).
   let total = Money.zero();
-  for (const r of rows) if (!r.voided) total = total.plus(Money.of(r.amount));
+  for (const r of rows) if (!r.voided) total = total.plus(Money.of(r.homeAmount ?? r.amount));
 
   return {
     from: range?.from?.toISOString(),
@@ -2020,6 +2059,89 @@ export async function checkDetail(
     rows,
     total: toAmountString(total),
   };
+}
+
+/**
+ * Paychecks as checks: each paycheck (not a YTD / liability adjustment) with the bank account its
+ * net pay was drawn on (the posted entry's credit to a checking / savings account). Voided
+ * paychecks stay (QB lists them; their number is used). `numberedOnly` keeps printed ones.
+ */
+async function paycheckChecks(
+  ctx: ServiceContext,
+  opts: { accountId?: string; range?: { from?: Date; to?: Date }; numberedOnly?: boolean },
+) {
+  const conds = [
+    eq(paychecks.companyId, ctx.companyId),
+    eq(paychecks.entryType, 'paycheck'),
+    sql`${journalEntryLines.credit} > 0`,
+    inArray(accounts.subtype, ['checking', 'savings']),
+  ];
+  if (opts.numberedOnly) conds.push(isNotNull(paychecks.checkNumber));
+  if (opts.accountId) conds.push(eq(journalEntryLines.accountId, opts.accountId));
+  if (opts.range?.from) conds.push(gte(paychecks.payDate, opts.range.from));
+  if (opts.range?.to) conds.push(lte(paychecks.payDate, opts.range.to));
+  const rows = await ctx.db
+    .select({
+      id: paychecks.id,
+      payDate: paychecks.payDate,
+      checkNumber: paychecks.checkNumber,
+      netPay: paychecks.netPay,
+      voidedAt: paychecks.voidedAt,
+      entryId: paychecks.postedEntryId,
+      first: employees.firstName,
+      last: employees.lastName,
+      bankAccountId: journalEntryLines.accountId,
+      bankAccountName: accounts.name,
+    })
+    .from(paychecks)
+    .innerJoin(employees, eq(paychecks.employeeId, employees.id))
+    .innerJoin(journalEntryLines, eq(journalEntryLines.journalEntryId, paychecks.postedEntryId))
+    .innerJoin(accounts, and(eq(journalEntryLines.accountId, accounts.id), eq(accounts.companyId, ctx.companyId)))
+    .where(and(...conds));
+  // One row per paycheck (a paycheck draws on one bank account).
+  const seen = new Set<string>();
+  return rows.filter((r) => (seen.has(r.id) ? false : (seen.add(r.id), true)));
+}
+
+/** Paychecks for Check Detail, with the paycheck's other lines (wages, withholdings) as the split. */
+async function paycheckDetailRows(ctx: ServiceContext, range?: { from?: Date; to?: Date }): Promise<CheckDetailRow[]> {
+  const pcs = await paycheckChecks(ctx, { range });
+  const entryIds = pcs.map((p) => p.entryId).filter((x): x is string => !!x);
+  const linesByEntry = new Map<string, (CheckDetailLine & { accountId: string })[]>();
+  for (let i = 0; i < entryIds.length; i += 2000) {
+    for (const l of await ctx.db
+      .select({
+        entryId: journalEntryLines.journalEntryId,
+        accountId: journalEntryLines.accountId,
+        accountName: accounts.name,
+        memo: journalEntryLines.memo,
+        debit: journalEntryLines.debit,
+        credit: journalEntryLines.credit,
+      })
+      .from(journalEntryLines)
+      .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
+      .where(inArray(journalEntryLines.journalEntryId, entryIds.slice(i, i + 2000)))
+      .orderBy(asc(journalEntryLines.createdAt), asc(journalEntryLines.id))) {
+      const list = linesByEntry.get(l.entryId) ?? [];
+      list.push({ description: l.memo, detail: l.accountName, amount: toAmountString(Money.sub(l.debit, l.credit)), accountId: l.accountId });
+      linesByEntry.set(l.entryId, list);
+    }
+  }
+  return pcs.map((p) => ({
+    source: 'paycheck' as const,
+    id: p.id,
+    date: p.payDate.toISOString(),
+    checkNumber: p.checkNumber,
+    payee: `${p.first} ${p.last}`.trim(),
+    bankAccountId: p.bankAccountId,
+    bankAccountName: p.bankAccountName,
+    amount: toAmountString(p.netPay),
+    voided: p.voidedAt !== null,
+    // Every line but the bank side; together they add up to the net pay.
+    lines: (linesByEntry.get(p.entryId ?? '') ?? [])
+      .filter((l) => l.accountId !== p.bankAccountId)
+      .map(({ description, detail, amount }) => ({ description, detail, amount })),
+  }));
 }
 
 /** p1 purchases: Sales Tax Payment, Liability and customer refund checks for Check Detail. */
@@ -2105,6 +2227,8 @@ export async function depositDetail(
       accountName: accounts.name,
       memo: deposits.memo,
       total: deposits.total,
+      homeTotal: deposits.homeTotal,
+      rate: deposits.exchangeRate,
       voidedAt: deposits.voidedAt,
     })
     .from(deposits)
@@ -2126,12 +2250,54 @@ export async function depositDetail(
         .leftJoin(customers, eq(paymentsReceived.customerId, customers.id))
         .where(inArray(depositLines.depositId, depIds))
     : [];
+  // Lines that are not a received payment carry the deposit service's own codes in their
+  // description ('salesReceipt:<id>', 'invoicePayment:<id>', 'cashback:<account id>') — they were
+  // printed as is. Show what they are instead: the sales receipt / invoice and its customer, or
+  // the account the cash back went to.
+  const { RECEIPT_LINE_PREFIX, INVOICE_PAYMENT_LINE_PREFIX, CASHBACK_LINE_PREFIX } = await import('./deposits');
+  const codeIds = (prefix: string) =>
+    [...new Set(lineRows.map((l) => l.description ?? '').filter((s) => s.startsWith(prefix)).map((s) => s.slice(prefix.length)))].filter((id) =>
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id),
+    );
+  const receiptIds = codeIds(RECEIPT_LINE_PREFIX);
+  const invoiceIds = codeIds(INVOICE_PAYMENT_LINE_PREFIX);
+  const cashBackIds = codeIds(CASHBACK_LINE_PREFIX);
+  const docOf = new Map<string, { label: string; customerName: string | null }>();
+  if (receiptIds.length) {
+    for (const r of await ctx.db
+      .select({ id: salesReceipts.id, num: salesReceipts.receiptNumber, ref: salesReceipts.refNumber, customerName: customers.displayName })
+      .from(salesReceipts)
+      .leftJoin(customers, eq(salesReceipts.customerId, customers.id))
+      .where(and(eq(salesReceipts.companyId, ctx.companyId), inArray(salesReceipts.id, receiptIds)))) {
+      docOf.set(`${RECEIPT_LINE_PREFIX}${r.id}`, { label: `Sales Receipt #${docRef(r.ref, r.num)}`, customerName: r.customerName });
+    }
+  }
+  if (invoiceIds.length) {
+    for (const r of await ctx.db
+      .select({ id: invoices.id, num: invoices.invoiceNumber, ref: invoices.refNumber, customerName: customers.displayName })
+      .from(invoices)
+      .innerJoin(customers, eq(invoices.customerId, customers.id))
+      .where(and(eq(invoices.companyId, ctx.companyId), inArray(invoices.id, invoiceIds)))) {
+      docOf.set(`${INVOICE_PAYMENT_LINE_PREFIX}${r.id}`, { label: `Payment on Invoice #${docRef(r.ref, r.num)}`, customerName: r.customerName });
+    }
+  }
+  if (cashBackIds.length) {
+    for (const a of await ctx.db
+      .select({ id: accounts.id, name: accounts.name })
+      .from(accounts)
+      .where(and(eq(accounts.companyId, ctx.companyId), inArray(accounts.id, cashBackIds)))) {
+      docOf.set(`${CASHBACK_LINE_PREFIX}${a.id}`, { label: `Cash back to ${a.name}`, customerName: null });
+    }
+  }
   const linesById = new Map<string, DepositDetailLine[]>();
   for (const l of lineRows) {
     if (!linesById.has(l.depositId)) linesById.set(l.depositId, []);
+    const code = l.description ?? '';
+    const doc = docOf.get(code);
+    const coded = [RECEIPT_LINE_PREFIX, INVOICE_PAYMENT_LINE_PREFIX, CASHBACK_LINE_PREFIX].some((p) => code.startsWith(p));
     linesById.get(l.depositId)!.push({
-      description: l.description,
-      customerName: l.customerName,
+      description: doc ? doc.label : coded ? null : l.description,
+      customerName: l.customerName ?? doc?.customerName ?? null,
       amount: toAmountString(l.amount),
     });
   }
@@ -2139,7 +2305,8 @@ export async function depositDetail(
   let total = Money.zero();
   const rows: DepositDetailRow[] = depRows.map((r) => {
     const voided = r.voidedAt !== null;
-    if (!voided) total = total.plus(Money.of(r.total));
+    // Home currency: a deposit to a foreign bank account counts at the home value it posted.
+    if (!voided) total = total.plus(r.homeTotal != null ? Money.of(r.homeTotal) : homeValue(r.total, r.rate));
     return {
       id: r.id,
       date: r.date.toISOString(),
@@ -2285,52 +2452,55 @@ export interface PurchasesByItemReport {
 }
 
 /**
- * Purchases by Item (summary) — quantity and cost per item across vendor bills
- * in the period (voided bills excluded). Only item-coded bill lines count.
+ * Purchases by Item (summary) — quantity and cost per item across every purchase in the period:
+ * bills, checks and credit-card charges with item lines, and vendor credits (returns) as
+ * negatives; void documents excluded; home currency (the same lines as the standard Purchases
+ * reports, reportsLists.ts purchaseLines).
  */
 export async function purchasesByItem(
   ctx: ServiceContext,
   range?: { from?: Date; to?: Date },
 ): Promise<PurchasesByItemReport> {
-  const conds = [
-    eq(bills.companyId, ctx.companyId),
-    ne(bills.status, 'void'),
-    isNotNull(billLines.itemId),
-  ];
-  if (range?.from) conds.push(gte(bills.date, range.from));
-  if (range?.to) conds.push(lte(bills.date, range.to));
-
-  const agg = await ctx.db
-    .select({
-      itemId: billLines.itemId,
-      itemName: items.name,
-      sku: items.sku,
-      quantity: sql<string>`COALESCE(SUM(CAST(${billLines.quantity} AS NUMERIC)), 0)`,
-      cost: sql<string>`COALESCE(SUM(CAST(${billLines.amount} AS NUMERIC)), 0)`,
-    })
-    .from(billLines)
-    .innerJoin(bills, eq(billLines.billId, bills.id))
-    .innerJoin(items, eq(billLines.itemId, items.id))
-    .where(and(...conds))
-    .groupBy(billLines.itemId, items.name, items.sku)
-    .orderBy(sql`SUM(CAST(${billLines.amount} AS NUMERIC)) DESC`);
+  // Loaded on demand: reportsLists imports this module.
+  const { purchaseLines } = await import('./reportsLists');
+  const lines = await purchaseLines(
+    ctx,
+    {},
+    range?.from ?? new Date(Date.UTC(1900, 0, 1)),
+    range?.to ?? new Date(Date.UTC(9999, 11, 31, 23, 59, 59, 999)),
+  );
+  const acc = new Map<string, { name: string; qty: ReturnType<typeof Money.zero>; cost: ReturnType<typeof Money.zero> }>();
+  for (const l of lines) {
+    const cur = acc.get(l.itemId) ?? { name: l.item ?? '', qty: Money.zero(), cost: Money.zero() };
+    cur.qty = cur.qty.plus(l.qty);
+    cur.cost = cur.cost.plus(l.amount);
+    acc.set(l.itemId, cur);
+  }
+  const skus = new Map<string, string | null>();
+  const ids = [...acc.keys()];
+  if (ids.length) {
+    for (const r of await ctx.db
+      .select({ id: items.id, sku: items.sku })
+      .from(items)
+      .where(and(eq(items.companyId, ctx.companyId), inArray(items.id, ids)))) {
+      skus.set(r.id, r.sku);
+    }
+  }
 
   let totQty = Money.zero();
   let totCost = Money.zero();
-  const rows: PurchasesByItemRow[] = agg
-    .filter((r) => r.itemId !== null)
-    .map((r) => {
-      const qty = Money.of(r.quantity);
-      const cost = Money.of(r.cost);
-      totQty = totQty.plus(qty);
-      totCost = totCost.plus(cost);
+  const rows: PurchasesByItemRow[] = [...acc.entries()]
+    .sort((a, b) => b[1].cost.comparedTo(a[1].cost))
+    .map(([itemId, r]) => {
+      totQty = totQty.plus(r.qty);
+      totCost = totCost.plus(r.cost);
       return {
-        itemId: r.itemId!,
-        itemName: r.itemName,
-        sku: r.sku,
-        quantity: qty.toString(),
-        cost: toAmountString(cost),
-        avgUnitCost: qty.isZero() ? null : cost.dividedBy(qty).toFixed(2),
+        itemId,
+        itemName: r.name,
+        sku: skus.get(itemId) ?? null,
+        quantity: r.qty.toString(),
+        cost: toAmountString(r.cost),
+        avgUnitCost: r.qty.isZero() ? null : r.cost.dividedBy(r.qty).toFixed(2),
       };
     });
 

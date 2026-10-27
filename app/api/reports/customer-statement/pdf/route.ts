@@ -15,6 +15,7 @@ import { customerStatement } from '@/lib/services/statements';
 import { buildStatementPdf } from '@/lib/pdf/forms';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus } from '@/lib/routeErrors';
+import { parseDateParam } from '../../_lib';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -38,9 +39,13 @@ export async function GET(req: NextRequest) {
 
     const ctx = await getServerContext();
 
+    // Real calendar days only (400 otherwise): '?from=garbage' became an Invalid Date that reached
+    // the statement query (HTTP 500), and 2026-02-30 rolled over to March 2.
     const range: { from?: Date; to?: Date } = {};
-    if (fromStr) range.from = new Date(fromStr + 'T00:00:00.000Z');
-    if (toStr)   range.to   = new Date(toStr   + 'T00:00:00.000Z');
+    const from = parseDateParam(fromStr, 'from');
+    const to = parseDateParam(toStr, 'to');
+    if (from) range.from = from;
+    if (to) range.to = to;
 
     const statement = await customerStatement(ctx, customerId, range);
 

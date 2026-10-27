@@ -671,8 +671,25 @@ describe('trial balance and balance sheet', () => {
         const bs = await run('balance-sheet', { asOf, basis });
         expect.soft(cell(bs, 'bs:assets:total'), `BS ${basis} ${asOf}`).toBe(cell(bs, 'bs:le:total'));
         if (basis === 'accrual') {
+          // Review 5: the report shows the trial balance as QuickBooks does — balance-sheet
+          // accounts at the ledger balance, income / expense accounts for the fiscal year to date,
+          // and earlier years' income in Retained Earnings (3900 = the balance sheet's line).
           const raw = await trialBalance(ctx, eod(asOf));
-          expect.soft(grand(tb, 'debit'), `TB report vs trialBalance() ${asOf}`).toBe(raw.totalDebit);
+          const isPL = (id: string) => ['revenue', 'expense'].includes(acctMeta.find((a) => a.id === id)?.type ?? '');
+          for (const r of raw.rows) {
+            if (isPL(r.accountId) || r.accountId === A['3900']) continue;
+            const t = rowById(tb, `tb:a:${r.accountId}`);
+            expect.soft(sub(t?.cells.debit, t?.cells.credit), `TB report vs trialBalance() ${r.code} ${asOf}`).toBe(sub(r.debit, r.credit));
+          }
+          let plNet = Money.zero();
+          for (const t of tb.rows) {
+            const id = /^tb:a:(.+)$/.exec(t.id)?.[1];
+            if (id && isPL(id) && t.kind === 'data') plNet = plNet.plus(Money.of(sub(t.cells.credit, t.cells.debit)));
+          }
+          const pl = await run('profit-loss', { from: fyStart(asOf), to: asOf });
+          expect.soft(toAmountString(plNet), `TB P&L accounts = P&L fiscal YTD ${asOf}`).toBe(cell(pl, 'pl:net'));
+          const reRow = rowById(tb, `tb:a:${A['3900']}`);
+          expect.soft(sub(reRow?.cells.credit, reRow?.cells.debit), `TB Retained Earnings = BS ${asOf}`).toBe(cell(bs, `bs:equity:a:${A['3900']}`));
         }
       }
     }

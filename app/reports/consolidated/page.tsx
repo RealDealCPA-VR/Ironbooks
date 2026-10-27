@@ -7,12 +7,16 @@ import { Button, Card, PageHeader, Table, Th, Td, Tr, Badge, toast } from '@/com
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency, Money, toAmountString } from '@/lib/money';
 import type { ConsolidatedPL, ConsolidatedBS } from '@/lib/services/consolidation';
+import { AsOfControl, RangeControls } from '../_components/shared';
 
 // ---------------------------------------------------------------------------
 // Types (mirrored from service layer; avoid direct server import in client)
 // ---------------------------------------------------------------------------
 
 type ReportType = 'pl' | 'bs';
+
+/** MM/DD/YYYY of the calendar day an API date names (its UTC day — the stored-date convention). */
+const dayLabel = (iso: string) => `${iso.slice(5, 7)}/${iso.slice(8, 10)}/${iso.slice(0, 4)}`;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -375,16 +379,25 @@ export default function ConsolidatedReportPage() {
   const [plData, setPlData] = useState<ConsolidatedPL | null>(null);
   const [bsData, setBsData] = useState<ConsolidatedBS | null>(null);
   const [loading, setLoading] = useState(false);
+  // Blank = the server's defaults (fiscal year to date / as of today), shown in the subtitle.
+  const [from, setFrom] = useState('');
+  const [to, setTo] = useState('');
+  const [asOf, setAsOf] = useState('');
 
   const fetchReport = useCallback(
-    async (type: ReportType) => {
+    async (type: ReportType, dates: { from: string; to: string; asOf: string }) => {
       setLoading(true);
       try {
         if (type === 'pl') {
-          const data = await api.get<ConsolidatedPL>('/api/reports/consolidated?type=pl');
+          const qs = new URLSearchParams({ type: 'pl' });
+          if (dates.from) qs.set('from', dates.from);
+          if (dates.to) qs.set('to', dates.to);
+          const data = await api.get<ConsolidatedPL>(`/api/reports/consolidated?${qs.toString()}`);
           setPlData(data);
         } else {
-          const data = await api.get<ConsolidatedBS>('/api/reports/consolidated?type=bs');
+          const qs = new URLSearchParams({ type: 'bs' });
+          if (dates.asOf) qs.set('asOf', dates.asOf);
+          const data = await api.get<ConsolidatedBS>(`/api/reports/consolidated?${qs.toString()}`);
           setBsData(data);
         }
       } catch (err) {
@@ -397,8 +410,18 @@ export default function ConsolidatedReportPage() {
   );
 
   useEffect(() => {
-    fetchReport(reportType);
+    fetchReport(reportType, { from, to, asOf });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reportType, fetchReport]);
+
+  const period =
+    reportType === 'pl'
+      ? plData?.consolidated.from && plData.consolidated.to
+        ? `${dayLabel(plData.consolidated.from)} – ${dayLabel(plData.consolidated.to)}`
+        : ''
+      : bsData?.consolidated.asOf
+        ? `As of ${dayLabel(bsData.consolidated.asOf)}`
+        : '';
 
   const companyCount =
     reportType === 'pl' ? (plData?.companies.length ?? 0) : (bsData?.companies.length ?? 0);
@@ -436,8 +459,17 @@ export default function ConsolidatedReportPage() {
         }
       />
 
+      <Card className="p-4 mb-4 print-hidden">
+        {reportType === 'pl' ? (
+          <RangeControls from={from} to={to} onFrom={setFrom} onTo={setTo} onRun={() => fetchReport('pl', { from, to, asOf })} />
+        ) : (
+          <AsOfControl asOf={asOf} onChange={setAsOf} onRun={() => fetchReport('bs', { from, to, asOf })} />
+        )}
+      </Card>
+
       {/* Subtitle */}
       <p className="text-navy/50 text-sm mb-6">
+        {period && <span className="font-semibold text-navy/70">{period}. </span>}
         Multi-entity view across{' '}
         <span className="font-semibold text-navy/70">{companyCount}</span>{' '}
         {companyCount === 1 ? 'company' : 'companies'}. The last column shows the arithmetic

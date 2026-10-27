@@ -166,8 +166,13 @@ export interface ReportSummaryResult {
 /** Report option keys carried in the URL (mirrors StdReportView's PARAM_KEYS). */
 export const REPORT_PARAM_KEYS = [
   'from', 'to', 'asOf', 'priorAsOf', 'accountId', 'section', 'nameId', 'customerId', 'vendorId', 'employeeId', 'itemId', 'jobId',
+  // Profit & Loss by Job cell QuickZoom: that Customer:Job column's lines (named or job-costed).
+  'customerJobId',
   'classId', 'budgetId', 'txnType', 'amountMin', 'amountMax', 'cleared', 'memo', 'number', 'sortBy', 'sortDir',
   'subtotalBy', 'columns', 'compare', 'basis', 'view', 'vehicle', 'dates', 'interval', 'through', 'agingFrom',
+  // Open Invoices / Collections "more than N days past due": without it an explanation re-ran
+  // the report unfiltered and explained a different number than the page showed.
+  'overDays',
 ] as const;
 
 /** Only the report options from a params object (drops row / col / back and anything unknown). */
@@ -212,6 +217,9 @@ export function drilldownApiUrl(
 /** A safe in-app "back" target (relative path only — never an absolute or protocol URL). */
 export function safeBackHref(back: string | null | undefined): string | null {
   if (!back || !back.startsWith('/') || back.startsWith('//') || back.includes('\\')) return null;
+  // Browsers drop tabs / line breaks from a URL before parsing it ('/\t/host' → '//host', another
+  // site), so no whitespace or control character may appear at all (query values arrive encoded).
+  if (/[\s\u0000-\u001f\u007f]/.test(back)) return null;
   return back;
 }
 

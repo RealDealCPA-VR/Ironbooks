@@ -8,16 +8,20 @@ import { type NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { balanceSheet } from '@/lib/services/reports';
 import { balanceSheetComparative } from '@/lib/services/reportsExtra';
-import { parseDateParam, parseRange, reportError } from '../_lib';
+import { endOfToday } from '@/lib/services/reportEngine';
+import { parseDateParam, reportError } from '../_lib';
 
 export async function GET(req: NextRequest) {
   try {
     const ctx = await getServerContext();
     const params = req.nextUrl.searchParams;
-    const asOf = parseDateParam(params.get('asOf'), 'asOf');
+    // No asOf = the end of TODAY on this computer's calendar (as every report): it used to run
+    // with no date at all (post-dated entries counted) or, with compareTo, as of the UTC moment —
+    // already tomorrow in US evenings.
+    const asOf = parseDateParam(params.get('asOf'), 'asOf') ?? endOfToday();
     const compareTo = parseDateParam(params.get('compareTo'), 'compareTo');
     if (compareTo) {
-      const report = await balanceSheetComparative(ctx, asOf ?? new Date(), compareTo);
+      const report = await balanceSheetComparative(ctx, asOf, compareTo);
       return NextResponse.json(report);
     }
     const report = await balanceSheet(ctx, asOf);

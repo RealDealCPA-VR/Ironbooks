@@ -26,6 +26,7 @@ import {
   trialBalanceReport,
 } from './reportsStandard';
 import type { StdReport } from '@/lib/reports/types';
+import { Money, toAmountString } from '@/lib/money';
 import { formatAmount, DEFAULT_NUMBER_FORMAT, roundDecimalString } from '@/lib/reports/format';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-reports-standard');
@@ -255,9 +256,13 @@ describe('Trial Balance roll-up', () => {
   it('nests sub-accounts and keeps the ledger totals', async () => {
     const r = await trialBalanceReport(ctx, { asOf: '2026-12-31' });
     const tb = await trialBalance(ctx, new Date('2026-12-31T23:59:59.999Z'));
-    expect(row(r, 'TOTAL')!.cells.debit).toBe(tb.totalDebit);
-    expect(row(r, 'TOTAL')!.cells.credit).toBe(tb.totalCredit);
-    expect(row(r, 'Total Sales')!.cells.credit).toBe('1550.00');
+    // Review 5: as in QuickBooks the 2025 income (sale 1,000 − rent 400) is in Retained Earnings,
+    // not on the income / expense accounts: the ledger's totals less the 400 rent debit and the
+    // 1,000 sale credit, plus a 600 credit on Retained Earnings.
+    expect(row(r, 'TOTAL')!.cells.debit).toBe(toAmountString(Money.of(tb.totalDebit).minus(400)));
+    expect(row(r, 'TOTAL')!.cells.credit).toBe(toAmountString(Money.of(tb.totalCredit).minus(400)));
+    expect(row(r, 'Retained Earnings')!.cells.credit).toBe('600.00');
+    expect(row(r, 'Total Sales')!.cells.credit).toBe('550.00');
     expect(r.balanced).toBe(true);
   });
 });

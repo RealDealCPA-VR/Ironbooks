@@ -22,7 +22,7 @@ import type { ReportParams } from '@/lib/validation/reports';
 import { validation } from './_base';
 import { resolveAccess } from './access';
 import { can } from '@/lib/permissions/model';
-import { trialBalance } from './reports';
+import { trialBalanceAmounts } from './reportsStandard';
 import { apAging, arAging, cashFlow, type CashFlowLine, type CashFlowReport } from './reportsExtra';
 import {
   activityByAccount,
@@ -244,6 +244,9 @@ async function mergedMeta(ctx: ServiceContext, companyIds: string[]) {
   return { meta, keyOfAccount };
 }
 
+/** Merged-chart key of the Retained Earnings line of companies that have no such account. */
+const SYNTHETIC_RE_KEY = 'equity|~|retained earnings';
+
 export async function combinedTrialBalance(ctx: ServiceContext, p: ReportParams): Promise<StdReport> {
   const asOf = resolveAsOf(p);
   const cos = await reportableCompanies(ctx);
@@ -254,17 +257,27 @@ export async function combinedTrialBalance(ctx: ServiceContext, p: ReportParams)
   let totalCredit = Money.zero();
   let balanced = true;
   for (let i = 0; i < cos.length; i++) {
-    const tb = await trialBalance(companyCtx(ctx, cos[i].id), asOf);
-    balanced = balanced && tb.balanced;
-    totalDebit = totalDebit.plus(Money.of(tb.totalDebit));
-    totalCredit = totalCredit.plus(Money.of(tb.totalCredit));
-    for (const r of tb.rows) {
-      const k = keyOfAccount.get(r.accountId)!;
+    // Each company's trial balance as QuickBooks shows it (trialBalanceAmounts): income and
+    // expense accounts for its fiscal year to date, earlier years' income in Retained Earnings.
+    const cctx = companyCtx(ctx, cos[i].id);
+    const tb = await trialBalanceAmounts(cctx, await loadAccountMeta(cctx), asOf, undefined);
+    balanced = balanced && tb.ledgerBalanced;
+    const put = (k: string, net: Decimal) => {
+      if (net.isZero()) return;
       const v = amounts.get(k) ?? zeros(n);
-      const net = Money.sub(r.debit, r.credit);
       v[i] = v[i].plus(net);
       v[n - 1] = v[n - 1].plus(net);
       amounts.set(k, v);
+      if (net.greaterThan(0)) totalDebit = totalDebit.plus(net);
+      else totalCredit = totalCredit.minus(net);
+    };
+    for (const [accountId, net] of tb.amounts) put(keyOfAccount.get(accountId)!, net);
+    if (!tb.retainedEarnings.isZero()) {
+      // A company with no Retained Earnings account: its earlier years' income on one shared line.
+      if (!meta.has(SYNTHETIC_RE_KEY)) {
+        meta.set(SYNTHETIC_RE_KEY, { id: SYNTHETIC_RE_KEY, code: '', name: 'Retained Earnings', type: 'equity', subtype: 'retained_earnings', parentId: null, isActive: true, section: 'equity', fullName: 'Retained Earnings' });
+      }
+      put(SYNTHETIC_RE_KEY, tb.retainedEarnings);
     }
   }
   assertTrialBalanceBalanced('Combined trial balance', totalDebit, totalCredit);
