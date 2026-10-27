@@ -1696,6 +1696,37 @@ export const fileSecrets = pgTable('file_secrets', {
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
+/**
+ * 0077 (filecrypto): the company file is encrypted at rest (electron/fileCrypto.js). One row while
+ * it is protected: the key check names the file key without revealing it; the lookup salt hides
+ * user names in the file's key slots. The file key itself is never stored (lib/services/fileProtection.ts).
+ */
+export const fileProtection = pgTable('file_protection', {
+  id: integer('id').primaryKey().default(1),
+  keyCheck: varchar('key_check', { length: 64 }).notNull(),
+  lookupSalt: varchar('lookup_salt', { length: 64 }).notNull(),
+  protectedAt: timestamp('protected_at').defaultNow().notNull(),
+  protectedBy: uuid('protected_by'),
+  recoveryCreatedAt: timestamp('recovery_created_at'),
+});
+
+/**
+ * 0077 (filecrypto): key slots — the file key wrapped with a user's password, a user's challenge
+ * answer or the recovery key. `secretRef` is a digest of the password / answer hash the slot was
+ * made for (a changed secret makes it stale). `slot` is electron/fileCrypto.js makeSlot's output.
+ */
+export const fileKeySlots = pgTable('file_key_slots', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  kind: varchar('kind', { length: 16 }).$type<'password' | 'challenge' | 'recovery'>().notNull(),
+  userId: uuid('user_id').references(() => users.id, { onDelete: 'cascade' }),
+  tag: varchar('tag', { length: 64 }),
+  question: text('question'),
+  secretRef: varchar('secret_ref', { length: 64 }),
+  slot: jsonb('slot').$type<Record<string, unknown>>().notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
 /** Learned categorizer state (naive Bayes counts) — one row per company. */
 export const aiCategorizerModels = pgTable('ai_categorizer_models', {
   id: uuid('id').primaryKey().defaultRandom(),

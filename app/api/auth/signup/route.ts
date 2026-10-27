@@ -9,6 +9,11 @@
  * password hash is the sentinel 'dev', doesn't count). The file password still applies.
  * The challenge question (QuickBooks parity) is what "I forgot my password" asks before it
  * resets the Admin's password (app/api/auth/request-reset).
+ *
+ * A new single company file is protected with passwords from its first save (filecrypto,
+ * lib/services/fileProtection.ts): the Admin's password (and challenge answer) get the first key
+ * slots, and the answer carries the file's RECOVERY KEY once, for the setup screen to show (print
+ * or save it — it is the only way back in if every password is lost). `protect: false` opts out.
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { eq, ne, sql } from 'drizzle-orm';
@@ -32,6 +37,7 @@ import { logTransaction } from '@/lib/services/transactionLog';
 import { startSession } from '@/lib/services/sessions';
 import { cookieSecure, originFromHeaders } from '@/lib/net/requestInfo';
 import { MIN_CHALLENGE_ANSWER, isKnownChallengeQuestion, normalizeChallengeAnswer } from '@/lib/challengeQuestions';
+import { companyFileForProtection, protectCompanyFile } from '@/lib/services/fileProtection';
 
 /** users.name / users.email / companies.name are varchar(255). */
 const MAX_TEXT = 255;
@@ -200,7 +206,32 @@ export async function POST(req: NextRequest) {
   }
 
   const { user, companyId, sessionId } = created;
-  const res = NextResponse.json({ id: user.id, name: user.name, email: user.email, companyId }, { status: 201 });
+  // filecrypto: protected from the first save (default on for a new single company file).
+  let recoveryKey: string | null = null;
+  let protectionError: string | null = null;
+  if (companyFileForProtection() && body.protect !== false) {
+    try {
+      ({ recoveryKey } = await protectCompanyFile(db, {
+        userId: user.id,
+        password,
+        challenge: wantsChallenge ? { question: challengeQuestion, answer: challengeAnswer } : null,
+      }));
+    } catch (err) {
+      console.error('[signup] could not protect the new company file:', (err as Error).message);
+      protectionError = 'The company file could not be protected with passwords yet. Turn it on in Company > Security.';
+    }
+  }
+  const res = NextResponse.json(
+    {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      companyId,
+      ...(recoveryKey ? { protected: true, recoveryKey } : {}),
+      ...(protectionError ? { protectionError } : {}),
+    },
+    { status: 201 },
+  );
   const opts = { httpOnly: true, secure: cookieSecure(origin), sameSite: 'lax' as const, path: '/', maxAge: 60 * 60 * 24 * 30 };
   res.cookies.set(SESSION_COOKIE, createSessionToken(user.id, 'user', sessionId), opts);
   res.cookies.set(COMPANY_COOKIE, companyId, opts);

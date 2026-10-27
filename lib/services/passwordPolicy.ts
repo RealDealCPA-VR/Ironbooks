@@ -29,6 +29,7 @@ import {
 import { ServiceError, validation, writeAudit, type ServiceContext } from './_base';
 import { requireFileAdmin } from './access';
 import { logTransaction } from './transactionLog';
+import { syncPasswordSlot } from './fileProtection';
 
 /** How many old hashes are kept per user (the largest "don't reuse" setting). */
 const HISTORY_KEEP = PASSWORD_POLICY_LIMITS.historyCount[1];
@@ -136,6 +137,11 @@ export async function assertPasswordAllowed(
  * goes into the history, the change date is stamped, and `mustChange` decides whether the next
  * sign-in has to choose another one (an Admin can ask for that when setting a password).
  * Runs on the given db handle (pass a transaction to make it part of a larger change).
+ *
+ * Every password path goes through here — changing your own, the challenge-question reset, the
+ * recovery key and an Admin setting one — so the user's key slot of a protected company file is
+ * re-made for the new password here too (lib/services/fileProtection.ts): the old password stops
+ * opening the file at its next save, the new one opens it.
  */
 export async function storeUserPassword(
   db: DB,
@@ -167,6 +173,7 @@ export async function storeUserPassword(
       updatedAt: now,
     })
     .where(eq(users.id, userId));
+  await syncPasswordSlot(db, userId, password);
 }
 
 export type PasswordChangeReason = 'expired' | 'required';

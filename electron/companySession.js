@@ -385,7 +385,7 @@ function discardProtectedWorkingData(workDir, companyFile) {
  * copies made before a restore, scheduled report exports — and is never deleted with the cache.
  */
 function isCacheEntry(name) {
-  return name === 'data' || name === STATE_FILE || (name.startsWith(`${STATE_FILE}.`) && name.endsWith('.tmp')) || /^data\.(restore-tmp|pre-restore|refused-restore)-\d+$/.test(name);
+  return name === 'data' || name === STATE_FILE || (name.startsWith(`${STATE_FILE}.`) && name.endsWith('.tmp')) || /^data\.(restore-tmp|pre-restore|refused-restore|unseal)-\d+$/.test(name);
 }
 
 /** Remove the cache of working copies not used for a long time, except `keep` (best effort). */

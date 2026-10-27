@@ -12,7 +12,7 @@ import path from 'node:path';
 import { cookies } from 'next/headers';
 import bcrypt from 'bcryptjs';
 import { eq } from 'drizzle-orm';
-import { getDb, resolveDataDir } from '@/lib/db';
+import { getDb, isSealedDir, resolveDataDir } from '@/lib/db';
 import { companies, employees, users } from '@/lib/db/schema';
 import { touchSession } from '@/lib/services/sessions';
 import { getRequestOrigin } from '@/lib/net/requestInfo';
@@ -76,6 +76,10 @@ export function companyFileId(): string {
   if (cached) return cached;
   let id: string;
   const file = path.join(dir, '.file-id');
+  // A protected company file before anyone signed in (lib/db/sealed.ts): its working copy is made
+  // at sign-in and must stay untouched until then. Nothing is bound to this placeholder (no
+  // session can be minted while sealed), and it is never cached.
+  if (isSealedDir(dir) && !fs.existsSync(file)) return 'sealed:' + crypto.createHash('sha256').update(dir).digest('hex').slice(0, 32);
   try {
     if (fs.existsSync(file)) {
       id = fs.readFileSync(file, 'utf8').trim();
@@ -174,33 +178,56 @@ function launchBinding(nonce: string): string {
   return crypto.createHash('sha256').update(`ironbooks-session-launch:${nonce}`).digest('base64url').slice(0, 22);
 }
 
-export function createUnlockToken(): string {
+/**
+ * `pre`: the sign-in screen of a company file protected with passwords, before anyone signed in
+ * (lib/db/sealed.ts). The file password (if the file has one) is inside the encrypted file and
+ * can't be checked yet, so this token only lets the sign-in page show; it never counts as an
+ * unlock (verifyUnlockToken refuses it) — the sign-in asks for the file password once the file
+ * is open (app/api/auth/login).
+ */
+export function createUnlockToken(opts: { pre?: boolean } = {}): string {
   const payload = JSON.stringify({
     dir: resolveDataDir(),
     nonce: launchBinding(launchNonce()),
     exp: Date.now() + UNLOCK_TTL_MS,
+    ...(opts.pre ? { pre: true } : {}),
   });
   const body = Buffer.from(payload).toString('base64url');
   return `${body}.${sign(body)}`;
 }
 
-export function verifyUnlockToken(token: string | undefined | null): boolean {
-  if (!token) return false;
+function readUnlockToken(token: string | undefined | null): { pre: boolean } | null {
+  if (!token) return null;
   const [body, sig] = token.split('.');
-  if (!body || !sig) return false;
+  if (!body || !sig) return null;
   const expected = sign(body);
   if (
     sig.length !== expected.length ||
     !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))
   ) {
-    return false;
+    return null;
   }
   try {
     const data = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
-    if (typeof data.exp !== 'number' || Date.now() > data.exp) return false;
-    if (data.dir !== resolveDataDir()) return false;
-    if ((data.nonce ?? '') !== launchBinding(launchNonce())) return false;
-    return true;
+    if (typeof data.exp !== 'number' || Date.now() > data.exp) return null;
+    if (data.dir !== resolveDataDir()) return null;
+    if ((data.nonce ?? '') !== launchBinding(launchNonce())) return null;
+    return { pre: data.pre === true };
+  } catch {
+    return null;
+  }
+}
+
+export function verifyUnlockToken(token: string | undefined | null): boolean {
+  const t = readUnlockToken(token);
+  return Boolean(t && !t.pre);
+}
+
+/** True when the request carries the sealed sign-in screen's token for THIS launch (see createUnlockToken). */
+export async function hasPreUnlockCookie(): Promise<boolean> {
+  try {
+    const store = await cookies();
+    return readUnlockToken(store.get(UNLOCK_COOKIE)?.value)?.pre === true;
   } catch {
     return false;
   }
@@ -227,6 +254,26 @@ export async function verifyPassword(plain: string, hash: string): Promise<boole
   } catch {
     return false;
   }
+}
+
+/** A cost-10 bcrypt hash of a random value nobody knows (same work as a real comparison). */
+const NO_SUCH_USER_HASH = '$2b$10$Lrlo.l0jlMgJOMGfl2XBT.IViB5yAjbxC4rE8ur2BM1PUrQf4edvK';
+
+/**
+ * verifyPassword for a sign-in whose user may not exist: an unknown user name (or a seeded demo
+ * user) costs the same bcrypt work as a wrong password, so the time an answer takes never tells
+ * which user names exist. Always false without a real hash.
+ */
+export async function verifyPasswordTimed(plain: string, hash: string | null | undefined): Promise<boolean> {
+  if (!hash || hash === 'dev') {
+    try {
+      await bcrypt.compare(plain, NO_SUCH_USER_HASH);
+    } catch {
+      /* nothing to protect */
+    }
+    return false;
+  }
+  return verifyPassword(plain, hash);
 }
 
 /**

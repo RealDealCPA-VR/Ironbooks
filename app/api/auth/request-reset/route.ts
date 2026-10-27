@@ -11,11 +11,18 @@
  * Company files are portable (file server, USB drive, an accountant), so a copy of the file must
  * not be openable by anyone who can guess the Admin's user name. Otherwise always 200 with a
  * generic message to avoid user-name enumeration.
+ *
+ * A company file protected with passwords (lib/services/fileProtection.ts): the challenge answer
+ * has its own key slot, so the answer is what opens the file here too — before the sign-in, while
+ * the server is sealed (lib/db/sealed.ts), the question comes from the file's slots and the right
+ * answer decrypts the file; then the reset goes on as usual (and the new password gets its slot).
+ * Without a challenge question, a protected file can only be reopened by an Admin resetting the
+ * password or with the recovery key (/api/auth/recover) — never by the single-user rule.
  */
 import { NextRequest, NextResponse } from 'next/server';
 import crypto from 'node:crypto';
 import { eq, ne } from 'drizzle-orm';
-import { getDb } from '@/lib/db';
+import { getDb, resolveDataDir, sealedMode, withSealedAccess } from '@/lib/db';
 import { users } from '@/lib/db/schema';
 import { hasValidUnlockCookie, verifyPassword } from '@/lib/auth';
 import { getFileLockStatus } from '@/lib/services/fileLock';
@@ -23,6 +30,18 @@ import { originFromHeaders } from '@/lib/net/requestInfo';
 import { GLOBAL_KEY_WEIGHT, attemptKeys, resetLimiter, tooManyResets } from '@/lib/net/rateLimit';
 import { invalidJsonBody, readJsonObject } from '@/lib/routeErrors';
 import { normalizeChallengeAnswer } from '@/lib/challengeQuestions';
+import {
+  finishKeyUnseal,
+  loadKeyFromChallenge,
+  readProtection,
+  sealedChallengeQuestion,
+  unlockFromFile,
+  unsealCompanyFile,
+} from '@/lib/services/fileProtection';
+
+const PROTECTED_NO_CHALLENGE_MESSAGE =
+  'This company file is protected with passwords, and this user has no challenge question that opens it. Ask an Admin to reset your password, or use the recovery key.';
+const WRONG_ANSWER_MESSAGE = "That answer doesn't match. Answers are not case-sensitive; check the spelling.";
 
 const MULTI_USER_RESET_MESSAGE =
   'This company file has more than one user, so passwords cannot be reset from this screen. ' +
@@ -48,7 +67,29 @@ export async function POST(req: NextRequest) {
   }
   try {
     limiter.recordFailure(keys, Date.now(), weights);
-    const db = await getDb();
+    const offlineLocal = process.env.BKA_OFFLINE === '1' && !origin.remote;
+    const sealed = sealedMode();
+    let db;
+    if (sealed === 'extract' || sealed === 'conflict') {
+      // Not decrypted yet: the question is in the file's challenge slot, and the answer opens it.
+      if (!offlineLocal) return NextResponse.json(generic);
+      const question = sealedChallengeQuestion(email);
+      if (!question) {
+        await unlockFromFile({ kind: 'challenge', login: email, secret: challengeAnswer || 'x' }); // same work either way
+        return NextResponse.json({ error: PROTECTED_NO_CHALLENGE_MESSAGE, code: 'FORBIDDEN' }, { status: 403 });
+      }
+      if (!challengeAnswer.trim()) return NextResponse.json({ ok: false, challengeQuestion: question });
+      const key = await unlockFromFile({ kind: 'challenge', login: email, secret: challengeAnswer });
+      if (!key) {
+        return NextResponse.json({ error: WRONG_ANSWER_MESSAGE, code: 'FORBIDDEN', challengeQuestion: question }, { status: 403 });
+      }
+      await unsealCompanyFile(key);
+      db = await getDb();
+    } else if (sealed === 'key') {
+      db = await withSealedAccess(() => getDb());
+    } else {
+      db = await getDb();
+    }
 
     // The file password (if set) gates everything in the file, password resets included.
     const lock = await getFileLockStatus(db);
@@ -64,7 +105,6 @@ export async function POST(req: NextRequest) {
     // users, anyone at this machine (e.g. a restricted clerk) could otherwise reset the owner's
     // password. With more than one real user, an Admin resets passwords in Users & Roles
     // (/api/users/[id]/reset-password, which enforces assertCanManageUser).
-    const offlineLocal = process.env.BKA_OFFLINE === '1' && !origin.remote;
     const [user] = await db.select().from(users).where(eq(users.email, email));
     const hasChallenge = Boolean(user?.challengeQuestion && user?.challengeAnswerHash);
     if (offlineLocal && hasChallenge) {
@@ -75,10 +115,20 @@ export async function POST(req: NextRequest) {
       }
       if (!(await verifyPassword(normalizeChallengeAnswer(challengeAnswer), user!.challengeAnswerHash!))) {
         return NextResponse.json(
-          { error: "That answer doesn't match. Answers are not case-sensitive; check the spelling.", code: 'FORBIDDEN', challengeQuestion: user!.challengeQuestion },
+          { error: WRONG_ANSWER_MESSAGE, code: 'FORBIDDEN', challengeQuestion: user!.challengeQuestion },
           { status: 403 },
         );
       }
+      // The working copy already on this computer (sealed 'key'): the answer's slot unlocks the file key.
+      if (sealed === 'key') {
+        if (!(await loadKeyFromChallenge(db, resolveDataDir(), user!.id, challengeAnswer))) {
+          return NextResponse.json({ error: PROTECTED_NO_CHALLENGE_MESSAGE, code: 'FORBIDDEN' }, { status: 403 });
+        }
+        await finishKeyUnseal();
+      }
+    } else if (offlineLocal && (sealed === 'key' || (await readProtection(db)))) {
+      // A protected file is never reopened by the single-user rule: only a secret that opens it.
+      return NextResponse.json({ error: PROTECTED_NO_CHALLENGE_MESSAGE, code: 'FORBIDDEN' }, { status: 403 });
     } else if (offlineLocal) {
       const realUsers = await db
         .select({ id: users.id })

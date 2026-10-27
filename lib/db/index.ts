@@ -22,8 +22,10 @@ import { ServiceError } from '@/lib/services/errors';
 import { OPEN_BLOCKING, checkLedgerHealth, ensureLedgerGuards, type LedgerProblem } from './ledgerGuards';
 import { CompanyFileInUseError, acquireDirLock, assertDirLockHeld, releaseDirLock } from './dirLock';
 import { refreshPlannerStats } from './plannerStats';
+import { assertNotSealed } from './sealed';
 
 export { CompanyFileInUseError, LOCK_FILE } from './dirLock';
+export { isSealedDir, sealedMode, withSealedAccess } from './sealed';
 
 export type DB = PgliteDatabase<typeof schema>;
 
@@ -207,6 +209,8 @@ export const MIGRATIONS_FOLDER = process.env.BKA_MIGRATIONS_DIR
 /** Open (or reuse) a database handle for a given company data directory. */
 export function openDb(dataDir?: string): DbHandle {
   const dir = resolveDataDir(dataDir);
+  // A company file protected with passwords is only used once someone has signed in (lib/db/sealed.ts).
+  assertNotSealed(dir);
   const existing = handles.get(dir);
   if (existing) return existing;
   if (openHolds.has(dir)) {

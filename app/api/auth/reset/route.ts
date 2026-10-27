@@ -4,7 +4,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { and, eq, gt } from 'drizzle-orm';
-import { getDb } from '@/lib/db';
+import { getDb, sealedMode } from '@/lib/db';
 import { users } from '@/lib/db/schema';
 import { hasValidUnlockCookie, MIN_PASSWORD_LENGTH } from '@/lib/auth';
 import { ServiceError } from '@/lib/services/_base';
@@ -46,6 +46,14 @@ export async function POST(req: NextRequest) {
     return NextResponse.json(tooMany, { status: 429, headers: { 'Retry-After': retryAfter } });
   }
   try {
+    // A protected company file closed and reopened since the reset was asked for (lib/db/sealed.ts):
+    // the token is inside the encrypted file; answer the challenge question again.
+    if (sealedMode()) {
+      return NextResponse.json(
+        { error: 'The company file was reopened since you answered your challenge question. Answer it again to choose a new password.', code: 'FORBIDDEN' },
+        { status: 400 },
+      );
+    }
     const db = await getDb();
     const lock = await getFileLockStatus(db);
     if (lock.enabled && !(await hasValidUnlockCookie())) {

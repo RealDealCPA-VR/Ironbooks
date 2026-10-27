@@ -4,6 +4,8 @@
  *  POST /api/auth/challenge  { currentPassword, question, answer } -> { ok: true, question }
  *
  * Setting it needs the current password (like changing the password), rate-limited like sign-in.
+ * In a company file protected with passwords the answer also gets its own key slot
+ * (lib/services/fileProtection.ts), so "I forgot my password" can open the file on any computer.
  * The answer is stored hashed (lib/challengeQuestions.ts normalizes case and spacing). Acts on
  * the USER, so it goes through getSessionGate ('self' in lib/permissions/routes.ts).
  */
@@ -14,6 +16,7 @@ import { users } from '@/lib/db/schema';
 import { hashPassword, verifyPassword } from '@/lib/auth';
 import { MIN_CHALLENGE_ANSWER, isKnownChallengeQuestion, normalizeChallengeAnswer } from '@/lib/challengeQuestions';
 import { logTransaction } from '@/lib/services/transactionLog';
+import { syncChallengeSlot } from '@/lib/services/fileProtection';
 import { originFromHeaders } from '@/lib/net/requestInfo';
 import { GLOBAL_KEY_WEIGHT, attemptKeys, loginLimiter, tooManyAttempts } from '@/lib/net/rateLimit';
 import { readJsonObject, invalidJsonBody, routeError } from '@/lib/routeErrors';
@@ -64,6 +67,8 @@ export async function POST(req: NextRequest) {
         .update(users)
         .set({ challengeQuestion: question, challengeAnswerHash: await hashPassword(normalizeChallengeAnswer(answer)), updatedAt: new Date() })
         .where(eq(users.id, userId));
+      // A protected company file: the new answer opens it ("I forgot my password"), the old one no longer does.
+      await syncChallengeSlot(db, userId, question, answer);
       await logTransaction(db, {
         userId,
         action: 'update',

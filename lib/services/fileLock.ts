@@ -96,3 +96,15 @@ export async function removeFilePassword(db: DB, currentPassword: string): Promi
   }
   await writeLock(db, null);
 }
+
+/**
+ * Remove the file password WITHOUT the current one — only for someone who has just proved they
+ * hold the company file's recovery key (app/api/auth/recover, lib/services/fileProtection.ts):
+ * the recovery key opens everything in the file, so it must also get past a forgotten file password.
+ */
+export async function removeFilePasswordWithRecoveryKey(db: DB): Promise<boolean> {
+  const status = await getFileLockStatus(db);
+  if (!status.enabled) return false;
+  await writeLock(db, null);
+  return true;
+}
