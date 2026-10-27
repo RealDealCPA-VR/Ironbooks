@@ -177,6 +177,9 @@ describe('P1 FX — adversarial QA', () => {
     await setBaseCurrency(ctx, { code: 'USD', name: 'US Dollar' });
     await upsertCurrency(ctx, { code: 'EUR', name: 'Euro', rateToBase: '1.10' });
     await upsertCurrency(ctx, { code: 'GBP', name: 'Pound', rateToBase: '1.25' });
+    // review5 fx: the list rates were set at the start of the year, so the adjustments dated later
+    // in 2026 update the list (a back-dated one keeps a newer list rate).
+    await db.execute(sql`UPDATE currencies SET updated_at = '2026-01-01' WHERE company_id = ${ctx.companyId}`);
     await setAccountCurrency(ctx, acct['1020'], 'EUR');
     await setAccountCurrency(ctx, acct['1030'], 'EUR');
     await setAccountCurrency(ctx, acct['1040'], 'GBP');
