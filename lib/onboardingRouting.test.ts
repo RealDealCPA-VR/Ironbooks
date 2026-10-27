@@ -28,7 +28,11 @@ describe('new companies go through the setup interview', () => {
   it('the desktop File > New Company flow opens Create Account, which leads to the interview', () => {
     const src = read('electron/main.js');
     const flow = src.slice(src.indexOf('async function createCompanyFlow()'), src.indexOf('async function openCompanyFlow()'));
-    expect(flow).toContain("saveConfig({ startRoute: '/signup' })");
+    // The start route is saved with the new file's config, which relaunchApp applies once the file
+    // open now has closed (openCompany passes its extra settings through).
+    expect(flow).toContain("openCompany(target, { startRoute: '/signup' })");
+    const open = src.slice(src.indexOf('function openCompany(location, extra = {})'), src.indexOf('function lastUserFor('));
+    expect(open).toMatch(/relaunchApp\(\{[\s\S]*\.\.\.extra,\s*\}\)/);
     // createWindow consumes the one-shot start route.
     expect(src).toContain('saveConfig({ startRoute: null })');
     expect(src).toContain('url + startRoute');
