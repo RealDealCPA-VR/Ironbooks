@@ -22,21 +22,31 @@ export type MoneyInput = string | number | Decimal | null | undefined;
  */
 export function toDecimal(value: MoneyInput): Decimal {
   if (value === null || value === undefined) return new Decimal(0);
-  if (value instanceof Decimal) return value;
+  // decimal.js parses 'NaN' / 'Infinity' (and Postgres numeric would store NaN, which the ledger
+  // triggers count as balanced): an amount must be a finite number, whatever form it arrives in.
+  if (value instanceof Decimal) {
+    if (!value.isFinite()) throw new MoneyParseError(value.toString());
+    return value;
+  }
+  let d: Decimal;
   if (typeof value === 'string') {
     const s = value.replace(/^[\s\p{Z}﻿]+|[\s\p{Z}﻿]+$/gu, '');
     if (s === '') return new Decimal(0);
     try {
-      return new Decimal(s);
+      d = new Decimal(s);
     } catch {
       throw new MoneyParseError(value);
     }
+    if (!d.isFinite()) throw new MoneyParseError(value);
+    return d;
   }
   try {
-    return new Decimal(value);
+    d = new Decimal(value);
   } catch {
     throw new MoneyParseError(String(value));
   }
+  if (!d.isFinite()) throw new MoneyParseError(String(value));
+  return d;
 }
 
 /**
