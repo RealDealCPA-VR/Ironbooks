@@ -151,7 +151,9 @@ export default function FinanceChargesPage() {
     setAssessing(true);
     try {
       const result = await api.post<AssessResult>('/api/finance-charges', {
-        asOf,
+        // The date the charges on screen were worked out for (the preview's), never a date typed
+        // since: the charges assessed are the ones the user reviewed and ticked.
+        asOf: preview.asOf,
         customerIds: [...selected],
       });
       const n = result.assessed.length;
@@ -266,7 +268,10 @@ export default function FinanceChargesPage() {
               id="asOf"
               type="date"
               value={asOf}
-              onChange={(e) => setAsOf(e.target.value)}
+              onChange={(e) => {
+                setAsOf(e.target.value);
+                setPreview(null); // the charges shown were for the old date: preview again
+              }}
               className="w-48"
             />
           </div>

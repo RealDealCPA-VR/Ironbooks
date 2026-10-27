@@ -717,3 +717,11 @@ describe('editing a sales receipt or credit memo keeps each line’s site / bin 
     );
   });
 });
+
+describe('Assess Finance Charges', () => {
+  it('assesses for the date the charges on screen were worked out for; a new date needs a new preview', () => {
+    const src = read('app/finance-charges/page.tsx');
+    expect(src).toContain('asOf: preview.asOf,');
+    expect(src).toMatch(/setAsOf\(e\.target\.value\);\s*setPreview\(null\);/);
+  });
+});
