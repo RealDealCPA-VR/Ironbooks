@@ -17,8 +17,18 @@ import { previewGlImport, runGlImport } from './qbGlImport';
 import { importIIF } from './qbImport';
 import { getBudget, listBudgets } from './budgets';
 import { createCompany } from './company';
+import { createAccount } from './accounts';
+import { setAccountCurrency, setBaseCurrency, upsertCurrency } from './currencies';
+import { mergeAccounts, mergeVendors } from './merge';
+import { createCustomer } from './customers';
+import { createInvoice } from './invoices';
+import { createBill } from './bills';
+import { exportListCsv } from './listExport';
 import { importOpenItems, previewOpenItems } from './openItemsImport';
-import { glCsv, upload, type GlFixture } from '@/test/fixtures/qbGlFixtures';
+import AdmZip from 'adm-zip';
+import { readXlsx } from './qbGlFiles';
+import { importListXlsx } from './qbImport';
+import { SAMPLE_GL, glCsv, glXlsx, upload, type GlFixture } from '@/test/fixtures/qbGlFixtures';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-imports-review5');
 let db: DB;
@@ -326,5 +336,120 @@ describe('D. Open items: input robustness', () => {
     expect(r.skipped).toBe(1);
     expect(r.issues.find((i) => i.reason === 'validation')!.message).toMatch(/longer than 100 characters/);
     expect(r.reconciliation.ap.inBalance).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// E. Hostile workbooks: zip bombs and formulas without results
+// ---------------------------------------------------------------------------
+
+/** Rewrite the declared uncompressed size of one zip entry (local + central headers). */
+function declareSize(zipBytes: Buffer, entryName: string, size: number): Buffer {
+  const out = Buffer.from(zipBytes);
+  const name = Buffer.from(entryName, 'utf8');
+  for (let i = 0; i < out.length - 46; i++) {
+    const sig = out.readUInt32LE(i);
+    if (sig === 0x04034b50) {
+      const n = out.readUInt16LE(i + 26);
+      if (out.subarray(i + 30, i + 30 + n).equals(name)) out.writeUInt32LE(size, i + 22);
+    } else if (sig === 0x02014b50) {
+      const n = out.readUInt16LE(i + 28);
+      if (out.subarray(i + 46, i + 46 + n).equals(name)) out.writeUInt32LE(size, i + 24);
+    }
+  }
+  return out;
+}
+
+describe('E. hostile .xlsx files', () => {
+  it('a workbook that expands to gigabytes is refused before anything is decompressed (GL, lists, statements)', async () => {
+    const bomb = declareSize(glXlsx(SAMPLE_GL), 'xl/worksheets/sheet2.xml', 3_500_000_000);
+    expect(() => readXlsx(bomb)).toThrow(/too large to read/);
+    const ctx = await newCompany('Bomb Co');
+    await expect(previewGlImport(ctx, { file: upload('gl.xlsx', bomb) })).rejects.toMatchObject({ code: 'VALIDATION' });
+    await expect(importListXlsx(ctx, 'customers', bomb, { displayName: 'Name' })).rejects.toMatchObject({ code: 'VALIDATION' });
+    // Many medium parts that add up past the total limit are refused too.
+    let many = glXlsx(SAMPLE_GL);
+    for (const part of ['xl/worksheets/sheet1.xml', 'xl/worksheets/sheet2.xml', 'xl/sharedStrings.xml']) many = declareSize(many, part, 180_000_000);
+    expect(() => readXlsx(many)).toThrow(/too large to read/);
+    // A normal workbook still reads.
+    expect(readXlsx(glXlsx(SAMPLE_GL)).length).toBe(2);
+  });
+
+  it('a formula whose result was never calculated is refused, not read as a blank amount', () => {
+    const zip = new AdmZip(glXlsx(SAMPLE_GL));
+    const xml = zip.getEntry('xl/worksheets/sheet2.xml')!.getData().toString('utf8');
+    let replaced = '';
+    const patched = xml.replace(/<c r="([A-Z]+\d+)" s="2"><v>([^<]+)<\/v><\/c>/, (_m, ref: string, v: string) => {
+      replaced = ref;
+      return `<c r="${ref}" s="2"><f>${v}*1</f></c>`;
+    });
+    expect(replaced).not.toBe('');
+    zip.updateFile('xl/worksheets/sheet2.xml', Buffer.from(patched, 'utf8'));
+    expect(() => readXlsx(zip.toBuffer())).toThrow(new RegExp(`Cell ${replaced} .*never calculated`));
+    // A formula WITH its saved result reads as the result.
+    const zip2 = new AdmZip(glXlsx(SAMPLE_GL));
+    const ok = xml.replace(/<c r="([A-Z]+\d+)" s="2"><v>([^<]+)<\/v><\/c>/, (_m, ref: string, v: string) => `<c r="${ref}" s="2"><f>${v}*1</f><v>${v}</v></c>`);
+    zip2.updateFile('xl/worksheets/sheet2.xml', Buffer.from(ok, 'utf8'));
+    expect(readXlsx(zip2.toBuffer())[1].rows.some((r) => r.cells.includes('2700'))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F. Merge refuses records in different currencies (QB rule)
+// ---------------------------------------------------------------------------
+
+describe('F. merge and currencies', () => {
+  it('a EUR bank account cannot be merged into a USD one, nor a EUR vendor into a USD vendor', async () => {
+    const co = await createCompany(db, { name: 'Merge FX Co', ownerId: userId });
+    const ctx: ServiceContext = { db, companyId: co.id, userId };
+    await setBaseCurrency(ctx, { code: 'USD', name: 'US Dollar' });
+    await upsertCurrency(ctx, { code: 'EUR', name: 'Euro', rateToBase: '1.10' });
+    const eur = await createAccount(ctx, { code: '1025', name: 'Euro Bank', type: 'asset', subtype: 'checking' });
+    await setAccountCurrency(ctx, eur.id, 'EUR');
+    const usd = await createAccount(ctx, { code: '1026', name: 'Second Checking', type: 'asset', subtype: 'checking' });
+    await expect(mergeAccounts(ctx, { fromId: eur.id, toId: usd.id })).rejects.toMatchObject({ code: 'VALIDATION', message: expect.stringMatching(/different currencies/) });
+    const [still] = await db.select().from(accounts).where(eq(accounts.id, eur.id));
+    expect(still.isActive).toBe(true);
+    // Same currency still merges (home: null vs null).
+    const usd2 = await createAccount(ctx, { code: '1027', name: 'Third Checking', type: 'asset', subtype: 'checking' });
+    await expect(mergeAccounts(ctx, { fromId: usd2.id, toId: usd.id })).resolves.toMatchObject({ deactivatedId: usd2.id });
+
+    const vEur = await createVendor(ctx, { displayName: 'Euro Supplier', currency: 'EUR' } as never);
+    const vUsd = await createVendor(ctx, { displayName: 'Dollar Supplier' });
+    await expect(mergeVendors(ctx, { fromId: vEur.id, toId: vUsd.id })).rejects.toMatchObject({ code: 'VALIDATION' });
+    const vHome = await createVendor(ctx, { displayName: 'Home Supplier', currency: 'USD' } as never);
+    await expect(mergeVendors(ctx, { fromId: vHome.id, toId: vUsd.id })).resolves.toMatchObject({ deactivatedId: vHome.id });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// G. List export: the Balance column is the real open balance
+// ---------------------------------------------------------------------------
+
+describe('G. customer / vendor list export balances', () => {
+  it('the Balance column equals A/R and A/P aging per name (it was always 0.00)', async () => {
+    const co = await createCompany(db, { name: 'Export Bal Co', ownerId: userId });
+    const ctx: ServiceContext = { db, companyId: co.id, userId };
+    const code = async (c: string) => (await db.select().from(accounts).where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, c))))[0].id;
+    const cust = await createCustomer(ctx, { displayName: 'Balance Customer' });
+    await createCustomer(ctx, { displayName: 'Paid Up Customer' });
+    await createInvoice(ctx, {
+      customerId: cust.id,
+      date: new Date('2026-01-10T00:00:00.000Z'),
+      lines: [{ accountId: await code('4000'), description: 'Work', quantity: 1, rate: '1250.50', taxable: false }],
+    } as never);
+    const vend = await createVendor(ctx, { displayName: 'Balance Vendor' });
+    await createBill(ctx, {
+      vendorId: vend.id,
+      date: new Date('2026-01-11T00:00:00.000Z'),
+      lines: [{ accountId: await code('6000'), description: 'Ads', amount: '40.25' }],
+    } as never);
+    const rowsOf = (csv: string) => csv.replace(/^\uFEFF/, '').trim().split(/\r\n/).map((l) => l.split(','));
+    const c = rowsOf((await exportListCsv(ctx, 'customers')).csv);
+    const cBal = c[0].indexOf('Balance');
+    expect(c.find((r) => r[0] === 'Balance Customer')![cBal]).toBe('1250.50');
+    expect(c.find((r) => r[0] === 'Paid Up Customer')![cBal]).toBe('0.00');
+    const v = rowsOf((await exportListCsv(ctx, 'vendors')).csv);
+    expect(v.find((r) => r[0] === 'Balance Vendor')![v[0].indexOf('Balance')]).toBe('40.25');
   });
 });

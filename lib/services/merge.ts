@@ -67,6 +67,7 @@ import { repointForeignKeys } from './lists/references';
 import { moveNotesAndTodos } from './lists/notes';
 import { repointBankRuleAccount } from './bankRules';
 import { assertListDeleteAllowed } from './accountantCopy/guard';
+import { foreignCode, homeCode } from './fxLines';
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -351,16 +352,19 @@ export async function mergeVendors(
   }
 
   const [fromRow] = await ctx.db
-    .select({ id: vendors.id, displayName: vendors.displayName, isActive: vendors.isActive })
+    .select({ id: vendors.id, displayName: vendors.displayName, isActive: vendors.isActive, currency: vendors.currency, name: vendors.displayName })
     .from(vendors)
     .where(and(eq(vendors.id, fromId), eq(vendors.companyId, ctx.companyId)));
   if (!fromRow) throw notFound(`Vendor ${fromId}`);
 
   const [toRow] = await ctx.db
-    .select({ id: vendors.id, displayName: vendors.displayName })
+    .select({ id: vendors.id, displayName: vendors.displayName, currency: vendors.currency, name: vendors.displayName })
     .from(vendors)
     .where(and(eq(vendors.id, toId), eq(vendors.companyId, ctx.companyId)));
   if (!toRow) throw notFound(`Vendor ${toId}`);
+  // QB: vendors that use different currencies can't be merged (their bills, credits and
+  // payments are in the vendor's currency; A/P aging and Pay Bills work per currency).
+  await assertSameCurrency(ctx, fromRow, toRow, 'vendors');
 
   return inTransaction(ctx, async (tx) => {
     const billRows = await tx.db
@@ -444,6 +448,23 @@ export async function mergeVendors(
       deactivatedId: fromId,
     };
   });
+}
+
+/** Refuse merging two records whose currencies differ (null / the home code = home currency). */
+async function assertSameCurrency(
+  ctx: ServiceContext,
+  from: { name: string; currency: string | null },
+  to: { name: string; currency: string | null },
+  what: 'accounts' | 'vendors',
+): Promise<void> {
+  const home = await homeCode(ctx);
+  const a = foreignCode(from.currency, home);
+  const b = foreignCode(to.currency, home);
+  if (a === b) return;
+  const label = (c: string | null) => c ?? home ?? 'the home currency';
+  throw validation(
+    `"${from.name}" uses ${label(a)} and "${to.name}" uses ${label(b)}. QuickBooks can't merge ${what} that use different currencies.`,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -545,6 +566,11 @@ export async function mergeAccounts(
   if (fromRow.subtype === 'non_posting' || toRow.subtype === 'non_posting') {
     throw validation('Non-posting accounts (estimates, purchase orders) cannot be merged.');
   }
+  // QB: accounts in different currencies can't be merged. A foreign bank / card account's lines
+  // carry amounts in its own currency (journal_entry_lines.foreign_amount): moving them into an
+  // account of another currency would mix currencies in one register and lose the foreign
+  // balance that revaluation and reconciliation work from.
+  await assertSameCurrency(ctx, fromRow, toRow, 'accounts');
 
   return inTransaction(ctx, async (tx) => {
     const reassigned: Record<string, number> = {};

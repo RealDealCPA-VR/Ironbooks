@@ -170,6 +170,32 @@ function zipText(zip: AdmZip, entryPath: string): string | null {
 }
 
 /**
+ * Zip-bomb guard. An .xlsx is a zip: a few MB on disk can declare gigabytes of XML, and inflating
+ * that (then parsing it) would exhaust memory and take the whole app down for everyone on the
+ * company file. The archive's own directory says how big each part is, so refuse before
+ * decompressing anything. (adm-zip caps every entry at its declared size, so a part cannot lie
+ * its way past this check.) A real QuickBooks export is far below these limits.
+ */
+export const XLSX_LIMITS = { entryBytes: 200 * 1024 * 1024, totalBytes: 400 * 1024 * 1024, entries: 5000 } as const;
+
+function assertReasonableXlsx(zip: AdmZip): void {
+  const entries = zip.getEntries();
+  if (entries.length > XLSX_LIMITS.entries) throw fail('This .xlsx workbook has too many parts to be a report export.');
+  let total = 0;
+  for (const e of entries) {
+    const size = Number(e.header.size) || 0;
+    total += size;
+    if (size > XLSX_LIMITS.entryBytes || total > XLSX_LIMITS.totalBytes) {
+      throw fail(
+        'This .xlsx workbook is too large to read (it expands to more than ' +
+          `${Math.round((size > XLSX_LIMITS.entryBytes ? XLSX_LIMITS.entryBytes : XLSX_LIMITS.totalBytes) / 1024 / 1024)} MB). ` +
+          'Export a shorter date range, or save the report as CSV.',
+      );
+    }
+  }
+}
+
+/**
  * Read every worksheet of an .xlsx workbook into grids. Cell values are returned as text:
  * strings verbatim, numbers as the stored decimal text (e.g. "1234.5" — callers parse with
  * decimal.js, never JS floats), date-formatted numbers as MM/DD/YYYY, booleans TRUE/FALSE.
@@ -181,6 +207,7 @@ export function readXlsx(bytes: Uint8Array): GridSheet[] {
   } catch {
     throw fail('This file is not a readable .xlsx workbook.');
   }
+  assertReasonableXlsx(zip);
   const parser = xmlParser();
   const workbookXml = zipText(zip, 'xl/workbook.xml');
   if (!workbookXml) throw fail('This .xlsx file has no workbook (xl/workbook.xml is missing).');
@@ -232,10 +259,17 @@ export function readXlsx(bytes: Uint8Array): GridSheet[] {
     const partPath = rels.get(relId) ?? `xl/worksheets/sheet${i + 1}.xml`;
     const xml = zipText(zip, partPath);
     if (!xml) return;
-    sheets.push({
-      name: s['@_name'] ?? `Sheet${i + 1}`,
-      rows: readWorksheet(parser, xml, sharedStrings, dateStyles, date1904),
-    });
+    const name = s['@_name'] ?? `Sheet${i + 1}`;
+    const uncalculated: string[] = [];
+    sheets.push({ name, rows: readWorksheet(parser, xml, sharedStrings, dateStyles, date1904, uncalculated) });
+    // A formula whose result was never saved (a workbook written by a script, never opened in
+    // Excel) has no value to read: reading it as blank would silently drop an amount.
+    if (uncalculated.length) {
+      throw fail(
+        `Cell ${uncalculated[0]} on the "${name}" sheet${uncalculated.length > 1 ? ` (and ${uncalculated.length - 1} more)` : ''} holds a formula whose result was never calculated. ` +
+          'Open the workbook in Excel, save it, and upload it again.',
+      );
+    }
   });
   if (!sheets.length) throw fail('This .xlsx workbook contains no worksheets.');
   return sheets;
@@ -247,6 +281,7 @@ function readWorksheet(
   sharedStrings: string[],
   dateStyles: Set<number>,
   date1904: boolean,
+  uncalculated: string[] = [],
 ): GridRow[] {
   const ws = parser.parse(xml)?.worksheet ?? {};
   const rowNodes = (ws.sheetData?.row ?? []) as Array<Record<string, unknown>>;
@@ -263,6 +298,9 @@ function readWorksheet(
       nextCol = col + 1;
       const t = String(c['@_t'] ?? 'n');
       const raw = textOf(c.v);
+      if (c.f !== undefined && c.v === undefined && t !== 'inlineStr') {
+        uncalculated.push(c['@_r'] ? String(c['@_r']) : `row ${rowNum}`);
+      }
       let value = '';
       if (t === 's') {
         value = sharedStrings[Number(raw)] ?? '';
