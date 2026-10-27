@@ -9,7 +9,7 @@
  * Equity). Imports into one company now run one at a time; the second run finds the first one's
  * work and adds nothing.
  */
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import path from 'node:path';
 import fs from 'node:fs';
 import { and, eq, like } from 'drizzle-orm';
@@ -156,6 +156,24 @@ describe('item quantities after the General Ledger import', () => {
     const r = await importIIF(ctx, iif);
     expect(r.items).toBe(1);
     expect(await inventoryBalance(ctx)).toBe('1000.00');
+  });
+});
+
+describe('"today" for an item list without an as-of date is the company\'s day', () => {
+  it('at 9 pm in New York the opening stock is dated today, not tomorrow (UTC)', async () => {
+    const ctx = await newCo('Evening Stock Co');
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(new Date('2026-03-10T02:00:00.000Z')); // Mar 9, 9:00 pm in New York
+      const csv = ['Name,Type,Cost,Qty', 'Evening Widget,inventory,2.00,5'].join('\n');
+      const r = await importItemsCSV(ctx, csv, { name: 'Name', type: 'Type', purchaseCost: 'Cost', quantityOnHand: 'Qty' });
+      expect(r.items).toBe(1);
+      const [w] = await db.select().from(items).where(and(eq(items.companyId, ctx.companyId), eq(items.name, 'Evening Widget')));
+      const [je] = await db.select().from(journalEntries).where(and(eq(journalEntries.companyId, ctx.companyId), eq(journalEntries.sourceRef, `item:${w.id}`)));
+      expect(je.date.toISOString().slice(0, 10)).toBe('2026-03-09');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

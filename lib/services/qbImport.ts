@@ -91,6 +91,8 @@ import { assignJobType } from './lists/jobTypes';
 import type { IifControlRow } from './openItemsImport';
 import { importRowError } from './qbImportErrors';
 import { withImportLock } from './importLock';
+import { getPreferences } from './company';
+import { todayInTimeZone } from '@/lib/preferences';
 
 // ---------------------------------------------------------------------------
 // IIF type+subtype mapping
@@ -1507,9 +1509,7 @@ async function importIIFRows(
     const d = parseIifDate(t.date)?.getTime();
     if (d !== undefined && (firstTxn === null || d < firstTxn)) firstTxn = d;
   }
-  const obDate = firstTxn !== null
-    ? new Date(firstTxn - 86_400_000)
-    : new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), new Date().getUTCDate()));
+  const obDate = firstTxn !== null ? new Date(firstTxn - 86_400_000) : await companyToday(ctx);
   await importIifAccounts(ctx, counts, parsed.accounts, lookup, obDate);
 
   // ---- Classes ("Parent:Sub") ----
@@ -2952,8 +2952,7 @@ async function importItemRows(ctx: ServiceContext, rows: Row[], mapping: ItemsCs
   // items on them come in without a journal entry (posting them would double the inventory).
   const carriedAccountIds = await glImportedAssetAccountIds(ctx);
   const col = (key: keyof ItemsCsvMapping, row: Row): string => (mapping[key] ? (row[mapping[key]!] ?? '').trim() : '');
-  const now = new Date();
-  const today = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const today = await companyToday(ctx);
   for (const row of rows) {
     const name = col('name', row);
     if (!name) {
@@ -3126,6 +3125,15 @@ export async function importListXlsx(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Today as the company's calendar day (Company Preferences time zone), at UTC midnight like every
+ * stored date. The UTC day was tomorrow every evening in the Americas (after 7 pm in New York), so
+ * opening balances and stock dated "today" landed a day ahead.
+ */
+async function companyToday(ctx: ServiceContext): Promise<Date> {
+  return new Date(`${todayInTimeZone((await getPreferences(ctx)).timezone)}T00:00:00.000Z`);
+}
 
 /**
  * Asset accounts holding postings of a QuickBooks General Ledger import (qbgl:* entries). That
