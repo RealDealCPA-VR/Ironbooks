@@ -848,6 +848,14 @@ export async function convertToBill(
   if (receipt.status === 'void') {
     throw new ServiceError('CONFLICT', 'Cannot convert a voided item receipt to a bill.');
   }
+  // Partly billed through Enter Bill for Received Items: the claim below would refuse it with
+  // "converted or voided by another transaction. Reload and retry", which no reload fixes.
+  if (receipt.status === 'partial') {
+    throw new ServiceError(
+      'CONFLICT',
+      'Part of this item receipt was already billed. Bill the rest with Enter Bill for Received Items.',
+    );
+  }
   const [rv] = await ctx.db.select({ currency: vendors.currency }).from(vendors).where(eq(vendors.id, receipt.vendorId));
   await assertHomeCurrencyVendor(ctx, rv?.currency ?? null);
 

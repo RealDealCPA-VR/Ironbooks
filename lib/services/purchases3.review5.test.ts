@@ -345,6 +345,63 @@ describe('review5 purchases (third pass)', { timeout: 180_000 }, () => {
     expect(row2.accountNumber).toBe('555-0001');
   });
 
+  it('J: Pay Sales Tax defaults "due through" from the local calendar day, not the UTC instant', async () => {
+    const { paySalesTaxScreen } = await import('./liabilityPayments');
+    const prev = process.env.TZ;
+    process.env.TZ = 'America/New_York';
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      // 10:30 PM on Sep 30 in New York — already Oct 1 in UTC.
+      vi.setSystemTime(new Date('2026-10-01T02:30:00.000Z'));
+      const screen = await paySalesTaxScreen(ctx);
+      const expected = { monthly: '2026-08-31', quarterly: '2026-06-30', annually: '2025-12-31' }[screen.frequency];
+      // Before: the period ending Sep 30 (the one still running) was offered as due.
+      expect(screen.defaultDueThrough).toBe(expected);
+    } finally {
+      vi.useRealTimers();
+      if (prev === undefined) delete process.env.TZ;
+      else process.env.TZ = prev;
+    }
+  });
+
+  it('K: Pay Bills by check pays from a bank account (no "check" queued on a credit card)', async () => {
+    const v = await newVendor();
+    const bill = await createBill(ctx, { vendorId: v.id, date: d('2026-05-01'), lines: [{ accountId: acct['6000'], amount: '60.00' }] });
+    const base = { vendorId: v.id, date: d('2026-05-02'), applications: [{ billId: bill.id, amountApplied: '20.00' }] };
+    // Before: saved, listed in Print Checks under the credit card and numbered there when printed.
+    expect((await refusal(payBills(ctx, { ...base, method: 'check', toPrint: true, paymentAccountId: acct['2100'] }))).code).toBe(
+      'VALIDATION',
+    );
+    const { listPrintQueue } = await import('./printQueue');
+    expect((await listPrintQueue(ctx)).filter((q) => q.paymentAccountId === acct['2100'])).toHaveLength(0);
+    // A card payment and a check from the bank are fine.
+    await payBills(ctx, { ...base, method: 'credit_card', paymentAccountId: acct['2100'] });
+    await payBills(ctx, { ...base, method: 'check', toPrint: true, paymentAccountId: acct['1000'] });
+  });
+
+  it('L: converting a partly billed item receipt says to use Enter Bill for Received Items', async () => {
+    const { createItemReceipt, convertToBill: convertReceipt } = await import('./itemReceipts');
+    const { enterBillForReceivedItems } = await import('./receiving');
+    const v = await newVendor();
+    const item = await createItem(ctx, {
+      name: `R5C Part ${++seq}`,
+      type: 'inventory',
+      assetAccountId: acct['1300'],
+      incomeAccountId: acct['4000'],
+      cogsAccountId: acct['5000'],
+    } as never);
+    const receipt = await createItemReceipt(ctx, { vendorId: v.id, date: d('2026-05-01'), lines: [{ itemId: item.id, quantity: 10, unitCost: '2.00' }] });
+    await enterBillForReceivedItems(ctx, {
+      vendorId: v.id,
+      date: d('2026-05-03'),
+      lines: [{ receiptLineId: receipt.lines[0].id, quantity: 4, unitCost: '2.00' }],
+    });
+    const err = await refusal(convertReceipt(ctx, receipt.id));
+    expect(err.code).toBe('CONFLICT');
+    // Before: "converted or voided by another transaction. Reload and retry."
+    expect(err.message).toMatch(/Enter Bill for Received Items/);
+  });
+
   it('I: making a vendor inactive does not hand a restricted user the full tax ID', async () => {
     const { BUILTIN_ROLES, unionRoles } = await import('@/lib/permissions/model');
     const restricted: ServiceContext = { ...ctx, access: unionRoles(BUILTIN_ROLES.filter((r) => r.key === 'purchasing')) };

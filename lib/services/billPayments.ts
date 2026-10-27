@@ -230,6 +230,13 @@ async function preparePayment(ctx: ServiceContext, input: PayBillsInput): Promis
   if (!isFundable) {
     throw validation('Payment account must be a bank/cash or credit-card account.');
   }
+  // QB Pay Bills: "Check" pays from a bank account (as Write Checks does). A "check" from a credit
+  // card account went into the Print Checks queue under the card and took a check number there.
+  if (input.method === 'check' && !isBankAccount(payAcct)) {
+    throw validation(
+      'A check is written on a bank account. Pick a bank account to pay from, or choose Credit Card as the payment method.',
+    );
+  }
 
   const apAccountId = await resolveApAccount(ctx);
 
