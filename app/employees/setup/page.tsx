@@ -493,9 +493,12 @@ function StateTaxes({ rows, onChanged }: { rows: StateSetting[]; onChanged: () =
     }
   }
 
+  // Removing a state's rates changes every later paycheck, so it asks first (also for Ctrl+D).
+  const [removing, setRemoving] = useState<StateSetting | null>(null);
   async function remove(id: string) {
     try {
       await api.del(`/api/payroll/state-settings/${id}`);
+      setRemoving(null);
       onChanged();
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Could not remove.', 'danger');
@@ -568,7 +571,7 @@ function StateTaxes({ rows, onChanged }: { rows: StateSetting[]; onChanged: () =
                 <Td numeric>{pct(r.sdiRate)}</Td>
                 <Td numeric>{Number(r.sdiWageBase) ? money(r.sdiWageBase) : 'No limit'}</Td>
                 <Td>
-                  <Button variant="ghost" size="sm" onClick={() => remove(r.id)}>
+                  <Button variant="ghost" size="sm" onClick={() => setRemoving(r)}>
                     Remove
                   </Button>
                 </Td>
@@ -577,6 +580,19 @@ function StateTaxes({ rows, onChanged }: { rows: StateSetting[]; onChanged: () =
           </tbody>
         </Table>
       )}
+      <ConfirmDialog
+        open={removing !== null}
+        title="Remove these state rates?"
+        message={
+          removing
+            ? `${removing.state} ${removing.year}: new paychecks for employees in ${removing.state} will no longer add unemployment or disability tax until you enter the rates again. Paychecks already written are not changed.`
+            : undefined
+        }
+        confirmLabel="Remove"
+        tone="danger"
+        onConfirm={() => removing && void remove(removing.id)}
+        onClose={() => setRemoving(null)}
+      />
       <p className="text-xs text-navy/50">
         Quarterly wage report: <Link href="/payroll-forms/reports" className="text-electric underline">Payroll reports › State wage worksheet</Link>.
       </p>

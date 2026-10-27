@@ -5,6 +5,7 @@
  *    once per app session: a name added afterwards never appeared in them until a reload, and a
  *    QuickReport (Ctrl+Q) for it showed its filter as "All".
  *  - A memorized Report Builder report opened a blank builder from the Memorized Report List.
+ *  - Deleting a scheduled report (and a state's payroll rates) took one click or one Ctrl+D.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
@@ -92,5 +93,30 @@ describe('opening a memorized report', () => {
     expect(list).not.toMatch(/return '\/reports\/builder';/);
     const builder = fs.readFileSync('app/reports/builder/page.tsx', 'utf8');
     expect(builder).toContain('memorizedIdFrom(window.location.search)');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// One-keystroke deletes
+// ---------------------------------------------------------------------------
+//
+// Ctrl+D (QuickBooks: delete the highlighted list row) presses the row's Delete / Remove button.
+// A scheduled report's Delete and a state's payroll-rate Remove acted at once, with no question —
+// with the list keys, one stray Ctrl+D deleted the schedule or the state's SUI / SDI rates. QB
+// always asks first; they now do too.
+
+describe('row deletes ask first', () => {
+  it('Scheduled Reports: Delete opens a confirmation, the confirmation deletes', () => {
+    const src = fs.readFileSync('app/reports/schedules/page.tsx', 'utf8');
+    expect(src).not.toMatch(/onClick=\{\(\) => remove\(s\)\}/);
+    expect(src).toMatch(/onClick=\{\(\) => setRemoving\(s\)\}[^>]*aria-label=\{`Delete \$\{s\.name\}`\}/);
+    expect(src).toMatch(/<ConfirmDialog[\s\S]*?onConfirm=\{\(\) => removing && void remove\(removing\)\}/);
+  });
+
+  it('Payroll Setup > state taxes: Remove opens a confirmation, the confirmation removes', () => {
+    const src = fs.readFileSync('app/employees/setup/page.tsx', 'utf8');
+    expect(src).not.toMatch(/onClick=\{\(\) => remove\(r\.id\)\}/);
+    expect(src).toContain('onClick={() => setRemoving(r)}');
+    expect(src).toMatch(/<ConfirmDialog[\s\S]*?onConfirm=\{\(\) => removing && void remove\(removing\.id\)\}/);
   });
 });

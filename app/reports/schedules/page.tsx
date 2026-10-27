@@ -8,7 +8,7 @@
  */
 import { useCallback, useEffect, useState } from 'react';
 import { CalendarClock, Pause, Play, Plus, Trash2 } from 'lucide-react';
-import { Badge, Button, Card, EmptyState, Input, Label, Modal, PageHeader, Select, Table, Td, Th, Tr, toast } from '@/components/ui';
+import { Badge, Button, Card, ConfirmDialog, EmptyState, Input, Label, Modal, PageHeader, Select, Table, Td, Th, Tr, toast } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { todayISO } from '@/lib/dates';
 
@@ -106,9 +106,12 @@ export default function ScheduledReportsPage() {
       toast(err instanceof ApiError ? err.message : 'Could not update.', 'danger');
     }
   };
+  // Deleting asks first (the row's Delete button, and Ctrl+D on a highlighted row).
+  const [removing, setRemoving] = useState<Schedule | null>(null);
   const remove = async (s: Schedule) => {
     try {
       await api.del(`/api/report-schedules/${s.id}`);
+      setRemoving(null);
       await load();
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Could not delete.', 'danger');
@@ -178,7 +181,7 @@ export default function ScheduledReportsPage() {
                     <Button variant="ghost" size="sm" onClick={() => toggle(s)} aria-label={s.isActive ? `Pause ${s.name}` : `Resume ${s.name}`}>
                       {s.isActive ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
                     </Button>
-                    <Button variant="ghost" size="sm" onClick={() => remove(s)} aria-label={`Delete ${s.name}`}>
+                    <Button variant="ghost" size="sm" onClick={() => setRemoving(s)} aria-label={`Delete ${s.name}`}>
                       <Trash2 className="h-4 w-4" />
                     </Button>
                   </Td>
@@ -188,6 +191,16 @@ export default function ScheduledReportsPage() {
           </Table>
         )}
       </Card>
+
+      <ConfirmDialog
+        open={removing !== null}
+        title="Delete this schedule?"
+        message={removing ? `“${removing.name}” will no longer run. Files it already saved are kept.` : undefined}
+        confirmLabel="Delete"
+        tone="danger"
+        onConfirm={() => removing && void remove(removing)}
+        onClose={() => setRemoving(null)}
+      />
 
       <Modal
         open={open}
