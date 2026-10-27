@@ -21,7 +21,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { eq } from 'drizzle-orm';
 import { getDb, closeDb, type DB } from '@/lib/db';
-import { accounts, items as itemsTable, users } from '@/lib/db/schema';
+import { accounts, users } from '@/lib/db/schema';
 import { buildAssembly, setBom, unbuildAssembly } from './assemblies';
 import { createSalesReceipt, voidSalesReceipt } from './salesReceipts';
 import { Money } from '@/lib/money';
@@ -344,17 +344,13 @@ describe('review4 fuzzer findings', () => {
   // selling out must clear the GL to exactly $0 (the fuzzer found builds / unbuilds, value
   // adjustments, credit-memo restocks and sales voids that lost the cents).
 
-  /** GL 1300 vs inventory valuation + the carried value remainders (stamp = current average). */
+  /**
+   * GL 1300 vs inventory valuation. Since review round 5 the valuation report's Asset Value
+   * already includes the carried value remainders (stamp = current average), as QB's does.
+   */
   async function exactTie(): Promise<{ gl: string; books: string }> {
     const val = Money.of((await inventoryValuation(ctx)).grandTotal);
-    const rows = await db
-      .select({ avg: itemsTable.averageCost, rem: itemsTable.valueRemainder, stamp: itemsTable.valueRemainderAvg })
-      .from(itemsTable)
-      .where(eq(itemsTable.companyId, ctx.companyId));
-    const rem = rows
-      .filter((r) => r.stamp != null && Money.of(r.stamp).equals(Money.of(r.avg ?? '0')))
-      .reduce((s, r) => s.plus(Money.of(r.rem ?? '0')), Money.zero());
-    return { gl: await gl('1300'), books: val.plus(rem).toFixed(2) };
+    return { gl: await gl('1300'), books: val.toFixed(2) };
   }
   async function thirdsItem(name: string) {
     const it = await createItem(ctx, { name, type: 'inventory', salesPrice: '1.00', incomeAccountId: acct['4000'], expenseAccountId: acct['5000'], assetAccountId: acct['1300'] });

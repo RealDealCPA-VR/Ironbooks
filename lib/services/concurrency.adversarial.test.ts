@@ -217,12 +217,13 @@ describe('optimistic concurrency — adversarial', () => {
         .insert(items)
         .values({ companyId, name: 'Frozen Clock Item', type: 'service', salesPrice: '1.00', incomeAccountId: acct['4000'], updatedAt: new Date() })
         .returning();
-      let version: Date = (await getItem(alice, it2.id)).updatedAt;
+      // An item's version is its editedAt (0067), as lib/client.ts versionOf reads it.
+      let version: Date = (await getItem(alice, it2.id)).editedAt;
       for (const price of ['2.00', '3.00', '4.00']) {
         const saved = await withVersionCheck(alice, 'item', it2.id, version.toISOString(), (c) =>
           updateItem(c, it2.id, { salesPrice: price }),
         );
-        version = saved.updatedAt;
+        version = saved.editedAt;
       }
       expect((await getItem(alice, it2.id)).salesPrice).toBe('4.00');
     } finally {

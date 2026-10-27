@@ -401,17 +401,57 @@ describe('Advanced Inventory — QA re-test round 1', () => {
       await adjustQuantityAtSite(A.ctx, { itemId: ok, quantityChange: 2, unitCost: 1, date: new Date('2026-06-16') });
       await adjustQuantityAtSite(A.ctx, { itemId: other, quantityChange: 2, unitCost: 1, date: new Date('2026-06-16') });
       const n = await entryCount(A);
+      // The second item's journal entry fails with a plain Error (a database crash, say). A count
+      // that is merely not a number is a per-item VALIDATION skip since review round 5, so the
+      // failure is injected at the database layer instead.
+      let posted = 0;
+      const failing = (db0: unknown): unknown =>
+        new Proxy(db0 as object, {
+          get(target, prop, receiver) {
+            const v = Reflect.get(target, prop, receiver);
+            if (prop === 'transaction') {
+              return (fn: (t: unknown) => Promise<unknown>) =>
+                (v as (f: (t: unknown) => Promise<unknown>) => Promise<unknown>).call(target, (t) => fn(failing(t)));
+            }
+            if (prop === 'insert') {
+              return (table: unknown) => {
+                if (table === journalEntries && ++posted === 2) throw new Error('simulated database failure');
+                return (v as (t: unknown) => unknown).call(target, table);
+              };
+            }
+            return typeof v === 'function' ? v.bind(target) : v;
+          },
+        });
       await expect(
-        batchPhysicalCount(A.ctx, {
+        batchPhysicalCount({ ...A.ctx, db: failing(A.ctx.db) as typeof A.ctx.db }, {
           date: new Date('2026-06-16'),
           counts: [
             { itemId: ok, countedQty: 9 },
-            { itemId: other, countedQty: 'not-a-number' },
+            { itemId: other, countedQty: 5 },
           ],
         }),
-      ).rejects.toBeTruthy();
+      ).rejects.toThrow(/simulated database failure/);
+      expect(posted).toBe(2);
       expect(await qoh(ok)).toBe('2.0000');
       expect(await entryCount(A)).toBe(n);
+      await assertBooksTie(A);
+    });
+
+    it('a count that is not a number is skipped with a plain reason (no HTTP 500)', async () => {
+      const ok = await seedItem(A, { name: 'B2 Typo OK' });
+      const typo = await seedItem(A, { name: 'B2 Typo' });
+      await adjustQuantityAtSite(A.ctx, { itemId: ok, quantityChange: 2, unitCost: 1, date: new Date('2026-06-16') });
+      await adjustQuantityAtSite(A.ctx, { itemId: typo, quantityChange: 2, unitCost: 1, date: new Date('2026-06-16') });
+      const res = await batchPhysicalCount(A.ctx, {
+        date: new Date('2026-06-16'),
+        counts: [
+          { itemId: ok, countedQty: 3 },
+          { itemId: typo, countedQty: 'not-a-number' },
+        ],
+      });
+      expect(res.applied.map((a) => a.itemId)).toEqual([ok]);
+      expect(res.skipped).toEqual([{ itemId: typo, reason: expect.stringMatching(/must be a number/) }]);
+      expect(await qoh(typo)).toBe('2.0000');
       await assertBooksTie(A);
     });
 

@@ -217,6 +217,7 @@ export const errorCorrections = pgTable('error_corrections', {
 });
 
 // Audit Logs
+// Indexes (hand-written migrations): (company_id, created_at) 0029; (company_id, entity_type, entity_id) 0067.
 export const auditLogs = pgTable('audit_logs', {
   id: uuid('id').primaryKey().defaultRandom(),
   companyId: uuid('company_id').references(() => companies.id).notNull(),
@@ -454,6 +455,12 @@ export const items = pgTable('items', {
   uomSetId: uuid('uom_set_id').references((): any => uomSets.id),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
+  /**
+   * Record-locking version (lib/services/concurrency.ts): moves on every change EXCEPT the stock
+   * figures (quantity on hand, average cost, value remainder) that sales and receipts write, so
+   * selling an item never makes an open Edit Item form stale (bka_version_items, 0067).
+   */
+  editedAt: timestamp('edited_at').defaultNow().notNull(),
 });
 
 // ---- Sales tax ----

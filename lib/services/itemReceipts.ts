@@ -61,7 +61,7 @@ import {
 } from './inventorySites';
 import { assertNoActiveLandedCost } from './landedCost';
 import { assertClosedPeriodEdit, retitleEntry } from './postedEdit';
-import { layerRoundingTolerance, takeFromDocumentLayers } from './fifo';
+import { insertLayersWorth, layerRoundingTolerance, takeFromDocumentLayers } from './fifo';
 import { valueRemainderAfter } from './inventory';
 import {
   type ServiceContext,
@@ -246,7 +246,10 @@ async function receiveStock(
   unitCost: Dec,
   date: Date,
   reason: string,
+  /** What the receipt posted to inventory for the line (its amount); default round2(qty x unit cost). */
+  posted?: Dec,
 ): Promise<void> {
+  const postedValue = posted ?? Money.round2(qty.times(unitCost));
   // Reload inside the tx so multiple lines for the same item compound correctly.
   const [item] = await ctx.db
     .select()
@@ -258,15 +261,9 @@ async function receiveStock(
   const newQty = currentQty.plus(qty);
 
   if (await isFifoTracked(ctx, itemId)) {
-    await ctx.db.insert(inventoryLayers).values({
-      companyId: ctx.companyId,
-      itemId,
-      date,
-      quantityRemaining: qty.toFixed(4),
-      unitCost: unitCost.toFixed(4),
-      // Tag the layer with its receipt so landed cost can find (and revalue) it.
-      sourceRef: reason,
-    });
+    // Layer(s) worth exactly what the receipt posted for the line (fifo.ts insertLayersWorth),
+    // tagged with the receipt so landed cost can find (and revalue) them.
+    await insertLayersWorth(ctx, { itemId, date, qty, value: postedValue, sourceRef: reason });
     await ctx.db
       .update(items)
       .set({ quantityOnHand: newQty.toFixed(4), updatedAt: new Date() })
@@ -282,8 +279,8 @@ async function receiveStock(
         quantityOnHand: newQty.toFixed(4),
         averageCost: newAvg.toFixed(4),
         // The cents the 4dp average cannot represent stay on record (as bills.ts receivePurchasedStock):
-        // the receipt's entry put round2(qty x unit cost) on the inventory account.
-        ...valueRemainderAfter(item, currentQty, newQty, newAvg, Money.round2(qty.times(unitCost))),
+        // the receipt's entry put the line's amount on the inventory account.
+        ...valueRemainderAfter(item, currentQty, newQty, newAvg, postedValue),
         updatedAt: new Date(),
       })
       .where(eq(items.id, itemId));
@@ -314,7 +311,13 @@ async function reverseStock(
   qty: Dec,
   unitCost: Dec,
   reason: string,
+  /**
+   * The amount the receipt posted to inventory for the line (its stored `amount`). The stored
+   * unit cost is rounded to 4dp, so round2(qty x unit cost) can differ from what was posted.
+   */
+  posted?: Dec,
 ): Promise<void> {
+  const postedValue = posted ?? Money.round2(qty.times(unitCost));
   const [item] = await ctx.db
     .select()
     .from(items)
@@ -339,7 +342,7 @@ async function reverseStock(
         itemName: item.name,
         sourceRefs: [`item_receipt:${reason.slice(reason.lastIndexOf(':') + 1)}`],
         qty,
-        expectedValue: Money.round2(qty.times(unitCost)),
+        expectedValue: postedValue,
         unitCost,
         action: 'void this item receipt',
       })
@@ -387,14 +390,14 @@ async function reverseStock(
       .where(eq(items.id, itemId));
   } else {
     const currentAvg = Money.of(item.averageCost ?? '0');
-    const remainingValue = currentQty.times(currentAvg).minus(qty.times(unitCost));
+    const remainingValue = currentQty.times(currentAvg).minus(postedValue);
     // The voided entry takes the receipt's full cost off the inventory account; refuse when the
     // stock left is worth less (written down / sold at a lower average since) instead of clamping
     // the average to 0 and leaving the GL below the item's value.
     if (remainingValue.lessThan(layerRoundingTolerance(currentQty).negated())) {
       throw new ServiceError(
         'CONFLICT',
-        `Cannot void this item receipt: the "${item.name}" on hand are valued at ${toAmountString(Money.round2(currentQty.times(currentAvg)))}, less than the ${toAmountString(Money.round2(qty.times(unitCost)))} it added (their cost was written down or the units sold since). Reverse the value adjustment or those sales first.`,
+        `Cannot void this item receipt: the "${item.name}" on hand are valued at ${toAmountString(Money.round2(currentQty.times(currentAvg)))}, less than the ${toAmountString(postedValue)} it added (their cost was written down or the units sold since). Reverse the value adjustment or those sales first.`,
       );
     }
     const newAvg = newQty.isZero()
@@ -408,7 +411,7 @@ async function reverseStock(
         quantityOnHand: newQty.toFixed(4),
         averageCost: newAvg.toFixed(4),
         // The voided entry took round2(qty x unit cost) off the inventory account.
-        ...valueRemainderAfter(item, currentQty, newQty, newAvg, Money.round2(qty.times(unitCost)).negated()),
+        ...valueRemainderAfter(item, currentQty, newQty, newAvg, postedValue.negated()),
         updatedAt: new Date(),
       })
       .where(eq(items.id, itemId));
@@ -444,12 +447,38 @@ export async function createItemReceipt(ctx: ServiceContext, input: CreateItemRe
   return saveItemReceipt(ctx, input);
 }
 
+/** The saved receipt line an edited line is compared with (same position). */
+type SavedReceiptLine = Pick<typeof itemReceiptLines.$inferSelect, 'itemId' | 'quantity' | 'unitCost' | 'amount'>;
+
 /**
- * Edit a saved item receipt (wave2 D1) — allowed while nothing of it has been billed. In ONE
- * transaction the old receipt is unwound exactly like a void (entry voided on its old date,
- * stock pulled back out, site movements reversed, PO quantities released) and the new version
- * is posted on the SAME receipt (same id, so FIFO layers / landed-cost links keep pointing at it).
+ * Unit cost and amount of a receipt line. The amount is quantity x the cost AS TYPED, rounded to
+ * the cent — what the vendor charges, as on a bill (QB): 3000 at 0.66666667 is $2,000.00, not
+ * 3000 x 0.6667 = $2,000.10. The cost column keeps 4 places, so the FIFO layers / average carry
+ * the amount itself (fifo.ts insertLayersWorth, the value remainder) and a void takes back exactly
+ * the amount (reverseStock).
+ * On an edit the form sends the STORED 4-decimal cost back: a line at the same position with the
+ * same item, quantity and stored cost keeps the amount it posted, so re-saving a receipt (a date
+ * fix) never turns its $2,000.00 into $2,000.10.
  */
+function receiptLineCost(
+  itemId: string,
+  qty: Dec,
+  typedCost: Dec,
+  saved: SavedReceiptLine | undefined,
+): { unitCost: Dec; amount: Dec } {
+  const amount = Money.round2(qty.times(typedCost));
+  if (
+    saved &&
+    saved.itemId === itemId &&
+    qty.equals(Money.of(saved.quantity)) &&
+    typedCost.equals(Money.of(saved.unitCost)) &&
+    !Money.of(saved.amount).equals(amount)
+  ) {
+    return { unitCost: typedCost, amount: Money.round2(saved.amount) };
+  }
+  return { unitCost: typedCost, amount };
+}
+
 /** Inventory detail of a line as the comparison key (null/undefined/empty treated alike). */
 function receiptDetailKey(d: Partial<InventoryLineDetail> | null | undefined): string {
   const serials = [...(d?.serialNumbers ?? [])].map((s) => String(s).trim()).filter(Boolean).sort();
@@ -481,14 +510,17 @@ async function isLedgerNeutralReceiptEdit(
   for (const [i, n] of input.lines.entries()) {
     const o = oldLines[i];
     let qty: Dec;
-    let cost: Dec;
+    let typed: Dec;
     try {
       qty = Money.of(Money.of(n.quantity).toFixed(4));
-      cost = Money.of(Money.of(n.unitCost).toFixed(4));
+      typed = Money.of(n.unitCost);
     } catch {
       return false;
     }
-    if (o.itemId !== n.itemId || !qty.equals(Money.of(o.quantity)) || !cost.equals(Money.of(o.unitCost))) return false;
+    if (!typed.isFinite() || o.itemId !== n.itemId || !qty.equals(Money.of(o.quantity))) return false;
+    // Same stored cost AND the same amount (a 5th-decimal change of the cost moves the amount).
+    if (!Money.of(typed.toFixed(4)).equals(Money.of(o.unitCost))) return false;
+    if (!receiptLineCost(n.itemId, qty, typed, o).amount.equals(Money.of(o.amount))) return false;
     const given =
       n.siteId !== undefined ||
       n.binId !== undefined ||
@@ -561,6 +593,12 @@ async function updateReceiptHeaderInTx(tx: ServiceContext, id: string, input: Cr
   return { ...updated, lines };
 }
 
+/**
+ * Edit a saved item receipt (wave2 D1) — allowed while nothing of it has been billed. In ONE
+ * transaction the old receipt is unwound exactly like a void (entry voided on its old date,
+ * stock pulled back out, site movements reversed, PO quantities released) and the new version
+ * is posted on the SAME receipt (same id, so FIFO layers / landed-cost links keep pointing at it).
+ */
 export async function updateItemReceipt(ctx: ServiceContext, id: string, input: CreateItemReceiptInput) {
   const [receipt] = await ctx.db
     .select()
@@ -617,6 +655,16 @@ async function saveItemReceipt(
     if (!itemMap.has(id)) throw notFound(`Item ${id}`);
   }
 
+  // An edit compares each line with the saved line at its position (receiptLineCost).
+  const savedLines = existing
+    ? await ctx.db
+        .select()
+        .from(itemReceiptLines)
+        .where(eq(itemReceiptLines.itemReceiptId, existing.id))
+        .orderBy(asc(itemReceiptLines.lineOrder))
+    : [];
+  let keptSavedAmount = false;
+
   // --- Resolve lines (Money math; no JS floats) ---
   type ResolvedLine = {
     itemId: string;
@@ -633,15 +681,15 @@ async function saveItemReceipt(
 
   for (const [i, line] of input.lines.entries()) {
     const item = itemMap.get(line.itemId)!;
-    // Quantity and unit cost are stored at 4 places (item_receipt_lines, FIFO layers); the amount
-    // is worked out from the stored values (as purchase orders do). A cost typed past 4 decimals
-    // (0.33333 x 1000) used to post 333.33 while the stored cost / FIFO layer valued 333.30, so
-    // the inventory GL drifted from the stock valuation and a void left the cents behind.
+    // The quantity is stored at 4 places, and the amount is worked out from it. The unit cost is
+    // stored at 4 places too, but the amount is quantity x the cost as typed (receiptLineCost): the
+    // stock carries exactly that amount (FIFO layers worth it / the value remainder), so the
+    // inventory GL equals the valuation and a void takes back what the receipt posted.
     let qty: Dec;
     let unitCost: Dec;
     try {
       qty = Money.of(Money.of(line.quantity).toFixed(4));
-      unitCost = Money.of(Money.of(line.unitCost).toFixed(4));
+      unitCost = Money.of(line.unitCost);
     } catch {
       throw validation(`Line ${i + 1}: enter the quantity and unit cost as numbers.`);
     }
@@ -656,7 +704,8 @@ async function saveItemReceipt(
     }
     // A $0 line (items received at no charge — a no-charge line of a purchase order) stocks the
     // units at $0 and posts nothing; the receipt's total must still be more than zero (below).
-    const amount = Money.round2(qty.times(unitCost));
+    const amount = receiptLineCost(line.itemId, qty, unitCost, savedLines[i]).amount;
+    if (!amount.equals(Money.round2(qty.times(unitCost)))) keptSavedAmount = true;
 
     const isInventory = item.type === 'inventory';
     let accountId: string;
@@ -709,13 +758,21 @@ async function saveItemReceipt(
         .from(itemReceiptLines)
         .where(eq(itemReceiptLines.itemReceiptId, existing.id))
         .orderBy(asc(itemReceiptLines.lineOrder));
+      // Amounts kept from the saved lines (receiptLineCost) must come from these very lines.
+      if (
+        keptSavedAmount &&
+        (oldLines.length !== savedLines.length ||
+          oldLines.some((o, k) => o.id !== savedLines[k].id || !Money.of(o.amount).equals(Money.of(savedLines[k].amount))))
+      ) {
+        throw new ServiceError('CONFLICT', 'This item receipt was changed by someone else while you edited it. Reload it and try again.');
+      }
       if (oldLines.some((l) => Money.of(l.quantityBilled ?? '0').greaterThan(0))) {
         throw new ServiceError('CONFLICT', 'Part of this item receipt was already billed, so it can no longer be edited.');
       }
       await assertNoActiveLandedCost(tx, { itemReceiptId: existing.id });
       if (cur.postedEntryId) await voidJournalEntry(tx, cur.postedEntryId);
       for (const line of oldLines) {
-        await reverseStock(tx, line.itemId, Money.of(line.quantity), Money.of(line.unitCost), `item_receipt_edit:${existing.id}`);
+        await reverseStock(tx, line.itemId, Money.of(line.quantity), Money.of(line.unitCost), `item_receipt_edit:${existing.id}`, Money.of(line.amount));
       }
       await reverseDocumentInventory(tx, 'item_receipt', existing.id);
       if (cur.purchaseOrderId) {
@@ -804,7 +861,7 @@ async function saveItemReceipt(
     // --- Receive stock for inventory lines (subledger only; same tx) ---
     for (const l of resolved) {
       if (!l.isInventory) continue;
-      await receiveStock(tx, l.itemId, l.quantity, l.unitCost, input.date, `item_receipt:${receipt.id}`);
+      await receiveStock(tx, l.itemId, l.quantity, l.unitCost, input.date, `item_receipt:${receipt.id}`, Money.of(l.amount));
     }
 
     // --- Advanced Inventory: receiving site / bin / serials / lot ---
@@ -1094,6 +1151,7 @@ async function voidItemReceiptInTx(ctx: ServiceContext, id: string) {
         Money.of(line.quantity),
         Money.of(line.unitCost),
         `item_receipt_void:${id}`,
+        Money.of(line.amount),
       );
     }
 

@@ -114,8 +114,10 @@ async function validateSet(ctx: ServiceContext, body: unknown, selfId?: string) 
 }
 
 export async function createUomSet(ctx: ServiceContext, body: unknown) {
-  const { header, units } = await validateSet(ctx, body);
+  // Validated in the insert's transaction: a double-submitted "New" gets the plain duplicate-name
+  // message instead of the unique index's raw error.
   return inTransaction(ctx, async (tx) => {
+    const { header, units } = await validateSet(tx, body);
     const [row] = await tx.db.insert(uomSets).values({ companyId: tx.companyId, ...header }).returning();
     if (units.length) await tx.db.insert(uomSetUnits).values(units.map((u) => ({ ...u, companyId: tx.companyId, setId: row.id })));
     const created = await getUomSet(tx, row.id);
@@ -129,8 +131,14 @@ export async function createUomSet(ctx: ServiceContext, body: unknown) {
  * use the set (that would silently rescale every quantity on hand).
  */
 export async function updateUomSet(ctx: ServiceContext, id: string, body: unknown) {
+  return inTransaction(ctx, (tx) => updateUomSetInTx(tx, id, body));
+}
+
+async function updateUomSetInTx(ctx: ServiceContext, id: string, body: unknown) {
   const before = await getUomSet(ctx, id);
   const { header, units } = await validateSet(ctx, body, id);
+  // Making a set inactive is deleting it from the list: refused while an Accountant's Copy is out (I1).
+  if (header.isActive === false && before.isActive) await assertListDeleteAllowed(ctx, 'delete', 'unit of measure sets');
   const [used] = await ctx.db.select({ id: items.id }).from(items).where(eq(items.uomSetId, id)).limit(1);
   if (used && header.baseUnitName.toLowerCase() !== before.baseUnitName.toLowerCase()) {
     throw validation('Items already use this set, so its base unit cannot change. Create a new set instead.');

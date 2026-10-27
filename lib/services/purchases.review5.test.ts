@@ -474,7 +474,7 @@ describe('review5 purchases', { timeout: 120_000 }, () => {
     expect(err.message).not.toMatch(/applied to a bill/i);
   });
 
-  it('Q: an item receipt costed beyond 4 decimals posts what its stored cost values (GL == stock, void clears)', async () => {
+  it('Q: an item receipt costed beyond 4 decimals: GL == stock, a re-save keeps its amount, void clears', async () => {
     const { receiveStock } = await import('./fifo');
     const v = await newVendor();
     const invAcct = (await createAccount(ctx, { code: '1350', name: 'Inv Q', type: 'asset' as never, subtype: 'inventory' })).id;
@@ -496,9 +496,22 @@ describe('review5 purchases', { timeout: 120_000 }, () => {
     const avgValue = Math.round(Number(avgRow.quantityOnHand) * Number(avgRow.averageCost) * 100) / 100 + Number(avgRow.valueRemainder ?? 0);
     const gained = Number(await glBalance(invAcct)) - Number(before);
     expect(gained.toFixed(2)).toBe((layerValue + avgValue).toFixed(2));
-    // The receipt line shows the cost it was valued at.
+    // Merge of r5/inventory: the amount is quantity x the cost as typed (as on a bill; the stock
+    // carries it to the cent), the cost column keeps 4 places.
     expect(receipt.lines[0].unitCost).toBe('0.3333');
-    expect(receipt.lines[0].amount).toBe('333.30');
+    expect(receipt.lines[0].amount).toBe('333.33');
+    // Re-saving the receipt from the form (which sends the stored 4dp cost back) with another date
+    // keeps the amounts it posted, and the stock still equals the GL.
+    const afterCreate = await glBalance(invAcct);
+    const resaved = await updateItemReceipt(ctx, receipt.id, {
+      vendorId: v.id,
+      date: d('2026-08-22'),
+      lines: receipt.lines.map((l) => ({ itemId: l.itemId, quantity: l.quantity, unitCost: l.unitCost })),
+    });
+    expect(resaved.lines.map((l) => l.amount)).toEqual(['333.33', '1000.00']);
+    expect(await glBalance(invAcct)).toBe(afterCreate);
+    const layers2 = await db.select().from(inventoryLayers).where(eq(inventoryLayers.sourceRef, `item_receipt:${receipt.id}`));
+    expect(layers2.reduce((s, l) => s + Math.round(Number(l.quantityRemaining) * Number(l.unitCost) * 100), 0) / 100).toBe(333.33);
     const { voidItemReceipt } = await import('./itemReceipts');
     await voidItemReceipt(ctx, receipt.id);
     expect(await glBalance(invAcct)).toBe(before);

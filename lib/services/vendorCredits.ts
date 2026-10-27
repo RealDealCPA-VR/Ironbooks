@@ -49,9 +49,16 @@ import {
   voidJournalEntry,
 } from '@/lib/services/posting';
 import { receivePurchasedStock } from './bills';
-import { takeFromLayers } from './fifo';
+import { restoreLayerDraws, takeFromLayers } from './fifo';
 import { bookValueRelief, sellOutRelief } from './inventory';
-import { postDocumentInventory, reverseDocumentInventory } from './inventorySites';
+import {
+  type InventoryLineDetail,
+  attachInventoryDetails,
+  loadDocumentInventoryDetails,
+  pickLineDetail,
+  postDocumentInventory,
+  reverseDocumentInventory,
+} from './inventorySites';
 import { assertClosedPeriodEdit, planPostedEdit, retitleEntry } from './postedEdit';
 import { getHomeCurrencyCode } from './currencies';
 import {
@@ -79,7 +86,12 @@ import {
 // Input types
 // ---------------------------------------------------------------------------
 
-export interface VendorCreditLineInput {
+/**
+ * Items tab lines also take the Advanced Inventory detail of the units returned (site, bin,
+ * serial numbers, lot) — a serial- or lot-tracked item can only leave stock with them, and stock
+ * held at another site goes back to the vendor from that site.
+ */
+export interface VendorCreditLineInput extends InventoryLineDetail {
   /** Expenses tab: GL account to credit (expense or asset). Items tab: optional override for a
    * non-inventory item's account. */
   accountId?: string | null;
@@ -315,6 +327,8 @@ async function relieveReturnedStock(
   itemId: string,
   qty: Decimal,
   reason: string,
+  /** The credit line's lineOrder: its FIFO draw is recorded with it, so a void / edit can put the units back. */
+  lineOrder?: number,
 ): Promise<Decimal> {
   const [item] = await tx.db
     .select()
@@ -337,7 +351,8 @@ async function relieveReturnedStock(
   const avgRelief = layer
     ? null
     : sellOutRelief(item, onHand.minus(qty), bookValueRelief(onHand, onHand.minus(qty), Money.of(item.averageCost ?? '0')));
-  const cost = layer ? (await takeFromLayers(tx, itemId, qty)).cost : avgRelief!.relief;
+  const taken = layer ? await takeFromLayers(tx, itemId, qty) : null;
+  const cost = taken ? taken.cost : avgRelief!.relief;
   const newQty = onHand.minus(qty);
   await tx.db
     .update(items)
@@ -354,22 +369,29 @@ async function relieveReturnedStock(
     entityType: 'item',
     entityId: itemId,
     oldValues: { quantityOnHand: item.quantityOnHand },
-    newValues: { quantityOnHand: newQty.toFixed(4), returnedCost: toAmountString(cost), reason },
+    // FIFO: the layers drawn, so restoreCreditStock puts the units back where they came from.
+    newValues: { quantityOnHand: newQty.toFixed(4), returnedCost: toAmountString(cost), reason, ...(taken ? { lineOrder: lineOrder ?? null, layers: taken.layers } : {}) },
   });
   return cost;
 }
 
-/** Relieve stock for every inventory line; returns the cost per line index. */
+/**
+ * Relieve stock for every inventory line; returns the cost per line index. `inputLines` carry
+ * each line's site / bin / serials / lot; with `carryForward` (an edit) a line that carries none
+ * keeps the detail stored for it, so a form without those columns never changes them.
+ */
 async function relieveCreditStock(
   tx: ServiceContext,
   creditId: string,
   date: Date,
   prep: PreparedLine[],
+  inputLines: VendorCreditLineInput[] = [],
+  carryForward = false,
 ): Promise<Map<number, Decimal>> {
   const costs = new Map<number, Decimal>();
   for (const [i, l] of prep.entries()) {
     if (!l.isInventory || !l.itemId || !l.quantity) continue;
-    costs.set(i, await relieveReturnedStock(tx, l.itemId, l.quantity, `vendor_credit:${creditId}`));
+    costs.set(i, await relieveReturnedStock(tx, l.itemId, l.quantity, `vendor_credit:${creditId}`, i));
   }
   if (costs.size > 0) {
     await postDocumentInventory(tx, {
@@ -377,15 +399,40 @@ async function relieveCreditStock(
       sourceId: creditId,
       date,
       direction: 'out',
-      lines: prep.map((l, idx) => ({
-        lineOrder: idx,
-        itemId: l.isInventory ? l.itemId : null,
-        quantity: l.quantity ? l.quantity.toFixed(4) : '0',
-      })),
+      lines: prep.map((l, idx) => {
+        const src = inputLines[idx];
+        return {
+          lineOrder: idx,
+          itemId: l.isInventory ? l.itemId : null,
+          quantity: l.quantity ? l.quantity.toFixed(4) : '0',
+          siteId: src?.siteId,
+          binId: src?.binId,
+          serialNumbers: src?.serialNumbers,
+          lotNumber: src?.lotNumber,
+          lotExpiration: src?.lotExpiration,
+        };
+      }),
       memo: 'Returned to vendor',
+      carryForward,
     });
   }
   return costs;
+}
+
+/** Does an edit give any line a site / bin / serial / lot other than the one stored for it? */
+async function lineDetailChanged(tx: ServiceContext, creditId: string, lines: VendorCreditLineInput[]): Promise<boolean> {
+  const stored = await loadDocumentInventoryDetails(tx, 'vendor_credit', creditId);
+  const key = (d: InventoryLineDetail | null | undefined) =>
+    JSON.stringify({
+      site: d?.siteId || null,
+      bin: d?.binId || null,
+      serials: (d?.serialNumbers ?? []).map((s) => String(s).trim()).filter(Boolean).sort(),
+      lot: d?.lotNumber?.trim() || null,
+    });
+  return lines.some((l, i) => {
+    const explicit = pickLineDetail(l);
+    return explicit !== undefined && key(explicit) !== key(stored.get(i));
+  });
 }
 
 /** Put the stock a saved credit returned back on hand at the cost it left with (void / edit). */
@@ -396,11 +443,54 @@ async function restoreCreditStock(tx: ServiceContext, credit: typeof vendorCredi
     .where(eq(vendorCreditLines.vendorCreditId, credit.id));
   const inv = saved.filter((l) => l.itemId && l.costAmount != null && l.quantity != null && Money.gt(l.quantity, 0));
   if (inv.length === 0) return;
-  await receivePurchasedStock(
+  // FIFO returns go back into the layers they were taken from (their draw is on record): a new
+  // layer dated the credit would put them behind every receipt in between, so re-saving an
+  // unchanged credit returned other, dearer units (fifo.ts restoreLayerDraws).
+  const rest: typeof inv = [];
+  for (const l of inv) {
+    const [audit] = await tx.db
+      .select({ newValues: auditLogs.newValues })
+      .from(auditLogs)
+      .where(
+        and(
+          eq(auditLogs.companyId, tx.companyId),
+          eq(auditLogs.entityType, 'item'),
+          eq(auditLogs.entityId, l.itemId!),
+          sql`${auditLogs.newValues}->>'reason' = ${`vendor_credit:${credit.id}`}`,
+          sql`${auditLogs.newValues}->>'lineOrder' = ${String(l.lineOrder)}`,
+        ),
+      )
+      .orderBy(desc(auditLogs.createdAt))
+      .limit(1);
+    const recorded = (audit?.newValues as { layers?: unknown } | null | undefined)?.layers;
+    if (!Array.isArray(recorded)) {
+      rest.push(l);
+      continue;
+    }
+    const [item] = await tx.db
+      .select({ name: items.name, quantityOnHand: items.quantityOnHand })
+      .from(items)
+      .where(and(eq(items.companyId, tx.companyId), eq(items.id, l.itemId!)));
+    const qty = Money.of(l.quantity!);
+    await restoreLayerDraws(tx, {
+      itemId: l.itemId!,
+      itemName: item?.name ?? 'item',
+      qty,
+      value: Money.of(l.costAmount!),
+      date: credit.date,
+      action: 'vendor credit reversed',
+      recorded,
+    });
+    await tx.db
+      .update(items)
+      .set({ quantityOnHand: Money.of(item?.quantityOnHand ?? '0').plus(qty).toFixed(4), updatedAt: new Date() })
+      .where(and(eq(items.companyId, tx.companyId), eq(items.id, l.itemId!)));
+  }
+  if (rest.length > 0) await receivePurchasedStock(
     tx,
     `vendor_credit:${credit.id}`,
     credit.date,
-    inv.map((l) => ({
+    rest.map((l) => ({
       itemId: l.itemId,
       isInventory: true,
       quantity: Money.of(l.quantity!).toFixed(4),
@@ -536,7 +626,7 @@ export async function createVendorCredit(ctx: ServiceContext, input: CreateVendo
       .returning();
 
     // 2) Returned items leave stock at their current cost.
-    const costs = await relieveCreditStock(tx, credit.id, input.date, prep);
+    const costs = await relieveCreditStock(tx, credit.id, input.date, prep, input.lines);
 
     // 3) Lines (amounts in the credit's currency).
     await tx.db.insert(vendorCreditLines).values(lineRowsFor(credit.id, prep, costs));
@@ -633,7 +723,9 @@ export async function updateVendorCredit(ctx: ServiceContext, id: string, input:
       const same =
         cur.vendorId === input.vendorId &&
         new Date(cur.date).toISOString().slice(0, 10) === new Date(input.date).toISOString().slice(0, 10) &&
-        lineSignature(oldLines) === lineSignature(prep);
+        lineSignature(oldLines) === lineSignature(prep) &&
+        // Other serial numbers / lot / site for the returned units move stock: re-post.
+        !(await lineDetailChanged(tx, id, input.lines));
       plan = same ? 'unchanged' : 'repost';
     } else {
       plan = await planPostedEdit(tx, {
@@ -678,7 +770,7 @@ export async function updateVendorCredit(ctx: ServiceContext, id: string, input:
       if (cur.postedEntryId) await voidJournalEntry(tx, cur.postedEntryId);
       await restoreCreditStock(tx, cur);
       await tx.db.delete(vendorCreditLines).where(eq(vendorCreditLines.vendorCreditId, id));
-      const costs = await relieveCreditStock(tx, id, input.date, prep);
+      const costs = await relieveCreditStock(tx, id, input.date, prep, input.lines, true);
       await tx.db.insert(vendorCreditLines).values(lineRowsFor(id, prep, costs));
       const entry = await postJournalEntry(tx, {
         date: input.date,
@@ -776,7 +868,13 @@ export async function getVendorCredit(ctx: ServiceContext, id: string) {
     .where(eq(vendorCreditLines.vendorCreditId, id))
     .orderBy(asc(vendorCreditLines.lineOrder));
 
-  return { ...credit, lines, applications: await listVendorCreditApplications(ctx, id) };
+  // Site / bin / serials / lot of returned items, as the other stock documents show them; and the
+  // bills the credit is applied to (the screen's Unapply list).
+  return {
+    ...credit,
+    lines: await attachInventoryDetails(ctx, 'vendor_credit', id, lines),
+    applications: await listVendorCreditApplications(ctx, id),
+  };
 }
 
 /** One bill a vendor credit is (still) applied to, with the net amount applied. */

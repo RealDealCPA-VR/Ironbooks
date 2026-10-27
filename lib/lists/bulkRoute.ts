@@ -18,6 +18,16 @@ export async function handleBulkPost(ctx: ServiceContext, list: BulkList, area: 
   if (parsed.data.rows.some((r) => typeof r.id === 'string' && r.id.trim() !== '')) {
     requirePermission(ctx, area, 'modify');
   }
+  // An opening quantity on hand posts to the ledger (Dr Inventory Asset / Cr Opening Balance
+  // Equity), so — exactly like the New Item form (POST /api/items) — it needs inventory rights on
+  // top of the list rights this route is mapped to.
+  const filled = (v: unknown) => v !== undefined && v !== null && String(v).trim() !== '';
+  if (
+    list === 'items' &&
+    parsed.data.rows.some((r) => filled(r.openingQuantity) || filled(r.openingValue) || filled(r.openingAsOf))
+  ) {
+    requirePermission(ctx, 'inventory', 'create');
+  }
   const result = await bulkSave(ctx, list, parsed.data.rows, { dryRun: parsed.data.dryRun });
   // Row problems are a normal outcome of checking a grid: 200 with per-row errors (saved=false).
   return NextResponse.json(result);

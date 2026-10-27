@@ -155,7 +155,7 @@ describe('inventory adjustment account (P1)', () => {
     const { ctx, acct } = await newCompany('Adjust Default Co');
     const itemId = await newItem(ctx, 'Bolt');
     const res = await adjustInventory(ctx, { itemId, quantityChange: 5, unitCost: 3, date: new Date('2026-02-01') });
-    const lines = await db.select().from(journalEntryLines).where(eq(journalEntryLines.journalEntryId, res.entry.id));
+    const lines = await db.select().from(journalEntryLines).where(eq(journalEntryLines.journalEntryId, res.entry!.id));
     const offset = lines.find((l) => l.accountId !== acct['1300'])!;
     expect(offset.accountId).not.toBe(acct['3000']);
     expect((await balanceOf(offset.accountId)).name).toBe('Inventory Adjustments');

@@ -16,6 +16,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { batchPhysicalCount } from '@/lib/services/inventoryOps';
+import { inventoryDate } from '@/lib/services/inventory';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
 
@@ -47,7 +48,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     }
 
     const result = await batchPhysicalCount(ctx, {
-      date: new Date(body.date),
+      date: inventoryDate(body.date),
       counts: body.counts,
       adjustmentAccountId: body.adjustmentAccountId ?? null,
       classId: body.classId ?? null,

@@ -85,8 +85,10 @@ async function validateLevel(ctx: ServiceContext, body: unknown, selfId?: string
 }
 
 export async function createBillingRateLevel(ctx: ServiceContext, body: unknown) {
-  const { input, fixedRate, rates } = await validateLevel(ctx, body);
+  // Validated in the insert's transaction: a double-submitted "New" gets the plain duplicate-name
+  // message instead of the unique index's raw error.
   return inTransaction(ctx, async (tx) => {
+    const { input, fixedRate, rates } = await validateLevel(tx, body);
     const [row] = await tx.db
       .insert(billingRateLevels)
       .values({ companyId: tx.companyId, name: input.name, type: input.type, fixedRate, isActive: input.isActive ?? true })
@@ -102,11 +104,11 @@ export async function createBillingRateLevel(ctx: ServiceContext, body: unknown)
 }
 
 export async function updateBillingRateLevel(ctx: ServiceContext, id: string, body: unknown) {
-  const before = await getBillingRateLevel(ctx, id);
-  const { input, fixedRate, rates } = await validateLevel(ctx, body, id);
-  // Making a level inactive is deleting it: refused while an Accountant's Copy is out (I1).
-  if (input.isActive === false && before.isActive) await assertListDeleteAllowed(ctx, 'delete', 'billing rate levels');
   return inTransaction(ctx, async (tx) => {
+    const before = await getBillingRateLevel(tx, id);
+    const { input, fixedRate, rates } = await validateLevel(tx, body, id);
+    // Making a level inactive is deleting it: refused while an Accountant's Copy is out (I1).
+    if (input.isActive === false && before.isActive) await assertListDeleteAllowed(tx, 'delete', 'billing rate levels');
     await tx.db
       .update(billingRateLevels)
       .set({ name: input.name, type: input.type, fixedRate, isActive: input.isActive ?? before.isActive, updatedAt: new Date() })

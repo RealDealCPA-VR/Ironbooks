@@ -43,7 +43,7 @@
  *   [inv-gl] [inv-item] [fifo-qty] [inv-neg] [site]  GL 1300 = inventory valuation (per item vs
  *                             GL-attributed value), FIFO layers = quantity on hand, no negative stock
  *                             or layers, no negative non-default site. Exact to the cent: GL 1300 =
- *                             valuation + the average-cost value remainders (migration 0061)
+ *                             valuation (whose Asset Value includes the 0061 value remainders)
  *   [inv-bounds] [bill-bounds] [cm-bounds] [cm-apps] [vc-bounds] [pay-bounds] [inv-paid]
  *                             0 <= balanceDue <= total and = total - paid (- retainage / credited),
  *                             status paid <=> 0 due, credits in [0, total], applications add up
@@ -1308,18 +1308,12 @@ export async function checkInvariants(w: World, r: R): Promise<Violation[]> {
   const val = await inventoryValuation(ctx);
   // Average-cost items carry the cents a 4-decimal average cannot represent as a value remainder
   // (items.value_remainder, valid while value_remainder_avg = average_cost — migration 0061); the GL
-  // holds it until the last unit leaves. So GL 1300 = valuation + carried remainders, exactly.
-  const [rem] = await rows<{ r: string }>(
-    w,
-    sql`SELECT COALESCE(SUM(CAST(value_remainder AS NUMERIC)) FILTER (WHERE value_remainder_avg IS NOT NULL
-          AND CAST(value_remainder_avg AS NUMERIC) = CAST(COALESCE(average_cost, '0') AS NUMERIC)), 0) AS r
-        FROM items WHERE company_id = ${ctx.companyId} AND type = 'inventory' AND is_active
-          AND id NOT IN (SELECT item_id FROM inventory_layers WHERE company_id = ${ctx.companyId})`,
-  );
-  const invDiff = Money.sub(Money.add(val.grandTotal, rem?.r ?? 0), g('1300'));
+  // holds it until the last unit leaves. Since review round 5 the valuation's Asset Value includes
+  // it (as QB's does), so GL 1300 = valuation, exactly.
+  const invDiff = Money.sub(val.grandTotal, g('1300'));
   if (!invDiff.isZero()) {
     // Exact to the cent: every average-cost path records its remainder, FIFO layers carry per-layer cents.
-    bad('inv-gl', `inventory valuation ${val.grandTotal} + remainders ${d2(rem?.r)} != GL 1300 ${d2(g('1300'))} (diff ${d2(invDiff)})`);
+    bad('inv-gl', `inventory valuation ${val.grandTotal} != GL 1300 ${d2(g('1300'))} (diff ${d2(invDiff)})`);
   }
   const layerQty = await rows<{ item_id: string; q: string; neg: number }>(
     w, sql`SELECT item_id, COALESCE(SUM(quantity_remaining),0) AS q, COUNT(*) FILTER (WHERE quantity_remaining < 0)::int AS neg FROM inventory_layers WHERE company_id = ${ctx.companyId} GROUP BY item_id`);

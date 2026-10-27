@@ -416,6 +416,13 @@
       "breakpoints": true
     },
     {
+      "idx": 67,
+      "version": "7",
+      "when": 1781400067000,
+      "tag": "0067_r5_inventory",
+      "breakpoints": true
+    },
+    {
       "idx": 68,
       "version": "7",
       "when": 1781400068000,

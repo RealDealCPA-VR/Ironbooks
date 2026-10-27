@@ -386,7 +386,7 @@ describe('Perpetual inventory (invoices + bills)', () => {
     expect((await trialBalance(ctx)).balanced).toBe(true);
   });
 
-  it('voiding the FIFO invoice restores stock via a compensating layer', async () => {
+  it('voiding the FIFO invoice puts the units back into the layers they came from', async () => {
     const before1300 = Number(await balanceOf('1300'));
 
     await voidInvoice(ctx, fifoInvoiceId);
@@ -395,17 +395,17 @@ describe('Perpetual inventory (invoices + bills)', () => {
     expect(await balanceOf('5000')).toBe('0.00');
     expect(Number(await balanceOf('1300'))).toBeCloseTo(before1300 + 62, 2);
 
-    // Total layer quantity is back to 10; the restored layer carries the
-    // blended consumed cost (62 / 6 = 10.3333).
+    // Review round 5: the 5 @ 10 and 1 @ 12 go back into their own layers (FIFO order kept),
+    // instead of a new blended layer (62 / 6 = 10.3333) dated the invoice.
     const layers = await db
       .select()
       .from(inventoryLayers)
-      .where(eq(inventoryLayers.itemId, gadgetId));
-    const totalQty = layers.reduce((s, l) => s + Number(l.quantityRemaining), 0);
-    expect(totalQty).toBeCloseTo(10, 4);
-    const restored = layers.find((l) => l.unitCost === '10.3333');
-    expect(restored).toBeTruthy();
-    expect(restored!.quantityRemaining).toBe('6.0000');
+      .where(eq(inventoryLayers.itemId, gadgetId))
+      .orderBy(asc(inventoryLayers.date));
+    expect(layers.map((l) => [l.quantityRemaining, l.unitCost])).toEqual([
+      ['5.0000', '10.0000'],
+      ['5.0000', '12.0000'],
+    ]);
 
     expect((await trialBalance(ctx)).balanced).toBe(true);
   });

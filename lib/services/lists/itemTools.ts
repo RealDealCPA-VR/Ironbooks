@@ -12,7 +12,7 @@ import Decimal from 'decimal.js';
 import { items, vendors } from '@/lib/db/schema';
 import { Money } from '@/lib/money';
 import { type ServiceContext, inTransaction, validation, writeAudit } from '../_base';
-import { stockStatus, type StockStatusRow } from '../inventory';
+import { stockStatus, todayCalendarDay, type StockStatusRow } from '../inventory';
 import { reorderReport } from '../inventoryOps';
 import { createPurchaseOrder } from '../purchaseOrders';
 
@@ -189,7 +189,9 @@ export async function createPurchaseOrdersFromReorder(ctx: ServiceContext, input
   if (plan.length === 0) {
     throw validation('None of these items has an active preferred vendor. Set one on each item first.');
   }
-  const date = input.date ?? new Date();
+  // Today's calendar day (the stored-date convention), not the UTC instant: in the evening west of
+  // UTC that is already tomorrow.
+  const date = input.date ?? todayCalendarDay();
   const created = await inTransaction(ctx, async (tx) => {
     const out = [];
     for (const p of plan) {

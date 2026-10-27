@@ -10,13 +10,13 @@
  * change still posts a balanced entry via posting.ts. The site-tagged movement (sourceType
  * 'adjustment', sourceId = the posted journal entry) is written in the same transaction.
  */
-import { and, eq, sql } from 'drizzle-orm';
-import { accounts, inventoryLayers, itemSiteSettings, items } from '@/lib/db/schema';
+import { and, eq, isNotNull, sql } from 'drizzle-orm';
+import { inventoryLayers, itemSiteSettings, items } from '@/lib/db/schema';
 import { Money } from '@/lib/money';
 import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from './_base';
-import { type AdjustmentDimensions, adjustInventory } from './inventory';
+import { type AdjustmentDimensions, adjustInventory, cogsAccountForItem, inventoryDate, inventoryNumber } from './inventory';
 import { consumeStock, receiveStock, seedOpeningLayer } from './fifo';
-import { type InventoryLineDetail, getSite, recordMovements } from './inventorySites';
+import { type InventoryLineDetail, ensureDefaultSite, getSite, recordMovements } from './inventorySites';
 
 export interface SiteAdjustmentInput extends InventoryLineDetail, AdjustmentDimensions {
   /**
@@ -39,8 +39,14 @@ export interface SiteAdjustmentInput extends InventoryLineDetail, AdjustmentDime
 }
 
 export async function adjustQuantityAtSite(ctx: ServiceContext, input: SiteAdjustmentInput) {
-  const qty = Money.of(input.quantityChange);
+  const qty = inventoryNumber(input.quantityChange, 'Quantity');
   if (qty.isZero()) throw validation('quantityChange cannot be zero.');
+  if (input.unitCost != null && input.unitCost !== '') inventoryNumber(input.unitCost, 'Unit cost');
+  input = {
+    ...input,
+    date: inventoryDate(input.date),
+    lotExpiration: input.lotExpiration == null ? input.lotExpiration : inventoryDate(input.lotExpiration, 'Lot expiration'),
+  };
 
   return inTransaction(ctx, async (tx) => {
     const [item] = await tx.db
@@ -61,13 +67,9 @@ export async function adjustQuantityAtSite(ctx: ServiceContext, input: SiteAdjus
     const memo = input.memo ?? (qty.greaterThan(0) ? 'Inventory adjustment (add)' : 'Inventory adjustment (remove)');
     const isCogs = input.purpose === 'cogs' && qty.lessThan(0);
     let adjustmentAccountId = input.adjustmentAccountId ?? null;
-    if (isCogs && !adjustmentAccountId) {
-      const [cogs] = await tx.db
-        .select({ id: accounts.id })
-        .from(accounts)
-        .where(and(eq(accounts.companyId, tx.companyId), eq(accounts.code, '5000')));
-      adjustmentAccountId = cogs?.id ?? null;
-    }
+    // COGS relief goes to the item's own COGS account (5000 when it has none) — the account every
+    // sale of the item posts to, and the one the FIFO path below uses.
+    if (isCogs && !adjustmentAccountId) adjustmentAccountId = await cogsAccountForItem(tx, item);
     const dims: AdjustmentDimensions = {
       adjustmentAccountId,
       classId: input.classId ?? null,
@@ -75,7 +77,8 @@ export async function adjustQuantityAtSite(ctx: ServiceContext, input: SiteAdjus
       jobId: input.jobId ?? null,
     };
 
-    let entryId: string;
+    // Null when the change moved no value (stock at $0 cost): nothing was posted.
+    let entryId: string | null;
     let glAmount: string;
     if (layer || input.costing === 'fifo') {
       if (qty.greaterThan(0)) {
@@ -116,7 +119,7 @@ export async function adjustQuantityAtSite(ctx: ServiceContext, input: SiteAdjus
         memo,
         ...dims,
       });
-      entryId = res.entry.id;
+      entryId = res.entry?.id ?? null;
       glAmount = res.glAmount;
     }
 
@@ -155,11 +158,40 @@ export async function adjustQuantityAtSite(ctx: ServiceContext, input: SiteAdjus
 // Per-site reorder points
 // ---------------------------------------------------------------------------
 
+/**
+ * Per-site reorder settings. The DEFAULT site's reorder point is the item's own reorder point
+ * (Edit Item; the reorder list and Create Purchase Orders use it): it is shown from the item,
+ * also when the default site has no settings row yet, so the Reorder Points screen and the
+ * reorder reports never disagree about it.
+ */
 export async function listSiteReorderPoints(ctx: ServiceContext, opts?: { itemId?: string; siteId?: string }) {
   const conds = [eq(itemSiteSettings.companyId, ctx.companyId)];
   if (opts?.itemId) conds.push(eq(itemSiteSettings.itemId, opts.itemId));
   if (opts?.siteId) conds.push(eq(itemSiteSettings.siteId, opts.siteId));
-  return ctx.db.select().from(itemSiteSettings).where(and(...conds));
+  const rows = await ctx.db.select().from(itemSiteSettings).where(and(...conds));
+  const defaultSite = await ensureDefaultSite(ctx);
+  if (opts?.siteId && opts.siteId !== defaultSite.id) return rows;
+  const itemConds = [eq(items.companyId, ctx.companyId), eq(items.type, 'inventory')];
+  if (opts?.itemId) itemConds.push(eq(items.id, opts.itemId));
+  const itemRows = await ctx.db
+    .select({ id: items.id, reorderPoint: items.reorderPoint })
+    .from(items)
+    .where(and(...itemConds, opts?.itemId ? undefined : isNotNull(items.reorderPoint)));
+  const itemRp = new Map(itemRows.map((r) => [r.id, r.reorderPoint]));
+  const out = rows.map((r) => (r.siteId === defaultSite.id && itemRp.has(r.itemId) ? { ...r, reorderPoint: itemRp.get(r.itemId) ?? null } : r));
+  for (const it of itemRows) {
+    if (it.reorderPoint == null || rows.some((r) => r.itemId === it.id && r.siteId === defaultSite.id)) continue;
+    out.push({
+      id: `default-site:${it.id}`,
+      companyId: ctx.companyId,
+      itemId: it.id,
+      siteId: defaultSite.id,
+      reorderPoint: it.reorderPoint,
+      maxQuantity: null,
+      updatedAt: new Date(0),
+    });
+  }
+  return out;
 }
 
 function parseOptionalQty(v: string | number | null | undefined, label: string): string | null {
@@ -192,12 +224,26 @@ export async function setSiteReorderPoint(
 
   return inTransaction(ctx, async (tx) => {
     const [item] = await tx.db
-      .select({ id: items.id, type: items.type })
+      .select({ id: items.id, type: items.type, reorderPoint: items.reorderPoint })
       .from(items)
       .where(and(eq(items.companyId, tx.companyId), eq(items.id, input.itemId)));
     if (!item) throw notFound('Item');
     if (item.type !== 'inventory') throw validation('Reorder points apply to inventory items only.');
-    await getSite(tx, input.siteId);
+    const site = await getSite(tx, input.siteId);
+    // The default site's reorder point is the item's reorder point (see listSiteReorderPoints).
+    if (site.isDefault && (item.reorderPoint ?? null) !== reorderPoint) {
+      await tx.db
+        .update(items)
+        .set({ reorderPoint, updatedAt: new Date() })
+        .where(and(eq(items.companyId, tx.companyId), eq(items.id, input.itemId)));
+      await writeAudit(tx, {
+        action: 'update',
+        entityType: 'item',
+        entityId: input.itemId,
+        oldValues: { reorderPoint: item.reorderPoint },
+        newValues: { reorderPoint, reason: `reorder point of the default site "${site.name}"` },
+      });
+    }
 
     const [existing] = await tx.db
       .select()

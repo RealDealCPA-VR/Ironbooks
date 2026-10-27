@@ -37,7 +37,15 @@ import {
   validation,
   writeAudit,
 } from './_base';
-import { assertNotFifoTracked, bookValueRelief, sellOutRelief, valueRemainderAfter } from './inventory';
+import {
+  assertNotFifoTracked,
+  bookValueRelief,
+  inventoryDate,
+  inventoryNumber,
+  sellOutRelief,
+  todayCalendarDay,
+  valueRemainderAfter,
+} from './inventory';
 import { postJournalEntry } from './posting';
 import { assertPeriodOpen, recordClosingDateException } from './fiscalPeriods';
 import { type InventoryLineDetail, type MovementRequest, recordMovements } from './inventorySites';
@@ -75,7 +83,7 @@ export interface BuildInput extends InventoryLineDetail {
     serialNumbers?: string[] | null;
     lotNumber?: string | null;
   }> | null;
-  /** Date stamped on the site movements (defaults to now). */
+  /** Date of the build (its value-move entries and site movements); defaults to today's calendar day. */
   date?: Date | null;
 }
 
@@ -91,7 +99,7 @@ function buildMovements(
   sourceType: 'build' | 'unbuild',
   sourceId: string,
 ): MovementRequest[] {
-  const date = input.date ?? new Date();
+  const date = input.date ?? todayCalendarDay();
   const memo = `Assembly ${sourceType}`;
   const detailFor = (id: string) => input.components?.find((c) => c.componentItemId === id);
   return [
@@ -222,6 +230,13 @@ export async function setBom(
   // Validate the assembly item belongs to this company
   await loadItem(ctx, assemblyItemId);
 
+  if (components != null && !Array.isArray(components)) throw validation('components must be a list.');
+  for (const [i, c] of (components ?? []).entries()) {
+    if (!c || typeof c !== 'object' || typeof c.componentItemId !== 'string' || !c.componentItemId) {
+      throw validation(`Component ${i + 1}: choose the component item.`);
+    }
+  }
+
   if (!components || components.length === 0) {
     // Empty BOM — clear it
     return inTransaction(ctx, async (tx) => {
@@ -259,7 +274,7 @@ export async function setBom(
 
   // Validate all quantities > 0
   for (const c of components) {
-    const qty = Money.of(c.quantity);
+    const qty = inventoryNumber(c.quantity, 'Component quantity');
     if (!qty.greaterThan(0)) {
       throw validation(`Component quantity must be greater than zero (got ${c.quantity}).`);
     }
@@ -425,13 +440,16 @@ type BuildResult = {
 };
 
 async function buildAssemblyInTx(ctx: ServiceContext, input: BuildInput): Promise<BuildResult> {
-  const buildQty = Money.of(input.quantity);
+  const buildQty = inventoryNumber(input.quantity, 'Build quantity');
   if (!buildQty.greaterThan(0)) {
     throw validation('Build quantity must be greater than zero.');
   }
+  // No date given (the Build Assemblies window): today's calendar day, as every stored document
+  // date — not the current UTC instant, which in the evening west of UTC is already tomorrow.
+  input = { ...input, date: input.date == null ? todayCalendarDay() : inventoryDate(input.date) };
   // A build that moves no value posts no ledger entry, so posting.ts never checks its date: the
   // closing date, closed periods and the Accountant's Copy dividing date are checked here.
-  const periodCheck = await assertPeriodOpen(ctx, input.date ?? new Date(), { sourceRef: 'assembly_build:' });
+  const periodCheck = await assertPeriodOpen(ctx, input.date!, { sourceRef: 'assembly_build:' });
 
   const assembly = await loadItem(ctx, input.assemblyItemId);
   assertInventoryType(assembly, 'assembly');
@@ -555,7 +573,7 @@ async function buildAssemblyInTx(ctx: ServiceContext, input: BuildInput): Promis
 
     // GL: each component's value moves to the assembly's inventory asset account.
     const buildId = randomUUID();
-    const buildDate = input.date ?? new Date();
+    const buildDate = input.date ?? todayCalendarDay();
     for (const bomLine of bom) {
       const comp = componentMap.get(bomLine.componentItemId)!;
       await postValueMove(tx, {
@@ -625,12 +643,13 @@ type UnbuildResult = {
 };
 
 async function unbuildAssemblyInTx(ctx: ServiceContext, input: BuildInput): Promise<UnbuildResult> {
-  const unbuildQty = Money.of(input.quantity);
+  const unbuildQty = inventoryNumber(input.quantity, 'Unbuild quantity');
   if (!unbuildQty.greaterThan(0)) {
     throw validation('Unbuild quantity must be greater than zero.');
   }
+  input = { ...input, date: input.date == null ? todayCalendarDay() : inventoryDate(input.date) }; // as for builds
   // As for builds: an unbuild that moves no value posts nothing, so its date is checked here.
-  const periodCheck = await assertPeriodOpen(ctx, input.date ?? new Date(), { sourceRef: 'assembly_unbuild:' });
+  const periodCheck = await assertPeriodOpen(ctx, input.date!, { sourceRef: 'assembly_unbuild:' });
 
   const assembly = await loadItem(ctx, input.assemblyItemId);
   assertInventoryType(assembly, 'assembly');
@@ -704,7 +723,7 @@ async function unbuildAssemblyInTx(ctx: ServiceContext, input: BuildInput): Prom
 
   return inTransaction(ctx, async (tx) => {
     const unbuildId = randomUUID();
-    const unbuildDate = input.date ?? new Date();
+    const unbuildDate = input.date ?? todayCalendarDay();
     // Restore each component's quantityOnHand, weighting the returned value
     // share into the component's averageCost.
     for (const [idx, line] of returnLines.entries()) {
@@ -894,8 +913,9 @@ export async function createPendingBuild(
   ctx: ServiceContext,
   input: CreatePendingBuildInput,
 ): Promise<PendingBuildRow> {
-  const qty = Money.of(input.quantity);
+  const qty = inventoryNumber(input.quantity, 'Pending build quantity');
   if (!qty.greaterThan(0)) throw validation('Pending build quantity must be greater than zero.');
+  input = { ...input, date: inventoryDate(input.date) };
 
   const assembly = await loadItem(ctx, input.assemblyItemId);
   const bom = await getBom(ctx, input.assemblyItemId);

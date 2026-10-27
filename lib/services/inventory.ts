@@ -30,6 +30,8 @@ import {
   customers,
   jobs,
   inventoryLayers,
+  inventorySites,
+  itemSiteSettings,
   salesOrders,
   salesOrderLines,
   purchaseOrders,
@@ -47,7 +49,8 @@ import {
   itemReceiptBillLines,
   vendorCreditLines,
 } from '@/lib/db/schema';
-import { Money, toAmountString } from '@/lib/money';
+import { Money, type MoneyInput, toAmountString } from '@/lib/money';
+import { MAX_DATE_YEAR, MIN_DATE_YEAR, parseDateInput } from '@/lib/validation/helpers';
 import { homeAmounts } from './currencies';
 import {
   type ServiceContext,
@@ -57,6 +60,48 @@ import {
   validation,
   writeAudit,
 } from './_base';
+
+// ---------------------------------------------------------------------------
+// Input checks shared by the inventory services (quantities, costs, dates typed by the user)
+// ---------------------------------------------------------------------------
+
+/**
+ * A quantity / cost / value as typed by the user (string or number): a plain VALIDATION error
+ * (HTTP 400) for anything that is not a finite number, instead of the MoneyParseError /
+ * NaN that used to surface as an HTTP 500 deep inside a costing path.
+ */
+export function inventoryNumber(value: unknown, label: string): Decimal {
+  let d: Decimal;
+  try {
+    d = Money.of(value as MoneyInput);
+  } catch {
+    throw validation(`${label} must be a number (got "${String(value)}").`);
+  }
+  if (!d.isFinite()) throw validation(`${label} must be a number (got "${String(value)}").`);
+  return d;
+}
+
+/**
+ * A transaction date: a Date, or a date string parsed like every zod-validated route (`zDate`:
+ * a real calendar day in years 1900–9999 — "2026-02-30" is refused, not rolled over to March).
+ * Anything else is a VALIDATION error instead of the RangeError ("Invalid time value") an
+ * Invalid Date throws when it reaches the database.
+ */
+export function inventoryDate(value: unknown, label = 'date'): Date {
+  const bad = () =>
+    validation(`${label}: "${String(value)}" is not a valid date (a real calendar day in years ${MIN_DATE_YEAR}-${MAX_DATE_YEAR}).`);
+  if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) throw bad();
+    const y = value.getUTCFullYear();
+    if (y < MIN_DATE_YEAR || y > MAX_DATE_YEAR) throw bad();
+    return value;
+  }
+  if (typeof value === 'string') {
+    const d = parseDateInput(value);
+    if (d) return d;
+  }
+  throw bad();
+}
 
 /**
  * Guard against costing-method mixing. The average-cost paths in this module (adjustInventory,
@@ -76,11 +121,23 @@ export async function assertNotFifoTracked(ctx: ServiceContext, itemId: string):
   }
 }
 import { assertNotControlLineAccount, postJournalEntry } from './posting';
+import { assertPeriodOpen, recordClosingDateException } from './fiscalPeriods';
+import { activeCopy } from './accountantCopy/guard';
 import { averageAfter, takeAccountantCost } from './accountantCopy/inventoryCost';
 
 // ---------------------------------------------------------------------------
 // Adjustment Account / Class / Customer:Job (QB Adjust Quantity/Value on Hand) — p1 purchases
 // ---------------------------------------------------------------------------
+
+/**
+ * Today's calendar day on this computer, at UTC midnight — the convention every stored document
+ * date uses. Used where an inventory posting has no date of its own (a build without one, merge
+ * rounding): `new Date()` is the current UTC instant, which in the evening west of UTC is already
+ * tomorrow's date (and on Dec 31, next year).
+ */
+export function todayCalendarDay(now: Date = new Date()): Date {
+  return new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
+}
 
 /** QB's default adjustment account name. */
 export const INVENTORY_ADJUSTMENTS_ACCOUNT_NAME = 'Inventory Adjustments';
@@ -252,21 +309,35 @@ export async function setReorderPoint(
     stored = value.toFixed(4);
   }
 
-  const [row] = await ctx.db
-    .update(items)
-    .set({ reorderPoint: stored, updatedAt: new Date() })
-    .where(and(eq(items.companyId, ctx.companyId), eq(items.id, itemId)))
-    .returning();
+  return inTransaction(ctx, async (tx) => {
+    const [row] = await tx.db
+      .update(items)
+      .set({ reorderPoint: stored, updatedAt: new Date() })
+      .where(and(eq(items.companyId, tx.companyId), eq(items.id, itemId)))
+      .returning();
+    // The item's reorder point is the default site's (Inventory Sites › Reorder Points): keep a
+    // default-site settings row, when there is one, showing the same value.
+    await tx.db
+      .update(itemSiteSettings)
+      .set({ reorderPoint: stored, updatedAt: new Date() })
+      .where(
+        and(
+          eq(itemSiteSettings.companyId, tx.companyId),
+          eq(itemSiteSettings.itemId, itemId),
+          sql`${itemSiteSettings.siteId} IN (SELECT ${inventorySites.id} FROM ${inventorySites} WHERE ${inventorySites.companyId} = ${tx.companyId} AND ${inventorySites.isDefault})`,
+        ),
+      );
 
-  await writeAudit(ctx, {
-    action: 'update',
-    entityType: 'item',
-    entityId: itemId,
-    oldValues: { reorderPoint: before.reorderPoint },
-    newValues: { reorderPoint: stored },
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'item',
+      entityId: itemId,
+      oldValues: { reorderPoint: before.reorderPoint },
+      newValues: { reorderPoint: stored },
+    });
+
+    return row;
   });
-
-  return row;
 }
 
 // ---------------------------------------------------------------------------
@@ -368,9 +439,37 @@ export function sellOutRelief(
   return { relief: withRemainder, remainderRelieved: true };
 }
 
+/**
+ * The ledger side of an inventory movement worth $0: no entry (postJournalEntry refuses $0
+ * lines), but the closing date / closed periods / Accountant's Copy dividing date still apply,
+ * and a closing-date password override is recorded, as for a posted adjustment. Returns null.
+ */
+export async function zeroValueAdjustment(tx: ServiceContext, date: Date, itemId: string, description: string): Promise<null> {
+  // An Accountant's Copy sends inventory adjustments back as their journal entries: one that
+  // posts nothing would never reach the client's file.
+  const copy = await activeCopy(tx.db, tx.companyId);
+  if (copy?.side === 'accountant') {
+    throw new ServiceError(
+      'FORBIDDEN',
+      "A quantity change with no value can't be sent back to your client from an Accountant's Copy. Enter it with a unit cost, or let your client enter it.",
+      { accountantCopy: true, side: copy.side },
+    );
+  }
+  const check = await assertPeriodOpen(tx, date, { sourceRef: `item:${itemId}` });
+  await recordClosingDateException(tx, check, {
+    entryId: itemId,
+    operation: 'post',
+    transactionDate: date,
+    description,
+    sourceRef: `item:${itemId}`,
+  });
+  return null;
+}
+
 export async function adjustInventory(ctx: ServiceContext, input: AdjustInventoryInput) {
-  const qtyChange = Money.of(input.quantityChange);
+  const qtyChange = inventoryNumber(input.quantityChange, 'Quantity');
   if (qtyChange.isZero()) throw validation('quantityChange cannot be zero.');
+  input = { ...input, date: inventoryDate(input.date) };
 
   await assertNotFifoTracked(ctx, input.itemId);
   const item = await loadItem(ctx, input.itemId);
@@ -403,7 +502,7 @@ export async function adjustInventory(ctx: ServiceContext, input: AdjustInventor
     if (input.unitCost == null) {
       throw validation('unitCost is required when receiving stock (quantityChange > 0).');
     }
-    const unitCost = Money.of(input.unitCost);
+    const unitCost = inventoryNumber(input.unitCost, 'Unit cost');
     if (unitCost.isNegative()) throw validation('unitCost cannot be negative.');
 
     // Weighted-average cost: (oldQty * oldAvgCost + newQty * newCost) / (oldQty + newQty)
@@ -486,12 +585,17 @@ export async function adjustInventory(ctx: ServiceContext, input: AdjustInventor
       ];
     }
 
-    const entry = await postJournalEntry(tx, {
-      date: input.date,
-      description: input.memo ?? `Inventory adjustment — ${item.name}`,
-      lines: postingLines,
-      sourceRef: `item:${input.itemId}`,
-    });
+    // A quantity change that moves no value (stock received at $0, or removed at a $0 average)
+    // posts no journal entry (a $0 entry cannot be posted); its date is still checked against
+    // the closing date and closed periods like any inventory adjustment.
+    const entry = glAmount.isZero()
+      ? await zeroValueAdjustment(tx, input.date, input.itemId, `Inventory adjustment — ${item.name}`)
+      : await postJournalEntry(tx, {
+          date: input.date,
+          description: input.memo ?? `Inventory adjustment — ${item.name}`,
+          lines: postingLines,
+          sourceRef: `item:${input.itemId}`,
+        });
 
     // Update item quantities and average cost
     await tx.db
@@ -515,12 +619,13 @@ export async function adjustInventory(ctx: ServiceContext, input: AdjustInventor
       newValues: {
         quantityOnHand: newQty.toFixed(4),
         averageCost: newAvgCost.toFixed(4),
-        postedEntryId: entry.id,
+        postedEntryId: entry?.id ?? null,
       },
     });
 
     return {
       item: { id: input.itemId, quantityOnHand: newQty.toFixed(4), averageCost: newAvgCost.toFixed(4) },
+      /** Null for a quantity change that moved no value ($0 cost): nothing was posted. */
       entry,
       glAmount: toAmountString(glAmount),
     };
@@ -560,7 +665,7 @@ export async function cogsAccountForItem(
 }
 
 export async function recordCOGS(ctx: ServiceContext, input: RecordCOGSInput) {
-  const qty = Money.of(input.quantity);
+  const qty = inventoryNumber(input.quantity, 'Quantity');
   if (qty.lessThanOrEqualTo(0)) throw validation('quantity must be positive for COGS recording.');
 
   await assertNotFifoTracked(ctx, input.itemId);
@@ -582,6 +687,14 @@ export async function recordCOGS(ctx: ServiceContext, input: RecordCOGSInput) {
   // Selling the last units also relieves the value remainder (the GL then holds exactly $0).
   const sellOut = sellOutRelief(item, newQty, atAverage);
   const cogsAmount = accountantCost ? Money.round2(accountantCost) : sellOut.relief;
+  if (!cogsAmount.greaterThan(0)) {
+    // A sale is reversed through its COGS entry (void / edit put the units back from it), and a $0
+    // entry cannot be posted: refuse plainly (every sales form), as fifo.ts does for FIFO units —
+    // not with the ledger's "a line must have a debit or a credit".
+    throw validation(
+      `Inventory item "${item.name}" has no cost in the units it would sell. Receive stock with a unit cost (bill or inventory adjustment) before selling it.`,
+    );
+  }
   const newAvgCost =
     accountantCost && !cogsAmount.equals(atAverage)
       ? averageAfter(currentQty, avgCost, newQty, cogsAmount.negated())
@@ -668,12 +781,16 @@ export interface InventoryValuationResult {
 
 /**
  * Inventory valuation covering both costing methods so the grand total ties to
- * the GL inventory asset account:
+ * the GL inventory asset account (QB Inventory Valuation Summary: Asset Value = what the
+ * balance sheet carries):
  *   - FIFO-tracked items (those with inventoryLayers rows) are valued from
  *     their remaining layers: SUM(quantityRemaining * unitCost).
- *   - Average-cost items are valued at quantityOnHand * averageCost.
- * Only active, inventory-type items are included (services/bundles/non-inventory
- * items carry no stock value).
+ *   - Average-cost items are valued at quantityOnHand * averageCost plus the value remainder the
+ *     GL still carries for them (the cents a 4dp average cannot show — 3000 units for $1000.00
+ *     are worth 1000.00, not 3000 x 0.3333 = 999.90).
+ * Inventory-type items only (services/bundles/non-inventory items carry no stock value). An
+ * inactive item is still listed while it holds stock or value — making an item inactive does
+ * not take its stock off the balance sheet.
  */
 export async function inventoryValuation(ctx: ServiceContext): Promise<InventoryValuationResult> {
   const rows = await ctx.db
@@ -681,17 +798,14 @@ export async function inventoryValuation(ctx: ServiceContext): Promise<Inventory
       id: items.id,
       name: items.name,
       sku: items.sku,
+      isActive: items.isActive,
       quantityOnHand: items.quantityOnHand,
       averageCost: items.averageCost,
+      valueRemainder: items.valueRemainder,
+      valueRemainderAvg: items.valueRemainderAvg,
     })
     .from(items)
-    .where(
-      and(
-        eq(items.companyId, ctx.companyId),
-        eq(items.isActive, true),
-        eq(items.type, 'inventory'),
-      ),
-    );
+    .where(and(eq(items.companyId, ctx.companyId), eq(items.type, 'inventory')));
 
   // Aggregate remaining FIFO layers per item. Any item with layer rows is
   // FIFO-tracked (same detection assertNotFifoTracked uses).
@@ -707,15 +821,17 @@ export async function inventoryValuation(ctx: ServiceContext): Promise<Inventory
   const fifoByItem = new Map(layerAgg.map((r) => [r.itemId, r]));
 
   let grandTotal = Money.zero();
-  const valuationRows: InventoryValuationRow[] = rows.map((r) => {
+  const valuationRows: InventoryValuationRow[] = [];
+  for (const r of rows) {
     const fifo = fifoByItem.get(r.id);
 
     if (fifo) {
       const qty = Money.of(fifo.layerQty ?? '0');
       const total = Money.round2(Money.of(fifo.layerValue ?? '0'));
+      if (!r.isActive && qty.isZero() && total.isZero()) continue;
       const effectiveUnitCost = qty.isZero() ? Money.zero() : total.dividedBy(qty);
       grandTotal = grandTotal.plus(total);
-      return {
+      valuationRows.push({
         id: r.id,
         name: r.name,
         sku: r.sku ?? null,
@@ -723,14 +839,16 @@ export async function inventoryValuation(ctx: ServiceContext): Promise<Inventory
         averageCost: effectiveUnitCost.toFixed(4),
         totalValue: toAmountString(total),
         costingMethod: 'fifo' as const,
-      };
+      });
+      continue;
     }
 
     const qty = Money.of(r.quantityOnHand ?? '0');
     const avg = Money.of(r.averageCost ?? '0');
-    const total = Money.round2(qty.times(avg));
+    const total = Money.round2(qty.times(avg)).plus(carriedValueRemainder(r));
+    if (!r.isActive && qty.isZero() && total.isZero()) continue;
     grandTotal = grandTotal.plus(total);
-    return {
+    valuationRows.push({
       id: r.id,
       name: r.name,
       sku: r.sku ?? null,
@@ -738,8 +856,8 @@ export async function inventoryValuation(ctx: ServiceContext): Promise<Inventory
       averageCost: avg.toFixed(4),
       totalValue: toAmountString(total),
       costingMethod: 'average' as const,
-    };
-  });
+    });
+  }
 
   return {
     items: valuationRows,
@@ -1315,28 +1433,31 @@ export async function inventoryValuationAsOf(
   ctx: ServiceContext,
   asOf: Date,
 ): Promise<ValuationAsOfResult> {
+  // Every inventory item: an inactive one is still listed while it carried value at the date
+  // (making an item inactive does not take its stock off the balance sheet).
   const itemRows = await ctx.db
     .select({
       id: items.id,
       name: items.name,
       sku: items.sku,
+      isActive: items.isActive,
       averageCost: items.averageCost,
       assetAccountId: items.assetAccountId,
     })
     .from(items)
-    .where(
-      and(eq(items.companyId, ctx.companyId), eq(items.isActive, true), eq(items.type, 'inventory')),
-    );
+    .where(and(eq(items.companyId, ctx.companyId), eq(items.type, 'inventory')));
 
   const accountMap = await inventoryAccountMap(ctx, itemRows);
   const movements = await loadItemGlMovements(ctx, accountMap, asOf);
   const costs = await currentUnitCosts(ctx, itemRows);
 
   let grandTotal = Money.zero();
+  const valueOf = (id: string) =>
+    (movements.get(id) ?? []).reduce((s, m) => s.plus(m.debit).minus(m.credit), Money.zero());
   const rows: ValuationAsOfRow[] = itemRows
+    .filter((r) => r.isActive || !Money.round2(valueOf(r.id)).isZero())
     .map((r) => {
-      const moves = movements.get(r.id) ?? [];
-      const value = moves.reduce((s, m) => s.plus(m.debit).minus(m.credit), Money.zero());
+      const value = valueOf(r.id);
       grandTotal = grandTotal.plus(value);
       const costInfo = costs.get(r.id) ?? { cost: null, costingMethod: 'average' as const };
       const qty = costInfo.cost ? value.dividedBy(costInfo.cost) : null;

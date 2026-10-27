@@ -293,7 +293,8 @@ describe('Enhanced receiving', () => {
       .filter((l) => Number(l.quantityRemaining) > 0)
       .map((l) => `${Number(l.quantityRemaining)}@${l.unitCost}`)
       .sort();
-    expect(layers).toEqual(['2@8.0000', '2@8.0000']);
+    // The re-costed half goes back into the receipt's layer (one layer, exactly as received).
+    expect(layers).toEqual(['4@8.0000']);
     expect((await getItemReceipt(ctx, receipt.id)).status).toBe('open');
     await expectBalanced();
   });

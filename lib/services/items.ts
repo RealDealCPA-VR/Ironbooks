@@ -15,6 +15,7 @@ import { and, asc, eq, ilike, ne, sql } from 'drizzle-orm';
 import { accounts, assemblyComponents, inventoryLayers, inventoryMovements, items } from '@/lib/db/schema';
 import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from './_base';
 import { Money } from '@/lib/money';
+import { isInventoryAssetAccount, qbAccountTypeLabel } from '@/lib/accountTypes';
 import { assertItemTypeAllowed } from '@/lib/featureGate';
 import { assertNotControlLineAccount } from './posting';
 import { type TrackingMode, TRACKING_MODES, assertTrackingModeChangeAllowed } from './inventorySites';
@@ -118,6 +119,7 @@ async function requireAccount(
   accountId: string,
   label: string,
   expectedType?: string,
+  opts: { inventoryAsset?: boolean } = {},
 ): Promise<void> {
   const [row] = await ctx.db
     .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype, name: accounts.name })
@@ -129,6 +131,14 @@ async function requireAccount(
   if (expectedType && row.type !== expectedType) {
     throw validation(
       `${label} account must be a "${expectedType}" account (got "${row.type}").`,
+    );
+  }
+  // QB lists only Other Current Asset accounts as an item's Asset Account: stock value posted to a
+  // bank, Undeposited Funds or a fixed asset would land in that register / the deposit picker.
+  if (opts.inventoryAsset && !isInventoryAssetAccount(row)) {
+    throw validation(
+      `"${row.name}" is ${qbAccountTypeLabel(row) === 'Other Current Asset' ? 'Undeposited Funds' : `a ${qbAccountTypeLabel(row)} account`}. ` +
+        "An item's asset account must be an Other Current Asset account such as Inventory Asset.",
     );
   }
 }
@@ -143,6 +153,12 @@ async function resolveAccountLinks(
     CreateItemInput,
     'type' | 'incomeAccountId' | 'expenseAccountId' | 'assetAccountId'
   >,
+  /**
+   * Whether the asset account is being chosen (a new item, or an edit that changes it): only then
+   * must it be an Other Current Asset. An item already on another asset account (older files,
+   * whose Edit Item offered every asset account) saves unchanged — its forms resend the account.
+   */
+  opts: { assetAccountChosen?: boolean } = { assetAccountChosen: true },
 ): Promise<void> {
   if (input.incomeAccountId) {
     await requireAccount(ctx, input.incomeAccountId, 'Income', 'revenue');
@@ -151,7 +167,7 @@ async function resolveAccountLinks(
     await requireAccount(ctx, input.expenseAccountId, 'Expense/COGS', 'expense');
   }
   if (input.assetAccountId) {
-    await requireAccount(ctx, input.assetAccountId, 'Asset', 'asset');
+    await requireAccount(ctx, input.assetAccountId, 'Asset', 'asset', { inventoryAsset: opts.assetAccountChosen !== false });
   }
 
   // Inventory items should have an asset account so inventory tracking is
@@ -409,6 +425,13 @@ async function assertAssetAccountChangeAllowed(
  * uniqueness (if being changed) and account-link types.
  */
 export async function updateItem(ctx: ServiceContext, id: string, patch: UpdateItemInput) {
+  // Read, check and write in ONE transaction (as createItem does): two saves at once must not
+  // both pass the unique-name / barcode checks (two items named alike, or the barcode index's raw
+  // error), and the change and its audit row are written together.
+  return inTransaction(ctx, (tx) => updateItemInTx(tx, id, patch));
+}
+
+async function updateItemInTx(ctx: ServiceContext, id: string, patch: UpdateItemInput) {
   const before = await getItem(ctx, id);
   await assertAccountantListEdit(ctx, 'item', before as Record<string, unknown>, patch as Record<string, unknown>); // I1
   // Making an item inactive (PATCH isActive: false) is deleting it: refused like deactivateItem
@@ -464,7 +487,7 @@ export async function updateItem(ctx: ServiceContext, id: string, patch: UpdateI
       patch.expenseAccountId !== undefined ? patch.expenseAccountId : undefined,
     assetAccountId:
       patch.assetAccountId !== undefined ? patch.assetAccountId : undefined,
-  });
+  }, { assetAccountChosen: patch.assetAccountId !== before.assetAccountId });
 
   // ── Advanced Inventory fields ───────────────────────────────────────────
   const barcode =

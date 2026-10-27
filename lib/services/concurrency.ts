@@ -110,10 +110,11 @@ const LABELS: Record<VersionedEntity, string> = {
 
 /**
  * The record field carrying the version. Accounts use editedAt: their updated_at also moves when
- * a posting changes the cached balance, which must not make an open account form stale.
+ * a posting changes the cached balance, which must not make an open account form stale. Items
+ * likewise (0067): every sale / receipt writes their quantity on hand and average cost.
  */
 export function versionField(entity: VersionedEntity): 'updatedAt' | 'editedAt' {
-  return entity === 'account' ? 'editedAt' : 'updatedAt';
+  return entity === 'account' || entity === 'item' ? 'editedAt' : 'updatedAt';
 }
 
 /** Parse the expected version from a request (header), or null when absent/invalid. */

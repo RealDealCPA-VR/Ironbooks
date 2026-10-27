@@ -14,12 +14,14 @@
  * default as inventory.adjustInventory / fifo.ts), with optional Class and Customer:Job on the
  * adjustment line.
  */
-import { and, asc, eq, inArray, isNotNull, sql } from 'drizzle-orm';
+import { and, asc, eq, gte, inArray, isNotNull, notInArray, sql } from 'drizzle-orm';
 import Decimal from 'decimal.js';
 import {
   accounts,
+  auditLogs,
   items,
   inventoryLayers,
+  inventoryMovements,
   inventorySites,
   itemSiteSettings,
   purchaseOrderLines,
@@ -42,10 +44,13 @@ import {
   assertNotFifoTracked,
   bookValueRelief,
   fifoLayerValue,
+  inventoryDate,
+  inventoryNumber,
   resolveAdjustmentAccount,
   carriedValueRemainder,
   sellOutRelief,
   valueRemainderAfter,
+  zeroValueAdjustment,
 } from './inventory';
 import { postJournalEntry } from './posting';
 import { assertDefaultSiteQuantities } from './inventorySites';
@@ -62,6 +67,56 @@ async function accountIdByCode(ctx: ServiceContext, code: string): Promise<strin
     .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, code)));
   if (!row) throw notFound(`Account with code ${code}`);
   return row.id;
+}
+
+/**
+ * Net quantity of an item moved by transactions dated AFTER `date`'s calendar day (sales, receipts,
+ * returns, adjustments, builds: their site movements, reversals included — a voided document
+ * nets to zero). Transfers and default-site rebalances move stock between sites, not in or out.
+ * Physical counts and opening stock write no site movement, so theirs come from their audit rows
+ * (a count records its date and the quantity before / after; opening stock its as-of date and
+ * quantity): a later-dated count entered first is then not taken for stock on hand at `date`.
+ * Used to put a back-dated count against the quantity on hand at its date.
+ */
+async function netMovedAfter(ctx: ServiceContext, itemId: string, date: Date): Promise<Decimal> {
+  const nextDay = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate() + 1));
+  const [row] = await ctx.db
+    .select({ qty: sql<string>`COALESCE(SUM(${inventoryMovements.quantity}), 0)` })
+    .from(inventoryMovements)
+    .where(
+      and(
+        eq(inventoryMovements.companyId, ctx.companyId),
+        eq(inventoryMovements.itemId, itemId),
+        gte(inventoryMovements.date, nextDay),
+        notInArray(inventoryMovements.sourceType, ['transfer', 'site_rebalance']),
+      ),
+    );
+  const after = nextDay.toISOString();
+  const countDate = sql`(${auditLogs.newValues}->>'physicalCountDate')`;
+  const openingAsOf = sql`(${auditLogs.newValues}->'openingStock'->>'asOf')`;
+  const [audited] = await ctx.db
+    .select({
+      qty: sql<string>`COALESCE(SUM(CASE
+        WHEN ${countDate} IS NOT NULL
+          THEN (${auditLogs.newValues}->>'quantityOnHand')::numeric - COALESCE((${auditLogs.oldValues}->>'quantityOnHand')::numeric, 0)
+        ELSE (${auditLogs.newValues}->'openingStock'->>'quantity')::numeric
+      END), 0)`,
+    })
+    .from(auditLogs)
+    .where(
+      and(
+        eq(auditLogs.companyId, ctx.companyId),
+        eq(auditLogs.entityType, 'item'),
+        eq(auditLogs.entityId, itemId),
+        sql`(
+          (${countDate} IS NOT NULL AND (${auditLogs.newValues}->>'quantityOnHand') IS NOT NULL
+            AND ${countDate}::timestamptz >= ${after}::timestamptz)
+          OR (${openingAsOf} IS NOT NULL AND (${auditLogs.newValues}->'openingStock'->>'quantity') IS NOT NULL
+            AND ${openingAsOf}::timestamptz >= ${after}::timestamptz)
+        )`,
+      ),
+    );
+  return Money.of(row?.qty ?? '0').plus(Money.of(audited?.qty ?? '0'));
 }
 
 /** Load an inventory-type item scoped to the company. Throws NOT_FOUND. */
@@ -260,10 +315,14 @@ export interface PhysicalCountResult {
 /**
  * Record a physical inventory count adjustment.
  *
- * delta = countedQty - currentQty
+ * delta = countedQty - quantity on hand AT the count date (today's quantity less what
+ * transactions dated after the count moved — see netMovedAfter); today's quantity moves by delta.
  *   - delta < 0 (shrinkage): Dr adjustmentAccount, Cr Inventory Asset
  *   - delta > 0 (overage):   Dr Inventory Asset, Cr adjustmentAccount
  *   - delta = 0: no GL posted, qty unchanged
+ * (A $0 count posts no entry but still answers to the closing date.) Later-dated counts and
+ * opening stock count among those transactions too (from their audit rows — they write no site
+ * movement), so counts entered out of date order each compare with the books at their own date.
  */
 export async function physicalCount(
   ctx: ServiceContext,
@@ -278,7 +337,8 @@ async function physicalCountInTx(
   ctx: ServiceContext,
   input: PhysicalCountInput,
 ): Promise<PhysicalCountResult> {
-  const counted = Money.of(input.countedQty);
+  const counted = inventoryNumber(input.countedQty, 'Counted quantity');
+  input = { ...input, date: inventoryDate(input.date) };
   if (counted.isNegative()) {
     throw validation('countedQty cannot be negative.');
   }
@@ -305,13 +365,24 @@ async function physicalCountInTx(
   const currentQty = Money.of(item.quantityOnHand ?? '0');
   const avgCost = Money.of(item.averageCost ?? '0');
 
-  const delta = counted.minus(currentQty);
+  // The count is compared with the quantity on hand AT its date, as QB's Adjust Quantity window
+  // does: a month-end count entered after the next month's sales / receipts must not book those
+  // as shrinkage / overage. Quantity at the date = today's less what later-dated transactions
+  // moved (their site movements; reversals carry the original's date and cancel out).
+  const qtyAtDate = currentQty.minus(await netMovedAfter(ctx, item.id, input.date));
+  const delta = counted.minus(qtyAtDate);
+  const newQty = currentQty.plus(delta);
+  if (newQty.isNegative()) {
+    throw validation(
+      `Counting ${counted.toFixed(4)} "${item.name}" on ${input.date.toISOString().slice(0, 10)} would leave ${newQty.toFixed(4)} on hand today, because transactions dated after the count took more than that out. Check the count date and those transactions.`,
+    );
+  }
 
-  // No change — update qty to match counted (no-op if equal) and return early
+  // No change — the count agrees with the books at its date.
   if (delta.isZero()) {
     return {
       itemId: item.id,
-      previousQty: currentQty.toFixed(4),
+      previousQty: qtyAtDate.toFixed(4),
       countedQty: counted.toFixed(4),
       delta: '0.0000',
       glAmount: '0.00',
@@ -323,8 +394,8 @@ async function physicalCountInTx(
 
   // Book value before minus after (telescopes: counting to zero clears the item's value exactly);
   // counting to zero also takes the value remainder the GL still carries (0061), like a sell-out.
-  const atBook = bookValueRelief(currentQty, counted, avgCost);
-  const sellOut = delta.isNegative() ? sellOutRelief(item, counted, atBook) : { relief: atBook, remainderRelieved: false };
+  const atBook = bookValueRelief(currentQty, newQty, avgCost);
+  const sellOut = delta.isNegative() ? sellOutRelief(item, newQty, atBook) : { relief: atBook, remainderRelieved: false };
   const glAmount = sellOut.relief.abs();
 
   return inTransaction(ctx, async (tx) => {
@@ -369,18 +440,24 @@ async function physicalCountInTx(
           },
         ];
 
-    const entry = glAmount.isZero() ? null : await postJournalEntry(tx, {
-      date: input.date,
-      description: `Physical inventory count adjustment — ${item.name}`,
-      lines: postingLines,
-      sourceRef: `item:${input.itemId}`,
-    });
+    // A count difference worth $0 (stock with no cost) posts no entry, but its date is still
+    // checked against the closing date / closed periods (and a password override recorded), as
+    // for a posted count — otherwise a count dated in a closed period changed quantities there.
+    const entry = glAmount.isZero()
+      ? await zeroValueAdjustment(tx, input.date, input.itemId, `Physical inventory count adjustment — ${item.name}`)
+      : await postJournalEntry(tx, {
+          date: input.date,
+          description: `Physical inventory count adjustment — ${item.name}`,
+          lines: postingLines,
+          sourceRef: `item:${input.itemId}`,
+        });
 
-    // Update the item's quantityOnHand to the counted qty
+    // Apply the count's difference to today's quantity (= the counted quantity when nothing
+    // dated after the count moved the item).
     await tx.db
       .update(items)
       .set({
-        quantityOnHand: counted.toFixed(4),
+        quantityOnHand: newQty.toFixed(4),
         ...(sellOut.remainderRelieved ? { valueRemainder: '0.00', valueRemainderAvg: avgCost.toFixed(4) } : {}),
         updatedAt: new Date(),
       })
@@ -395,7 +472,9 @@ async function physicalCountInTx(
       entityId: input.itemId,
       oldValues: { quantityOnHand: item.quantityOnHand },
       newValues: {
-        quantityOnHand: counted.toFixed(4),
+        quantityOnHand: newQty.toFixed(4),
+        countedQty: counted.toFixed(4),
+        quantityAtCountDate: qtyAtDate.toFixed(4),
         physicalCountDate: input.date.toISOString(),
         postedEntryId: entry?.id ?? null,
       },
@@ -403,13 +482,13 @@ async function physicalCountInTx(
 
     return {
       itemId: item.id,
-      previousQty: currentQty.toFixed(4),
+      previousQty: qtyAtDate.toFixed(4),
       countedQty: counted.toFixed(4),
       delta: delta.toFixed(4),
       glAmount: toAmountString(glAmount),
       journalEntryId: entry?.id ?? null,
       adjustmentAccountId,
-      updatedQty: counted.toFixed(4),
+      updatedQty: newQty.toFixed(4),
     };
   });
 }
@@ -478,6 +557,9 @@ async function adjustInventoryValueInTx(
   if (hasTotal === hasUnit) {
     throw validation('Provide exactly one of newTotalValue or newUnitCost.');
   }
+  if (hasTotal) inventoryNumber(input.newTotalValue, 'New total value');
+  if (hasUnit) inventoryNumber(input.newUnitCost, 'New unit cost');
+  input = { ...input, date: inventoryDate(input.date) };
 
   const item = await loadInventoryItem(ctx, input.itemId);
   if (item.type !== 'inventory') {
@@ -700,9 +782,16 @@ export async function batchPhysicalCount(
   ctx: ServiceContext,
   input: { date: Date; counts: BatchCountEntry[] } & AdjustmentDimensions,
 ): Promise<BatchCountResult> {
-  if (!input.counts || input.counts.length === 0) {
+  if (!Array.isArray(input.counts) || input.counts.length === 0) {
     throw validation('counts must contain at least one entry.');
   }
+  for (const [i, c] of input.counts.entries()) {
+    if (!c || typeof c !== 'object' || typeof c.itemId !== 'string' || !c.itemId) {
+      throw validation(`Count ${i + 1}: an item id and a counted quantity are required.`);
+    }
+  }
+  // One date for the whole sheet: a bad one fails the batch up front (not every item as "skipped").
+  input = { ...input, date: inventoryDate(input.date) };
   const seen = new Set<string>();
   for (const c of input.counts) {
     if (seen.has(c.itemId)) throw validation('Duplicate itemId in counts.');

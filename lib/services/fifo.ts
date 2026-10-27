@@ -20,9 +20,9 @@
  * expense account created when missing — inventory.ts ensureInventoryAdjustmentAccount), with
  * Class and Customer:Job on the adjustment line, like QB. Owner's Equity is never the offset.
  */
-import { and, asc, eq, sql } from 'drizzle-orm';
+import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import Decimal from 'decimal.js';
-import { items, accounts, inventoryLayers } from '@/lib/db/schema';
+import { items, accounts, auditLogs, inventoryLayers } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import {
   type ServiceContext,
@@ -33,7 +33,18 @@ import {
   writeAudit,
 } from './_base';
 import { postJournalEntry } from './posting';
-import { type AdjustmentDimensions, adjustmentPostingFields, cogsAccountForItem, fifoLayerValue, resolveAdjustmentAccount } from './inventory';
+import {
+  type AdjustmentDimensions,
+  adjustmentPostingFields,
+  cogsAccountForItem,
+  carriedValueRemainder,
+  fifoLayerValue,
+  inventoryDate,
+  inventoryNumber,
+  resolveAdjustmentAccount,
+  todayCalendarDay,
+  zeroValueAdjustment,
+} from './inventory';
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -60,6 +71,63 @@ async function loadItem(ctx: ServiceContext, itemId: string) {
 }
 
 // ---------------------------------------------------------------------------
+// insertLayersWorth — new cost layers worth exactly a posted amount
+// ---------------------------------------------------------------------------
+
+export interface LayersWorthInput {
+  itemId: string;
+  date: Date;
+  /** Units received (> 0). */
+  qty: Decimal;
+  /** The amount the document posted to the inventory account for them (2dp, >= 0). */
+  value: Decimal;
+  /** inventory_layers.source_ref (the document that created the units), when it has one. */
+  sourceRef?: string | null;
+}
+
+/**
+ * Insert FIFO cost layers for `qty` units worth exactly `value` — what the document posted to the
+ * inventory account. Unit cost is stored to 4 decimals and a layer is worth round2(qty x cost)
+ * (fifoLayerValue), so one layer cannot always carry the amount: 3000 units for $1,000.00 at
+ * 0.3333 are worth 999.90. Then one unit is split off into its own layer carrying the cents
+ * (same date and source, so FIFO order and the document's reversal are unchanged) — the rule
+ * landed cost uses (landedCost.ts revalueLayer). Fractional quantities of one unit or less keep a
+ * single layer at the nearest cost. Must run inside the caller's transaction.
+ */
+export async function insertLayersWorth(tx: ServiceContext, input: LayersWorthInput) {
+  const { itemId, date, qty } = input;
+  const base = { companyId: tx.companyId, itemId, date, sourceRef: input.sourceRef ?? null };
+  return tx.db
+    .insert(inventoryLayers)
+    .values(
+      layersWorth(qty, input.value).map((p) => ({ ...base, quantityRemaining: p.qty.toFixed(4), unitCost: p.unitCost.toFixed(4) })),
+    )
+    .returning();
+}
+
+/**
+ * The (quantity, 4dp unit cost) pieces insertLayersWorth stores for `qty` units worth `value`:
+ * one piece at the nearest cost when that is worth exactly `value` (or the quantity is one unit
+ * or less), else (qty - 1) units at the cost rounded DOWN (never worth more than `value`) and one
+ * unit at the cents that leaves — together exactly `value`. Pure; used to find / re-cost a
+ * document's layers (receiving.ts).
+ */
+export function layersWorth(qty: Decimal, value0: Decimal): Array<{ qty: Decimal; unitCost: Decimal }> {
+  const value = Money.round2(value0);
+  const nearest = qty.isZero() ? Money.zero() : Money.of(value.dividedBy(qty).toFixed(4));
+  if (fifoLayerValue(qty, nearest).equals(value) || !qty.greaterThan(1) || value.isNegative()) {
+    return [{ qty, unitCost: nearest }];
+  }
+  const rest = qty.minus(1);
+  const restCost = value.dividedBy(qty).toDecimalPlaces(4, Decimal.ROUND_DOWN);
+  const lastCost = value.minus(fifoLayerValue(rest, restCost));
+  return [
+    { qty: rest, unitCost: restCost },
+    { qty: Money.of('1'), unitCost: lastCost },
+  ];
+}
+
+// ---------------------------------------------------------------------------
 // seedOpeningLayer
 // ---------------------------------------------------------------------------
 
@@ -79,30 +147,44 @@ export async function seedOpeningLayer(tx: ServiceContext, itemId: string, date:
     .limit(1);
   if (anyLayer) return;
   const [current] = await tx.db
-    .select({ quantityOnHand: items.quantityOnHand, averageCost: items.averageCost })
+    .select({
+      quantityOnHand: items.quantityOnHand,
+      averageCost: items.averageCost,
+      valueRemainder: items.valueRemainder,
+      valueRemainderAvg: items.valueRemainderAvg,
+    })
     .from(items)
     .where(and(eq(items.companyId, tx.companyId), eq(items.id, itemId)));
-  const openingQty = Money.of(current?.quantityOnHand ?? '0');
+  if (!current) return;
+  const openingQty = Money.of(current.quantityOnHand ?? '0');
   if (!openingQty.greaterThan(0)) return;
-  const unitCost = Money.of(current?.averageCost ?? '0').toFixed(4);
-  const [opening] = await tx.db
-    .insert(inventoryLayers)
-    .values({
-      companyId: tx.companyId,
-      itemId,
-      date,
-      quantityRemaining: openingQty.toFixed(4),
-      unitCost,
-    })
-    .returning();
+  // What the GL carries for the stock: its book value plus the value remainder (0061) the 4dp
+  // average could not show — the layers take both, so the GL stays equal to the FIFO valuation and
+  // using the last unit clears the account to $0.
+  const value = Money.round2(openingQty.times(Money.of(current.averageCost ?? '0'))).plus(carriedValueRemainder(current));
+  const opening = await insertLayersWorth(tx, { itemId, date, qty: openingQty, value });
+  // The stock already on hand is older than whatever this transaction adds next (a receipt or
+  // adjustment on the same date shares created_at, and takeFromLayers would break that tie by the
+  // random id): the opening layer sorts a millisecond earlier, so it is drawn first.
+  await tx.db
+    .update(inventoryLayers)
+    .set({ createdAt: sql`${inventoryLayers.createdAt} - interval '1 millisecond'` })
+    .where(and(eq(inventoryLayers.companyId, tx.companyId), inArray(inventoryLayers.id, opening.map((l) => l.id))));
+  if (!Money.of(current.valueRemainder ?? '0').isZero()) {
+    await tx.db
+      .update(items)
+      .set({ valueRemainder: '0.00', valueRemainderAvg: null, updatedAt: new Date() })
+      .where(and(eq(items.companyId, tx.companyId), eq(items.id, itemId)));
+  }
   await writeAudit(tx, {
     action: 'create',
     entityType: 'inventory_layer',
-    entityId: opening.id,
+    entityId: opening[0].id,
     newValues: {
       itemId,
       quantity: openingQty.toFixed(4),
-      unitCost,
+      value: toAmountString(value),
+      layers: opening.map((l) => ({ id: l.id, quantity: l.quantityRemaining, unitCost: l.unitCost })),
       reason: 'opening layer for existing average-cost stock',
     },
   });
@@ -126,7 +208,8 @@ export interface ReceiveStockResult {
   quantity: string;
   unitCost: string;
   totalCost: string;
-  entryId: string;
+  /** Null when the stock was received at $0 (nothing posted). */
+  entryId: string | null;
 }
 
 /**
@@ -138,11 +221,12 @@ export async function receiveStock(
   ctx: ServiceContext,
   input: ReceiveStockInput,
 ): Promise<ReceiveStockResult> {
-  const qty = Money.of(input.quantity);
+  const qty = inventoryNumber(input.quantity, 'Quantity');
   if (qty.lessThanOrEqualTo(0)) throw validation('quantity must be positive.');
 
-  const unitCost = Money.of(input.unitCost);
+  const unitCost = inventoryNumber(input.unitCost, 'Unit cost');
   if (unitCost.isNegative()) throw validation('unitCost cannot be negative.');
+  input = { ...input, date: inventoryDate(input.date) };
 
   // Validate item exists in company scope
   const item = await loadItem(ctx, input.itemId);
@@ -156,37 +240,30 @@ export async function receiveStock(
 
     await seedOpeningLayer(tx, input.itemId, input.date);
 
-    // Post GL: Dr Inventory, Cr Adjustment Account
-    const entry = await postJournalEntry(tx, {
-      date: input.date,
-      description: input.memo ?? `Inventory adjustment — ${item.name}`,
-      lines: [
-        {
-          accountId: inventoryAccountId,
-          debit: toAmountString(totalCost),
-          memo: input.memo ?? 'FIFO stock receipt',
-        },
-        {
-          accountId: offsetAccountId,
-          credit: toAmountString(totalCost),
-          memo: input.memo ?? 'Inventory adjustment',
-          ...dims,
-        },
-      ],
-      sourceRef: `item:${input.itemId}`,
-    });
+    // Post GL: Dr Inventory, Cr Adjustment Account (stock received at $0 posts nothing).
+    const entry = totalCost.isZero()
+      ? await zeroValueAdjustment(tx, input.date, input.itemId, `Inventory adjustment — ${item.name}`)
+      : await postJournalEntry(tx, {
+          date: input.date,
+          description: input.memo ?? `Inventory adjustment — ${item.name}`,
+          lines: [
+            {
+              accountId: inventoryAccountId,
+              debit: toAmountString(totalCost),
+              memo: input.memo ?? 'FIFO stock receipt',
+            },
+            {
+              accountId: offsetAccountId,
+              credit: toAmountString(totalCost),
+              memo: input.memo ?? 'Inventory adjustment',
+              ...dims,
+            },
+          ],
+          sourceRef: `item:${input.itemId}`,
+        });
 
-    // Insert the inventory cost layer
-    const [layer] = await tx.db
-      .insert(inventoryLayers)
-      .values({
-        companyId: tx.companyId,
-        itemId: input.itemId,
-        date: input.date,
-        quantityRemaining: qty.toFixed(4),
-        unitCost: unitCost.toFixed(4),
-      })
-      .returning();
+    // Insert the inventory cost layer(s): worth exactly what the entry posted.
+    const [layer] = await insertLayersWorth(tx, { itemId: input.itemId, date: input.date, qty, value: totalCost });
 
     // Also keep item.quantityOnHand in sync
     await tx.db
@@ -206,7 +283,7 @@ export async function receiveStock(
         quantity: qty.toFixed(4),
         unitCost: unitCost.toFixed(4),
         totalCost: toAmountString(totalCost),
-        entryId: entry.id,
+        entryId: entry?.id ?? null,
       },
     });
 
@@ -216,7 +293,7 @@ export async function receiveStock(
       quantity: qty.toFixed(4),
       unitCost: unitCost.toFixed(4),
       totalCost: toAmountString(totalCost),
-      entryId: entry.id,
+      entryId: entry?.id ?? null,
     };
   });
 }
@@ -247,11 +324,14 @@ export async function takeFromLayers(
   itemId: string,
   qty: Decimal,
 ): Promise<{ cost: Decimal; layers: ConsumedLayer[] }> {
+  // Oldest first; layers written in one transaction share created_at (a bill's lines, the unit
+  // insertLayersWorth splits off), so the id settles their order — the same sale always draws
+  // the same units (a re-saved invoice costs the same).
   const layers = await tx.db
     .select()
     .from(inventoryLayers)
     .where(and(eq(inventoryLayers.companyId, tx.companyId), eq(inventoryLayers.itemId, itemId)))
-    .orderBy(asc(inventoryLayers.date), asc(inventoryLayers.createdAt));
+    .orderBy(asc(inventoryLayers.date), asc(inventoryLayers.createdAt), asc(inventoryLayers.id));
   const available = layers.filter((l) => Money.of(l.quantityRemaining).greaterThan(0));
   const totalAvailable = available.reduce((sum, l) => sum.plus(Money.of(l.quantityRemaining)), Money.zero());
   if (qty.greaterThan(totalAvailable)) {
@@ -387,32 +467,157 @@ export async function takeFromDocumentLayers(
   // 4-decimal unit cost times the quantity, or a value adjustment smaller than that). The voided
   // entry takes the posted amount off the GL; true the inventory account up to the value the
   // layers actually gave back (against the item's COGS account), so GL == valuation to the cent.
-  const trueUp = Money.round2(input.expectedValue).minus(Money.round2(value));
-  if (!trueUp.isZero()) {
-    const [item] = await tx.db
-      .select({ assetAccountId: items.assetAccountId, expenseAccountId: items.expenseAccountId })
-      .from(items)
-      .where(and(eq(items.companyId, tx.companyId), eq(items.id, input.itemId)));
-    const inventoryAccountId = item?.assetAccountId ?? (await accountIdByCode(tx, '1300'));
-    const offsetAccountId = await cogsAccountForItem(tx, item ?? {});
-    const amount = toAmountString(trueUp.abs());
-    const memo = `Rounding — ${input.itemName} (${input.action})`;
-    await postJournalEntry(tx, {
-      date: input.trueUpDate ?? new Date(),
-      description: memo,
-      sourceRef: `item:${input.itemId}`,
-      lines: trueUp.greaterThan(0)
-        ? [
-            { accountId: inventoryAccountId, debit: amount, memo },
-            { accountId: offsetAccountId, credit: amount, memo },
-          ]
-        : [
-            { accountId: offsetAccountId, debit: amount, memo },
-            { accountId: inventoryAccountId, credit: amount, memo },
-          ],
-    });
-  }
+  await postInventoryTrueUp(tx, {
+    itemId: input.itemId,
+    itemName: input.itemName,
+    amount: Money.round2(input.expectedValue).minus(Money.round2(value)),
+    date: input.trueUpDate ?? todayCalendarDay(),
+    action: input.action,
+  });
   return { cost: Money.round2(value) };
+}
+
+/**
+ * Rounding true-up between an item's inventory asset account and its COGS account: `amount` > 0
+ * debits inventory, < 0 credits it; $0 posts nothing. Used when a reversal moves the layers by a
+ * cent more or less than the voided entry moved the GL, so GL == FIFO valuation to the cent.
+ * (Also used by receivingLinks.releaseReceiptBilling when a bill void restores re-costed layers.)
+ */
+export async function postInventoryTrueUp(
+  tx: ServiceContext,
+  input: { itemId: string; itemName: string; amount: Decimal; date: Date; action: string },
+): Promise<void> {
+  const trueUp = Money.round2(input.amount);
+  if (trueUp.isZero()) return;
+  const [item] = await tx.db
+    .select({ assetAccountId: items.assetAccountId, expenseAccountId: items.expenseAccountId })
+    .from(items)
+    .where(and(eq(items.companyId, tx.companyId), eq(items.id, input.itemId)));
+  const inventoryAccountId = item?.assetAccountId ?? (await accountIdByCode(tx, '1300'));
+  const offsetAccountId = await cogsAccountForItem(tx, item ?? {});
+  const amount = toAmountString(trueUp.abs());
+  const memo = `Rounding — ${input.itemName} (${input.action})`;
+  await postJournalEntry(tx, {
+    date: input.date,
+    description: memo,
+    sourceRef: `item:${input.itemId}`,
+    lines: trueUp.greaterThan(0)
+      ? [
+          { accountId: inventoryAccountId, debit: amount, memo },
+          { accountId: offsetAccountId, credit: amount, memo },
+        ]
+      : [
+          { accountId: offsetAccountId, debit: amount, memo },
+          { accountId: inventoryAccountId, credit: amount, memo },
+        ],
+  });
+}
+
+export interface ConsumptionRestore {
+  itemId: string;
+  itemName: string;
+  /** The journal entry consumeStock posted for the units (its audit row records the layers drawn). */
+  entryId: string;
+  qty: Decimal;
+  /** The value the voided COGS entry gives back to the inventory account. */
+  value: Decimal;
+  /** The sale's date: a fallback layer's date and a rounding true-up's date. */
+  date: Date;
+  /** What is being undone, for the true-up memo (e.g. "void invoice"). */
+  action: string;
+}
+
+/**
+ * Put the units a FIFO sale (consumeStock) took back into the layers they came from, for a void /
+ * edit of the sale (whose COGS entry is voided, so exactly `value` returns to the GL). Returning
+ * them as a NEW layer dated the sale put them behind every receipt in between: re-saving an
+ * unchanged invoice re-costed the sale out of the newer, dearer layers, and the next sale after a
+ * void was costed out of FIFO order.
+ *  - The layers drawn are the ones consumeStock recorded for the entry (its audit row).
+ *  - While they still carry the cost they had (no value adjustment since), the units go back into
+ *    them; the cent a later partial draw can shift (per-layer rounding) is trued up against the
+ *    item's COGS account, as takeFromDocumentLayers does, so GL == valuation to the cent.
+ *  - Otherwise (no record for older data, a revalued or merged-away layer) they come back as a new
+ *    layer worth exactly `value` (insertLayersWorth), dated the sale.
+ * Writes the layers only; the caller voids the entry and puts the quantity back on hand.
+ */
+export async function restoreConsumedStock(tx: ServiceContext, input: ConsumptionRestore): Promise<void> {
+  if (!input.qty.greaterThan(0)) return;
+  const [audit] = await tx.db
+    .select({ newValues: auditLogs.newValues })
+    .from(auditLogs)
+    .where(
+      and(
+        eq(auditLogs.companyId, tx.companyId),
+        eq(auditLogs.entityType, 'item'),
+        eq(auditLogs.entityId, input.itemId),
+        sql`${auditLogs.newValues}->>'entryId' = ${input.entryId}`,
+      ),
+    )
+    .limit(1);
+  await restoreLayerDraws(tx, { ...input, recorded: (audit?.newValues as { layers?: unknown } | null | undefined)?.layers });
+}
+
+/**
+ * The core of restoreConsumedStock: put `qty` units worth `value` back into the layers a draw
+ * took them from (`recorded`: the ConsumedLayer list takeFromLayers returned, as stored in the
+ * audit trail), or — when the record is missing / no longer matches — into a new layer worth
+ * exactly `value`. Used by sales (consumeStock) and vendor-credit returns.
+ */
+export async function restoreLayerDraws(
+  tx: ServiceContext,
+  input: Omit<ConsumptionRestore, 'entryId'> & { recorded: unknown },
+): Promise<void> {
+  const qty = input.qty;
+  const value = Money.round2(input.value);
+  if (!qty.greaterThan(0)) return;
+  const fallback = async () => {
+    await insertLayersWorth(tx, { itemId: input.itemId, date: input.date, qty, value });
+  };
+  const recorded = input.recorded;
+  if (!Array.isArray(recorded) || recorded.length === 0) return fallback();
+  const draws: Array<{ layerId: string; take: Decimal; unitCost: Decimal }> = [];
+  for (const r of recorded) {
+    const d0 = r as { layerId?: unknown; quantityTaken?: unknown; unitCost?: unknown };
+    if (typeof d0.layerId !== 'string' || typeof d0.quantityTaken !== 'string' || typeof d0.unitCost !== 'string') {
+      return fallback();
+    }
+    draws.push({ layerId: d0.layerId, take: Money.of(d0.quantityTaken), unitCost: Money.of(d0.unitCost) });
+  }
+  const drawnQty = draws.reduce((sum, d0) => sum.plus(d0.take), Money.zero());
+  if (!drawnQty.equals(qty)) return fallback();
+
+  const layerRows = await tx.db
+    .select()
+    .from(inventoryLayers)
+    .where(and(eq(inventoryLayers.companyId, tx.companyId), eq(inventoryLayers.itemId, input.itemId)));
+  const byId = new Map(layerRows.map((l) => [l.id, l]));
+  const plan: Array<{ id: string; left: Decimal }> = [];
+  let restored = Money.zero();
+  for (const d0 of draws) {
+    const layer = byId.get(d0.layerId);
+    // Gone, or revalued since (its units now carry another cost than the sale relieved).
+    if (!layer || !Money.of(layer.unitCost).equals(d0.unitCost)) return fallback();
+    const now = Money.of(layer.quantityRemaining);
+    const left = now.plus(d0.take);
+    restored = restored.plus(fifoLayerValue(left, layer.unitCost).minus(fifoLayerValue(now, layer.unitCost)));
+    plan.push({ id: layer.id, left });
+  }
+  if (restored.minus(value).abs().greaterThan(layerRoundingTolerance(qty))) return fallback();
+
+  for (const p of plan) {
+    await tx.db
+      .update(inventoryLayers)
+      .set({ quantityRemaining: p.left.toFixed(4) })
+      .where(eq(inventoryLayers.id, p.id));
+  }
+  await postInventoryTrueUp(tx, {
+    itemId: input.itemId,
+    itemName: input.itemName,
+    amount: restored.minus(value),
+    date: input.date,
+    action: input.action,
+  });
 }
 
 /**
@@ -436,7 +641,8 @@ export interface ConsumeStockResult {
   quantityConsumed: string;
   totalCOGS: string;
   layers: ConsumedLayer[];
-  entryId: string;
+  /** Null when an adjustment removed units that carry no cost (nothing posted). */
+  entryId: string | null;
 }
 
 /**
@@ -448,8 +654,9 @@ export async function consumeStock(
   ctx: ServiceContext,
   input: ConsumeStockInput,
 ): Promise<ConsumeStockResult> {
-  const needQty = Money.of(input.quantity);
+  const needQty = inventoryNumber(input.quantity, 'Quantity');
   if (needQty.lessThanOrEqualTo(0)) throw validation('quantity must be positive.');
+  input = { ...input, date: inventoryDate(input.date) };
 
   // Validate item exists
   const item = await loadItem(ctx, input.itemId);
@@ -457,6 +664,13 @@ export async function consumeStock(
   return inTransaction(ctx, async (tx) => {
     // Deplete layers FIFO (oldest first) for the exact cost.
     const { cost: cogsAmount, layers: consumedLayers } = await takeFromLayers(tx, input.itemId, needQty);
+    if (cogsAmount.isZero() && input.purpose !== 'adjustment') {
+      // A sale is reversed through its COGS entry (void / edit put the units back from it), so a
+      // sale of units that carry no cost is refused plainly, as for average-cost items.
+      throw validation(
+        `Inventory item "${item.name}" has no cost in the units it would sell. Receive stock with a unit cost (bill or inventory adjustment) before selling it.`,
+      );
+    }
 
     // Post GL: Dr COGS (sales) / Adjustment Account (adjustments), Cr Inventory
     const inventoryAccountId = item.assetAccountId ?? (await accountIdByCode(tx, '1300'));
@@ -467,24 +681,27 @@ export async function consumeStock(
       : await cogsAccountForItem(tx, item);
     const dims = isAdjustment ? await adjustmentPostingFields(tx, input) : input.classId ? { classId: input.classId } : {};
 
-    const entry = await postJournalEntry(tx, {
-      date: input.date,
-      description: input.memo ?? (isAdjustment ? `Inventory adjustment — ${item.name}` : `FIFO COGS — item ${input.itemId}`),
-      lines: [
-        {
-          accountId: cogsAccountId,
-          debit: toAmountString(cogsAmount),
-          memo: input.memo ?? (isAdjustment ? 'Inventory adjustment' : 'FIFO COGS'),
-          ...dims,
-        },
-        {
-          accountId: inventoryAccountId,
-          credit: toAmountString(cogsAmount),
-          memo: input.memo ?? 'FIFO inventory reduction',
-        },
-      ],
-      sourceRef: `item:${input.itemId}`,
-    });
+    // Removing units that carry no cost (an adjustment) posts nothing; a sale was refused above.
+    const entry = cogsAmount.isZero()
+      ? await zeroValueAdjustment(tx, input.date, input.itemId, `Inventory adjustment — ${item.name}`)
+      : await postJournalEntry(tx, {
+          date: input.date,
+          description: input.memo ?? (isAdjustment ? `Inventory adjustment — ${item.name}` : `Cost of goods sold — ${item.name}`),
+          lines: [
+            {
+              accountId: cogsAccountId,
+              debit: toAmountString(cogsAmount),
+              memo: input.memo ?? (isAdjustment ? 'Inventory adjustment' : 'FIFO COGS'),
+              ...dims,
+            },
+            {
+              accountId: inventoryAccountId,
+              credit: toAmountString(cogsAmount),
+              memo: input.memo ?? 'FIFO inventory reduction',
+            },
+          ],
+          sourceRef: `item:${input.itemId}`,
+        });
 
     // Keep item.quantityOnHand in sync
     await tx.db
@@ -502,7 +719,7 @@ export async function consumeStock(
       newValues: {
         quantityConsumed: needQty.toFixed(4),
         totalCOGS: toAmountString(cogsAmount),
-        entryId: entry.id,
+        entryId: entry?.id ?? null,
         layers: consumedLayers,
       },
     });
@@ -512,7 +729,7 @@ export async function consumeStock(
       quantityConsumed: needQty.toFixed(4),
       totalCOGS: toAmountString(cogsAmount),
       layers: consumedLayers,
-      entryId: entry.id,
+      entryId: entry?.id ?? null,
     };
   });
 }

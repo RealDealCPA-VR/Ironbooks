@@ -19,7 +19,7 @@ import { updateItem, deactivateItem } from './items';
 import { updateCustomer } from './customers';
 import { createManualEntry, updateEntry } from './journal';
 import { trialBalance } from './reports';
-import { withVersionCheck, type VersionedEntity } from './concurrency';
+import { versionField, withVersionCheck, type VersionedEntity } from './concurrency';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-concurrency-round2');
 let db: DB;
@@ -32,19 +32,22 @@ let vendorId: string;
 
 const TABLE = { invoice: invoices, bill: bills, journal_entry: journalEntries, customer: customers, vendor: vendors, item: items } as const;
 
+/** The record's version column (items: editedAt since 0067 — stock movements don't move it). */
 async function storedVersion(entity: VersionedEntity, id: string): Promise<Date> {
   const t = (TABLE as Record<string, unknown>)[entity] as unknown as typeof customers;
-  const [row] = await db.select({ updatedAt: t.updatedAt }).from(t).where(eq(t.id, id));
-  return row.updatedAt;
+  const col = (t as unknown as Record<string, typeof customers.updatedAt>)[versionField(entity)];
+  const [row] = await db.select({ v: col }).from(t).where(eq(t.id, id));
+  return row.v;
 }
 
-/** The record the route would serialize: top level or one level down. */
-function returnedVersion(result: unknown, id: string): Date | undefined {
+/** The record the route would serialize: top level or one level down (its version field). */
+function returnedVersion(result: unknown, id: string, entity: VersionedEntity = 'customer'): Date | undefined {
+  const f = versionField(entity);
   const r = result as Record<string, unknown>;
-  if (r && r.id === id && r.updatedAt instanceof Date) return r.updatedAt;
+  if (r && r.id === id && r[f] instanceof Date) return r[f] as Date;
   for (const v of Object.values(r ?? {})) {
     const o = v as Record<string, unknown>;
-    if (o && typeof o === 'object' && o.id === id && o.updatedAt instanceof Date) return o.updatedAt;
+    if (o && typeof o === 'object' && o.id === id && o[f] instanceof Date) return o[f] as Date;
   }
   return undefined;
 }
@@ -107,7 +110,7 @@ describe('optimistic concurrency — re-test round 1', () => {
       let version = (await storedVersion(entity, id)).toISOString();
       for (const save of saves) {
         const result = await withVersionCheck(alice, entity, id, version, save);
-        const v = returnedVersion(result, id);
+        const v = returnedVersion(result, id, entity);
         expect(v, `${entity}: save must return the record with its version`).toBeInstanceOf(Date);
         expect(v!.getTime(), `${entity}: returned version must be the stored one`).toBe((await storedVersion(entity, id)).getTime());
         version = v!.toISOString();

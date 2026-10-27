@@ -7,9 +7,10 @@
  * historical assignments keep resolving.
  */
 import { and, asc, eq } from 'drizzle-orm';
-import { customerTypes, customers, vendorTypes, vendors } from '@/lib/db/schema';
+import { customerTypes, vendorTypes, vendors } from '@/lib/db/schema';
 import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from './_base';
 import { assertListDeleteAllowed } from './accountantCopy/guard';
+import { findReferences } from './lists/references';
 
 export type TypeListKind = 'customer' | 'vendor';
 
@@ -68,9 +69,11 @@ async function validateInput(ctx: ServiceContext, kind: TypeListKind, input: Typ
 }
 
 export async function createType(ctx: ServiceContext, kind: TypeListKind, input: TypeListInput) {
-  const v = await validateInput(ctx, kind, input);
   const t = tableFor(kind);
+  // The duplicate-name check runs in the same transaction as the insert (a double-submitted
+  // "New" must not add the type twice — the table has no unique index to stop it).
   return inTransaction(ctx, async (tx) => {
+    const v = await validateInput(tx, kind, input);
     const [row] = await tx.db
       .insert(t)
       .values({ companyId: tx.companyId, ...v, isActive: input.isActive ?? true })
@@ -81,10 +84,13 @@ export async function createType(ctx: ServiceContext, kind: TypeListKind, input:
 }
 
 export async function updateType(ctx: ServiceContext, kind: TypeListKind, id: string, input: TypeListInput) {
-  const before = await loadType(ctx, kind, id);
-  const v = await validateInput(ctx, kind, input, id);
   const t = tableFor(kind);
   return inTransaction(ctx, async (tx) => {
+    const before = await loadType(tx, kind, id);
+    // Making a type inactive is deleting it from the list: refused while an Accountant's Copy is
+    // out (I1), like deleteType and every other list.
+    if (input.isActive === false && before.isActive) await assertListDeleteAllowed(tx, 'delete', 'list entries');
+    const v = await validateInput(tx, kind, input, id);
     const [row] = await tx.db
       .update(t)
       .set({ ...v, isActive: input.isActive ?? before.isActive })
@@ -101,7 +107,7 @@ export async function updateType(ctx: ServiceContext, kind: TypeListKind, id: st
   });
 }
 
-/** Delete an unused type; a type still assigned to customers/vendors is deactivated instead. */
+/** Delete an unused type; a type in use anywhere (customers, vendors, price rules ...) is deactivated instead. */
 export async function deleteType(
   ctx: ServiceContext,
   kind: TypeListKind,
@@ -109,20 +115,14 @@ export async function deleteType(
 ): Promise<{ deleted: boolean; deactivated: boolean }> {
   await assertListDeleteAllowed(ctx, 'delete', 'list entries'); // Accountant's Copy (I1)
   const before = await loadType(ctx, kind, id);
-  const inUse =
-    kind === 'customer'
-      ? await ctx.db
-          .select({ id: customers.id })
-          .from(customers)
-          .where(and(eq(customers.companyId, ctx.companyId), eq(customers.customerTypeId, id)))
-          .limit(1)
-      : await ctx.db
-          .select({ id: vendors.id })
-          .from(vendors)
-          .where(and(eq(vendors.companyId, ctx.companyId), eq(vendors.vendorTypeId, id)))
-          .limit(1);
   const t = tableFor(kind);
+  const tableName = kind === 'customer' ? 'customer_types' : 'vendor_types';
   return inTransaction(ctx, async (tx) => {
+    // In use anywhere in the company file — customers / vendors, but also a price rule's
+    // conditions (customer types are a price-rule condition, lib/services/pricing.ts), memorized
+    // reports … (lib/services/lists/references.ts). Its own subtypes are not a use: they move up.
+    const hits = (await findReferences(tx, tableName, [id])).get(id.toLowerCase()) ?? [];
+    const inUse = hits.filter((h) => !(h.table === tableName && h.column === 'parent_id'));
     if (inUse.length > 0) {
       await tx.db.update(t).set({ isActive: false }).where(eq(t.id, id));
       await writeAudit(tx, {

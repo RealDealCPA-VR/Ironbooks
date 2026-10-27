@@ -39,13 +39,16 @@ import {
   itemReceiptLines,
   itemReceipts,
   items,
+  landedCostAllocationLines,
+  landedCostAllocations,
   purchaseOrderLines,
   purchaseOrders,
   vendors,
 } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { postJournalEntry } from './posting';
-import { fifoLayerValue, valueRemainderAfter } from './inventory';
+import { cogsAccountForItem, fifoLayerValue, valueRemainderAfter } from './inventory';
+import { layersWorth } from './fifo';
 import { dueDateFromTermsList } from './lists/terms';
 import { findAccrualAccount, getOrCreateAccrualAccount, receiptAccrualAccounts } from './itemReceipts';
 import {
@@ -310,8 +313,6 @@ interface PlannedLine extends ReceiptBillLinePreview {
   varianceAccountId: string | null;
   inventoryAccountId: string | null;
   layerPlan: Array<{ layer: typeof inventoryLayers.$inferSelect; take: Dec }>;
-  /** FIFO: the 4-decimal unit-cost increment the layers in layerPlan get. */
-  layerUnitDelta: Dec | null;
   /** The account the receipt's entry credited, which this bill relieves (set after planning). */
   accrualAccountId: string;
 }
@@ -386,6 +387,47 @@ async function isFifoTracked(ctx: ServiceContext, itemId: string): Promise<boole
   return Boolean(row);
 }
 
+/**
+ * Layers of a receipt's item that bills entered against the receipt (still active: a void deletes
+ * its link rows) have already re-costed — the layerIds in their item_receipt_bill_lines
+ * layerAdjustments — plus the units landed cost later split off those (they carry the bill's
+ * increment too). The next bill on the receipt must not re-cost them again.
+ */
+async function recostedReceiptLayers(ctx: ServiceContext, receiptId: string, itemId: string): Promise<Set<string>> {
+  const links = await ctx.db
+    .select({ layerAdjustments: itemReceiptBillLines.layerAdjustments })
+    .from(itemReceiptBillLines)
+    .where(
+      and(
+        eq(itemReceiptBillLines.companyId, ctx.companyId),
+        eq(itemReceiptBillLines.itemReceiptId, receiptId),
+        eq(itemReceiptBillLines.itemId, itemId),
+      ),
+    );
+  const ids = new Set<string>();
+  for (const link of links) {
+    for (const a of link.layerAdjustments ?? []) if (a.kind !== 'average' && a.layerId) ids.add(a.layerId);
+  }
+  if (ids.size === 0) return ids;
+  const splits = await ctx.db
+    .select({ layerAdjustments: landedCostAllocationLines.layerAdjustments })
+    .from(landedCostAllocationLines)
+    .innerJoin(landedCostAllocations, eq(landedCostAllocationLines.allocationId, landedCostAllocations.id))
+    .where(and(eq(landedCostAllocations.companyId, ctx.companyId), eq(landedCostAllocationLines.itemId, itemId)));
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const row of splits) {
+      for (const a of row.layerAdjustments ?? []) {
+        if (a.splitFrom && ids.has(a.splitFrom) && !ids.has(a.layerId)) {
+          ids.add(a.layerId);
+          grew = true;
+        }
+      }
+    }
+  }
+  return ids;
+}
+
 /** Validate the request and compute every amount (read-only when `dryRun`). */
 async function planReceiptBill(ctx: ServiceContext, input: EnterReceiptBillInput, dryRun = false) {
   const [vendor] = await ctx.db
@@ -413,6 +455,21 @@ async function planReceiptBill(ctx: ServiceContext, input: EnterReceiptBillInput
     : [];
   const itemById = new Map(itemRows.map((i) => [i.id, i]));
 
+  // Receipts with more than one line for the same item: their own layers at another line's cost
+  // belong to that other line, so a bill on one line must never re-cost them.
+  const receiptIds = [...new Set(rows.map((r) => r.receipt.id))];
+  const linesPerReceiptItem = new Map<string, number>();
+  if (receiptIds.length) {
+    const all = await ctx.db
+      .select({ receiptId: itemReceiptLines.itemReceiptId, itemId: itemReceiptLines.itemId })
+      .from(itemReceiptLines)
+      .where(inArray(itemReceiptLines.itemReceiptId, receiptIds));
+    for (const l of all) {
+      const key = `${l.receiptId}|${l.itemId}`;
+      linesPerReceiptItem.set(key, (linesPerReceiptItem.get(key) ?? 0) + 1);
+    }
+  }
+
   // Previously relieved accrual per line (for exact-cent relief on the final bill).
   const prior = await ctx.db
     .select({ lineId: itemReceiptBillLines.itemReceiptLineId, accrual: itemReceiptBillLines.accrualAmount })
@@ -438,13 +495,9 @@ async function planReceiptBill(ctx: ServiceContext, input: EnterReceiptBillInput
 
   const settings = await getReceivingSettings(ctx);
   let ppvAccountId: string | null = null;
-  let cogsAccountId: string | null = null;
   let defaultInventoryAcctId: string | null = null;
   // FIFO layer quantity already planned by earlier rows of this bill (same item, same layer).
   const layerTaken = new Map<string, Dec>();
-  // FIFO layers as the earlier rows of this bill leave them (remaining quantity, unit cost), to
-  // work out exactly what each row's re-costing does to the valuation.
-  const simLayer = new Map<string, { remaining: Dec; cost: Dec }>();
 
   const planned: PlannedLine[] = [];
   for (const [i, req] of input.lines.entries()) {
@@ -497,7 +550,6 @@ async function planReceiptBill(ctx: ServiceContext, input: EnterReceiptBillInput
     let inventoryVariance = Money.zero();
     let expensedVariance = Money.zero();
     let layerPlan: PlannedLine['layerPlan'] = [];
-    let layerUnitDelta: Dec | null = null;
 
     if (!totalVariance.isZero()) {
       if (!isInventory) {
@@ -515,8 +567,9 @@ async function planReceiptBill(ctx: ServiceContext, input: EnterReceiptBillInput
       } else {
         varianceMode = 'inventory';
         inventoryAccountId = item.assetAccountId ?? (defaultInventoryAcctId ??= await accountIdByCode(ctx, '1300'));
-        cogsAccountId ??= await accountIdByCode(ctx, '5000');
-        varianceAccountId = cogsAccountId;
+        // The part on units already sold is cost of sales of THIS item: its own COGS account, as
+        // its sales post (cogsAccountForItem), not 5000.
+        varianceAccountId = await cogsAccountForItem(ctx, item);
         // How much of the touched quantity is still in stock at the receipt's cost?
         let covered = Money.zero();
         if (await isFifoTracked(ctx, item.id)) {
@@ -526,12 +579,34 @@ async function planReceiptBill(ctx: ServiceContext, input: EnterReceiptBillInput
             .where(and(eq(inventoryLayers.companyId, ctx.companyId), eq(inventoryLayers.itemId, item.id)))
             .orderBy(desc(inventoryLayers.date), desc(inventoryLayers.createdAt));
           const costKey = receiptCost.toFixed(4);
-          const matching = layers.filter(
-            (l) => Money.of(l.quantityRemaining).greaterThan(0) && Money.of(l.unitCost).toFixed(4) === costKey,
-          );
-          // Prefer the layer(s) created by this receipt (same date), newest first.
-          const sameDay = matching.filter((l) => l.date.getTime() === receipt.date.getTime());
-          const ordered = [...sameDay, ...matching.filter((l) => !sameDay.includes(l))];
+          const open = layers.filter((l) => Money.of(l.quantityRemaining).greaterThan(0));
+          // The receipt's own layers (tagged item_receipt:<id>) still on hand, whatever their cost
+          // now (landed cost may have raised it), except those an earlier bill on the receipt
+          // already re-costed. Layers at one of this line's costs come first (a receipt with two
+          // lines for the item): a receipt stores a line as layer(s) worth exactly its amount
+          // (fifo.ts layersWorth) — one layer at the 4dp cost, or (qty - 1) units plus a one-unit
+          // layer carrying the cents.
+          const ownRef = `item_receipt:${receipt.id}`;
+          const ownCosts = new Set([
+            costKey,
+            ...layersWorth(received, Money.of(line.amount)).map((p) => p.unitCost.toFixed(4)),
+          ]);
+          const recosted = await recostedReceiptLayers(ctx, receipt.id, item.id);
+          const ownOpen = open.filter((l) => l.sourceRef === ownRef && !recosted.has(l.id));
+          const atLineCost = (l: (typeof layers)[number]) => ownCosts.has(Money.of(l.unitCost).toFixed(4));
+          // Layers at another cost (raised by landed cost) are this line's only when the receipt has
+          // no other line for the item; otherwise they may be the other line's units.
+          const soleLine = (linesPerReceiptItem.get(`${receipt.id}|${item.id}`) ?? 0) <= 1;
+          const own = [...ownOpen.filter(atLineCost), ...(soleLine ? ownOpen.filter((l) => !atLineCost(l)) : [])];
+          // Receipts recorded before layers were tagged: older (untagged) layers at the receipt's
+          // cost, same date first, newest first. Never when the receipt has layers of its own (its
+          // units were sold, or are re-costed already): other stock is not the receipt's.
+          const tagged = layers.some((l) => l.sourceRef === ownRef);
+          const legacy = tagged
+            ? []
+            : open.filter((l) => l.sourceRef == null && Money.of(l.unitCost).toFixed(4) === costKey);
+          const sameDay = legacy.filter((l) => l.date.getTime() === receipt.date.getTime());
+          const ordered = [...own, ...sameDay, ...legacy.filter((l) => !sameDay.includes(l))];
           let need = touched;
           for (const layer of ordered) {
             if (!need.greaterThan(0)) break;
@@ -555,38 +630,11 @@ async function planReceiptBill(ctx: ServiceContext, input: EnterReceiptBillInput
           const value = Money.of(item.quantityOnHand ?? '0').times(Money.of(item.averageCost ?? '0'));
           const floor = Money.round2(value).negated();
           if (inventoryVariance.lessThan(floor)) inventoryVariance = floor;
-        } else if (!inventoryVariance.isZero()) {
-          // FIFO: the layers take a 4-decimal unit-cost increment, so on bulk quantities they gain a
-          // few cents less (or more) than the variance (3000 units: +0.0003 each = 0.90 of 1.00).
-          // Capitalize exactly what the layers gain — the valuation reports' figure — and send the
-          // rest to the variance account with the share on sold units (inventory GL == valuation).
-          const coveredQty = layerPlan.reduce((s, p) => s.plus(p.take), Money.zero());
-          layerUnitDelta = inventoryVariance.dividedBy(coveredQty).toDecimalPlaces(4);
-          let change = Money.zero();
-          const after = new Map<string, { remaining: Dec; cost: Dec }>();
-          for (const { layer, take } of layerPlan) {
-            const cur = after.get(layer.id) ??
-              simLayer.get(layer.id) ?? { remaining: Money.of(layer.quantityRemaining), cost: Money.of(layer.unitCost) };
-            const newCost = cur.cost.plus(layerUnitDelta);
-            if (newCost.isNegative()) throw validation(`Price variance would make "${item.name}" cost negative.`);
-            const before = fifoLayerValue(cur.remaining, cur.cost);
-            if (take.equals(cur.remaining)) {
-              change = change.plus(fifoLayerValue(take, newCost).minus(before));
-              after.set(layer.id, { remaining: cur.remaining, cost: newCost });
-            } else {
-              const rest = cur.remaining.minus(take);
-              change = change.plus(fifoLayerValue(rest, cur.cost).plus(fifoLayerValue(take, newCost)).minus(before));
-              after.set(layer.id, { remaining: rest, cost: cur.cost });
-            }
-          }
-          inventoryVariance = Money.round2(change);
-          // Later rows of this bill see the layers as this one leaves them (only when it re-costs).
-          if (!inventoryVariance.isZero()) for (const [id, s] of after) simLayer.set(id, s);
         }
-        if (inventoryVariance.isZero()) {
-          layerPlan = [];
-          layerUnitDelta = null;
-        }
+        // FIFO: enterBillForReceivedItems spreads exactly this amount over the planned layers, each
+        // piece stored as layer(s) worth exactly its new value (fifo.ts layersWorth), so the whole
+        // variance on units still in stock is capitalized and the inventory GL == valuation.
+        if (inventoryVariance.isZero()) layerPlan = [];
         expensedVariance = totalVariance.minus(inventoryVariance);
       }
     }
@@ -601,7 +649,6 @@ async function planReceiptBill(ctx: ServiceContext, input: EnterReceiptBillInput
       varianceAccountId,
       inventoryAccountId,
       layerPlan,
-      layerUnitDelta,
       receiptLineId: line.id,
       receiptId: receipt.id,
       itemId: item.id,
@@ -715,7 +762,6 @@ async function planReceiptBill(ctx: ServiceContext, input: EnterReceiptBillInput
           varianceAccountId: _v,
           inventoryAccountId: _i,
           layerPlan: _p,
-          layerUnitDelta: _u,
           accrualAccountId: _a,
           ...rest
         }) => rest,
@@ -853,45 +899,67 @@ export async function enterBillForReceivedItems(ctx: ServiceContext, input: Ente
       const invVariance = Money.of(l.inventoryVariance);
       if (!invVariance.isZero()) {
         if (l.layerPlan.length > 0) {
-          // The increment planned with the variance (planReceiptBill capitalizes what it adds up to).
-          const unitDelta = l.layerUnitDelta ?? Money.zero();
-          for (const { layer: planned0, take } of l.layerPlan) {
+          // The bill moves the inventory account by exactly invVariance, so the covered units'
+          // layers must gain exactly that: each planned piece takes its share to the cent and its
+          // units are stored as layer(s) worth exactly their new value (fifo.ts layersWorth). A
+          // common 4dp unit delta cannot carry it (3000 units + $100.00 = 0.0333 each = $99.90).
+          const coveredQty = l.layerPlan.reduce((s, p) => s.plus(p.take), Money.zero());
+          let allocated = Money.zero();
+          for (const [k, { layer: planned0, take }] of l.layerPlan.entries()) {
+            const share =
+              k === l.layerPlan.length - 1
+                ? invVariance.minus(allocated)
+                : Money.round2(invVariance.times(take).dividedBy(coveredQty));
+            allocated = allocated.plus(share);
             // Re-read: an earlier row of this bill may already have split this layer.
             const [layer] = await tx.db.select().from(inventoryLayers).where(eq(inventoryLayers.id, planned0.id));
             const remaining = Money.of(layer.quantityRemaining);
             if (take.greaterThan(remaining)) {
               throw new ServiceError('CONFLICT', 'Inventory changed while billing. Reload and retry.');
             }
-            const newCost = Money.of(layer.unitCost).plus(unitDelta);
-            if (newCost.isNegative()) throw validation(`Price variance would make "${l.itemName}" cost negative.`);
-            if (take.equals(remaining)) {
-              await tx.db.update(inventoryLayers).set({ unitCost: newCost.toFixed(4) }).where(eq(inventoryLayers.id, layer.id));
-              layerAdjustments.push({ layerId: layer.id, quantity: take.toFixed(4), unitDelta: unitDelta.toFixed(4) });
-            } else {
-              // Split: the re-costed units become their own layer (same date keeps FIFO order).
-              await tx.db
-                .update(inventoryLayers)
-                .set({ quantityRemaining: remaining.minus(take).toFixed(4) })
-                .where(eq(inventoryLayers.id, layer.id));
+            const cost = Money.of(layer.unitCost);
+            const rest = remaining.minus(take);
+            // What the taken units are worth now: the layer's value before minus after (the rule
+            // takeFromLayers relieves by), so the units left in the layer keep their own value.
+            const target = fifoLayerValue(remaining, cost).minus(fifoLayerValue(rest, cost)).plus(share);
+            if (target.isNegative()) throw validation(`Price variance would make "${l.itemName}" cost negative.`);
+            const pieces = layersWorth(take, target);
+            const unitDelta = (p: { unitCost: Dec }) => p.unitCost.minus(cost).toFixed(4);
+            const insertPiece = async (p: { qty: Dec; unitCost: Dec }) => {
+              // Same date and source keeps FIFO order, and landed cost still finds the receipt's units.
               const [split] = await tx.db
                 .insert(inventoryLayers)
                 .values({
                   companyId: tx.companyId,
                   itemId: l.itemId,
                   date: layer.date,
-                  quantityRemaining: take.toFixed(4),
-                  unitCost: newCost.toFixed(4),
+                  quantityRemaining: p.qty.toFixed(4),
+                  unitCost: p.unitCost.toFixed(4),
                   // Still the receipt's units: landed cost and the receipt's own void find its
                   // layers by this tag (an untagged split made landed cost expense them as sold).
                   sourceRef: layer.sourceRef,
                 })
                 .returning();
-              layerAdjustments.push({
-                layerId: split.id,
-                splitFrom: layer.id,
-                quantity: take.toFixed(4),
-                unitDelta: unitDelta.toFixed(4),
-              });
+              // A void restores the cost and merges the units back into `splitFrom`
+              // (receivingLinks.releaseReceiptBilling).
+              layerAdjustments.push({ layerId: split.id, splitFrom: layer.id, quantity: p.qty.toFixed(4), unitDelta: unitDelta(p) });
+            };
+            if (rest.isZero()) {
+              // The whole layer is re-costed (one unit split off when the cents need it).
+              const [first, ...more] = pieces;
+              await tx.db
+                .update(inventoryLayers)
+                .set({ quantityRemaining: first.qty.toFixed(4), unitCost: first.unitCost.toFixed(4) })
+                .where(eq(inventoryLayers.id, layer.id));
+              layerAdjustments.push({ layerId: layer.id, quantity: first.qty.toFixed(4), unitDelta: unitDelta(first) });
+              for (const p of more) await insertPiece(p);
+            } else {
+              // Split: the re-costed units become their own layer(s).
+              await tx.db
+                .update(inventoryLayers)
+                .set({ quantityRemaining: rest.toFixed(4) })
+                .where(eq(inventoryLayers.id, layer.id));
+              for (const p of pieces) await insertPiece(p);
             }
           }
         } else {

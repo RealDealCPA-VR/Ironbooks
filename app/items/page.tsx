@@ -28,6 +28,7 @@ import {
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import { isInventoryAssetAccount } from '@/lib/accountTypes';
 import { useFocusParam } from '@/lib/useFocusParam';
 import { usePreferences } from '@/lib/usePreferences';
 import Link from 'next/link';
@@ -78,6 +79,7 @@ interface Account {
   code: string;
   name: string;
   type: string;
+  subtype?: string | null;
 }
 
 interface FormState {
@@ -221,7 +223,10 @@ function ItemsPageContent() {
 
   const incomeAccounts = accounts.filter((a) => a.type === 'revenue');
   const expenseAccounts = accounts.filter((a) => a.type === 'expense');
-  const assetAccounts = accounts.filter((a) => a.type === 'asset');
+  // QB: an inventory item's Asset Account is an Other Current Asset (never a bank / Undeposited Funds).
+  // The item being edited keeps its current account in the list (older files allowed any asset
+  // account), so the form shows it and saves unchanged.
+  const assetAccounts = accounts.filter((a) => isInventoryAssetAccount(a) || a.id === editingItem?.assetAccountId);
 
   // ── Modal helpers ──────────────────────────────────────────────────────────
 

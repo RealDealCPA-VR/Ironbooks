@@ -51,7 +51,7 @@ import {
 } from './_base';
 import { assertNotControlAccount, postJournalEntry, voidJournalEntry } from './posting';
 import { recordCOGS, valueRemainderAfter } from './inventory';
-import { consumeStock } from './fifo';
+import { consumeStock, restoreConsumedStock } from './fifo';
 import {
   type InventoryLineDetail,
   attachInventoryDetails,
@@ -506,7 +506,7 @@ async function postSalesReceiptDocument(
         memo,
         classId, // COGS carries the receipt's class (P&L by Class)
       });
-      entryId = res.entryId;
+      entryId = res.entryId!; // a sale always posts COGS (consumeStock refuses a $0 sale)
       cogs = res.totalCOGS;
     } else {
       const res = await recordCOGS(tx, {
@@ -727,14 +727,19 @@ async function reverseSalesReceiptPostings(
     const qty = Money.of(line.quantity);
 
     if (await isFifoTracked(tx, line.itemId)) {
-      // Restore the stock value as a new layer at the blended consumed cost.
-      const unitCost = qty.isZero() ? Money.zero() : cogs.dividedBy(qty);
-      await tx.db.insert(inventoryLayers).values({
-        companyId: tx.companyId,
+      // Put the units back into the layers the sale drew them from (fifo.ts restoreConsumedStock).
+      const [it] = await tx.db
+        .select({ name: items.name })
+        .from(items)
+        .where(and(eq(items.companyId, tx.companyId), eq(items.id, line.itemId)));
+      await restoreConsumedStock(tx, {
         itemId: line.itemId,
+        itemName: it?.name ?? 'item',
+        entryId: cogsEntry.id,
+        qty,
+        value: cogs,
         date: receipt.date,
-        quantityRemaining: qty.toFixed(4),
-        unitCost: unitCost.toFixed(4),
+        action: 'sales receipt reversed',
       });
       await tx.db
         .update(items)
