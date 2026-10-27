@@ -816,7 +816,8 @@ export async function createPeriodCopy(ctx: ServiceContext, input: PeriodCopyInp
     fs.rmSync(path.join(work, TRANSACTION_LOG_FILE), { force: true });
     resetTransactionLogCache(work);
 
-    const out = await createPortableCompanyFile(wctx, { dataDir: work });
+    // prefsperms: an auditor / lender copy never carries the file's own secrets (AI keys, mail).
+    const out = await createPortableCompanyFile(wctx, { dataDir: work, omitFileSecrets: true });
     const safe = co.name.replace(/[\\/:*?"<>|\u0000-\u001F]/g, '-').replace(/\s+/g, ' ').trim() || 'Company';
     result = {
       buffer: out.buffer,
