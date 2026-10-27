@@ -92,8 +92,12 @@ function totalsOf(entry: unknown): { debit: Decimal; credit: Decimal } {
 describe('journal page sends the normalized payload', () => {
   it('app/journal/page.tsx builds debit/credit through journalPayloadAmount (not raw strings)', () => {
     const src = fs.readFileSync(path.join(ROOT, 'app', 'journal', 'page.tsx'), 'utf8');
-    expect(src).toMatch(/debit:\s*journalPayloadAmount\(l\.debit\)/);
-    expect(src).toMatch(/credit:\s*journalPayloadAmount\(l\.credit\)/);
+    // Save and Memorize build their lines with one helper (lib/journalBalance.ts
+    // journalPayloadLines), which normalizes debit / credit through journalPayloadAmount.
+    expect(src).toMatch(/lines:\s*journalPayloadLines\(lines\)/);
+    const helper = fs.readFileSync(path.join(ROOT, 'lib', 'journalBalance.ts'), 'utf8');
+    expect(helper).toMatch(/debit:\s*journalPayloadAmount\(l\.debit\)/);
+    expect(helper).toMatch(/credit:\s*journalPayloadAmount\(l\.credit\)/);
     // The old raw ternary `debit: l.debit ? l.debit : undefined` is gone (`?? ''` prefill is fine).
     expect(src).not.toMatch(/debit:\s*l\.debit\s*\?\s*l\.debit/);
   });
