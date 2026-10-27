@@ -194,7 +194,11 @@ async function accountOf(ctx: ServiceContext, id: string) {
   return row;
 }
 
-async function validateLoanInput(ctx: ServiceContext, input: LoanInput) {
+async function validateLoanInput(
+  ctx: ServiceContext,
+  input: LoanInput,
+  existing?: { currency: string | null; exchangeRate: string | null },
+) {
   if (!input.name?.trim()) throw validation('Give the loan a name.');
   const amount = Money.of(input.originalAmount);
   if (!amount.greaterThan(0)) throw validation('The loan amount must be greater than zero.');
@@ -239,7 +243,16 @@ async function validateLoanInput(ctx: ServiceContext, input: LoanInput) {
       `The lender uses ${lenderCurrency ?? home ?? 'your home currency'}, so the loan must be in ${lenderCurrency ?? home ?? 'your home currency'} too.`,
     );
   }
-  const fx = currency ? await currencyRate(ctx, currency, input.exchangeRate) : null;
+  // review5 fx: an edit that leaves the rate blank keeps the rate the loan was booked at (the
+  // form's "Blank = list rate" is for a new loan). Taking today's list rate re-booked the loan:
+  // its carrying value in Home Currency Adjustment and the realized gain / loss of every later
+  // payment were then measured against a rate the liability was never posted at.
+  const blankRate = input.exchangeRate == null || String(input.exchangeRate).trim() === '';
+  const keptRate =
+    blankRate && existing?.exchangeRate && currency && foreignCode(existing.currency, home) === currency
+      ? existing.exchangeRate
+      : input.exchangeRate;
+  const fx = currency ? await currencyRate(ctx, currency, keptRate) : null;
   // The payment account's currency is checked when a payment is set up (assertLoanPaymentCurrency).
   return { amount, rate, ppy, escrow, currency, fxRate: fx ? fx.rate.toFixed(8) : null };
 }
@@ -284,7 +297,7 @@ export async function updateLoan(ctx: ServiceContext, id: string, input: LoanInp
     .from(loans)
     .where(and(eq(loans.companyId, ctx.companyId), eq(loans.id, id)));
   if (!existing) throw notFound('Loan');
-  const v = await validateLoanInput(ctx, input);
+  const v = await validateLoanInput(ctx, input, existing);
   return inTransaction(ctx, async (tx) => {
     const [loan] = await tx.db
       .update(loans)
