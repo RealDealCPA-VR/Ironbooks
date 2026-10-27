@@ -55,6 +55,8 @@ export interface CompanyUser {
   isActive: boolean;
   /** The company creator (companies.ownerId). */
   isOwner: boolean;
+  /** Two-factor sign-in is on for this login (an Admin's password reset can turn it off). */
+  twoFactor: boolean;
   roleKeys: string[];
   roles: { key: string; name: string }[];
   isAdmin: boolean;
@@ -87,6 +89,7 @@ async function membershipRows(ctx: ServiceContext) {
       isActive: userCompanies.isActive,
       name: users.name,
       login: users.email,
+      totpEnabled: users.totpEnabled,
     })
     .from(userCompanies)
     .innerJoin(users, eq(users.id, userCompanies.userId))
@@ -121,6 +124,7 @@ export async function listUsers(ctx: ServiceContext): Promise<CompanyUser[]> {
         login: m.login,
         isActive: m.isActive !== false,
         isOwner,
+        twoFactor: m.totpEnabled === true,
         roleKeys: keys,
         roles: keys.map((k) => ({ key: k, name: nameOf.get(k)! })),
         isAdmin: keys.includes(ADMIN_ROLE_KEY),
@@ -451,12 +455,16 @@ export async function setUserRoles(
   return updateUser(ctx, userId, { roleKeys });
 }
 
-/** Admin-initiated password reset (the new password is never logged). */
+/**
+ * Admin-initiated password reset (the new password is never logged). `turnOffTwoFactor` also
+ * turns off the user's two-factor sign-in — the only way back in for someone who lost their
+ * phone or authenticator app (turning it off themselves needs a code from it).
+ */
 export async function resetUserPassword(
   ctx: ServiceContext,
   userId: string,
   password: string,
-  opts: { requireChange?: boolean } = {},
+  opts: { requireChange?: boolean; turnOffTwoFactor?: boolean } = {},
 ): Promise<void> {
   requirePermission(ctx, 'users', 'modify');
   if (!(await getMembership(ctx, userId))) throw notFound('User');
@@ -467,6 +475,15 @@ export async function resetUserPassword(
   await assertPasswordAllowed(ctx.db, password, { userId });
   await inTransaction(ctx, async (tx) => {
     await storeUserPassword(tx.db, userId, password, { mustChange: opts.requireChange === true });
+    let twoFactorTurnedOff = false;
+    if (opts.turnOffTwoFactor === true) {
+      const off = await tx.db
+        .update(users)
+        .set({ totpEnabled: false, totpSecret: null, updatedAt: new Date() })
+        .where(and(eq(users.id, userId), eq(users.totpEnabled, true)))
+        .returning({ id: users.id });
+      twoFactorTurnedOff = off.length > 0;
+    }
     // Whoever held the old password is signed out everywhere (also releases any single-user
     // hold of those sessions) — same as the self-service reset and change-password routes.
     // An Admin resetting their own password keeps the session they did it from.
@@ -480,7 +497,11 @@ export async function resetUserPassword(
       action: 'update',
       entityType: 'user',
       entityId: userId,
-      newValues: { passwordReset: true, mustChangeAtNextSignIn: opts.requireChange === true },
+      newValues: {
+        passwordReset: true,
+        mustChangeAtNextSignIn: opts.requireChange === true,
+        ...(twoFactorTurnedOff ? { twoFactorTurnedOff: true } : {}),
+      },
     });
   });
 }

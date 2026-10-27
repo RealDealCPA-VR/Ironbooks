@@ -1,5 +1,6 @@
 /**
- * POST /api/users/[id]/reset-password — { password } set a new password for a user.
+ * POST /api/users/[id]/reset-password — { password, requireChange?, turnOffTwoFactor? } set a new
+ * password for a user (and optionally turn off their two-factor sign-in, for a lost authenticator).
  * Users & Roles 'modify'; a non-Admin cannot reset the password of a user with more access.
  */
 import { NextRequest, NextResponse } from 'next/server';
@@ -26,7 +27,10 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     const body = await req.json().catch(() => ({}));
     const parsed = resetPasswordSchema.safeParse(body);
     if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
-    await resetUserPassword(ctx, id, parsed.data.password, { requireChange: parsed.data.requireChange });
+    await resetUserPassword(ctx, id, parsed.data.password, {
+      requireChange: parsed.data.requireChange,
+      turnOffTwoFactor: parsed.data.turnOffTwoFactor,
+    });
     return NextResponse.json({ ok: true });
   } catch (err) {
     return errorResponse(err);

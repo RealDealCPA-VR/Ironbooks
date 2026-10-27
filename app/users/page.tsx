@@ -39,6 +39,8 @@ interface CompanyUser {
   login: string;
   isActive: boolean;
   isOwner: boolean;
+  /** Two-factor sign-in is on (Reset password can turn it off for a lost authenticator). */
+  twoFactor?: boolean;
   roleKeys: string[];
   roles: { key: string; name: string }[];
   isAdmin: boolean;
@@ -230,6 +232,7 @@ function UsersTab({
               <Td>
                 <span className="font-semibold">{u.name}</span>
                 {u.isOwner && <span className="ml-2 text-xs text-navy/40">(company creator)</span>}
+                {u.twoFactor && <span className="ml-2 text-xs text-navy/40">(two-factor sign-in on)</span>}
               </Td>
               <Td className="font-mono text-sm">{u.login}</Td>
               <Td>
@@ -462,6 +465,7 @@ function ResetPassword({ user, onClose }: { user: CompanyUser; onClose: () => vo
   const [password, setPassword] = useState('');
   const [confirm, setConfirm] = useState('');
   const [requireChange, setRequireChange] = useState(true);
+  const [turnOffTwoFactor, setTurnOffTwoFactor] = useState(false);
   const [busy, setBusy] = useState(false);
   const policy = usePasswordPolicy();
   async function save() {
@@ -471,7 +475,11 @@ function ResetPassword({ user, onClose }: { user: CompanyUser; onClose: () => vo
     }
     setBusy(true);
     try {
-      await api.post(`/api/users/${user.userId}/reset-password`, { password, requireChange });
+      await api.post(`/api/users/${user.userId}/reset-password`, {
+        password,
+        requireChange,
+        ...(user.twoFactor && turnOffTwoFactor ? { turnOffTwoFactor: true } : {}),
+      });
       toast(`Password reset for ${user.name}.`, 'success');
       onClose();
     } catch (e) {
@@ -518,6 +526,12 @@ function ResetPassword({ user, onClose }: { user: CompanyUser; onClose: () => vo
           <input type="checkbox" checked={requireChange} onChange={(e) => setRequireChange(e.target.checked)} />
           Ask {user.name} to choose a new password at their next sign-in
         </label>
+        {user.twoFactor && (
+          <label className="flex items-center gap-2 text-sm text-navy">
+            <input type="checkbox" checked={turnOffTwoFactor} onChange={(e) => setTurnOffTwoFactor(e.target.checked)} />
+            Also turn off two-factor sign-in (they lost their phone or authenticator app)
+          </label>
+        )}
       </div>
     </Modal>
   );
