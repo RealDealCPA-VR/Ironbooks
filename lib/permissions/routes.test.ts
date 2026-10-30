@@ -165,7 +165,6 @@ describe('API permission map coverage', () => {
         '/api/company-file/close',
         '/api/company-file/info',
         '/api/company-file/save-as',
-        '/api/email/status',
         '/api/portal/login',
         '/api/portal/logout',
         '/api/portal/me',

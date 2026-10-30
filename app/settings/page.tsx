@@ -48,6 +48,8 @@ import {
   Wallet,
 } from 'lucide-react';
 import PreferencePane from './PreferencePane';
+import EmailServerSetup from './EmailServerSetup';
+import { canDoActivity, useMe } from '@/lib/usePermissions';
 import { AppearanceControls } from '@/components/AppearancePicker';
 import {
   Badge,
@@ -338,7 +340,14 @@ function AccountSelect({
 
 export default function SettingsPage() {
   const [tab, setTab] = useState<TabId>('company');
+  const { me } = useMe();
   const [loading, setLoading] = useState(true);
+
+  // Deep links: /settings?tab=sendForms opens that category (the "Set up email" fixes use it).
+  useEffect(() => {
+    const want = new URLSearchParams(window.location.search).get('tab');
+    if (want && TABS.some((t) => t.id === want)) setTab(want as TabId);
+  }, []);
   const [saving, setSaving] = useState(false);
 
   const [companyName, setCompanyName] = useState('');
@@ -1123,6 +1132,9 @@ export default function SettingsPage() {
                 </div>
               </Card>
             )}
+
+            {/* ── Send Forms: the mail server stored in the company file (prefsperms) ── */}
+            {tab === 'sendForms' && <EmailServerSetup canEdit={canDoActivity(me, 'company.send_forms', 'modify')} />}
 
             {/* ── Categorized QB preferences (Company + My Preferences) ───────── */}
             {PANE_FOR_TAB[tab] && (

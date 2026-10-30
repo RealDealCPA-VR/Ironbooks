@@ -84,7 +84,13 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/portal/login': kind('public', 'POST'),
   '/api/portal/logout': kind('public', 'POST'),
   '/api/portal/me': kind('self', 'GET'),
-  '/api/email/status': kind('public', 'GET'),
+  // prefsperms: whether this company can send email (file mail server or SMTP env); nothing secret.
+  '/api/email/status': kind('member', 'GET'),
+  // prefsperms: Preferences > Send Forms mail server (Company & Preferences > Send Forms set-up).
+  '/api/email/settings': r('company', 'GET PUT:modify DELETE:modify'),
+  // Test: typed settings need the set-up right (checked in the service); anyone may test the saved
+  // ones to their OWN address (My Preferences > Send Forms).
+  '/api/email/test': kind('member', 'POST'),
 
   // ---- Company files / company settings ----
   '/api/companies': kind('self', 'GET POST'),
@@ -387,6 +393,7 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/purchase-orders': r('vendors', 'GET POST'),
   '/api/purchase-orders/[id]': r('vendors', 'GET POST:modify PATCH'),
   '/api/purchase-orders/[id]/pdf': r('vendors', 'GET:print'),
+  '/api/purchase-orders/[id]/email': r('vendors', 'POST:print'), // prefsperms: email the P.O. to the vendor
   '/api/expense-reports': r('vendors', 'GET POST'),
   '/api/expense-reports/[id]': r('vendors', 'GET POST:modify'),
   '/api/reports/1099/mapping': r('vendors', 'GET PATCH'),

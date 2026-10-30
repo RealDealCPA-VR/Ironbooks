@@ -341,14 +341,14 @@ describe('Needs attention inbox (integration)', () => {
     expect(backup.key).not.toBe('backup:never');
   });
 
-  it('payment reminder: plain text always, email only when SMTP is set up', async () => {
+  it('payment reminder: plain text always, email only when a mail server is set up', async () => {
     const txt = paymentReminderText({ customerName: 'Late Payer LLC', invoiceNumber: '1001', balance: '300.00', dueDate: '2026-05-01', daysOverdue: 45, companyName: 'Acme' });
     expect(txt.subject).toBe('Payment reminder: invoice 1001 from Acme');
     expect(txt.body).toMatch(/was due on May 1, 2026 \(45 days ago\)/);
     const saved = process.env.SMTP_HOST;
     delete process.env.SMTP_HOST;
     try {
-      await expect(sendPaymentReminder(t.ctx, ids.inv1)).rejects.toMatchObject({ code: 'VALIDATION', message: expect.stringMatching(/SMTP/) });
+      await expect(sendPaymentReminder(t.ctx, ids.inv1)).rejects.toMatchObject({ code: 'VALIDATION', message: expect.stringMatching(/Preferences > Send Forms/) });
       const r = await getAttention(t.ctx, { today: TODAY, now: NOW });
       expect(r.emailConfigured).toBe(false);
     } finally {

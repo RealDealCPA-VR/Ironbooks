@@ -1,14 +1,21 @@
 /**
- * Email service — send invoices via configurable SMTP (nodemailer).
+ * Email service — send forms through the company's mail server (nodemailer).
  *
- * Configuration is read entirely from environment variables:
- *   SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM
+ * prefsperms: the mail server is set up INSIDE the app (Preferences > Send Forms) and stored in the
+ * company file (lib/services/emailSettings.ts, password sealed with the file's own vault secret).
+ * This computer's SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASS / SMTP_FROM environment variables
+ * still work as a fallback when the file has no mail server of its own (a server deployment).
  *
- * None of the env vars are required to start the app; `isConfigured()` returns
- * false when they are absent, and `sendMail` / `emailInvoice` throw a friendly
- * VALIDATION ServiceError so the API layer can surface the hint to the UI.
+ * Every send:
+ *  - is refused in a sandbox (practice copy);
+ *  - throws a friendly VALIDATION ServiceError when no mail server is set up
+ *    (EMAIL_NOT_SET_UP_MESSAGE, with a "Set up email" fix that opens Preferences > Send Forms);
+ *  - obeys the company network policy: a mail relay on the LAN / tailnet is always fine, a public
+ *    mail provider needs the company's opt-in for email (Privacy & Network);
+ *  - comes from the sending user's own name and address when they set one (My Preferences >
+ *    Send Forms) and the company allows it, else from the company's sender with replies to them;
+ *  - explains a mail server failure in plain words.
  */
-import nodemailer from 'nodemailer';
 import type { Attachment } from 'nodemailer/lib/mailer';
 import { and, eq } from 'drizzle-orm';
 import { customers } from '@/lib/db/schema';
@@ -20,28 +27,37 @@ import { getCompany, getPreferences } from './company';
 import { buildInvoicePdf } from '@/lib/pdf/forms';
 import { fillMergeFields } from '@/lib/preferences';
 import { formatCurrency } from '@/lib/money';
-import { assertOutboundAllowed } from '@/lib/net/guard';
 import { assertNotSandbox } from './sandboxState';
 import { getHomeCurrencyCode } from './currencies';
+import {
+  EMAIL_NOT_SET_UP_MESSAGE,
+  assertMailServerAllowed,
+  explainMailError,
+  isEmailConfigured,
+  mailTransport,
+  resolveMailConfig,
+  senderFor,
+  senderMergeFields,
+  transportOptions,
+} from './emailSettings';
 
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 
-export function isConfigured(): boolean {
-  return !!(
-    process.env.SMTP_HOST &&
-    process.env.SMTP_PORT &&
-    process.env.SMTP_USER &&
-    process.env.SMTP_PASS &&
-    process.env.SMTP_FROM
-  );
+/**
+ * Can this company send email? True when the company file has a usable mail server
+ * (Preferences > Send Forms) or this computer's SMTP environment variables are set.
+ */
+export async function isConfigured(ctx: ServiceContext): Promise<boolean> {
+  return isEmailConfigured(ctx);
 }
 
-/** Bracket bare IPv6 literals so the host can be embedded in a URL for the policy check. */
-function smtpHostForUrl(host: string): string {
-  const h = host.trim();
-  return h.includes(':') && !h.startsWith('[') ? `[${h}]` : h;
+/** The "Email is not set up" error, with a fix that opens Preferences > Send Forms. */
+export function emailNotSetUpError(): ServiceError {
+  return new ServiceError('VALIDATION', EMAIL_NOT_SET_UP_MESSAGE, undefined, [
+    { id: 'email.setup', label: 'Set up email', kind: 'navigate', href: '/settings?tab=sendForms' },
+  ]);
 }
 
 // ---------------------------------------------------------------------------
@@ -56,43 +72,37 @@ export interface MailOptions {
   attachments?: Attachment[];
 }
 
-export async function sendMail(opts: MailOptions, ctx: ServiceContext): Promise<void> {
-  // Sandbox mode: nothing leaves a practice copy (checked first, even before SMTP config).
+/**
+ * Send one email through the company's mail server, from the signed-in user's sender identity.
+ * Returns the addresses used.
+ */
+export async function sendMail(opts: MailOptions, ctx: ServiceContext): Promise<{ from: string; to: string }> {
+  // Sandbox mode: nothing leaves a practice copy (checked first, even before the mail set-up).
   assertNotSandbox('Email');
-  if (!isConfigured()) {
-    throw new ServiceError(
-      'VALIDATION',
-      'Email not configured. Set SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, and SMTP_FROM environment variables.',
-    );
-  }
+  const cfg = await resolveMailConfig(ctx);
+  if (!cfg) throw emailNotSetUpError();
 
   // Network policy: an SMTP relay on the LAN/tailnet is always fine; a public mail provider
   // needs the company's explicit cloud opt-in for 'email' (Settings → Privacy & Network).
-  const port = Number(process.env.SMTP_PORT!);
-  await assertOutboundAllowed(
-    `${port === 465 ? 'smtps' : 'smtp'}://${smtpHostForUrl(process.env.SMTP_HOST!)}:${port}`,
-    'email',
-    ctx,
-  );
+  await assertMailServerAllowed(ctx, cfg);
 
-  const transport = nodemailer.createTransport({
-    host: process.env.SMTP_HOST!,
-    port: Number(process.env.SMTP_PORT!),
-    secure: Number(process.env.SMTP_PORT!) === 465,
-    auth: {
-      user: process.env.SMTP_USER!,
-      pass: process.env.SMTP_PASS!,
-    },
-  });
-
-  await transport.sendMail({
-    from: process.env.SMTP_FROM!,
-    to: opts.to,
-    subject: opts.subject,
-    text: opts.text,
-    html: opts.html,
-    attachments: opts.attachments,
-  });
+  const sender = await senderFor(ctx, cfg);
+  const transport = mailTransport.create(transportOptions(cfg));
+  try {
+    await transport.sendMail({
+      from: sender.from.name ? { name: sender.from.name, address: sender.from.address } : sender.from.address,
+      to: opts.to,
+      ...(sender.replyTo ? { replyTo: sender.replyTo } : {}),
+      ...(sender.bcc.length ? { bcc: sender.bcc } : {}),
+      subject: opts.subject,
+      text: opts.text,
+      html: opts.html,
+      attachments: opts.attachments,
+    });
+  } catch (err) {
+    throw new ServiceError('VALIDATION', explainMailError(err, { host: cfg.host, port: cfg.port, fromEmail: sender.from.address }));
+  }
+  return { from: sender.from.address, to: opts.to };
 }
 
 // ---------------------------------------------------------------------------
@@ -138,9 +148,9 @@ export function invoiceMergeFields(inv: {
  * The PDF prints with the invoice form template (the given `templateId`, else the invoice
  * default template — see lib/pdf/forms.ts) and the subject/body come from the Send Forms
  * preferences (merge fields: {{number}}, {{customer.name}}, {{company.name}}, {{total}},
- * {{balance}}, {{dueDate}}).
+ * {{balance}}, {{dueDate}}, {{sender.name}}, {{sender.email}}).
  *
- * Throws ServiceError('VALIDATION') when SMTP is not configured.
+ * Throws ServiceError('VALIDATION') when no mail server is set up.
  * Throws ServiceError('NOT_FOUND') when the invoice or company is missing.
  * Throws ServiceError('VALIDATION') when no recipient email can be determined.
  */
@@ -151,13 +161,8 @@ export async function emailInvoice(
   templateId?: string | null,
 ): Promise<void> {
   assertNotSandbox('Email');
-  // Guard early so we don't do heavy work when SMTP is unconfigured.
-  if (!isConfigured()) {
-    throw new ServiceError(
-      'VALIDATION',
-      'Email not configured. Set SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, and SMTP_FROM environment variables.',
-    );
-  }
+  // Guard early so we don't do heavy work when no mail server is set up.
+  if (!(await isConfigured(ctx))) throw emailNotSetUpError();
 
   // Load invoice (scoped to company via getInvoice).
   const invoice = await getInvoice(ctx, invoiceId);
@@ -212,6 +217,7 @@ export async function emailInvoice(
     dueDate: invoice.dueDate,
     currency: invoice.currency || home || (company.settings as Record<string, unknown> | null)?.currency,
   });
+  Object.assign(merge, await senderMergeFields(ctx));
   const form = prefs.sendForms.invoice;
 
   await sendMail({

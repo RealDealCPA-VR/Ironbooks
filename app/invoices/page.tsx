@@ -2175,9 +2175,11 @@ function InvoicesPageContent() {
       >
         {!emailConfigured && (
           <div className="mb-4 rounded-lg bg-amber-50 border border-amber-200 px-4 py-3 text-sm text-amber-800">
-            <strong>SMTP not configured.</strong> Set <code>SMTP_HOST</code>, <code>SMTP_PORT</code>,{' '}
-            <code>SMTP_USER</code>, <code>SMTP_PASS</code>, and <code>SMTP_FROM</code> environment
-            variables to enable email sending.
+            <strong>Email is not set up yet.</strong> Add your mail server under{' '}
+            <a href="/settings?tab=sendForms" className="font-semibold underline">
+              Preferences &gt; Send Forms
+            </a>{' '}
+            (or ask whoever may set up email), then send the invoice.
           </div>
         )}
         <div>

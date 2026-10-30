@@ -11,6 +11,7 @@ import {
   Ban,
   CheckSquare,
   Pencil,
+  Mail,
 } from 'lucide-react';
 import {
   Button,
@@ -54,6 +55,7 @@ import { TransactionNav, useAdjacentTransactions } from '@/components/Transactio
 interface Vendor {
   id: string;
   displayName: string;
+  email?: string | null;
 }
 
 interface Account {
@@ -785,6 +787,28 @@ export default function PurchaseOrdersPage() {
 
   const vendorMap = Object.fromEntries(vendors.map((v) => [v.id, v.displayName]));
 
+  // prefsperms: Email the P.O. to the vendor (Preferences > Send Forms "Purchase Order" wording).
+  const [emailTarget, setEmailTarget] = useState<PurchaseOrder | null>(null);
+  const [emailTo, setEmailTo] = useState('');
+  const [emailing, setEmailing] = useState(false);
+  function openEmail(po: PurchaseOrder) {
+    setEmailTarget(po);
+    setEmailTo(vendors.find((v) => v.id === po.vendorId)?.email ?? '');
+  }
+  async function sendPoEmail() {
+    if (!emailTarget) return;
+    setEmailing(true);
+    try {
+      const r = await api.post<{ to: string }>(`/api/purchase-orders/${emailTarget.id}/email`, { to: emailTo.trim() || undefined });
+      toast(`PO #${docNo(emailTarget.refNumber, emailTarget.poNumber)} emailed to ${r.to}.`, 'success');
+      setEmailTarget(null);
+    } catch (err) {
+      toastError(err, 'Could not email the purchase order.');
+    } finally {
+      setEmailing(false);
+    }
+  }
+
   const fetchData = useCallback(async () => {
     setLoading(true);
     try {
@@ -907,6 +931,11 @@ export default function PurchaseOrdersPage() {
                       >
                         <Download className="h-3.5 w-3.5" /> PDF
                       </Button>
+                      {po.status !== 'void' && (
+                        <Button variant="ghost" size="sm" onClick={() => openEmail(po)} title="Email the purchase order to the vendor">
+                          <Mail className="h-3.5 w-3.5" /> Email
+                        </Button>
+                      )}
                       {(po.status === 'open' || po.status === 'partial') && (
                         <>
                           <Button
@@ -1022,6 +1051,31 @@ export default function PurchaseOrdersPage() {
         accounts={accounts}
         items={items}
       />
+
+      <Modal
+        open={!!emailTarget}
+        onClose={() => setEmailTarget(null)}
+        title={`Email PO #${docNo(emailTarget?.refNumber, emailTarget?.poNumber ?? '')}`}
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setEmailTarget(null)}>
+              Cancel
+            </Button>
+            <Button onClick={() => void sendPoEmail()} loading={emailing} disabled={!emailTo.trim()}>
+              <Mail className="h-4 w-4" aria-hidden="true" /> Send
+            </Button>
+          </>
+        }
+      >
+        <div className="max-w-sm">
+          <Label htmlFor="po-email-to">Send to</Label>
+          <Input id="po-email-to" type="email" value={emailTo} onChange={(e) => setEmailTo(e.target.value)} placeholder="vendor@example.com" />
+        </div>
+        <p className="mt-3 text-xs text-navy/50">
+          The purchase order is attached as a PDF. The subject and message come from Preferences &gt; Send Forms
+          (Purchase Order).
+        </p>
+      </Modal>
 
       <ConfirmDialog
         open={!!voidTarget}

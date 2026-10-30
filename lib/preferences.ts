@@ -98,8 +98,39 @@ export interface SendFormDefaults {
   body: string;
 }
 
-/** Default email wording per form (Send Forms preferences). Merge fields: see lib/services/letters.ts. */
-export const DEFAULT_SEND_FORMS: Record<FormType, SendFormDefaults> = {
+/**
+ * Send Forms email templates (QB Preferences > Send Forms > Company Preferences: "Change default
+ * for ..."): every printed form plus the overdue-invoice payment reminder. Kept apart from
+ * FORM_TYPES, which are the PRINT layouts (form templates).
+ */
+export const EMAIL_TEMPLATE_TYPES = [...FORM_TYPES, 'payment_reminder'] as const;
+export type EmailTemplateType = (typeof EMAIL_TEMPLATE_TYPES)[number];
+
+export const EMAIL_TEMPLATE_LABELS: Record<EmailTemplateType, string> = {
+  ...FORM_TYPE_LABELS,
+  payment_reminder: 'Overdue Invoice Reminder',
+};
+
+/**
+ * The merge fields each email template understands ({{field}}; unknown ones print blank). Every
+ * template also has {{company.name}}, {{sender.name}} and {{sender.email}} (who is sending).
+ * Amounts ({{total}}, {{balance}}) are in the form's currency; {{overdue}} reads "was due on
+ * May 1, 2026 (45 days ago)".
+ */
+export const EMAIL_MERGE_FIELDS: Record<EmailTemplateType, string[]> = {
+  invoice: ['number', 'customer.name', 'date', 'total', 'balance', 'dueDate'],
+  estimate: ['number', 'customer.name', 'total', 'date'],
+  sales_receipt: ['number', 'customer.name', 'total', 'date'],
+  credit_memo: ['number', 'customer.name', 'total', 'balance', 'date'],
+  sales_order: ['number', 'customer.name', 'total', 'date'],
+  purchase_order: ['number', 'vendor.name', 'total', 'date', 'expectedDate'],
+  statement: ['customer.name', 'balance', 'date'],
+  payment_reminder: ['number', 'customer.name', 'balance', 'dueDate', 'daysOverdue', 'overdue'],
+};
+export const COMMON_MERGE_FIELDS = ['company.name', 'sender.name', 'sender.email'] as const;
+
+/** Default email wording per form (Send Forms preferences). Merge fields: EMAIL_MERGE_FIELDS. */
+export const DEFAULT_SEND_FORMS: Record<EmailTemplateType, SendFormDefaults> = {
   invoice: {
     subject: 'Invoice {{number}} from {{company.name}}',
     body:
@@ -129,6 +160,11 @@ export const DEFAULT_SEND_FORMS: Record<FormType, SendFormDefaults> = {
   statement: {
     subject: 'Statement from {{company.name}}',
     body: 'Dear {{customer.name}},\n\nYour statement is attached. Please remit payment for any balance due.\n\nSincerely,\n{{company.name}}',
+  },
+  payment_reminder: {
+    subject: 'Payment reminder: invoice {{number}} from {{company.name}}',
+    body:
+      'Dear {{customer.name}},\n\nThis is a friendly reminder that invoice {{number}} for {{balance}} {{overdue}}.\nIf you have already sent your payment, thank you, and please ignore this message.\nOtherwise, we would appreciate payment at your earliest convenience. A copy of the invoice is attached.\n\nThank you for your business.\n{{company.name}}',
   },
 };
 
@@ -196,7 +232,7 @@ export interface CompanyPreferences {
   salesTaxBasis: 'accrual' | 'cash';
   salesTaxFrequency: 'monthly' | 'quarterly' | 'annually';
   // Send Forms
-  sendForms: Record<FormType, SendFormDefaults>;
+  sendForms: Record<EmailTemplateType, SendFormDefaults>;
   // Time & Expenses
   timeTrackingEnabled: boolean;
   firstDayOfWeek: 'sunday' | 'monday';
@@ -306,6 +342,13 @@ export interface MyPreferences {
   spellIgnoreInternetAddresses: boolean;
   // Checking
   startWithPayee: boolean;
+  // Send Forms (prefsperms): who this person's emails come from (QB My Preferences > Send Forms).
+  /** Name shown as the sender of the forms I email ('' = the company's sender name). */
+  sendFromName: string;
+  /** Address my forms are sent from ('' = the company's address); replies come back here. */
+  sendFromEmail: string;
+  /** Send me a blind copy of every form I email. */
+  bccMe: boolean;
   // Desktop
   showHomeWorkflow: boolean;
   /** p1 ux: 'simple' = everyday tasks only (default for new users); 'advanced' = every menu. */
@@ -328,6 +371,9 @@ export const DEFAULT_MY_PREFERENCES: MyPreferences = {
   spellIgnoreWithNumbers: true,
   spellIgnoreInternetAddresses: true,
   startWithPayee: true,
+  sendFromName: '',
+  sendFromEmail: '',
+  bccMe: false,
   showHomeWorkflow: true,
   navMode: 'simple',
 };
@@ -459,7 +505,7 @@ export const PREFERENCE_CATEGORIES: Array<{
     company: ['salesTaxEnabled', 'salesTaxBasis', 'salesTaxFrequency'],
     my: [],
   },
-  { id: 'sendForms', label: 'Send Forms', company: ['sendForms'], my: [] },
+  { id: 'sendForms', label: 'Send Forms', company: ['sendForms'], my: ['sendFromName', 'sendFromEmail', 'bccMe'] },
   {
     id: 'spelling',
     label: 'Spelling',
@@ -540,7 +586,7 @@ export function resolveCompanyPreferences(settings: unknown): CompanyPreferences
   prefs.reminders = reminders;
   const sendForms = { ...DEFAULT_SEND_FORMS };
   if (isPlainObject(s.sendForms)) {
-    for (const k of FORM_TYPES) {
+    for (const k of EMAIL_TEMPLATE_TYPES) {
       const f = s.sendForms[k];
       if (isPlainObject(f)) {
         sendForms[k] = {

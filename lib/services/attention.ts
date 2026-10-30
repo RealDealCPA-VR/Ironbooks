@@ -46,13 +46,14 @@ import type { DB } from '@/lib/db';
 import { resolveDataDir } from '@/lib/db';
 import { Money, formatCurrency, toAmountString } from '@/lib/money';
 import { can, type Action, type Area } from '@/lib/permissions/model';
-import { addDaysIso, todayInTimeZone } from '@/lib/preferences';
+import { DEFAULT_SEND_FORMS, addDaysIso, fillMergeFields, todayInTimeZone, type SendFormDefaults } from '@/lib/preferences';
 import { ServiceError, notFound, validation, writeAudit, type ServiceContext } from './_base';
 import { getCompany, getPreferences } from './company';
 import { listUndepositedPayments } from './deposits';
 import { canSeeTodoLink } from './todos';
 import { requireFileAdmin, requirePermission } from './access';
 import { isConfigured as emailIsConfigured, sendMail } from './email';
+import { EMAIL_NOT_SET_UP_MESSAGE, senderMergeFields } from './emailSettings';
 import { lastFullBackup, readBackupHistory } from './backupHistory';
 import { runVersionedBackup } from './backupSchedule';
 import { buildInvoicePdf } from '@/lib/pdf/forms';
@@ -237,6 +238,13 @@ const docNo = (ref: string | null, n: number | null) => (ref && ref.trim() ? ref
 // Payment reminder text (email body, or copy / mailto when email isn't set up)
 // ---------------------------------------------------------------------------
 
+/**
+ * The overdue-invoice reminder: the company's "Overdue Invoice Reminder" email template
+ * (Preferences > Send Forms; the built-in wording by default) with its merge fields filled:
+ * {{number}}, {{customer.name}}, {{balance}} (in the invoice's currency), {{dueDate}},
+ * {{daysOverdue}}, {{overdue}} ("was due on May 1, 2026 (45 days ago)"), {{company.name}},
+ * {{sender.name}}, {{sender.email}}.
+ */
 export function paymentReminderText(p: {
   customerName: string;
   invoiceNumber: string;
@@ -246,22 +254,28 @@ export function paymentReminderText(p: {
   companyName: string;
   /** The invoice's currency (its own, or the company's home currency). Defaults to USD. */
   currency?: string | null;
+  /** The company's template (Preferences > Send Forms); the built-in wording when absent. */
+  template?: SendFormDefaults | null;
+  /** {{sender.name}} / {{sender.email}}. */
+  sender?: Record<string, string>;
 }): { subject: string; body: string } {
   const amount = formatCurrency(p.balance, p.currency || 'USD');
-  const due = p.dueDate ? ` was due on ${shortDate(p.dueDate)}` : ' is past due';
+  const due = p.dueDate ? `was due on ${shortDate(p.dueDate)}` : 'is past due';
   const late = p.daysOverdue > 0 ? ` (${plural(p.daysOverdue, 'day')} ago)` : '';
+  const merge: Record<string, string> = {
+    number: p.invoiceNumber,
+    'customer.name': p.customerName,
+    balance: amount,
+    dueDate: p.dueDate ? shortDate(p.dueDate) : '',
+    daysOverdue: String(Math.max(p.daysOverdue, 0)),
+    overdue: `${due}${late}`,
+    'company.name': p.companyName,
+    ...(p.sender ?? {}),
+  };
+  const t = p.template ?? DEFAULT_SEND_FORMS.payment_reminder;
   return {
-    subject: `Payment reminder: invoice ${p.invoiceNumber} from ${p.companyName}`,
-    body: [
-      `Dear ${p.customerName},`,
-      '',
-      `This is a friendly reminder that invoice ${p.invoiceNumber} for ${amount}${due}${late}.`,
-      'If you have already sent your payment, thank you, and please ignore this message.',
-      'Otherwise, we would appreciate payment at your earliest convenience. A copy of the invoice is attached.',
-      '',
-      'Thank you for your business.',
-      p.companyName,
-    ].join('\n'),
+    subject: fillMergeFields(t.subject, merge).trim() || `Payment reminder: invoice ${p.invoiceNumber}`,
+    body: fillMergeFields(t.body, merge),
   };
 }
 
@@ -278,6 +292,10 @@ interface SourceEnv {
   undepositedDays: number;
   companyName: string;
   homeCurrency: string;
+  /** Preferences > Send Forms "Overdue Invoice Reminder" template. */
+  reminderTemplate: SendFormDefaults;
+  /** {{sender.name}} / {{sender.email}} for the reminder (the signed-in person). */
+  sender: Record<string, string>;
   companyCreatedAt: Date | null;
   payrollLiabilityAccountId: string | null;
   /** Company file data folder (backup history lives there); default = the open file. */
@@ -403,7 +421,7 @@ const bankTxnSource: Source = async ({ ctx, today, countOnly, hiddenKeys }) => {
 };
 
 /** Invoices past due with money still owed. */
-const overdueInvoiceSource: Source = async ({ ctx, today, countOnly, companyName, homeCurrency }) => {
+const overdueInvoiceSource: Source = async ({ ctx, today, countOnly, companyName, homeCurrency, reminderTemplate, sender }) => {
   const rows = await ctx.db
     .select({
       id: invoices.id,
@@ -461,6 +479,8 @@ const overdueInvoiceSource: Source = async ({ ctx, today, countOnly, companyName
           daysOverdue: days,
           companyName,
           currency: r.currency || homeCurrency,
+          template: reminderTemplate,
+          sender,
         });
     const sentOn = lastSent.get(r.id);
     return item({
@@ -892,6 +912,8 @@ export async function getAttention(ctx: ServiceContext, opts: AttentionOptions =
     undepositedDays: opts.undepositedDays ?? DEFAULT_UNDEPOSITED_DAYS,
     companyName: company?.name ?? 'Your company',
     homeCurrency,
+    reminderTemplate: prefs.sendForms.payment_reminder,
+    sender: opts.countOnly ? {} : await senderMergeFields(ctx),
     companyCreatedAt: company?.createdAt ?? null,
     payrollLiabilityAccountId: prefs.payrollLiabilityAccountId ?? null,
     dataDir: opts.dataDir,
@@ -973,7 +995,7 @@ export async function getAttention(ctx: ServiceContext, opts: AttentionOptions =
     hiddenCount,
     ...(opts.includeHidden ? { hidden: hidden.sort(compareItems) } : {}),
     accountOptions,
-    emailConfigured: emailIsConfigured(),
+    emailConfigured: opts.countOnly ? false : await emailIsConfigured(ctx),
     homeCurrency,
   };
 }
@@ -1062,8 +1084,7 @@ export async function setAttentionState(
 // Payment reminder email
 // ---------------------------------------------------------------------------
 
-export const EMAIL_NOT_SET_UP =
-  'Email is not set up on this computer yet. Whoever installed Ironbooks can add the SMTP settings (SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS and SMTP_FROM). Until then, copy the reminder or open it in your own email program.';
+export const EMAIL_NOT_SET_UP = `${EMAIL_NOT_SET_UP_MESSAGE} Until then, copy the reminder or open it in your own email program.`;
 
 /**
  * Email a friendly payment reminder (with the invoice PDF) for an open invoice. Goes through the
@@ -1102,7 +1123,11 @@ export async function sendPaymentReminder(
     throw validation(`There is no email address for ${inv.customerName}. Type one in, or add it to the customer record.`);
   }
   if (!/^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(recipient)) throw validation('That email address does not look right.');
-  if (!emailIsConfigured()) throw validation(EMAIL_NOT_SET_UP);
+  if (!(await emailIsConfigured(ctx))) {
+    throw validation(EMAIL_NOT_SET_UP, undefined, [
+      { id: 'email.setup', label: 'Set up email', kind: 'navigate', href: '/settings?tab=sendForms' },
+    ]);
+  }
 
   const prefs = await getPreferences(ctx);
   const today = todayInTimeZone(prefs.timezone);
@@ -1117,6 +1142,8 @@ export async function sendPaymentReminder(
     daysOverdue: due ? Math.max(daysBetween(due, today), 0) : 0,
     companyName: company?.name ?? 'Your company',
     currency: inv.currency || (await resolveHomeCurrency(ctx, company?.settings?.currency)),
+    template: prefs.sendForms.payment_reminder,
+    sender: await senderMergeFields(ctx),
   });
   const { bytes } = await buildInvoicePdf(ctx, inv.id);
   await sendMail(

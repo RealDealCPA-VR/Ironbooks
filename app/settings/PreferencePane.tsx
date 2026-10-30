@@ -12,8 +12,10 @@ import { Building2, User } from 'lucide-react';
 import { Button, Card, Input, Label, Select, toast } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import {
-  FORM_TYPES,
-  FORM_TYPE_LABELS,
+  COMMON_MERGE_FIELDS,
+  EMAIL_MERGE_FIELDS,
+  EMAIL_TEMPLATE_LABELS,
+  EMAIL_TEMPLATE_TYPES,
   PREFERENCE_CATEGORIES,
   REMINDER_KEYS,
   REMINDER_LABELS,
@@ -174,15 +176,15 @@ function SendFormsEditor({
   onChange: (v: CompanyPreferences['sendForms']) => void;
   disabled?: boolean;
 }) {
-  const [form, setForm] = React.useState<(typeof FORM_TYPES)[number]>('invoice');
+  const [form, setForm] = React.useState<(typeof EMAIL_TEMPLATE_TYPES)[number]>('invoice');
   return (
     <div className="flex flex-col gap-3">
       <div className="max-w-xs">
         <Label htmlFor="sf-form">Form</Label>
         <Select id="sf-form" value={form} onChange={(e) => setForm(e.target.value as typeof form)}>
-          {FORM_TYPES.map((f) => (
+          {EMAIL_TEMPLATE_TYPES.map((f) => (
             <option key={f} value={f}>
-              {FORM_TYPE_LABELS[f]}
+              {EMAIL_TEMPLATE_LABELS[f]}
             </option>
           ))}
         </Select>
@@ -208,8 +210,8 @@ function SendFormsEditor({
           className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-navy focus:outline-none focus:ring-2 focus:ring-electric/40"
         />
         <p className="mt-1 text-xs text-navy/50">
-          Fill-in fields: {'{{number}}'}, {'{{customer.name}}'}, {'{{company.name}}'}, {'{{total}}'}, {'{{balance}}'},{' '}
-          {'{{dueDate}}'}.
+          Fill-in fields for this form:{' '}
+          {[...EMAIL_MERGE_FIELDS[form], ...COMMON_MERGE_FIELDS].map((f) => `{{${f}}}`).join(', ')}.
         </p>
       </div>
     </div>

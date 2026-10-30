@@ -49,6 +49,10 @@ export const myPreferencesSchema = z
     spellIgnoreWithNumbers: z.boolean(),
     spellIgnoreInternetAddresses: z.boolean(),
     startWithPayee: z.boolean(),
+    // prefsperms: Send Forms - who my emails come from.
+    sendFromName: z.string().trim().max(100),
+    sendFromEmail: z.union([z.literal(''), z.string().trim().max(255).email('must be an email address')]),
+    bccMe: z.boolean(),
     showHomeWorkflow: z.boolean(),
     navMode: z.enum(['simple', 'advanced']),
   })
@@ -172,3 +176,31 @@ export const updateAttachmentSchema = z.object({
 
 // ---- Calendar ----
 export const calendarQuerySchema = z.object({ from: zIsoDay, to: zIsoDay });
+
+// ---------------------------------------------------------------------------
+// prefsperms: Preferences > Send Forms mail server (lib/services/emailSettings.ts)
+// ---------------------------------------------------------------------------
+
+/** The mail server form. `password`: a string sets it, null / '' removes it, absent keeps it. */
+export const emailSetupSchema = z
+  .object({
+    host: z.string().trim().min(1, 'enter the mail server name').max(255),
+    port: z.coerce.number().int('must be a whole number').min(1).max(65535),
+    security: z.enum(['ssl', 'starttls', 'none']),
+    username: z.string().max(255).nullish(),
+    password: z.string().max(500).nullish(),
+    fromName: z.string().max(255).nullish(),
+    fromEmail: z.string().trim().min(1, 'enter the address forms are sent from').max(255),
+    replyTo: z.string().max(255).nullish(),
+    bcc: z.string().max(500).nullish(),
+    useSenderAddress: z.boolean().optional(),
+  })
+  .strict();
+
+/** Test: the saved settings (no draft) or the typed, not yet saved ones; `to` = where to send it. */
+export const emailTestSchema = z
+  .object({
+    to: z.string().max(255).nullish(),
+    draft: emailSetupSchema.nullish(),
+  })
+  .strict();

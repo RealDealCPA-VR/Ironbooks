@@ -121,6 +121,9 @@ export const FIELD_META: Record<string, FieldMeta> = {
   salesTaxFrequency: { label: 'How often you pay sales tax', type: 'select', options: [['monthly', 'Monthly'], ['quarterly', 'Quarterly'], ['annually', 'Annually']], dependsOn: 'salesTaxEnabled' },
   // Send Forms
   sendForms: { label: 'Email wording for each form', type: 'sendForms' },
+  sendFromName: { label: 'Send my emails with this name', help: "Leave blank to use the company's sender name.", type: 'text' },
+  sendFromEmail: { label: 'Send my emails from this address', help: "Replies come back to you. Leave blank to use the company's address. Your mail server must allow sending from it: use Test on the Send Forms page.", type: 'text' },
+  bccMe: { label: 'Send me a copy (Bcc) of every form I email', type: 'bool' },
   // Spelling
   spellCheckEnabled: { label: 'Check spelling as I type (memos and descriptions)', help: 'Uses the spell checker built into your computer. Right-click a word for suggestions.', type: 'bool' },
   spellIgnoreUppercase: { label: 'Ignore words in UPPERCASE', type: 'bool', dependsOn: 'spellCheckEnabled', help: "Note: the spell checker built into your computer decides this; Ironbooks cannot change it." },

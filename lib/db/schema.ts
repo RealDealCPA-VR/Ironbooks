@@ -2832,3 +2832,31 @@ export const accountantCopyBaseline = pgTable('accountant_copy_baseline', {
   /** 0058: 'void' | 'draft' | 'live', or the status of an estimate / sales order / purchase order. */
   state: varchar('state', { length: 20 }),
 });
+
+/**
+ * 0079 prefsperms: Send Forms mail server, stored IN the company file (Preferences > Send Forms;
+ * lib/services/emailSettings.ts). `passwordEnc` is sealed with the file's vault secret
+ * (lib/ai/keyVault.ts sealForFile) and never returned; one row per company.
+ */
+export const companyEmailSettings = pgTable('company_email_settings', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull().unique(),
+  host: varchar('host', { length: 255 }),
+  port: integer('port'),
+  /** 'ssl' (implicit TLS, usually 465) | 'starttls' (usually 587) | 'none' (a LAN relay). */
+  security: varchar('security', { length: 16 }).notNull().default('starttls'),
+  username: varchar('username', { length: 255 }),
+  passwordEnc: text('password_enc'),
+  fromName: varchar('from_name', { length: 255 }),
+  fromEmail: varchar('from_email', { length: 255 }),
+  replyTo: varchar('reply_to', { length: 255 }),
+  bcc: varchar('bcc', { length: 500 }),
+  /** Send from each user's own address (My Preferences > Send Forms) when they set one. */
+  useSenderAddress: boolean('use_sender_address').notNull().default(true),
+  lastTestAt: timestamp('last_test_at'),
+  lastTestOk: boolean('last_test_ok'),
+  lastTestMessage: text('last_test_message'),
+  updatedBy: uuid('updated_by').references(() => users.id),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
