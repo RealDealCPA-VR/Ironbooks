@@ -201,6 +201,8 @@ export const reportScheduleSchema = z
       .refine((s) => !s.includes('..'), 'Folder name may not contain ".."')
       .optional(),
     isActive: z.boolean().optional(),
+    /** Also email the export to these addresses (comma separated; checked by the service). */
+    emailTo: z.string().max(5000).nullable().optional(),
   })
   .refine((s) => !!s.memorizedReportId !== !!s.groupId, {
     message: 'Choose either one memorized report or one report group.',
@@ -212,6 +214,8 @@ export const updateReportScheduleSchema = z.object({
   frequency: z.enum(SCHEDULE_FREQUENCIES).optional(),
   isActive: z.boolean().optional(),
   format: z.enum(['csv', 'xlsx']).optional(),
+  /** Recipients of the emailed export; '' or null = files only. */
+  emailTo: z.string().max(5000).nullable().optional(),
 });
 
 export const PIVOT_DIMENSIONS = ['account', 'accountType', 'class', 'customer', 'vendor', 'name', 'item', 'month', 'quarter', 'year', 'txnType'] as const;

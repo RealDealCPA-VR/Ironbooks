@@ -1,5 +1,5 @@
 /**
- * PATCH  /api/report-schedules/[id] — rename / change frequency / pause ({ name?, frequency?, isActive?, format? })
+ * PATCH  /api/report-schedules/[id] — rename / change frequency / pause / recipients ({ name?, frequency?, isActive?, format?, emailTo? })
  * DELETE /api/report-schedules/[id]
  */
 import { NextRequest, NextResponse } from 'next/server';

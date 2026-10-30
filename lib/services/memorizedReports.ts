@@ -2,7 +2,8 @@
  * Memorized (saved) reports — store a report type + its settings / filters so users can re-run a
  * customized report later (QuickBooks "Memorized Reports"), organised in Memorized Report Groups,
  * run a whole group at once ("Process Multiple Reports") and run on a schedule (exports saved to
- * a local folder; the desktop shell's timer calls runDueSchedules).
+ * a local folder; the desktop shell's timer calls runDueSchedules), optionally emailed to the
+ * schedule's recipients (QB "Send report as e-mail") through lib/services/email.ts.
  *
  * Config shape for standard reports: { params: { from, to, accountId, … }, display: { … } }.
  * Report builder ("custom") reports keep their own config shape.
@@ -21,6 +22,9 @@ import { runReport, type ReportConfig } from './reportBuilder';
 import { requirePermission, resolveAccess } from './access';
 import { requireAnyReportAccess } from './reportsAccess';
 import { assertNotSandbox } from './sandboxState';
+import { sendMail } from './email';
+import { getCompany, getPreferences } from './company';
+import { fillMergeFields } from '@/lib/preferences';
 import { can, type Area, type EffectiveAccess } from '@/lib/permissions/model';
 
 /**
@@ -425,6 +429,88 @@ function safeSegment(s: string, fallback: string): string {
   return out && out !== '.' ? out : fallback;
 }
 
+/** Most recipients one schedule may email (QB keeps a short To list on a report email). */
+export const MAX_SCHEDULE_RECIPIENTS = 20;
+const EMAIL_RE = /^[^\s@,;<>"()]+@[^\s@,;<>"()]+\.[^\s@,;<>"()]+$/;
+
+/**
+ * A schedule's recipients: comma / semicolon / space separated addresses, trimmed, duplicates
+ * (any case) dropped, joined with ", ". Empty → null (files only). Anything that is not a plain
+ * email address (a name, a header injection, a list of 21) is refused.
+ */
+export function normalizeRecipients(input: string | null | undefined): string | null {
+  if (input === undefined || input === null) return null;
+  if (typeof input !== 'string') throw validation('Recipients must be email addresses.');
+  if (/[\r\n]/.test(input)) throw validation('Recipients must be email addresses, one after another.');
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of input.split(/[,;\s]+/)) {
+    const a = raw.trim();
+    if (!a) continue;
+    if (a.length > 254 || !EMAIL_RE.test(a)) throw validation(`"${a.slice(0, 60)}" is not a valid email address.`);
+    if (seen.has(a.toLowerCase())) continue;
+    seen.add(a.toLowerCase());
+    out.push(a);
+  }
+  if (out.length > MAX_SCHEDULE_RECIPIENTS) throw validation(`A schedule can email at most ${MAX_SCHEDULE_RECIPIENTS} people.`);
+  return out.length ? out.join(', ') : null;
+}
+
+/**
+ * Write a file so a reader never sees half of it: into a temporary file next to it, then renamed
+ * over the old one. A write that fails (disk full, the folder went away) leaves the previous
+ * export as it was and no temporary file behind.
+ */
+function writeFileAtomic(file: string, data: string | Buffer): void {
+  const tmp = `${file}.${process.pid}.${Date.now().toString(36)}.tmp`;
+  try {
+    if (typeof data === 'string') fs.writeFileSync(tmp, data, 'utf8');
+    else fs.writeFileSync(tmp, data);
+    fs.renameSync(tmp, file);
+  } catch (err) {
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {
+      /* the temporary file could not be removed either: nothing more to do */
+    }
+    throw err;
+  }
+}
+
+/** Email wording of a scheduled report (Send Forms "report" template when the company has one). */
+const DEFAULT_REPORT_EMAIL = {
+  subject: '{{report.name}} — {{date}} from {{company.name}}',
+  body: 'Hello,\n\nAttached: {{report.list}}.\n\nThis report was sent by a schedule in {{company.name}} ({{schedule.frequency}}).\n\n{{company.name}}',
+};
+
+async function emailScheduledReport(
+  ctx: ServiceContext,
+  schedule: { name: string; frequency: string; emailTo: string },
+  attachments: { filename: string; content: Buffer; contentType: string }[],
+  reportNames: string[],
+  stamp: string,
+): Promise<void> {
+  const [company, prefs] = await Promise.all([getCompany(ctx), getPreferences(ctx)]);
+  // The Send Forms preferences may carry a "report" template (prefsperms); else the default.
+  const tpl = (prefs.sendForms as unknown as Record<string, { subject?: string; body?: string } | undefined>).report;
+  const merge = {
+    'report.name': schedule.name,
+    'report.list': reportNames.join(', '),
+    'company.name': company?.name ?? '',
+    date: stamp,
+    'schedule.frequency': schedule.frequency === 'daily' ? 'every day' : schedule.frequency === 'weekly' ? 'every week' : 'every month',
+  };
+  await sendMail(
+    {
+      to: schedule.emailTo,
+      subject: fillMergeFields(tpl?.subject || DEFAULT_REPORT_EMAIL.subject, merge),
+      text: fillMergeFields(tpl?.body || DEFAULT_REPORT_EMAIL.body, merge),
+      attachments,
+    },
+    ctx,
+  );
+}
+
 export async function listReportSchedules(ctx: ServiceContext) {
   requirePermission(ctx, 'file_utilities', 'view');
   return ctx.db
@@ -445,9 +531,12 @@ export async function createReportSchedule(
     format?: 'csv' | 'xlsx';
     folder?: string;
     isActive?: boolean;
+    /** Also email the export to these addresses (comma / semicolon separated); empty = files only. */
+    emailTo?: string | null;
   },
 ) {
   requirePermission(ctx, 'file_utilities', 'create');
+  const emailTo = normalizeRecipients(input.emailTo);
   if (!!input.memorizedReportId === !!input.groupId) throw validation('Choose either one memorized report or one report group.');
   if (input.memorizedReportId) {
     // A schedule later runs unattended and writes the report to disk, so the person setting it up
@@ -483,9 +572,10 @@ export async function createReportSchedule(
         folder: input.folder?.trim() || null,
         isActive: input.isActive ?? true,
         createdBy: tx.userId,
+        emailTo,
       })
       .returning();
-    await writeAudit(tx, { action: 'create', entityType: 'report_schedule', entityId: row.id, newValues: { name: row.name, frequency: row.frequency, nextRunAt: row.nextRunAt } });
+    await writeAudit(tx, { action: 'create', entityType: 'report_schedule', entityId: row.id, newValues: { name: row.name, frequency: row.frequency, nextRunAt: row.nextRunAt, emailTo } });
     return row;
   });
 }
@@ -493,9 +583,10 @@ export async function createReportSchedule(
 export async function updateReportSchedule(
   ctx: ServiceContext,
   id: string,
-  patch: { name?: string; frequency?: ScheduleFrequency; isActive?: boolean; format?: 'csv' | 'xlsx' },
+  patch: { name?: string; frequency?: ScheduleFrequency; isActive?: boolean; format?: 'csv' | 'xlsx'; emailTo?: string | null },
 ) {
   requirePermission(ctx, 'file_utilities', 'modify');
+  const emailTo = patch.emailTo !== undefined ? normalizeRecipients(patch.emailTo) : undefined;
   const [before] = await ctx.db.select().from(reportSchedules).where(and(eq(reportSchedules.id, id), eq(reportSchedules.companyId, ctx.companyId)));
   if (!before) throw notFound('Report schedule');
   // Monthly schedules run on an anchor day of month. Keep it when frequency is unchanged (and set);
@@ -512,10 +603,17 @@ export async function updateReportSchedule(
         anchorDay,
         isActive: patch.isActive ?? before.isActive,
         format: patch.format ?? before.format,
+        ...(emailTo !== undefined ? { emailTo } : {}),
       })
       .where(eq(reportSchedules.id, id))
       .returning();
-    await writeAudit(tx, { action: 'update', entityType: 'report_schedule', entityId: id, oldValues: { name: before.name, frequency: before.frequency, isActive: before.isActive }, newValues: { name: row.name, frequency: row.frequency, isActive: row.isActive } });
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'report_schedule',
+      entityId: id,
+      oldValues: { name: before.name, frequency: before.frequency, isActive: before.isActive, emailTo: before.emailTo },
+      newValues: { name: row.name, frequency: row.frequency, isActive: row.isActive, emailTo: row.emailTo },
+    });
     return row;
   });
 }
@@ -542,8 +640,10 @@ export interface ScheduleRunResult {
 /**
  * Run every active schedule whose next run is due (≤ now): run its report(s), write the export
  * files into the export folder, then advance nextRunAt past `now` (missed runs are not replayed
- * one by one). Email delivery is intentionally not done here — reports leave the machine only if
- * the user sends them.
+ * one by one). A schedule with recipients (emailTo) then emails the files it saved, attached,
+ * through sendMail — the Send Forms / SMTP settings, sandbox mode and the company's network
+ * opt-in apply; the people who set the schedule up chose to send them. A failed email never loses
+ * the saved files: the run is 'partial' and says why.
  *
  * Whose access a schedule runs with:
  *  - Trusted context (the desktop timer's internal token): the schedule's creator's current access,
@@ -579,10 +679,12 @@ export async function runDueSchedules(
       continue;
     }
     const files: string[] = [];
+    const attachments: { filename: string; content: Buffer; contentType: string }[] = [];
+    let reportNames: string[] = [];
     let status: ScheduleRunResult['status'] = 'ok';
     let message: string | undefined;
+    let runCtx: ServiceContext = ctx;
     try {
-      let runCtx: ServiceContext = ctx;
       if (!ctx.access && s.createdBy) {
         if (!creatorAccess.has(s.createdBy)) {
           const r = await resolveAccess(ctx.db, ctx.companyId, s.createdBy);
@@ -603,10 +705,13 @@ export async function runDueSchedules(
       fs.mkdirSync(dir, { recursive: true });
       // The run's local calendar day (the UTC day is tomorrow in US evenings).
       const stamp = localDateISO(now);
+      reportNames = ok.map((p) => p.name);
       if (s.format === 'xlsx' && ok.length) {
         const file = path.join(dir, `${safeSegment(s.name, 'Reports')} ${stamp}.xlsx`);
-        fs.writeFileSync(file, ok.length === 1 ? buildXlsx({ sheetName: ok[0].report!.title.slice(0, 28), title: ok[0].report!.title, subtitle: ok[0].report!.subtitle, ...reportToTable(ok[0].report!) }) : reportsToWorkbook(ok.map((p) => p.report!)));
+        const content = ok.length === 1 ? buildXlsx({ sheetName: ok[0].report!.title.slice(0, 28), title: ok[0].report!.title, subtitle: ok[0].report!.subtitle, ...reportToTable(ok[0].report!) }) : reportsToWorkbook(ok.map((p) => p.report!));
+        writeFileAtomic(file, content);
         files.push(file);
+        attachments.push({ filename: path.basename(file), content: Buffer.from(content), contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
       } else {
         // One file per report, never two with the same name: reports named alike (or alike once
         // made file-safe — "A/R" and "A:R") overwrote each other's export. Windows names are
@@ -618,8 +723,10 @@ export async function runDueSchedules(
           for (let i = 2; used.has(name.toLowerCase()); i++) name = `${base} (${i})`;
           used.add(name.toLowerCase());
           const file = path.join(dir, `${name}.csv`);
-          fs.writeFileSync(file, '﻿' + reportToCsv(p.report!), 'utf8');
+          const content = '﻿' + reportToCsv(p.report!);
+          writeFileAtomic(file, content);
           files.push(file);
+          attachments.push({ filename: path.basename(file), content: Buffer.from(content, 'utf8'), contentType: 'text/csv; charset=utf-8' });
         }
       }
       if (failed.length) {
@@ -630,6 +737,17 @@ export async function runDueSchedules(
       status = 'failed';
       message = err instanceof Error ? err.message : 'Scheduled report failed.';
     }
+    let emailed = false;
+    if (s.emailTo && attachments.length) {
+      try {
+        await emailScheduledReport(runCtx, { name: s.name, frequency: s.frequency, emailTo: s.emailTo }, attachments, reportNames, localDateISO(now));
+        emailed = true;
+      } catch (err) {
+        if (status === 'ok') status = 'partial';
+        const why = err instanceof Error ? err.message : 'the email could not be sent';
+        message = [message, `Saved but not emailed: ${why}`].filter(Boolean).join('; ');
+      }
+    }
     const freq = s.frequency as ScheduleFrequency;
     let next = nextRunAfter(s.nextRunAt, freq, s.anchorDay);
     let guard = 0;
@@ -637,9 +755,14 @@ export async function runDueSchedules(
     await inTransaction(ctx, async (tx) => {
       await tx.db
         .update(reportSchedules)
-        .set({ lastRunAt: now, lastStatus: status, lastMessage: message ?? (files.length ? `Saved ${files.length} file(s)` : null), nextRunAt: next })
+        .set({
+          lastRunAt: now,
+          lastStatus: status,
+          lastMessage: message ?? (files.length ? `Saved ${files.length} file(s)${emailed ? ` and emailed to ${s.emailTo}` : ''}` : null),
+          nextRunAt: next,
+        })
         .where(eq(reportSchedules.id, s.id));
-      await writeAudit(tx, { action: 'update', entityType: 'report_schedule', entityId: s.id, newValues: { ran: now, status, files: files.map((f) => path.basename(f)) } });
+      await writeAudit(tx, { action: 'update', entityType: 'report_schedule', entityId: s.id, newValues: { ran: now, status, files: files.map((f) => path.basename(f)), ...(emailed ? { emailedTo: s.emailTo } : {}) } });
     });
     results.push({ scheduleId: s.id, name: s.name, status, files, message });
   }

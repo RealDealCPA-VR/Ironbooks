@@ -3,11 +3,13 @@
 /**
  * Scheduled Reports: run a memorized report (or a whole group) every day, week or month and
  * save the export (CSV or Excel) into a folder on this computer. The desktop app checks for due
- * schedules automatically; "Run due reports now" does it on demand. Nothing is emailed — files
- * stay on this computer.
+ * schedules automatically; "Run due reports now" does it on demand. A schedule can also email
+ * its files to the people listed in "Email to" (QB "Send report as e-mail"): the email goes out
+ * through the company's Send Forms / email settings, only with the company's network opt-in for
+ * an outside mail server, and never from a sandbox copy. Without recipients files stay here.
  */
 import { useCallback, useEffect, useState } from 'react';
-import { CalendarClock, Pause, Play, Plus, Trash2 } from 'lucide-react';
+import { CalendarClock, Mail, Pause, Play, Plus, Trash2 } from 'lucide-react';
 import { Badge, Button, Card, ConfirmDialog, EmptyState, Input, Label, Modal, PageHeader, Select, Table, Td, Th, Tr, toast } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { todayISO } from '@/lib/dates';
@@ -25,6 +27,7 @@ interface Schedule {
   lastRunAt: string | null;
   lastStatus: string | null;
   lastMessage: string | null;
+  emailTo: string | null;
 }
 interface Option {
   id: string;
@@ -39,7 +42,9 @@ export default function ScheduledReportsPage() {
   const [reports, setReports] = useState<Option[]>([]);
   const [groups, setGroups] = useState<Option[]>([]);
   const [open, setOpen] = useState(false);
-  const [form, setForm] = useState({ name: '', target: '', frequency: 'monthly', startDate: today(), format: 'csv', folder: '' });
+  const [form, setForm] = useState({ name: '', target: '', frequency: 'monthly', startDate: today(), format: 'csv', folder: '', emailTo: '' });
+  // "Email to" of an existing schedule (null = dialog closed).
+  const [mailEdit, setMailEdit] = useState<{ s: Schedule; value: string } | null>(null);
   const [busy, setBusy] = useState(false);
 
   const load = useCallback(async () => {
@@ -72,9 +77,10 @@ export default function ScheduledReportsPage() {
         startDate: form.startDate,
         format: form.format,
         folder: form.folder || undefined,
+        emailTo: form.emailTo.trim() || null,
       });
       setOpen(false);
-      setForm({ name: '', target: '', frequency: 'monthly', startDate: today(), format: 'csv', folder: '' });
+      setForm({ name: '', target: '', frequency: 'monthly', startDate: today(), format: 'csv', folder: '', emailTo: '' });
       await load();
       toast('Schedule saved.', 'success');
     } catch (err) {
@@ -93,6 +99,21 @@ export default function ScheduledReportsPage() {
       await load();
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Could not run the schedules.', 'danger');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const saveRecipients = async () => {
+    if (!mailEdit) return;
+    setBusy(true);
+    try {
+      await api.patch(`/api/report-schedules/${mailEdit.s.id}`, { emailTo: mailEdit.value.trim() || null });
+      setMailEdit(null);
+      await load();
+      toast('Recipients saved.', 'success');
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Could not save the recipients.', 'danger');
     } finally {
       setBusy(false);
     }
@@ -138,8 +159,8 @@ export default function ScheduledReportsPage() {
         }
       />
       <p className="text-sm text-navy/60 -mt-4 mb-6">
-        Files are saved on this computer in <code className="rounded bg-white px-1">{folder || '…'}</code>. Reports are never emailed
-        automatically.
+        Files are saved on this computer in <code className="rounded bg-white px-1">{folder || '…'}</code>. A schedule with people in
+        &ldquo;Email to&rdquo; also emails them the files, using your Send Forms email settings; without recipients nothing leaves this computer.
       </p>
       <Card className="p-0 overflow-hidden">
         {schedules.length === 0 ? (
@@ -154,6 +175,7 @@ export default function ScheduledReportsPage() {
                 <Th>Next run</Th>
                 <Th>Last run</Th>
                 <Th>Format</Th>
+                <Th>Email to</Th>
                 <Th>{''}</Th>
               </tr>
             </thead>
@@ -177,7 +199,13 @@ export default function ScheduledReportsPage() {
                     )}
                   </Td>
                   <Td className="uppercase">{s.format}{s.folder ? ` → ${s.folder}` : ''}</Td>
+                  <Td className="text-sm text-navy/70 max-w-[14rem] truncate" title={s.emailTo ?? ''}>
+                    {s.emailTo ?? <span className="text-navy/40">Files only</span>}
+                  </Td>
                   <Td>
+                    <Button variant="ghost" size="sm" onClick={() => setMailEdit({ s, value: s.emailTo ?? '' })} aria-label={`Email recipients of ${s.name}`}>
+                      <Mail className="h-4 w-4" />
+                    </Button>
                     <Button variant="ghost" size="sm" onClick={() => toggle(s)} aria-label={s.isActive ? `Pause ${s.name}` : `Resume ${s.name}`}>
                       {s.isActive ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4" />}
                     </Button>
@@ -269,8 +297,46 @@ export default function ScheduledReportsPage() {
               <Input id="sc-folder" value={form.folder} onChange={(e) => setForm({ ...form, folder: e.target.value })} placeholder="Scheduled" />
             </div>
           </div>
+          <div>
+            <Label htmlFor="sc-email">Email to (optional)</Label>
+            <Input
+              id="sc-email"
+              value={form.emailTo}
+              onChange={(e) => setForm({ ...form, emailTo: e.target.value })}
+              placeholder="owner@example.com, accountant@example.com"
+              autoComplete="off"
+            />
+            <p className="text-xs text-navy/50 mt-1">Each run also emails the files to these people, separated by commas. Leave blank to only save files.</p>
+          </div>
           <p className="text-xs text-navy/50">Dates saved in the memorized report are used as-is each time it runs.</p>
         </div>
+      </Modal>
+
+      <Modal
+        open={mailEdit !== null}
+        onClose={() => setMailEdit(null)}
+        title={mailEdit ? `Email “${mailEdit.s.name}” to` : 'Email to'}
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setMailEdit(null)}>
+              Cancel
+            </Button>
+            <Button onClick={saveRecipients} loading={busy}>
+              Save
+            </Button>
+          </>
+        }
+      >
+        <Label htmlFor="sc-email-edit">Email addresses</Label>
+        <Input
+          id="sc-email-edit"
+          value={mailEdit?.value ?? ''}
+          onChange={(e) => mailEdit && setMailEdit({ ...mailEdit, value: e.target.value })}
+          placeholder="owner@example.com, accountant@example.com"
+          autoComplete="off"
+          autoFocus
+        />
+        <p className="text-xs text-navy/50 mt-1">Separate addresses with commas. Clear the box to stop emailing and only save files.</p>
       </Modal>
     </main>
   );
