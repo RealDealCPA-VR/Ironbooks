@@ -1325,6 +1325,30 @@ export function listKeyAction(e: KeyLike): ListKeyAction | null {
 }
 
 /**
+ * Left / Right (no modifiers) in a list or report: scroll a column to the left / right, as in
+ * QuickBooks' wide reports. Null for every other key.
+ */
+export function listScrollKey(e: KeyLike): 'left' | 'right' | null {
+  if (e.altKey || e.shiftKey || ctrlOrCmd(e)) return null;
+  return e.key === 'ArrowLeft' ? 'left' : e.key === 'ArrowRight' ? 'right' : null;
+}
+
+/**
+ * Where a column scroll lands: the next column edge right of `scrollLeft` (or left of it), given
+ * the columns' left edges in scroll coordinates, kept within 0..maxScroll. Null when there is
+ * nowhere to go (already at that end), so the key is left alone.
+ */
+export function nextColumnScroll(edges: readonly number[], scrollLeft: number, maxScroll: number, dir: 'left' | 'right'): number | null {
+  if (maxScroll <= 0) return null;
+  const sorted = [...new Set(edges.map((x) => Math.max(0, Math.round(x))))].sort((a, b) => a - b);
+  let to: number | undefined;
+  if (dir === 'right') to = sorted.find((x) => x > scrollLeft + 1) ?? maxScroll;
+  else to = [...sorted].reverse().find((x) => x < scrollLeft - 1) ?? 0;
+  const clamped = Math.min(maxScroll, Math.max(0, to));
+  return Math.abs(clamped - scrollLeft) < 1 ? null : clamped;
+}
+
+/**
  * The row to highlight after a move key. With nothing highlighted yet, Down / Home / PgDn start
  * at the top and Up / End / PgUp at the bottom (registers keep their newest entry last).
  */
@@ -1476,6 +1500,34 @@ function rowLabels(row: HTMLElement): string[] {
     .map((c) => c.textContent ?? '');
 }
 
+/** The element that scrolls a list sideways: the list itself, a wrapper inside it, or one around it. */
+function sidewaysScroller(container: HTMLElement): HTMLElement | null {
+  const scrolls = (el: HTMLElement) => {
+    if (el.scrollWidth <= el.clientWidth + 1) return false;
+    const o = getComputedStyle(el).overflowX;
+    return o === 'auto' || o === 'scroll';
+  };
+  if (scrolls(container)) return container;
+  const table = container.querySelector('table');
+  for (let el = table?.parentElement ?? null; el && el !== container; el = el.parentElement) if (scrolls(el)) return el;
+  for (let el = container.parentElement; el && el !== document.body; el = el.parentElement) if (scrolls(el)) return el;
+  return null;
+}
+
+/** Left / Right: scroll the list's table a column sideways. True when it scrolled. */
+function scrollListColumn(container: HTMLElement, dir: 'left' | 'right'): boolean {
+  const scroller = sidewaysScroller(container);
+  if (!scroller) return false;
+  const table = container.querySelector('table');
+  const row = table?.querySelector('thead tr') ?? table?.querySelector('tbody tr');
+  const base = scroller.getBoundingClientRect().left - scroller.scrollLeft;
+  const edges = Array.from((row as HTMLTableRowElement | null)?.cells ?? []).map((c) => c.getBoundingClientRect().left - base);
+  const to = nextColumnScroll(edges, scroller.scrollLeft, scroller.scrollWidth - scroller.clientWidth, dir);
+  if (to === null) return false;
+  scroller.scrollLeft = to;
+  return true;
+}
+
 /** Rows per PgUp / PgDn: what fits in the list's own scroll area, else in the window. */
 function pageSizeOf(container: HTMLElement, rows: HTMLElement[]): number {
   const rowHeight = rows[0]?.getBoundingClientRect().height || 32;
@@ -1609,6 +1661,7 @@ export interface ListKeysProps<T extends HTMLElement> {
  *
  *   Up / Down       move the highlighted row        Home / End   first / last row
  *   PgUp / PgDn     a page at a time                Enter        open the row (openListRow)
+ *   Left / Right    a wide report or list scrolls a column sideways
  *   typing a name   jump to the first row that starts with it (QB type-ahead)
  *   click           highlights the row
  *
@@ -1651,6 +1704,11 @@ export function useListKeys<T extends HTMLElement = HTMLDivElement>(options: Lis
       if (action) {
         e.preventDefault();
         setActiveListRow(container, rows[nextListIndex(action, current, rows.length, pageSizeOf(container, rows))]);
+        return;
+      }
+      const sideways = listScrollKey(e);
+      if (sideways) {
+        if (scrollListColumn(container, sideways)) e.preventDefault();
         return;
       }
       const now = Date.now();

@@ -77,10 +77,10 @@ export interface QbShortcut {
 export const QB_SHORTCUTS: QbShortcut[] = [
   // ---- Navigate around QuickBooks ----
   { keys: 'F1', qb: 'Open the Help window', group: 'navigate', sources: ['intuit', 'qbhelp', 'teachucomp'], status: 'done', ironbooks: 'Help for this page ("What is this page?"); it also opens this shortcuts list' },
-  { keys: 'Esc', qb: 'Close current window', group: 'navigate', sources: ['intuit', 'qbhelp', 'dummies'], status: 'done', ironbooks: 'Closes the open form or dialog; a changed form first asks whether to record the changes (Yes / No / Cancel)' },
-  { keys: 'Ctrl+F4', qb: 'Close active window', group: 'navigate', sources: ['qbhelp', 'axpert', 'fmd'], status: 'done', ironbooks: 'Closes the open form (asking about changes); with none open, closes the page and shows the window before it' },
-  { keys: 'Ctrl+Tab / Ctrl+F6', qb: 'Next open window', group: 'navigate', sources: ['axpert', 'fmd'], status: 'done', ironbooks: 'Switches to the next open window (the pages you have open this session)' },
-  { keys: 'Ctrl+Shift+Tab / Ctrl+Shift+F6', qb: 'Previous open window', group: 'navigate', sources: ['axpert'], status: 'done', ironbooks: 'Switches to the previous open window' },
+  { keys: 'Esc', qb: 'Close current window', group: 'navigate', sources: ['intuit', 'qbhelp', 'dummies'], status: 'done', ironbooks: 'Closes the open form or dialog — a changed form first asks "Do you want to record your changes?" (Yes / No / Cancel); with nothing open or selected, closes the window' },
+  { keys: 'Ctrl+F4', qb: 'Close active window', group: 'navigate', sources: ['qbhelp', 'axpert', 'fmd'], status: 'done', desktopOnly: true, ironbooks: 'Closes the open form (asking about changes); with none open, closes the window and shows the one before it' },
+  { keys: 'Ctrl+Tab / Ctrl+F6', qb: 'Next open window', group: 'navigate', sources: ['axpert', 'fmd'], status: 'done', desktopOnly: true, ironbooks: 'Switches to the next open window (the pages opened this session; Window > Open Window List shows them)' },
+  { keys: 'Ctrl+Shift+Tab / Ctrl+Shift+F6', qb: 'Previous open window', group: 'navigate', sources: ['axpert'], status: 'done', desktopOnly: true, ironbooks: 'Switches to the previous open window' },
   { keys: 'F2 / Ctrl+1', qb: 'Open the Product Information window (product, company file location, …)', group: 'navigate', sources: ['intuit', 'qbhelp'], status: 'done', ironbooks: 'Product Information: version, company file location and size, and how many accounts, names, items and transactions it holds' },
   { keys: 'F2, then F3', qb: 'Open Tech Help / Technical Info', group: 'navigate', sources: ['intuit'], status: 'done', ironbooks: 'F3 in Product Information shows the technical details (versions, database, data folder)' },
   { keys: 'F3 / Ctrl+2', qb: 'Open the Search window', group: 'navigate', sources: ['intuit'], status: 'done', ironbooks: 'Opens Search (the command bar): customers, vendors, items, accounts, transactions and pages' },
@@ -94,7 +94,7 @@ export const QB_SHORTCUTS: QbShortcut[] = [
   // ---- Data fields on forms ----
   { keys: '+ / -', qb: 'Increase or decrease the check or form number by one', group: 'data-fields', sources: ['intuit', 'qbhelp', 'teachucomp'], status: 'done', ironbooks: 'Next / previous number in every check, invoice and document number field' },
   { keys: 'Tab / Shift+Tab', qb: 'Next / previous field', group: 'data-fields', sources: ['intuit', 'qbhelp'], status: 'done', ironbooks: "In QuickBooks' order: name, class, template, date, number, …, the lines, memo, then the Save buttons" },
-  { keys: 'Enter', qb: 'Record or save a transaction', group: 'data-fields', sources: ['intuit', 'qbhelp', 'teachucomp'], status: 'done', ironbooks: 'Records the form; with "Pressing Enter moves between fields" on (My Preferences) it goes to the next field instead' },
+  { keys: 'Enter', qb: 'Record or save a transaction', group: 'data-fields', sources: ['intuit', 'qbhelp', 'teachucomp'], status: 'done', ironbooks: 'Records the form (Save & Close); with "Pressing Enter moves between fields" on (My Preferences) it goes to the next field instead. In a line grid it goes to the next line; in an open list it takes the entry' },
   { keys: 'Ctrl+Z', qb: 'Undo changes made in the field', group: 'data-fields', sources: ['intuit', 'qbhelp', 'teachucomp'], status: 'done', ironbooks: 'Undoes typing in the field — including dates and amounts changed by the QuickBooks keys' },
   { keys: 'Ctrl+C / Ctrl+X / Ctrl+V', qb: 'Copy, cut, paste', group: 'data-fields', sources: ['intuit', 'qbhelp'], status: 'done', ironbooks: 'Copy, cut and paste text' },
   { keys: 'Home / End', qb: 'Beginning / end of the field', group: 'data-fields', sources: ['qbhelp', 'teachucomp'], status: 'done', ironbooks: 'Beginning / end of the field' },
@@ -140,6 +140,7 @@ export const QB_SHORTCUTS: QbShortcut[] = [
   { keys: 'Up / Down, Home / End', qb: 'Move through a list', group: 'lists', sources: ['qbhelp', 'axpert'], status: 'done', ironbooks: 'Move the highlight; Home / End first / last row' },
   { keys: 'A…Z', qb: 'Type a name to go to it', group: 'lists', sources: ['axpert'], status: 'done', ironbooks: 'Jumps to the first row starting with what you type' },
   { keys: 'Enter', qb: 'QuickZoom on a report / open the list item', group: 'lists', sources: ['qbhelp', 'teachucomp', 'axpert'], status: 'done', ironbooks: 'Opens the highlighted row; on a report, QuickZoom' },
+  { keys: 'Left / Right', qb: 'Report column to the left / right', group: 'lists', sources: ['teachucomp', 'qbhelp'], status: 'done', ironbooks: 'Scrolls a wide report or list a column to the left / right' },
   { keys: 'Ctrl+E', qb: 'Edit the list item or the transaction selected in a register', group: 'lists', sources: ['intuit', 'qbhelp'], status: 'done', ironbooks: 'Edits the highlighted row' },
   { keys: 'Ctrl+D', qb: 'Delete the list item or transaction', group: 'lists', sources: ['intuit', 'qbhelp'], status: 'done', ironbooks: 'Deletes (or voids, or makes inactive) the highlighted row, asking first' },
   { keys: 'Ctrl+Q', qb: 'QuickReport on the transaction or list item', group: 'lists', sources: ['qbhelp', 'teachucomp', 'axpert'], status: 'done', ironbooks: 'QuickReport of the highlighted customer, vendor, employee or account' },
@@ -153,7 +154,7 @@ export const QB_SHORTCUTS: QbShortcut[] = [
   { keys: 'Ctrl+W', qb: 'Write a new check', group: 'new-task', sources: ['intuit', 'qbhelp'], status: 'done', ironbooks: 'Write Checks (never closes the window)' },
   { keys: 'Ctrl+J', qb: 'Open the Customer Center', group: 'new-task', sources: ['intuit', 'qbhelp'], status: 'done', ironbooks: 'Customer Center' },
   { keys: 'Ctrl+A', qb: 'Open the Chart of Accounts', group: 'new-task', sources: ['intuit', 'qbhelp'], status: 'done', ironbooks: 'Chart of Accounts (in a text field it selects the text)' },
-  { keys: 'Ctrl+R', qb: 'Open an account register', group: 'new-task', sources: ['intuit', 'dummies'], status: 'done', ironbooks: 'Use Register: choose an account (never reloads the window)' },
+  { keys: 'Ctrl+R', qb: 'Open an account register', group: 'new-task', sources: ['intuit', 'dummies'], status: 'done', ironbooks: 'Use Register: choose an account — or, on the Chart of Accounts, the highlighted account\'s register (never reloads the window)' },
   { keys: 'Ctrl+G', qb: "From a register: open the transfer account's register", group: 'new-task', sources: ['intuit', 'qbhelp', 'teachucomp', 'dummies'], status: 'done', ironbooks: "Opens the other account's register at the same transaction" },
   { keys: 'Ctrl+K', qb: 'QuickBooks Service Keys (payroll only)', group: 'new-task', sources: ['intuit'], status: 'na', ironbooks: 'Ironbooks payroll is built in, so there are no Intuit service keys; Ctrl+K opens the command bar' },
 

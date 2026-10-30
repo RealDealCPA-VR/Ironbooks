@@ -1,22 +1,32 @@
+// The DOM test harness itself (test/domHarness.ts): real key presses type into fields and Tab
+// moves the focus, the way a keyboard does.
 import * as React from 'react';
-import { domTest, mount, press, check, runDomTests, $, focusedLabel } from './kit';
-import { Input } from '@/components/ui';
+import { domTest, mount, press, typeText, equal, runDomTests, $, focusedLabel, stubFetch } from './kit';
 
-domTest('tab', async () => {
+domTest('typing and Tab are real key presses', async () => {
   await mount(
     <div>
-      <Input aria-label="Before" />
-      <Input type="date" aria-label="Date" defaultValue="2026-03-15" />
-      <Input aria-label="After" />
+      <input aria-label="First" />
+      <input aria-label="Second" />
     </div>,
   );
   $<HTMLInputElement>('input')!.focus();
-  const seen: string[] = [focusedLabel()];
-  for (let i = 0; i < 5; i++) {
-    await press('Tab');
-    seen.push(focusedLabel());
-  }
-  check(false, `seq: ${seen.join(' > ')} hasFocus=${document.hasFocus()}`);
+  await typeText('ab');
+  equal($<HTMLInputElement>('input')!.value, 'ab', 'typed text');
+  await press('Tab');
+  equal(focusedLabel(), 'Second', 'Tab moves to the next field');
+  await press('Tab', { shift: true });
+  equal(focusedLabel(), 'First', 'Shift+Tab moves back');
+});
+
+domTest('fetch can be answered by the test', async () => {
+  const calls = stubFetch({ 'GET /api/thing': { ok: 1 } });
+  const r = await fetch('/api/thing');
+  equal(r.status, 200, 'stubbed status');
+  equal(JSON.stringify(await r.json()), '{"ok":1}', 'stubbed body');
+  const missing = await fetch('/api/other', { method: 'POST', body: '{}' });
+  equal(missing.status, 404, 'an unstubbed route answers 404');
+  equal(calls.map((c) => `${c.method} ${c.path}`).join(','), 'GET /api/thing,POST /api/other', 'calls are recorded');
 });
 
 void runDomTests();

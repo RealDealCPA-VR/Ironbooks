@@ -140,6 +140,96 @@ export async function focus(el: Element | null, message = 'element to focus') {
   await settle();
 }
 
+// ---------------------------------------------------------------------------
+// fetch: the page's API calls answered by the test
+// ---------------------------------------------------------------------------
+
+export interface FetchCall {
+  method: string;
+  /** Path and query ('/api/todos?open=1'). */
+  path: string;
+  body: unknown;
+}
+
+/** A canned answer: a JSON body (status 200), or { status, body } / a function of the call. */
+export type FetchAnswer =
+  | unknown
+  | { __status: number; body?: unknown }
+  | ((call: FetchCall) => unknown | { __status: number; body?: unknown } | Promise<unknown>);
+
+/** Status + body for a stubbed answer: `reply(500, { error: 'down' })`. */
+export function reply(status: number, body?: unknown): { __status: number; body?: unknown } {
+  return { __status: status, body };
+}
+
+const realFetch = window.fetch.bind(window);
+let fetchCalls: FetchCall[] = [];
+
+/**
+ * Answer the page's fetch calls from `routes` — keys are 'METHOD /path' (the query is ignored
+ * unless the key has one) — and record every call. Unknown routes answer 404. The stub stays
+ * until the next stubFetch / restoreFetch (each test starts from the real fetch).
+ */
+export function stubFetch(routes: Record<string, FetchAnswer>): FetchCall[] {
+  fetchCalls = [];
+  const calls = fetchCalls;
+  window.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url, window.location.href);
+    const method = (init?.method ?? (input instanceof Request ? input.method : 'GET')).toUpperCase();
+    let body: unknown = init?.body ?? null;
+    if (typeof body === 'string') {
+      try {
+        body = JSON.parse(body);
+      } catch {
+        /* not JSON: kept as text */
+      }
+    }
+    // The test page is a file: URL, where '/api/x' resolves under the drive letter ('/C:/api/x').
+    const pathname = url.protocol === 'file:' ? url.pathname.replace(/^\/[A-Za-z]:/, '') : url.pathname;
+    const call: FetchCall = { method, path: `${pathname}${url.search}`, body };
+    calls.push(call);
+    const key = `${method} ${pathname}${url.search}`;
+    const found = key in routes ? routes[key] : routes[`${method} ${pathname}`];
+    if (found === undefined) return new Response(JSON.stringify({ error: `no stub for ${key}` }), { status: 404, headers: { 'content-type': 'application/json' } });
+    let answer = typeof found === 'function' ? await (found as (c: FetchCall) => unknown)(call) : found;
+    let status = 200;
+    if (answer && typeof answer === 'object' && '__status' in (answer as object)) {
+      status = (answer as { __status: number }).__status;
+      answer = (answer as { body?: unknown }).body;
+    }
+    return new Response(answer === undefined ? null : JSON.stringify(answer), { status, headers: { 'content-type': 'application/json' } });
+  }) as typeof window.fetch;
+  return calls;
+}
+
+/** Put the real fetch back. */
+export function restoreFetch() {
+  window.fetch = realFetch;
+}
+
+/** The calls made since the last stubFetch. */
+export function fetchLog(): FetchCall[] {
+  return fetchCalls;
+}
+
+/** Click an element as a mouse would (a trusted-looking sequence of pointer and mouse events). */
+export async function click(el: Element | null, message = 'element to click') {
+  check(el, `missing ${message}`);
+  const opts = { bubbles: true, cancelable: true, view: window, button: 0 };
+  el.dispatchEvent(new PointerEvent('pointerdown', opts));
+  el.dispatchEvent(new MouseEvent('mousedown', opts));
+  (el as HTMLElement).focus?.();
+  el.dispatchEvent(new PointerEvent('pointerup', opts));
+  el.dispatchEvent(new MouseEvent('mouseup', opts));
+  (el as HTMLElement).click();
+  await settle();
+}
+
+/** The text of the page (or `scope`), whitespace collapsed. */
+export function textOf(scope: Element | null = document.body): string {
+  return (scope?.textContent ?? '').replace(/\s+/g, ' ').trim();
+}
+
 /** Run every registered test in order and hand the results to the runner. */
 export async function runDomTests() {
   const results: DomResult[] = [];
@@ -152,6 +242,7 @@ export async function runDomTests() {
     }
     try {
       await unmount();
+      restoreFetch();
       window.history.replaceState(null, '', '#');
     } catch {
       /* the next test mounts afresh */

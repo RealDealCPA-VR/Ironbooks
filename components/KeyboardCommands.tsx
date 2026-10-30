@@ -43,6 +43,7 @@ import {
   globalShortcutFor,
   isEditableTarget,
   listKeyAction,
+  listScrollKey,
   navigateGuarded,
   openListRow,
   typeAheadChar,
@@ -100,7 +101,7 @@ async function entryForSource(ref: string): Promise<string | null> {
  */
 function forwardToList(e: KeyboardEvent, target: HTMLElement | null, dialog: HTMLElement | null) {
   if (dialog || !onPageBody(target)) return;
-  if (!listKeyAction(e) && typeAheadChar(e, '') === null) return;
+  if (!listKeyAction(e) && !listScrollKey(e) && typeAheadChar(e, '') === null) return;
   const list = firstList();
   if (!list) return;
   e.preventDefault();
