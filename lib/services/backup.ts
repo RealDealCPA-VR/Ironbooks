@@ -64,7 +64,7 @@ import {
   billingRateLevelItems, billingRateLevels, customerMessages, customerTypes, entityNotes,
   formTemplates, itemReceiptBillLines, jobTypes, leads, letterTemplates, listSeeds,
   memorizedReportGroups, otherNames, payRuns, paymentMethods, paymentTerms, payrollItems,
-  priceLevelItems, priceLevels, priceRules, qbGlImports, receiptScans, reportSchedules,
+  priceLevelItems, priceLevels, priceRules, qbGlImports, receiptScans, reportSchedules, commentedReports,
   salesTaxCodes, shipViaMethods, todoItems, todos, uomSetUnits, uomSets, vehicles, vendorTypes,
 } from '@/lib/db/schema';
 import { ServiceError, type ServiceContext } from './_base';
@@ -856,6 +856,7 @@ const COMPANY_TABLES: CompanyTableSpec[] = [
   { name: 'todos', table: todos, joins: [], companyCol: todos.companyId },
   { name: 'todoItems', table: todoItems, joins: [], companyCol: todoItems.companyId },
   { name: 'reportSchedules', table: reportSchedules, joins: [], companyCol: reportSchedules.companyId },
+  { name: 'commentedReports', table: commentedReports, joins: [], companyCol: commentedReports.companyId },
   { name: 'qbGlImports', table: qbGlImports, joins: [], companyCol: qbGlImports.companyId },
   { name: 'receiptScans', table: receiptScans, joins: [], companyCol: receiptScans.companyId },
 ];

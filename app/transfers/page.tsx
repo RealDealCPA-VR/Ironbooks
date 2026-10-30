@@ -21,6 +21,7 @@ import {
   toast, toastError,
 } from '@/components/ui';
 import { api } from '@/lib/client';
+import { useOpenParam } from '@/lib/useOpenParam';
 // wave2 prefs: Memorize (Ctrl+M)
 import MemorizeButton from '@/components/MemorizeButton';
 import { formatCurrency } from '@/lib/money';
@@ -285,6 +286,24 @@ export default function TransfersPage() {
   const [editing, setEditing] = useState<Transfer | null>(null);
   const [pendingVoid, setPendingVoid] = useState<Transfer | null>(null);
   const [voiding, setVoiding] = useState(false);
+
+  // QuickZoom from a report line (/reports/open → ?open=<id>): open that transfer (a voided one
+  // cannot be edited, so it is only pointed out).
+  useOpenParam((id) => {
+    void (async () => {
+      try {
+        const tr = transfers.find((t) => t.id === id) ?? (await api.get<Transfer>(`/api/transfers/${id}`));
+        if (tr.voidedAt) {
+          toast('This transfer is void.', 'info');
+          return;
+        }
+        setEditing(tr);
+        setShowNew(true);
+      } catch (err: unknown) {
+        toastError(err, 'Failed to load the transfer.');
+      }
+    })();
+  }, !loading);
 
   async function handleVoid(tr: Transfer) {
     setVoiding(true);

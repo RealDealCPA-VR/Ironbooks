@@ -37,6 +37,7 @@ import {
 } from '@/components/ui';
 import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
+import { useOpenParam } from '@/lib/useOpenParam';
 import { localDateISO, todayISO } from '@/lib/dates';
 import { useErrorFixes, type FixContext } from '@/components/ErrorFixPanel';
 import { getPath, parseLinePath, type ErrorFix } from '@/lib/errorFixes';
@@ -543,6 +544,9 @@ export default function PayBillsPage() {
   }
 
   // ── edit / void a recent payment ─────────────────────────────────────────
+
+  // QuickZoom from a report line (/reports/open → ?open=<id>): open that bill payment.
+  useOpenParam((id) => void openEditPayment({ id } as BillPayment));
 
   async function openEditPayment(p: BillPayment) {
     try {

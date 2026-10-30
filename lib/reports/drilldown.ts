@@ -173,6 +173,8 @@ export const REPORT_PARAM_KEYS = [
   // Open Invoices / Collections "more than N days past due": without it an explanation re-ran
   // the report unfiltered and explained a different number than the page showed.
   'overDays',
+  // Report gaps round: Sales by Rep, inventory sites, Cash Flow Forecast periods.
+  'repId', 'siteId', 'period',
 ] as const;
 
 /** Only the report options from a params object (drops row / col / back and anything unknown). */
@@ -212,6 +214,17 @@ export function drilldownApiUrl(
   const qs = new URLSearchParams({ ...reportOptions(params), row: rowId, col: column });
   if (brief) qs.set('brief', '1');
   return `/api/reports/drilldown/${encodeURIComponent(report)}?${qs.toString()}`;
+}
+
+/**
+ * QuickZoom from a transaction line to the form it came from (app/reports/open resolves the
+ * entry to its invoice, bill, check… — lib/services/sourceForms.ts). The back link returns to the report.
+ */
+export function sourceFormHref(entryId: string, back?: string | null): string {
+  const qs = new URLSearchParams({ entry: entryId });
+  const b = safeBackHref(back);
+  if (b) qs.set('back', b);
+  return `/reports/open?${qs.toString()}`;
 }
 
 /** A safe in-app "back" target (relative path only — never an absolute or protocol URL). */

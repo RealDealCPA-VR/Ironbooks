@@ -25,6 +25,7 @@ import {
 } from '@/components/ui';
 import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
+import { useOpenParam } from '@/lib/useOpenParam';
 import MemorizeButton from '@/components/MemorizeButton';
 import { formatCurrency } from '@/lib/money';
 import { formatDate, todayISO } from '@/lib/dates';
@@ -670,6 +671,9 @@ function DepositsPageContent() {
     await openEdit(d.id);
     setFormKey((k) => k + 1);
   }
+
+  // QuickZoom from a report line (/reports/open → ?open=<id>): open that deposit.
+  useOpenParam((id) => void openEdit(id), !loading);
 
   async function openEdit(id: string) {
     try {

@@ -73,7 +73,7 @@ describe('P1 report page wiring', () => {
   });
 
   it('Report Center links resolve to existing pages or catalog keys and include the new reports', () => {
-    const src = read(REPORTS, 'page.tsx');
+    const src = read(REPORTS, '_components', 'reportCenterSections.ts');
     const hrefs = [...src.matchAll(/href:\s*'([^']+)'/g)].map((m) => m[1]);
     expect(hrefs.length).toBeGreaterThan(10);
     for (const h of hrefs) {

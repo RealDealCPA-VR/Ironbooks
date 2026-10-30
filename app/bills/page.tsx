@@ -28,6 +28,7 @@ import { Help } from '@/components/Help';
 import { TypeaheadSelect } from '@/components/TypeaheadSelect';
 import type { TypeaheadChoice } from '@/lib/typeahead';
 import { api } from '@/lib/client';
+import { useOpenParam } from '@/lib/useOpenParam';
 import { todayISO } from '@/lib/dates';
 import { fetchVendorPrefill, PREFILL_SOURCE_LABEL } from '@/lib/aiClient';
 import {
@@ -474,6 +475,9 @@ export default function BillsPage() {
   }
 
   /** Prefill the form from a saved bill and open the modal in edit mode. */
+  // QuickZoom from a report line (/reports/open → ?open=<id>): open that bill.
+  useOpenParam((id) => void openEditModal({ id } as Bill), !loading);
+
   async function openEditModal(bill: Bill) {
     setLoadingEditId(bill.id);
     try {

@@ -124,6 +124,10 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/memorized-reports/groups': kind('member', 'GET POST'),
   '/api/memorized-reports/groups/[id]': kind('member', 'PATCH DELETE'),
   '/api/memorized-reports/process': kind('member', 'POST'),
+  // reports: Commented Reports — the service runs / shows each report only to someone who may view
+  // that report's own area (commentedReports.ts), so these are member routes like the above.
+  '/api/commented-reports': kind('member', 'GET POST'),
+  '/api/commented-reports/[id]': kind('member', 'GET PATCH DELETE'),
   // Scheduled reports write export files to the local disk (a file utility).
   '/api/report-schedules': r('file_utilities', 'GET POST'),
   '/api/report-schedules/[id]': r('file_utilities', 'PATCH:modify DELETE'),
@@ -809,7 +813,11 @@ export const PAGE_AREAS: Record<string, Area | Area[]> = {
   '/reports/reconciliation': 'accounting',
   // wave2 reports. The standard report viewer, memorized reports and graphs host reports from
   // several areas; their APIs check each report's own area (runStandardReport / graph kind).
-  '/reports/std': [...ANY_REPORT, 'time'],
+  // reports: the std viewer also hosts the Sales Tax and Closing Date Exception reports.
+  '/reports/std': [...ANY_REPORT, 'time', 'sales_tax', 'closing'],
+  '/reports/commented': [...ANY_REPORT, 'time', 'sales_tax', 'closing'],
+  // QuickZoom to the source form: the form page then checks its own area.
+  '/reports/open': [...ANY_REPORT, 'time', 'sales_tax', 'closing'],
   '/reports/drilldown': ANY_REPORT, // reportexplain: QuickZoom list; the API checks the report's area
   '/reports/memorized': ANY_REPORT,
   '/reports/graphs': ['reports_financial', 'reports_sales', 'reports_purchases'],

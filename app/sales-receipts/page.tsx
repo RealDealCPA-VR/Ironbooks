@@ -25,6 +25,7 @@ import {
 } from '@/components/ui';
 import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
+import { useOpenParam } from '@/lib/useOpenParam';
 import { todayISO } from '@/lib/dates';
 import { formatCurrency } from '@/lib/money';
 import {
@@ -807,6 +808,9 @@ export default function SalesReceiptsPage() {
   const [editTarget, setEditTarget] = useState<SalesReceiptDetail | null>(null);
   /** Remounts the form: Revert / Clear, and moving to another receipt (Previous / Next). */
   const [formKey, setFormKey] = useState(0);
+
+  // QuickZoom from a report line (/reports/open → ?open=<id>): open that sales receipt.
+  useOpenParam((id) => void openEdit({ id } as SalesReceipt), !loading);
 
   async function openEdit(r: SalesReceipt) {
     try {

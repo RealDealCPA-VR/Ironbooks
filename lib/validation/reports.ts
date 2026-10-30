@@ -226,3 +226,23 @@ export const pivotSchema = z.object({
   to: zDateStr.optional(),
   section: z.string().max(40).optional(),
 });
+
+/** Commented Reports (QB "Comment on Report"). */
+const commentSchema = z.object({
+  id: z.string().max(64).optional(),
+  rowId: z.string().min(1).max(300),
+  columnKey: z.string().min(1).max(60),
+  text: z.string().trim().min(1, 'A comment cannot be empty').max(2000),
+});
+
+export const commentedReportSchema = z.object({
+  name: z.string().trim().min(1, 'Give the commented report a name').max(255),
+  reportType: z.string().trim().min(1, 'Report type is required').max(100),
+  params: z.record(z.unknown()).default({}),
+  comments: z.array(commentSchema).max(200).optional(),
+});
+
+export const updateCommentedReportSchema = z.object({
+  name: z.string().trim().min(1, 'Give the commented report a name').max(255).optional(),
+  comments: z.array(commentSchema).max(200).optional(),
+});

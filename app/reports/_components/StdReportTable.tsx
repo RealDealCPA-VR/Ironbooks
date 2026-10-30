@@ -5,14 +5,20 @@
  * total styling, collapse & expand of sub-account roll-ups and grouped detail (QB "Collapse"),
  * the user's number format (lib/reports/format.ts), and QuickZoom on every row:
  *  - a row / cell with an href opens that report or page,
- *  - a transaction row (entryId) opens the transaction detail (EntryDetailModal).
+ *  - a transaction row (entryId) opens its SOURCE FORM — the invoice, bill, check, deposit… it
+ *    came from (QB QuickZoom on a detail line), through /reports/open (sourceFormHref); a General
+ *    Journal entry opens in Make General Journal Entries.
  * QB list keys move through the rows (useListKeys): Enter QuickZooms the highlighted row, and
  * Ctrl+Y / Ctrl+H show a transaction row's journal / history (components/KeyboardCommands.tsx).
+ * Commented Reports: `marks` puts the comment numbers next to the commented amounts, and in
+ * comment mode (`onComment`) clicking an amount comments on it instead of QuickZooming.
  */
 import { useMemo, useState } from 'react';
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
+import { MessageSquarePlus } from 'lucide-react';
+import { sourceFormHref } from '@/lib/reports/drilldown';
 import { ChevronDown, ChevronRight } from 'lucide-react';
-import EntryDetailModal from '@/components/EntryDetailModal';
 import { useListKeys } from '@/lib/shortcuts';
 import type { CellValue, StdColumn, StdReport, StdRow } from '@/lib/reports/types';
 import { FONT_CLASS, FONT_SIZE_CLASS, formatAmount, type NumberFormat } from '@/lib/reports/format';
@@ -75,6 +81,8 @@ export default function StdReportTable({
   onToggle,
   hiddenColumns,
   explain,
+  marks,
+  onComment,
 }: {
   report: StdReport;
   format: NumberFormat;
@@ -83,8 +91,12 @@ export default function StdReportTable({
   hiddenColumns?: Set<string>;
   /** Explain every amount (hover / focus tooltip + drill-down). */
   explain?: ExplainContext;
+  /** Commented Reports: "rowId|columnKey" → the comment numbers shown next to that amount. */
+  marks?: Map<string, number[]>;
+  /** Comment mode: clicking an amount comments on it (no QuickZoom). */
+  onComment?: (row: StdRow, column: StdColumn) => void;
 }) {
-  const [entryId, setEntryId] = useState<string | null>(null);
+  const router = useRouter();
   const listKeys = useListKeys<HTMLDivElement>();
   const byId = useMemo(() => new Map(report.rows.map((r) => [r.id, r])), [report]);
   const columns = report.columns.filter((c, i) => i === 0 || !hiddenColumns?.has(c.key));
@@ -158,22 +170,51 @@ export default function StdReportTable({
             const isCollapsed = collapsed.has(r.id);
             const cells = isCollapsed && r.collapsedCells ? r.collapsedCells : r.cells;
             const canToggle = !!r.collapsedCells;
-            const openEntry = r.entryId ? () => setEntryId(r.entryId!) : undefined;
+            // QuickZoom on a transaction line opens its source form (Back returns to this report).
+            const openEntry = r.entryId
+              ? () => {
+                  explain?.onNavigate?.();
+                  router.push(sourceFormHref(r.entryId!, explain?.backHref));
+                }
+              : undefined;
             return (
               <tr
                 key={r.id}
                 className={`border-b border-slate-100 ${rowClass(r)} ${openEntry ? 'cursor-pointer' : ''}`}
-                onDoubleClick={openEntry}
+                onDoubleClick={onComment ? undefined : openEntry}
                 data-journal-entry={r.entryId ?? undefined}
               >
                 {columns.map((c, i) => {
                   const v = cells[c.key] ?? null;
-                  const content = renderValue(c, v);
+                  const mark = marks?.get(`${r.id}|${c.key}`);
+                  const content = mark ? (
+                    <>
+                      {renderValue(c, v)}
+                      <sup className="ml-0.5 text-[0.65rem] font-semibold text-electric" aria-label={`Comment ${mark.join(', ')}`}>
+                        [{mark.join(', ')}]
+                      </sup>
+                    </>
+                  ) : (
+                    renderValue(c, v)
+                  );
                   const numeric = c.type && NUMERIC.has(c.type);
                   const cellHref = r.hrefs?.[c.key] ?? (i === 0 || (numeric && r.kind === 'data') ? r.href : null);
                   let inner: React.ReactNode = content;
-                  const explainable = !!explain && numeric && c.type !== 'number' && v !== null && v !== '';
-                  if (explainable && explainAll) {
+                  const explainable = !onComment && !!explain && numeric && c.type !== 'number' && v !== null && v !== '';
+                  if (onComment && numeric && v !== null && v !== '') {
+                    inner = (
+                      <button
+                        type="button"
+                        onClick={() => onComment(r, c)}
+                        className="inline-flex items-center gap-1 rounded px-1 hover:bg-electric/10 hover:text-electric focus:outline-none focus:ring-2 focus:ring-electric/40"
+                        title="Comment on this amount"
+                        aria-label={`Comment on ${String(cells[columns[0].key] ?? '')} ${c.header}`.trim()}
+                      >
+                        <MessageSquarePlus className="h-3 w-3 print-hidden opacity-50" aria-hidden="true" />
+                        {content}
+                      </button>
+                    );
+                  } else if (explainable && explainAll) {
                     // reportexplain: every amount explains itself and drills to its transactions.
                     const cellLabel = `${String(cells[columns[0].key] ?? r.cells.type ?? '')}${c.header ? `, ${c.header}` : ''}`.trim();
                     const single = !!openEntry && c.key !== 'balance';
@@ -195,15 +236,15 @@ export default function StdReportTable({
                         {content}
                       </AmountExplain>
                     );
-                  } else if (cellHref && content !== '') {
+                  } else if (cellHref && !onComment && v !== null && v !== '') {
                     inner = (
                       <Link href={cellHref} className="hover:text-electric hover:underline" title="QuickZoom: open the detail behind this amount">
                         {content}
                       </Link>
                     );
-                  } else if (openEntry && content !== '' && (i === 0 || numeric || c.key === 'num' || c.key === 'type')) {
+                  } else if (openEntry && !onComment && v !== null && v !== '' && (i === 0 || numeric || c.key === 'num' || c.key === 'type')) {
                     inner = (
-                      <button type="button" onClick={openEntry} className="text-left hover:text-electric hover:underline" title="Open this transaction">
+                      <button type="button" onClick={openEntry} className="text-left hover:text-electric hover:underline" title="Open the form this transaction came from">
                         {content}
                       </button>
                     );
@@ -238,7 +279,6 @@ export default function StdReportTable({
           })}
         </tbody>
       </table>
-      <EntryDetailModal entryId={entryId} onClose={() => setEntryId(null)} />
     </div>
   );
 }

@@ -26,6 +26,7 @@ import {
 } from '@/components/ui';
 import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
+import { useOpenParam } from '@/lib/useOpenParam';
 import { formatCurrency } from '@/lib/money';
 import { billableCostTotal, invoiceFormTotals, type LiveBillables } from '@/lib/invoiceLineMath';
 import { todayISO } from '@/lib/dates';
@@ -1791,6 +1792,9 @@ function InvoicesPageContent() {
       .getElementById(`invoice-row-${inv.id}`)
       ?.scrollIntoView({ block: 'center', behavior: 'smooth' });
   });
+
+  // QuickZoom from a report line (/reports/open → ?open=<id>): open that invoice.
+  useOpenParam((id) => void handleEdit({ id } as Invoice), !loading);
 
   async function handleEdit(inv: Invoice) {
     setLoadingEditId(inv.id);

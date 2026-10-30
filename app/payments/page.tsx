@@ -24,6 +24,7 @@ import {
 } from '@/components/ui';
 import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
+import { useOpenParam } from '@/lib/useOpenParam';
 import { todayISO } from '@/lib/dates';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
@@ -1705,6 +1706,9 @@ function PaymentsPageContent() {
     setModalOpen(false);
     setFormKey((k) => k + 1);
   }
+
+  // QuickZoom from a report line (/reports/open → ?open=<id>): open that payment.
+  useOpenParam((id) => void openEdit({ id } as Payment), !loading);
 
   async function openEdit(p: Payment) {
     try {

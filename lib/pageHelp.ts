@@ -320,6 +320,12 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
     first: 'Pick the date at the top; click any amount to see the details.',
     qb: 'Balance Sheet Standard',
   },
+  '/reports/commented': {
+    title: 'Commented Reports',
+    what: 'Reports saved with your comments on their amounts, kept exactly as they were when you commented them, to print, export or discuss later.',
+    first: 'On any report click "Comment on report", click the amounts to explain, then save. Open one here to change or export it.',
+    qb: 'Commented Reports',
+  },
   '/reports/drilldown': {
     title: "What's behind this number",
     what: 'Every transaction that adds up to the amount you clicked on a report, using the same dates, basis and filters as the report.',
