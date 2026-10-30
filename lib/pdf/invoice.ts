@@ -45,6 +45,8 @@ export interface InvoicePdfData {
    * P.O. No. Fills the template's header fields and Ship To block (wins over the defaults above).
    */
   shipping?: SalesShippingInfo | null;
+  /** salesar (B8): the invoice's Customer Message. */
+  customerMessage?: string | null;
 }
 
 /** Ship-to address object (invoices.ship_to) → printable lines. */
@@ -116,6 +118,7 @@ export async function renderInvoicePdf(data: InvoicePdfData, template?: PdfTempl
         ...(balance > 0 ? [{ label: 'Balance Due', value: inv.balanceDue, emphasis: 'balance' as const }] : []),
       ],
       memo: inv.memo,
+      customerMessage: data.customerMessage ?? null,
     },
     template?.design,
     template?.logo,

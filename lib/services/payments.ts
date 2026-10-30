@@ -74,6 +74,7 @@ import {
 } from './journalApplications';
 import { clearPaymentFxReliefs, ensureLegacyFxRelief, homeAt, invoiceHomeOpenNow, recordPaymentFxRelief } from './fxSubledger'; // p1 fx
 import { companyToday } from './salesDates';
+import { resolvePaymentMethod } from './salesFormLists';
 
 // ---- Types ------------------------------------------------------------------
 
@@ -98,8 +99,13 @@ export interface PaymentCreditInput {
 export interface ReceivePaymentInput {
   customerId: string;
   date: Date;
-  /** Payment method (cash|check|credit_card|ach|bank_transfer|other). */
+  /** Payment method type (cash|check|credit_card|ach|bank_transfer|other). */
   method: 'cash' | 'check' | 'credit_card' | 'ach' | 'bank_transfer' | 'other';
+  /**
+   * salesar (B7): the Payment Method list entry ("Visa", "E-Check"). Its type is stored as
+   * `method`. Edit: omitted keeps the saved entry while the method type stays the same.
+   */
+  paymentMethodId?: string | null;
   reference?: string | null;
   /**
    * Total payment amount received from the customer. May be 0 when the "payment" only applies
@@ -915,11 +921,26 @@ async function postPayment(
         })
       : null;
 
-  // 2. Insert (or, for an edit, rewrite) the paymentsReceived record
+  // 2. Insert (or, for an edit, rewrite) the paymentsReceived record. B7: the Payment Method list
+  //    entry decides the method type stored with it (salesFormLists.resolvePaymentMethod).
+  const prevMethod = existingId
+    ? (
+        await tx.db
+          .select({ paymentMethodId: paymentsReceived.paymentMethodId, method: paymentsReceived.method })
+          .from(paymentsReceived)
+          .where(eq(paymentsReceived.id, existingId))
+      )[0]
+    : undefined;
+  const pm = await resolvePaymentMethod(
+    tx,
+    { paymentMethodId: input.paymentMethodId, method: input.method },
+    prevMethod ? { paymentMethodId: prevMethod.paymentMethodId ?? null, method: prevMethod.method } : undefined,
+  );
   const header = {
     customerId: input.customerId,
     date: input.date,
-    method: input.method,
+    method: pm.method,
+    paymentMethodId: pm.paymentMethodId,
     reference: input.reference ?? null,
     amount: amountStr,
     unapplied: toAmountString(unapplied),
@@ -998,7 +1019,8 @@ async function postPayment(
     newValues: {
       customerId: input.customerId,
       amount: amountStr,
-      method: input.method,
+      method: pm.method,
+      paymentMethodId: pm.paymentMethodId,
       applications: input.applications,
       journalItems,
       journalCredits,

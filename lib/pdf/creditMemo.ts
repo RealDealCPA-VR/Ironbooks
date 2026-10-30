@@ -25,6 +25,8 @@ export interface CreditMemoPdfData {
     memo?: string | null;
   };
   lines: SalesFormPdfLine[];
+  /** salesar (B8): the memo's Customer Message. */
+  customerMessage?: string | null;
 }
 
 /** A `template` (a resolved form template) prints the template layout; without one, the built-in layout. */
@@ -48,6 +50,7 @@ export async function renderCreditMemoPdf(data: CreditMemoPdfData, template?: Pd
           { label: 'Remaining credit', value: m.remaining, emphasis: 'balance' as const },
         ],
         memo: m.memo ?? null,
+        customerMessage: data.customerMessage ?? null,
       },
       template.design,
       template.logo,
@@ -69,6 +72,7 @@ export async function renderCreditMemoPdf(data: CreditMemoPdfData, template?: Pd
     customerName: data.customerName,
     lines: data.lines,
     totals,
+    message: data.customerMessage ?? null,
     note: data.memo.memo ? `Memo: ${data.memo.memo}` : null,
   });
 }

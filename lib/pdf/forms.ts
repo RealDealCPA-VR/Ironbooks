@@ -20,6 +20,7 @@ import { renderInvoicePdf } from './invoice';
 import { renderEstimatePdf } from './estimate';
 import { renderPurchaseOrderPdf } from './purchaseOrder';
 import { renderStatementPdf } from './statement';
+import { customerMessageText } from '@/lib/services/salesFormLists';
 
 export interface Letterhead {
   name: string;
@@ -113,6 +114,7 @@ export async function buildInvoicePdf(
       company: letterhead,
       customerName,
       currency: invoice.currency ?? undefined,
+      customerMessage: await customerMessageText(ctx, invoice.customerMessageId),
       billToLines: addressToLines(cust?.billingAddress),
       shipToLines: addressToLines(cust?.shippingAddress),
       invoice: {
@@ -174,6 +176,7 @@ export async function buildEstimatePdf(
       company: letterhead,
       customerName: cust?.displayName ?? 'Customer',
       billToLines: addressToLines(cust?.billingAddress),
+      customerMessage: await customerMessageText(ctx, estimate.customerMessageId),
       estimate: {
         number: docRef(estimate.refNumber, estimate.estimateNumber),
         date: isoDate(estimate.date),

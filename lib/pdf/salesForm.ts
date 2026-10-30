@@ -43,6 +43,8 @@ export interface SalesFormPdfData {
   totals: Array<[string, string | number]>;
   /** Optional note printed under the totals (e.g. payment method, memo). */
   note?: string | null;
+  /** salesar (B8): the Customer Message picked on the form, printed under the totals. */
+  message?: string | null;
 }
 
 const PAGE_W = PageSizes.Letter[0];
@@ -235,6 +237,21 @@ export async function renderSalesFormPdf(data: SalesFormPdfData): Promise<Uint8A
     cursor -= last ? 20 : 15;
   });
 
+  if (data.message) {
+    cursor -= 6;
+    // Up to two lines of the Customer Message (QB prints it at the foot of the form).
+    const words = safeText(data.message).split(/\s+/);
+    const rows: string[] = [''];
+    for (const w of words) {
+      const next = rows[rows.length - 1] ? `${rows[rows.length - 1]} ${w}` : w;
+      if (next.length > 95 && rows[rows.length - 1]) rows.push(w);
+      else rows[rows.length - 1] = next;
+    }
+    for (const r of rows.slice(0, 2)) {
+      page.drawText(trunc(r, 95), { x: MARGIN_L, y: Math.max(cursor, 40), font: regular, size: 10, color: COLOR_BLACK });
+      cursor -= 13;
+    }
+  }
   if (data.note) {
     cursor -= 6;
     page.drawText(trunc(safeText(data.note), 95), { x: MARGIN_L, y: Math.max(cursor, 40), font: regular, size: 9, color: COLOR_GRAY });

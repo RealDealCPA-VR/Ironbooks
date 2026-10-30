@@ -26,6 +26,11 @@ export const sendFlagFields = {
   toBeEmailed: z.boolean().optional(),
 };
 
+/** salesar (B8): the Customer Message list entry printed at the foot of a sales form. */
+export const customerMessageField = {
+  customerMessageId: zUuid.nullish(),
+};
+
 /** The user saw the "over credit limit" warning and chose to save anyway. */
 export const creditLimitOverrideField = {
   overrideCreditLimit: z.boolean().optional(),

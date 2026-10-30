@@ -38,6 +38,8 @@ export interface FormDocument {
   totals: Array<{ label: string; value: string | number; emphasis?: 'total' | 'balance' }>;
   /** Printed under the lines when the 'memo' field is shown. */
   memo?: string | null;
+  /** salesar (B8): the Customer Message picked on the form — always printed under the lines. */
+  customerMessage?: string | null;
   /** ISO currency for money formatting (default USD). */
   currency?: string;
 }
@@ -367,6 +369,16 @@ export async function renderFormPdf(
     y -= 6;
     text(d.fields.memo.label.toUpperCase(), MARGIN, y, { font: bold, size: 8, color: GRAY });
     for (const l of memoLines.slice(0, 20)) {
+      y -= size + 3;
+      text(l, MARGIN, y, { size });
+    }
+  }
+
+  if (doc.customerMessage) {
+    const msgLines = wrapText(doc.customerMessage, regular, size, CONTENT_W * 0.55);
+    if (y - (msgLines.length + 1) * (size + 3) < FOOTER_RESERVE) newPage();
+    y -= 6;
+    for (const l of msgLines.slice(0, 6)) {
       y -= size + 3;
       text(l, MARGIN, y, { size });
     }

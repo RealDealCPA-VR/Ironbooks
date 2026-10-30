@@ -15,6 +15,7 @@ import { assertAccountantMayConvert, assertDividingDateOpen } from './accountant
 import { and, eq, inArray } from 'drizzle-orm';
 import { Money, toAmountString } from '@/lib/money';
 import { estimates, estimateLines, customers, taxRates, classes, items, invoiceLines } from '@/lib/db/schema';
+import { resolveCustomerMessage, storedLineTaxCode } from './salesFormLists';
 import {
   type ServiceContext,
   ServiceError,
@@ -52,6 +53,8 @@ export interface EstimateLineInput {
   rate?: string | number | null;
   /** Defaults to true. */
   taxable?: boolean;
+  /** salesar (B9): the line's Sales Tax Code; `taxable` follows it (salesFormLists.applyLineTaxCodes). */
+  salesTaxCodeId?: string | null;
   /** Class for this line; carried onto the invoice lines that bill it. */
   classId?: string | null;
 }
@@ -82,6 +85,8 @@ export interface CreateEstimateInput {
   /** wave2 sales (C7): queue for batch printing / emailing. */
   toBePrinted?: boolean;
   toBeEmailed?: boolean;
+  /** salesar (B8): Customer Message list entry printed at the foot of the estimate. Edit: omitted = kept. */
+  customerMessageId?: string | null;
 }
 
 export type EstimateStatus = 'draft' | 'accepted' | 'rejected' | 'closed';
@@ -288,6 +293,7 @@ export async function createEstimate(ctx: ServiceContext, input: CreateEstimateI
         shipTo: input.shipTo ?? null,
         toBePrinted: input.toBePrinted ?? false,
         toBeEmailed: input.toBeEmailed ?? false,
+        customerMessageId: await resolveCustomerMessage(tx, input.customerMessageId),
       })
       .returning();
 
@@ -300,6 +306,7 @@ export async function createEstimate(ctx: ServiceContext, input: CreateEstimateI
         rate: cl.rate,
         amount: cl.amount,
         taxable: cl.taxable,
+        salesTaxCodeId: storedLineTaxCode(input.lines?.[cl.lineOrder], cl.taxable),
         classId: cl.classId,
         lineOrder: cl.lineOrder,
         pricing: cl.pricing as Record<string, unknown> | null,
@@ -480,6 +487,7 @@ export async function convertToInvoice(
       quantity: l.quantity,
       rate: l.rate,
       taxable: l.taxable,
+      salesTaxCodeId: l.salesTaxCodeId ?? null,
       classId: l.classId ?? null,
       pricing: { origin: 'estimate' },
       estimateLineId: l.id,
@@ -493,6 +501,8 @@ export async function convertToInvoice(
       date: await companyToday(tx),
       lines: invoiceLines,
       memo: estimate.memo ?? undefined,
+      // The estimate's customer message carries over (QB copies it onto the invoice).
+      customerMessageId: estimate.customerMessageId ?? null,
       // wave2 sales: carry the quoted tax rate (stored since 0027) so the invoice total matches.
       taxRateId: estimate.taxRateId ?? null,
       // The estimate's ship-to carries over (none → the customer's default ship-to).
@@ -724,6 +734,7 @@ export async function createProgressInvoice(
       memo: `Progress billing (${progressLabel}) for Estimate #${estRef}`,
       // Sales tax is charged on the invoice itself, at the estimate's rate, on taxable lines.
       taxRateId: estimate.taxRateId ?? null,
+      customerMessageId: estimate.customerMessageId ?? null,
       shipTo: estimate.shipTo ?? undefined,
       overrideCreditLimit: input.overrideCreditLimit,
       // Over-billing was checked (and, if asked, allowed) just above against the same figures.
@@ -735,6 +746,7 @@ export async function createProgressInvoice(
         rate: b.line.rate,
         amount: toAmountString(b.amount),
         taxable: b.line.taxable,
+        salesTaxCodeId: b.line.salesTaxCodeId ?? null,
         classId: b.line.classId ?? null,
         pricing: { origin: 'estimate' },
         estimateLineId: b.line.id,
@@ -841,6 +853,7 @@ export async function updateEstimate(ctx: ServiceContext, id: string, input: Cre
         rate: cl.rate,
         amount: cl.amount,
         taxable: cl.taxable,
+        salesTaxCodeId: storedLineTaxCode(input.lines?.[cl.lineOrder], cl.taxable),
         classId: cl.classId,
         lineOrder: cl.lineOrder,
         pricing: cl.pricing as Record<string, unknown> | null,
@@ -861,6 +874,7 @@ export async function updateEstimate(ctx: ServiceContext, id: string, input: Cre
         shipTo: input.shipTo !== undefined ? input.shipTo : current.shipTo,
         toBePrinted: input.toBePrinted ?? current.toBePrinted,
         toBeEmailed: input.toBeEmailed ?? current.toBeEmailed,
+        customerMessageId: await resolveCustomerMessage(tx, input.customerMessageId, current.customerMessageId),
         updatedAt: new Date(),
       })
       .where(eq(estimates.id, id))

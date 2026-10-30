@@ -79,6 +79,7 @@ import {
 import { type AppliedPricing, resolveLinePricing } from './pricing';
 import { applyCustomerShipToDefault, applyCustomerTaxDefaults } from './customerDefaults';
 import { assertDocumentJob, assertLineJobs } from './jobCustomers';
+import { resolveCustomerMessage, storedLineTaxCode } from './salesFormLists';
 import { dueDateFromTermsList } from './lists/terms';
 import { allocateDocNumber, docRef, renumberDoc } from './docNumbers';
 import {
@@ -115,6 +116,11 @@ export interface InvoiceLineInput extends InventoryLineDetail {
   pricing?: { origin?: string | null } | null;
   /** Whether this line participates in tax calculation. Defaults true. */
   taxable?: boolean;
+  /**
+   * salesar (B9): the line's Sales Tax Code ("Tax", "Non", ...). The server decides `taxable`
+   * from it, else from the item's code (customerDefaults / salesFormLists.applyLineTaxCodes).
+   */
+  salesTaxCodeId?: string | null;
   /** Per-line tax rate override (UUID of a taxRates row). When set, this line is taxed at this
    *  rate instead of the invoice-level rate (supports mixed-jurisdiction invoices). */
   taxRateId?: string | null;
@@ -209,6 +215,8 @@ export interface CreateInvoiceInput {
   poNumber?: string | null;
   toBePrinted?: boolean;
   toBeEmailed?: boolean;
+  /** salesar (B8): Customer Message list entry printed at the foot of the invoice. Edit: omitted = kept. */
+  customerMessageId?: string | null;
   /**
    * The user saw the "over credit limit" warning and chose to save anyway. Without it, an
    * invoice that pushes the customer over their credit limit is refused with a
@@ -1633,6 +1641,7 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
         memo: input.memo ?? null,
         customFields: input.customFields ?? null,
         ...shippingColumns(input),
+        customerMessageId: await resolveCustomerMessage(tx, input.customerMessageId),
         isStatementCharge: input.isStatementCharge === true,
         // postedEntryId filled below after posting (stays null for drafts)
       })
@@ -1653,6 +1662,7 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
         rate: cl.rate,
         amount: cl.amount,
         taxable: cl.taxable,
+        salesTaxCodeId: storedLineTaxCode(input.lines?.[cl.lineOrder], cl.taxable),
         taxRateId: cl.taxRateId,
         classId: cl.classId,
         jobId: cl.jobId,
@@ -2362,6 +2372,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
           rate: cl.rate,
           amount: cl.amount,
           taxable: cl.taxable,
+          salesTaxCodeId: storedLineTaxCode(input.lines?.[cl.lineOrder], cl.taxable),
           taxRateId: cl.taxRateId,
           classId: cl.classId,
           jobId: cl.jobId,
@@ -2410,6 +2421,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
           customFields:
             input.customFields !== undefined ? input.customFields : invoice.customFields,
           ...shippingColumns(input, invoice),
+          customerMessageId: await resolveCustomerMessage(tx, input.customerMessageId, invoice.customerMessageId),
           updatedAt: new Date(),
         })
         .where(eq(invoices.id, id))
@@ -2516,6 +2528,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
         rate: cl.rate,
         amount: cl.amount,
         taxable: cl.taxable,
+        salesTaxCodeId: storedLineTaxCode(input.lines?.[cl.lineOrder], cl.taxable),
         taxRateId: cl.taxRateId,
         classId: cl.classId,
         jobId: cl.jobId,
@@ -2571,6 +2584,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
         customFields:
           input.customFields !== undefined ? input.customFields : invoice.customFields,
         ...shippingColumns(input, invoice),
+        customerMessageId: await resolveCustomerMessage(tx, input.customerMessageId, invoice.customerMessageId),
         postedEntryId: entry.id,
         updatedAt: new Date(),
       })
@@ -2690,6 +2704,7 @@ export async function getInvoice(ctx: ServiceContext, id: string) {
       rate: invoiceLines.rate,
       amount: invoiceLines.amount,
       taxable: invoiceLines.taxable,
+      salesTaxCodeId: invoiceLines.salesTaxCodeId,
       classId: invoiceLines.classId,
       jobId: invoiceLines.jobId,
       taxRateId: invoiceLines.taxRateId,

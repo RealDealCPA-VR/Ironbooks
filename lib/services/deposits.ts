@@ -66,6 +66,7 @@ import { syncLineMemos } from './entryLineMemos';
 import { subledgerAccountReason } from '@/lib/registerEntryPlan';
 import { homeAmounts } from './currencies';
 import { currencyRate, exchangeGainLossLine, foreignCode, homeCode, toHome } from './exchangeRates';
+import { paymentMethodNames } from './salesFormLists';
 
 /** p1 fx: home amount each payment's posted entry put into Undeposited Funds (debits - credits). */
 async function postedUndepositedHome(
@@ -141,6 +142,13 @@ export interface UndepositedItem {
   customerName: string | null;
   date: Date;
   method: string;
+  /**
+   * salesar (B7): the Payment Method list entry the payment / sales receipt was received with
+   * ("Visa"), so Payments to Deposit can show and group by it (QB "View payment method type").
+   * Null for items saved with a bare type (they show and group by their type).
+   */
+  paymentMethodId?: string | null;
+  paymentMethodName?: string | null;
   reference: string | null;
   amount: string;
   /** p1 fx: payment currency (null = home); `amount` is in it. */
@@ -361,6 +369,7 @@ export async function listUndepositedPayments(
     ...invRows.map((r) => r.customerId),
   ]);
   const home = await homeCode(ctx);
+  const methodNames = await paymentMethodNames(ctx, [...pmtRows.map((r) => r.paymentMethodId), ...srRows.map((r) => r.paymentMethodId)]);
 
   const items: UndepositedItem[] = [
     ...pmtRows.map((r) => ({
@@ -370,6 +379,8 @@ export async function listUndepositedPayments(
       customerName: custMap.get(r.customerId) ?? null,
       date: r.date,
       method: r.method,
+      paymentMethodId: r.paymentMethodId ?? null,
+      paymentMethodName: r.paymentMethodId ? (methodNames.get(r.paymentMethodId) ?? null) : null,
       reference: r.reference,
       amount: r.amount,
       currency: foreignCode(r.currency, home),
@@ -381,6 +392,8 @@ export async function listUndepositedPayments(
       customerName: r.customerId ? (custMap.get(r.customerId) ?? null) : null,
       date: r.date,
       method: r.method,
+      paymentMethodId: r.paymentMethodId ?? null,
+      paymentMethodName: r.paymentMethodId ? (methodNames.get(r.paymentMethodId) ?? null) : null,
       reference: r.reference ?? `Sales Receipt #${r.refNumber || r.receiptNumber}`,
       amount: r.total,
       currency: null,

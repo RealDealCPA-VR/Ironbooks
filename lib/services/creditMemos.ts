@@ -87,6 +87,7 @@ import {
   writeAudit,
 } from './_base';
 import { applyCustomerTaxDefaults } from './customerDefaults';
+import { resolveCustomerMessage, storedLineTaxCode } from './salesFormLists';
 import { companyToday } from './salesDates';
 import { assertDocumentJob, assertLineJobs } from './jobCustomers';
 import { allocateDocNumber, docRef, renumberDoc } from './docNumbers';
@@ -116,6 +117,8 @@ export interface CreditMemoLineInput extends InventoryLineDetail {
   accountId?: string | null;
   /** Whether this line participates in tax computation. Defaults true. */
   taxable?: boolean;
+  /** salesar (B9): the line's Sales Tax Code; `taxable` follows it (salesFormLists.applyLineTaxCodes). */
+  salesTaxCodeId?: string | null;
   /**
    * Inventory items only: return the goods to stock (true, default) or treat
    * the return as a damaged-goods write-off (false — no restock, no COGS
@@ -148,6 +151,8 @@ export interface CreateCreditMemoInput {
   /** salesar: class and Customer:Job of the memo (a write-off takes the invoice's). Edit: omitted = kept. */
   classId?: string | null;
   jobId?: string | null;
+  /** salesar (B8): Customer Message list entry printed at the foot of the memo. Edit: omitted = kept. */
+  customerMessageId?: string | null;
 }
 
 export interface ApplyToInvoiceInput {
@@ -456,6 +461,7 @@ async function postCreditMemoDocument(
         amount: cl.amount,
         lineOrder: cl.lineOrder,
         taxable: cl.taxable,
+        salesTaxCodeId: storedLineTaxCode(input.lines?.[cl.lineOrder], cl.taxable),
         restock: cl.restock,
         pricing: cl.pricing as Record<string, unknown> | null,
         classId: cl.classId,
@@ -743,6 +749,7 @@ export async function createCreditMemo(ctx: ServiceContext, input: CreateCreditM
         toBeEmailed: input.toBeEmailed ?? false,
         classId: input.classId ?? null,
         jobId: input.jobId ?? null,
+        customerMessageId: await resolveCustomerMessage(tx, input.customerMessageId),
       })
       .returning();
 
@@ -1658,6 +1665,7 @@ export async function updateCreditMemo(
         toBeEmailed: input.toBeEmailed ?? memo.toBeEmailed,
         classId: input.classId ?? null,
         jobId: input.jobId ?? null,
+        customerMessageId: await resolveCustomerMessage(tx, input.customerMessageId, memo.customerMessageId),
         postedEntryId: entry.id,
       })
       .where(eq(creditMemos.id, id))

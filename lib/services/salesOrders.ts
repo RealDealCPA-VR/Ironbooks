@@ -39,6 +39,7 @@ import { SalesLineTotals, salesLineKind } from './salesLineKinds';
 import { assertSalesTaxAllowed } from '@/lib/featureGate';
 import { applyCustomerShipToDefault, applyCustomerTaxDefaults } from './customerDefaults';
 import { allocateDocNumber, docRef, renumberDoc } from './docNumbers';
+import { resolveCustomerMessage, storedLineTaxCode } from './salesFormLists';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -54,6 +55,8 @@ export interface SalesOrderLineInput {
   rate?: string | number | null;
   /** QB "Tax" column; defaults to true. */
   taxable?: boolean;
+  /** salesar (B9): the line's Sales Tax Code; `taxable` follows it (salesFormLists.applyLineTaxCodes). */
+  salesTaxCodeId?: string | null;
 }
 
 export interface CreateSalesOrderInput {
@@ -82,6 +85,8 @@ export interface CreateSalesOrderInput {
   poNumber?: string | null;
   toBePrinted?: boolean;
   toBeEmailed?: boolean;
+  /** salesar (B8): Customer Message list entry printed at the foot of the order. Edit: omitted = kept. */
+  customerMessageId?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -222,6 +227,7 @@ export async function createSalesOrder(ctx: ServiceContext, input: CreateSalesOr
         total: toAmountString(total),
         memo: input.memo ?? null,
         ...shippingColumns(input),
+        customerMessageId: await resolveCustomerMessage(tx, input.customerMessageId),
       })
       .returning();
 
@@ -234,6 +240,7 @@ export async function createSalesOrder(ctx: ServiceContext, input: CreateSalesOr
         rate: cl.rate,
         amount: cl.amount,
         taxable: cl.taxable,
+        salesTaxCodeId: storedLineTaxCode(input.lines?.[cl.lineOrder], cl.taxable),
         lineOrder: cl.lineOrder,
         pricing: cl.pricing as Record<string, unknown> | null,
       })),
@@ -528,12 +535,15 @@ export async function convertToInvoice(
       trackingNumber: order.trackingNumber,
       shipTo: order.shipTo,
       poNumber: order.poNumber,
+      // The order's customer message carries over (QB copies it onto the invoice).
+      customerMessageId: order.customerMessageId ?? null,
       lines: plan.map(({ line, qty }) => ({
         itemId: line.itemId ?? null,
         description: line.description ?? null,
         quantity: qty.toFixed(4),
         rate: line.rate,
         taxable: line.taxable,
+        salesTaxCodeId: line.salesTaxCodeId ?? null,
         pricing: { origin: 'sales_order' },
       })),
     });
@@ -1047,6 +1057,7 @@ async function updateSalesOrderInTx(
         rate: cl.rate,
         amount: cl.amount,
         taxable: cl.taxable,
+        salesTaxCodeId: storedLineTaxCode(input.lines?.[cl.lineOrder], cl.taxable),
         quantityInvoiced: keepInvoiced.get(i) ?? '0',
         lineOrder: cl.lineOrder,
         pricing: cl.pricing as Record<string, unknown> | null,
@@ -1065,6 +1076,7 @@ async function updateSalesOrderInTx(
         status: newStatus,
         ...(renum ? { refNumber: renum.refNumber, orderNumber: renum.number } : {}),
         ...shippingColumns(input, existing),
+        customerMessageId: await resolveCustomerMessage(tx, input.customerMessageId, existing.customerMessageId),
       })
       .where(and(eq(salesOrders.id, id), eq(salesOrders.companyId, tx.companyId)));
 

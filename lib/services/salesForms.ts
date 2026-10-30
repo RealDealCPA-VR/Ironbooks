@@ -40,6 +40,7 @@ import { renderSalesOrderPdf } from '@/lib/pdf/salesOrder';
 import type { SalesShippingInfo } from '@/lib/pdf/salesForm';
 import { addressToLines, buildInvoicePdf, buildStatementPdf, companyLetterhead } from '@/lib/pdf/forms';
 import { resolveFormTemplate } from './formTemplates';
+import { customerMessageText } from './salesFormLists';
 
 export const SALES_FORM_KINDS = ['invoice', 'estimate', 'sales_receipt', 'credit_memo', 'sales_order'] as const;
 export type SalesFormKind = (typeof SALES_FORM_KINDS)[number];
@@ -159,6 +160,7 @@ export async function renderSalesForm(
       const cust = await customerInfo(ctx, est.customerId);
       const bytes = await renderEstimatePdf({
         company: letterhead,
+        customerMessage: await customerMessageText(ctx, est.customerMessageId),
         billToLines: cust.billToLines,
         customerName: cust.name,
         estimate: {
@@ -188,6 +190,7 @@ export async function renderSalesForm(
       const cust = await customerInfo(ctx, r.customerId);
       const bytes = await renderSalesReceiptPdf({
         company: letterhead,
+        customerMessage: await customerMessageText(ctx, r.customerMessageId),
         billToLines: cust.billToLines,
         customerName: cust.name,
         receipt: {
@@ -218,6 +221,7 @@ export async function renderSalesForm(
       const cust = await customerInfo(ctx, m.customerId);
       const bytes = await renderCreditMemoPdf({
         company: letterhead,
+        customerMessage: await customerMessageText(ctx, m.customerMessageId),
         billToLines: cust.billToLines,
         customerName: cust.name,
         memo: {
@@ -247,6 +251,7 @@ export async function renderSalesForm(
       const cust = await customerInfo(ctx, o.customerId);
       const bytes = await renderSalesOrderPdf({
         company: letterhead,
+        customerMessage: await customerMessageText(ctx, o.customerMessageId),
         billToLines: cust.billToLines,
         customerName: cust.name,
         order: { number: docRef(o.refNumber, o.orderNumber), date: iso(o.date), status: o.status, total: o.total, memo: o.memo },
