@@ -27,6 +27,8 @@ export interface DomResult {
   name: string;
   ok: boolean;
   error?: string;
+  /** How long the test took. */
+  ms?: number;
 }
 
 const bridge = (window as unknown as { __domTest: Bridge }).__domTest;
@@ -234,11 +236,14 @@ export function textOf(scope: Element | null = document.body): string {
 export async function runDomTests() {
   const results: DomResult[] = [];
   for (const t of tests) {
+    // Shown with a run that times out (test/domHarness.ts), so the test that hung is named.
+    console.warn(`[dom] ${Math.round(performance.now())}ms ${t.name}`);
+    const started = performance.now();
     try {
       await t.fn();
-      results.push({ name: t.name, ok: true });
+      results.push({ name: t.name, ok: true, ms: Math.round(performance.now() - started) });
     } catch (err) {
-      results.push({ name: t.name, ok: false, error: err instanceof Error ? `${err.message}${err instanceof CheckError ? '' : `\n${err.stack ?? ''}`}` : String(err) });
+      results.push({ name: t.name, ok: false, ms: Math.round(performance.now() - started), error: err instanceof Error ? `${err.message}${err instanceof CheckError ? '' : `\n${err.stack ?? ''}`}` : String(err) });
     }
     try {
       await unmount();

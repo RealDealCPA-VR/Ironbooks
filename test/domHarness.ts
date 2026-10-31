@@ -77,9 +77,9 @@ export async function runDomFile(file: string, timeoutMs = 150_000): Promise<Dom
   const results = path.join(dir, 'results.json');
   const env = { ...process.env };
   delete env.ELECTRON_RUN_AS_NODE;
+  let stderr = '';
   await new Promise<void>((resolve, reject) => {
     const child = spawn(bin, [path.join(ROOT, 'test/dom/runner.cjs'), html, results], { env, stdio: ['ignore', 'ignore', 'pipe'] });
-    let stderr = '';
     child.stderr?.on('data', (d) => {
       stderr += String(d);
     });
@@ -95,6 +95,9 @@ export async function runDomFile(file: string, timeoutMs = 150_000): Promise<Dom
   });
   const parsed = JSON.parse(fs.readFileSync(results, 'utf8')) as DomResult[];
   fs.rmSync(dir, { recursive: true, force: true });
+  // A run that did not finish: say which test was running (the page logs each one).
+  for (const r of parsed) if (!r.ok && (r.name === 'timeout' || r.name === 'renderer')) r.error = `${r.error}
+${stderr.slice(-2000)}`;
   return parsed;
 }
 

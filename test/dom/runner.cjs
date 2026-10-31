@@ -41,9 +41,19 @@ app.whenReady().then(async () => {
     show: false,
     width: 1280,
     height: 900,
-    webPreferences: { preload: path.join(__dirname, 'preload.cjs'), contextIsolation: true, sandbox: false },
+    // A hidden window draws no frames (animation frames about once a second), which made every
+    // key press wait a second: render offscreen at 60 frames a second instead — never shown,
+    // never taking the focus from what is on the screen.
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.cjs'),
+      contextIsolation: true,
+      sandbox: false,
+      backgroundThrottling: false,
+      offscreen: true,
+    },
   });
   const wc = win.webContents;
+  wc.setFrameRate(60);
   // DevTools input needs a live page: attach on a blank one, then load the tests.
   await win.loadURL('about:blank');
   wc.debugger.attach('1.3');
