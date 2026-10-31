@@ -201,7 +201,7 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
   '/print-checks': {
     title: 'Print Checks',
     what: 'Print the checks you marked "to be printed" on your check stock.',
-    first: 'Pick the bank account, check the starting check number, then print.',
+    first: 'Pick the bank account, check the starting check number, then print. Answer "Did checks print OK?" to record the numbers; tick any check that printed wrong to reprint it.',
   },
   '/sales-tax': {
     title: 'Pay Sales Tax',

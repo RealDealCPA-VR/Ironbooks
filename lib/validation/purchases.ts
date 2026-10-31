@@ -80,6 +80,34 @@ export const markPrintedSchema = z.object({
   allowDuplicateNumber: z.boolean().optional(),
 });
 
+/** purchbank D3: one check of a print run and the number on the check paper it prints on. */
+const printRunItemSchema = z.object({
+  source: printSourceSchema,
+  id: zUuid,
+  checkNumber: z.string().trim().min(1, 'Each check needs the number printed on its check paper.').max(100),
+});
+
+/** POST /api/print-queue/run — check a print run before printing (nothing is recorded). */
+export const printRunSchema = z.object({
+  items: z.array(printRunItemSchema).min(1, 'Pick at least one check to print.').max(300, 'Print at most 300 checks at a time.'),
+  allowDuplicateNumber: z.boolean().optional(),
+});
+
+/** POST /api/print-queue/confirm — "Did check(s) print OK?": `reprint` marks the ones that printed wrong. */
+export const confirmPrintRunSchema = z.object({
+  items: z
+    .array(printRunItemSchema.extend({ reprint: z.boolean().optional() }))
+    .min(1, 'Pick at least one check to print.')
+    .max(300, 'Print at most 300 checks at a time.'),
+  allowDuplicateNumber: z.boolean().optional(),
+});
+
+/** POST /api/print-queue/reprint — put a printed check back in the queue to print it again. */
+export const reprintCheckSchema = z.object({
+  source: printSourceSchema,
+  id: zUuid,
+});
+
 export const queuePaychecksSchema = z.object({
   paycheckIds: z.array(zUuid).min(1, 'Pick at least one paycheck.'),
 });

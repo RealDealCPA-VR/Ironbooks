@@ -436,6 +436,9 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/print-queue': r('banking', 'GET POST:print'),
   '/api/print-queue/paychecks': r('payroll', 'GET POST:print'),
   '/api/print-queue/refunds': r('banking', 'GET POST:print'),
+  '/api/print-queue/run': r('banking', 'POST:print'), // purchbank D3: check a run before printing (paychecks also need payroll:print)
+  '/api/print-queue/confirm': r('banking', 'POST:print'), // purchbank D3: "Did check(s) print OK?"
+  '/api/print-queue/reprint': r('banking', 'POST:print'), // purchbank D3: put a printed check back in the queue
   '/api/checks/settings': r('banking', 'GET PUT:modify'),
   '/api/loans': r('banking', 'GET POST'),
   '/api/loans/[id]': r('banking', 'GET PATCH DELETE'),

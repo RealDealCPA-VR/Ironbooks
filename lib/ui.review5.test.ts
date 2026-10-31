@@ -706,13 +706,21 @@ describe('Print Checks numbering', () => {
     expect(nextCheckNumber('ABC')).toBeNull();
   });
 
-  it('a single check whose number was recorded leaves the queue and moves the number on even if the PDF fails', () => {
+  it('numbers are recorded only after "Did check(s) print OK?", and the run moves the number on (purchbank D3)', () => {
     const src = read('app/print-checks/page.tsx');
-    const single = src.slice(src.indexOf('async function handlePrintQueued'), src.indexOf('// ── Print the selected checks'));
-    // The number advances and the check leaves the queue BEFORE the PDF is opened.
-    expect(single.indexOf('setNextNumber(next)')).toBeGreaterThan(-1);
-    expect(single.indexOf('setNextNumber(next)')).toBeLessThan(single.indexOf('await openCheckPdf('));
-    expect(single.indexOf('setQueue(')).toBeLessThan(single.indexOf('await openCheckPdf('));
+    const run = src.slice(src.indexOf('async function startRun'), src.indexOf('function handlePrintQueued'));
+    // The run is checked (nothing recorded), printed, then the question is asked.
+    expect(run.indexOf("api.post('/api/print-queue/run'")).toBeGreaterThan(-1);
+    expect(run.indexOf("api.post('/api/print-queue/run'")).toBeLessThan(run.indexOf('await openCheckPdf('));
+    expect(run.indexOf('setConfirmRun(')).toBeGreaterThan(run.indexOf('await openCheckPdf('));
+    expect(run).not.toContain("'/api/print-queue/confirm'");
+    expect(run).not.toContain("api.post('/api/print-queue',");
+    // Answered: the numbers are recorded and the next number follows the run's LAST check (the
+    // spoiled ones used paper too), so no number is printed twice.
+    const confirm = src.slice(src.indexOf('async function confirmPrinted'), src.indexOf('function nonePrinted'));
+    expect(confirm).toContain("'/api/print-queue/confirm'");
+    expect(confirm).toContain('nextCheckNumber(run.items[run.items.length - 1].checkNumber)');
+    expect(confirm.indexOf('setNextNumber(next)')).toBeGreaterThan(confirm.indexOf("'/api/print-queue/confirm'"));
   });
 });
 
