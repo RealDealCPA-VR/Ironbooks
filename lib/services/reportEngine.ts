@@ -17,6 +17,7 @@
  * every amount is Decimal (lib/money.ts).
  */
 import { and, asc, desc, eq, gte, inArray, lte, sql, type SQL } from 'drizzle-orm';
+import { itemCandidates, linesForItem } from './reportItemLines';
 import type Decimal from 'decimal.js';
 import {
   accounts,
@@ -1293,6 +1294,10 @@ export interface GlLine {
    * from (QB keeps a line's Customer:Job on cash-basis reports). Read by costLineCustomers.
    */
   jobId?: string | null;
+  /** The entry's reference (posted lines; per-line COGS entries carry their document line here). */
+  reference?: string | null;
+  /** Cash-basis share lines: the A/R / A/P document they come from (the Item filter reads it). */
+  cashDoc?: { kind: string; id: string };
 }
 
 export interface GlLineFilter extends ActivityFilter {
@@ -1305,6 +1310,8 @@ export interface GlLineFilter extends ActivityFilter {
    * or by their document) and bill / check / vendor-credit lines costed to it (costLineCustomers).
    */
   jobCustomerId?: string;
+  /** QB "Item" filter: the part of each line that comes from this item's document lines (reportItemLines.ts). */
+  itemId?: string;
   txnType?: TxnTypeKey;
   amountMin?: string;
   amountMax?: string;
@@ -1357,6 +1364,7 @@ export function glFilterFromParams(
     f.nameType = 'employee';
   }
   if (p.customerJobId) f.jobCustomerId = p.customerJobId;
+  if (p.itemId) f.itemId = p.itemId;
   if (p.section) {
     const secs = p.section.split(',').filter((s) => [...PL_SECTIONS, ...BS_SECTIONS].includes(s as SectionKey));
     if (secs.length) f.sections = secs as SectionKey[];
@@ -1465,9 +1473,11 @@ export async function fetchGlLines(
   // off Customer Balance Detail and every other name-filtered detail report.
   if (f.nameId) conds.push(nameCandidates(ctx.companyId, f.nameId));
   if (f.jobCustomerId) conds.push(sql`(${nameCandidates(ctx.companyId, f.jobCustomerId)} OR ${costedToCandidates(ctx.companyId, f.jobCustomerId)})`);
+  // Item: entries that can involve the item (cash-basis shares are added after the read).
+  if (f.itemId) conds.push(itemCandidates(ctx.companyId, f.itemId));
 
-  // Name / number / job filters are applied after resolution, so read a larger window first.
-  const postFilter = !!(f.nameId || f.number || f.jobCustomerId);
+  // Name / number / job / item filters are applied after resolution, so read a larger window first.
+  const postFilter = !!(f.nameId || f.number || f.jobCustomerId || f.itemId);
   const fetchCap = postFilter ? GL_LIMITS.postFilterScan : limit + 1;
 
   const raw = await ctx.db
@@ -1562,6 +1572,7 @@ export async function fetchGlLines(
       natural: account ? naturalAmount(account.section, debit, credit) : debit.minus(credit),
       cleared: r.cleared === true || (r.cleared as unknown) === 't',
       split: '',
+      reference: r.reference,
     };
   });
   lines = lines.filter((l) => !!l.account);
@@ -1580,6 +1591,7 @@ export async function fetchGlLines(
       (l) => l.num.toLowerCase().includes(needle) || String(l.entryNumber) === f.number,
     );
   }
+  if (f.itemId) lines = await linesForItem(ctx, lines, f.itemId);
   // A post-filtered read that hit its scan cap may have left matching lines unread: say so
   // (the report shows its "only the first … lines" note) instead of a silently short report.
   const truncated = lines.length > limit || (postFilter && raw.length >= fetchCap);
@@ -1891,6 +1903,7 @@ async function applyCashBasisToGlLines(
       natural: naturalAmount(account.section, debit, credit),
       cleared: false,
       split,
+      cashDoc: { kind: a.doc.kind, id: a.doc.id },
     };
   });
   let extra = await withCashBasisJobs(ctx, picked, synthetic);

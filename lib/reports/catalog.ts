@@ -84,23 +84,25 @@ export interface CatalogEntry {
   feature?: FeatureKey;
 }
 
-const DETAIL_FILTERS: ReportControl[] = ['account', 'customer', 'vendor', 'txnType', 'amount', 'cleared', 'class', 'memo', 'number', 'sort', 'subtotal'];
+const DETAIL_FILTERS: ReportControl[] = ['account', 'customer', 'vendor', 'item', 'txnType', 'amount', 'cleared', 'class', 'memo', 'number', 'sort', 'subtotal'];
+/** QB Filters on Profit & Loss and Balance Sheet (reportsStandard.ts statementFilters): beyond Class. */
+const STATEMENT_FILTERS: ReportControl[] = ['class', 'customer', 'vendor', 'employee', 'item', 'account', 'txnType', 'amount', 'cleared', 'memo', 'number'];
 
 export const REPORT_CATALOG: CatalogEntry[] = [
   // ---- Company & Financial ----
-  { key: 'profit-loss', title: 'Profit & Loss Standard', description: 'Income, cost of goods sold, expenses and net income for a period.', group: 'Company & Financial', area: 'reports_financial', controls: ['range', 'periodColumns', 'compare', 'class'], basis: true },
+  { key: 'profit-loss', title: 'Profit & Loss Standard', description: 'Income, cost of goods sold, expenses and net income for a period.', group: 'Company & Financial', area: 'reports_financial', controls: ['range', 'periodColumns', 'compare', ...STATEMENT_FILTERS], basis: true },
   { key: 'profit-loss-detail', title: 'Profit & Loss Detail', description: 'Every income and expense transaction behind the P&L.', group: 'Company & Financial', area: 'reports_financial', controls: ['range', ...DETAIL_FILTERS], basis: true },
   { key: 'profit-loss-ytd', title: 'Profit & Loss YTD Comparison', description: 'This period next to the fiscal year to date.', group: 'Company & Financial', area: 'reports_financial', controls: ['range', 'class'], basis: true },
-  { key: 'profit-loss-prev-year', title: 'Profit & Loss Prev Year Comparison', description: 'This period vs the same period last year, with $ and % change.', group: 'Company & Financial', area: 'reports_financial', controls: ['range', 'class'], defaults: { compare: 'prev_year' }, basis: true },
-  { key: 'profit-loss-by-month', title: 'Profit & Loss by Month', description: 'Income and expenses month by month.', group: 'Company & Financial', area: 'reports_financial', controls: ['range', 'periodColumns', 'class'], defaults: { columns: 'month' }, basis: true },
-  { key: 'profit-loss-percent', title: 'Profit & Loss % of Income', description: 'Each line as a percentage of total income.', group: 'Company & Financial', area: 'reports_financial', controls: ['range', 'periodColumns', 'class'], basis: true },
+  { key: 'profit-loss-prev-year', title: 'Profit & Loss Prev Year Comparison', description: 'This period vs the same period last year, with $ and % change.', group: 'Company & Financial', area: 'reports_financial', controls: ['range', ...STATEMENT_FILTERS], defaults: { compare: 'prev_year' }, basis: true },
+  { key: 'profit-loss-by-month', title: 'Profit & Loss by Month', description: 'Income and expenses month by month.', group: 'Company & Financial', area: 'reports_financial', controls: ['range', 'periodColumns', ...STATEMENT_FILTERS], defaults: { columns: 'month' }, basis: true },
+  { key: 'profit-loss-percent', title: 'Profit & Loss % of Income', description: 'Each line as a percentage of total income.', group: 'Company & Financial', area: 'reports_financial', controls: ['range', 'periodColumns', ...STATEMENT_FILTERS], basis: true },
   { key: 'profit-loss-by-job', title: 'Profit & Loss by Job', description: 'One column per customer or job.', group: 'Company & Financial', area: 'reports_financial', controls: ['range', 'class'], basis: true },
   { key: 'pl-by-class', title: 'Profit & Loss by Class', description: 'One column per class.', group: 'Company & Financial', area: 'reports_financial', controls: ['range'], basis: true },
-  { key: 'balance-sheet', title: 'Balance Sheet Standard', description: 'What you own and owe, with Retained Earnings and Net Income.', group: 'Company & Financial', area: 'reports_financial', controls: ['asOf', 'compare'], basis: true },
-  { key: 'balance-sheet-prev-year', title: 'Balance Sheet Prev Year Comparison', description: 'This balance sheet next to the same date last year, with $ and % change.', group: 'Company & Financial', area: 'reports_financial', controls: ['asOf'], defaults: { compare: 'prev_year' }, basis: true },
-  { key: 'balance-sheet-summary', title: 'Balance Sheet Summary', description: 'The balance sheet by section totals only.', group: 'Company & Financial', area: 'reports_financial', controls: ['asOf'], basis: true },
+  { key: 'balance-sheet', title: 'Balance Sheet Standard', description: 'What you own and owe, with Retained Earnings and Net Income.', group: 'Company & Financial', area: 'reports_financial', controls: ['asOf', 'compare', ...STATEMENT_FILTERS], basis: true },
+  { key: 'balance-sheet-prev-year', title: 'Balance Sheet Prev Year Comparison', description: 'This balance sheet next to the same date last year, with $ and % change.', group: 'Company & Financial', area: 'reports_financial', controls: ['asOf', ...STATEMENT_FILTERS], defaults: { compare: 'prev_year' }, basis: true },
+  { key: 'balance-sheet-summary', title: 'Balance Sheet Summary', description: 'The balance sheet by section totals only.', group: 'Company & Financial', area: 'reports_financial', controls: ['asOf', ...STATEMENT_FILTERS], basis: true },
   { key: 'balance-sheet-detail', title: 'Balance Sheet Detail', description: 'Beginning balance, transactions and ending balance for each balance sheet account.', group: 'Company & Financial', area: 'reports_financial', controls: ['range', ...DETAIL_FILTERS], basis: true },
-  { key: 'balance-sheet-by-period', title: 'Balance Sheet by Period', description: 'Balance sheet at the end of each month, quarter or year.', group: 'Company & Financial', area: 'reports_financial', controls: ['range', 'periodColumns'], defaults: { columns: 'month' }, basis: true },
+  { key: 'balance-sheet-by-period', title: 'Balance Sheet by Period', description: 'Balance sheet at the end of each month, quarter or year.', group: 'Company & Financial', area: 'reports_financial', controls: ['range', 'periodColumns', ...STATEMENT_FILTERS], defaults: { columns: 'month' }, basis: true },
   { key: 'cash-flow-forecast', title: 'Cash Flow Forecast', description: 'The cash you can expect week by week from open invoices, bills and bank transactions.', group: 'Company & Financial', area: 'reports_financial', controls: ['range', 'period'] },
   { key: 'statement-of-cash-flows', title: 'Statement of Cash Flows', description: 'Where your cash came from and went: operating, investing and financing.', group: 'Company & Financial', area: 'reports_financial', controls: ['range'] },
   { key: 'trial-balance', title: 'Trial Balance', description: 'Debit and credit balance of every account.', group: 'Accountant & Taxes', area: 'reports_financial', controls: ['asOf'], basis: true },

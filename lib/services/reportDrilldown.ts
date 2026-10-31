@@ -59,7 +59,7 @@ import {
   type SectionKey,
   payeeGroupOf,
 } from './reportEngine';
-import { jobBucketOf, previousPeriod, retainedEarningsAccount, shiftMonths, shiftYears } from './reportsStandard';
+import { jobBucketOf, previousPeriod, retainedEarningsAccount, shiftMonths, shiftYears, statementFilters } from './reportsStandard';
 import { fiscalYearStartFor } from './reports';
 import { openItems, type OpenItem } from './reportsAging';
 import { salesLinesOnBasis } from './reportsLists';
@@ -140,6 +140,19 @@ function itemsFrom(lines: GlLine[], contrib: (l: GlLine) => Decimal | null): Dri
 
 async function lines(ctx: ServiceContext, meta: Map<string, AccountMeta>, cap: number, f: GlLineFilter) {
   return fetchGlLines(ctx, meta, { ...f, limit: f.limit ?? cap });
+}
+
+/**
+ * A filtered Profit & Loss / Balance Sheet (reportsStandard.ts statementFilters: Account, Name,
+ * Customer:Job, Item, Type, Amount, Memo, Number, Cleared) explains only the lines it added up:
+ * the same filters on the explanation's read, closing entries left out like the report.
+ */
+function withStatementFilters(meta: Map<string, AccountMeta>, p: ReportParams, f: GlLineFilter): GlLineFilter {
+  const sf = statementFilters(p);
+  if (!Object.keys(sf).length) return f;
+  const x = glFilterFromParams(meta, sf as ReportParams, { from: f.from, to: f.to });
+  const accountIds = x.accountIds && f.accountIds ? f.accountIds.filter((id) => x.accountIds!.includes(id)) : (x.accountIds ?? f.accountIds);
+  return { ...f, ...x, from: f.from, to: f.to, classId: f.classId, basis: f.basis, accountIds, excludeClose: true };
 }
 
 /**
@@ -318,7 +331,7 @@ const plFamily: Family = {
     const windows = await plWindows(i, jobLines, jobOf);
     const items: DrillItem[] = [];
     for (const w of windows) {
-      const got = await lines(ctx, meta, cap, { from: w.from, to: w.to, classId, excludeClose: true, basis, accountIds });
+      const got = await lines(ctx, meta, cap, withStatementFilters(meta, p, { from: w.from, to: w.to, classId, excludeClose: true, basis, accountIds }));
       incomplete ||= got.truncated;
       items.push(
         ...itemsFrom(got.lines, (l) => {
@@ -427,7 +440,13 @@ const bsFamily: Family = {
     let incomplete = false;
     for (const w of windows) {
       const fyStart = await fiscalYearStartFor(ctx, w.asOf);
-      const got = await lines(ctx, meta, cap, { to: w.asOf, basis, accountIds });
+      // A filtered balance sheet (Class and the statement filters) adds up only its matching lines.
+      const got = await lines(
+        ctx,
+        meta,
+        cap,
+        withStatementFilters(meta, p, { to: w.asOf, basis, accountIds, ...(p.classId ? { classId: p.classId, excludeClose: true } : {}) }),
+      );
       incomplete ||= got.truncated;
       items.push(
         ...itemsFrom(got.lines, (l) => {

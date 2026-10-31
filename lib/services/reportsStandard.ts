@@ -64,6 +64,7 @@ import {
   type Amounts,
   type BSSection,
   type GlLine,
+  type SectionKey,
   type GroupKey,
   type PLSection,
   type Period,
@@ -82,6 +83,120 @@ const basisSuffix = (b: Basis) => (b === 'cash' ? ' · Cash Basis' : '');
 /** The balance sheet for one as-of date on the report's basis. */
 const sheetAsOf = (ctx: ServiceContext, asOf: Date, b: Basis) =>
   b === 'cash' ? cashBasisBalanceSheet(ctx, asOf) : balanceSheet(ctx, asOf);
+
+// ---------------------------------------------------------------------------
+// Statement filters (QB Filters on Profit & Loss and Balance Sheet beyond Class): Account, Name,
+// Customer:Job, Item, Transaction Type, Amount, Memo, Number, Cleared. A filtered statement adds
+// up the matching ledger LINES (the detail-line engine), so it shows exactly what its QuickZoom
+// lists; an unfiltered one keeps the fast per-account totals.
+// ---------------------------------------------------------------------------
+
+export const STATEMENT_FILTER_KEYS = [
+  'accountId', 'accountIds', 'nameId', 'customerId', 'vendorId', 'employeeId', 'customerJobId', 'itemId',
+  'txnType', 'amountMin', 'amountMax', 'memo', 'number', 'cleared',
+] as const;
+
+/** The statement filters set on `p` (the Customer filter is that Customer:Job, like P&L by Job). */
+export function statementFilters(p: ReportParams): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const k of STATEMENT_FILTER_KEYS) {
+    const v = (p as Record<string, unknown>)[k];
+    if (typeof v === 'string' && v && !(k === 'cleared' && v === 'any')) out[k] = v;
+  }
+  if (out.customerId && !out.customerJobId) {
+    out.customerJobId = out.customerId;
+    delete out.customerId;
+  }
+  return out;
+}
+
+/** The lines a filtered statement adds up, closing entries left out. */
+async function statementLines(
+  ctx: ServiceContext,
+  meta: Map<string, AccountMeta>,
+  p: ReportParams,
+  range: { from?: Date; to?: Date },
+  sections?: SectionKey[],
+): Promise<{ lines: GlLine[]; truncated: boolean }> {
+  const q = { classId: p.classId, basis: p.basis, ...statementFilters(p) } as ReportParams;
+  const f = glFilterFromParams(meta, q, range);
+  f.excludeClose = true;
+  if (sections) f.sections = f.sections ? f.sections.filter((x) => sections.includes(x)) : sections;
+  f.limit = GL_LIMITS.maxLines;
+  return fetchGlLines(ctx, meta, f);
+}
+
+/** Per-account debit / credit of lines, bucketed like activityByAccount. */
+function activityOfLines(lines: GlLine[], bucketOf: (l: GlLine) => string | null) {
+  const acc = new Map<string, { accountId: string; bucket: string | null; debit: Decimal; credit: Decimal }>();
+  for (const l of lines) {
+    const b = bucketOf(l);
+    const k = `${l.accountId}|${b ?? ''}`;
+    const cur = acc.get(k) ?? { accountId: l.accountId, bucket: b, debit: Money.zero(), credit: Money.zero() };
+    cur.debit = cur.debit.plus(l.debit);
+    cur.credit = cur.credit.plus(l.credit);
+    acc.set(k, cur);
+  }
+  return [...acc.values()].map((r) => ({ ...r, debit: r.debit.toFixed(2), credit: r.credit.toFixed(2) }));
+}
+
+/** Plain-language notes of a filtered statement. */
+function filterNotes(truncated: boolean, balanceSheet = false): string[] {
+  const notes = [
+    balanceSheet
+      ? 'Filtered: only the transactions that match the filters are added up, so a filtered balance sheet need not balance (as in QuickBooks).'
+      : 'Filtered: only the transactions that match the filters are added up.',
+  ];
+  if (truncated) notes.push('The filters matched more than 50,000 lines; only the first 50,000 are added up — narrow the dates or filters.');
+  return notes;
+}
+
+/** A balance sheet of the filtered lines as of `asOf` (Retained Earnings / Net Income from the filtered P&L lines). */
+async function filteredSheetAsOf(
+  ctx: ServiceContext,
+  meta: Map<string, AccountMeta>,
+  p: ReportParams,
+  asOf: Date,
+): Promise<{ bs: BalanceSheet; truncated: boolean }> {
+  const fyStart = await fiscalYearStartFor(ctx, asOf);
+  const { lines, truncated } = await statementLines(ctx, meta, p, { to: asOf });
+  const bal = new Map<string, Decimal>();
+  let prior = Money.zero();
+  let current = Money.zero();
+  for (const l of lines) {
+    if (isPLSection(l.account.section)) {
+      const ni = l.credit.minus(l.debit);
+      if (l.date < fyStart) prior = prior.plus(ni);
+      else current = current.plus(ni);
+    } else {
+      bal.set(l.accountId, (bal.get(l.accountId) ?? Money.zero()).plus(l.natural));
+    }
+  }
+  const out: Record<'assets' | 'liabilities' | 'equity', { accountId: string; code: string; name: string; amount: string }[]> = { assets: [], liabilities: [], equity: [] };
+  const tot = { assets: Money.zero(), liabilities: Money.zero(), equity: Money.zero() };
+  for (const [id, v] of bal) {
+    const a = meta.get(id)!;
+    const g = a.section === 'equity' ? 'equity' : CURRENT_LIABS.includes(a.section as BSSection) || a.section === 'long_term_liability' ? 'liabilities' : 'assets';
+    out[g].push({ accountId: id, code: a.code, name: a.name, amount: toAmountString(v) });
+    tot[g] = tot[g].plus(v);
+  }
+  const equity = tot.equity.plus(prior).plus(current);
+  return {
+    truncated,
+    bs: {
+      ...out,
+      totalAssets: toAmountString(tot.assets),
+      totalLiabilities: toAmountString(tot.liabilities),
+      totalEquity: toAmountString(equity),
+      retainedEarnings: toAmountString(prior.plus(current)),
+      priorYearsEarnings: toAmountString(prior),
+      currentYearNetIncome: toAmountString(current),
+      fiscalYearStart: fyStart.toISOString(),
+      balanced: Money.eq(tot.assets, tot.liabilities.plus(equity)),
+      asOf: asOf.toISOString(),
+    },
+  };
+}
 
 const pct = (num: Decimal, den: Decimal): CellValue =>
   den.isZero() ? null : num.dividedBy(den.abs()).times(100).toFixed(2);
@@ -160,6 +275,16 @@ export async function profitAndLossReport(
   let amounts: Map<string, Amounts>;
   let derive: ((v: Amounts, c: { incomeTotal: Amounts }) => Record<string, CellValue>) | undefined;
   const notes: string[] = [];
+  // Filters beyond Class: add up the matching lines instead of the per-account totals.
+  const filters = statementFilters(p);
+  const filtered = Object.keys(filters).length > 0;
+  let cut = false;
+  const activity = async (r: { from: Date; to: Date }, byDay: boolean) => {
+    if (!filtered) return activityByAccount(ctx, { from: r.from, to: r.to, classId, excludeClose: true, basis }, byDay ? 'day' : 'none');
+    const got = await statementLines(ctx, meta, p, r, [...PL_SECTIONS]);
+    cut ||= got.truncated;
+    return activityOfLines(got.lines, (l) => (byDay ? dayStr(l.date) : null));
+  };
 
   if (periodKind) {
     const periods = splitPeriods(from, to, periodKind, fye);
@@ -167,17 +292,14 @@ export async function profitAndLossReport(
     amountKeys = [...periods.map((x) => x.key), 'total'];
     columns.push(...periods.map((x) => ({ key: x.key, header: x.label, type: 'money' as const })));
     columns.push({ key: 'total', header: 'TOTAL', type: 'money' });
-    const act = await activityByAccount(ctx, { from, to, classId, excludeClose: true, basis }, 'day');
+    const act = await activity({ from, to }, true);
     amounts = plAmountsFromActivity(meta, act, amountKeys.length, (b) => {
       const i = periodIndex(periods, parseDay(b ?? undefined)!);
       return i >= 0 ? [i, periods.length] : [periods.length];
     });
   } else if (compare) {
     const prev = compare === 'prev_year' ? { from: shiftYears(from, -1), to: shiftYears(to, -1) } : previousPeriod(from, to);
-    const [cur, pri] = await Promise.all([
-      activityByAccount(ctx, { from, to, classId, excludeClose: true, basis }),
-      activityByAccount(ctx, { from: prev.from, to: prev.to, classId, excludeClose: true, basis }),
-    ]);
+    const [cur, pri] = await Promise.all([activity({ from, to }, false), activity({ from: prev.from, to: prev.to }, false)]);
     amountKeys = ['cur', 'prev'];
     columns.push(
       { key: 'cur', header: rangeLabel(from, to), type: 'money' },
@@ -189,7 +311,7 @@ export async function profitAndLossReport(
     amounts = plAmountsFromActivity(meta, tagged, 2, (b) => (b === 'cur' ? 0 : 1));
     derive = (v) => ({ chg: toAmountString(v[0].minus(v[1])), pctchg: pct(v[0].minus(v[1]), v[1]) });
   } else {
-    const act = await activityByAccount(ctx, { from, to, classId, excludeClose: true, basis });
+    const act = await activity({ from, to }, false);
     amountKeys = ['total'];
     columns.push({ key: 'total', header: rangeLabel(from, to), type: 'money' });
     amounts = plAmountsFromActivity(meta, act, 1, () => 0);
@@ -216,14 +338,16 @@ export async function profitAndLossReport(
     };
   }
 
-  const qs = { from: dayStr(from), to: dayStr(to), classId, basis };
+  // QuickZoom carries the filters, so the detail lists exactly the lines behind each amount.
+  const qs = { from: dayStr(from), to: dayStr(to), classId, basis, ...filters };
+  if (filtered) notes.push(...filterNotes(cut));
   const built = buildPLRows({
     meta,
     amounts,
     columns,
     amountKeys,
     derive,
-    hrefFor: accountDetailHref(from, to, { classId, basis }),
+    hrefFor: accountDetailHref(from, to, { classId, basis, ...filters }),
     totalHref: (s) => (s === 'net' ? stdHref('profit-loss-detail', qs) : stdHref('profit-loss-detail', { ...qs, section: s })),
   });
 
@@ -239,10 +363,11 @@ export async function profitAndLossReport(
   return {
     key: o.key ?? 'profit-loss',
     title: o.title ?? 'Profit & Loss',
-    subtitle: `${rangeLabel(from, to)}${className ? ` · Class: ${className}` : ''}${basisSuffix(basis)}`,
+    subtitle: `${rangeLabel(from, to)}${className ? ` · Class: ${className}` : ''}${filtered ? ' · Filtered' : ''}${basisSuffix(basis)}`,
     columns,
     rows: built.rows,
     notes,
+    truncated: cut || undefined,
   };
 }
 
@@ -418,8 +543,15 @@ const CURRENT_LIABS: BSSection[] = ['ap', 'credit_card', 'other_current_liabilit
 function buildBSRows(
   meta: Map<string, AccountMeta>,
   cols: BSColumn[],
-  opts: { summary?: boolean; derive?: (v: Amounts) => Record<string, CellValue>; basis?: Basis },
+  opts: {
+    summary?: boolean;
+    derive?: (v: Amounts) => Record<string, CellValue>;
+    basis?: Basis;
+    /** Filtered sheet: the QuickZoom filters, and no ledger tie-out (a filtered sheet need not balance). */
+    filters?: Record<string, string>;
+  },
 ): { rows: StdRow[]; balanced: boolean } {
+  const zf = opts.filters ?? {};
   const basis = opts.basis;
   const n = cols.length;
   const amounts = new Map<BSSection, Map<string, Amounts>>();
@@ -451,7 +583,7 @@ function buildBSRows(
   };
   const rows: StdRow[] = [];
   const hrefFor = (a: AccountMeta) =>
-    stdHref('transaction-detail-by-account', { accountId: a.id, to: dayStr(cols[0].asOf), basis });
+    stdHref('transaction-detail-by-account', { accountId: a.id, to: dayStr(cols[0].asOf), basis, ...zf });
 
   const sectionTotal = new Map<BSSection, Amounts>();
   const block = (s: BSSection, depth: number, parent: string | null) => {
@@ -471,7 +603,7 @@ function buildBSRows(
         depth,
         kind: 'data',
         cells: cells(SECTION_LABELS[s], total),
-        href: stdHref('balance-sheet-detail', { to: dayStr(cols[0].asOf), section: s, basis }),
+        href: stdHref('balance-sheet-detail', { to: dayStr(cols[0].asOf), section: s, basis, ...zf }),
       });
       return;
     }
@@ -530,7 +662,7 @@ function buildBSRows(
           depth: 2,
           kind: 'data',
           cells: cells('Equity accounts', t),
-          href: stdHref('balance-sheet-detail', { to: dayStr(cols[0].asOf), section: 'equity', basis }),
+          href: stdHref('balance-sheet-detail', { to: dayStr(cols[0].asOf), section: 'equity', basis, ...zf }),
         });
       } else {
         const tree = buildAccountTree({ meta, amounts: m, ncols: n, idPrefix: 'bs:equity', parentRowId: 'bs:equity', depth: 2, cells, hrefFor });
@@ -544,7 +676,7 @@ function buildBSRows(
             kind: 'data',
             cells: cells('Retained Earnings', priorYears),
             href: cols[0].bs.fiscalYearStart
-              ? stdHref('profit-loss', { to: dayStr(new Date(new Date(cols[0].bs.fiscalYearStart).getTime() - 1)), from: '1900-01-01', basis })
+              ? stdHref('profit-loss', { to: dayStr(new Date(new Date(cols[0].bs.fiscalYearStart).getTime() - 1)), from: '1900-01-01', basis, ...zf })
               : null,
           });
           addInto(t, priorYears);
@@ -557,7 +689,7 @@ function buildBSRows(
         kind: 'data',
         cells: cells('Net Income', netIncome),
         href: cols[0].bs.fiscalYearStart
-          ? stdHref('profit-loss', { from: dayStr(new Date(cols[0].bs.fiscalYearStart)), to: dayStr(cols[0].asOf), basis })
+          ? stdHref('profit-loss', { from: dayStr(new Date(cols[0].bs.fiscalYearStart)), to: dayStr(cols[0].asOf), basis, ...zf })
           : null,
       });
       addInto(t, netIncome);
@@ -567,6 +699,11 @@ function buildBSRows(
   }, 'grand');
 
   // Ledger check per column: the laid-out totals must equal the asserted balanceSheet totals.
+  // (A filtered sheet adds up only the matching lines: it is not the ledger and need not balance.)
+  if (opts.filters) {
+    void totalLE;
+    return { rows, balanced: cols.every((_, i) => Money.eq(totalAssets[i], totalLiabilities[i].plus(totalEquity[i]))) };
+  }
   cols.forEach((c, i) => {
     assertBalanceSheetBalanced(`Balance sheet (${c.header})`, totalAssets[i], totalLiabilities[i], totalEquity[i]);
     if (
@@ -596,6 +733,16 @@ export async function balanceSheetReport(
   const meta = await loadAccountMeta(ctx);
   const basis = basisOf(p);
   const periodKind = p.columns && p.columns !== 'total' ? p.columns : null;
+  // Filters (QB Filters on the Balance Sheet: Account, Name, Customer:Job, Item, Class, Type…).
+  const filters = { ...(p.classId ? { classId: p.classId } : {}), ...statementFilters(p) };
+  const filtered = Object.keys(filters).length > 0;
+  let cut = false;
+  const sheet = async (asOf: Date): Promise<BalanceSheet> => {
+    if (!filtered) return sheetAsOf(ctx, asOf, basis);
+    const got = await filteredSheetAsOf(ctx, meta, p, asOf);
+    cut ||= got.truncated;
+    return got.bs;
+  };
   let cols: BSColumn[];
   let derive: ((v: Amounts) => Record<string, CellValue>) | undefined;
   const extraCols: StdColumn[] = [];
@@ -606,25 +753,46 @@ export async function balanceSheetReport(
     const periods: Period[] = splitPeriods(from, to, periodKind, fye);
     if (periods.length > 60) throw validation('Too many columns — choose a shorter date range or wider columns.');
     cols = await Promise.all(
-      periods.map(async (x) => ({ key: x.key, header: fmtDay(x.to), asOf: x.to, bs: await sheetAsOf(ctx, x.to, basis) })),
+      periods.map(async (x) => ({ key: x.key, header: fmtDay(x.to), asOf: x.to, bs: await sheet(x.to) })),
     );
     subtitle = `As of each ${periodKind} end, ${rangeLabel(from, to)}`;
   } else {
     const asOf = resolveAsOf(p);
-    cols = [{ key: 'total', header: fmtDay(asOf), asOf, bs: await sheetAsOf(ctx, asOf, basis) }];
+    cols = [{ key: 'total', header: fmtDay(asOf), asOf, bs: await sheet(asOf) }];
     subtitle = `As of ${fmtDay(asOf)}`;
     if (p.compare && p.compare !== 'none') {
       let prior = p.priorAsOf ? parseDay(p.priorAsOf, true)! : shiftYears(asOf, -1);
       if (!p.priorAsOf && p.compare === 'prev_period') {
         prior = shiftMonths(asOf, -1);
       }
-      cols.push({ key: 'prev', header: fmtDay(prior), asOf: prior, bs: await sheetAsOf(ctx, prior, basis) });
+      cols.push({ key: 'prev', header: fmtDay(prior), asOf: prior, bs: await sheet(prior) });
       extraCols.push({ key: 'chg', header: '$ Change', type: 'money' }, { key: 'pctchg', header: '% Change', type: 'percent' });
       derive = (v) => ({ chg: toAmountString(v[0].minus(v[1])), pctchg: pct(v[0].minus(v[1]), v[1]) });
       subtitle = `As of ${fmtDay(asOf)} vs ${fmtDay(prior)}`;
     }
   }
-  const built = buildBSRows(meta, cols, { summary: o.summary, derive, basis });
+  const built = buildBSRows(meta, cols, { summary: o.summary, derive, basis, filters: filtered ? filters : undefined });
+  if (filtered) {
+    let className: string | undefined;
+    if (p.classId) {
+      const [c] = await ctx.db.select({ name: classes.name }).from(classes).where(and(eq(classes.id, p.classId), eq(classes.companyId, ctx.companyId)));
+      if (!c) throw notFound('Class');
+      className = c.name;
+    }
+    return {
+      key: o.summary ? 'balance-sheet-summary' : 'balance-sheet',
+      title: o.summary ? 'Balance Sheet Summary' : 'Balance Sheet',
+      subtitle: `${subtitle}${className ? ` · Class: ${className}` : ''} · Filtered${basisSuffix(basis)}`,
+      columns: [
+        { key: 'label', header: '' },
+        ...cols.map((c) => ({ key: c.key, header: c.header, type: 'money' as const })),
+        ...extraCols,
+      ],
+      rows: built.rows,
+      notes: filterNotes(cut, true),
+      truncated: cut || undefined,
+    };
+  }
   return {
     key: o.summary ? 'balance-sheet-summary' : 'balance-sheet',
     title: o.summary ? 'Balance Sheet Summary' : 'Balance Sheet',
