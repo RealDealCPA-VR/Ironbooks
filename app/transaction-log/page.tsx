@@ -6,11 +6,13 @@
  * that every posted journal entry is accounted for.
  *
  * Filters: date range, user, record type, action, free text. Click a row for its details;
- * "Open" drills to the record. Export via the shared report toolbar (CSV / Excel / PDF).
+ * "Open" drills to the record. Export via the shared report toolbar (CSV / Excel / PDF) for the
+ * rows on screen, or "Export all (CSV)" for every matching record (streamed, no row cap). The raw
+ * log (.bktlg) downloads byte for byte with its verification report (transactionLogExport.ts).
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
-import { ScrollText, ShieldCheck, ShieldAlert, ChevronDown, ChevronRight, ExternalLink } from 'lucide-react';
+import { ScrollText, ShieldCheck, ShieldAlert, ChevronDown, ChevronRight, ExternalLink, Download, FileCheck2 } from 'lucide-react';
 import {
   Badge,
   Button,
@@ -290,6 +292,19 @@ export default function TransactionLogPage() {
     : null;
 
   const filtersActive = Boolean(from || to || userId || entityType || action || q);
+  // The same filters for "Export all (CSV)" (every matching record, streamed by the server).
+  const exportQuery = (() => {
+    const qs = new URLSearchParams();
+    const fromIso = localDayStartIso(from);
+    const toIso = localDayEndIso(to);
+    if (fromIso) qs.set('from', fromIso);
+    if (toIso) qs.set('to', toIso);
+    if (userId) qs.set('userId', userId);
+    if (entityType) qs.set('entityType', entityType);
+    if (action) qs.set('action', action);
+    if (debouncedQ.trim()) qs.set('q', debouncedQ.trim());
+    return qs.toString();
+  })();
 
   return (
     <div className="p-8 w-full">
@@ -346,9 +361,29 @@ export default function TransactionLogPage() {
             )}
           </div>
         </div>
-        <Button variant="secondary" size="sm" onClick={runVerify} loading={verifying}>
-          Verify now
-        </Button>
+        <div className="flex flex-col items-end gap-2">
+          <Button variant="secondary" size="sm" onClick={runVerify} loading={verifying}>
+            Verify now
+          </Button>
+          {verify?.exists && (
+            <div className="flex flex-wrap justify-end gap-2 text-sm">
+              <a
+                href="/api/transaction-log/download"
+                className="inline-flex items-center gap-1 text-electric hover:underline"
+                title="The log file itself (.bktlg), byte for byte, so it can be checked outside Ironbooks"
+              >
+                <Download className="h-4 w-4" aria-hidden="true" /> Download log (.bktlg)
+              </a>
+              <a
+                href="/api/transaction-log/download?part=verification"
+                className="inline-flex items-center gap-1 text-electric hover:underline"
+                title="Size, SHA-256 fingerprint and the verification result of the downloaded log"
+              >
+                <FileCheck2 className="h-4 w-4" aria-hidden="true" /> Verification report
+              </a>
+            </div>
+          )}
+        </div>
       </Card>
 
       {/* Filters */}
@@ -417,7 +452,17 @@ export default function TransactionLogPage() {
         </div>
       </Card>
 
-      <ReportToolbar table={exportTable} disabled={loading} />
+      <div className="flex flex-wrap items-center gap-3">
+        <ReportToolbar table={exportTable} disabled={loading} />
+        <a href={`/api/transaction-log/export?${exportQuery}`} className="mb-4 inline-flex items-center gap-1 text-sm text-electric hover:underline">
+          <Download className="h-4 w-4" aria-hidden="true" /> Export all {data ? data.total.toLocaleString() : ''} (CSV)
+        </a>
+      </div>
+      {data && data.total > rows.length && (
+        <p className="-mt-2 mb-3 text-xs text-navy/50">
+          Showing the newest {rows.length.toLocaleString()} of {data.total.toLocaleString()} matching records. &ldquo;Export all&rdquo; downloads every one.
+        </p>
+      )}
 
       <Card className="p-0">
         {loading && !data ? (

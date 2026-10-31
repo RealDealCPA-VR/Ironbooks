@@ -223,6 +223,10 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/company-file/info': kind('public', 'GET'),
   '/api/transaction-log': r('reports_financial', 'GET'),
   '/api/transaction-log/verify': r('reports_financial', 'GET'),
+  // reports: the filtered log as CSV, every record (streamed); the raw .bktlg + its verification
+  // report is a copy of part of the company file (file utility, like /api/portable).
+  '/api/transaction-log/export': r('reports_financial', 'GET'),
+  '/api/transaction-log/download': r('file_utilities', 'GET:create'),
   '/api/qb-import/gl': r('file_utilities', 'GET POST'),
   '/api/qb-import/open-items': r('file_utilities', 'GET POST'),
   '/api/integrity': r('file_utilities', 'GET'),
