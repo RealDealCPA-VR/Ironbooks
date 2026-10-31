@@ -79,6 +79,30 @@ interface EntitySource {
 
 const str = (v: unknown) => (v === null || v === undefined ? '' : String(v));
 
+/** Rows of a list endpoint (a bare array, or { rows } / { items } / { data }). */
+function listRows(d: unknown): AnyRow[] {
+  if (Array.isArray(d)) return d as AnyRow[];
+  const o = (d ?? {}) as Record<string, unknown>;
+  for (const k of ['rows', 'items', 'data', 'payments']) if (Array.isArray(o[k])) return o[k] as AnyRow[];
+  return [];
+}
+
+/** A transaction type picked by number and date (the first number field present wins). */
+function docType(value: string, label: string, url: string, numberFields: string[]): { value: string; label: string; source: EntitySource } {
+  return {
+    value,
+    label,
+    source: {
+      url,
+      rows: listRows,
+      label: (r) => {
+        const n = numberFields.map((f) => str(r[f])).find((v) => v);
+        return `${label}${n ? ` #${n}` : ''}${r.date ? ` — ${formatDate(str(r.date))}` : ''}`;
+      },
+    },
+  };
+}
+
 const ENTITY_TYPES: { value: string; label: string; source?: EntitySource }[] = [
   {
     value: 'invoice',
@@ -144,6 +168,19 @@ const ENTITY_TYPES: { value: string; label: string; source?: EntitySource }[] = 
       rows: (d) => (Array.isArray(d) ? (d as AnyRow[]) : []),
       label: (r) => `${str(r.firstName)} ${str(r.lastName)}`.trim() || 'Employee',
     },
+  },
+  // J9 (feature round, accountant): every form and list with an attachment panel.
+  docType('sales_receipt', 'Sales Receipt', '/api/sales-receipts', ['refNumber', 'receiptNumber']),
+  docType('credit_memo', 'Credit Memo', '/api/credit-memos', ['refNumber', 'memoNumber']),
+  docType('estimate', 'Estimate', '/api/estimates', ['refNumber', 'estimateNumber']),
+  docType('sales_order', 'Sales Order', '/api/sales-orders', ['refNumber', 'orderNumber']),
+  docType('purchase_order', 'Purchase Order', '/api/purchase-orders', ['refNumber', 'poNumber']),
+  docType('deposit', 'Deposit', '/api/deposits', []),
+  docType('payment_received', 'Customer Payment', '/api/payments', ['reference', 'checkNumber']),
+  {
+    value: 'item',
+    label: 'Item',
+    source: { url: '/api/items', rows: listRows, label: (r) => str(r.name) || 'Item' },
   },
   // No list endpoint for these — the record reference comes from a deep link.
   { value: 'paycheck', label: 'Paycheck' },

@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
+import AttachmentPanel from '@/components/AttachmentPanel'; // J9 Doc Center
 import Link from 'next/link';
 import {
   UserSquare, Plus, Play, KeyRound, Pencil, Ban, RotateCcw, MinusCircle,
@@ -2321,6 +2322,7 @@ export default function EmployeesPage() {
             </Button>
           </div>
         </div>
+        <AttachmentPanel className="mt-4" entityType="employee" entityId={editId} />
       </Modal>
 
       {/* ---- Run Payroll Modal ---- */}

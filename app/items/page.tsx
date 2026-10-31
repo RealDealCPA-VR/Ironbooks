@@ -33,6 +33,7 @@ import { useFocusParam } from '@/lib/useFocusParam';
 import { usePreferences } from '@/lib/usePreferences';
 import Link from 'next/link';
 import { Help } from '@/components/Help';
+import AttachmentPanel from '@/components/AttachmentPanel'; // J9 Doc Center
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -830,6 +831,7 @@ function ItemsPageContent() {
             Taxable by default on sales forms
           </label>
         </form>
+        <AttachmentPanel className="mt-4" entityType="item" entityId={editingItem?.id} />
       </Modal>
 
       {/* Deactivate Confirmation Modal */}

@@ -51,6 +51,7 @@ import {
   useDuplicateNumberConfirm,
 } from '@/components/sales/DocNumberField';
 import { TransactionNav, useAdjacentTransactions } from '@/components/TransactionNav';
+import AttachmentPanel from '@/components/AttachmentPanel'; // J9 Doc Center
 
 // ---------------------------------------------------------------------------
 // Types
@@ -403,6 +404,7 @@ function NewOrderModal({ open, editing, onClose, customers, items, taxRates, onC
           </span>
         </div>
       </div>
+      <AttachmentPanel className="mt-4" entityType="sales_order" entityId={editing?.id} />
     </Modal>
   );
 }

@@ -66,6 +66,7 @@ import { previewSalesTotals } from '@/lib/salesLineMath';
 import { usePrefill } from '@/lib/commands/usePrefill';
 import type { FormPrefill } from '@/lib/commands/prefill';
 import { TransactionNav, useAdjacentTransactions } from '@/components/TransactionNav';
+import AttachmentPanel from '@/components/AttachmentPanel'; // J9 Doc Center
 
 // ---------------------------------------------------------------------------
 // Types
@@ -778,6 +779,7 @@ function NewReceiptModal({
           </div>
         </div>
       </div>
+      <AttachmentPanel className="mt-4" entityType="sales_receipt" entityId={editing?.id} />
     </Modal>
   );
 }
