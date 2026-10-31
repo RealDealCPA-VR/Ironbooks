@@ -65,3 +65,22 @@ describe('Pay Bills: the payment method follows the pay-from account', () => {
     expect(src.match(/methodForAccount\(accounts\.find/g)?.length).toBe(2);
   });
 });
+
+describe('Bank feed review: one row changes, one row is refreshed', () => {
+  it('Add / Match / Exclude / Restore update that row from the answer instead of reloading the whole feed', () => {
+    const src = fs.readFileSync('app/bank-review/page.tsx', 'utf8');
+    const busy = src.slice(src.indexOf('async function withBusy'), src.indexOf('async function applyRowUpdate'));
+    expect(busy).toContain('if (row && row.id === id) await applyRowUpdate(row as BankTransaction);');
+    // The full reload is only the fallback (Unmatch, or an answer without the row).
+    expect(busy.match(/fetchTransactions\(/g)?.length).toBe(1);
+    expect(src).toContain('return res?.transaction ?? null;');
+    // A row back in the queue asks for its own candidates only.
+    expect(src).toContain('`/api/bank-transactions/${row.id}/matches`');
+  });
+});
+
+describe('Quick Check: the amount is read by the money parser in the browser too', () => {
+  it('no parseFloat on the Print Checks page', () => {
+    expect(fs.readFileSync('app/print-checks/page.tsx', 'utf8')).not.toMatch(/parseFloat\(/);
+  });
+});

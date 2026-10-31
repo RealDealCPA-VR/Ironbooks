@@ -385,15 +385,63 @@ export default function BankReviewPage() {
   // Handlers
   // ------------------------------------------------------------------
 
-  async function withBusy(id: string, fn: () => Promise<void>) {
+  /**
+   * Run a one-row action, then refresh only that row from the server's answer (the whole feed
+   * history, its suggestions and every row's match candidates used to be reloaded after each
+   * click). `fn` returns the updated row; null falls back to a full reload.
+   */
+  async function withBusy(id: string, fn: () => Promise<Partial<BankTransaction> | null>) {
     setBusyId(id);
     try {
-      await fn();
-      await fetchTransactions(selectedBankAccountId);
+      const row = await fn();
+      if (row && row.id === id) await applyRowUpdate(row as BankTransaction);
+      else await fetchTransactions(selectedBankAccountId);
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Action failed.', 'danger');
     } finally {
       setBusyId(null);
+    }
+  }
+
+  /** One row changed (added, matched, excluded, restored): update it and the candidate lists. */
+  async function applyRowUpdate(row: BankTransaction) {
+    setTransactions((prev) => prev.map((t) => (t.id === row.id ? { ...t, ...row } : t)));
+    setSelected((prev) => {
+      if (!prev.has(row.id)) return prev;
+      const next = new Set(prev);
+      next.delete(row.id);
+      return next;
+    });
+    const reviewed = row.matched || row.excluded;
+    const taken = row.matched ? row.matchedEntryId : null;
+    let restoredCandidates: MatchCandidate[] | null = null;
+    if (!reviewed) {
+      // Back in the review queue: its own match candidates (one request for this row only).
+      restoredCandidates = await api
+        .get<MatchCandidate[]>(`/api/bank-transactions/${row.id}/matches`)
+        .catch(() => [] as MatchCandidate[]);
+    }
+    // A transaction now matched to an entry can't be offered to the other rows any more.
+    const prune = (list: MatchCandidate[] | undefined) => (taken ? (list ?? []).filter((c) => c.entryId !== taken) : (list ?? []));
+    setRowCandidates((prev) => {
+      const next: Record<string, MatchCandidate[]> = {};
+      for (const [k, v] of Object.entries(prev)) if (k !== row.id) next[k] = prune(v);
+      if (restoredCandidates) next[row.id] = restoredCandidates;
+      return next;
+    });
+    setRowCandidateId((prev) => {
+      const next = { ...prev };
+      if (taken) {
+        for (const [k, v] of Object.entries(next)) if (v === taken) delete next[k];
+      }
+      delete next[row.id];
+      if (restoredCandidates && restoredCandidates.length > 0) next[row.id] = restoredCandidates[0].entryId;
+      return next;
+    });
+    if (restoredCandidates) {
+      const high = restoredCandidates.filter((c) => c.confidence === 'high');
+      setRowMode((prev) => ({ ...prev, [row.id]: high.length === 1 ? 'match' : 'add' }));
+      if (high.length === 1) setRowCandidateId((prev) => ({ ...prev, [row.id]: high[0].entryId }));
     }
   }
 
@@ -407,7 +455,7 @@ export default function BankReviewPage() {
     const keepsSuggestion = !!sg && sg.accountId === accountId;
     const classId = rowClassId[txn.id] || null;
     withBusy(txn.id, async () => {
-      const res = await api.post<{ ruleOffer: RuleOffer | null }>('/api/bank-transactions/categorize', {
+      const res = await api.post<{ transaction?: BankTransaction; ruleOffer: RuleOffer | null }>('/api/bank-transactions/categorize', {
         bankTransactionId: txn.id,
         accountId,
         ...(classId ? { classId } : {}),
@@ -424,6 +472,7 @@ export default function BankReviewPage() {
         const offer = res.ruleOffer;
         setOffers((prev) => [offer, ...prev.filter((o) => !(o.pattern === offer.pattern && o.direction === offer.direction))]);
       }
+      return res?.transaction ?? null;
     });
   };
 
@@ -434,33 +483,38 @@ export default function BankReviewPage() {
       return;
     }
     withBusy(txn.id, async () => {
-      await api.post('/api/bank-transactions/match', {
+      const res = await api.post<{ transaction?: BankTransaction }>('/api/bank-transactions/match', {
         bankTransactionId: txn.id,
         journalEntryId,
       });
       toast('Matched to existing transaction — nothing new was posted.', 'success');
+      return res?.transaction ?? null;
     });
   };
 
   const handleExclude = (txn: BankTransaction) =>
     withBusy(txn.id, async () => {
-      await api.post('/api/bank-transactions/exclude', { bankTransactionId: txn.id });
+      const row = await api.post<BankTransaction>('/api/bank-transactions/exclude', { bankTransactionId: txn.id });
       toast('Transaction excluded from review.', 'success');
+      return row ?? null;
     });
 
   const handleRestore = (txn: BankTransaction) =>
     withBusy(txn.id, async () => {
-      await api.post('/api/bank-transactions/exclude', {
+      const row = await api.post<BankTransaction>('/api/bank-transactions/exclude', {
         bankTransactionId: txn.id,
         restore: true,
       });
       toast('Transaction restored to the review queue.', 'success');
+      return row ?? null;
     });
 
   const handleUnmatch = (txn: BankTransaction) =>
     withBusy(txn.id, async () => {
       await api.post('/api/bank-transactions/unmatch', { bankTransactionId: txn.id });
       toast('Unmatched.', 'success');
+      // The entry it was matched to becomes a candidate for the other rows again: reload.
+      return null;
     });
 
   async function handleAskAi(txn: BankTransaction) {

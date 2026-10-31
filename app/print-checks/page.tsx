@@ -43,6 +43,7 @@ import {
   toastError,
 } from '@/components/ui';
 import { numberToWords } from '@/lib/pdf/check';
+import { parseTypedAmount } from '@/lib/fieldValidation';
 import {
   CHECK_FIELD_KEYS,
   CHECK_FIELD_LABELS,
@@ -328,8 +329,9 @@ export default function PrintChecksPage() {
   }, [bankId]);
 
   useEffect(() => {
-    const n = parseFloat(amount);
-    setAmountWords(!amount || isNaN(n) || n < 0 ? '' : numberToWords(amount));
+    // The money parser, as the server's (parseFloat read "12abc" as 12 and spelled it out).
+    const n = parseTypedAmount(amount);
+    setAmountWords(!n || n === 'invalid' || n.isNegative() ? '' : numberToWords(n.toFixed(2)));
   }, [amount]);
 
   // ── Print checks (PARITY D3) ──────────────────────────────────────────────
@@ -584,9 +586,9 @@ export default function PrintChecksPage() {
       toast('Payee name is required.', 'danger');
       return;
     }
-    const amountNum = parseFloat(amount);
-    if (!amount || isNaN(amountNum) || amountNum <= 0) {
-      toast('Amount must be a positive number.', 'danger');
+    const amountNum = parseTypedAmount(amount);
+    if (!amountNum || amountNum === 'invalid' || !amountNum.greaterThan(0)) {
+      toast('Enter the amount as money, more than zero (for example 1,250.00).', 'danger');
       return;
     }
     if (!date) {
