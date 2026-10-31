@@ -336,3 +336,27 @@ describe('sealed backups (.bka)', () => {
     expect(opened.entries.some((e: { name: string }) => e.name === 'bookkeeper-manifest.json')).toBe(true);
   });
 });
+
+describe('a whole file under one password (portable .bkp, Accountant’s Copy .ibac)', () => {
+  it('round-trips; a wrong password, a changed byte or a changed header never opens it', async () => {
+    const plain = Buffer.from(`PK fake zip naming ${CUSTOMER} of ${COMPANY}`.repeat(50), 'utf8');
+    const sealed = await crypto.sealWithPassword(plain, 'Portable-Pass-9', { kind: 'portable' });
+    expect(crypto.isPasswordSealed(sealed)).toBe(true);
+    expect(crypto.isPasswordSealed(plain)).toBe(false);
+    expect(crypto.passwordEnvelopeInfo(sealed)).toEqual({ kind: 'portable' });
+    expect(sealed.includes(Buffer.from(CUSTOMER))).toBe(false);
+    expect((await crypto.openWithPassword(sealed, 'Portable-Pass-9'))?.equals(plain)).toBe(true);
+    expect(await crypto.openWithPassword(sealed, 'portable-pass-9')).toBeNull();
+    expect(await crypto.openWithPassword(sealed, '')).toBeNull();
+    const body = Buffer.from(sealed);
+    body[body.length - 40] ^= 1;
+    expect(await crypto.openWithPassword(body, 'Portable-Pass-9')).toBeNull();
+    const tag = Buffer.from(sealed);
+    tag[tag.length - 1] ^= 1;
+    expect(await crypto.openWithPassword(tag, 'Portable-Pass-9')).toBeNull();
+    // The header (kind, cost, salt, nonce) is authenticated too.
+    const header = Buffer.from(sealed.toString('latin1').replace('"kind":"portable"', '"kind":"portablx"'), 'latin1');
+    expect(header.length).toBe(sealed.length);
+    expect(await crypto.openWithPassword(header, 'Portable-Pass-9')).toBeNull();
+  });
+});

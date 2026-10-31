@@ -204,7 +204,7 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   // Company file (team companyfile): portable file = full copy of the file (create, like a
   // backup); restoring one is a restore ('delete', like /api/backup); the shareable ledger
   // and transaction log are exports / an audit view of the books.
-  '/api/portable': r('file_utilities', 'GET:create'),
+  '/api/portable': r('file_utilities', 'GET:create POST:create'), // filecrypto: POST { password } = encrypted .bkp
   '/api/portable/restore': r('file_utilities', 'POST:delete'),
   '/api/portable/shareable': r('file_utilities', 'GET:print'),
   // Single-file company file (lib/services/companyFileSave.ts): anyone signed in sees whether it

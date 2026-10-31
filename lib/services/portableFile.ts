@@ -23,6 +23,14 @@
  * directory is removed and the restore is refused — a partial or altered file never opens.
  *
  * The session-signing secret (.auth-secret) is deliberately NOT included.
+ *
+ * A PASSWORD (filecrypto; offered, on by default): the whole file is encrypted under it
+ * (electron/fileCrypto.js sealWithPassword) and opening it needs it (unlockPortableBuffer). A
+ * password-protected portable file of a company file protected with passwords also carries the
+ * file key (`file-key.json`, inside the encryption), so the company file restored from it is
+ * protected again from its first write, with the same user names, passwords and recovery key.
+ * Without a password the file is plain (the person chose so) and never carries the key: the
+ * restored books open with a user's password, which unwraps the key from that user's slot.
  */
 import AdmZip from 'adm-zip';
 import fs from 'node:fs';
@@ -37,6 +45,8 @@ import { ServiceError, type ServiceContext } from './_base';
 import { allowLedgerRewriteRaw } from './posting';
 import { trialBalance } from './reports';
 import { TRANSACTION_LOG_FILE, transactionLogPath, readAllTransactionLog } from './transactionLog';
+import { adoptCarriedKey, fileKeyFor, readProtection } from './fileProtection';
+import fileCrypto from '@/electron/fileCrypto';
 import pkg from '@/package.json';
 
 export const PORTABLE_EXTENSION = 'bkp';
@@ -44,6 +54,40 @@ export const PORTABLE_MANIFEST_ENTRY = 'bookkeeper-portable.json';
 export const PORTABLE_CHECKSUMS_ENTRY = 'checksums.sha256';
 /** Bump when the portable layout changes incompatibly. */
 export const PORTABLE_FORMAT_VERSION = 1;
+/** The company file's key, only inside a password-protected portable file of a protected file. */
+export const PORTABLE_KEY_ENTRY = 'file-key.json';
+
+export const PORTABLE_PASSWORD_MESSAGE = 'This file is protected with a password. Enter the password it was saved with to open it.';
+export const PORTABLE_WRONG_PASSWORD_MESSAGE = 'That password does not open this file. Passwords are case-sensitive.';
+
+/** The shortest password a portable or transfer file may be given. */
+export const MIN_FILE_PASSWORD = 8;
+
+/**
+ * Open a portable or transfer file protected with a password: its plain bytes (the zip the rest
+ * of this module reads). A file without a password comes back as it is. FORBIDDEN with
+ * details.passwordRequired (and details.wrongPassword when one was given) otherwise.
+ */
+export async function unlockPortableBuffer(buffer: Buffer, password?: string | null): Promise<Buffer> {
+  if (!fileCrypto.isPasswordSealed(buffer)) return buffer;
+  if (!password) throw new ServiceError('FORBIDDEN', PORTABLE_PASSWORD_MESSAGE, { passwordRequired: true });
+  const plain = await fileCrypto.openWithPassword(buffer, password);
+  if (!plain) throw new ServiceError('FORBIDDEN', PORTABLE_WRONG_PASSWORD_MESSAGE, { passwordRequired: true, wrongPassword: true });
+  return plain;
+}
+
+/** A portable / transfer file's password must be at least MIN_FILE_PASSWORD characters. */
+export function assertFilePassword(password: unknown): asserts password is string {
+  if (typeof password !== 'string' || password.length < MIN_FILE_PASSWORD) {
+    throw new ServiceError('VALIDATION', `Give the file a password of at least ${MIN_FILE_PASSWORD} characters (or choose to save it without one).`);
+  }
+}
+
+/** Encrypt a finished portable / transfer file under `password` (checked for length here). */
+export async function protectPortableBuffer(buffer: Buffer, password: string, kind: 'portable' | 'accountant-copy'): Promise<Buffer> {
+  assertFilePassword(password);
+  return fileCrypto.sealWithPassword(buffer, password, { kind });
+}
 
 /** Desktop company-file manifest (mirrors electron/companyFile.js). */
 const COMPANY_FILE_MANIFEST = 'bookkeeper-company.json';
@@ -249,8 +293,15 @@ export function portableFilename(companyName: string): string {
  */
 export async function createPortableCompanyFile(
   ctx: ServiceContext,
-  opts: { dataDir?: string } = {},
+  opts: {
+    dataDir?: string;
+    /** Encrypt the whole file under this password (and carry a protected file's key inside). */
+    password?: string | null;
+    /** Carry a protected file's key without sealing here (the caller seals the final file). */
+    carryFileKey?: boolean;
+  } = {},
 ): Promise<PortableFileResult> {
+  if (opts.password != null) assertFilePassword(opts.password);
   if (ctx.role && ctx.role !== 'owner' && ctx.role !== 'admin') {
     throw new ServiceError(
       'FORBIDDEN',
@@ -318,12 +369,22 @@ export async function createPortableCompanyFile(
     transactionLog,
   };
   add(PORTABLE_MANIFEST_ENTRY, Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'));
+  // A protected company file's key travels only inside an encrypted portable / transfer file.
+  if (opts.password || opts.carryFileKey) {
+    const prot = await readProtection(db);
+    const key = prot ? fileKeyFor(dataDir) : null;
+    if (prot && key && fileCrypto.keyCheckOf(key) === prot.keyCheck) {
+      add(PORTABLE_KEY_ENTRY, Buffer.from(JSON.stringify({ keyCheck: prot.keyCheck, fileKey: key.toString('base64') }), 'utf8'));
+    }
+  }
   zip.addFile(
     PORTABLE_CHECKSUMS_ENTRY,
     Buffer.from(checksums.map(([h, e]) => `${h}  ${e}`).join('\n') + '\n', 'utf8'),
   );
 
-  return { buffer: zip.toBuffer(), filename: portableFilename(current.name), manifest };
+  const plain = zip.toBuffer();
+  const buffer = opts.password ? await protectPortableBuffer(plain, opts.password, 'portable') : plain;
+  return { buffer, filename: portableFilename(current.name), manifest };
 }
 
 // ---------------------------------------------------------------------------
@@ -344,6 +405,8 @@ interface OpenedPortable {
  * truncated download or an edited row is refused before anything is written).
  */
 export function openPortableFile(buffer: Buffer): OpenedPortable {
+  // Protected with a password: unlockPortableBuffer first (the routes do, with the password given).
+  if (fileCrypto.isPasswordSealed(buffer)) throw new ServiceError('FORBIDDEN', PORTABLE_PASSWORD_MESSAGE, { passwordRequired: true });
   let zip: AdmZip;
   try {
     zip = new AdmZip(buffer);
@@ -421,6 +484,8 @@ export function readPortableManifest(buffer: Buffer): PortableManifest {
 
 export interface PortableRestoreResult {
   dataDir: string;
+  /** The restored books are protected with passwords and their file key is known here (filecrypto). */
+  protected?: boolean;
   companyName: string;
   companies: Array<{ id: string; name: string }>;
   rowCounts: Record<string, number>;
@@ -671,9 +736,24 @@ export async function restorePortableCompanyFile(
       'utf8',
     );
 
+    // A protected company file's key carried inside a password-protected portable file: the
+    // restored books are protected again (same key, same slots), from their first write.
+    let keyAdopted = false;
+    const keyEntry = zip.getEntry(PORTABLE_KEY_ENTRY);
+    if (keyEntry) {
+      try {
+        const k = JSON.parse(zip.readAsText(keyEntry)) as { fileKey?: string };
+        const key = typeof k.fileKey === 'string' ? Buffer.from(k.fileKey, 'base64') : null;
+        keyAdopted = Boolean(key && key.length === 32 && (await adoptCarriedKey(db, dir, key)));
+      } catch {
+        keyAdopted = false;
+      }
+    }
+
     await closeDb(dir);
     return {
       dataDir: dir,
+      ...(keyAdopted ? { protected: true } : {}),
       companyName: manifest.companyName,
       companies: manifest.companies,
       rowCounts: manifest.rowCounts,

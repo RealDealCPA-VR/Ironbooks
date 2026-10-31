@@ -57,7 +57,7 @@ import { createTransfer, updateTransfer, voidTransfer, type CreateTransferInput 
 import { createDeposit, updateDeposit, voidDeposit, getDeposit, CASHBACK_LINE_PREFIX, INVOICE_PAYMENT_LINE_PREFIX, RECEIPT_LINE_PREFIX, type CreateDepositInput } from '../deposits';
 import type { PostingLine } from '../posting';
 import { currentVersion, withVersionCheck, type VersionedEntity } from '../concurrency';
-import { createPortableCompanyFile } from '../portableFile';
+import { assertFilePassword, createPortableCompanyFile, protectPortableBuffer } from '../portableFile';
 import { trialBalance } from '../reports';
 import { getClosingDateSettings } from '../company';
 import {
@@ -173,9 +173,10 @@ export interface TransferFileResult {
 
 export async function createAccountantCopy(
   ctx: ServiceContext,
-  input: { dividingDate: string; dataDir?: string },
+  input: { dividingDate: string; dataDir?: string; password?: string | null },
 ): Promise<TransferFileResult> {
   assertOwnerOrAdmin(ctx, "create an Accountant's Copy (it contains every user and password of the file)");
+  if (input.password != null) assertFilePassword(input.password);
   const dividingDate = String(input.dividingDate ?? '').trim();
   if (!DATE_RE.test(dividingDate) || isNaN(new Date(`${dividingDate}T00:00:00.000Z`).getTime())) {
     throw validation('Enter the dividing date as a date (YYYY-MM-DD).');
@@ -218,7 +219,7 @@ export async function createAccountantCopy(
   });
 
   try {
-    return await buildTransferFile(ctx, row, co.name, me?.name ?? null, input.dataDir);
+    return await buildTransferFile(ctx, row, co.name, me?.name ?? null, input.dataDir, input.password ?? null);
   } catch (err) {
     // The file could not be built: nothing went out, so the restriction is lifted again.
     await ctx.db
@@ -229,15 +230,21 @@ export async function createAccountantCopy(
   }
 }
 
-/** The .ibac of a copy row: a Portable Company File of this file plus the copy's manifest. */
+/**
+ * The .ibac of a copy row: a Portable Company File of this file plus the copy's manifest. With a
+ * `password` (filecrypto; offered, on by default) the whole transfer file is encrypted under it
+ * and a protected file's key travels inside, so the accountant's copy stays protected.
+ */
 async function buildTransferFile(
   ctx: ServiceContext,
   row: AccountantCopyRow,
   companyName: string,
   createdBy: string | null,
   dataDir: string | undefined,
+  password: string | null = null,
 ): Promise<TransferFileResult> {
-  const portable = await createPortableCompanyFile(ctx, { dataDir });
+  if (password != null) assertFilePassword(password); // before any work
+  const portable = await createPortableCompanyFile(ctx, { dataDir, carryFileKey: Boolean(password) });
   const zip = new AdmZip(portable.buffer);
   const manifest: TransferManifest = {
     app: 'ironbooks',
@@ -252,7 +259,7 @@ async function buildTransferFile(
   };
   zip.addFile(TRANSFER_ENTRY, Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'));
   return {
-    buffer: zip.toBuffer(),
+    buffer: password ? await protectPortableBuffer(zip.toBuffer(), password, 'accountant-copy') : zip.toBuffer(),
     filename: `${safeCompanyName(companyName)} (Accountant's Copy ${row.dividingDate}).${TRANSFER_EXTENSION}`,
     copy: publicCopy(row),
   };
@@ -267,7 +274,7 @@ async function buildTransferFile(
  * on; later work in this file only travels as context (it stays locked in the accountant's copy).
  * Only one changes file of the copy can ever be imported.
  */
-export async function saveTransferFileAgain(ctx: ServiceContext, input: { dataDir?: string } = {}): Promise<TransferFileResult> {
+export async function saveTransferFileAgain(ctx: ServiceContext, input: { dataDir?: string; password?: string | null } = {}): Promise<TransferFileResult> {
   assertOwnerOrAdmin(ctx, "save the Accountant's Copy (it contains every user and password of the file)");
   const status = await accountantCopyStatus(ctx);
   if (status.mode === 'accountant') {
@@ -284,7 +291,7 @@ export async function saveTransferFileAgain(ctx: ServiceContext, input: { dataDi
   const [co] = await ctx.db.select({ name: companies.name }).from(companies).where(eq(companies.id, ctx.companyId));
   if (!co) throw new ServiceError('NOT_FOUND', 'Company not found');
   const [creator] = row.createdBy ? await ctx.db.select({ name: users.name }).from(users).where(eq(users.id, row.createdBy)) : [];
-  const out = await buildTransferFile(ctx, row, co.name, creator?.name ?? null, input.dataDir);
+  const out = await buildTransferFile(ctx, row, co.name, creator?.name ?? null, input.dataDir, input.password ?? null);
   await inTransaction(ctx, (tx) =>
     writeAudit(tx, { action: 'update', entityType: 'accountant_copy', entityId: row.id, newValues: { transferFileSavedAgain: true } }),
   );

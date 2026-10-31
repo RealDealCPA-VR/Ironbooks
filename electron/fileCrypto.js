@@ -329,6 +329,94 @@ function newSealId() {
   return b64(crypto.randomBytes(16));
 }
 
+// ---------------------------------------------------------------------------
+// A whole file under ONE password: the portable company file (.bkp) and the Accountant's Copy
+// transfer file (.ibac), when they are given a password (on by default). Layout:
+//   "IRONBOOKS-PROTECTED\n" | uint32 header length | header JSON | ciphertext | GCM tag
+// The header ({ v, kind, kdf, salt, nonce }) is the additional data, so it can't be changed; the
+// file is verified as a whole before a single byte of it is used.
+// ---------------------------------------------------------------------------
+
+const ENVELOPE_MAGIC = Buffer.from('IRONBOOKS-PROTECTED\n', 'utf8');
+
+/** True when `buf` is a file protected with a password (sealWithPassword). */
+function isPasswordSealed(buf) {
+  return Buffer.isBuffer(buf) && buf.length > ENVELOPE_MAGIC.length + 4 && buf.subarray(0, ENVELOPE_MAGIC.length).equals(ENVELOPE_MAGIC);
+}
+
+function envelopeParts(buf) {
+  if (!isPasswordSealed(buf)) return null;
+  const len = buf.readUInt32BE(ENVELOPE_MAGIC.length);
+  const start = ENVELOPE_MAGIC.length + 4;
+  if (len <= 0 || len > 64 * 1024 || start + len + TAG_BYTES > buf.length) return null;
+  let header;
+  try {
+    header = JSON.parse(buf.subarray(start, start + len).toString('utf8'));
+  } catch {
+    return null;
+  }
+  if (!header || header.v !== 1 || !validKdf(header.kdf) || !unb64(header.salt) || !unb64(header.nonce)) return null;
+  return { header, aad: buf.subarray(0, start + len), body: buf.subarray(start + len) };
+}
+
+/** The plain header of a password-protected file ({ v, kind, kdf, ... }), or null. */
+function passwordEnvelopeInfo(buf) {
+  const parts = envelopeParts(buf);
+  return parts ? { kind: parts.header.kind || null } : null;
+}
+
+/**
+ * Encrypt `plain` (a whole file) under `password`: a key derived with scrypt (its own salt, the
+ * same cost as a key slot), AES-256-GCM.
+ * @param {Buffer} plain
+ * @param {string} password
+ * @param {{ kind?: string }} [opts]
+ * @returns {Promise<Buffer>}
+ */
+async function sealWithPassword(plain, password, { kind = 'file' } = {}) {
+  if (typeof password !== 'string' || !password) throw new Error('a password is required');
+  const kdf = currentKdf();
+  const salt = b64(crypto.randomBytes(SALT_BYTES));
+  const nonce = crypto.randomBytes(NONCE_BYTES);
+  const header = Buffer.from(JSON.stringify({ v: 1, kind, cipher: CIPHER, kdf: { name: 'scrypt', N: kdf.N, r: kdf.r, p: kdf.p }, salt, nonce: b64(nonce) }), 'utf8');
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(header.length, 0);
+  const aad = Buffer.concat([ENVELOPE_MAGIC, len, header]);
+  const kek = await deriveKek(password, salt, kdf);
+  const c = crypto.createCipheriv(CIPHER, kek, nonce);
+  c.setAAD(aad);
+  return Buffer.concat([aad, c.update(plain), c.final(), c.getAuthTag()]);
+}
+
+/**
+ * Decrypt a password-protected file: the plain bytes, or null when the password is wrong (or the
+ * file was changed — the two can't be told apart, and neither opens it).
+ * @param {Buffer} buf
+ * @param {string} password
+ * @returns {Promise<Buffer | null>}
+ */
+async function openWithPassword(buf, password) {
+  const parts = envelopeParts(buf);
+  if (!parts || typeof password !== 'string' || !password) {
+    await burnKdf(password);
+    return null;
+  }
+  let kek;
+  try {
+    kek = await deriveKek(password, parts.header.salt, parts.header.kdf);
+  } catch {
+    return null;
+  }
+  try {
+    const d = crypto.createDecipheriv(CIPHER, kek, unb64(parts.header.nonce));
+    d.setAAD(parts.aad);
+    d.setAuthTag(parts.body.subarray(parts.body.length - TAG_BYTES));
+    return Buffer.concat([d.update(parts.body.subarray(0, parts.body.length - TAG_BYTES)), d.final()]);
+  } catch {
+    return null;
+  }
+}
+
 module.exports = {
   CIPHER,
   KEY_BYTES,
@@ -356,4 +444,8 @@ module.exports = {
   openBytes,
   newSealId,
   TamperedError,
+  isPasswordSealed,
+  passwordEnvelopeInfo,
+  sealWithPassword,
+  openWithPassword,
 };

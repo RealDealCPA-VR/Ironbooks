@@ -59,6 +59,8 @@ const hostingCore = require('./hostingCore');
 const hosting = require('./hosting');
 const security = require('./security');
 const { promptForHost } = require('./connectPrompt');
+const { promptForFilePassword } = require('./passwordPrompt');
+const fileCrypto = require('./fileCrypto');
 const { pruneLegacyAutoBackups } = require('./legacyBackups');
 
 const isDev = !app.isPackaged;
@@ -1667,25 +1669,49 @@ async function openPortableFlow(filePath) {
   }
   // The server restores (and verifies) into a scratch folder on this computer; that folder is then
   // packed into the single company file the person chose.
-  const scratch = path.join(workingRoot(), `restore-${crypto.randomBytes(6).toString('hex')}`);
-  try {
-    const res = await fetch(`${serverUrl}/api/portable/restore?target=${encodeURIComponent(scratch)}`, {
+  const scratch = path.join(workingRoot(), `restore-${crypto.randomBytes(6).toString('hex')}`, 'data');
+  // The server restores (and verifies) into the scratch folder and writes the company file itself
+  // (packAs): the books of a protected file are written encrypted with the key that travelled
+  // inside the password-protected portable file — this shell never has it.
+  const restore = async (password) => {
+    const headers = { 'x-bka-internal': internalToken, 'content-type': 'application/octet-stream' };
+    if (password) headers['x-ironbooks-password'] = Buffer.from(password, 'utf8').toString('base64url');
+    const res = await fetch(`${serverUrl}/api/portable/restore?target=${encodeURIComponent(scratch)}&packAs=${encodeURIComponent(target)}`, {
       method: 'POST',
-      headers: { 'x-bka-internal': internalToken, 'content-type': 'application/octet-stream' },
+      headers,
       body: bytes,
       signal: AbortSignal.timeout(30 * 60 * 1000),
     });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      dialog.showErrorBox('Could not open the portable company file', data.error || `HTTP ${res.status}`);
-      return;
+    return { res, data: await res.json().catch(() => ({})) };
+  };
+  try {
+    let data;
+    if (fileCrypto.isPasswordSealed(bytes)) {
+      // Protected with a password (filecrypto): ask for it; a wrong one asks again.
+      data = await promptForFilePassword(parentWindow(), {
+        title: 'Open Portable Company File',
+        message: `${path.basename(filePath)} is protected with a password. Enter the password it was saved with.`,
+        onSubmit: async (password) => {
+          const r = await restore(password);
+          if (r.res.ok) return { ok: true, value: r.data };
+          if (r.data && r.data.details && r.data.details.passwordRequired) return { ok: false, error: r.data.error };
+          // Anything else (a damaged file, a newer version): stop asking and say why.
+          return { ok: true, value: { __error: r.data.error || `HTTP ${r.res.status}` } };
+        },
+      });
+      if (!data) return;
+      if (data.__error) {
+        dialog.showErrorBox('Could not open the portable company file', data.__error);
+        return;
+      }
+    } else {
+      const r = await restore(null);
+      if (!r.res.ok) {
+        dialog.showErrorBox('Could not open the portable company file', r.data.error || `HTTP ${r.res.status}`);
+        return;
+      }
+      data = r.data;
     }
-    const scratchWork = path.dirname(scratch);
-    await companySession.writeWorkingCopyAs(scratchWork, target, {
-      companyName: data.companyName || base,
-      appVersion: app.getVersion(),
-      dataDir: scratch,
-    });
     rememberRecentCompany(target);
     const choice = await dialog.showMessageBox(mainWindow, {
       noLink: true,
@@ -1705,7 +1731,7 @@ Every table, the trial balance, attachments and the transaction log ` +
   } catch (e) {
     dialog.showErrorBox('Could not open the portable company file', openErrorText(e));
   } finally {
-    fs.rm(scratch, { recursive: true, force: true }, () => {});
+    fs.rm(path.dirname(scratch), { recursive: true, force: true }, () => {});
   }
 }
 

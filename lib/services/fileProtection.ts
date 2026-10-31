@@ -903,6 +903,20 @@ export async function carryProtectionIntoRestore(db: DB, dataDir: string, before
   writeMarker(dataDir, before.protection.keyCheck);
 }
 
+/**
+ * A restored copy whose file key travelled with it (inside a password-protected portable or
+ * transfer file): when the key is the one its protection record names, it is known here from now
+ * on — the restored books are written encrypted with it, and its slots open it as before.
+ */
+export async function adoptCarriedKey(db: DB, dataDir: string, key: Buffer): Promise<boolean> {
+  const prot = await readProtection(db);
+  if (!prot || fileCrypto.keyCheckOf(key) !== prot.keyCheck) return false;
+  rememberFileKey(dataDir, key);
+  writeMarker(dataDir, prot.keyCheck);
+  await sealProtectionFor(db, dataDir).catch(() => null);
+  return true;
+}
+
 /** The protection rows of a database, to carry into a restore (null for a file without passwords). */
 export async function snapshotProtection(db: DB): Promise<{ protection: ProtectionRow; slots: Array<typeof fileKeySlots.$inferSelect> } | null> {
   const protection = await readProtection(db);

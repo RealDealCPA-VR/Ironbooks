@@ -72,3 +72,43 @@ export async function withArchiveCredentialLimit<T>(
     gate.release();
   }
 }
+
+/**
+ * The password of a portable company file (.bkp) or an Accountant's Copy transfer file (.ibac)
+ * being opened (lib/services/portableFile.ts unlockPortableBuffer): the same header, base64url.
+ */
+export function filePasswordFrom(headers: Headers): string | null {
+  return decodePassword(headers.get(PASSWORD_HEADER));
+}
+
+/**
+ * Run `fn` (which may try `password` on a password-protected file) under the sign-in rate limit:
+ * refused while too many wrong passwords were tried from this address; a wrong one
+ * (ServiceError details.wrongPassword) counts as one attempt.
+ */
+export async function withFilePasswordLimit<T>(password: string | null, addr: string, fn: () => Promise<T>): Promise<T> {
+  if (!password) return fn();
+  const limiter = loginLimiter();
+  const keys = attemptKeys('file-password', null, addr);
+  const weights = { [keys[keys.length - 1]]: GLOBAL_KEY_WEIGHT };
+  const gate = limiter.begin(keys, Date.now(), weights);
+  if (!gate.allowed) {
+    throw new ServiceError('FORBIDDEN', 'Too many wrong passwords. Wait a minute and try again.', {
+      passwordRequired: true,
+      rateLimited: true,
+      retryAfterMs: gate.retryAfterMs,
+    });
+  }
+  try {
+    const out = await fn();
+    limiter.recordSuccess(keys.slice(0, -1));
+    return out;
+  } catch (err) {
+    if (err instanceof ServiceError && (err.details as { wrongPassword?: boolean } | undefined)?.wrongPassword) {
+      limiter.recordFailure(keys, Date.now(), weights);
+    }
+    throw err;
+  } finally {
+    gate.release();
+  }
+}
