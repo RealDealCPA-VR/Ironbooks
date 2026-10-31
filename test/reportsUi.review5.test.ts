@@ -9,6 +9,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
+import { expectAllPassed, runDomFile } from './domHarness';
 
 const get = vi.fn();
 vi.mock('@/lib/client', () => ({
@@ -106,17 +107,12 @@ describe('opening a memorized report', () => {
 // always asks first; they now do too.
 
 describe('row deletes ask first', () => {
-  it('Scheduled Reports: Delete opens a confirmation, the confirmation deletes', () => {
-    const src = fs.readFileSync('app/reports/schedules/page.tsx', 'utf8');
-    expect(src).not.toMatch(/onClick=\{\(\) => remove\(s\)\}/);
-    expect(src).toMatch(/onClick=\{\(\) => setRemoving\(s\)\}[^>]*aria-label=\{`Delete \$\{s\.name\}`\}/);
-    expect(src).toMatch(/<ConfirmDialog[\s\S]*?onConfirm=\{\(\) => removing && void remove\(removing\)\}/);
-  });
-
-  it('Payroll Setup > state taxes: Remove opens a confirmation, the confirmation removes', () => {
-    const src = fs.readFileSync('app/employees/setup/page.tsx', 'utf8');
-    expect(src).not.toMatch(/onClick=\{\(\) => remove\(r\.id\)\}/);
-    expect(src).toContain('onClick={() => setRemoving(r)}');
-    expect(src).toMatch(/<ConfirmDialog[\s\S]*?onConfirm=\{\(\) => removing && void remove\(removing\.id\)\}/);
-  });
+  // The real pages in a browser window (test/dom/rowDeletes.dom.tsx), against stubbed API answers:
+  // the DELETE requests the page sends are counted before, after Cancel and after confirming.
+  it('Scheduled Reports Delete and Payroll Setup > state taxes Remove: confirm first, then exactly one DELETE', async () => {
+    expectAllPassed(await runDomFile('test/dom/rowDeletes.dom.tsx'), [
+      'Scheduled Reports: Delete asks first; Cancel deletes nothing; confirming deletes once',
+      'Payroll Setup > State payroll taxes: Remove asks first; Cancel removes nothing; confirming removes once',
+    ]);
+  }, 180_000);
 });

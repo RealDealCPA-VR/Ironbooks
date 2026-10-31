@@ -8,7 +8,7 @@
  *    QuickBooks opens them on the last finished quarter / calendar year; so do these now.
  */
 import { afterAll, describe, expect, it } from 'vitest';
-import fs from 'node:fs';
+import { expectAllPassed, runDomFile } from '../test/domHarness';
 import { lastCompletedQuarter, lastCompletedYear } from './formPeriods';
 
 const originalTz = process.env.TZ;
@@ -34,11 +34,19 @@ describe('tax form periods', () => {
     expect(lastCompletedYear(new Date('2027-01-01T07:00:00.000Z'))).toBe(2025);
   });
 
-  it('the form pages open on these periods', () => {
-    const read = (f: string) => fs.readFileSync(f, 'utf8');
-    expect(read('app/payroll-forms/page.tsx')).toContain('useState(String(lastCompletedQuarter().quarter))');
-    expect(read('app/payroll-forms/reports/page.tsx')).toContain('useState(String(lastCompletedQuarter().quarter))');
-    expect(read('app/reports/1099/page.tsx')).toContain('useState(String(lastCompletedYear()))');
-    expect(read('app/reports/1099-efile/page.tsx')).toContain('useState(String(lastCompletedYear()))');
-  });
+  // The pages themselves, on fixed clocks in a browser window (test/dom/formPeriods.dom.tsx):
+  // October, the first hour of Q2, and either side of midnight on New Year's Eve, in a zone west
+  // and a zone east of UTC (so a UTC-calendar year or quarter would show).
+  for (const tz of ['America/Los_Angeles', 'Asia/Tokyo']) {
+    it(`the form pages open on these periods (${tz})`, async () => {
+      process.env.TZ = tz;
+      expectAllPassed(await runDomFile('test/dom/formPeriods.dom.tsx'), [
+        `the window runs in ${tz}, where a UTC year boundary falls inside these clocks`,
+        'Process Payroll Forms: 941 on the last finished quarter; W-2, 940 and W-3 on the last finished year',
+        'Payroll reports > State wage worksheet: the last finished quarter, and that is what it runs',
+        '1099 Worksheets: opens on, and loads, the last finished calendar year',
+        '1099 e-file: opens on, and loads, the last finished calendar year',
+      ]);
+    }, 180_000);
+  }
 });

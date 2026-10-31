@@ -17,6 +17,7 @@ import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import LoadFailed from '@/components/LoadFailed';
 import { pickShortcutButton, type ShortcutButton } from '@/lib/shortcuts';
+import { expectAllPassed, runDomFile } from './domHarness';
 
 const src = (f: string) => fs.readFileSync(f, 'utf8');
 
@@ -31,24 +32,17 @@ describe('LoadFailed', () => {
 });
 
 describe('pages show a failed load instead of loading for ever', () => {
-  it('Privacy & Network', () => {
-    const s = src('app/privacy/page.tsx');
-    expect(s).toMatch(/loadError \? <LoadFailed[^>]*onRetry=\{\(\) => void load\(\)\}/);
-    expect(s).toContain('else setLoadError(msg)');
-  });
-
-  it('Multi-user: no toast on every 30-second refresh; a failed first load offers Try again', () => {
-    const s = src('app/multi-user/page.tsx');
-    const load = s.slice(s.indexOf('const load = useCallback'), s.indexOf('const retry'));
-    expect(load).not.toContain('toast(');
-    expect(load).toContain('setLoadError(');
-    expect(s).toMatch(/loadError \? <LoadFailed/);
-  });
-
-  it('Users & Roles > Password rules', () => {
-    const s = src('app/users/PasswordPolicyEditor.tsx');
-    expect(s).toMatch(/loadError \? \(\s*<LoadFailed/);
-  });
+  // The real pages in a browser window (test/dom/loadFailed.dom.tsx): the first load answers 500,
+  // then Try again reaches a working server. Multi-user's 30-second refresh timer is caught and
+  // fired by the test, with the app's Toaster mounted to see any toast.
+  it('Privacy & Network, Multi-user and Password rules: "could not be loaded" + Try again; Multi-user refresh failures raise no toast', async () => {
+    expectAllPassed(await runDomFile('test/dom/loadFailed.dom.tsx'), [
+      'Privacy & Network: a failed first load offers Try again, which loads the page',
+      'Multi-user: a failed first load offers Try again, which loads the page',
+      'Multi-user: a failed 30-second refresh is noted once on the page, never as a toast',
+      'Users & Roles > Password rules: a failed load offers Try again, which loads the rules',
+    ]);
+  }, 180_000);
 });
 
 // ---------------------------------------------------------------------------
