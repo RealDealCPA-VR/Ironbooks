@@ -104,6 +104,12 @@ describe('preference catalogue', () => {
       'Spelling',
       'Time & Expenses',
       'Multiple Currencies',
+      // prefsperms A2: the categories that were missing.
+      'Calendar',
+      'Desktop View',
+      'Finance Charge',
+      'Integrated Applications',
+      'Search',
     ]) {
       expect(labels).toContain(l);
     }

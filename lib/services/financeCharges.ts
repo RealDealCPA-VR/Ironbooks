@@ -165,10 +165,12 @@ export async function updateFinanceChargeSettings(
       .where(eq(companies.id, tx.companyId));
     if (!row) throw notFound('Company');
 
+    // Only the financeCharges key changes, merged in SQL: never writes back a stale copy of the
+    // other settings (the companies.settings lost-update rule, prefsperms review 5 leftover).
     await tx.db
       .update(companies)
       .set({
-        settings: { ...(row.settings ?? {}), financeCharges: next },
+        settings: sql`coalesce(${companies.settings}, '{}'::jsonb) || jsonb_build_object('financeCharges', ${JSON.stringify(next)}::jsonb)`,
         updatedAt: new Date(),
       })
       .where(eq(companies.id, tx.companyId));
