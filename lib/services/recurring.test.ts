@@ -131,8 +131,9 @@ describe('Recurring templates service', () => {
       .where(eq(recurringTemplates.companyId, ctx.companyId));
 
     const nextRun = tpl.nextRunDate!;
-    const expectedNext = new Date(today);
-    expectedNext.setMonth(expectedNext.getMonth() + 1);
+    // One month on, kept inside next month: Oct 31 -> Nov 30, not Dec 1 (Date.setMonth overflows
+    // on the 29th-31st, which failed this test on month-end days).
+    const expectedNext = new Date(today.getFullYear(), today.getMonth() + 1, 1);
 
     // Allow same day (month boundary)
     expect(nextRun.getMonth()).toBe(expectedNext.getMonth());
