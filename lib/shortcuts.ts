@@ -301,6 +301,52 @@ export function adjustDateForKey(key: string, current?: string, today?: string):
   return format(next, 'yyyy-MM-dd');
 }
 
+/**
+ * A date typed the QuickBooks way, as yyyy-MM-dd (null when it is not a date):
+ *   "10/24" or "10-24"  -> October 24 of the current year
+ *   "1024"              -> October 24 of the current year
+ *   "24"                -> the 24th of the current month
+ *   "10/24/26"          -> 2026-10-24 (two-digit years are 20xx)
+ *   "10/24/2026", "102426", "10242026" and "2026-10-24" as written.
+ * "Current" follows the company's today (setDateKeyToday) unless `today` is given.
+ */
+export function parseTypedDate(text: string, today?: string): string | null {
+  const t = text.trim();
+  if (!t) return null;
+  const now = todayDate(today);
+  const iso = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(t);
+  let y: number;
+  let m: number;
+  let d: number;
+  if (iso) {
+    [y, m, d] = [Number(iso[1]), Number(iso[2]), Number(iso[3])];
+  } else {
+    const parts = t.split(/[/.\-\s]+/).filter(Boolean);
+    let nums: string[];
+    if (parts.length === 1 && /^\d+$/.test(parts[0])) {
+      const s = parts[0];
+      if (s.length <= 2) nums = [String(now.getMonth() + 1), s];
+      else if (s.length === 3 || s.length === 4) nums = [s.slice(0, s.length - 2), s.slice(-2)];
+      else if (s.length === 6 || s.length === 8) nums = [s.slice(0, 2), s.slice(2, 4), s.slice(4)];
+      else return null;
+    } else if (parts.length >= 2 && parts.length <= 3 && parts.every((p) => /^\d+$/.test(p))) {
+      nums = parts;
+    } else {
+      return null;
+    }
+    m = Number(nums[0]);
+    d = Number(nums[1]);
+    if (nums[2] === undefined) y = now.getFullYear();
+    else if (nums[2].length <= 2) y = 2000 + Number(nums[2]);
+    else if (nums[2].length === 4) y = Number(nums[2]);
+    else return null;
+  }
+  if (m < 1 || m > 12 || d < 1 || d > 31 || y < 1900 || y > 2999) return null;
+  const date = new Date(y, m - 1, d);
+  if (date.getMonth() !== m - 1 || date.getDate() !== d) return null; // Feb 30 and the like
+  return format(date, 'yyyy-MM-dd');
+}
+
 /** Alt+Down in a date field: open its calendar (QB "Open calendar to select a date"). */
 export function isCalendarKey(e: KeyLike): boolean {
   return e.key === 'ArrowDown' && e.altKey && !ctrlOrCmd(e) && !e.shiftKey;

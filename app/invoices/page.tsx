@@ -25,6 +25,7 @@ import {
   toast, toastError,
 } from '@/components/ui';
 import { Help } from '@/components/Help';
+import { NameField } from '@/components/NameField';
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { billableCostTotal, invoiceFormTotals, type LiveBillables } from '@/lib/invoiceLineMath';
@@ -382,6 +383,8 @@ interface InvoiceModalProps {
   editing: InvoiceDetail | null;
   onClose: () => void;
   customers: Customer[];
+  /** Quick Add put a new customer on the list. */
+  onCustomerAdded?: (c: Customer) => void;
   items: Item[];
   taxRates: TaxRate[];
   classes: ClassRow[];
@@ -399,6 +402,7 @@ function InvoiceModal({
   editing,
   onClose,
   customers,
+  onCustomerAdded,
   items,
   taxRates,
   classes,
@@ -408,6 +412,7 @@ function InvoiceModal({
   prefill = null,
   nav = null,
 }: InvoiceModalProps) {
+  const customerChoices = useMemo(() => customers.map((c) => ({ id: c.id, label: c.displayName })), [customers]);
   const [customerId, setCustomerId] = useState('');
   const [date, setDate] = useState(() => todayISO());
   const [dueDate, setDueDate] = useState('');
@@ -1152,19 +1157,18 @@ function InvoiceModal({
         {/* Customer */}
         <div>
           <Label htmlFor="inv-customer" required>Customer</Label>
-          <Select
+          <NameField
             id="inv-customer"
+            nameType="customer"
             value={customerId}
-            onChange={(e) => setCustomerId(e.target.value)}
+            choices={customerChoices}
+            onChange={setCustomerId}
+            onAdded={(n) => onCustomerAdded?.({ id: n.id, displayName: n.label })}
+            placeholder="Type a customer name…"
             autoFocus
             aria-required="true"
             {...fieldA11y('inv', 'customer', fieldErrors)}
-          >
-            <option value="">Select a customer…</option>
-            {customers.map((c) => (
-              <option key={c.id} value={c.id}>{c.displayName}</option>
-            ))}
-          </Select>
+          />
           <FieldError formId="inv" name="customer" errors={fieldErrors} />
           {recallText && <p className="mt-1 text-xs text-electric" role="status">{recallText}</p>}
         </div>
@@ -2109,6 +2113,7 @@ function InvoicesPageContent() {
         onClose={() => { setShowNew(false); setEditTarget(null); setPrefill(null); }}
         prefill={editTarget ? null : prefill}
         customers={customers}
+        onCustomerAdded={(c) => setCustomers((prev) => [...prev, c])}
         items={items}
         taxRates={taxRates}
         classes={classes}

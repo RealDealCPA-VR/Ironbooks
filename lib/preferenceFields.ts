@@ -78,7 +78,8 @@ export const FIELD_META: Record<string, FieldMeta> = {
   defaultDate: { label: 'Default date for new transactions', help: '"The last date I entered" uses the date you last saved on the same kind of form (a check, an invoice, ...) since you opened the app.', type: 'select', options: [['today', "Today's date"], ['last', 'The last date I entered']] },
   autoRecallLastTransaction: { label: 'Recall the last transaction for a name', help: 'When you pick a name on a new bill, check, expense, card charge, invoice, sales receipt, estimate or sales order, the lines, terms, class, sales rep, tax and memo from the last one for that name are filled in.', type: 'bool' },
   showHomeWorkflow: { label: 'Show the home workflow on the dashboard', type: 'bool' },
-  navMode: { label: 'Menu style', help: 'Simple shows only everyday tasks. Advanced shows every screen. You can also switch at the top of the menu.', type: 'select', options: [['simple', 'Simple (everyday tasks)'], ['advanced', 'Advanced (every screen)']] },
+  navMode: { label: 'Menu style', help: 'Advanced shows every screen, as QuickBooks does. Simple shows only everyday tasks. You can also switch at the top of the menu.', type: 'select', options: [['advanced', 'Advanced (every screen)'], ['simple', 'Simple (everyday tasks)']] },
+  density: { label: 'Screen density', help: 'Compact fits more rows in lists, registers and forms, closer to QuickBooks Desktop.', type: 'select', options: [['comfortable', 'Comfortable'], ['compact', 'Compact']] },
   // Jobs & Estimates
   estimatesEnabled: { label: 'Use estimates', type: 'bool' },
   progressInvoicingEnabled: { label: 'Use progress invoicing', help: 'Invoice part of an estimate at a time.', type: 'bool', dependsOn: 'estimatesEnabled' },

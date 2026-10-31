@@ -44,6 +44,7 @@ import {
 } from '@/components/ui';
 import { Help } from '@/components/Help';
 import { TypeaheadSelect } from '@/components/TypeaheadSelect';
+import { NameField } from '@/components/NameField';
 import type { TypeaheadChoice } from '@/lib/typeahead';
 import { api } from '@/lib/client';
 import { todayISO } from '@/lib/dates';
@@ -323,6 +324,13 @@ function ExpensesPageContent() {
 
   const isCC = entryType === 'cc_charge' || entryType === 'cc_credit';
   const paymentAccounts = accounts.filter((a) => (isCC ? isCreditCard(a) : isBankish(a)));
+  const paymentAccountChoices = paymentAccounts.map((a) => ({ id: a.id, label: a.code ? `${a.code} – ${a.name}` : a.name, terms: [a.name, a.code ?? ''].filter(Boolean) }));
+  // Pay to the Order of: vendors, Other Names, and the one-time payee typed on this check.
+  const payeeChoices = [
+    ...vendors.map((v) => ({ id: v.id, label: v.displayName, hint: 'Vendor' })),
+    ...payeeOtherNames.map((o) => ({ id: `${OTHER_NAME_PREFIX}${o.id}`, label: o.label, hint: 'Other Name' })),
+    ...(payeeSel === OTHER_PAYEE && payeeName.trim() ? [{ id: OTHER_PAYEE, label: payeeName.trim(), hint: 'This check only' }] : []),
+  ];
   const lineAccounts = accounts.filter((a) => a.id !== paymentAccountId);
 
   // ── data loading ──────────────────────────────────────────────────────────
@@ -847,11 +855,13 @@ function ExpensesPageContent() {
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div>
             <Label htmlFor="exp-payee" required>Pay to the Order of</Label>
-            <Select
+            <NameField
               id="exp-payee"
+              nameType="vendor"
+              types={['vendor', 'other']}
               value={payeeSel}
-              onChange={(e) => {
-                const v = e.target.value;
+              choices={payeeChoices}
+              onChange={(v) => {
                 setPayeeSel(v);
                 if (v && v !== OTHER_PAYEE && !v.startsWith(OTHER_NAME_PREFIX)) prefillFor({ vendorId: v });
                 else if (v.startsWith(OTHER_NAME_PREFIX)) {
@@ -859,42 +869,26 @@ function ExpensesPageContent() {
                   if (o && o.isActive !== false) prefillFor({ payee: o.name });
                 }
               }}
+              onAdded={(n) => {
+                if (n.type === 'other') {
+                  setOtherNames((prev) => [...prev, { id: n.id, name: n.label, isActive: true }]);
+                  return `${OTHER_NAME_PREFIX}${n.id}`;
+                }
+                setVendors((prev) => [...prev, { id: n.id, displayName: n.label }]);
+                return n.id;
+              }}
+              onUseOnce={(text) => {
+                setPayeeName(text);
+                setPayeeSel(OTHER_PAYEE);
+                prefillFor({ payee: text });
+              }}
+              placeholder="Type a payee name…"
               aria-required="true"
               {...fieldA11y('exp', 'payee', fieldErrors)}
-            >
-              <option value="">Select payee…</option>
-              <optgroup label="Vendors">
-                {vendors.map((v) => (
-                  <option key={v.id} value={v.id}>
-                    {v.displayName}
-                  </option>
-                ))}
-              </optgroup>
-              {payeeOtherNames.length > 0 && (
-                <optgroup label="Other Names">
-                  {payeeOtherNames.map((o) => (
-                    <option key={o.id} value={`${OTHER_NAME_PREFIX}${o.id}`}>
-                      {o.label}
-                    </option>
-                  ))}
-                </optgroup>
-              )}
-              <option value={OTHER_PAYEE}>Someone else (type a name)…</option>
-            </Select>
+            />
             <p className="mt-1 text-xs text-navy/50">
-              Paying someone who is not a vendor? Add them to the{' '}
-              <Link href="/lists?list=other-names" className="text-electric hover:underline">Other Names list</Link>.
+              Type a name and press Tab. A name that is not on a list can be added, or used just this once.
             </p>
-            {payeeSel === OTHER_PAYEE && (
-              <Input
-                className="mt-2"
-                placeholder="Payee name"
-                value={payeeName}
-                onChange={(e) => setPayeeName(e.target.value)}
-                onBlur={() => payeeName.trim() && prefillFor({ payee: payeeName })}
-                aria-label="Payee name"
-              />
-            )}
             <FieldError formId="exp" name="payee" errors={fieldErrors} />
             {prefillNote && <p className="mt-1 text-xs text-electric">{prefillNote}</p>}
           </div>
@@ -903,20 +897,15 @@ function ExpensesPageContent() {
             <Label htmlFor="exp-account" required>
               {isCC ? 'Credit Card Account' : 'Bank Account'} <Help term="reconcile" side="bottom" />
             </Label>
-            <Select
+            <TypeaheadSelect
               id="exp-account"
               value={paymentAccountId}
-              onChange={(e) => setPaymentAccountId(e.target.value)}
+              choices={paymentAccountChoices}
+              onChange={setPaymentAccountId}
+              placeholder="Type an account name or number…"
               aria-required="true"
               {...fieldA11y('exp', 'account', fieldErrors)}
-            >
-              <option value="">Select account…</option>
-              {paymentAccounts.map((a) => (
-                <option key={a.id} value={a.id}>
-                  {a.code} – {a.name}
-                </option>
-              ))}
-            </Select>
+            />
             <FieldError formId="exp" name="account" errors={fieldErrors} />
             {isCC && paymentAccounts.length === 0 && (
               <p className="mt-1 text-xs text-navy/40">

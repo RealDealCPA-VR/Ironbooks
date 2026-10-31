@@ -51,6 +51,7 @@ export const myPreferencesSchema = z
     startWithPayee: z.boolean(),
     showHomeWorkflow: z.boolean(),
     navMode: z.enum(['simple', 'advanced']),
+    density: z.enum(['comfortable', 'compact']),
     // The Favorites menu: in-app page paths, in order.
     favorites: z
       .array(z.string().refine(isFavoritePath, 'must be a page of the app, like /invoices'))

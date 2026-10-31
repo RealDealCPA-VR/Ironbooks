@@ -69,6 +69,11 @@ export default function PreferenceBehaviors() {
   const ref = React.useRef(prefs);
   ref.current = prefs;
 
+  // ---- My Preferences > General > Screen density (app/globals.css html[data-density]) ----
+  React.useEffect(() => {
+    document.documentElement.setAttribute('data-density', prefs.my.density);
+  }, [prefs.my.density]);
+
   // ---- save-time prompts + after-save effects (API client write hooks) ----
   React.useEffect(() => {
     setWriteHooks({

@@ -10,4 +10,8 @@ describe('QuickBooks keys in the browser', () => {
   it('fields and forms: date keys, form numbers, Esc / Enter, line copy, Tab order', async () => {
     expectAllPassed(await runDomFile('test/dom/keyboardForms.dom.tsx'));
   }, 180_000);
+
+  it('partial dates and name fields with Quick Add', async () => {
+    expectAllPassed(await runDomFile('test/dom/nameFieldDates.dom.tsx'));
+  }, 180_000);
 });

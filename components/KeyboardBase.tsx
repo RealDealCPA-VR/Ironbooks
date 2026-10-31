@@ -13,6 +13,10 @@
  *    browser's date box would otherwise stop on its month, day, year and calendar button first
  *    (four Tabs per date on every form). Typing a date still fills it in, and Left / Right move
  *    between its parts;
+ *  - a date typed in part, as in QuickBooks: "10/24" (or "1024") then Tab, Enter or a click
+ *    elsewhere fills in the current year; "24" alone is the 24th of this month
+ *    (lib/shortcuts.ts parseTypedDate). The browser's date box would otherwise leave the field
+ *    empty until the year is typed too;
  *  - Ctrl+Z undoes a change the QuickBooks keys made (a date key, + / - on a number, QuickMath,
  *    a pasted line), which the field's own undo does not know about, and undoes typing in a date
  *    field (which has no undo of its own); typing elsewhere keeps the field's own undo;
@@ -25,7 +29,7 @@
  *    leave-this-form check instead of leaving at once.
  */
 import * as React from 'react';
-import { adjustDateForKey, historyGuarded, isCalendarKey } from '@/lib/shortcuts';
+import { adjustDateForKey, historyGuarded, isCalendarKey, parseTypedDate } from '@/lib/shortcuts';
 import { nextTabStop, qbTabStop } from '@/lib/keyboardTargets';
 
 /** The browser keys (Ctrl + letter) the app takes away from the browser when it has no use for them. */
@@ -38,6 +42,23 @@ const lastValue = new WeakMap<HTMLElement, string>();
 /** Fields whose latest change came from a QuickBooks key (an untrusted input event). */
 const keyChanged = new WeakSet<HTMLElement>();
 let restoring = false;
+
+/** What was typed into each date field since it got the focus (digits and separators). */
+const typedDate = new WeakMap<HTMLInputElement, string>();
+
+/**
+ * A date field left with only part of a date typed (the browser holds no value yet): fill in the
+ * rest the QuickBooks way. True when it did.
+ */
+export function completeTypedDate(el: HTMLInputElement): boolean {
+  const typed = typedDate.get(el);
+  typedDate.delete(el);
+  if (!typed || el.value || !el.validity.badInput || el.readOnly || el.disabled) return false;
+  const iso = parseTypedDate(typed);
+  if (!iso) return false;
+  setValue(el, iso);
+  return true;
+}
 
 type ValueField = HTMLInputElement | HTMLTextAreaElement;
 
@@ -95,10 +116,14 @@ export default function KeyboardBase() {
     function onFocusIn(e: FocusEvent) {
       if (e.target === current) return;
       current = e.target;
+      if (e.target instanceof HTMLInputElement && e.target.type === 'date') typedDate.delete(e.target);
       if (isValueField(e.target)) lastValue.set(e.target, e.target.value);
     }
     function onFocusOut(e: FocusEvent) {
-      if (e.target === current && e.relatedTarget !== e.target) current = null;
+      if (e.target === current && e.relatedTarget !== e.target) {
+        current = null;
+        if (e.target instanceof HTMLInputElement && e.target.type === 'date') completeTypedDate(e.target);
+      }
     }
 
     function onInput(e: Event) {
@@ -120,6 +145,17 @@ export default function KeyboardBase() {
       if (e.isComposing) return;
       const target = e.target as HTMLElement | null;
       const ctrl = e.ctrlKey || e.metaKey;
+
+      // ---- a date typed in part: remember it; Tab / Enter fill in the rest first ----
+      if (target instanceof HTMLInputElement && target.type === 'date' && !ctrl && !e.altKey) {
+        if (/^[0-9/.\-]$/.test(e.key) && !e.defaultPrevented) {
+          typedDate.set(target, (typedDate.get(target) ?? '') + e.key);
+        } else if (e.key === 'Tab' || e.key === 'Enter') {
+          completeTypedDate(target);
+        } else if (e.key === 'Backspace' || e.key === 'Delete' || e.key.startsWith('Arrow') || e.key.length === 1) {
+          typedDate.delete(target);
+        }
+      }
 
       // ---- Tab: QuickBooks' order on transaction forms; one Tab stop per date field ----
       if (e.key === 'Tab' && !ctrl && !e.altKey && !e.defaultPrevented && target instanceof HTMLElement && target !== document.body) {

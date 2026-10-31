@@ -26,6 +26,7 @@ import {
 } from '@/components/ui';
 import { Help } from '@/components/Help';
 import { TypeaheadSelect } from '@/components/TypeaheadSelect';
+import { NameField } from '@/components/NameField';
 import type { TypeaheadChoice } from '@/lib/typeahead';
 import { api } from '@/lib/client';
 import { todayISO } from '@/lib/dates';
@@ -253,6 +254,7 @@ function lineAmount(line: LineRow): number {
 export default function BillsPage() {
   const [bills, setBills] = useState<Bill[]>([]);
   const [vendors, setVendors] = useState<Vendor[]>([]);
+  const vendorChoices = useMemo(() => vendors.map((v) => ({ id: v.id, label: v.displayName })), [vendors]);
   const prefs = usePreferences();
   // Smart defaults: recall the vendor's last bill, default date (lib/useSmartDefaults.ts).
   const smart = useSmartDefaults('bill');
@@ -931,21 +933,20 @@ export default function BillsPage() {
           {/* Vendor */}
           <div>
             <Label htmlFor="bill-vendor" required>Vendor <Help term="ap" /></Label>
-            <Select
+            <NameField
               id="bill-vendor"
+              nameType="vendor"
               autoFocus
               value={vendorId}
-              onChange={(e) => handleVendorChange(e.target.value)}
+              choices={vendorChoices}
+              onChange={(id) => void handleVendorChange(id)}
+              onAdded={(n) => {
+                setVendors((prev) => [...prev, { id: n.id, displayName: n.label }]);
+              }}
+              placeholder="Type a vendor name…"
               aria-required="true"
               {...fieldA11y('bill', 'vendor', fieldErrors)}
-            >
-              <option value="">Select vendor…</option>
-              {vendors.map((v) => (
-                <option key={v.id} value={v.id}>
-                  {v.displayName}
-                </option>
-              ))}
-            </Select>
+            />
             <FieldError formId="bill" name="vendor" errors={fieldErrors} />
             {prefillNote && <p className="mt-1 text-xs text-electric">{prefillNote}</p>}
           </div>
