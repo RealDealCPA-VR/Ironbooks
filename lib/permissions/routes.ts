@@ -655,6 +655,8 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/sandbox/discard': kind('member', 'POST'),
   '/api/sandbox/keep': kind('member', 'POST'),
   '/api/sandbox/leftovers/[id]': r('file_utilities', 'POST:create DELETE'),
+  // feature round (accountant): System Accounts by role (choosing one is a company setting).
+  '/api/account-roles': { ...r('accounting', 'GET'), ...r('company', 'PATCH:modify') },
 };
 
 const ANY_REPORT: Area[] = [
@@ -817,6 +819,7 @@ export const PAGE_AREAS: Record<string, Area | Area[]> = {
   '/reports/schedules': 'file_utilities',
   '/find': 'reports_financial',
   '/sandbox': 'file_utilities', // Try it on a copy
+  '/system-accounts': 'accounting', // feature round (accountant): Company > System Accounts
 };
 
 // ---------------------------------------------------------------------------
