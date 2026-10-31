@@ -41,6 +41,7 @@ import {
   resolveMyPreferences,
 } from '@/lib/preferences';
 import { isRestorablePath, startPageTarget } from '@/lib/startPage';
+import { calendarLayout, initialCalendarView, shiftAnchor, splitUpcomingPastDue, upcomingPastDueRange } from '@/lib/calendarView';
 import { myPreferencesSchema } from '@/lib/validation/prefs';
 import { POST as portalLogin } from '@/app/api/portal/login/route';
 import { UploadTokenError, createUploadToken, uploadLinkStatus } from './receipts';
@@ -263,5 +264,50 @@ describe('A2: Desktop View, Search and Calendar settings', () => {
     expect(myPreferencesSchema.safeParse({ calendarView: 'week', calendarWeek: 'mon_fri', calendarPastDueDays: 10 }).success).toBe(true);
     expect(myPreferencesSchema.safeParse({ calendarPastDueDays: 1.5 }).success).toBe(false);
     expect(myPreferencesSchema.safeParse({ searchDefault: 'web' }).success).toBe(false);
+  });
+});
+
+describe('A2: Calendar preferences shape the calendar', () => {
+  it('opens in the chosen view, or the one used last', () => {
+    expect(initialCalendarView('week', 'day')).toBe('week');
+    expect(initialCalendarView('last', 'day')).toBe('day');
+    expect(initialCalendarView('last', null)).toBe('month');
+  });
+
+  it('weekly view: Sunday-Saturday, Monday-Sunday, Monday-Friday or the work week', () => {
+    // 2026-10-29 is a Thursday.
+    expect(calendarLayout('week', '2026-10-29', 'sun_sat', 'monday').days).toEqual([
+      '2026-10-25', '2026-10-26', '2026-10-27', '2026-10-28', '2026-10-29', '2026-10-30', '2026-10-31',
+    ]);
+    const monFri = calendarLayout('week', '2026-10-29', 'mon_fri', 'sunday');
+    expect(monFri.days).toEqual(['2026-10-26', '2026-10-27', '2026-10-28', '2026-10-29', '2026-10-30']);
+    expect(monFri.headings).toEqual(['Mon', 'Tue', 'Wed', 'Thu', 'Fri']);
+    expect(calendarLayout('week', '2026-10-29', 'company', 'sunday').days[0]).toBe('2026-10-25');
+    expect(calendarLayout('week', '2026-10-29', 'company', 'monday').days[0]).toBe('2026-10-26');
+  });
+
+  it('month grid starts on the chosen weekday; day view is one day; arrows move by the view', () => {
+    const m = calendarLayout('month', '2026-10-15', 'sun_sat', 'monday');
+    expect(m.days).toHaveLength(42);
+    expect(m.days[0]).toBe('2026-09-27'); // the Sunday before Oct 1 (a Thursday)
+    expect(m.headings[0]).toBe('Sun');
+    expect(calendarLayout('month', '2026-10-15', 'mon_sun', 'sunday').days[0]).toBe('2026-09-28');
+    expect(calendarLayout('day', '2026-10-15', 'company', 'monday').days).toEqual(['2026-10-15']);
+    expect(shiftAnchor('month', '2026-01-31', 1)).toBe('2026-02-01');
+    expect(shiftAnchor('week', '2026-10-29', -1)).toBe('2026-10-22');
+    expect(shiftAnchor('day', '2026-12-31', 1)).toBe('2027-01-01');
+  });
+
+  it('Upcoming & Past Due covers the chosen window, past due first, open items only', () => {
+    expect(upcomingPastDueRange('2026-10-29', 30, 7)).toEqual({ from: '2026-09-29', to: '2026-11-05' });
+    const split = splitUpcomingPastDue(
+      [
+        { date: '2026-11-01', events: [{ type: 'due', id: 'b' }, { type: 'entered', id: 'x' }] },
+        { date: '2026-10-01', events: [{ type: 'due', id: 'a' }, { type: 'due', id: 'paid', done: true }] },
+      ],
+      '2026-10-29',
+    );
+    expect(split.pastDue.map((e) => e.id)).toEqual(['a']);
+    expect(split.upcoming.map((e) => e.id)).toEqual(['b']);
   });
 });
