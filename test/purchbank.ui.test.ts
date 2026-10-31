@@ -43,3 +43,14 @@ describe('date defaults are worked out when a form opens', () => {
     expect(OWNED.flatMap(files).flatMap(moduleLevelToday)).toEqual([]);
   });
 });
+
+describe('Enter Bills: the due date follows the bill date and terms (D5)', () => {
+  it('changing the bill date works the due date out again unless one was typed', () => {
+    const src = fs.readFileSync('app/bills/page.tsx', 'utf8');
+    const handler = src.slice(src.indexOf('function handleDateChange'), src.indexOf('function handleTermsChange'));
+    expect(handler).toContain('if (dueTyped.current || !value) return;');
+    expect(handler).toContain('fetchDueDateForTerms(value, ref)');
+    expect(src).toContain('onChange={(e) => handleDateChange(e.target.value)}');
+    expect(src).toContain('dueTyped.current = Boolean(e.target.value);');
+  });
+});

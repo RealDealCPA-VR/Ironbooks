@@ -288,6 +288,8 @@ export default function BillsPage() {
   const [lines, setLines] = useState<LineRow[]>([emptyLine()]);
   /** The vendor the form currently shows (guards late recall responses). */
   const vendorRef = useRef('');
+  // D5: the due date follows the bill date and terms until the user types one (QB Enter Bills).
+  const dueTyped = useRef(false);
   /** Shown under the vendor picker after accounts were pre-filled (QB vendor pre-fill). */
   const [prefillNote, setPrefillNote] = useState('');
 
@@ -385,6 +387,7 @@ export default function BillsPage() {
   // ---------------------------------------------------------------------------
 
   function openModal() {
+    dueTyped.current = false;
     fixer.clear();
     setShowErrors(false);
     setEditingId(null);
@@ -408,9 +411,21 @@ export default function BillsPage() {
    * Vendor picked on a NEW bill whose lines are still blank: pre-fill the expense accounts
    * (vendor default → last bill/check → learned categorizer). Never overwrites typed lines.
    */
+  /** Bill date changed: a due date worked out from the terms moves with it (a typed one stays). */
+  function handleDateChange(value: string) {
+    setDate(value);
+    if (dueTyped.current || !value) return;
+    const vendor = vendors.find((v) => v.id === vendorId);
+    const ref = terms || vendor?.terms || prefs.company.defaultVendorTerms;
+    void fetchDueDateForTerms(value, ref).then((due) => {
+      if (due && !dueTyped.current) setDueDate(due);
+    });
+  }
+
   /** Terms picked: the due date follows them (Terms list, Standard or Date-Driven). */
   function handleTermsChange(value: string) {
     setTerms(value);
+    dueTyped.current = false;
     const vendor = vendors.find((v) => v.id === vendorId);
     const ref = value || vendor?.terms || prefs.company.defaultVendorTerms;
     void fetchDueDateForTerms(date, ref).then((due) => {
@@ -484,6 +499,7 @@ export default function BillsPage() {
       setBillNumber(detail.billNumber ?? '');
       setDate(detail.date.slice(0, 10));
       setDueDate(detail.dueDate ? detail.dueDate.slice(0, 10) : '');
+      dueTyped.current = Boolean(detail.dueDate);
       setTerms(detail.terms ?? '');
       setMemo(detail.memo ?? '');
       setClassId(detail.classId ?? '');
@@ -966,7 +982,7 @@ export default function BillsPage() {
               <DateInput
                 id="bill-date"
                 value={date}
-                onChange={(e) => setDate(e.target.value)}
+                onChange={(e) => handleDateChange(e.target.value)}
                 aria-required="true"
                 {...fieldA11y('bill', 'date', fieldErrors)}
               />
@@ -992,7 +1008,10 @@ export default function BillsPage() {
               <DateInput
                 id="bill-due"
                 value={dueDate}
-                onChange={(e) => setDueDate(e.target.value)}
+                onChange={(e) => {
+                  dueTyped.current = Boolean(e.target.value);
+                  setDueDate(e.target.value);
+                }}
                 {...fieldA11y('bill', 'due', fieldErrors)}
               />
               <FieldError formId="bill" name="due" errors={fieldErrors} />

@@ -288,11 +288,27 @@ export async function billTermsFor(
   ctx: ServiceContext,
   input: { terms?: string | null; dueDate?: Date | null; date: Date },
   vendor: { terms: string | null; termsId: string | null },
+  /** Edits: the bill's saved terms. Its label sent back unchanged keeps the entry it was entered with. */
+  existing?: { terms: string | null; termsId: string | null } | null,
 ): Promise<{ terms: string | null; termsId: string | null; dueDate: Date | null }> {
   const typed = input.terms?.trim() || null;
   let row: TermsRow | null = null;
   let label: string | null = null;
-  if (typed) {
+  const keptEntry =
+    typed && existing?.termsId && existing.terms && existing.terms.trim().toLowerCase() === typed.toLowerCase()
+      ? (
+          await ctx.db
+            .select()
+            .from(paymentTerms)
+            .where(and(eq(paymentTerms.companyId, ctx.companyId), eq(paymentTerms.id, existing.termsId)))
+        )[0]
+      : undefined;
+  if (keptEntry) {
+    // The bill's own entry, renamed since (the form sends the label the bill was saved with): it
+    // keeps giving the due date and the Pay Bills discount, under its current name.
+    row = keptEntry;
+    label = termsLabel(keptEntry);
+  } else if (typed) {
     row = await findTermsRef(ctx, typed);
     label = row && row.id === typed ? termsLabel(row) : typed.slice(0, 50);
   } else if (vendor.termsId) {
@@ -318,7 +334,7 @@ export async function billTermsFor(
 async function prepareBill(
   ctx: ServiceContext,
   input: CreateBillInput,
-  opts: { keepLineAccountIds?: ReadonlySet<string> } = {},
+  opts: { keepLineAccountIds?: ReadonlySet<string>; existingTerms?: { terms: string | null; termsId: string | null } } = {},
 ): Promise<PreparedBill> {
   // --- Validate vendor belongs to this company ---
   const [vendorRow] = await ctx.db
@@ -342,7 +358,7 @@ async function prepareBill(
   });
 
   // --- Terms + due date (explicit due date wins; D5: the Terms list decides) ---
-  const { terms, termsId, dueDate } = await billTermsFor(ctx, input, vendorRow);
+  const { terms, termsId, dueDate } = await billTermsFor(ctx, input, vendorRow, opts.existingTerms);
 
   // --- Validate lines ---
   if (!input.lines || input.lines.length === 0) {
@@ -1153,7 +1169,7 @@ async function receiptBillHeaderEdit(
     .from(vendors)
     .where(and(eq(vendors.id, input.vendorId), eq(vendors.companyId, ctx.companyId)));
   if (!vendorRow) throw notFound('Vendor');
-  const t = await billTermsFor(ctx, input, vendorRow);
+  const t = await billTermsFor(ctx, input, vendorRow, bill);
   return {
     ...t,
     resolvedLines: input.lines.map((l, i) => ({
@@ -1264,7 +1280,7 @@ export async function updateBill(ctx: ServiceContext, id: string, input: CreateB
   {
     // An input the full edit would refuse anyway falls through to it, so its own checks give the
     // usual message.
-    const neutralPrep = await prepareBill(ctx, input, { keepLineAccountIds }).catch(() => null);
+    const neutralPrep = await prepareBill(ctx, input, { keepLineAccountIds, existingTerms: existing }).catch(() => null);
     if (neutralPrep) keepSavedAccountLineQuantities(input, neutralPrep, savedLines);
     if (neutralPrep && (await isLedgerNeutralBillEdit(ctx, existing, input, neutralPrep))) {
       return inTransaction(ctx, async (tx) => {
@@ -1320,7 +1336,7 @@ export async function updateBill(ctx: ServiceContext, id: string, input: CreateB
   }
 
   // Validate + resolve the new document (read-only).
-  const prep = await prepareBill(ctx, input, { keepLineAccountIds });
+  const prep = await prepareBill(ctx, input, { keepLineAccountIds, existingTerms: existing });
 
   return inTransaction(ctx, async (tx) => {
     // Duplicate vendor-reference check in the same transaction as the save (see createBill).
