@@ -128,59 +128,46 @@ export async function runReport(
     conds.push(inArray(journalEntryLines.accountId, accountIds));
   }
 
-  // Pull all matching lines with account metadata
-  const rawRows = await ctx.db
+  // Totals per group, added up by the database (review-5: the builder read every matching ledger
+  // line into memory and added them up in JS — on a large file that was the whole ledger).
+  const groupBy: GroupBy = config.groupBy ?? 'month';
+  const keyExpr =
+    groupBy === 'account'
+      ? sql<string>`${journalEntryLines.accountId}::text`
+      : groupBy === 'type'
+        ? sql<string>`${accounts.type}::text`
+        : sql<string>`to_char(${journalEntries.date}, 'YYYY-MM')`;
+  const grouped = await ctx.db
     .select({
-      accountId: journalEntryLines.accountId,
-      accountCode: accounts.code,
-      accountName: accounts.name,
-      accountType: accounts.type,
-      entryDate: journalEntries.date,
-      debit: journalEntryLines.debit,
-      credit: journalEntryLines.credit,
+      key: keyExpr,
+      accountCode: sql<string>`MIN(${accounts.code})`,
+      accountName: sql<string>`MIN(${accounts.name})`,
+      debit: sql<string>`COALESCE(SUM(${journalEntryLines.debit}), 0)`,
+      credit: sql<string>`COALESCE(SUM(${journalEntryLines.credit}), 0)`,
     })
     .from(journalEntryLines)
     .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
     .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
-    .where(and(...conds));
+    .where(and(...conds))
+    .groupBy(keyExpr);
 
-  // Aggregate into groups
   type GroupAccum = { label: string; debit: ReturnType<typeof Money.zero>; credit: ReturnType<typeof Money.zero> };
   const groups = new Map<string, GroupAccum>();
-
-  function ensureGroup(key: string, label: string): GroupAccum {
-    if (!groups.has(key)) {
-      groups.set(key, { label, debit: Money.zero(), credit: Money.zero() });
-    }
-    return groups.get(key)!;
-  }
-
-  for (const row of rawRows) {
-    let key: string;
+  for (const row of grouped) {
+    const key = String(row.key);
     let label: string;
-
-    if (config.groupBy === 'account') {
-      key = row.accountId;
+    if (groupBy === 'account') {
       label = `${row.accountCode} — ${row.accountName}`;
-    } else if (config.groupBy === 'type') {
-      key = row.accountType;
-      label = row.accountType.charAt(0).toUpperCase() + row.accountType.slice(1);
+    } else if (groupBy === 'type') {
+      label = key.charAt(0).toUpperCase() + key.slice(1);
     } else {
-      // 'month'
-      const d = new Date(row.entryDate);
-      const yyyy = d.getUTCFullYear();
-      const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
-      key = `${yyyy}-${mm}`;
-      label = new Date(`${yyyy}-${mm}-01`).toLocaleDateString('en-US', {
+      label = new Date(`${key}-01T00:00:00.000Z`).toLocaleDateString('en-US', {
         year: 'numeric',
         month: 'long',
         timeZone: 'UTC',
       });
     }
-
-    const g = ensureGroup(key, label);
-    g.debit = g.debit.plus(Money.of(row.debit));
-    g.credit = g.credit.plus(Money.of(row.credit));
+    groups.set(key, { label, debit: Money.of(String(row.debit)), credit: Money.of(String(row.credit)) });
   }
 
   // Build output rows, sorted by key
