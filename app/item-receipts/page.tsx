@@ -36,6 +36,7 @@ import {
   useGridKeys,
 } from '@/components/ui';
 import { api } from '@/lib/client';
+import { saveWithDuplicateCheck } from '@/lib/purchasesClient';
 import { todayISO } from '@/lib/dates';
 import {
   BarcodeScanInput,
@@ -641,12 +642,17 @@ function ConvertModal({ receipt, vendorName, onClose, onConverted }: ConvertModa
     if (!receipt) return;
     setConverting(true);
     try {
-      await api.post(`/api/item-receipts/${receipt.id}`, {
-        action: 'convert',
-        billNumber: billNumber || undefined,
-        date: date || undefined,
-        dueDate: dueDate || undefined,
-      });
+      // QB: "This vendor already has a bill with reference number …" asks before keeping it.
+      const saved = await saveWithDuplicateCheck((allowDuplicateNumber) =>
+        api.post(`/api/item-receipts/${receipt.id}`, {
+          action: 'convert',
+          billNumber: billNumber || undefined,
+          date: date || undefined,
+          dueDate: dueDate || undefined,
+          allowDuplicateNumber,
+        }),
+      );
+      if (saved === null) return;
       toast('Bill created — accrual moved to Accounts Payable.', 'success');
       onConverted();
       onClose();

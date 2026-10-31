@@ -13,6 +13,21 @@ export const purchaseOrderLineSchema = z.object({
   description: z.string().nullish(),
   quantity: zDecimal,
   rate: zDecimal,
+  // purchbank: QB Customer:Job and Class columns (carried onto the bill)
+  customerId: zUuid.nullish(),
+  jobId: zUuid.nullish(),
+  classId: zUuid.nullish(),
+});
+
+/** purchbank: P.O. Ship To address (each line at most 255 characters). */
+export const poShipToSchema = z.object({
+  name: z.string().max(255).nullish(),
+  line1: z.string().max(255).nullish(),
+  line2: z.string().max(255).nullish(),
+  city: z.string().max(255).nullish(),
+  state: z.string().max(255).nullish(),
+  zip: z.string().max(255).nullish(),
+  country: z.string().max(255).nullish(),
 });
 
 export const createPurchaseOrderSchema = z.object({
@@ -24,6 +39,10 @@ export const createPurchaseOrderSchema = z.object({
   expectedDate: zDate.nullish(),
   memo: z.string().nullish(),
   lines: zLines(purchaseOrderLineSchema),
+  /** purchbank: typed Ship To (null = the company address; omitted on an edit = kept). */
+  shipTo: poShipToSchema.nullish(),
+  /** purchbank: drop ship to this customer (their shipping address when none is typed). */
+  shipToCustomerId: zUuid.nullish(),
 });
 export type CreatePurchaseOrderBody = z.infer<typeof createPurchaseOrderSchema>;
 
@@ -46,6 +65,8 @@ export const purchaseOrderActionSchema = z.discriminatedUnion('action', [
     lines: zLines(poBillLineSchema).optional(),
     date: zDate.optional(),
     billNumber: z.string().nullish(),
+    /** The user confirmed QB's "this vendor already has a bill with that reference number" warning. */
+    allowDuplicateNumber: z.boolean().optional(),
   }),
   z.object({ action: z.literal('void') }),
   z.object({ action: z.literal('close') }),
