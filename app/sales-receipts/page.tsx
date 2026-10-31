@@ -67,6 +67,29 @@ import { previewSalesTotals } from '@/lib/salesLineMath';
 import { usePrefill } from '@/lib/commands/usePrefill';
 import type { FormPrefill } from '@/lib/commands/prefill';
 import { TransactionNav, useAdjacentTransactions } from '@/components/TransactionNav';
+// salesar (B7 / B8 / B9): Payment Method list, Customer Message and the per-line Sales Tax Code.
+import {
+  CustomerMessageField,
+  LineTaxCodeCell,
+  PaymentMethodField,
+  customerTaxStatus,
+  useCustomerMessages,
+  usePaymentMethods,
+  useSalesTaxCodes,
+} from '@/components/sales/FormLists';
+import {
+  type CustomerTaxStatus,
+  type TaxCodeEntry,
+  customerMessagePayload,
+  defaultPaymentMethodValue,
+  filledLineTaxCode,
+  itemLineTaxCode,
+  lineTaxPayload,
+  paymentMethodDisplay,
+  paymentMethodPayload,
+  paymentMethodValue,
+  withShownTaxable,
+} from '@/lib/salesFormListsClient';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -82,6 +105,9 @@ interface Item {
   name: string;
   type: string;
   salesPrice: string | null;
+  taxable?: boolean;
+  /** salesar (B9): the item's Sales Tax Code (a picked item defaults the line to it). */
+  salesTaxCodeId?: string | null;
   trackingMode?: string | null;
 }
 
@@ -107,7 +133,10 @@ interface SalesReceipt {
   customerId: string | null;
   customerName: string | null;
   date: string;
+  /** Payment method type (cash, check, credit_card, ...). */
   method: string;
+  /** salesar (B7): the Payment Method list entry ("Visa"); null on receipts saved with a bare type. */
+  paymentMethodId?: string | null;
   reference: string | null;
   subtotal: string;
   taxAmount: string;
@@ -129,12 +158,16 @@ interface SalesReceiptDetail extends SalesReceipt {
   shipTo?: Record<string, string> | null;
   toBePrinted?: boolean;
   toBeEmailed?: boolean;
+  /** salesar (B8): Customer Message list entry printed at the foot of the receipt. */
+  customerMessageId?: string | null;
   lines: Array<{
     itemId: string | null;
     description: string | null;
     quantity: string;
     rate: string;
     taxable: boolean;
+    /** salesar (B9): the line's Sales Tax Code (null on lines saved before codes: shown by `taxable`). */
+    salesTaxCodeId?: string | null;
     // Advanced Inventory detail (present only when stored for the line)
     siteId?: string | null;
     binId?: string | null;
@@ -150,6 +183,8 @@ interface LineRow {
   quantity: string;
   rate: string;
   taxable: boolean;
+  /** salesar (B9): the line's Sales Tax Code ('' / absent = the standard code for `taxable`). */
+  salesTaxCodeId?: string;
   /** Advanced Inventory: site / bin / serials / lot the stock is sold from. */
   inv?: InvDetail;
   /** Advanced pricing: the user typed the rate (automatic prices leave it alone). */
@@ -158,23 +193,23 @@ interface LineRow {
 
 const EMPTY_LINE: LineRow = { itemId: '', description: '', quantity: '', rate: '', taxable: true };
 
-const METHODS: Array<{ value: string; label: string }> = [
-  { value: 'cash', label: 'Cash' },
-  { value: 'check', label: 'Check' },
-  { value: 'credit_card', label: 'Credit Card' },
-  { value: 'ach', label: 'ACH' },
-  { value: 'bank_transfer', label: 'Bank Transfer' },
-  { value: 'other', label: 'Other' },
-];
-
-function methodLabel(value: string): string {
-  return METHODS.find((m) => m.value === value)?.label ?? value;
-}
-
-/** Same item-type math as the service: discount items subtract, subtotal items add nothing. */
-function computeTotals(lines: LineRow[], taxRate: TaxRate | undefined, items: Item[]) {
+/**
+ * Same item-type math as the service: discount items subtract, subtotal items add nothing; each
+ * line is taxed as its Sales Tax Code says (a non-taxable customer: nothing is taxed).
+ */
+function computeTotals(
+  lines: LineRow[],
+  taxRate: TaxRate | undefined,
+  items: Item[],
+  taxCodes: TaxCodeEntry[],
+  customerTax: CustomerTaxStatus | null,
+) {
   const { subtotal, tax, total } = previewSalesTotals(
-    lines.map((l) => ({ ...l, itemType: items.find((i) => i.id === l.itemId)?.type ?? null })),
+    withShownTaxable(
+      lines.map((l) => ({ ...l, itemType: items.find((i) => i.id === l.itemId)?.type ?? null })),
+      taxCodes,
+      customerTax,
+    ),
     taxRate ? parseFloat(taxRate.rate) || 0 : 0,
   );
   return { subtotal, tax, total };
@@ -225,7 +260,11 @@ function NewReceiptModal({
 
   const [customerId, setCustomerId] = useState('');
   const [date, setDate] = useState(() => todayISO());
-  const [method, setMethod] = useState('cash');
+  // B7: the Payment Method picker value (`pm:<entry id>` / `type:<type>`; '' = the default "Cash"
+  // entry, resolved once the list has loaded).
+  const [pmValue, setPmValue] = useState('');
+  const paymentMethods = usePaymentMethods(open);
+  const paymentMethod = pmValue || defaultPaymentMethodValue(paymentMethods);
   const [depositAccountId, setDepositAccountId] = useState('');
   const [reference, setReference] = useState('');
   const [taxRateId, setTaxRateId] = useState('');
@@ -251,6 +290,11 @@ function NewReceiptModal({
     if (st) setShip((prev) => ({ ...prev, shipTo: st }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [custDefaults]);
+  // salesar: Customer Message (B8) and the per-line Sales Tax Code column (B9).
+  const [customerMessageId, setCustomerMessageId] = useState('');
+  const customerMessages = useCustomerMessages(open);
+  const taxCodes = useSalesTaxCodes(open);
+  const customerTax = customerTaxStatus(custDefaults);
 
   // Reset form when modal opens; deposit-to defaults to Undeposited Funds (1050)
   // so receipts flow into the Make Deposits workflow.
@@ -258,12 +302,15 @@ function NewReceiptModal({
     if (open && editing) {
       setCustomerId(editing.customerId ?? '');
       setDate(editing.date.slice(0, 10));
-      setMethod(editing.method);
+      // The saved Payment Method entry, or the bare type of a receipt saved before the list was used.
+      setPmValue(paymentMethodValue(editing));
       setDepositAccountId(editing.depositAccountId ?? '');
       setReference(editing.reference ?? '');
       setTaxRateId(editing.taxRateId ?? '');
       setClassId(editing.classId ?? '');
       setMemo(editing.memo ?? '');
+      // The saved message shows even if it was made inactive since.
+      setCustomerMessageId(editing.customerMessageId ?? '');
       setShip(shippingFromDoc(editing));
       setLines(
         editing.lines.map((l) => ({
@@ -272,6 +319,8 @@ function NewReceiptModal({
           quantity: String(Number(l.quantity)),
           rate: String(Number(l.rate)),
           taxable: l.taxable,
+          // Lines saved before codes have none: they show the standard code for `taxable`.
+          salesTaxCodeId: l.salesTaxCodeId ?? '',
           rateManual: true,
           // The site / bin / serials / lot the stock left from: an edit re-posts the receipt, and
           // a line sent without them went back to the default site with its serials dropped.
@@ -285,12 +334,13 @@ function NewReceiptModal({
       setCustomerId('');
       // My Preferences > General "Default date": today, or the last receipt date entered this session.
       setDate(smart.defaultDate());
-      setMethod('cash');
+      setPmValue('');
       setDepositAccountId(defaultDepositId);
       setReference('');
       setTaxRateId('');
       setClassId('');
       setMemo('');
+      setCustomerMessageId('');
       setLines([{ ...EMPTY_LINE }]);
       // cmdbar: a command-bar prefill ("sold 2 widgets to Acme").
       if (prefill) {
@@ -305,7 +355,12 @@ function NewReceiptModal({
               description: l.description ?? '',
               quantity: l.quantity ?? '1',
               rate: l.rate ?? '',
-              taxable: l.taxable ?? true,
+              // The item's Sales Tax Code unless the command said taxable / not (B9).
+              ...filledLineTaxCode(
+                l.itemId ? items.find((i) => i.id === l.itemId) : null,
+                taxCodes,
+                l.taxable,
+              ),
               rateManual: !!l.rateFromUser,
             })),
           );
@@ -384,6 +439,8 @@ function NewReceiptModal({
 
   function handleItemSelect(idx: number, itemId: string) {
     const item = items.find((i) => i.id === itemId);
+    // B9: the item's Sales Tax Code (else Tax / Non by its taxable flag).
+    const code = item ? itemLineTaxCode(item, taxCodes) : null;
     setLines((prev) => {
       const next = [...prev];
       next[idx] = {
@@ -392,6 +449,7 @@ function NewReceiptModal({
         description: next[idx].description || item?.name || '',
         rate: item?.salesPrice ?? next[idx].rate,
         quantity: next[idx].quantity || '1',
+        ...(code ?? {}),
         rateManual: false,
       };
       return next;
@@ -423,8 +481,10 @@ function NewReceiptModal({
   // Advanced Inventory: sites/bins + scan-to-add.
   const adv = useAdvancedInventory(open);
   function addScannedItem(it: { id: string; name: string; salesPrice?: string | null }) {
+    // B9: a scanned item's line starts on the item's Sales Tax Code, as when picked by hand.
+    const code = itemLineTaxCode(items.find((i) => i.id === it.id), taxCodes);
     setLines((prev) => {
-      const row: LineRow = { ...EMPTY_LINE, itemId: it.id, description: it.name, quantity: '1', rate: it.salesPrice ?? '' };
+      const row: LineRow = { ...EMPTY_LINE, itemId: it.id, description: it.name, quantity: '1', rate: it.salesPrice ?? '', ...code };
       const emptyIdx = prev.findIndex((l) => !l.itemId && !l.description && !l.quantity && !l.rate);
       if (emptyIdx >= 0) return prev.map((l, i) => (i === emptyIdx ? row : l));
       return [...prev, row];
@@ -440,25 +500,35 @@ function NewReceiptModal({
   const grid = useGridKeys({ addRow: addLine, removeRow: removeLine, disabled: saving });
 
   const selectedTaxRate = taxRates.find((t) => t.id === taxRateId);
-  const { subtotal, tax, total } = computeTotals(lines, selectedTaxRate, items);
+  const { subtotal, tax, total } = computeTotals(lines, selectedTaxRate, items, taxCodes, customerTax);
+  // QB's per-line "Tax" column (Sales Tax Code) only while sales tax is on (or the receipt has a tax item).
+  const showTaxColumn = prefs.company.salesTaxEnabled || !!taxRateId;
+  const lineGridCols = showTaxColumn
+    ? 'grid-cols-[150px_1fr_60px_80px_72px_32px]'
+    : 'grid-cols-[150px_1fr_60px_80px_32px]';
+  const itemType =(id: string) => items.find((i) => i.id === id)?.type ?? null;
 
   function receiptPayload(validLines: LineRow[]) {
     return {
       ...shippingPayload(ship),
       customerId: customerId || null,
       date,
-      method,
+      // B7: the Payment Method list entry (its type is stored as the method) or a bare type.
+      ...paymentMethodPayload(paymentMethod, paymentMethods),
       depositAccountId: depositAccountId || null,
       reference: reference || null,
       taxRateId: taxRateId || null,
       classId: classId || null,
       memo: memo || null,
+      // B8: the Customer Message (null clears a saved one).
+      customerMessageId: customerMessagePayload(customerMessageId),
       lines: validLines.map((l) => ({
         itemId: l.itemId || null,
         description: l.description || null,
         quantity: l.quantity,
         rate: l.rate,
-        taxable: l.taxable,
+        // B9: the line's Sales Tax Code (the server decides taxability from it).
+        ...lineTaxPayload({ ...l, itemType: itemType(l.itemId) }, taxCodes, customerTax),
         ...inventoryLinePayload(l.inv),
       })),
     };
@@ -528,6 +598,7 @@ function NewReceiptModal({
                   quantity: l.quantity,
                   rate: l.rate,
                   taxable: l.taxable,
+                  salesTaxCodeId: l.salesTaxCodeId,
                 })),
               };
             }}
@@ -586,12 +657,8 @@ function NewReceiptModal({
         {/* Payment method + reference */}
         <div className="grid grid-cols-2 gap-3">
           <div>
-            <Label htmlFor="sr-method">Payment Method</Label>
-            <Select id="sr-method" value={method} onChange={(e) => setMethod(e.target.value)}>
-              {METHODS.map((m) => (
-                <option key={m.value} value={m.value}>{m.label}</option>
-              ))}
-            </Select>
+            {/* QB Payment Method list entries ("Visa — Credit card"); Make Deposits groups by them. */}
+            <PaymentMethodField id="sr-method" value={paymentMethod} onChange={setPmValue} entries={paymentMethods} />
           </div>
           <div>
             <Label htmlFor="sr-reference">Reference / Check #</Label>
@@ -642,12 +709,12 @@ function NewReceiptModal({
 
           <div className="rounded-lg border border-slate-200 overflow-hidden" onKeyDown={grid.onKeyDown}>
             {/* Header row */}
-            <div className="grid grid-cols-[150px_1fr_60px_80px_44px_32px] gap-2 bg-slate-50 px-3 py-2 text-xs font-semibold text-navy/60 border-b border-slate-200">
+            <div className={`grid ${lineGridCols} gap-2 bg-slate-50 px-3 py-2 text-xs font-semibold text-navy/60 border-b border-slate-200`}>
               <span>Item</span>
               <span>Description</span>
               <span>Qty</span>
               <span>Rate</span>
-              <span>Tax</span>
+              {showTaxColumn && <span title="Sales tax code: taxable or non-taxable">Tax</span>}
               <span />
             </div>
 
@@ -655,7 +722,7 @@ function NewReceiptModal({
               <div
                 key={idx}
                 data-grid-row
-                className="grid grid-cols-[150px_1fr_60px_80px_44px_32px] gap-2 items-start px-3 py-2 border-b border-slate-100 last:border-b-0"
+                className={`grid ${lineGridCols} gap-2 items-start px-3 py-2 border-b border-slate-100 last:border-b-0`}
               >
                 <Select
                   value={line.itemId}
@@ -689,13 +756,15 @@ function NewReceiptModal({
                     onUseQuoted={(price) => updateLine(idx, { rate: String(Number(price)), rateManual: false })}
                   />
                 </div>
-                <input
-                  type="checkbox"
-                  checked={line.taxable}
-                  onChange={(e) => updateLine(idx, { taxable: e.target.checked })}
-                  className="h-4 w-4 justify-self-center accent-electric"
-                  aria-label="Taxable"
-                />
+                {showTaxColumn && (
+                  <LineTaxCodeCell
+                    row={{ ...line, itemType: itemType(line.itemId) }}
+                    codes={taxCodes}
+                    customer={customerTax}
+                    label={`Line ${idx + 1} sales tax code`}
+                    onChange={(p) => updateLine(idx, p)}
+                  />
+                )}
                 <button
                   type="button"
                   onClick={() => removeLine(idx)}
@@ -718,6 +787,14 @@ function NewReceiptModal({
             ))}
           </div>
         </div>
+
+        {/* QB "Customer Message" under the lines: printed on the sales receipt. */}
+        <CustomerMessageField
+          id="sr-message"
+          value={customerMessageId}
+          onChange={setCustomerMessageId}
+          messages={customerMessages}
+        />
 
         {/* Tax rate + memo */}
         <div className="grid grid-cols-2 gap-3">
@@ -804,6 +881,8 @@ function SalesReceiptsPageContent() {
   const [taxRates, setTaxRates] = useState<TaxRate[]>([]);
   const [loading, setLoading] = useState(true);
   const [showNew, setShowNew] = useState(false);
+  // B7: Payment Method list entries, so the Method column names the entry ("Visa").
+  const paymentMethodEntries = usePaymentMethods(true);
   // cmdbar: the command bar opens a NEW sales receipt filled in for the user to save.
   const [prefill, setPrefill] = useState<FormPrefill | null>(null);
   usePrefill('sales_receipt', (p) => {
@@ -938,7 +1017,7 @@ function SalesReceiptsPageContent() {
                   <Td className="font-semibold text-navy">#{docNo(r.refNumber, r.receiptNumber)}</Td>
                   <Td>{r.customerName ?? 'Walk-in'}</Td>
                   <Td className="text-navy/70">{formatDate(r.date)}</Td>
-                  <Td className="text-navy/70">{methodLabel(r.method)}</Td>
+                  <Td className="text-navy/70">{paymentMethodDisplay(r, paymentMethodEntries)}</Td>
                   <Td numeric>{formatCurrency(r.taxAmount)}</Td>
                   <Td numeric className="font-medium">{formatCurrency(r.total)}</Td>
                   <Td>

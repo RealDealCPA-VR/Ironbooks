@@ -53,6 +53,17 @@ import {
 import PrefillNotice from '@/components/PrefillNotice';
 import { usePrefill } from '@/lib/commands/usePrefill';
 import { TransactionNav, useAdjacentTransactions } from '@/components/TransactionNav';
+// salesar (B8 / B9): Customer Message picker and the per-line Sales Tax Code column.
+import { CustomerMessageField, customerTaxStatus, useCustomerMessages, useSalesTaxCodes } from '@/components/sales/FormLists';
+import {
+  type CustomerMessageEntry,
+  type CustomerTaxStatus,
+  type TaxCodeEntry,
+  customerMessagePayload,
+  filledLineTaxCode,
+  lineTaxPayload,
+  withShownTaxable,
+} from '@/lib/salesFormListsClient';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -78,6 +89,8 @@ interface Estimate {
   taxRateId?: string | null;
   toBePrinted?: boolean;
   toBeEmailed?: boolean;
+  /** Customer Message list entry printed at the foot of the estimate. */
+  customerMessageId?: string | null;
 }
 
 interface EstimateDetailLine {
@@ -88,6 +101,8 @@ interface EstimateDetailLine {
   rate: string;
   amount: string;
   taxable: boolean;
+  /** The line's Sales Tax Code (null on lines saved before codes: shown by `taxable`). */
+  salesTaxCodeId?: string | null;
   classId?: string | null;
   /** Progress invoicing: invoiced so far on this line (units, dollars before tax, percent). */
   qtyInvoiced?: string;
@@ -117,6 +132,8 @@ interface EstimateLineForm {
   quantity: string;
   rate: string;
   taxable: boolean;
+  /** The line's Sales Tax Code ('' = the standard code for `taxable`). */
+  salesTaxCodeId?: string;
   /** Advanced pricing: the user typed the rate (automatic prices leave it alone). */
   rateManual?: boolean;
   /** Class for the line; progress invoices carry it onto their lines. */
@@ -129,6 +146,8 @@ interface EstimateForm {
   expirationDate: string;
   taxRateId: string;
   memo: string;
+  /** Customer Message list entry ('' = none). */
+  customerMessageId: string;
   lines: EstimateLineForm[];
 }
 
@@ -148,6 +167,7 @@ const EMPTY_FORM: EstimateForm = {
   expirationDate: '',
   taxRateId: '',
   memo: '',
+  customerMessageId: '',
   lines: [{ ...EMPTY_LINE }],
 };
 
@@ -183,6 +203,9 @@ function EstimateFormBody({
   onChange,
   onLinesChange,
   recallText,
+  taxCodes,
+  customerTax,
+  messages,
 }: {
   form: EstimateForm;
   customers: Customer[];
@@ -193,9 +216,15 @@ function EstimateFormBody({
   onLinesChange: (lines: EstimateLineForm[]) => void;
   /** Smart defaults: what was filled in from the customer's last estimate. */
   recallText?: string;
+  /** Sales Tax Code list (B9) and the customer's tax status. */
+  taxCodes: TaxCodeEntry[];
+  customerTax: CustomerTaxStatus | null;
+  /** Customer Message list (B8). */
+  messages: CustomerMessageEntry[];
 }) {
-  // Mirror the service/invoice math (item-type aware): tax applies to taxable lines only,
-  // discount items subtract, subtotal items add nothing.
+  // Mirror the service/invoice math (item-type aware): tax applies to taxable lines only (each
+  // line's Sales Tax Code decides; a non-taxable customer is taxed nothing), discount items
+  // subtract, subtotal items add nothing.
   const selectedRate = taxRates.find((t) => t.id === form.taxRateId);
   const { salesTaxEnabled: salesTaxOn, classTrackingEnabled: classTrackingOn } = usePreferences().company;
   const {
@@ -203,7 +232,11 @@ function EstimateFormBody({
     tax: taxAmount,
     total,
   } = previewSalesTotals(
-    form.lines.map((l) => ({ ...l, itemType: items.find((i) => i.id === l.itemId)?.type ?? null })),
+    withShownTaxable(
+      form.lines.map((l) => ({ ...l, itemType: items.find((i) => i.id === l.itemId)?.type ?? null })),
+      taxCodes,
+      customerTax,
+    ),
     selectedRate ? parseFloat(selectedRate.rate) || 0 : 0,
   );
 
@@ -273,7 +306,10 @@ function EstimateFormBody({
           lines={form.lines}
           onChange={onLinesChange}
           header={{ customerId: form.customerId || null, date: form.date }}
-          showTaxable
+          // QB's per-line "Tax" column (Sales Tax Code) only while sales tax is on (or the estimate has a tax item).
+          showTaxable={salesTaxOn || !!form.taxRateId}
+          taxCodes={taxCodes}
+          customerTax={customerTax}
           // Class pickers only while "Use class tracking" is on (or a line already has a class).
           classes={classTrackingOn || form.lines.some((l) => l.classId) ? classes : undefined}
         />
@@ -287,6 +323,14 @@ function EstimateFormBody({
           <span className="font-bold text-navy">Total: {formatCurrency(total)}</span>
         </div>
       </div>
+
+      {/* QB "Customer Message" under the lines: printed on the estimate. */}
+      <CustomerMessageField
+        id="est-message"
+        value={form.customerMessageId}
+        onChange={(id) => onChange('customerMessageId', id)}
+        messages={messages}
+      />
 
       <div>
         <Label htmlFor="memo">Memo</Label>
@@ -343,6 +387,10 @@ function EstimatesPageContent() {
   const dupConfirm = useDuplicateNumberConfirm();
   // Customer defaults: tax item and ship-to address (new estimates).
   const custDefaults = useCustomerSalesDefaults(addOpen ? addForm.customerId : null);
+  // salesar: Sales Tax Code column (B9) and Customer Message (B8) lists.
+  const taxCodes = useSalesTaxCodes(addOpen);
+  const customerMessages = useCustomerMessages(addOpen);
+  const customerTax = customerTaxStatus(custDefaults);
   /** Tax item recalled from the last estimate — wins over the customer's default tax item. */
   const recalledTaxRef = useRef<string | null>(null);
   useEffect(() => {
@@ -485,7 +533,8 @@ function EstimatesPageContent() {
             description: l.description ?? '',
             quantity: l.quantity ?? '1',
             rate: l.rate ?? '',
-            taxable: l.taxable ?? true,
+            // The item's Sales Tax Code unless the command said taxable / not (B9).
+            ...filledLineTaxCode(l.itemId ? items.find((it) => it.id === l.itemId) : null, taxCodes, l.taxable),
             rateManual: !!l.rateFromUser,
           }))
         : [{ ...EMPTY_LINE }],
@@ -517,6 +566,8 @@ function EstimatesPageContent() {
         expirationDate: detail.expirationDate ? detail.expirationDate.slice(0, 10) : '',
         taxRateId: detail.taxRateId ?? '',
         memo: detail.memo ?? '',
+        // The saved message shows even if it was made inactive since.
+        customerMessageId: detail.customerMessageId ?? '',
         lines: detail.lines.map((l) => ({
           id: l.id,
           itemId: l.itemId ?? '',
@@ -524,6 +575,8 @@ function EstimatesPageContent() {
           quantity: String(Number(l.quantity)),
           rate: String(Number(l.rate)),
           taxable: l.taxable,
+          // Lines saved before codes have none: they show the standard code for `taxable`.
+          salesTaxCodeId: l.salesTaxCodeId ?? '',
           rateManual: true,
           classId: l.classId ?? '',
         })),
@@ -577,13 +630,16 @@ function EstimatesPageContent() {
         expirationDate: addForm.expirationDate || null,
         taxRateId: addForm.taxRateId || null,
         memo: addForm.memo || null,
+        // null clears a saved message.
+        customerMessageId: customerMessagePayload(addForm.customerMessageId),
         lines: addForm.lines.map((l, i) => ({
           ...(editingId && l.id ? { id: l.id } : {}),
           itemId: l.itemId || null,
           description: l.description.trim(),
           // Blank rate on an item line: the server prices it (advanced pricing).
           ...(numbers[i] as { quantity: string; rate: string | number | null }),
-          taxable: l.taxable,
+          // The line's Sales Tax Code (the server decides taxability from it).
+          ...lineTaxPayload({ ...l, itemType: items.find((it) => it.id === l.itemId)?.type ?? null }, taxCodes, customerTax),
           classId: l.classId || null,
         })),
       };
@@ -923,6 +979,9 @@ function EstimatesPageContent() {
           onChange={handleFormChange}
           onLinesChange={(lines) => setAddForm((prev) => ({ ...prev, lines }))}
           recallText={editingId ? '' : recallText}
+          taxCodes={taxCodes}
+          customerTax={customerTax}
+          messages={customerMessages}
         />
         <div className="mt-4">
           <ShippingSection

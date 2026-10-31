@@ -77,6 +77,15 @@ import { type SmartLine, fillRecalledItems, invoiceFieldsFromRecall, lineClassOv
 import PrefillNotice from '@/components/PrefillNotice';
 import { usePrefill } from '@/lib/commands/usePrefill';
 import type { FormPrefill } from '@/lib/commands/prefill';
+// salesar (B8 / B9): Customer Message picker and the per-line Sales Tax Code column.
+import { CustomerMessageField, LineTaxCodeCell, customerTaxStatus, useCustomerMessages, useSalesTaxCodes } from '@/components/sales/FormLists';
+import {
+  customerMessagePayload,
+  filledLineTaxCode,
+  itemLineTaxCode,
+  lineTaxPayload,
+  withShownTaxable,
+} from '@/lib/salesFormListsClient';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -99,6 +108,8 @@ interface Item {
   description: string | null;
   salesPrice: string | null;
   taxable: boolean;
+  /** salesar (B9): the item's Sales Tax Code (a picked item defaults the line to it). */
+  salesTaxCodeId?: string | null;
   quantityOnHand: string | null;
   unitOfMeasure: string | null;
   trackingMode?: string | null;
@@ -167,6 +178,8 @@ interface InvoiceDetail extends Invoice {
   exchangeRate: string | null;
   memo: string | null;
   customFields: Record<string, string> | null;
+  /** salesar (B8): Customer Message list entry printed at the foot of the invoice. */
+  customerMessageId?: string | null;
   lines: Array<{
     id: string;
     itemId: string | null;
@@ -174,6 +187,8 @@ interface InvoiceDetail extends Invoice {
     quantity: string;
     rate: string;
     taxable: boolean;
+    /** salesar (B9): the line's Sales Tax Code (null on lines saved before codes: shown by `taxable`). */
+    salesTaxCodeId?: string | null;
     jobId: string | null;
     /** The line's class (stored as its own class, or the invoice's when it had none). */
     classId?: string | null;
@@ -203,6 +218,8 @@ interface LineRow {
   quantity: string;
   rate: string;
   taxable: boolean;
+  /** salesar (B9): the line's Sales Tax Code ('' / absent = the standard code for `taxable`). */
+  salesTaxCodeId?: string;
   jobId: string;
   /** The line's own class when it differs from the invoice's ('' / absent = the invoice class). */
   classId?: string;
@@ -466,9 +483,16 @@ function InvoiceModal({
     if (st) setShip((prev) => ({ ...prev, shipTo: st }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [custDefaults]);
+  // salesar: Customer Message (B8) and the per-line Sales Tax Code column (B9).
+  const [customerMessageId, setCustomerMessageId] = useState('');
+  const customerMessages = useCustomerMessages(open);
+  const taxCodes = useSalesTaxCodes(open);
+  const customerTax = customerTaxStatus(custDefaults);
 
   const itemNameById = new Map(items.map((it) => [it.id, it.name]));
   const prefs = usePreferences();
+  // QB's per-line "Tax" column (Sales Tax Code) only while sales tax is on (or the invoice has a tax item).
+  const showTaxColumn = prefs.company.salesTaxEnabled || !!taxRateId;
   // Smart defaults (lib/useSmartDefaults.ts): default date + recall the customer's last invoice.
   const smart = useSmartDefaults('invoice');
   termsRef.current = terms;
@@ -511,6 +535,8 @@ function InvoiceModal({
       );
       setSaveAsPending(editing.status === 'draft');
       setCustomValues(editing.customFields ?? {});
+      // The saved message shows even if it was made inactive since.
+      setCustomerMessageId(editing.customerMessageId ?? '');
       setLines(
         editing.lines.map((l) => ({
           itemName: l.itemName ?? (l.itemId ? (itemNameById.get(l.itemId) ?? '') : ''),
@@ -521,6 +547,8 @@ function InvoiceModal({
           quantity: String(Number(l.quantity)),
           rate: String(Number(l.rate)),
           taxable: l.taxable,
+          // Lines saved before codes have none: they show the standard code for `taxable`.
+          salesTaxCodeId: l.salesTaxCodeId ?? '',
           jobId: l.jobId ?? '',
           classId: lineClassOverride(l.classId, editing.classId),
           discountPercent: false,
@@ -550,6 +578,7 @@ function InvoiceModal({
       setSaveAsPending(false);
       setRetainagePercent('');
       setCustomValues({});
+      setCustomerMessageId('');
       setLines([{ ...EMPTY_LINE }]);
       // cmdbar: a command-bar prefill ("invoice Acme 3 hours consulting").
       if (prefill) {
@@ -566,7 +595,12 @@ function InvoiceModal({
               description: l.description ?? '',
               quantity: l.quantity ?? '',
               rate: l.rate ?? '',
-              taxable: l.taxable ?? true,
+              // The item's Sales Tax Code unless the command said taxable / not (B9).
+              ...filledLineTaxCode(
+                l.itemId ? items.find((it) => it.id === l.itemId) : null,
+                taxCodes,
+                l.taxable,
+              ),
               rateManual: !!l.rateFromUser,
             })),
           );
@@ -740,7 +774,11 @@ function InvoiceModal({
         quantity: String(Number(c.quantity)),
         // Base price first; the customer's price level / rules replace it via the quotes.
         rate: c.salesPrice ?? '0',
-        taxable: c.taxable,
+        // The component item's Sales Tax Code (B9), else Tax / Non by its taxable flag.
+        ...itemLineTaxCode(
+          items.find((it) => it.id === c.componentItemId) ?? { type: c.type, taxable: c.taxable },
+          taxCodes,
+        ),
         jobId: '',
         discountPercent: false,
       }));
@@ -770,6 +808,9 @@ function InvoiceModal({
       const isSpecial =
         match.type === 'discount' || match.type === 'subtotal' ||
         match.type === 'payment' || match.type === 'sales_tax';
+      // The item's Sales Tax Code (B9): its own code, else Tax / Non by its taxable flag;
+      // subtotal / payment / sales tax items carry none and are never taxed.
+      const code = itemLineTaxCode(match, taxCodes);
       updateLine(idx, {
         itemName: match.name,
         itemId: match.id,
@@ -777,7 +818,8 @@ function InvoiceModal({
         unitOfMeasure: match.unitOfMeasure,
         description: match.description ?? match.name,
         rate: match.type === 'subtotal' ? '' : (match.salesPrice ?? ''),
-        taxable: isSpecial ? match.type === 'discount' && match.taxable : match.taxable,
+        taxable: isSpecial ? match.type === 'discount' && code.taxable : code.taxable,
+        salesTaxCodeId: code.salesTaxCodeId,
         quantity: match.type === 'subtotal' ? '' : lines[idx].quantity || '1',
         discountPercent: false,
         rateManual: false,
@@ -855,7 +897,8 @@ function InvoiceModal({
   const hasBillablesSelected = selectedCostIds.size + selectedTimeIds.size > 0;
 
   const totals = computeTotals(
-    lines,
+    // Each line is taxed as its Sales Tax Code says (a non-taxable customer: nothing is taxed).
+    withShownTaxable(lines, taxCodes, customerTax),
     discount,
     discountType,
     selectedRate?.rate ?? '',
@@ -919,8 +962,8 @@ function InvoiceModal({
     for (const u of formLineUpdates<Record<string, unknown>, number>(fix, patched, 'lines', lineIdx)) {
       const v = u.line[u.field];
       if (u.field === 'quantity') updateLine(u.key, { quantity: v == null ? '' : String(v) });
-      // "Remove the sales tax": the line no longer charges tax.
-      else if (u.field === 'taxRateId' && (v == null || v === '')) updateLine(u.key, { taxable: false });
+      // "Remove the sales tax": the line no longer charges tax ('' = the standard "Non" code).
+      else if (u.field === 'taxRateId' && (v == null || v === '')) updateLine(u.key, { taxable: false, salesTaxCodeId: '' });
     }
   }
 
@@ -981,6 +1024,8 @@ function InvoiceModal({
       memo: memo || undefined,
       customFields: customFieldDefs.length > 0 ? customValues : undefined,
       ...shippingPayload(ship),
+      // B8: the Customer Message (null clears a saved one).
+      customerMessageId: customerMessagePayload(customerMessageId),
       lines: indexed.map(({ l, idx }) => {
         const kind = lineKind(l);
         if (kind === 'subtotal') {
@@ -994,7 +1039,8 @@ function InvoiceModal({
             description: l.description || null,
             quantity: 1,
             rate: totals.amounts[idx].toFixed(2),
-            taxable: l.taxable,
+            // B9: the line's Sales Tax Code (the server decides taxability from it).
+            ...lineTaxPayload(l, taxCodes, customerTax),
             jobId: l.jobId || null,
             classId: l.classId || null,
             ...(editing ? { estimateLineId: l.estimateLineId ?? null } : {}),
@@ -1005,7 +1051,8 @@ function InvoiceModal({
           description: l.description || null,
           quantity: l.quantity,
           rate: l.rate,
-          taxable: l.taxable,
+          // B9: the line's Sales Tax Code (the server decides taxability from it).
+          ...lineTaxPayload(l, taxCodes, customerTax),
           jobId: l.jobId || null,
           classId: l.classId || null,
           ...inventoryLinePayload(l.inv),
@@ -1113,12 +1160,14 @@ function InvoiceModal({
                 taxRateId: taxRateId || undefined,
                 classId: classId || undefined,
                 memo: memo || undefined,
+                // Each entry keeps the Customer Message and every line's Sales Tax Code.
+                customerMessageId: customerMessagePayload(customerMessageId),
                 lines: rows.map((l) => ({
                   itemId: l.itemId,
                   description: l.description || null,
                   quantity: l.quantity || '1',
                   rate: l.rate || '0',
-                  taxable: l.taxable,
+                  ...lineTaxPayload(l, taxCodes, customerTax),
                   jobId: l.jobId || null,
                 })),
               };
@@ -1368,8 +1417,10 @@ function InvoiceModal({
                     <MinusCircle className="h-4 w-4" />
                   </button>
                 </div>
-                {/* Row 2: qty, rate, job, taxable, amount */}
-                <div className="grid grid-cols-[64px_84px_1fr_52px_76px] gap-2 items-center">
+                {/* Row 2: qty, rate, job, sales tax code (QB "Tax" column, while sales tax is on), amount */}
+                <div
+                  className={`grid ${showTaxColumn ? 'grid-cols-[64px_84px_1fr_76px_76px]' : 'grid-cols-[64px_84px_1fr_76px]'} gap-2 items-center`}
+                >
                   <AmountInput
                     placeholder="Qty"
                     aria-label={`Line ${idx + 1} quantity`}
@@ -1396,16 +1447,15 @@ function InvoiceModal({
                       <option key={j.id} value={j.id}>{j.name}</option>
                     ))}
                   </Select>
-                  <label className="flex items-center gap-1 text-xs text-navy/60 select-none justify-center">
-                    <input
-                      type="checkbox"
-                      checked={line.taxable}
-                      disabled={kind === 'subtotal' || kind === 'payment' || kind === 'sales_tax'}
-                      onChange={(e) => updateLine(idx, { taxable: e.target.checked })}
-                      className="accent-electric"
+                  {showTaxColumn && (
+                    <LineTaxCodeCell
+                      row={line}
+                      codes={taxCodes}
+                      customer={customerTax}
+                      label={`Line ${idx + 1} sales tax code`}
+                      onChange={(p) => updateLine(idx, p)}
                     />
-                    Tax
-                  </label>
+                  )}
                   <span className="text-right text-xs font-semibold text-navy/70 tabular-nums">
                     {formatCurrency((totals.amounts[idx] ?? 0).toFixed(2))}
                   </span>
@@ -1626,6 +1676,14 @@ function InvoiceModal({
             <Link href="/invoices/retainage" className="text-electric hover:underline">Retainage</Link>.
           </p>
         </div>
+
+        {/* QB "Customer Message" under the lines: printed on the invoice. */}
+        <CustomerMessageField
+          id="inv-message"
+          value={customerMessageId}
+          onChange={setCustomerMessageId}
+          messages={customerMessages}
+        />
 
         {/* Live totals (incl. tax) */}
         <div className="rounded-lg bg-navy/5 px-4 py-3 space-y-1">

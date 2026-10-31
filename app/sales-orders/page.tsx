@@ -52,6 +52,10 @@ import {
   useDuplicateNumberConfirm,
 } from '@/components/sales/DocNumberField';
 import { TransactionNav, useAdjacentTransactions } from '@/components/TransactionNav';
+// salesar (B8 / B9): Customer Message picker and the per-line Sales Tax Code column.
+import { CustomerMessageField, customerTaxStatus, useCustomerMessages, useSalesTaxCodes } from '@/components/sales/FormLists';
+import { customerMessagePayload, lineTaxPayload, withShownTaxable } from '@/lib/salesFormListsClient';
+import { usePreferences } from '@/lib/usePreferences';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -83,6 +87,8 @@ interface SalesOrder {
   shipTo?: Record<string, string> | null;
   toBePrinted?: boolean;
   toBeEmailed?: boolean;
+  /** Customer Message list entry printed at the foot of the order. */
+  customerMessageId?: string | null;
 }
 
 interface SalesOrderLine {
@@ -94,6 +100,8 @@ interface SalesOrderLine {
   amount: string;
   quantityInvoiced: string;
   taxable?: boolean;
+  /** The line's Sales Tax Code (null on lines saved before codes: shown by `taxable`). */
+  salesTaxCodeId?: string | null;
 }
 
 interface TaxRate {
@@ -178,6 +186,13 @@ function NewOrderModal({ open, editing, onClose, customers, items, taxRates, onC
   const [lines, setLines] = useState<EditableLine[]>([emptyPricedLine()]);
   const [ship, setShip] = useState<ShippingState>(EMPTY_SHIPPING);
   const [saving, setSaving] = useState(false);
+  // salesar: Customer Message (B8) and the per-line Sales Tax Code column (B9).
+  const [customerMessageId, setCustomerMessageId] = useState('');
+  const customerMessages = useCustomerMessages(open);
+  const taxCodes = useSalesTaxCodes(open);
+  const customerTax = customerTaxStatus(custDefaults);
+  const salesTaxOn = usePreferences().company.salesTaxEnabled;
+  const itemType = (id: string) => items.find((i) => i.id === id)?.type ?? null;
   // Smart defaults (lib/useSmartDefaults.ts): default date + recall the customer's last order.
   const smart = useSmartDefaults('sales_order');
   const [recallText, setRecallText] = useState('');
@@ -190,6 +205,8 @@ function NewOrderModal({ open, editing, onClose, customers, items, taxRates, onC
       setMemo(editing.memo ?? '');
       setShip(shippingFromDoc(editing));
       setTaxRateId(editing.taxRateId ?? '');
+      // The saved message shows even if it was made inactive since.
+      setCustomerMessageId(editing.customerMessageId ?? '');
       setLines(
         editing.lines.map((l) => ({
           id: l.id,
@@ -199,6 +216,8 @@ function NewOrderModal({ open, editing, onClose, customers, items, taxRates, onC
           quantity: String(Number(l.quantity)),
           rate: String(Number(l.rate)),
           taxable: l.taxable !== false,
+          // Lines saved before codes have none: they show the standard code for `taxable`.
+          salesTaxCodeId: l.salesTaxCodeId ?? '',
           rateManual: true,
         })),
       );
@@ -209,6 +228,7 @@ function NewOrderModal({ open, editing, onClose, customers, items, taxRates, onC
       setMemo('');
       setShip(shippingFromDoc(null));
       setTaxRateId('');
+      setCustomerMessageId('');
       setLines([emptyPricedLine()]);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -245,7 +265,12 @@ function NewOrderModal({ open, editing, onClose, customers, items, taxRates, onC
   }, [open, editing, customerId, recall]);
 
   const selectedRate = taxRates.find((t) => t.id === taxRateId);
-  const liveTotal = computeTotal(lines, items, selectedRate ? parseFloat(selectedRate.rate) || 0 : 0);
+  // Each line is taxed as its Sales Tax Code says (a non-taxable customer: nothing is taxed).
+  const liveTotal = computeTotal(
+    withShownTaxable(lines.map((l) => ({ ...l, itemType: itemType(l.itemId) })), taxCodes, customerTax),
+    items,
+    selectedRate ? parseFloat(selectedRate.rate) || 0 : 0,
+  );
 
   async function handleSubmit() {
     if (!customerId) { toast('Please select a customer.', 'danger'); return; }
@@ -270,6 +295,8 @@ function NewOrderModal({ open, editing, onClose, customers, items, taxRates, onC
         date,
         memo: memo || undefined,
         taxRateId: taxRateId || null,
+        // null clears a saved message.
+        customerMessageId: customerMessagePayload(customerMessageId),
         ...shippingPayload(ship),
         lines: validLines.map((l) => ({
           ...(l.id ? { id: l.id } : {}),
@@ -278,7 +305,8 @@ function NewOrderModal({ open, editing, onClose, customers, items, taxRates, onC
           quantity: l.quantity,
           // Blank rate on an item line: the server prices it (advanced pricing).
           rate: l.rate === '' ? null : l.rate,
-          taxable: l.taxable !== false,
+          // The line's Sales Tax Code (the server decides taxability from it).
+          ...lineTaxPayload({ ...l, taxable: l.taxable !== false, itemType: itemType(l.itemId) }, taxCodes, customerTax),
         })),
       };
       const saved = await dupConfirm.run((allowDuplicateNumber) =>
@@ -392,9 +420,20 @@ function NewOrderModal({ open, editing, onClose, customers, items, taxRates, onC
             lines={lines}
             onChange={setLines}
             header={{ customerId: customerId || null, date }}
-            showTaxable
+            // QB's per-line "Tax" column (Sales Tax Code) only while sales tax is on (or the order has a tax item).
+            showTaxable={salesTaxOn || !!taxRateId}
+            taxCodes={taxCodes}
+            customerTax={customerTax}
           />
         </div>
+
+        {/* QB "Customer Message" under the lines: printed on the sales order. */}
+        <CustomerMessageField
+          id="so-message"
+          value={customerMessageId}
+          onChange={setCustomerMessageId}
+          messages={customerMessages}
+        />
 
         {/* Live total */}
         <div className="flex items-center justify-between rounded-lg bg-navy/5 px-4 py-3">

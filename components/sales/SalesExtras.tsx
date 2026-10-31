@@ -94,6 +94,8 @@ export interface CustomerSalesDefaults {
   taxRateId: string | null;
   /** false = the customer's tax code is non-taxable. */
   taxable: boolean;
+  /** salesar (B9): the customer's Sales Tax Code (its lines show it when non-taxable). */
+  salesTaxCodeId?: string | null;
   shipTos: ShipToAddress[];
 }
 
@@ -110,6 +112,7 @@ export function useCustomerSalesDefaults(customerId: string | null | undefined):
       .get<{
         taxRateId?: string | null;
         taxable?: boolean;
+        salesTaxCodeId?: string | null;
         shipToAddresses?: ShipToAddress[] | null;
         shippingAddress?: Record<string, string> | null;
       }>(`/api/customers/${customerId}`)
@@ -121,10 +124,13 @@ export function useCustomerSalesDefaults(customerId: string | null | undefined):
             : c.shippingAddress && Object.values(c.shippingAddress).some((v) => String(v ?? '').trim())
               ? [{ name: 'Ship To 1', ...c.shippingAddress, isDefault: true }]
               : [];
-        setState({ id: customerId, d: { taxRateId: c.taxRateId ?? null, taxable: c.taxable !== false, shipTos: list } });
+        setState({
+          id: customerId,
+          d: { taxRateId: c.taxRateId ?? null, taxable: c.taxable !== false, salesTaxCodeId: c.salesTaxCodeId ?? null, shipTos: list },
+        });
       })
       .catch(() => {
-        if (!cancelled) setState({ id: customerId, d: { taxRateId: null, taxable: true, shipTos: [] } });
+        if (!cancelled) setState({ id: customerId, d: { taxRateId: null, taxable: true, salesTaxCodeId: null, shipTos: [] } });
       });
     return () => {
       cancelled = true;

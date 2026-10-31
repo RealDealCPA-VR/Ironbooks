@@ -58,6 +58,15 @@ import { usePriceQuotes, samePrice } from '@/lib/usePriceQuotes';
 import { PriceSourceBadge } from '@/components/PriceSourceBadge';
 import { previewSalesTotals } from '@/lib/salesLineMath';
 import { TransactionNav, useAdjacentTransactions } from '@/components/TransactionNav';
+// salesar (B8 / B9): Customer Message picker and the per-line Sales Tax Code column.
+import {
+  CustomerMessageField,
+  LineTaxCodeCell,
+  customerTaxStatus,
+  useCustomerMessages,
+  useSalesTaxCodes,
+} from '@/components/sales/FormLists';
+import { customerMessagePayload, itemLineTaxCode, lineTaxPayload, withShownTaxable } from '@/lib/salesFormListsClient';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -97,12 +106,16 @@ interface CreditMemoDetail extends CreditMemo {
   taxRateId: string | null;
   toBePrinted?: boolean;
   toBeEmailed?: boolean;
+  /** Customer Message list entry printed at the foot of the memo. */
+  customerMessageId?: string | null;
   lines: Array<{
     itemId: string | null;
     description: string | null;
     quantity: string;
     rate: string;
     taxable?: boolean;
+    /** The line's Sales Tax Code (null on lines saved before codes: shown by `taxable`). */
+    salesTaxCodeId?: string | null;
     restock?: boolean;
     // Advanced Inventory detail (present only when stored for the line)
     siteId?: string | null;
@@ -128,6 +141,8 @@ interface Item {
   type: string;
   salesPrice: string | null;
   taxable: boolean;
+  /** salesar (B9): the item's Sales Tax Code (a picked item defaults the line to it). */
+  salesTaxCodeId?: string | null;
   trackingMode?: string | null;
 }
 
@@ -143,6 +158,8 @@ interface LineRow {
   quantity: string;
   rate: string;
   taxable: boolean;
+  /** salesar (B9): the line's Sales Tax Code ('' / absent = the standard code for `taxable`). */
+  salesTaxCodeId?: string;
   /** Inventory items only: true = return to stock, false = damaged write-off. */
   restock: boolean;
   /** Advanced pricing (B12): the user typed the rate, so automatic prices leave it alone. */
@@ -223,6 +240,11 @@ function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCr
     setTaxRateId(custDefaults.taxable ? (custDefaults.taxRateId ?? '') : '');
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [custDefaults]);
+  // salesar: Customer Message (B8) and the per-line Sales Tax Code column (B9).
+  const [customerMessageId, setCustomerMessageId] = useState('');
+  const customerMessages = useCustomerMessages(open);
+  const taxCodes = useSalesTaxCodes(open);
+  const customerTax = customerTaxStatus(custDefaults);
 
   useEffect(() => {
     if (open && editing) {
@@ -230,6 +252,8 @@ function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCr
       setDate(editing.date.slice(0, 10));
       setMemoNote(editing.memo ?? '');
       setTaxRateId(editing.taxRateId ?? '');
+      // The saved message shows even if it was made inactive since.
+      setCustomerMessageId(editing.customerMessageId ?? '');
       setFlags(shippingFromDoc(editing));
       setApplications(editing.applications ?? []);
       setLines(
@@ -239,6 +263,8 @@ function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCr
           quantity: String(Number(l.quantity)),
           rate: String(Number(l.rate)),
           taxable: l.taxable !== false,
+          // Lines saved before codes have none: they show the standard code for `taxable`.
+          salesTaxCodeId: l.salesTaxCodeId ?? '',
           restock: l.restock !== false,
           // Saved prices stay as they are; the badge still offers the current quote.
           rateManual: true,
@@ -256,6 +282,7 @@ function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCr
       setDate(todayISO());
       setMemoNote('');
       setTaxRateId('');
+      setCustomerMessageId('');
       setLines([{ ...EMPTY_LINE }]);
     }
   }, [open, editing]);
@@ -295,7 +322,8 @@ function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCr
       // The base price shows at once; the customer's price level / price rules replace it below.
       rate: item.salesPrice ?? '',
       rateManual: false,
-      taxable: item.taxable,
+      // B9: the item's Sales Tax Code (else Tax / Non by its taxable flag).
+      ...itemLineTaxCode(item, taxCodes),
       restock: true,
     });
   }
@@ -320,7 +348,18 @@ function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCr
   }, [quotes]);
 
   const selectedRate = taxRates.find((t) => t.id === taxRateId);
-  const live = computeLiveTotals(lines, items, selectedRate ? parseFloat(selectedRate.rate) || 0 : 0);
+  const itemType = (id: string) => itemMap.get(id)?.type ?? null;
+  // Each line is taxed as its Sales Tax Code says (a non-taxable customer: nothing is taxed).
+  const live = computeLiveTotals(
+    withShownTaxable(lines.map((l) => ({ ...l, itemType: itemType(l.itemId) })), taxCodes, customerTax),
+    items,
+    selectedRate ? parseFloat(selectedRate.rate) || 0 : 0,
+  );
+  // QB's per-line "Tax" column (Sales Tax Code) only while sales tax is on (or the memo has a tax item).
+  const showTaxColumn = salesTaxOn || !!taxRateId;
+  const lineGridCols = showTaxColumn
+    ? 'grid-cols-[minmax(110px,1fr)_minmax(110px,1fr)_64px_80px_72px_56px_32px]'
+    : 'grid-cols-[minmax(110px,1fr)_minmax(110px,1fr)_64px_80px_56px_32px]';
   const liveSubtotal = live.subtotal;
   const liveTax = live.tax;
   const liveTotal = live.total;
@@ -340,7 +379,8 @@ function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCr
         description: it.name,
         quantity: '1',
         rate: it.salesPrice ?? '',
-        taxable: item?.taxable ?? true,
+        // B9: a scanned item's line starts on the item's Sales Tax Code, as when picked by hand.
+        ...itemLineTaxCode(item, taxCodes),
       };
       const emptyIdx = prev.findIndex((l) => !l.itemId && !l.description && !l.quantity && !l.rate);
       if (emptyIdx >= 0) return prev.map((l, i) => (i === emptyIdx ? row : l));
@@ -380,12 +420,15 @@ function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCr
         date,
         memo: memoNote || null,
         taxRateId: taxRateId || null,
+        // B8: the Customer Message (null clears a saved one).
+        customerMessageId: customerMessagePayload(customerMessageId),
         lines: validLines.map((l) => ({
           itemId: l.itemId || null,
           description: l.description || null,
           quantity: l.quantity,
           rate: l.rate,
-          taxable: l.taxable,
+          // B9: the line's Sales Tax Code (the server decides taxability from it).
+          ...lineTaxPayload({ ...l, itemType: itemType(l.itemId) }, taxCodes, customerTax),
           restock: l.restock,
           ...(l.restock ? inventoryLinePayload(l.inv) : {}),
         })),
@@ -433,12 +476,14 @@ function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCr
                 date,
                 memo: memoNote || null,
                 taxRateId: taxRateId || null,
+                // Each entry keeps the Customer Message and every line's Sales Tax Code.
+                customerMessageId: customerMessagePayload(customerMessageId),
                 lines: valid.map((l) => ({
                   itemId: l.itemId || null,
                   description: l.description || null,
                   quantity: l.quantity,
                   rate: l.rate,
-                  taxable: l.taxable,
+                  ...lineTaxPayload({ ...l, itemType: itemType(l.itemId) }, taxCodes, customerTax),
                   restock: l.restock,
                 })),
               };
@@ -525,12 +570,12 @@ function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCr
           </div>
 
           <div className="rounded-lg border border-slate-200 overflow-hidden" onKeyDown={grid.onKeyDown}>
-            <div className="grid grid-cols-[minmax(110px,1fr)_minmax(110px,1fr)_64px_80px_40px_56px_32px] gap-2 bg-slate-50 px-3 py-2 text-xs font-semibold text-navy/60 border-b border-slate-200">
+            <div className={`grid ${lineGridCols} gap-2 bg-slate-50 px-3 py-2 text-xs font-semibold text-navy/60 border-b border-slate-200`}>
               <span>Item</span>
               <span>Description</span>
               <span>Qty</span>
               <span>Rate</span>
-              <span title="Line participates in sales tax">Tax</span>
+              {showTaxColumn && <span title="Sales tax code: taxable or non-taxable">Tax</span>}
               <span title="Return inventory to stock (uncheck for damaged write-off)">Restock</span>
               <span />
             </div>
@@ -541,7 +586,7 @@ function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCr
                 <div
                   key={idx}
                   data-grid-row
-                  className="grid grid-cols-[minmax(110px,1fr)_minmax(110px,1fr)_64px_80px_40px_56px_32px] gap-2 items-center px-3 py-2 border-b border-slate-100 last:border-b-0"
+                  className={`grid ${lineGridCols} gap-2 items-center px-3 py-2 border-b border-slate-100 last:border-b-0`}
                 >
                   <Select
                     value={line.itemId}
@@ -576,15 +621,15 @@ function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCr
                       onUseQuoted={(price) => updateLine(idx, { rate: String(Number(price)), rateManual: false })}
                     />
                   </div>
-                  <span className="flex items-center justify-center">
-                    <input
-                      type="checkbox"
-                      checked={line.taxable}
-                      onChange={(e) => updateLine(idx, { taxable: e.target.checked })}
-                      className="h-4 w-4 accent-electric"
-                      aria-label={`Line ${idx + 1} taxable`}
+                  {showTaxColumn && (
+                    <LineTaxCodeCell
+                      row={{ ...line, itemType: lineItem?.type ?? null }}
+                      codes={taxCodes}
+                      customer={customerTax}
+                      label={`Line ${idx + 1} sales tax code`}
+                      onChange={(p) => updateLine(idx, p)}
                     />
-                  </span>
+                  )}
                   <span className="flex items-center justify-center">
                     {isInventory ? (
                       <input
@@ -624,6 +669,14 @@ function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCr
             })}
           </div>
         </div>
+
+        {/* QB "Customer Message" under the lines: printed on the credit memo. */}
+        <CustomerMessageField
+          id="cm-message"
+          value={customerMessageId}
+          onChange={setCustomerMessageId}
+          messages={customerMessages}
+        />
 
         {/* Tax rate */}
         {/* Hidden while "Charge sales tax" is off (QB removes tax from forms); an old document keeps its tax. */}
