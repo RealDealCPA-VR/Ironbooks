@@ -92,7 +92,7 @@ export default function RemindersList({ compact = false }: { compact?: boolean }
                     </Link>
                     {i.amount !== null && (
                       <span className="shrink-0 tabular-nums text-navy/70">
-                        {i.currency ? `${i.currency} ${Number(i.amount).toFixed(2)}` : formatCurrency(i.amount)}
+                        {i.currency ? `${i.currency} ${i.amount}` : formatCurrency(i.amount)}
                         {i.currency && i.homeAmount ? <span className="ml-1 text-xs text-navy/40">({formatCurrency(i.homeAmount)})</span> : null}
                       </span>
                     )}
