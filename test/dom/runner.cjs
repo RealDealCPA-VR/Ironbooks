@@ -6,7 +6,7 @@
 //   electron test/dom/runner.cjs <page.html> <results.json>
 'use strict';
 
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, Menu, ipcMain } = require('electron');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -37,6 +37,8 @@ function finish(results) {
 
 app.whenReady().then(async () => {
   log('ready');
+  // No default menu: its Ctrl+R / Ctrl+W / F5 accelerators must not reload or close the test page.
+  Menu.setApplicationMenu(null);
   const win = new BrowserWindow({
     show: false,
     width: 1280,

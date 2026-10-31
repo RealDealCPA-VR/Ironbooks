@@ -103,6 +103,9 @@ ${stderr.slice(-2000)}`;
 
 /** Fail with every failed DOM test's name and reason. */
 export function expectAllPassed(results: DomResult[], expectedNames?: string[]) {
+  // IB_DOM_TIMES=1: how long each test took.
+  if (process.env.IB_DOM_TIMES) for (const r of results) process.stderr.write(`${String(r.ms ?? '?').padStart(6)} ms  ${r.name}
+`);
   const failed = results.filter((r) => !r.ok).map((r) => `✗ ${r.name}: ${r.error}`);
   expect(failed, failed.join('\n\n')).toEqual([]);
   if (expectedNames) expect(results.map((r) => r.name)).toEqual(expectedNames);

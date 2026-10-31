@@ -15,6 +15,10 @@ describe('QuickBooks keys in the browser', () => {
     expectAllPassed(await runDomFile('test/dom/keyboardLists.dom.tsx'));
   }, 180_000);
 
+  it('the shell: leave-this-form guard, F5, browser keys, Esc, Enter preference, Help, Product Information, menu bar', async () => {
+    expectAllPassed(await runDomFile('test/dom/keyboardShell.dom.tsx'));
+  }, 180_000);
+
   it('review leftovers: calendar to-do delete asks, memorized report load failure, conversion rates', async () => {
     expectAllPassed(await runDomFile('test/dom/keyboardLeftovers.dom.tsx'));
   }, 180_000);
