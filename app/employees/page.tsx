@@ -32,6 +32,7 @@ import { MIN_PASSWORD_LENGTH } from '@/lib/passwordPolicy';
 import { formatCurrency } from '@/lib/money';
 import { formatDate, todayISO } from '@/lib/dates';
 import { EditPaycheckModal } from './EditPaycheckModal';
+import { EntityNotes } from '@/components/lists/EntityNotes';
 import {
   TAX_TRACKING_LABELS,
   trackingChoicesFor,
@@ -2321,6 +2322,9 @@ export default function EmployeesPage() {
             </Button>
           </div>
         </div>
+
+        {/* ---- Dated notes (QB Employee Center "Notes"); each note saves on its own ---- */}
+        {editId && <EntityNotes entityType="employee" entityId={editId} />}
       </Modal>
 
       {/* ---- Run Payroll Modal ---- */}

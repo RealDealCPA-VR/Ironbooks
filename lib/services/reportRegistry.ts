@@ -83,6 +83,7 @@ import {
   openInvoicesReport,
 } from './reportsAging';
 import { salesTaxLiabilityStd } from './reportsSalesTax';
+import { typeFilterLabel } from './reportTypeFilters';
 import { companies } from '@/lib/db/schema';
 import { eq } from 'drizzle-orm';
 
@@ -259,6 +260,9 @@ export async function executePreparedReport(
     report.notes = [...(report.notes ?? []), TRUNCATED_NOTE];
   }
   if (entry.basis) report.basis = params.basis === 'cash' ? 'cash' : 'accrual';
+  // B4: say which Customer / Vendor / Job Type the report is filtered to.
+  const typeLabel = await typeFilterLabel(ctx, params);
+  if (typeLabel) report.subtitle = report.subtitle ? `${report.subtitle} · ${typeLabel}` : typeLabel;
   report.range = await resolvedRange(ctx, params);
   rememberReportRun(ctx, key, params, report);
   return report;

@@ -41,6 +41,7 @@ import {
   inTransaction,
 } from './_base';
 import { assertListDeleteAllowed } from './accountantCopy/guard';
+import { assertTypeAssignable } from './typeLists';
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -52,6 +53,8 @@ export interface CreateJobInput {
   budget?: string | number | null;
   startDate?: Date | null;
   endDate?: Date | null;
+  /** B4: Job Type list entry (QB "Job Type"; a job report filter). */
+  jobTypeId?: string | null;
 }
 
 export type UpdateJobInput = Partial<CreateJobInput> & { status?: string };
@@ -89,6 +92,8 @@ export interface JobSummaryRow {
   profit: string;
   isActive: boolean;
   createdAt: Date;
+  /** B4: the job's Job Type (null = none). */
+  jobTypeId: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -134,6 +139,7 @@ export async function getJob(ctx: ServiceContext, id: string) {
 export async function createJob(ctx: ServiceContext, input: CreateJobInput) {
   validateCreateInput(input);
   if (input.customerId) await assertRefInCompany(ctx, customers, input.customerId, 'Customer');
+  await assertTypeAssignable(ctx, 'job', input.jobTypeId);
   return inTransaction(ctx, async (tx) => {
     const [job] = await tx.db
       .insert(jobs)
@@ -144,6 +150,7 @@ export async function createJob(ctx: ServiceContext, input: CreateJobInput) {
         budget: input.budget != null ? toAmountString(input.budget) : null,
         startDate: input.startDate ?? null,
         endDate: input.endDate ?? null,
+        jobTypeId: input.jobTypeId ?? null,
         status: 'active',
         isActive: true,
       })
@@ -172,11 +179,13 @@ export async function updateJob(ctx: ServiceContext, id: string, input: UpdateJo
   };
   validateCreateInput(merged);
   if (input.customerId) await assertRefInCompany(ctx, customers, input.customerId, 'Customer');
+  if (input.jobTypeId !== undefined) await assertTypeAssignable(ctx, 'job', input.jobTypeId, existing.jobTypeId);
 
   return inTransaction(ctx, async (tx) => {
     const patch: Record<string, unknown> = {};
     if (input.name !== undefined) patch.name = input.name.trim();
     if (input.customerId !== undefined) patch.customerId = input.customerId;
+    if (input.jobTypeId !== undefined) patch.jobTypeId = input.jobTypeId;
     if (input.budget !== undefined) patch.budget = input.budget != null ? toAmountString(input.budget) : null;
     if (input.startDate !== undefined) patch.startDate = input.startDate;
     if (input.endDate !== undefined) patch.endDate = input.endDate;
@@ -470,6 +479,7 @@ export async function jobsSummary(ctx: ServiceContext): Promise<JobSummaryRow[]>
       endDate: jobs.endDate,
       isActive: jobs.isActive,
       createdAt: jobs.createdAt,
+      jobTypeId: jobs.jobTypeId,
     })
     .from(jobs)
     .leftJoin(
@@ -498,6 +508,7 @@ export async function jobsSummary(ctx: ServiceContext): Promise<JobSummaryRow[]>
       endDate: j.endDate,
       isActive: j.isActive,
       createdAt: j.createdAt,
+      jobTypeId: j.jobTypeId ?? null,
       revenue: toAmountString(revenue),
       cost: toAmountString(cost),
       profit: toAmountString(profit),

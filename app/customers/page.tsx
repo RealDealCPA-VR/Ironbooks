@@ -3,9 +3,11 @@
 import { Suspense, useEffect, useState } from 'react';
 import { Users, Pencil, UserX, Plus, Download, ListPlus, PlusCircle, MinusCircle } from 'lucide-react';
 import {
+  AmountInput,
   Button,
   Card,
   ConfirmDialog,
+  DateInput,
   EmptyState,
   Input,
   Select,
@@ -32,6 +34,7 @@ import { Help } from '@/components/Help';
 import Link from 'next/link';
 import { ShipToEditor, shipToRowsFrom, shipToRowsPayload, type ShipToRow } from '@/components/sales/ShipToEditor';
 import type { ShipToAddress } from '@/lib/shipTo';
+import { todayISO } from '@/lib/dates';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -59,6 +62,27 @@ interface Customer {
   /** B12: price level used on this customer's sales forms. */
   priceLevelId?: string | null;
   shipToAddresses?: ShipToAddress[] | null;
+  /** B4: Customer Type list entry. */
+  customerTypeId?: string | null;
+}
+
+/** B4: Customer Type list entry (GET /api/type-lists/customer). */
+interface TypeOption {
+  id: string;
+  name: string;
+  parentId: string | null;
+  isActive: boolean;
+}
+
+/** "Parent:Child" name of a type list entry. */
+function typeFullName(t: TypeOption, all: TypeOption[]): string {
+  const path: string[] = [];
+  const seen = new Set<string>();
+  for (let cur: TypeOption | undefined = t; cur && !seen.has(cur.id); cur = cur.parentId ? all.find((x) => x.id === cur!.parentId) : undefined) {
+    seen.add(cur.id);
+    path.unshift(cur.name);
+  }
+  return path.join(':');
 }
 
 /** Price levels from Advanced Pricing (GET /api/pricing/levels). */
@@ -117,6 +141,10 @@ interface CustomerFormState {
   taxRateId: string;
   priceLevelId: string;
   notes: string;
+  customerTypeId: string;
+  /** New customer only (QB "Opening Balance ... as of"). */
+  openingBalance: string;
+  openingBalanceDate: string;
 }
 
 const EMPTY_FORM: CustomerFormState = {
@@ -132,6 +160,9 @@ const EMPTY_FORM: CustomerFormState = {
   taxRateId: '',
   priceLevelId: '',
   notes: '',
+  customerTypeId: '',
+  openingBalance: '',
+  openingBalanceDate: '',
 };
 
 function termsLabelFor(val: string | null) {
@@ -162,9 +193,15 @@ function CustomerForm({
   priceLevels,
   shipTos,
   onShipTosChange,
+  customerTypes,
+  isNew = false,
 }: {
   form: CustomerFormState;
   onChange: (field: keyof CustomerFormState, value: string) => void;
+  /** B4: the Customer Type list. */
+  customerTypes: TypeOption[];
+  /** New Customer: shows QB's "Opening Balance ... as of". */
+  isNew?: boolean;
   /** null = price levels could not be loaded (no access): the field is hidden. */
   priceLevels: PriceLevelOption[] | null;
   termsList: ListOption[];
@@ -221,6 +258,32 @@ function CustomerForm({
           />
         </div>
       </div>
+      {isNew && (
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <Label htmlFor="openingBalance">Opening balance</Label>
+            <AmountInput
+              id="openingBalance"
+              placeholder="0.00"
+              value={form.openingBalance}
+              onChange={(e) => onChange('openingBalance', e.target.value)}
+              onValueCommit={(v) => onChange('openingBalance', v)}
+            />
+          </div>
+          <div>
+            <Label htmlFor="openingBalanceDate">as of</Label>
+            <DateInput
+              id="openingBalanceDate"
+              value={form.openingBalanceDate}
+              onChange={(e) => onChange('openingBalanceDate', e.target.value)}
+            />
+          </div>
+          <p className="col-span-2 -mt-2 text-xs text-navy/50">
+            What this customer owes you on that date. It is recorded as an invoice to the customer (on
+            Uncategorized Income), so it shows in their balance and on A/R aging. Leave blank for none.
+          </p>
+        </div>
+      )}
       <div className="grid grid-cols-2 gap-3">
         <div>
           <Label htmlFor="terms">Payment Terms</Label>
@@ -265,6 +328,26 @@ function CustomerForm({
           ))}
         </Select>
         <p className="mt-1 text-xs text-navy/50">New invoices and other sales forms for this customer use this tax.</p>
+      </div>
+      <div>
+        <Label htmlFor="customerType">Customer type</Label>
+        <Select id="customerType" value={form.customerTypeId} onChange={(e) => onChange('customerTypeId', e.target.value)}>
+          <option value="">—</option>
+          {customerTypes
+            .filter((t) => t.isActive || t.id === form.customerTypeId)
+            .map((t) => ({ t, name: typeFullName(t, customerTypes) }))
+            .sort((a, b) => a.name.localeCompare(b.name))
+            .map(({ t, name }) => (
+              <option key={t.id} value={t.id}>
+                {name}
+                {t.isActive ? '' : ' — inactive'}
+              </option>
+            ))}
+        </Select>
+        <p className="mt-1 text-xs text-navy/50">
+          Groups customers (Retail, Wholesale…) for report filters and price rules. Edit the choices on the{' '}
+          <Link href="/lists?list=customer-types" className="text-electric hover:underline">Customer Types list</Link>.
+        </p>
       </div>
       {priceLevels && (
         <div>
@@ -476,10 +559,21 @@ function CustomersPageContent() {
   const [priceLevels, setPriceLevels] = useState<PriceLevelOption[] | null>(null);
   const [addShipTos, setAddShipTos] = useState<ShipToRow[]>([]);
   const [editShipTos, setEditShipTos] = useState<ShipToRow[]>([]);
+  const [customerTypes, setCustomerTypes] = useState<TypeOption[]>([]);
+  /** The type list loaded: only then does an edit send the type (never clear it unseen). */
+  const [customerTypesLoaded, setCustomerTypesLoaded] = useState(false);
   useEffect(() => {
     api
       .get<TaxRateOption[]>('/api/tax-rates')
       .then((d) => setTaxRates(Array.isArray(d) ? d : []))
+      .catch(() => {});
+    // B4: Customer Type list (non-fatal: the picker is just empty).
+    api
+      .get<{ types: TypeOption[] }>('/api/type-lists/customer')
+      .then((d) => {
+        setCustomerTypes(Array.isArray(d.types) ? d.types : []);
+        setCustomerTypesLoaded(true);
+      })
       .catch(() => {});
     // B12: price levels (hidden when the user cannot read Advanced Pricing).
     api
@@ -561,7 +655,7 @@ function CustomersPageContent() {
 
   function openAddModal() {
     // Preferences > Sales & Customers: default terms for new customers.
-    setAddForm({ ...EMPTY_FORM, terms: prefs.company.defaultCustomerTerms });
+    setAddForm({ ...EMPTY_FORM, terms: prefs.company.defaultCustomerTerms, openingBalanceDate: todayISO() });
     setAddShipTos([]);
     setAddCustom({});
     setAddOpen(true);
@@ -589,8 +683,12 @@ function CustomersPageContent() {
         taxExemptionReason: addForm.taxExemptionReason.trim() || undefined,
         taxRateId: addForm.taxRateId || undefined,
         priceLevelId: addForm.priceLevelId || undefined,
+        customerTypeId: addForm.customerTypeId || undefined,
         shipToAddresses: shipToRowsPayload(addShipTos),
         notes: addForm.notes.trim() || undefined,
+        // QB "Opening Balance ... as of": recorded as an invoice in the same save.
+        openingBalance: addForm.openingBalance.trim() || undefined,
+        openingBalanceDate: addForm.openingBalance.trim() ? addForm.openingBalanceDate || undefined : undefined,
       });
       try {
         await saveCustomValues(created.id, addCustom);
@@ -602,7 +700,13 @@ function CustomersPageContent() {
           'danger',
         );
       }
-      toast('Customer created', 'success');
+      const ob = (created as Customer & { openingBalanceDoc?: { kind: string } }).openingBalanceDoc;
+      toast(
+        ob
+          ? `Customer created. The opening balance is recorded as ${ob.kind === 'invoice' ? 'an invoice' : 'a credit memo'}.`
+          : 'Customer created',
+        'success',
+      );
       setAddOpen(false);
       await fetchCustomers();
     } catch (err) {
@@ -631,6 +735,9 @@ function CustomersPageContent() {
       taxRateId: customer.taxRateId ?? '',
       priceLevelId: customer.priceLevelId ?? '',
       notes: customer.notes ?? '',
+      customerTypeId: customer.customerTypeId ?? '',
+      openingBalance: '',
+      openingBalanceDate: '',
     });
     setEditShipTos(shipToRowsFrom(customer.shipToAddresses));
     setEditCustom({ ...(customer.customFields ?? {}) });
@@ -665,6 +772,7 @@ function CustomersPageContent() {
         taxRateId: editForm.taxRateId || null,
         // Only when the levels loaded, so a user without Advanced Pricing access never clears it.
         ...(priceLevels ? { priceLevelId: editForm.priceLevelId || null } : {}),
+        ...(customerTypesLoaded ? { customerTypeId: editForm.customerTypeId || null } : {}),
         shipToAddresses: shipToRowsPayload(editShipTos),
         notes: editForm.notes.trim() || null,
       });
@@ -901,6 +1009,8 @@ function CustomersPageContent() {
           priceLevels={priceLevels}
           shipTos={addShipTos}
           onShipTosChange={setAddShipTos}
+          customerTypes={customerTypes}
+          isNew
           customFieldNames={customFieldNames}
           customValues={addCustom}
           onCustomChange={(name, value) => setAddCustom((prev) => ({ ...prev, [name]: value }))}
@@ -936,6 +1046,7 @@ function CustomersPageContent() {
           priceLevels={priceLevels}
           shipTos={editShipTos}
           onShipTosChange={setEditShipTos}
+          customerTypes={customerTypes}
           customFieldNames={customFieldNames}
           customValues={editCustom}
           onCustomChange={(name, value) => setEditCustom((prev) => ({ ...prev, [name]: value }))}

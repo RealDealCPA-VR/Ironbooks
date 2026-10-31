@@ -11,6 +11,8 @@ export const createJobSchema = z.object({
   budget: zDecimal.nullish(),
   startDate: zDate.nullish(),
   endDate: zDate.nullish(),
+  /** B4: Job Type list entry. */
+  jobTypeId: zUuid.nullish(),
 });
 export type CreateJobBody = z.infer<typeof createJobSchema>;
 
@@ -22,5 +24,7 @@ export const updateJobSchema = z.object({
   startDate: zDate.nullish(),
   endDate: zDate.nullish(),
   status: z.string().optional(),
+  /** B4: Job Type list entry (null clears it). */
+  jobTypeId: zUuid.nullish(),
 });
 export type UpdateJobBody = z.infer<typeof updateJobSchema>;

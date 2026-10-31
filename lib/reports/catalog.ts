@@ -21,6 +21,10 @@ export type ReportControl =
   | 'account'
   | 'customer'
   | 'vendor'
+  /** B4: Customer Type / Vendor Type / Job Type (QB Filters > Customer Type, ...). */
+  | 'customerType'
+  | 'vendorType'
+  | 'jobType'
   | 'employee'
   | 'item'
   | 'job'
@@ -99,16 +103,16 @@ export const REPORT_CATALOG: CatalogEntry[] = [
   { key: 'account-listing', title: 'Account Listing', description: 'Your chart of accounts with balances.', group: 'Lists', area: 'reports_financial', controls: ['asOf'] },
 
   // ---- Customers & Receivables / Sales ----
-  { key: 'ar-aging-summary', title: 'A/R Aging Summary', description: 'What each customer owes, by how many days past due.', group: 'Customers & Receivables', area: 'reports_sales', controls: ['asOf', 'aging', 'customer', 'class'] },
-  { key: 'ar-aging-detail', title: 'A/R Aging Detail', description: 'Each open invoice and credit under its aging column.', group: 'Customers & Receivables', area: 'reports_sales', controls: ['asOf', 'aging', 'customer', 'class'] },
-  { key: 'open-invoices', title: 'Open Invoices', description: 'Unpaid invoices and credits by customer, as of a date.', group: 'Customers & Receivables', area: 'reports_sales', controls: ['asOf', 'customer', 'class', 'overdue'] },
-  { key: 'collections-report', title: 'Collections Report', description: 'Overdue invoices by customer, with phone and email.', group: 'Customers & Receivables', area: 'reports_sales', controls: ['asOf', 'customer', 'class', 'overdue'] },
-  { key: 'customer-balance-summary', title: 'Customer Balance Summary', description: 'What each customer owes you.', group: 'Customers & Receivables', area: 'reports_sales', controls: ['asOf'] },
-  { key: 'customer-balance-detail', title: 'Customer Balance Detail', description: 'Every invoice and payment behind each customer balance.', group: 'Customers & Receivables', area: 'reports_sales', controls: ['optionalRange', 'customer', 'sort'] },
+  { key: 'ar-aging-summary', title: 'A/R Aging Summary', description: 'What each customer owes, by how many days past due.', group: 'Customers & Receivables', area: 'reports_sales', controls: ['asOf', 'aging', 'customer', 'customerType', 'class'] },
+  { key: 'ar-aging-detail', title: 'A/R Aging Detail', description: 'Each open invoice and credit under its aging column.', group: 'Customers & Receivables', area: 'reports_sales', controls: ['asOf', 'aging', 'customer', 'customerType', 'class'] },
+  { key: 'open-invoices', title: 'Open Invoices', description: 'Unpaid invoices and credits by customer, as of a date.', group: 'Customers & Receivables', area: 'reports_sales', controls: ['asOf', 'customer', 'customerType', 'class', 'overdue'] },
+  { key: 'collections-report', title: 'Collections Report', description: 'Overdue invoices by customer, with phone and email.', group: 'Customers & Receivables', area: 'reports_sales', controls: ['asOf', 'customer', 'customerType', 'class', 'overdue'] },
+  { key: 'customer-balance-summary', title: 'Customer Balance Summary', description: 'What each customer owes you.', group: 'Customers & Receivables', area: 'reports_sales', controls: ['asOf', 'customerType'] },
+  { key: 'customer-balance-detail', title: 'Customer Balance Detail', description: 'Every invoice and payment behind each customer balance.', group: 'Customers & Receivables', area: 'reports_sales', controls: ['optionalRange', 'customer', 'customerType', 'sort'] },
   { key: 'transaction-list-by-customer', title: 'Transaction List by Customer', description: 'All transactions, grouped by customer.', group: 'Customers & Receivables', area: 'reports_sales', controls: ['range', 'customer', 'txnType', 'amount', 'memo', 'number', 'sort'] },
-  { key: 'sales-by-customer-summary', title: 'Sales by Customer Summary', description: 'Total sales per customer and job.', group: 'Sales', area: 'reports_sales', controls: ['range', 'customer', 'item', 'class'], basis: true },
+  { key: 'sales-by-customer-summary', title: 'Sales by Customer Summary', description: 'Total sales per customer and job.', group: 'Sales', area: 'reports_sales', controls: ['range', 'customer', 'customerType', 'item', 'class'], basis: true },
   { key: 'sales-by-item-summary', title: 'Sales by Item Summary', description: 'Quantity, sales, cost and gross margin per item.', group: 'Sales', area: 'reports_sales', controls: ['range', 'customer', 'item', 'class'], basis: true },
-  { key: 'sales-by-customer-detail', title: 'Sales by Customer Detail', description: 'Every item sold, grouped by customer.', group: 'Sales', area: 'reports_sales', controls: ['range', 'customer', 'item', 'class'], basis: true },
+  { key: 'sales-by-customer-detail', title: 'Sales by Customer Detail', description: 'Every item sold, grouped by customer.', group: 'Sales', area: 'reports_sales', controls: ['range', 'customer', 'customerType', 'item', 'class'], basis: true },
   { key: 'sales-by-item-detail', title: 'Sales by Item Detail', description: 'Every sale, grouped by item.', group: 'Sales', area: 'reports_sales', controls: ['range', 'customer', 'item', 'class'], basis: true },
   { key: 'open-sales-orders-by-customer', title: 'Open Sales Orders by Customer', description: 'Sales orders not yet invoiced, by customer.', group: 'Sales', area: 'reports_sales', controls: ['customer', 'item'] },
   { key: 'open-sales-orders-by-item', title: 'Open Sales Orders by Item', description: 'Sales orders not yet invoiced, by item.', group: 'Sales', area: 'reports_sales', controls: ['customer', 'item'] },
@@ -118,9 +122,9 @@ export const REPORT_CATALOG: CatalogEntry[] = [
   { key: 'item-listing', title: 'Item Listing', description: 'Items with cost, price, quantity and accounts.', group: 'Lists', area: 'reports_sales', controls: [] },
 
   // ---- Jobs, Time & Mileage ----
-  { key: 'job-profitability-summary', title: 'Job Profitability Summary', description: 'Actual revenue vs actual cost per customer or job.', group: 'Jobs, Time & Mileage', area: 'reports_sales', controls: ['optionalRange'] },
-  { key: 'job-profitability-detail', title: 'Job Profitability Detail', description: 'Revenue and cost by item for one job.', group: 'Jobs, Time & Mileage', area: 'reports_sales', controls: ['optionalRange', 'customer', 'job'] },
-  { key: 'job-estimates-vs-actuals', title: 'Job Estimates vs. Actuals', description: 'Estimated revenue vs what you actually billed.', group: 'Jobs, Time & Mileage', area: 'reports_sales', controls: ['optionalRange'] },
+  { key: 'job-profitability-summary', title: 'Job Profitability Summary', description: 'Actual revenue vs actual cost per customer or job.', group: 'Jobs, Time & Mileage', area: 'reports_sales', controls: ['optionalRange', 'jobType'] },
+  { key: 'job-profitability-detail', title: 'Job Profitability Detail', description: 'Revenue and cost by item for one job.', group: 'Jobs, Time & Mileage', area: 'reports_sales', controls: ['optionalRange', 'customer', 'job', 'jobType'] },
+  { key: 'job-estimates-vs-actuals', title: 'Job Estimates vs. Actuals', description: 'Estimated revenue vs what you actually billed.', group: 'Jobs, Time & Mileage', area: 'reports_sales', controls: ['optionalRange', 'jobType'] },
   { key: 'item-estimates-vs-actuals', title: 'Item Estimates vs. Actuals', description: 'Estimated vs actual quantity and revenue per item.', group: 'Jobs, Time & Mileage', area: 'reports_sales', controls: ['optionalRange'] },
   { key: 'unbilled-costs-by-job', title: 'Unbilled Costs by Job', description: 'Billable expenses and time not yet invoiced.', group: 'Jobs, Time & Mileage', area: 'reports_sales', controls: [] },
   { key: 'time-by-job', title: 'Time by Job', description: 'Hours per customer or job.', group: 'Jobs, Time & Mileage', area: 'time', controls: ['range', 'view', 'employee', 'customer', 'item'] },
@@ -130,17 +134,17 @@ export const REPORT_CATALOG: CatalogEntry[] = [
   { key: 'mileage-by-vehicle', title: 'Mileage by Vehicle', description: 'Miles driven per vehicle.', group: 'Jobs, Time & Mileage', area: 'time', controls: ['range', 'view', 'vehicle'] },
 
   // ---- Vendors & Payables / Purchases ----
-  { key: 'ap-aging-summary', title: 'A/P Aging Summary', description: 'What you owe each vendor, by how many days past due.', group: 'Vendors & Payables', area: 'reports_purchases', controls: ['asOf', 'aging', 'vendor', 'class'] },
-  { key: 'ap-aging-detail', title: 'A/P Aging Detail', description: 'Each open bill and credit under its aging column.', group: 'Vendors & Payables', area: 'reports_purchases', controls: ['asOf', 'aging', 'vendor', 'class'] },
+  { key: 'ap-aging-summary', title: 'A/P Aging Summary', description: 'What you owe each vendor, by how many days past due.', group: 'Vendors & Payables', area: 'reports_purchases', controls: ['asOf', 'aging', 'vendor', 'vendorType', 'class'] },
+  { key: 'ap-aging-detail', title: 'A/P Aging Detail', description: 'Each open bill and credit under its aging column.', group: 'Vendors & Payables', area: 'reports_purchases', controls: ['asOf', 'aging', 'vendor', 'vendorType', 'class'] },
   { key: 'sales-tax-liability', title: 'Sales Tax Liability', description: 'Sales tax collected, paid and still owed, by tax agency.', group: 'Vendors & Payables', area: 'sales_tax', controls: ['range'] },
-  { key: 'vendor-balance-summary', title: 'Vendor Balance Summary', description: 'What you owe each vendor.', group: 'Vendors & Payables', area: 'reports_purchases', controls: ['asOf'] },
-  { key: 'vendor-balance-detail', title: 'Vendor Balance Detail', description: 'Every bill and payment behind each vendor balance.', group: 'Vendors & Payables', area: 'reports_purchases', controls: ['optionalRange', 'vendor', 'sort'] },
-  { key: 'unpaid-bills-detail', title: 'Unpaid Bills Detail', description: 'Open bills and credits by vendor, with days past due.', group: 'Vendors & Payables', area: 'reports_purchases', controls: ['asOf', 'vendor', 'overdue'] },
+  { key: 'vendor-balance-summary', title: 'Vendor Balance Summary', description: 'What you owe each vendor.', group: 'Vendors & Payables', area: 'reports_purchases', controls: ['asOf', 'vendorType'] },
+  { key: 'vendor-balance-detail', title: 'Vendor Balance Detail', description: 'Every bill and payment behind each vendor balance.', group: 'Vendors & Payables', area: 'reports_purchases', controls: ['optionalRange', 'vendor', 'vendorType', 'sort'] },
+  { key: 'unpaid-bills-detail', title: 'Unpaid Bills Detail', description: 'Open bills and credits by vendor, with days past due.', group: 'Vendors & Payables', area: 'reports_purchases', controls: ['asOf', 'vendor', 'vendorType', 'overdue'] },
   { key: 'bills-applied-payments', title: 'Bills & Applied Payments', description: 'Each bill with the payments and credits applied to it.', group: 'Vendors & Payables', area: 'reports_purchases', controls: ['range', 'vendor'] },
   { key: 'transaction-list-by-vendor', title: 'Transaction List by Vendor', description: 'All transactions, grouped by vendor.', group: 'Vendors & Payables', area: 'reports_purchases', controls: ['range', 'vendor', 'txnType', 'amount', 'memo', 'number', 'sort'] },
   { key: 'expenses-by-vendor-summary', title: 'Expenses by Vendor Summary', description: 'Total spending per vendor.', group: 'Vendors & Payables', area: 'reports_purchases', controls: ['range', 'class'], basis: true },
   { key: 'expenses-by-vendor-detail', title: 'Expenses by Vendor Detail', description: 'Every expense, grouped by vendor.', group: 'Vendors & Payables', area: 'reports_purchases', controls: ['range', 'vendor', 'class', 'memo', 'sort'], basis: true },
-  { key: 'purchases-by-vendor-summary', title: 'Purchases by Vendor Summary', description: 'Items bought from each vendor.', group: 'Purchases', area: 'reports_purchases', controls: ['range', 'item', 'vendor'] },
+  { key: 'purchases-by-vendor-summary', title: 'Purchases by Vendor Summary', description: 'Items bought from each vendor.', group: 'Purchases', area: 'reports_purchases', controls: ['range', 'item', 'vendor', 'vendorType'] },
   { key: 'purchases-by-item-summary', title: 'Purchases by Item Summary', description: 'Quantity and cost of each item bought.', group: 'Purchases', area: 'reports_purchases', controls: ['range', 'item', 'vendor'] },
   { key: 'purchases-by-item-detail', title: 'Purchases by Item Detail', description: 'Every item bought, grouped by item.', group: 'Purchases', area: 'reports_purchases', controls: ['range', 'item', 'vendor'] },
   { key: 'open-purchase-orders', title: 'Open Purchase Orders', description: 'Purchase orders not yet received.', group: 'Purchases', area: 'reports_purchases', controls: ['vendor'] },

@@ -73,6 +73,10 @@ export const reportParamsSchema = z
      */
     customerJobId: zId.optional(),
     classId: zId.optional(),
+    /** B4: Customer Type / Vendor Type / Job Type filters (a type includes its subtypes). */
+    customerTypeId: zId.optional(),
+    vendorTypeId: zId.optional(),
+    jobTypeId: zId.optional(),
     budgetId: zId.optional(),
     txnType: z.enum(TXN_TYPE_KEYS).optional(),
     amountMin: zAmount.optional(),

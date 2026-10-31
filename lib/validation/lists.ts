@@ -208,3 +208,11 @@ export const taxRatePatchSchema = z.object({
   agencyId: zUuid.nullish(),
   isActive: z.boolean().optional(),
 });
+
+/** B18: POST /api/tax-rates — a new sales tax item { name, rate (0..1 fraction), agencyId?, isActive? }. */
+export const taxRateCreateSchema = z.object({
+  name: zName(255, 'Rate name'),
+  rate: zDecimal,
+  agencyId: zUuid.nullish(),
+  isActive: z.boolean().optional(),
+});

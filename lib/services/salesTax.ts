@@ -7,6 +7,7 @@ import { and, eq, sql } from 'drizzle-orm';
 import { accounts, creditMemos, taxAgencies, taxRateComponents, taxRates, invoices } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from './_base';
+import { assertListDeleteAllowed } from './accountantCopy/guard';
 
 /**
  * A sales tax rate as a decimal fraction 0..1 (0.0825 = 8.25%). Text that is not a number used to
@@ -36,6 +37,7 @@ export async function createTaxAgency(
   input: { name: string; liabilityAccountId?: string | null },
 ) {
   if (!input.name?.trim()) throw validation('Agency name is required.');
+  if (input.name.trim().length > 255) throw validation('Agency name is too long (255 characters at most).');
   // The liability account, when given, must belong to this company.
   if (input.liabilityAccountId) {
     const [acct] = await ctx.db
@@ -45,6 +47,13 @@ export async function createTaxAgency(
     if (!acct) throw notFound('Liability account');
   }
   return inTransaction(ctx, async (tx) => {
+    // B18: agencies are picked by name on the Sales Tax Items list — two with one name could not
+    // be told apart (checked in the insert's transaction, so a double-click adds it once).
+    const [dup] = await tx.db
+      .select({ id: taxAgencies.id })
+      .from(taxAgencies)
+      .where(and(eq(taxAgencies.companyId, tx.companyId), sql`lower(${taxAgencies.name}) = lower(${input.name.trim()})`));
+    if (dup) throw validation(`A tax agency named "${input.name.trim()}" already exists.`);
     const [row] = await tx.db
       .insert(taxAgencies)
       .values({
@@ -65,37 +74,73 @@ export async function listTaxRates(ctx: ServiceContext, opts?: { includeInactive
   return ctx.db.select().from(taxRates).where(where);
 }
 
+/**
+ * B18: a sales tax item's name is unique in the company (case-insensitive, as QB item names):
+ * two "State Tax" items in the tax pick-lists could not be told apart.
+ */
+async function assertTaxRateNameFree(ctx: ServiceContext, name: string, selfId?: string) {
+  const [dup] = await ctx.db
+    .select({ id: taxRates.id })
+    .from(taxRates)
+    .where(
+      and(
+        eq(taxRates.companyId, ctx.companyId),
+        sql`lower(${taxRates.name}) = lower(${name})`,
+        ...(selfId ? [sql`${taxRates.id} <> ${selfId}`] : []),
+      ),
+    );
+  if (dup) throw validation(`A sales tax item named "${name}" already exists. Pick another name.`);
+}
+
+function cleanTaxRateName(raw: string | undefined): string {
+  const name = (raw ?? '').trim();
+  if (!name) throw validation('Rate name is required.');
+  if (name.length > 255) throw validation('Rate name is too long (255 characters at most).');
+  return name;
+}
+
+/** The agency, when given, must be one of this company's tax agencies (never another company's). */
+async function assertAgencyInCompany(ctx: ServiceContext, agencyId: string) {
+  const [agency] = await ctx.db
+    .select({ id: taxAgencies.id })
+    .from(taxAgencies)
+    .where(and(eq(taxAgencies.id, agencyId), eq(taxAgencies.companyId, ctx.companyId)));
+  if (!agency) throw notFound('Tax agency');
+}
+
 export async function createTaxRate(
   ctx: ServiceContext,
-  input: { name: string; rate: string | number; agencyId?: string | null },
+  input: { name: string; rate: string | number; agencyId?: string | null; isActive?: boolean },
 ) {
-  if (!input.name?.trim()) throw validation('Rate name is required.');
+  const name = cleanTaxRateName(input.name);
   const rate = parseTaxRateFraction(input.rate);
-  if (input.agencyId) {
-    // Same company check as updateTaxRate: never link another company's tax agency.
-    const [agency] = await ctx.db
-      .select({ id: taxAgencies.id })
-      .from(taxAgencies)
-      .where(and(eq(taxAgencies.id, input.agencyId), eq(taxAgencies.companyId, ctx.companyId)));
-    if (!agency) throw notFound('Tax agency');
-  }
-  const [row] = await ctx.db
-    .insert(taxRates)
-    .values({
-      companyId: ctx.companyId,
-      name: input.name.trim(),
-      rate: rate.toFixed(6),
-      agencyId: input.agencyId ?? null,
-    })
-    .returning();
-  await writeAudit(ctx, { action: 'create', entityType: 'tax_rate', entityId: row.id, newValues: row });
-  return row;
+  if (input.agencyId) await assertAgencyInCompany(ctx, input.agencyId);
+  // The unique-name check runs in the insert's transaction (a double-clicked Save must not add
+  // the item twice).
+  return inTransaction(ctx, async (tx) => {
+    await assertTaxRateNameFree(tx, name);
+    const [row] = await tx.db
+      .insert(taxRates)
+      .values({
+        companyId: tx.companyId,
+        name,
+        rate: rate.toFixed(6),
+        agencyId: input.agencyId ?? null,
+        isActive: input.isActive ?? true,
+      })
+      .returning();
+    await writeAudit(tx, { action: 'create', entityType: 'tax_rate', entityId: row.id, newValues: row });
+    return row;
+  });
 }
 
 /**
  * Edit a sales tax rate item (QB: edit the Sales Tax Item). A new rate applies to transactions
- * entered from now on — posted invoices keep the tax they were charged (their taxAmount and
- * journal entries are not touched). Deactivating hides the rate from new transactions.
+ * entered from now on — saved invoices, sales receipts and credit memos keep the tax they were
+ * charged (they store the item and the tax AMOUNT; their taxAmount and journal entries are not
+ * touched). Note: re-saving one of those documents after an edit works its tax out again from the
+ * item's current rate (the documents do not store the percentage). Deactivating hides the item
+ * from new transactions (GET /api/tax-rates lists active items only).
  */
 export async function updateTaxRate(
   ctx: ServiceContext,
@@ -103,8 +148,10 @@ export async function updateTaxRate(
   patch: { name?: string; rate?: string | number; agencyId?: string | null; isActive?: boolean },
 ) {
   const before = await getTaxRate(ctx, id);
-  const name = patch.name !== undefined ? patch.name.trim() : before.name;
-  if (!name) throw validation('Rate name is required.');
+  const name = patch.name !== undefined ? cleanTaxRateName(patch.name) : before.name;
+  // Making an item inactive is deleting it from the list: refused while an Accountant's Copy is
+  // out (I1), like every other list.
+  if (patch.isActive === false && before.isActive) await assertListDeleteAllowed(ctx, 'delete', 'sales tax items');
   let rate = before.rate;
   if (patch.rate !== undefined) {
     const r = parseTaxRateFraction(patch.rate);
@@ -119,14 +166,9 @@ export async function updateTaxRate(
     }
     rate = r.toFixed(6);
   }
-  if (patch.agencyId) {
-    const [agency] = await ctx.db
-      .select({ id: taxAgencies.id })
-      .from(taxAgencies)
-      .where(and(eq(taxAgencies.id, patch.agencyId), eq(taxAgencies.companyId, ctx.companyId)));
-    if (!agency) throw notFound('Tax agency');
-  }
+  if (patch.agencyId) await assertAgencyInCompany(ctx, patch.agencyId);
   return inTransaction(ctx, async (tx) => {
+    if (name.toLowerCase() !== before.name.toLowerCase()) await assertTaxRateNameFree(tx, name, id);
     const [row] = await tx.db
       .update(taxRates)
       .set({
