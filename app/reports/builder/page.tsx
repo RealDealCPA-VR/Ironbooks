@@ -25,7 +25,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
-import { formatCurrency } from '@/lib/money';
+import { useReportNumbers } from '@/app/reports/_components/NumberFormatPanel';
 import type { ReportConfig, ReportResult } from '@/lib/services/reportBuilder';
 import { csvMinimal, withCsvBom } from '@/lib/csv';
 import { memorizedIdFrom } from '../_components/memorizedHref';
@@ -90,6 +90,8 @@ function downloadCsv(csv: string, filename: string) {
 // ---------------------------------------------------------------------------
 
 export default function ReportBuilderPage() {
+  // Fonts & Numbers (the same remembered format as the standard reports).
+  const nums = useReportNumbers();
   // --- Config state ---
   const [from, setFrom] = useState('');
   const [to, setTo] = useState('');
@@ -222,7 +224,7 @@ export default function ReportBuilderPage() {
   }
 
   return (
-    <main className="min-h-screen bg-offwhite p-8 font-sans">
+    <main className={`min-h-screen bg-offwhite p-8 ${nums.tableClass}`}>
       <PageHeader
         title="Custom Report Builder"
         icon={Wrench}
@@ -252,6 +254,8 @@ export default function ReportBuilderPage() {
           </div>
         }
       />
+      <div className="-mt-3 mb-4 flex justify-end print-hidden">{nums.button}</div>
+      {nums.panel}
 
       {/* Saved reports panel */}
       {savedOpen && saved.length > 0 && (
@@ -390,17 +394,17 @@ export default function ReportBuilderPage() {
                         )}
                       </Td>
                       <Td className="text-right tabular-nums">
-                        {Number(row.debit) !== 0 ? formatCurrency(row.debit) : '—'}
+                        {Number(row.debit) !== 0 ? nums.money(row.debit) : '—'}
                       </Td>
                       <Td className="text-right tabular-nums">
-                        {Number(row.credit) !== 0 ? formatCurrency(row.credit) : '—'}
+                        {Number(row.credit) !== 0 ? nums.money(row.credit) : '—'}
                       </Td>
                       <Td
                         className={`text-right tabular-nums font-semibold ${
                           net < 0 ? 'text-red-600' : net > 0 ? 'text-navy' : 'text-navy/40'
                         }`}
                       >
-                        {formatCurrency(row.net)}
+                        {nums.money(row.net)}
                       </Td>
                     </Tr>
                   );
@@ -410,17 +414,17 @@ export default function ReportBuilderPage() {
                 <tr className="border-t-2 border-navy/20 bg-slate-50">
                   <td className="py-3 px-4 font-bold text-navy">Totals</td>
                   <td className="py-3 px-4 text-right tabular-nums font-bold text-navy">
-                    {formatCurrency(result.totals.debit)}
+                    {nums.money(result.totals.debit)}
                   </td>
                   <td className="py-3 px-4 text-right tabular-nums font-bold text-navy">
-                    {formatCurrency(result.totals.credit)}
+                    {nums.money(result.totals.credit)}
                   </td>
                   <td
                     className={`py-3 px-4 text-right tabular-nums font-bold text-lg ${
                       Number(result.totals.net) < 0 ? 'text-red-600' : 'text-emerald'
                     }`}
                   >
-                    {formatCurrency(result.totals.net)}
+                    {nums.money(result.totals.net)}
                   </td>
                 </tr>
               </tfoot>
