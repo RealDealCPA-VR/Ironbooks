@@ -11,6 +11,10 @@ describe('QuickBooks keys in the browser', () => {
     expectAllPassed(await runDomFile('test/dom/keyboardForms.dom.tsx'));
   }, 180_000);
 
+  it('lists, registers, reports, pickers, menus and the window keys', async () => {
+    expectAllPassed(await runDomFile('test/dom/keyboardLists.dom.tsx'));
+  }, 180_000);
+
   it('review leftovers: calendar to-do delete asks, memorized report load failure, conversion rates', async () => {
     expectAllPassed(await runDomFile('test/dom/keyboardLeftovers.dom.tsx'));
   }, 180_000);

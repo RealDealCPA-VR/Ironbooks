@@ -72,7 +72,7 @@ export async function runDomFile(file: string, timeoutMs = 150_000): Promise<Dom
   const html = path.join(dir, 'index.html');
   fs.writeFileSync(
     html,
-    `<!doctype html><html><head><meta charset="utf-8"><title>dom test</title></head><body><main id="dom-main"></main><script src="bundle.js"></script></body></html>`,
+    `<!doctype html><html><head><meta charset="utf-8"><title>dom test</title></head><body><script src="bundle.js"></script></body></html>`,
   );
   const results = path.join(dir, 'results.json');
   const env = { ...process.env };
