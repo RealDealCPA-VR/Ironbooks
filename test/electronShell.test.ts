@@ -9,7 +9,7 @@ import { createRequire } from 'node:module';
 import { GLOBAL_SHORTCUTS } from '../lib/shortcuts';
 
 const require = createRequire(import.meta.url);
-const { MENU_SECTIONS, menuRoutes, buildSectionMenus } = require('../electron/menuRoutes.js');
+const { MENU_SECTIONS, FILE_UTILITIES, menuRoutes, menuActions, buildSectionMenus, buildUtilitiesMenu } = require('../electron/menuRoutes.js');
 const { configureSpellChecker, contextMenuTemplate, NO_DOWNLOAD_URL } = require('../electron/spelling.js');
 
 const APP_DIR = path.resolve(__dirname, '..', 'app');
@@ -17,6 +17,7 @@ const APP_DIR = path.resolve(__dirname, '..', 'app');
 describe('application menus', () => {
   it('has the QuickBooks menu sections', () => {
     expect(MENU_SECTIONS.map((s: { label: string }) => s.label)).toEqual([
+      'Accountant',
       'Company',
       'Customers',
       'Vendors',
@@ -69,6 +70,58 @@ describe('application menus', () => {
         expect(sc?.href, `${item.label} ${item.shortcut}`).toBe(item.route);
       }
     }
+  });
+
+  // J14 (feature round, accountant): QB's Accountant menu, File > Utilities, and Set Closing Date
+  // opening the closing-date dialog instead of the Fiscal Periods page.
+  it('has an Accountant menu with the accountant tools', () => {
+    const acct = MENU_SECTIONS.find((s: { label: string }) => s.label === 'Accountant');
+    const labels = acct.items.map((i: { label?: string }) => i.label).filter(Boolean);
+    for (const want of [
+      'Accountant Center',
+      'Batch Enter Transactions',
+      'Batch Delete/Void Transactions',
+      'Client Data Review',
+      'Working Trial Balance',
+      'Reclassify Transactions',
+      'Set Closing Date…',
+      "Accountant's Copy…",
+    ]) {
+      expect(labels, want).toContain(want);
+    }
+  });
+
+  it('File > Utilities offers find, import / export, verify, rebuild and condense', () => {
+    const labels = FILE_UTILITIES.map((i: { label?: string }) => i.label).filter(Boolean);
+    for (const want of ['Find…', 'Verify Data', 'Rebuild Data', 'Condense Data…', 'Export Lists to IIF Files…', 'Set Closing Date…']) {
+      expect(labels, want).toContain(want);
+    }
+    const navigate = vi.fn();
+    const send = vi.fn();
+    const menu = buildUtilitiesMenu(navigate, send, 'win32');
+    expect(menu.label).toBe('Utilities');
+    menu.submenu.find((i: { label?: string }) => i.label === 'Verify Data').click();
+    expect(navigate).toHaveBeenCalledWith('/integrity');
+    const main = fs.readFileSync(path.resolve(__dirname, '..', 'electron', 'main.js'), 'utf8');
+    expect(main).toContain('buildUtilitiesMenu(navigate, sendMenuAction)');
+  });
+
+  it('Set Closing Date opens the dialog (a menu action), not the Fiscal Periods page', () => {
+    const navigate = vi.fn();
+    const send = vi.fn();
+    const menus = buildSectionMenus(navigate, 'win32', send);
+    for (const section of ['Accountant', 'Company']) {
+      const item = menus
+        .find((m: { label: string }) => m.label === section)
+        .submenu.find((i: { label?: string }) => i.label === 'Set Closing Date…');
+      item.click();
+    }
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(send).toHaveBeenCalledWith('set-closing-date');
+    expect(navigate).not.toHaveBeenCalled();
+    // Every menu action is handled by the renderer bridge.
+    const bridge = fs.readFileSync(path.resolve(__dirname, '..', 'components', 'DesktopBridge.tsx'), 'utf8');
+    for (const action of menuActions() as string[]) expect(bridge, action).toContain(`action === '${action}'`);
   });
 
   it('macOS gets no key equivalents (they would take the key before the page)', () => {

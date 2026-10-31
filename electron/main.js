@@ -41,7 +41,7 @@ const { app, BrowserWindow, Menu, dialog, ipcMain, nativeTheme, shell, session }
     // Fall back to the default (new) userData location.
   }
 })();
-const { buildSectionMenus } = require('./menuRoutes');
+const { buildSectionMenus, buildUtilitiesMenu } = require('./menuRoutes');
 const spelling = require('./spelling');
 const windowTheme = require('./windowTheme');
 const startScreen = require('./startScreen');
@@ -1964,6 +1964,8 @@ function buildMenu() {
         // QB File > Send Company File > Accountant's Copy (I1) and File > Create Copy > Period Copy (I7).
         { label: "Accountant's Copy…", click: () => navigate('/accountant/accountants-copy') },
         { label: 'Create Period Copy…', click: () => navigate('/accountant/period-copy') },
+        // QB File > Utilities (find, import / export, verify / rebuild, condense, closing date).
+        buildUtilitiesMenu(navigate, sendMenuAction),
         { type: 'separator' },
         { role: 'quit' },
       ],
@@ -1985,7 +1987,7 @@ function buildMenu() {
     // Reload on F5 (not the default Ctrl+R): Ctrl+R is the QB "Registers" shortcut in the app.
     { label: 'View', submenu: [{ role: 'reload', accelerator: 'F5' }, { role: 'toggleDevTools' }, { type: 'separator' }, { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' }, { type: 'separator' }, { role: 'togglefullscreen' }] },
     // QB menus: Company, Customers, Vendors, Employees, Banking, Reports, Lists (electron/menuRoutes.js).
-    ...buildSectionMenus(navigate),
+    ...buildSectionMenus(navigate, process.platform, sendMenuAction),
     {
       label: 'Window',
       submenu: [
@@ -2012,6 +2014,11 @@ function buildMenu() {
     },
   ];
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
+
+/** An in-app menu action (e.g. 'set-closing-date' opens that dialog over the current window). */
+function sendMenuAction(action) {
+  mainWindow?.webContents.send('menu', action);
 }
 
 function navigate(route) {

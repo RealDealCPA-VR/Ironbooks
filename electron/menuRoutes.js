@@ -1,5 +1,5 @@
-// QuickBooks-style application menus (Company, Customers, Vendors, Employees, Banking, Reports,
-// Lists) as plain data: label -> in-app route. electron/main.js turns them into native menu items
+// QuickBooks-style application menus (Accountant, Company, Customers, Vendors, Employees, Banking,
+// Reports, Lists, and File > Utilities) as plain data: label -> in-app route. electron/main.js turns them into native menu items
 // that navigate through the DesktopBridge IPC ('navigate'); the Window menu is built there.
 //
 // Pure module (no electron import) so tests can check every route is a real page.
@@ -10,10 +10,69 @@
 
 'use strict';
 
-/** @typedef {{ label: string, route: string, shortcut?: string } | { separator: true }} MenuEntry */
+/**
+ * A menu item opens a page (`route`) or runs an in-app action (`action`, sent to the page as a
+ * 'menu' message: 'set-closing-date' opens the Set Closing Date dialog over the current window,
+ * like QuickBooks, instead of leaving it).
+ * @typedef {{ label: string, route: string, shortcut?: string } | { label: string, action: string } | { separator: true }} MenuEntry
+ */
+
+/**
+ * QB Accountant menu (Accountant / Premier Accountant editions): the accountant's tools in one
+ * place. Placed before Company, as QuickBooks does.
+ * @type {{ label: string, items: MenuEntry[] }}
+ */
+const ACCOUNTANT_MENU = {
+  label: 'Accountant',
+  items: [
+    { label: 'Accountant Center', route: '/accountant' },
+    { label: 'Chart of Accounts', route: '/accounts', shortcut: 'Ctrl+A' },
+    { label: 'Fixed Asset Item List', route: '/fixed-assets' },
+    { label: 'Batch Enter Transactions', route: '/accountant/batch-enter' },
+    { label: 'Batch Delete/Void Transactions', route: '/accountant/batch-void' },
+    { label: 'Client Data Review', route: '/accountant/client-data-review' },
+    { label: 'Make General Journal Entries', route: '/journal' },
+    { label: 'Reconcile', route: '/reconcile' },
+    { label: 'Working Trial Balance', route: '/accountant/working-trial-balance' },
+    { separator: true },
+    { label: 'Set Closing Date…', action: 'set-closing-date' },
+    { label: 'Closing Date Exception Report', route: '/reports/closing-date-exceptions' },
+    { label: 'Voided/Deleted Transactions', route: '/reports/voided-deleted' },
+    { label: 'Review List Changes', route: '/accountant/list-changes' },
+    { separator: true },
+    { label: 'Reclassify Transactions', route: '/accountant/reclassify' },
+    { label: 'Write Off Invoices', route: '/accountant/write-off' },
+    { label: 'Fix Sales Tax', route: '/accountant/fix-sales-tax' },
+    { label: 'Sales Tax Adjustment', route: '/accountant/sales-tax-adjustment' },
+    { separator: true },
+    { label: "Accountant's Copy…", route: '/accountant/accountants-copy' },
+    { label: 'Create Period Copy…', route: '/accountant/period-copy' },
+    { label: 'Condense Data…', route: '/backup' },
+  ],
+};
+
+/**
+ * QB File > Utilities: find, import / export, verify and rebuild, condense. main.js puts it in
+ * the File menu (the rest of File is built there: company files, backups, hosting).
+ * @type {MenuEntry[]}
+ */
+const FILE_UTILITIES = [
+  { label: 'Find…', route: '/find' },
+  { separator: true },
+  { label: 'Import QuickBooks Files (IIF, Excel, reports)…', route: '/qb-import' },
+  { label: 'Export Lists to IIF Files…', route: '/qb-import?tab=export' },
+  { separator: true },
+  { label: 'Verify Data', route: '/integrity' },
+  { label: 'Rebuild Data', route: '/integrity' },
+  { label: 'Condense Data…', route: '/backup' },
+  { separator: true },
+  { label: 'Set Closing Date…', action: 'set-closing-date' },
+  { label: 'Fiscal Periods', route: '/fiscal-periods' },
+];
 
 /** @type {Array<{ label: string, items: MenuEntry[] }>} */
 const MENU_SECTIONS = [
+  ACCOUNTANT_MENU,
   {
     label: 'Company',
     items: [
@@ -29,7 +88,8 @@ const MENU_SECTIONS = [
       { label: 'Setup Interview…', route: '/onboarding' },
       { label: 'Form Templates', route: '/templates' },
       { label: 'Users and Roles', route: '/users' },
-      { label: 'Set Closing Date / Fiscal Periods', route: '/fiscal-periods' },
+      { label: 'Set Closing Date…', action: 'set-closing-date' },
+      { label: 'Fiscal Periods', route: '/fiscal-periods' },
       { separator: true },
       { label: 'Chart of Accounts', route: '/accounts', shortcut: 'Ctrl+A' },
       { label: 'Make General Journal Entries', route: '/journal' },
@@ -131,13 +191,36 @@ const MENU_SECTIONS = [
   },
 ];
 
-/** Every distinct route the menus can open (for tests). */
+/** Every distinct route the menus can open, File > Utilities included (for tests). */
 function menuRoutes() {
   const out = new Set();
   for (const section of MENU_SECTIONS) {
     for (const item of section.items) if ('route' in item) out.add(item.route);
   }
+  for (const item of FILE_UTILITIES) if ('route' in item) out.add(item.route);
   return [...out];
+}
+
+/** Every in-app action the menus can send (for tests: DesktopBridge handles each one). */
+function menuActions() {
+  const out = new Set();
+  for (const item of [...MENU_SECTIONS.flatMap((s) => s.items), ...FILE_UTILITIES]) if ('action' in item) out.add(item.action);
+  return [...out];
+}
+
+/**
+ * One native menu item for an entry (shortcut keys displayed, not registered: see
+ * buildSectionMenus).
+ * @param {MenuEntry} item
+ * @param {(route: string) => void} navigate
+ * @param {(action: string) => void} sendAction
+ * @param {boolean} showKeys
+ */
+function nativeItem(item, navigate, sendAction, showKeys) {
+  if ('separator' in item) return { type: 'separator' };
+  if ('action' in item) return { label: item.label, click: () => sendAction(item.action) };
+  const entry = { label: item.label, click: () => navigate(item.route) };
+  return item.shortcut && showKeys ? { ...entry, accelerator: item.shortcut, registerAccelerator: false } : entry;
 }
 
 /**
@@ -146,19 +229,25 @@ function menuRoutes() {
  * switch — a menu key equivalent would take the key before the page — so they are left off there.
  * @param {(route: string) => void} navigate
  * @param {string} [platform] process.platform (for tests)
+ * @param {(action: string) => void} [sendAction] runs an in-app action (default: nothing)
  */
-function buildSectionMenus(navigate, platform = process.platform) {
+function buildSectionMenus(navigate, platform = process.platform, sendAction = () => {}) {
   const showKeys = platform !== 'darwin';
   return MENU_SECTIONS.map((section) => ({
     label: section.label,
-    submenu: section.items.map((item) => {
-      if ('separator' in item) return { type: 'separator' };
-      const entry = { label: item.label, click: () => navigate(item.route) };
-      return item.shortcut && showKeys
-        ? { ...entry, accelerator: item.shortcut, registerAccelerator: false }
-        : entry;
-    }),
+    submenu: section.items.map((item) => nativeItem(item, navigate, sendAction, showKeys)),
   }));
 }
 
-module.exports = { MENU_SECTIONS, menuRoutes, buildSectionMenus };
+/**
+ * File > Utilities as one native submenu item.
+ * @param {(route: string) => void} navigate
+ * @param {(action: string) => void} sendAction
+ * @param {string} [platform]
+ */
+function buildUtilitiesMenu(navigate, sendAction, platform = process.platform) {
+  const showKeys = platform !== 'darwin';
+  return { label: 'Utilities', submenu: FILE_UTILITIES.map((item) => nativeItem(item, navigate, sendAction, showKeys)) };
+}
+
+module.exports = { MENU_SECTIONS, FILE_UTILITIES, menuRoutes, menuActions, buildSectionMenus, buildUtilitiesMenu };

@@ -15,7 +15,7 @@
  *
  * Everything runs on this computer: files are read locally and sent only to the local server.
  */
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { ChevronDown, ChevronRight, Upload } from 'lucide-react';
 import { Card, PageHeader } from '@/components/ui';
@@ -55,6 +55,10 @@ export default function QbImportPage() {
   const [showLists, setShowLists] = useState(false);
   const [showOpenItems, setShowOpenItems] = useState(false);
   const [showExport, setShowExport] = useState(false);
+  // File > Utilities > Export Lists to IIF Files (electron/menuRoutes.js) opens straight onto the export.
+  useEffect(() => {
+    if (new URLSearchParams(window.location.search).get('tab') === 'export') setShowExport(true);
+  }, []);
 
   return (
     <main className="min-h-screen bg-offwhite p-8 font-sans">
