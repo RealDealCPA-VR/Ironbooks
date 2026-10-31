@@ -28,7 +28,7 @@ import { createBill, getBill, updateBill } from './bills';
 import { createVendorCredit, updateVendorCredit } from './vendorCredits';
 import { createDeposit } from './deposits';
 import { createTransfer } from './transfers';
-import { payBills } from './billPayments';
+import { payBills, updateBillPayment } from './billPayments';
 import { vendor1099Report } from './statements';
 import { payCreditCard, payPayrollLiabilities, paySalesTax } from './liabilityPayments';
 import { createBankAccount } from './bankAccounts';
@@ -199,6 +199,55 @@ describe('ledger-neutral edits sync the kept entry line memos', () => {
     } as never);
     expect(edited.postedEntryId).toBe(vc.postedEntryId);
     expect(await memos(vc.postedEntryId!)).toContain('Toner returned (damaged)');
+  });
+
+  it('bill payments: a check-number-only edit changes the bank line memo, same entry', async () => {
+    const v = await vendor();
+    const bill = await createBill(ctx, { vendorId: v.id, date: d('2026-03-02'), lines: [{ accountId: acct['6300'], amount: '60.00' }] });
+    const input = {
+      vendorId: v.id,
+      date: d('2026-03-05'),
+      method: 'check' as const,
+      reference: '701',
+      paymentAccountId: acct['1000'],
+      applications: [{ billId: bill.id, amountApplied: '60.00' }],
+    };
+    const bp = await payBills(ctx, input);
+    expect(await memos(bp.postedEntryId!)).toContain('Bill payment — ref: 701');
+    const edited = await updateBillPayment(ctx, bp.id, { ...input, reference: '702' });
+    expect(edited.postedEntryId).toBe(bp.postedEntryId);
+    const after = await memos(bp.postedEntryId!);
+    expect(after).toContain('Bill payment — ref: 702');
+    expect(after).not.toContain('Bill payment — ref: 701');
+  });
+
+  it('item receipts: a reference / description edit changes the line memos, same entry', async () => {
+    const v = await vendor();
+    const item = await createItem(ctx, {
+      name: `Memo item ${seq}`,
+      type: 'inventory',
+      incomeAccountId: acct['4000'],
+      expenseAccountId: acct['5000'],
+      assetAccountId: acct['1300'],
+    } as never);
+    const r = await createItemReceipt(ctx, {
+      vendorId: v.id,
+      date: d('2026-03-02'),
+      reference: 'PS-1',
+      lines: [{ itemId: item.id, quantity: 2, unitCost: '5.00', description: 'Blue widgets' }],
+    } as never);
+    const edited = await updateItemReceipt(ctx, r.id, {
+      vendorId: v.id,
+      date: d('2026-03-02'),
+      reference: 'PS-2',
+      lines: [{ itemId: item.id, quantity: 2, unitCost: '5.00', description: 'Blue widgets (boxed)' }],
+    } as never);
+    expect(edited.postedEntryId).toBe(r.postedEntryId);
+    const after = await memos(r.postedEntryId!);
+    expect(after).toContain('Blue widgets (boxed)');
+    expect(after).not.toContain('Blue widgets');
+    expect(after.some((m) => m?.startsWith('Item receipt PS-2'))).toBe(true);
+    expect(after.some((m) => m?.startsWith('Item receipt PS-1'))).toBe(false);
   });
 });
 

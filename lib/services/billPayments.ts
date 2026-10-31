@@ -28,6 +28,7 @@
 import { assertAccountantDatesOpen } from './accountantCopy/guard';
 import { overAppliedFixes } from '@/lib/errorFixes';
 import { isBankAccount, isCreditCardAccount, isPaymentSourceAccount } from '@/lib/accountTypes';
+import { renameLineMemos } from './entryLineMemos';
 import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import type Decimal from 'decimal.js';
 import { Money, toAmountString } from '@/lib/money';
@@ -849,6 +850,11 @@ export async function updateBillPayment(ctx: ServiceContext, id: string, input: 
           .update(journalEntries)
           .set({ reference, updatedAt: new Date() })
           .where(and(eq(journalEntries.id, entryId), eq(journalEntries.companyId, tx.companyId)));
+        // The bank line's memo names the check number (buildPaymentLines): keep it in step, or the
+        // register / reports Memo column still shows the old number.
+        await renameLineMemos(tx, entryId, [
+          { from: `Bill payment — ref: ${cur.reference ?? 'n/a'}`, to: `Bill payment — ref: ${reference ?? 'n/a'}` },
+        ]);
       }
     } else {
       // A reconciled payment: QB's warning, then (once the user confirms) it is re-posted and stays
