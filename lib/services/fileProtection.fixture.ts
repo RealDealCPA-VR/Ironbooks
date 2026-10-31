@@ -54,7 +54,7 @@ export function apiRequest(method: string, url: string, body?: unknown, opts: { 
   return new NextRequest(`http://127.0.0.1${url}`, {
     method,
     headers,
-    ...(body === undefined ? {} : { body: body instanceof Uint8Array ? body : JSON.stringify(body) }),
+    ...(body === undefined ? {} : { body: (body instanceof Uint8Array ? body : JSON.stringify(body)) as BodyInit }),
   });
 }
 

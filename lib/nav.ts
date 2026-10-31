@@ -217,7 +217,7 @@ export const navGroups: NavGroup[] = [
       { icon: CalendarRange, label: 'Period Copy', path: '/accountant/period-copy', qb: 'Period Copy', keywords: 'audit copy date range auditor' }, // I7
       { icon: Users, label: 'Users & Roles', path: '/users', qb: 'Set Up Users and Roles', keywords: 'permissions access' },
       { icon: FileSpreadsheet, label: 'Migrate from QuickBooks', path: '/qb-import', qb: 'Import IIF / Convert', keywords: 'import iif convert' },
-      { icon: ShieldCheck, label: 'Security (2FA)', path: '/security', qb: 'Security', keywords: 'two factor password' },
+      { icon: ShieldCheck, label: 'Security (2FA)', path: '/security', qb: 'Security', keywords: 'two factor password protect encrypt recovery key file passwords' },
       { icon: KeyRound, label: 'Change My Password', path: '/change-password', qb: 'Change Your Password', keywords: 'new password expired' }, // gapsb K
       { icon: Network, label: 'Privacy & Network', path: '/privacy', qb: 'Privacy', keywords: 'internet offline' },
       { icon: Users, label: 'Multi-user', path: '/multi-user', qb: 'Multi-user mode', keywords: 'network share host' },

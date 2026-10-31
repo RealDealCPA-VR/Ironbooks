@@ -32,6 +32,12 @@ import {
 } from '@/components/ui';
 import { api } from '@/lib/client';
 import { desktopBridge, niceDate, postAndSave } from '@/lib/accountantCopyClient';
+import { CredentialsModal, FilePasswordFields, filePasswordHeader, filePasswordProblem, type FilePasswordChoice } from '@/components/FileProtection';
+
+/** The transfer file's password choice as the request body wants it (filecrypto). */
+function passwordBody(c: FilePasswordChoice): { password: string } | { protect: false } {
+  return c.protect ? { password: c.password } : { protect: false };
+}
 import { formatCurrency } from '@/lib/money';
 import { BackToCenter } from '../_shared';
 
@@ -226,11 +232,13 @@ export default function AccountantsCopyPage() {
 function ClientStart({ status, onChanged }: { status: Status; onChanged: () => void }) {
   const [dividingDate, setDividingDate] = useState(lastMonthEnd());
   const [busy, setBusy] = useState(false);
+  const [choice, setChoice] = useState<FilePasswordChoice>({ protect: true, password: '', confirm: '' });
 
   async function create() {
+    if (filePasswordProblem(choice)) return;
     setBusy(true);
     try {
-      const res = await postAndSave('/api/accountant-copy', { dividingDate }, 'Company.ibac', {
+      const res = await postAndSave('/api/accountant-copy', { dividingDate, ...passwordBody(choice) }, 'Company.ibac', {
         name: "Ironbooks Accountant's Copy",
         extensions: ['ibac'],
       });
@@ -261,7 +269,10 @@ function ClientStart({ status, onChanged }: { status: Status; onChanged: () => v
           </Label>
           <DateInput id="dividing-date" value={dividingDate} onChange={(e) => setDividingDate(e.target.value)} className="max-w-xs" />
           <p className="mt-1 text-xs text-navy/50">Usually the last day of the period your accountant is reviewing (for example, the end of last year).</p>
-          <Button className="mt-4" onClick={create} loading={busy} disabled={!dividingDate}>
+          <div className="mt-4">
+            <FilePasswordFields value={choice} onChange={setChoice} what="the transfer file" />
+          </div>
+          <Button className="mt-4" onClick={create} loading={busy} disabled={!dividingDate || Boolean(filePasswordProblem(choice))}>
             <FileDown className="h-4 w-4" aria-hidden="true" /> Create Accountant&apos;s Copy…
           </Button>
         </div>
@@ -345,11 +356,16 @@ function ClientOutstanding({ status, onChanged }: { status: Status; onChanged: (
     }
   }
 
+  const [saveAgainOpen, setSaveAgainOpen] = useState(false);
+  const [againChoice, setAgainChoice] = useState<FilePasswordChoice>({ protect: true, password: '', confirm: '' });
+
   /** The transfer file of this copy again (same copy, same dividing date) — e.g. the first Save was cancelled. */
   async function saveAgain() {
+    if (filePasswordProblem(againChoice)) return;
+    setSaveAgainOpen(false);
     setBusy('save');
     try {
-      const res = await postAndSave('/api/accountant-copy', { saveAgain: true }, 'Company.ibac', {
+      const res = await postAndSave('/api/accountant-copy', { saveAgain: true, ...passwordBody(againChoice) }, 'Company.ibac', {
         name: "Ironbooks Accountant's Copy",
         extensions: ['ibac'],
       });
@@ -400,12 +416,29 @@ function ClientOutstanding({ status, onChanged }: { status: Status; onChanged: (
           </Button>
           <Button
             variant="secondary"
-            onClick={saveAgain}
+            onClick={() => setSaveAgainOpen(true)}
             loading={busy === 'save'}
             title="Save this Accountant's Copy's transfer file again (same copy and dividing date), for example if the first save was cancelled"
           >
             <FileDown className="h-4 w-4" aria-hidden="true" /> Save the transfer file again…
           </Button>
+          <Modal
+            open={saveAgainOpen}
+            onClose={() => setSaveAgainOpen(false)}
+            title="Save the transfer file again"
+            footer={
+              <>
+                <Button variant="secondary" onClick={() => setSaveAgainOpen(false)}>
+                  Cancel
+                </Button>
+                <Button onClick={saveAgain} disabled={Boolean(filePasswordProblem(againChoice))}>
+                  Save…
+                </Button>
+              </>
+            }
+          >
+            <FilePasswordFields value={againChoice} onChange={setAgainChoice} what="the transfer file" />
+          </Modal>
           <Button variant="secondary" onClick={() => setConfirmCancel(true)}>
             <XCircle className="h-4 w-4" aria-hidden="true" /> Cancel Accountant&apos;s Copy
           </Button>
@@ -551,16 +584,30 @@ function OpenTransferFile() {
   const [opened, setOpened] = useState<Opened | null>(null);
   const [busy, setBusy] = useState<null | 'inspect' | 'open'>(null);
   const desktop = Boolean(desktopBridge()?.isDesktop);
+  // filecrypto: a transfer file protected with a password.
+  const [askPassword, setAskPassword] = useState<{ file: File; error: string | null } | null>(null);
+  const [filePassword, setFilePassword] = useState<string | null>(null);
 
   async function onFile(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     e.target.value = '';
     if (!file) return;
+    setFilePassword(null);
+    await inspect(file, null);
+  }
+
+  async function inspect(file: File, password: string | null) {
     setBusy('inspect');
     try {
-      const res = await fetch('/api/accountant-copy/open?inspect=1', { method: 'POST', body: await file.arrayBuffer() });
+      const res = await fetch('/api/accountant-copy/open?inspect=1', { method: 'POST', body: await file.arrayBuffer(), headers: filePasswordHeader(password) });
       const data = await res.json().catch(() => ({}));
+      if (res.status === 403 && data?.details?.passwordRequired && !data?.details?.rateLimited) {
+        setAskPassword({ file, error: data.details.wrongPassword ? data.error : null });
+        return;
+      }
       if (!res.ok) throw new Error(data?.error || 'This file could not be read.');
+      setAskPassword(null);
+      setFilePassword(password);
       setPending({ file, info: data as TransferInfo });
     } catch (err) {
       toastError(err, 'This file could not be read.');
@@ -573,7 +620,7 @@ function OpenTransferFile() {
     if (!pending) return;
     setBusy('open');
     try {
-      const res = await fetch('/api/accountant-copy/open', { method: 'POST', body: await pending.file.arrayBuffer() });
+      const res = await fetch('/api/accountant-copy/open', { method: 'POST', body: await pending.file.arrayBuffer(), headers: filePasswordHeader(filePassword) });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data?.error || "The Accountant's Copy could not be opened.");
       setPending(null);
@@ -587,6 +634,16 @@ function OpenTransferFile() {
 
   return (
     <>
+      <CredentialsModal
+        open={Boolean(askPassword)}
+        mode="password"
+        title="Protected transfer file"
+        message="This Accountant's Copy transfer file is protected with a password. Enter the password your client gave you."
+        error={askPassword?.error}
+        busy={busy === 'inspect'}
+        onSubmit={(c) => askPassword && void inspect(askPassword.file, c.password)}
+        onCancel={() => setAskPassword(null)}
+      />
       <Card className="mb-6 p-6">
         <h2 className="flex items-center gap-2 text-lg font-bold text-navy">
           <FolderInput className="h-5 w-5 text-electric" aria-hidden="true" /> For accountants: open a client&apos;s Accountant&apos;s Copy

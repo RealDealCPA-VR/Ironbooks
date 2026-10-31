@@ -153,6 +153,7 @@ describe('API permission map coverage', () => {
         '/api/auth/logout',
         '/api/auth/me',
         '/api/auth/password-policy', // gapsb K: the rules only, for the sign-up / reset forms
+        '/api/auth/recover', // filecrypto: the recovery key sets an Admin's new password (local only, rate-limited)
         '/api/auth/request-reset',
         '/api/auth/reset',
         '/api/auth/signup',
@@ -165,6 +166,9 @@ describe('API permission map coverage', () => {
         '/api/company-file/info',
         '/api/company-file/save-as',
         '/api/email/status',
+        // filecrypto: protect the file / new recovery key (an Admin of every company, checked in the handler)
+        '/api/file-protection',
+        '/api/file-protection/recovery-key',
         '/api/portal/login',
         '/api/portal/logout',
         '/api/portal/me',
