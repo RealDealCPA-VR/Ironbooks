@@ -23,6 +23,38 @@ export const loanSchema = z.object({
   // p1 fx: loan currency (default: the lender's) and the rate it was booked at
   currency: z.string().max(3).nullish(),
   exchangeRate: zDecimalPositive.nullish(),
+  // purchbank F1: balloon, compounding, the lender's payment amount, a loan already in progress
+  balloonAmount: zMoney.nullish(),
+  compounding: z.enum(['monthly', 'exact_days']).nullish(),
+  dayCount: z.coerce.number().int().nullish(),
+  paymentAmount: zMoney.nullish(),
+  nextPaymentNumber: z.coerce.number().int().min(1).nullish(),
+  nextPaymentDate: zDate.nullish(),
+});
+
+/** POST /api/loans/:id/what-if — QB Loan Manager "What If Scenarios" (nothing is saved). */
+export const loanWhatIfSchema = z.object({
+  annualRate: zDecimal.nullish(),
+  paymentAmount: zMoney.nullish(),
+  termMonths: z.coerce.number().int().min(1).max(600).nullish(),
+  lumpSum: zMoney.nullish(),
+  extraPrincipal: zMoney.nullish(),
+  balloonAmount: zMoney.nullish(),
+});
+
+/** POST /api/loans/what-if — evaluate a new loan's payment, interest and payoff. */
+export const loanEvaluateSchema = z.object({
+  originalAmount: zMoney,
+  annualRate: zDecimal,
+  termMonths: z.coerce.number().int().min(1).max(600),
+  paymentsPerYear: z.coerce.number().int().optional(),
+  originDate: zDate,
+  firstPaymentDate: zDate,
+  balloonAmount: zMoney.nullish(),
+  compounding: z.enum(['monthly', 'exact_days']).nullish(),
+  dayCount: z.coerce.number().int().nullish(),
+  paymentAmount: zMoney.nullish(),
+  escrowAmount: zMoney.nullish(),
 });
 
 export const loanPaymentSchema = z.object({

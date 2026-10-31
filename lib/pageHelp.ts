@@ -272,8 +272,8 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
   },
   '/loans': {
     title: 'Loans',
-    what: 'Track loans you owe, their payments and how much is interest.',
-    first: 'Add a loan with its amount, rate and term.',
+    what: 'Track loans you owe, their payments and how much is interest. The balance owed is read from the loan account; "What if" compares another rate, payment or term, a lump sum or extra principal.',
+    first: 'Add a loan with its amount, rate and term (tick "already being paid" for a loan you have been paying). Then set up each payment as a check or a bill.',
     qb: 'Loan Manager',
   },
   '/accountant/batch-enter': {

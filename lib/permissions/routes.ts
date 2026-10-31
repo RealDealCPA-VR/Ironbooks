@@ -440,6 +440,8 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/loans': r('banking', 'GET POST'),
   '/api/loans/[id]': r('banking', 'GET PATCH DELETE'),
   '/api/loans/[id]/payments': r('banking', 'POST DELETE'), // p1 fx: DELETE voids a payment + its FX entry
+  '/api/loans/[id]/what-if': r('banking', 'POST:view'), // purchbank F1: What If Scenarios (nothing saved)
+  '/api/loans/what-if': r('banking', 'POST:view'), // purchbank F1: evaluate a new loan (nothing saved)
   '/api/banking/account-currency': r('accounting', 'POST:modify'),
   '/api/registers': r('banking', 'GET'),
   '/api/registers/[accountId]': r('banking', 'GET POST'),
