@@ -536,6 +536,7 @@ function RegisterPageInner() {
                         title={source ? `Open ${source.label}` : 'View journal entry'}
                         data-journal-entry={row.journalEntryId}
                         data-list-label={row.description}
+                        data-row-date={String(row.date).slice(0, 10)}
                         data-transfer-href={transferHref(row) ?? undefined}
                         data-split={row.otherAccount && !row.otherAccount.id ? '' : undefined}
                         data-copy-transaction={copy ? JSON.stringify(copy) : undefined}

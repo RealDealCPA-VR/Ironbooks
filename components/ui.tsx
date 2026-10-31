@@ -655,6 +655,9 @@ export function Modal({
       if (e.key !== 'Tab') return;
       const dialog = dialogRef.current;
       if (!dialog) return;
+      // A transaction form in QuickBooks' Tab order: components/KeyboardBase.tsx moves the focus
+      // and wraps it inside the dialog (its order is not the page order this trap knows).
+      if (dialog.querySelector('[data-qb-tab-order]') && dialog.contains(document.activeElement)) return;
       const focusables = Array.from(dialog.querySelectorAll<HTMLElement>(FOCUSABLE));
       if (focusables.length === 0) {
         e.preventDefault();

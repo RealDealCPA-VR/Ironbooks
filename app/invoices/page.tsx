@@ -1131,7 +1131,7 @@ function InvoiceModal({
         </>
       }
     >
-      <div className="space-y-4">
+      <div className="space-y-4" data-qb-tab-order="">
         {nav}
         {!editing && <PrefillNotice note={prefill?.note} />}
         {fixer.panel}

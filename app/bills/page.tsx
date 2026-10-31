@@ -913,7 +913,7 @@ export default function BillsPage() {
           </>
         }
       >
-        <div className="space-y-4">
+        <div className="space-y-4" data-qb-tab-order="">
           <TransactionNav
             sourceRef={editingId ? `bill:${editingId}` : null}
             onPrevious={navPrev ? () => void openEditModal(navPrev) : null}

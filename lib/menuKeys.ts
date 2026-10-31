@@ -53,7 +53,26 @@ export function pickerKeyMove(
   return hit >= 0 ? { index: hit, typed: word } : { index: current, typed: word };
 }
 
-const PICKER_ITEMS = '[role="option"], [role="menuitem"], [role="menuitemradio"], [data-picker-item]';
+/**
+ * First-letter type-ahead for a listbox that tracks its own highlighted index
+ * (aria-activedescendant): `const jump = useTypeAhead();` then in onKeyDown
+ * `const to = jump(e, active, labels); if (to !== null) { e.preventDefault(); setActive(to); }`.
+ * Only letters / digits (and what follows them within TYPE_AHEAD_MS) are taken; null otherwise.
+ */
+export function useTypeAhead(): (e: PickerKey, current: number, labels: readonly string[]) => number | null {
+  const typed = React.useRef({ text: '', at: 0 });
+  return React.useCallback((e: PickerKey, current: number, labels: readonly string[]) => {
+    if (e.key.length !== 1) return null;
+    const now = Date.now();
+    const sofar = now - typed.current.at > TYPE_AHEAD_MS ? '' : typed.current.text;
+    const move = pickerKeyMove(e, current, labels, sofar);
+    if (!move) return null;
+    typed.current = { text: move.typed, at: now };
+    return move.index >= 0 ? move.index : current;
+  }, []);
+}
+
+const PICKER_ITEMS ='[role="option"], [role="menuitem"], [role="menuitemradio"], [data-picker-item]';
 
 /**
  * Up / Down / Home / End and first-letter type-ahead for a picker or menu whose items take the

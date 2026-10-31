@@ -5,7 +5,7 @@
  * done, grouped under Intuit's own headings, so the list shows exactly what works.
  * lib/qbShortcuts.test.ts checks each done row against the key handlers.
  *
- * Sources (retrieved 2026-10-27):
+ * Sources (retrieved 2026-10-27; Intuit's article, QBK Accounting and TeachUcomp re-read 2026-10-30):
  *  - intuit: Intuit, "Keyboard shortcuts in QuickBooks Desktop"
  *    https://quickbooks.intuit.com/learn-support/en-us/help-articles/quickbooks-desktop-keyboard-shortcuts/00/261708
  *    (Canadian mirror: https://quickbooks.intuit.com/learn-support/en-ca/help-article/multi-user-mode/keyboard-shortcuts-quickbooks-desktop/L7xynnaf3_CA_en_CA)
@@ -30,8 +30,16 @@
  *    form buttons' underlined letters (TeachUcomp's sticker, Axpert's Invoices list) are
  *    Alt+S Save & New and Alt+A Save & Close. Ironbooks follows the buttons: Alt+S Save & New,
  *    Alt+A Save & Close, Alt+N saves (asking first) and goes to the next form.
- *  - Ctrl+F6: Intuit's article puts it under Lists as "Run a Quick Report"; the in-product
- *    QuickReport key is Ctrl+Q, and Ctrl+F6 is the Windows / QuickBooks next-window key (FMD).
+ *  - Ctrl+F6: Intuit's article puts it under Lists as "Run a Quick Report for an item on a list";
+ *    the in-product QuickReport key is Ctrl+Q, and Ctrl+F6 is the Windows / QuickBooks
+ *    next-window key (FMD). Ironbooks does both: on a list with a highlighted name or account
+ *    Ctrl+F6 runs its QuickReport, anywhere else it goes to the next window.
+ *  - Ctrl+R: Intuit's article (and the Dummies cheat sheet): open an account register; the
+ *    2008–2014 in-product Help (QBK Accounting): "Open split transaction window in register".
+ *    Ironbooks follows Intuit's current list.
+ *  - + / - in data fields: Intuit's article says "Increase or decrease the amount"; the
+ *    in-product Help and TeachUcomp say "Increase check or other form number by one". In an
+ *    amount field + and - are QuickMath (QuickBooks too), so they step form numbers.
  *  - Vendors / Employees menus: Alt+O and Alt+Y (Axpert: "Alt+O and Enter: Vendor Center",
  *    "Alt+Y and Enter: Employee Center").
  */
@@ -79,7 +87,7 @@ export const QB_SHORTCUTS: QbShortcut[] = [
   { keys: 'F1', qb: 'Open the Help window', group: 'navigate', sources: ['intuit', 'qbhelp', 'teachucomp'], status: 'done', ironbooks: 'Help for this page ("What is this page?"); it also opens this shortcuts list' },
   { keys: 'Esc', qb: 'Close current window', group: 'navigate', sources: ['intuit', 'qbhelp', 'dummies'], status: 'done', ironbooks: 'Closes the open form or dialog — a changed form first asks "Do you want to record your changes?" (Yes / No / Cancel); with nothing open or selected, closes the window' },
   { keys: 'Ctrl+F4', qb: 'Close active window', group: 'navigate', sources: ['qbhelp', 'axpert', 'fmd'], status: 'done', desktopOnly: true, ironbooks: 'Closes the open form (asking about changes); with none open, closes the window and shows the one before it' },
-  { keys: 'Ctrl+Tab / Ctrl+F6', qb: 'Next open window', group: 'navigate', sources: ['axpert', 'fmd'], status: 'done', desktopOnly: true, ironbooks: 'Switches to the next open window (the pages opened this session; Window > Open Window List shows them)' },
+  { keys: 'Ctrl+Tab / Ctrl+F6', qb: 'Next open window', group: 'navigate', sources: ['axpert', 'fmd'], status: 'done', desktopOnly: true, ironbooks: 'Switches to the next open window (the pages opened this session; Window > Open Window List shows them). On a list with a highlighted name or account, Ctrl+F6 runs its QuickReport instead' },
   { keys: 'Ctrl+Shift+Tab / Ctrl+Shift+F6', qb: 'Previous open window', group: 'navigate', sources: ['axpert'], status: 'done', desktopOnly: true, ironbooks: 'Switches to the previous open window' },
   { keys: 'F2 / Ctrl+1', qb: 'Open the Product Information window (product, company file location, …)', group: 'navigate', sources: ['intuit', 'qbhelp'], status: 'done', ironbooks: 'Product Information: version, company file location and size, and how many accounts, names, items and transactions it holds' },
   { keys: 'F2, then F3', qb: 'Open Tech Help / Technical Info', group: 'navigate', sources: ['intuit'], status: 'done', ironbooks: 'F3 in Product Information shows the technical details (versions, database, data folder)' },
@@ -98,6 +106,7 @@ export const QB_SHORTCUTS: QbShortcut[] = [
   { keys: 'Ctrl+Z', qb: 'Undo changes made in the field', group: 'data-fields', sources: ['intuit', 'qbhelp', 'teachucomp'], status: 'done', ironbooks: 'Undoes typing in the field — including dates and amounts changed by the QuickBooks keys' },
   { keys: 'Ctrl+C / Ctrl+X / Ctrl+V', qb: 'Copy, cut, paste', group: 'data-fields', sources: ['intuit', 'qbhelp'], status: 'done', ironbooks: 'Copy, cut and paste text' },
   { keys: 'Home / End', qb: 'Beginning / end of the field', group: 'data-fields', sources: ['qbhelp', 'teachucomp'], status: 'done', ironbooks: 'Beginning / end of the field' },
+  { keys: 'Del / Backspace', qb: 'Delete the character right / left of the cursor', group: 'data-fields', sources: ['qbhelp', 'teachucomp'], status: 'done', ironbooks: 'Delete the character right / left of the cursor' },
   { keys: 'Home Home / End End', qb: 'Beginning / end of the transaction', group: 'data-fields', sources: ['fmd'], status: 'done', ironbooks: 'Twice quickly: the first / last field of the form' },
   { keys: 'Ctrl+Left / Ctrl+Right', qb: 'Previous / next word in the field', group: 'data-fields', sources: ['qbhelp', 'teachucomp'], status: 'done', ironbooks: 'Previous / next word' },
   { keys: 'Space', qb: 'Mark or unmark a checkbox', group: 'data-fields', sources: ['fmd'], status: 'done', ironbooks: 'Marks or unmarks the checkbox (Pay Bills, Make Deposits, …)' },
@@ -144,6 +153,7 @@ export const QB_SHORTCUTS: QbShortcut[] = [
   { keys: 'Ctrl+E', qb: 'Edit the list item or the transaction selected in a register', group: 'lists', sources: ['intuit', 'qbhelp'], status: 'done', ironbooks: 'Edits the highlighted row' },
   { keys: 'Ctrl+D', qb: 'Delete the list item or transaction', group: 'lists', sources: ['intuit', 'qbhelp'], status: 'done', ironbooks: 'Deletes (or voids, or makes inactive) the highlighted row, asking first' },
   { keys: 'Ctrl+Q', qb: 'QuickReport on the transaction or list item', group: 'lists', sources: ['qbhelp', 'teachucomp', 'axpert'], status: 'done', ironbooks: 'QuickReport of the highlighted customer, vendor, employee or account' },
+  { keys: 'Ctrl+F6 (on a list)', qb: 'Run a QuickReport for an item on a list', group: 'lists', sources: ['intuit'], status: 'done', desktopOnly: true, ironbooks: 'QuickReport of the highlighted name or account (with nothing highlighted: the next window)' },
   { keys: 'Ctrl+R (Chart of Accounts)', qb: "Open the highlighted account's register", group: 'lists', sources: ['axpert'], status: 'done', ironbooks: "The highlighted account's register" },
   { keys: 'Ctrl+O', qb: 'Copy the transaction in a register', group: 'lists', sources: ['qbhelp', 'teachucomp', 'axpert'], status: 'done', ironbooks: 'Copies the highlighted register transaction' },
   { keys: 'Ctrl+V', qb: 'Paste the copied transaction in a register', group: 'lists', sources: ['qbhelp', 'teachucomp'], status: 'done', ironbooks: "Pastes it on the register's blank line, ready to record with Enter" },
@@ -157,12 +167,15 @@ export const QB_SHORTCUTS: QbShortcut[] = [
   { keys: 'Ctrl+R', qb: 'Open an account register', group: 'new-task', sources: ['intuit', 'dummies'], status: 'done', ironbooks: 'Use Register: choose an account — or, on the Chart of Accounts, the highlighted account\'s register (never reloads the window)' },
   { keys: 'Ctrl+G', qb: "From a register: open the transfer account's register", group: 'new-task', sources: ['intuit', 'qbhelp', 'teachucomp', 'dummies'], status: 'done', ironbooks: "Opens the other account's register at the same transaction" },
   { keys: 'Ctrl+K', qb: 'QuickBooks Service Keys (payroll only)', group: 'new-task', sources: ['intuit'], status: 'na', ironbooks: 'Ironbooks payroll is built in, so there are no Intuit service keys; Ctrl+K opens the command bar' },
+  { keys: 'Ctrl+R (in a register, QuickBooks 2014 and earlier)', qb: 'Open the split transaction window', group: 'new-task', sources: ['qbhelp'], status: 'na', ironbooks: "Current QuickBooks (Intuit's list) uses Ctrl+R for Use Register, as Ironbooks does; in a register, Enter opens the highlighted transaction with every account it uses (its splits)" },
 
   // ---- Open, set up, and close ----
   { keys: 'Alt+F4', qb: 'Close QuickBooks', group: 'open-close', sources: ['intuit', 'qbhelp'], status: 'done', desktopOnly: true, ironbooks: 'Closes Ironbooks, saving the company file (asks first when a form has typed work)' },
   { keys: 'Ctrl+Alt+Y (Product Information)', qb: 'Set up YTD amounts for payroll', group: 'open-close', sources: ['intuit'], status: 'done', ironbooks: 'Opens Payroll Setup > year-to-date amounts' },
   { keys: 'Hold Alt while opening', qb: 'Open the company file with no windows open', group: 'open-close', sources: ['intuit', 'qbhelp'], status: 'na', ironbooks: 'Ironbooks never reopens the windows from last time — a company file always opens on the Home page' },
   { keys: 'Hold Ctrl while starting', qb: 'Start QuickBooks without opening a company file', group: 'open-close', sources: ['qbhelp', 'teachucomp'], status: 'na', ironbooks: 'A desktop app cannot read held keys before its window exists; File > Close Company shows the No Company Open window' },
+  { keys: 'Alt+F4 (Help window)', qb: 'Close the Help window', group: 'open-close', sources: ['teachucomp'], status: 'na', ironbooks: 'The Help window is a dialog inside Ironbooks: Esc closes it (Alt+F4 closes Ironbooks itself)' },
+  { keys: 'Cmd keys (QuickBooks Desktop for Mac)', qb: 'The Mac edition uses Cmd and its own keys (Cmd+Shift+V Vendor Center, …)', group: 'open-close', sources: ['intuit'], status: 'na', ironbooks: 'Ironbooks follows QuickBooks Desktop for Windows; on a Mac, Cmd works wherever these lists say Ctrl' },
 
   // ---- Ironbooks keys with no QuickBooks equivalent ----
   { keys: 'Ctrl+K', qb: '—', group: 'navigate', sources: ['ironbooks'], status: 'done', ironbooks: 'Command bar: search, or type what you want to do ("invoice Acme 250")' },

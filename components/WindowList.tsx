@@ -3,7 +3,8 @@
  * QuickBooks' windows, mounted once by components/AppShell.tsx. Ironbooks shows one page at a
  * time; the pages opened this session are its "open windows" (lib/windowList.ts):
  *
- *   Ctrl+Tab / Ctrl+F6                 the next open window
+ *   Ctrl+Tab / Ctrl+F6                 the next open window (Ctrl+F6 on a list with a highlighted
+ *                                      name or account: its QuickReport, as Intuit lists it)
  *   Ctrl+Shift+Tab / Ctrl+Shift+F6     the previous one
  *   Ctrl+F4                            close the open form (asking about changes, as Esc does);
  *                                      with none open, close this window and show the one before it
@@ -17,8 +18,9 @@ import { usePathname, useRouter } from 'next/navigation';
 import { Button, CLOSE_DIALOG_EVENT, Modal } from '@/components/ui';
 import { paletteDestinations } from '@/lib/nav';
 import { globalShortcutFor, isEditableTarget, navigateGuarded } from '@/lib/shortcuts';
-import { openDialog } from '@/lib/keyboardTargets';
+import { openDialog, selectedRow } from '@/lib/keyboardTargets';
 import { type OpenWindow, closeWindow, cycleWindow, parseWindowList, visitWindow } from '@/lib/windowList';
+import { useTypeAhead } from '@/lib/menuKeys';
 
 const STORAGE_KEY = 'ironbooks.openWindows';
 
@@ -68,6 +70,7 @@ export default function WindowList() {
   const [active, setActive] = React.useState(0);
   const listRef = React.useRef<OpenWindow[]>([]);
   listRef.current = list;
+  const typeAhead = useTypeAhead();
 
   // Note each page as it opens (its title settles a moment after the page draws).
   React.useEffect(() => {
@@ -113,7 +116,11 @@ export default function WindowList() {
         sc?.command === 'close-window' ? 'close' : sc?.command === 'next-window' ? 'next' : sc?.command === 'prev-window' ? 'prev' : null;
       if (cmd) {
         e.preventDefault();
-        run(cmd);
+        // Intuit's list: Ctrl+F6 on a list runs the highlighted name's or account's QuickReport.
+        const quickReport =
+          cmd === 'next' && e.key === 'F6' ? selectedRow(target, openDialog())?.getAttribute('data-quick-report') : null;
+        if (quickReport) go(quickReport);
+        else run(cmd);
         return;
       }
       // QuickBooks: Esc closes the active window. Only from the page itself — never from a field,
@@ -144,7 +151,7 @@ export default function WindowList() {
       window.removeEventListener(WINDOW_COMMAND_EVENT, onCommand);
       window.removeEventListener(OPEN_WINDOW_LIST_EVENT, onOpenList);
     };
-  }, [run]);
+  }, [run, go]);
 
   function closeFromList(w: OpenWindow) {
     const rest = readList().filter((x) => x.path !== w.path);
@@ -186,6 +193,13 @@ export default function WindowList() {
             } else if (e.key === 'Delete' && list[active]) {
               e.preventDefault();
               closeFromList(list[active]);
+            } else {
+              // A window's first letter jumps to it (Windows lists).
+              const to = typeAhead(e, active, list.map((w) => w.label));
+              if (to !== null) {
+                e.preventDefault();
+                setActive(to);
+              }
             }
           }}
           ref={(el) => {

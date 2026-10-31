@@ -1324,6 +1324,41 @@ export function listKeyAction(e: KeyLike): ListKeyAction | null {
   return LIST_KEYS[e.key] ?? null;
 }
 
+/** Ctrl+PgUp / Ctrl+PgDn (no other modifier): -1 / 1, else null. */
+export function monthKeyDirection(e: KeyLike): -1 | 1 | null {
+  if (!ctrlOrCmd(e) || e.altKey || e.shiftKey) return null;
+  return e.key === 'PageUp' ? -1 : e.key === 'PageDown' ? 1 : null;
+}
+
+/**
+ * QuickBooks' Ctrl+PgUp / Ctrl+PgDn in a register: the previous / next month. `dates` are the
+ * rows' dates (YYYY-MM-DD, oldest first, as a register lists them); `current` the highlighted row
+ * (-1: none — Ctrl+PgUp then starts from the newest, Ctrl+PgDn from the oldest). Returns the
+ * first row of the month before / after the highlighted row's month — when that month has no
+ * transactions, the nearest one in that direction — or the first / last row at either end.
+ */
+export function registerMonthIndex(dates: readonly string[], current: number, dir: -1 | 1): number {
+  const n = dates.length;
+  if (n === 0) return -1;
+  if (current < 0 || current >= n) return dir === -1 ? n - 1 : 0;
+  const monthOf = (d: string) => d.slice(0, 7);
+  const cur = monthOf(dates[current]);
+  if (dir === 1) {
+    for (let i = current + 1; i < n; i++) if (monthOf(dates[i]) > cur) return i;
+    return n - 1;
+  }
+  // The latest earlier month that has rows, then its first row.
+  let target: string | null = null;
+  for (let i = current - 1; i >= 0; i--) {
+    if (monthOf(dates[i]) < cur) {
+      target = monthOf(dates[i]);
+      break;
+    }
+  }
+  if (target === null) return 0;
+  return dates.findIndex((d) => monthOf(d) === target);
+}
+
 /**
  * Left / Right (no modifiers) in a list or report: scroll a column to the left / right, as in
  * QuickBooks' wide reports. Null for every other key.
@@ -1696,6 +1731,14 @@ export function useListKeys<T extends HTMLElement = HTMLDivElement>(options: Lis
       if (!rows.length) return;
       const active = activeListRow(container);
       const current = active ? rows.indexOf(active) : -1;
+      // A register (rows dated with data-row-date): Ctrl+PgUp / Ctrl+PgDn go a month back / on.
+      const month = monthKeyDirection(e);
+      const dates = month ? rows.map((r) => r.getAttribute('data-row-date') ?? '') : [];
+      if (month && dates.every((d) => /^\d{4}-\d{2}-\d{2}/.test(d))) {
+        e.preventDefault();
+        setActiveListRow(container, rows[registerMonthIndex(dates, current, month)]);
+        return;
+      }
       const action = listKeyAction(e);
       if (action === 'open') {
         if (current >= 0 && openListRow(rows[current], 'open')) e.preventDefault();

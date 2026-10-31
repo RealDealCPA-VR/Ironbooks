@@ -806,7 +806,7 @@ function ExpensesPageContent() {
       {/* Entry form                                                          */}
       {/* ------------------------------------------------------------------ */}
       {/* data-shortcut-scope: the form keys (Ctrl+S, Alt+S, Alt+A, Esc) act on this form. */}
-      <Card className="p-6 mb-8 space-y-5" data-shortcut-scope>
+      <Card className="p-6 mb-8 space-y-5" data-shortcut-scope data-qb-tab-order="exp-account exp-checkno exp-date exp-payee">
         <TransactionNav
           sourceRef={editingId ? `expense:${editingId}` : null}
           onPrevious={navPrev ? () => void startEdit(navPrev) : null}

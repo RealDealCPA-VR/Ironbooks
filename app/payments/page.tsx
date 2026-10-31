@@ -890,7 +890,7 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
         </>
       }
     >
-      <div className="space-y-4">
+      <div className="space-y-4" data-qb-tab-order="pm-customer pm-amount pm-date pm-method pm-ref pm-memo">
         {nav}
         {fixer.panel}
         {editing && (

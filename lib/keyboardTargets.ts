@@ -11,7 +11,7 @@
  *   data-transfer-href   the register of the transaction's other account (Ctrl+G in a register)
  *   data-copy-transaction  JSON of a register transaction Ctrl+O copies
  */
-import { activeListRow, listRows } from './shortcuts';
+import { activeListRow, listRows, pickShortcutButton } from './shortcuts';
 
 const DIALOG = '[role="dialog"][aria-modal="true"], [role="alertdialog"]';
 
@@ -85,6 +85,185 @@ export function nextTabStop(from: HTMLElement, dir: 1 | -1): HTMLElement | null 
   const j = i + dir;
   if (j >= 0 && j < list.length) return list[j];
   return dialog ? list[(j + list.length) % list.length] ?? null : null;
+}
+
+// ---------------------------------------------------------------------------
+// QuickBooks' Tab order on transaction forms
+// ---------------------------------------------------------------------------
+
+/**
+ * Marks a transaction form whose Tab order follows QuickBooks (components/KeyboardBase.tsx moves
+ * the focus): name → class → template → date → number → the other header fields → the lines →
+ * the fields under them → memo → Save & Close → Save & New → the other buttons. Put it anywhere
+ * in the form (inside a dialog it orders the whole dialog). The form's own layout is not
+ * changed; fields keep their places on screen.
+ *
+ * Forms whose QuickBooks header order is different (Write Checks: Bank Account → No. → Date →
+ * Pay to the Order of; Receive Payments: Received From → Amount → Date → Method → Check # →
+ * Memo) give it as the attribute's value — field ids, in order — instead of the name / class /
+ * template / date / number rule.
+ */
+export const QB_TAB_ORDER_ATTR = 'data-qb-tab-order';
+
+/** A header field QuickBooks puts in a fixed place in the Tab order. */
+export type QbFieldRole = 'name' | 'class' | 'template' | 'date' | 'number' | 'memo';
+
+/** The order of the header roles (memo is placed separately). */
+export const QB_HEADER_ROLES: readonly QbFieldRole[] = ['name', 'class', 'template', 'date', 'number'];
+
+/** A field label as the role rules read it: no "*", "(optional)", trailing colon or extra spaces. */
+export function normalizeFieldLabel(label: string): string {
+  return label
+    .replace(/\*/g, ' ')
+    .replace(/\((optional|required)\)/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/[\s:?]+$/, '')
+    .trim();
+}
+
+const NAME_LABEL = /^(customer(\s*:\s*job|\s*\/\s*job| or job)?|vendor|payee|pay to the order of|received from|employee|name)$/i;
+const NOT_THE_TRANSACTION_DATE = /^(due|expir|expect|ship|revers|deliver|discount|start|end|from|to|bill due|paid)/i;
+const NUMBER_LABEL = /(#|\bno\.?|\bnumber|\bnum\.?|\bref\.?|\breference)(\s|$|\/)|#$/i;
+
+/**
+ * The QuickBooks role of a form field, from its label, its input type and whether it is a
+ * document-number field (data-doc-number); null for every other field.
+ */
+export function qbFieldRole(field: { label: string; type?: string; docNumber?: boolean; tag?: string }): QbFieldRole | null {
+  const label = normalizeFieldLabel(field.label);
+  const type = (field.type ?? '').toLowerCase();
+  if (field.docNumber) return 'number';
+  if (/^memo\b/i.test(label)) return 'memo';
+  if (/^class\b/i.test(label)) return 'class';
+  if (/^(form )?template\b/i.test(label)) return 'template';
+  if (type === 'date') return !label || (/date/i.test(label) && !NOT_THE_TRANSACTION_DATE.test(label)) ? 'date' : null;
+  if (NAME_LABEL.test(label)) return 'name';
+  if (type !== 'checkbox' && type !== 'radio' && NUMBER_LABEL.test(label)) return 'number';
+  return null;
+}
+
+/** The text that labels a field: aria-label, aria-labelledby, its <label>, else its placeholder. */
+export function fieldLabelText(el: HTMLElement): string {
+  const aria = el.getAttribute('aria-label');
+  if (aria) return aria;
+  const by = el.getAttribute('aria-labelledby');
+  if (by) {
+    const text = by
+      .split(/\s+/)
+      .map((id) => el.ownerDocument.getElementById(id)?.textContent ?? '')
+      .join(' ')
+      .trim();
+    if (text) return text;
+  }
+  const labels = (el as HTMLInputElement).labels;
+  if (labels && labels.length) return labels[0].textContent ?? '';
+  return el.getAttribute('placeholder') ?? '';
+}
+
+const isFieldEl = (el: HTMLElement) => el.tagName === 'INPUT' || el.tagName === 'SELECT' || el.tagName === 'TEXTAREA';
+const LINES = '[data-grid-row], [data-list], [data-qb-lines]';
+
+/**
+ * The Tab order of a QuickBooks transaction form (QB_TAB_ORDER_ATTR) inside `root` — the dialog,
+ * or the marked form on a page:
+ *
+ *   1. what comes before the first header role (the toolbar, a dialog's close button)
+ *   2. name, class, template, date, number — each the first such field above the lines
+ *   3. the other header fields and buttons, in page order (a memo the form shows above its lines,
+ *      as QuickBooks' checks and bills do, stays here)
+ *   4. the lines, in page order
+ *   5. the fields under the lines, in page order, then a memo shown under the lines
+ *   6. Save & Close, Save & New, then the other buttons after the last field (Cancel, Print, …)
+ */
+export function qbTabOrder(root: HTMLElement): HTMLElement[] {
+  const all = tabbables(root);
+  const inLines = all.map((el) => !!el.closest(LINES));
+  const firstLine = inLines.indexOf(true);
+  const lastLine = inLines.lastIndexOf(true);
+  const headerEnd = firstLine >= 0 ? firstLine : all.length;
+  let lastField = -1;
+  all.forEach((el, i) => {
+    if (isFieldEl(el)) lastField = i;
+  });
+
+  // Roles above the lines (the first field of each; the form's own document number — a
+  // data-doc-number field — before any other "#" field, such as the customer's P.O. No.).
+  const roleOf = new Map<HTMLElement, QbFieldRole>();
+  const taken = new Set<QbFieldRole>();
+  const docNumber = all.find((el, i) => !inLines[i] && i < headerEnd && el.hasAttribute('data-doc-number'));
+  if (docNumber) {
+    roleOf.set(docNumber, 'number');
+    taken.add('number');
+  }
+  for (let i = 0; i < all.length; i++) {
+    const el = all[i];
+    if (!isFieldEl(el) || inLines[i] || roleOf.has(el)) continue;
+    const role = qbFieldRole({
+      label: fieldLabelText(el),
+      type: (el as HTMLInputElement).type,
+      docNumber: el.hasAttribute('data-doc-number'),
+      tag: el.tagName,
+    });
+    if (!role || taken.has(role)) continue;
+    // Above the lines only, except a memo (QuickBooks puts it under the lines on sales forms).
+    if (role !== 'memo' && i >= headerEnd) continue;
+    taken.add(role);
+    roleOf.set(el, role);
+  }
+  const memo = [...roleOf].find(([, r]) => r === 'memo')?.[0] ?? null;
+  const memoBelow = memo !== null && firstLine >= 0 && all.indexOf(memo) > lastLine;
+
+  const header = all.slice(0, headerEnd);
+  // The form's own header order (field ids), else QuickBooks' name / class / template / date / number.
+  const marker = root.matches(`[${QB_TAB_ORDER_ATTR}]`) ? root : root.querySelector(`[${QB_TAB_ORDER_ATTR}]`);
+  const explicit = (marker?.getAttribute(QB_TAB_ORDER_ATTR) ?? '').trim();
+  const roleEls = explicit
+    ? explicit
+        .split(/\s+/)
+        .map((id) => root.ownerDocument.getElementById(id))
+        .filter((el): el is HTMLElement => !!el && header.includes(el) && !(memoBelow && el === memo))
+    : QB_HEADER_ROLES.map((r) => [...roleOf].find(([, role]) => role === r)?.[0]).filter((el): el is HTMLElement => !!el);
+  const firstRoleAt = roleEls.length ? Math.min(...roleEls.map((el) => all.indexOf(el))) : headerEnd;
+  const before = header.slice(0, firstRoleAt).filter((el) => !roleEls.includes(el));
+  const restHeader = header.slice(firstRoleAt).filter((el) => !roleEls.includes(el));
+  const lines = firstLine >= 0 ? all.slice(firstLine, lastLine + 1) : [];
+
+  // After the lines: fields (and buttons among them) up to the last field, then the trailing buttons.
+  const afterStart = firstLine >= 0 ? lastLine + 1 : headerEnd;
+  const tailStart = Math.max(afterStart, lastField + 1);
+  const middle = all.slice(afterStart, tailStart).filter((el) => !(memoBelow && el === memo));
+  const tail = all.slice(tailStart);
+  const descs = tail.map((el) => ({
+    label:
+      (el.getAttribute('aria-label') || el.textContent || (el as HTMLInputElement).value || el.getAttribute('title') || '').trim(),
+    shortcut: el.getAttribute('data-shortcut'),
+    disabled: (el as HTMLButtonElement).disabled === true,
+  }));
+  const saveClose = pickShortcutButton(descs, 'save-close');
+  const saveNewRaw = pickShortcutButton(descs, 'save-new');
+  const saveNew = saveNewRaw === saveClose ? -1 : saveNewRaw;
+  const saves = [saveClose, saveNew].filter((i) => i >= 0).map((i) => tail[i]);
+  const otherTail = tail.filter((el) => !saves.includes(el));
+
+  return [...before, ...roleEls, ...restHeader, ...lines, ...middle, ...(memoBelow && memo ? [memo] : []), ...saves, ...otherTail];
+}
+
+/**
+ * Where Tab (1) or Shift+Tab (-1) goes from `from` on a QuickBooks-ordered form, or undefined
+ * when `from` is not on one. Null at either end of a page form (the browser moves on); a dialog
+ * wraps around.
+ */
+export function qbTabStop(from: HTMLElement, dir: 1 | -1): HTMLElement | null | undefined {
+  const marker = from.closest(`[${QB_TAB_ORDER_ATTR}]`) as HTMLElement | null;
+  const dialog = from.closest('[role="dialog"][aria-modal="true"]') as HTMLElement | null;
+  const root = dialog && dialog.querySelector(`[${QB_TAB_ORDER_ATTR}]`) ? dialog : marker;
+  if (!root) return undefined;
+  const order = qbTabOrder(root);
+  const i = order.indexOf(from);
+  if (i < 0) return undefined;
+  const j = i + dir;
+  if (j >= 0 && j < order.length) return order[j];
+  return dialog ? (order[(j + order.length) % order.length] ?? null) : null;
 }
 
 /** An attribute of the selected row, or null. */

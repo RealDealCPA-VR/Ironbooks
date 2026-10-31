@@ -5,6 +5,10 @@
  *
  *  - the QB date keys (+ - T W K M H Y R [ ] ; ') and Alt+Down (open the calendar) in EVERY date
  *    field — the kit's <Input type="date"> handles its own; any other date field is handled here;
+ *  - Tab / Shift+Tab on a transaction form marked data-qb-tab-order go in QuickBooks' order
+ *    (lib/keyboardTargets.ts qbTabOrder: name → class → template → date → number → … → lines →
+ *    memo → Save & Close → Save & New), wrapping inside a dialog; the browser's own Tab is left
+ *    alone wherever it already goes to the same place;
  *  - Tab / Shift+Tab leave a date field for the next / previous field, as in QuickBooks: the
  *    browser's date box would otherwise stop on its month, day, year and calendar button first
  *    (four Tabs per date on every form). Typing a date still fills it in, and Left / Right move
@@ -22,7 +26,7 @@
  */
 import * as React from 'react';
 import { adjustDateForKey, historyGuarded, isCalendarKey } from '@/lib/shortcuts';
-import { nextTabStop } from '@/lib/keyboardTargets';
+import { nextTabStop, qbTabStop } from '@/lib/keyboardTargets';
 
 /** The browser keys (Ctrl + letter) the app takes away from the browser when it has no use for them. */
 const BROWSER_CTRL_LETTERS = new Set(['d', 'e', 'f', 'g', 'h', 'j', 'k', 'l', 'n', 'o', 'p', 'r', 's', 'u']);
@@ -85,8 +89,16 @@ export default function KeyboardBase() {
   React.useEffect(() => {
     let lastHome = { at: 0, key: '' };
 
+    /** The field the cursor is in. A date field moves the focus among its own parts (a second
+     * focusin, with no focusout, when a QuickBooks key rewrites it): that is not a new visit. */
+    let current: EventTarget | null = null;
     function onFocusIn(e: FocusEvent) {
+      if (e.target === current) return;
+      current = e.target;
       if (isValueField(e.target)) lastValue.set(e.target, e.target.value);
+    }
+    function onFocusOut(e: FocusEvent) {
+      if (e.target === current && e.relatedTarget !== e.target) current = null;
     }
 
     function onInput(e: Event) {
@@ -109,17 +121,15 @@ export default function KeyboardBase() {
       const target = e.target as HTMLElement | null;
       const ctrl = e.ctrlKey || e.metaKey;
 
-      // ---- Tab out of a date field: one Tab stop, like every other field ----
-      if (
-        target instanceof HTMLInputElement &&
-        target.type === 'date' &&
-        e.key === 'Tab' &&
-        !ctrl &&
-        !e.altKey &&
-        !e.defaultPrevented
-      ) {
-        const to = nextTabStop(target, e.shiftKey ? -1 : 1);
-        if (to) {
+      // ---- Tab: QuickBooks' order on transaction forms; one Tab stop per date field ----
+      if (e.key === 'Tab' && !ctrl && !e.altKey && !e.defaultPrevented && target instanceof HTMLElement && target !== document.body) {
+        const dir = e.shiftKey ? -1 : 1;
+        const isDate = target instanceof HTMLInputElement && target.type === 'date';
+        const natural = nextTabStop(target, dir);
+        const qb = qbTabStop(target, dir);
+        const to = qb ? qb : isDate ? natural : null;
+        // Only step in where the browser would go somewhere else (or stop inside a date field).
+        if (to && (to !== natural || isDate)) {
           e.preventDefault();
           to.focus();
           if (to instanceof HTMLInputElement && /^(text|search|tel|url|email|number|)$/.test(to.type)) to.select?.();
@@ -199,11 +209,13 @@ export default function KeyboardBase() {
     }
 
     document.addEventListener('focusin', onFocusIn, true);
+    document.addEventListener('focusout', onFocusOut, true);
     document.addEventListener('input', onInput, true);
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('keydown', lastInLine, true);
     return () => {
       document.removeEventListener('focusin', onFocusIn, true);
+      document.removeEventListener('focusout', onFocusOut, true);
       document.removeEventListener('input', onInput, true);
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('keydown', lastInLine, true);

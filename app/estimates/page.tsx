@@ -880,7 +880,7 @@ export default function EstimatesPage() {
           </>
         }
       >
-        <div className="mb-3">
+        <div className="mb-3" data-qb-tab-order="">
           <TransactionNav
             sourceRef={null}
             onPrevious={nav.prev ? () => void openEditModal(nav.prev!) : null}

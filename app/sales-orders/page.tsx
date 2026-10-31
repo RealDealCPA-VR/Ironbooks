@@ -317,7 +317,7 @@ function NewOrderModal({ open, editing, onClose, customers, items, taxRates, onC
         </>
       }
     >
-      <div className="space-y-4">
+      <div className="space-y-4" data-qb-tab-order="">
         {nav}
         {/* Customer */}
         <div>

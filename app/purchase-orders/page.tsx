@@ -354,7 +354,7 @@ function NewPoModal({ open, onClose, vendors, accounts, items, onCreated, editId
         </>
       }
     >
-      <div className="space-y-4">
+      <div className="space-y-4" data-qb-tab-order="">
         {nav}
         {editId && (
           <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">

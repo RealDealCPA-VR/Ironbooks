@@ -398,7 +398,7 @@ function NewReceiptModal({ open, onClose, vendors, items, onCreated, editId }: N
         </>
       }
     >
-      <div className="space-y-4">
+      <div className="space-y-4" data-qb-tab-order="">
         {editId && (
           <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
             You can change this receipt until its bill is entered. Saving replaces the received

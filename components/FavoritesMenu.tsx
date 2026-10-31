@@ -7,7 +7,7 @@
  *
  * Keyboard: type to filter, Up / Down and Enter (or the Add button) add a page; in "On the
  * Favorites menu", the Move up / Move down / Remove buttons — or Alt+Up / Alt+Down / Delete on a
- * selected entry — order the menu. Save (Ctrl+S) keeps it.
+ * selected entry, a page's first letter to jump to it — order the menu. Save (Ctrl+S) keeps it.
  */
 import * as React from 'react';
 import { Button, Modal, toast } from '@/components/ui';
@@ -16,6 +16,7 @@ import { canOpenHref, type PermissionMap } from '@/lib/commands/actions';
 import { paletteDestinations } from '@/lib/nav';
 import { MAX_FAVORITES } from '@/lib/preferences';
 import { refreshPreferences, usePreferences } from '@/lib/usePreferences';
+import { useTypeAhead } from '@/lib/menuKeys';
 import { windowLabelFor } from './WindowList';
 
 /** Favorites > Customize Favorites (the desktop menu sends it through components/DesktopBridge.tsx). */
@@ -49,6 +50,7 @@ export default function FavoritesMenu({
   const [filter, setFilter] = React.useState('');
   const [active, setActive] = React.useState(0);
   const [saving, setSaving] = React.useState(false);
+  const typeAhead = useTypeAhead();
 
   // The desktop's Favorites menu follows what is stored.
   const key = stored.join('|');
@@ -197,6 +199,13 @@ export default function FavoritesMenu({
               } else if (e.key === 'Delete') {
                 e.preventDefault();
                 remove(selected);
+              } else {
+                // A page's first letter jumps to it (Windows lists).
+                const to = typeAhead(e, selected, chosen.map((p) => windowLabelFor(p) ?? p));
+                if (to !== null) {
+                  e.preventDefault();
+                  setSelected(to);
+                }
               }
             }}
             className="max-h-80 overflow-y-auto rounded-lg border border-slate-200 outline-none focus-visible:ring-2 focus-visible:ring-electric/50"

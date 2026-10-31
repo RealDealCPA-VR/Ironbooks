@@ -38,6 +38,7 @@ import {
   Tr,
   toast,
   toastError,
+  DocNumberInput,
 } from '@/components/ui';
 import { numberToWords } from '@/lib/pdf/check';
 import {
@@ -622,7 +623,7 @@ export default function PrintChecksPage() {
             )}
             <div className="w-44">
               <Label htmlFor="next-number">Next Check Number</Label>
-              <Input
+              <DocNumberInput
                 id="next-number"
                 placeholder="e.g. 1001"
                 value={nextNumber}
@@ -1118,7 +1119,7 @@ export default function PrintChecksPage() {
           <div className="grid grid-cols-2 gap-4">
             <div>
               <Label htmlFor="chk-number">Check Number</Label>
-              <Input
+              <DocNumberInput
                 id="chk-number"
                 placeholder="e.g. 1001"
                 value={checkNumber}
