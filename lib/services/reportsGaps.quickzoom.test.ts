@@ -25,6 +25,7 @@ import { receivePayment } from './payments';
 import { createSalesRep } from './salesReps';
 import { runStandardReport } from './reportRegistry';
 import { salesTaxRevenueSummary } from './accountant/salesTaxLedger';
+import { createMemorizedGroup, processMultipleReports, saveMemorizedReport } from './memorizedReports';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-reports-gaps-quickzoom');
 let db: DB;
@@ -105,4 +106,19 @@ describe('Sales Tax Revenue Summary on the standard engine (H12)', () => {
     expect(grand.cells.tax).toBe(Number(svc.totals.taxCollected).toFixed(2));
     expect(grand.cells.totalSales).toBe('380.00');
   });
+});
+
+describe('memorize every standard report (H4)', () => {
+  it('every catalog report can be memorized into a group and run with Process Multiple Reports', async () => {
+    const group = await createMemorizedGroup(ctx, { name: 'Everything' });
+    const keys = REPORT_CATALOG.map((e) => e.key).filter((k) => !['budget-overview', 'budget-vs-actual-report', 'forecast-overview'].includes(k));
+    for (const k of keys) {
+      const e = REPORT_CATALOG.find((x) => x.key === k)!;
+      const params = e.controls.includes('asOf') && !e.controls.includes('range') ? { asOf: '2026-12-31' } : RANGE;
+      await saveMemorizedReport(ctx, { name: `M ${k}`, reportType: k, groupId: group.id, config: { params } } as never);
+    }
+    const out = await processMultipleReports(ctx, { groupId: group.id });
+    expect(out.filter((o) => o.error).map((o) => `${o.name}: ${o.error}`)).toEqual([]);
+    expect(out).toHaveLength(keys.length);
+  }, 120_000);
 });
