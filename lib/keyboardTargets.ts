@@ -205,8 +205,9 @@ export function qbTabOrder(root: HTMLElement): HTMLElement[] {
       tag: el.tagName,
     });
     if (!role || taken.has(role)) continue;
-    // Above the lines only, except a memo (QuickBooks puts it under the lines on sales forms).
-    if (role !== 'memo' && i >= headerEnd) continue;
+    // Above the lines only — except a memo (QuickBooks puts it under the lines on sales forms)
+    // and a class or template, which QuickBooks keeps beside the name wherever a form shows them.
+    if (role !== 'memo' && role !== 'class' && role !== 'template' && i >= headerEnd) continue;
     taken.add(role);
     roleOf.set(el, role);
   }
@@ -223,7 +224,8 @@ export function qbTabOrder(root: HTMLElement): HTMLElement[] {
         .map((id) => root.ownerDocument.getElementById(id))
         .filter((el): el is HTMLElement => !!el && header.includes(el) && !(memoBelow && el === memo))
     : QB_HEADER_ROLES.map((r) => [...roleOf].find(([, role]) => role === r)?.[0]).filter((el): el is HTMLElement => !!el);
-  const firstRoleAt = roleEls.length ? Math.min(...roleEls.map((el) => all.indexOf(el))) : headerEnd;
+  const headerRoleAt = roleEls.map((el) => all.indexOf(el)).filter((i) => i < headerEnd);
+  const firstRoleAt = headerRoleAt.length ? Math.min(...headerRoleAt) : headerEnd;
   const before = header.slice(0, firstRoleAt).filter((el) => !roleEls.includes(el));
   const restHeader = header.slice(firstRoleAt).filter((el) => !roleEls.includes(el));
   const lines = firstLine >= 0 ? all.slice(firstLine, lastLine + 1) : [];
@@ -231,8 +233,8 @@ export function qbTabOrder(root: HTMLElement): HTMLElement[] {
   // After the lines: fields (and buttons among them) up to the last field, then the trailing buttons.
   const afterStart = firstLine >= 0 ? lastLine + 1 : headerEnd;
   const tailStart = Math.max(afterStart, lastField + 1);
-  const middle = all.slice(afterStart, tailStart).filter((el) => !(memoBelow && el === memo));
-  const tail = all.slice(tailStart);
+  const middle = all.slice(afterStart, tailStart).filter((el) => !(memoBelow && el === memo) && !roleEls.includes(el));
+  const tail = all.slice(tailStart).filter((el) => !roleEls.includes(el));
   const descs = tail.map((el) => ({
     label:
       (el.getAttribute('aria-label') || el.textContent || (el as HTMLInputElement).value || el.getAttribute('title') || '').trim(),

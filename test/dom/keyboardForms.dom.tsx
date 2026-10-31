@@ -436,6 +436,40 @@ domTest('Tab follows QuickBooks: name, class, date, number, the rest, lines, mem
   equal(back.join(' < '), 'c < Previous < Close < Cancel < Memorize', 'Shift+Tab goes the same way back, wrapping in the dialog');
 });
 
+domTest('a Class drawn under the lines still comes right after the name (Enter Sales Receipts)', async () => {
+  await mount(
+    <>
+      <KeyboardBase />
+      <Modal open onClose={() => {}} title="Enter Sales Receipts" footer={<Button>Save Sale</Button>}>
+        <div data-qb-tab-order="">
+          <label htmlFor="cust">Customer (optional)</label>
+          <input id="cust" />
+          <label htmlFor="sd">Sale Date</label>
+          <DateInput id="sd" defaultValue="2026-03-15" />
+          <label htmlFor="sno">Sale No.</label>
+          <DocNumberInput id="sno" defaultValue="SR-7" />
+          <div data-grid-row>
+            <input aria-label="Item" />
+          </div>
+          <label htmlFor="memo">Memo</label>
+          <input id="memo" />
+          <label htmlFor="cls">Class (optional)</label>
+          <select id="cls">
+            <option>East</option>
+          </select>
+        </div>
+      </Modal>
+    </>,
+  );
+  await focusOn('cust');
+  const seen = [tabLabel()];
+  for (let i = 0; i < 6; i++) {
+    await press('Tab');
+    seen.push(tabLabel());
+  }
+  equal(seen.join(' > '), 'cust > cls > sd > sno > Item > memo > Save Sale', 'sales receipt order');
+});
+
 domTest('a form can give its own QuickBooks header order (Write Checks: account, number, date, payee)', async () => {
   await mount(
     <main>
