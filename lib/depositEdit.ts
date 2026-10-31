@@ -25,6 +25,9 @@ export interface UndepositedItem {
   customerName: string | null;
   date: string;
   method: string;
+  /** salesar (B7): the Payment Method list entry ("Visa"); null/absent = shown by `method`. */
+  paymentMethodId?: string | null;
+  paymentMethodName?: string | null;
   reference: string | null;
   amount: string;
   /** p1 fx: payment currency (null = home). */
@@ -39,6 +42,19 @@ export interface DepositLine {
   amount: string;
   /** Account an extra line credits (null on payment / receipt / cash-back lines). */
   accountId?: string | null;
+  /**
+   * salesar (B7): what a payment / sales receipt / invoice-payment line came from (GET
+   * /api/deposits/:id) — its method, Payment Method entry, customer, reference and date.
+   */
+  source?: {
+    method: string;
+    paymentMethodId: string | null;
+    paymentMethodName: string | null;
+    customerId: string | null;
+    customerName: string | null;
+    reference: string | null;
+    date: string;
+  } | null;
 }
 
 export interface Deposit {
@@ -94,17 +110,27 @@ export function depositToEdit(dep: Deposit): DepositEdit {
   const currency = dep.currency ?? null;
   let cashBackAccountId = '';
   let cashBackAmount = '';
+  // salesar (B7): a line's source (method, Payment Method entry, customer...) when the server
+  // named it; else the generic "Already on this deposit" row of deposits loaded without it.
+  const fromSource = (l: DepositLine, fallbackMethod: string) =>
+    l.source
+      ? {
+          customerId: l.source.customerId,
+          customerName: l.source.customerName ?? 'Already on this deposit',
+          date: l.source.date,
+          method: l.source.method,
+          paymentMethodId: l.source.paymentMethodId,
+          paymentMethodName: l.source.paymentMethodName,
+          reference: l.source.reference,
+        }
+      : { customerId: null, customerName: 'Already on this deposit', date: dep.date, method: fallbackMethod, reference: null };
   for (const l of dep.lines) {
     const desc = l.description ?? '';
     if (l.paymentId) {
       items.push({
         id: l.paymentId,
         kind: 'payment',
-        customerId: null,
-        customerName: 'Already on this deposit',
-        date: dep.date,
-        method: 'payment',
-        reference: null,
+        ...fromSource(l, 'payment'),
         amount: l.amount,
         currency,
       });
@@ -112,11 +138,7 @@ export function depositToEdit(dep: Deposit): DepositEdit {
       items.push({
         id: desc.slice(RECEIPT_PREFIX.length),
         kind: 'sales_receipt',
-        customerId: null,
-        customerName: 'Already on this deposit',
-        date: dep.date,
-        method: 'sales receipt',
-        reference: null,
+        ...fromSource(l, 'sales receipt'),
         amount: l.amount,
         currency,
       });
@@ -124,11 +146,7 @@ export function depositToEdit(dep: Deposit): DepositEdit {
       items.push({
         id: desc.slice(INVOICE_PAYMENT_PREFIX.length),
         kind: 'invoice_payment',
-        customerId: null,
-        customerName: 'Already on this deposit',
-        date: dep.date,
-        method: 'invoice payment',
-        reference: null,
+        ...fromSource(l, 'invoice payment'),
         amount: l.amount,
         currency,
       });
