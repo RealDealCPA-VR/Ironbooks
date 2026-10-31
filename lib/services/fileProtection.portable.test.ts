@@ -116,6 +116,18 @@ describe('portable and transfer files of a protected company file', () => {
     expect(await fileOpensWith(target, 'password', 'Juniper-Pass-1', 'jo')).toBe(true);
   }, 180_000);
 
+  it('a browser restore while a single company file is open lands next to the company file, not in the hidden working copy', async () => {
+    // Review round 5 leftover: defaultPortableRestoreDir used dirname(dataDir) — the working copy.
+    resetLimiters();
+    const { buffer } = await createPortableCompanyFile(ctx());
+    const res = await restorePOST(apiRequest('POST', '/api/portable/restore', new Uint8Array(buffer)));
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    const where = body.packed ?? body.dataDir;
+    expect(path.dirname(where)).toBe(path.dirname(FILE));
+    expect(format.isCompanyFile(where)).toBe(true);
+  }, 180_000);
+
   it("an Accountant's Copy transfer file with a password needs it to open", async () => {
     resetLimiters();
     await expect(createAccountantCopy(ctx(), { dividingDate: '2026-06-30', password: 'short' })).rejects.toMatchObject({ code: 'VALIDATION' });
