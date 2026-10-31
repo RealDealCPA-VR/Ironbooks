@@ -482,6 +482,10 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
         // The transaction-log head this save holds: the next open knows exactly what is saved.
         fingerprint,
         ...(s.dbSchema ? { dbSchema: s.dbSchema } : {}),
+        // A protected TRAINING file (lib/services/sandbox.ts keepSandboxAsTraining) keeps saying so:
+        // `training` in its plain listing, its marker inside the encrypted details (the marker file
+        // itself never travels; lib/services/fileProtection.ts doUnseal puts it back at sign-in).
+        ...(protection ? trainingFields(dataDir) : {}),
       },
       backupManifest: {
         app: 'bookkeeper-ai',
@@ -725,6 +729,9 @@ export async function closeCompanyFile(): Promise<CloseResult> {
       throw err;
     }
   }
+  // The server is on a sandbox copy ("Try it on a copy"): leaving it comes back to this working
+  // copy, so it stays (plain text only on this computer, like any working copy) until then.
+  if (path.resolve(active) !== path.resolve(dir)) return result;
   return finishClose(s, result);
 }
 
@@ -743,6 +750,16 @@ function finishClose(s: SaveState, result: SaveResult): CloseResult {
   const sealed = result.outcome === 'unchanged' ? s.lastSealed || isProtectedWorkingCopy(s) : Boolean(result.encrypted);
   if (!sealed) return result;
   return { ...result, workingCopyRemoved: removeWorkingData(s, result.outcome === 'conflict') };
+}
+
+/** The training-file marker of a working copy, for the manifest of its (protected) save. */
+function trainingFields(dataDir: string): { training?: true; sandboxMarker?: Record<string, unknown> } {
+  try {
+    const m = JSON.parse(fs.readFileSync(path.join(dataDir, '.ironbooks-sandbox.json'), 'utf8'));
+    return m && typeof m === 'object' && m.kind === 'training' ? { training: true, sandboxMarker: m } : {};
+  } catch {
+    return {};
+  }
 }
 
 /** The working copy says it belongs to a protected file (lib/services/fileProtection.ts marker). */

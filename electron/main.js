@@ -520,7 +520,11 @@ function sandboxRoot() {
 function sandboxActive() {
   if (remoteHostOrigin) return null;
   try {
-    return companyFile.readSandboxMarker(activeCompanyDir());
+    const marker = companyFile.readSandboxMarker(activeCompanyDir());
+    // A protected training file (filecrypto) says so in its plain listing; its marker is only in
+    // the working copy once someone has signed in.
+    if (!marker && openFile && openFile.training) return { kind: 'training' };
+    return marker;
   } catch {
     return null;
   }
@@ -582,7 +586,9 @@ ipcMain.handle('sandbox:left', (e, opts) => {
   const trainingDir = opts && typeof opts.trainingDir === 'string' ? opts.trainingDir : null;
   const kept = trainingDir ? companyFile.readSandboxMarker(trainingDir) : null;
   // A kept training file shows up under File > Recent Companies (it opens like any other file).
-  if (kept && kept.kind === 'training') rememberRecentCompany(trainingDir);
+  // A protected one (filecrypto) is a single encrypted company file, its marker inside it.
+  const keptFile = !kept && trainingDir ? companyFileFormat.readCompanyManifest(trainingDir) : null;
+  if ((kept && kept.kind === 'training') || (keptFile && keptFile.training === true)) rememberRecentCompany(trainingDir);
   rememberRecentCompany(sb.realFile || sb.realDir);
   setImmediate(() => {
     relaunchApp();
@@ -672,6 +678,8 @@ function agoText(ms) {
 /** Plain-language reason a company file could not be opened. */
 function openErrorText(err) {
   if (err && err.code === 'NEWER_FORMAT') return err.message;
+  // Protected with passwords (filecrypto): a damaged or altered entry, or no key to open it.
+  if (err && (err.code === 'TAMPERED' || err.code === 'SEALED' || err.code === 'PROTECTED')) return err.message;
   if (err && err.code === 'READ_ONLY_LOCATION') return err.message;
   if (err && err.name === 'NotACompanyFileError') return err.message;
   if (err && (err.code === 'ENOENT' || err.code === 'ENOTDIR')) {
@@ -1533,13 +1541,30 @@ async function restoreBackupAsNewFileFlow(bkaPath) {
   const scratchWork = path.join(workingRoot(), `restore-${crypto.randomBytes(6).toString('hex')}`);
   const scratch = companySession.dataDirOf(scratchWork);
   try {
-    const info = await companyFileFormat.extractBackupArchive(bkaPath, scratch, {
-      knownSchemaAt: companySession.latestMigrationAt(migrationsDir()),
-    });
-    await companySession.writeWorkingCopyAs(scratchWork, target, {
-      companyName: info.companyName || companyFileFormat.companyFileBaseName(target),
-      appVersion: app.getVersion(),
-    });
+    const knownSchemaAt = companySession.latestMigrationAt(migrationsDir());
+    const head = companyFileFormat.readArchiveHead(bkaPath);
+    if (head && head.manifest && companyFileFormat.isSealedManifest(head.manifest)) {
+      // A backup protected with passwords (filecrypto) becomes a protected company file without
+      // ever being decrypted here: opening it asks for a user name + password from the file it was
+      // made from (or its recovery key), like the file itself.
+      await companyFileFormat.sealedBackupAsCompanyFile(bkaPath, target, {
+        knownSchemaAt,
+        manifest: {
+          fileId: crypto.randomUUID(),
+          companyName: head.manifest.companyName || companyFileFormat.companyFileBaseName(target),
+          saveId: crypto.randomUUID(),
+          previousSaveId: null,
+          savedAt: new Date().toISOString(),
+          appVersion: app.getVersion(),
+        },
+      });
+    } else {
+      const info = await companyFileFormat.extractBackupArchive(bkaPath, scratch, { knownSchemaAt });
+      await companySession.writeWorkingCopyAs(scratchWork, target, {
+        companyName: info.companyName || companyFileFormat.companyFileBaseName(target),
+        appVersion: app.getVersion(),
+      });
+    }
     rememberRecentCompany(target);
     const { response } = await dialog.showMessageBox(parentWindow(), {
       noLink: true,
