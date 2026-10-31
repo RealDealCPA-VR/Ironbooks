@@ -706,9 +706,14 @@ export function sealedChallengeQuestion(login: string): string | null {
   return slot && typeof slot.question === 'string' ? slot.question : null;
 }
 
-/** The "unsaved changes" copy made when the file was opened (sealed conflict plan), for the sign-in answer. */
-export function unsealedConflictCopy(): string | null {
-  return keyState().conflictCopy;
+/**
+ * The "unsaved changes" copy made when the file was opened (sealed conflict plan), for the answer
+ * of the sign-in that made it — reported once, to the person on this computer.
+ */
+export function takeUnsealedConflictCopy(): string | null {
+  const copy = keyState().conflictCopy;
+  keyState().conflictCopy = null;
+  return copy;
 }
 
 function statePathOf(): string | null {
@@ -775,8 +780,13 @@ async function doUnseal(fileKey: Buffer): Promise<void> {
     // This computer's session-signing key (never in the company file) stays with the working copy.
     const secret = path.join(dataDir, '.auth-secret');
     if (fs.existsSync(secret)) fs.copyFileSync(secret, path.join(tmp, '.auth-secret'));
+    // A protected training file (lib/services/sandbox.ts keepSandboxAsTraining) carries its
+    // training marker inside its encrypted details: the working copy is a training file again.
+    if (opened.sandboxMarker && typeof opened.sandboxMarker === 'object' && m.training === true) {
+      fs.writeFileSync(path.join(tmp, '.ironbooks-sandbox.json'), JSON.stringify(opened.sandboxMarker, null, 2));
+    }
     fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-    fs.renameSync(tmp, dataDir);
+    await format.renameWithRetry(tmp, dataDir);
     if (statePath) {
       session.writeState(workDir, {
         base: { saveId: m.saveId ?? null, savedAt: m.savedAt ?? null, fingerprint: opened.fingerprint ?? null },

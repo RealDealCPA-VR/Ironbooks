@@ -55,7 +55,7 @@ import {
   refreshSlotAtSignIn,
   unlockFromFile,
   unsealCompanyFile,
-  unsealedConflictCopy,
+  takeUnsealedConflictCopy,
 } from '@/lib/services/fileProtection';
 import { cookieSecure, originFromHeaders, type RequestOrigin } from '@/lib/net/requestInfo';
 import { GLOBAL_KEY_WEIGHT, attemptKeys, loginLimiter, tooManyAttempts } from '@/lib/net/rateLimit';
@@ -283,7 +283,7 @@ async function handlePost(req: NextRequest) {
         challengeSlotMissing = st?.self?.challenge === 'missing';
       }
     }
-    const conflictCopy = origin.remote ? null : unsealedConflictCopy();
+    const conflictCopy = origin.remote ? null : takeUnsealedConflictCopy();
 
     const res = NextResponse.json({
       id: user.id,
