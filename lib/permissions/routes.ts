@@ -104,6 +104,10 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/budgets': r('company', 'GET POST'),
   '/api/budgets/[id]': r('company', 'GET PATCH'),
   '/api/budgets/[id]/vs-actual': r('reports_financial', 'GET'),
+  // reports (H17): budget tools — create from actuals, copy & adjust, adjust row amounts.
+  '/api/budgets/[id]/fill-from-actuals': r('company', 'POST:modify'),
+  '/api/budgets/[id]/copy': r('company', 'POST:create'),
+  '/api/budgets/[id]/adjust': r('company', 'POST:modify'),
   '/api/fiscal-periods': r('closing', 'GET POST:modify'),
   '/api/fiscal-periods/[id]': r('closing', 'PATCH'),
   '/api/year-end-close': r('closing', 'POST:modify'),

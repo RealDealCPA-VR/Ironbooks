@@ -32,3 +32,28 @@ export const setBudgetLineSchema = z.object({
   classId: zUuid.nullish(),
 });
 export type SetBudgetLineBody = z.infer<typeof setBudgetLineSchema>;
+
+/** POST /api/budgets/:id/fill-from-actuals — QB "Create budget from previous year's actual data". */
+export const fillBudgetSchema = z.object({
+  /** The fiscal year whose actuals fill the budget (default: the year before the budget's). */
+  fiscalYear: z.coerce.number().int().min(2000).max(2100).nullish(),
+  classId: zUuid.nullish(),
+  customerId: zUuid.nullish(),
+});
+
+/** POST /api/budgets/:id/copy — copy a budget / forecast into another year, +/- a percentage. */
+export const copyBudgetSchema = z.object({
+  name: z.string().trim().min(1, 'Give the new budget a name').max(255),
+  fiscalYear: z.coerce.number().int().min(2000).max(2100),
+  isForecast: z.boolean().optional(),
+  percent: z.union([z.string().max(20), z.number()]).nullish(),
+});
+
+/** POST /api/budgets/:id/adjust — Adjust Row Amounts by a percentage. */
+export const adjustBudgetSchema = z.object({
+  percent: z.union([z.string().max(20), z.number()]),
+  fromMonth: z.coerce.number().int().min(1).max(12).nullish(),
+  accountIds: z.array(zUuid).max(2000).nullish(),
+  classId: zUuid.nullish(),
+  customerId: zUuid.nullish(),
+});

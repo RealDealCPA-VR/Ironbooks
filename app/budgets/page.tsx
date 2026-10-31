@@ -1,8 +1,15 @@
 'use client';
 
+/**
+ * Set Up Budgets & Forecasts (QB Planning & Budgeting): budgets and forecasts by account, for the
+ * whole company, by Class or by Customer:Job, and balance-sheet budgets. Tools: Create from
+ * actuals (a fiscal year's actual amounts), Copy & adjust (into another year / as a forecast,
+ * +/- a percentage) and Adjust amounts (+/- a percentage from a month on). Budget Overview and
+ * Budget vs. Actual open as standard reports for the budget and the class / Customer:Job shown.
+ */
 import { useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
-import { BarChart2, Plus } from 'lucide-react';
+import { BarChart2, Copy, History, Percent, Plus } from 'lucide-react';
 import {
   Badge,
   Select,
@@ -112,11 +119,18 @@ function fiscalMonths(fiscalYear: number, fiscalYearEnd: string | undefined): { 
   });
 }
 
-function getLineAmount(lines: BudgetLine[], accountId: string, month: number, customerId = ''): string {
+function getLineAmount(lines: BudgetLine[], accountId: string, month: number, customerId = '', classId = ''): string {
   const line = lines.find(
-    (l) => l.accountId === accountId && l.month === month && (l.customerId ?? '') === customerId && !l.classId,
+    (l) => l.accountId === accountId && l.month === month && (l.customerId ?? '') === customerId && (l.classId ?? '') === classId,
   );
   return line?.amount ?? '';
+}
+
+/** The budget's criteria from its lines (QB keeps one per budget). */
+function criteriaOf(lines: BudgetLine[]): 'company' | 'class' | 'customer' | null {
+  if (lines.some((l) => l.classId)) return 'class';
+  if (lines.some((l) => l.customerId)) return 'customer';
+  return lines.length ? 'company' : null;
 }
 
 function varianceColor(variance: string): string {
@@ -234,12 +248,15 @@ function BudgetGrid({
   accounts,
   onLineChange,
   customerId,
+  classId = '',
 }: {
   budget: BudgetWithLines;
   accounts: Account[];
   onLineChange: (accountId: string, month: number, amount: string) => void;
   /** Customer:Job being budgeted ('' = whole company). */
   customerId: string;
+  /** Class being budgeted ('' = none). */
+  classId?: string;
 }) {
   // P&L budgets: income and expense accounts. Balance-sheet budgets: asset, liability, equity.
   const isBs = budget.kind === 'balance_sheet';
@@ -251,7 +268,7 @@ function BudgetGrid({
   return (
     <div className="overflow-x-auto">
       {/* Keyed by budget so switching budgets remounts the uncontrolled inputs. */}
-      <table key={`${budget.id}:${customerId}`} className="w-full border-collapse text-sm min-w-[900px]">
+      <table key={`${budget.id}:${customerId}:${classId}`} className="w-full border-collapse text-sm min-w-[900px]">
         <thead>
           <tr>
             <th className="py-2.5 px-3 text-left font-semibold text-navy/70 border-b-2 border-navy/10 sticky left-0 bg-white z-10 min-w-[180px]">
@@ -282,7 +299,7 @@ function BudgetGrid({
                   <span className="text-navy font-medium">{acct.name}</span>
                 </td>
                 {months.map(({ month, label }) => {
-                  const current = getLineAmount(budget.lines, acct.id, month, customerId);
+                  const current = getLineAmount(budget.lines, acct.id, month, customerId, classId);
                   return (
                     <td key={month} className="py-1 px-1">
                       <input
@@ -477,15 +494,23 @@ export default function BudgetsPage() {
 
   // Active tab on the right panel.
   const [tab, setTab] = useState<'grid' | 'vs-actual'>('grid');
-  // Customer:Job dimension for the grid ('' = whole company).
+  // Customer:Job / Class dimension for the grid ('' = whole company).
   const [customerId, setCustomerId] = useState('');
+  const [classId, setClassId] = useState('');
+  const [by, setBy] = useState<'company' | 'class' | 'customer'>('company');
   const [customers, setCustomers] = useState<{ id: string; name: string }[]>([]);
+  const [classList, setClassList] = useState<{ id: string; name: string }[]>([]);
   useEffect(() => {
     api
-      .get<{ customers: { id: string; name: string }[] }>('/api/reports/filter-options')
-      .then((o) => setCustomers(o.customers))
+      .get<{ customers: { id: string; name: string }[]; classes?: { id: string; name: string }[] }>('/api/reports/filter-options')
+      .then((o) => {
+        setCustomers(o.customers);
+        setClassList(o.classes ?? []);
+      })
       .catch(() => setCustomers([]));
   }, []);
+  // Budget tools (QB Create from actuals / Copy & adjust / Adjust Row Amounts).
+  const [tool, setTool] = useState<'fill' | 'copy' | 'adjust' | null>(null);
 
   // ---------------------------------------------------------------------------
   // Load budget list
@@ -535,11 +560,22 @@ export default function BudgetsPage() {
     try {
       const full = await api.get<BudgetWithLines>(`/api/budgets/${budget.id}`);
       setSelected(full);
+      // Open on the budget's own criteria (company / class / Customer:Job) and its first slice.
+      const crit = criteriaOf(full.lines);
+      setBy(crit ?? 'company');
+      setClassId(crit === 'class' ? (full.lines.find((l) => l.classId)?.classId ?? '') : '');
+      setCustomerId(crit === 'customer' ? (full.lines.find((l) => l.customerId)?.customerId ?? '') : '');
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Failed to load budget', 'danger');
     } finally {
       setSelectedLoading(false);
     }
+  }
+
+  async function reloadSelected() {
+    if (!selected) return;
+    setSelected(await api.get<BudgetWithLines>(`/api/budgets/${selected.id}`));
+    setVsActual(null);
   }
 
   // ---------------------------------------------------------------------------
@@ -551,7 +587,13 @@ export default function BudgetsPage() {
     const numAmount = Number(amount);
     if (isNaN(numAmount)) return;
     try {
-      await api.patch(`/api/budgets/${selected.id}`, { accountId, month, amount, customerId: customerId || null });
+      await api.patch(`/api/budgets/${selected.id}`, {
+        accountId,
+        month,
+        amount,
+        customerId: by === 'customer' ? customerId || null : null,
+        classId: by === 'class' ? classId || null : null,
+      });
       // Refresh budget lines silently.
       const full = await api.get<BudgetWithLines>(`/api/budgets/${selected.id}`);
       setSelected(full);
@@ -595,6 +637,12 @@ export default function BudgetsPage() {
       loadVsActual();
     }
   }
+
+  // The class / Customer:Job slice the grid shows, for the report links.
+  const sliceQs = by === 'customer' && customerId ? `&customerId=${customerId}` : by === 'class' && classId ? `&classId=${classId}` : '';
+  const gridCustomer = selected?.kind === 'balance_sheet' || by !== 'customer' ? '' : customerId;
+  const gridClass = selected?.kind === 'balance_sheet' || by !== 'class' ? '' : classId;
+  const sliceMissing = (by === 'customer' && !customerId) || (by === 'class' && !classId);
 
   // ---------------------------------------------------------------------------
   // Render
@@ -685,13 +733,13 @@ export default function BudgetsPage() {
                   <div className="flex gap-3 mt-1 text-xs">
                     <Link
                       className="text-electric hover:underline"
-                      href={`/reports/std/${selected.isForecast ? 'forecast-overview' : 'budget-overview'}?budgetId=${selected.id}${customerId ? `&customerId=${customerId}` : ''}`}
+                      href={`/reports/std/${selected.isForecast ? 'forecast-overview' : 'budget-overview'}?budgetId=${selected.id}${sliceQs}`}
                     >
                       {selected.isForecast ? 'Forecast Overview' : 'Budget Overview'} report
                     </Link>
                     <Link
                       className="text-electric hover:underline"
-                      href={`/reports/std/budget-vs-actual-report?budgetId=${selected.id}${customerId ? `&customerId=${customerId}` : ''}`}
+                      href={`/reports/std/budget-vs-actual-report?budgetId=${selected.id}${sliceQs}`}
                     >
                       {selected.isForecast ? 'Forecast' : 'Budget'} vs. Actual report
                     </Link>
@@ -717,28 +765,73 @@ export default function BudgetsPage() {
               <div className="p-4">
                 {tab === 'grid' && (
                   <>
-                    {selected.kind !== 'balance_sheet' && customers.length > 0 && (
-                      <div className="flex items-end gap-2 mb-3">
-                        <div className="min-w-[16rem]">
-                          <Label htmlFor="budget-customer">Budget for</Label>
-                          <Select id="budget-customer" value={customerId} onChange={(e) => setCustomerId(e.target.value)}>
-                            <option value="">Whole company</option>
-                            {customers.map((c) => (
-                              <option key={c.id} value={c.id}>
-                                {c.name}
-                              </option>
-                            ))}
-                          </Select>
-                        </div>
-                        <p className="text-xs text-navy/50 mb-2">A budget is either for the whole company or by Customer:Job — not both.</p>
+                    <div className="flex flex-wrap items-end gap-2 mb-3">
+                      {selected.kind !== 'balance_sheet' && (
+                        <>
+                          <div className="min-w-[12rem]">
+                            <Label htmlFor="budget-by">Budget by</Label>
+                            <Select
+                              id="budget-by"
+                              value={by}
+                              onChange={(e) => {
+                                setBy(e.target.value as 'company' | 'class' | 'customer');
+                                setCustomerId('');
+                                setClassId('');
+                              }}
+                            >
+                              <option value="company">Account (whole company)</option>
+                              <option value="class">Account and Class</option>
+                              <option value="customer">Account and Customer:Job</option>
+                            </Select>
+                          </div>
+                          {by === 'customer' && (
+                            <div className="min-w-[14rem]">
+                              <Label htmlFor="budget-customer">Customer:Job</Label>
+                              <Select id="budget-customer" value={customerId} onChange={(e) => setCustomerId(e.target.value)}>
+                                <option value="">Choose a Customer:Job…</option>
+                                {customers.map((c) => (
+                                  <option key={c.id} value={c.id}>
+                                    {c.name}
+                                  </option>
+                                ))}
+                              </Select>
+                            </div>
+                          )}
+                          {by === 'class' && (
+                            <div className="min-w-[14rem]">
+                              <Label htmlFor="budget-class">Class</Label>
+                              <Select id="budget-class" value={classId} onChange={(e) => setClassId(e.target.value)}>
+                                <option value="">Choose a class…</option>
+                                {classList.map((c) => (
+                                  <option key={c.id} value={c.id}>
+                                    {c.name}
+                                  </option>
+                                ))}
+                              </Select>
+                            </div>
+                          )}
+                        </>
+                      )}
+                      <div className="flex gap-2 ml-auto">
+                        <Button variant="secondary" size="sm" onClick={() => setTool('fill')} disabled={sliceMissing}>
+                          <History className="h-4 w-4" /> Create from actuals
+                        </Button>
+                        <Button variant="secondary" size="sm" onClick={() => setTool('adjust')} disabled={!selected.lines.length}>
+                          <Percent className="h-4 w-4" /> Adjust amounts
+                        </Button>
+                        <Button variant="secondary" size="sm" onClick={() => setTool('copy')}>
+                          <Copy className="h-4 w-4" /> Copy &amp; adjust
+                        </Button>
                       </div>
+                    </div>
+                    <p className="text-xs text-navy/50 mb-3">
+                      A budget is for the whole company, by class or by Customer:Job — one of them (QuickBooks budget criteria).
+                    </p>
+                    {sliceMissing ? (
+                      <p className="py-8 text-center text-sm text-navy/50">Choose the {by === 'class' ? 'class' : 'Customer:Job'} to budget for.</p>
+                    ) : (
+                      <BudgetGrid budget={selected} accounts={accounts} onLineChange={handleLineChange} customerId={gridCustomer} classId={gridClass} />
                     )}
-                    <BudgetGrid
-                      budget={selected}
-                      accounts={accounts}
-                      onLineChange={handleLineChange}
-                      customerId={selected.kind === 'balance_sheet' ? '' : customerId}
-                    />
                   </>
                 )}
 
@@ -794,6 +887,31 @@ export default function BudgetsPage() {
         </div>
       </div>
 
+      {selected && (
+        <BudgetToolDialog
+          tool={tool}
+          budget={selected}
+          slice={{ customerId: gridCustomer || null, classId: gridClass || null }}
+          sliceLabel={
+            gridCustomer
+              ? customers.find((c) => c.id === gridCustomer)?.name ?? 'this Customer:Job'
+              : gridClass
+                ? classList.find((c) => c.id === gridClass)?.name ?? 'this class'
+                : 'the whole company'
+          }
+          onClose={() => setTool(null)}
+          onDone={async (created) => {
+            setTool(null);
+            if (created) {
+              setBudgets((prev) => [...prev, created]);
+              await selectBudget(created);
+            } else {
+              await reloadSelected();
+            }
+          }}
+        />
+      )}
+
       {/* New Budget modal */}
       <NewBudgetModal
         open={newBudgetOpen}
@@ -805,5 +923,144 @@ export default function BudgetsPage() {
         }}
       />
     </main>
+  );
+}
+
+/** Create from actuals / Copy & adjust / Adjust amounts (lib/services/budgetTools.ts). */
+function BudgetToolDialog({
+  tool,
+  budget,
+  slice,
+  sliceLabel,
+  onClose,
+  onDone,
+}: {
+  tool: 'fill' | 'copy' | 'adjust' | null;
+  budget: BudgetWithLines;
+  slice: { customerId: string | null; classId: string | null };
+  sliceLabel: string;
+  onClose: () => void;
+  onDone: (created?: Budget) => void | Promise<void>;
+}) {
+  const [year, setYear] = useState(String(budget.fiscalYear - 1));
+  const [name, setName] = useState('');
+  const [percent, setPercent] = useState('');
+  const [fromMonth, setFromMonth] = useState('');
+  const [asForecast, setAsForecast] = useState(false);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    if (!tool) return;
+    setYear(String(tool === 'copy' ? budget.fiscalYear + 1 : budget.fiscalYear - 1));
+    setName(`${budget.name} FY${budget.fiscalYear + 1}`);
+    setPercent('');
+    setFromMonth('');
+    setAsForecast(!!budget.isForecast);
+  }, [tool, budget]);
+  const noun = budget.isForecast ? 'forecast' : 'budget';
+  const run = async () => {
+    setBusy(true);
+    try {
+      if (tool === 'fill') {
+        const r = await api.post<{ lines: number; fiscalYear: number }>(`/api/budgets/${budget.id}/fill-from-actuals`, { fiscalYear: Number(year), ...slice });
+        toast(`Filled ${r.lines} amount${r.lines === 1 ? '' : 's'} from FY${r.fiscalYear} actuals.`, 'success');
+        await onDone();
+      } else if (tool === 'copy') {
+        const b = await api.post<Budget>(`/api/budgets/${budget.id}/copy`, { name: name.trim(), fiscalYear: Number(year), isForecast: asForecast, percent: percent.trim() || null });
+        toast(`${asForecast ? 'Forecast' : 'Budget'} “${b.name}” created.`, 'success');
+        await onDone(b);
+      } else if (tool === 'adjust') {
+        const r = await api.post<{ lines: number }>(`/api/budgets/${budget.id}/adjust`, { percent: percent.trim(), fromMonth: fromMonth ? Number(fromMonth) : null, ...slice });
+        toast(`Adjusted ${r.lines} amount${r.lines === 1 ? '' : 's'}.`, 'success');
+        await onDone();
+      }
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'That did not work.', 'danger');
+    } finally {
+      setBusy(false);
+    }
+  };
+  const title = tool === 'fill' ? 'Create from actuals' : tool === 'copy' ? `Copy & adjust this ${noun}` : 'Adjust amounts';
+  return (
+    <Modal
+      open={tool !== null}
+      onClose={onClose}
+      title={title}
+      footer={
+        <>
+          <Button variant="secondary" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button loading={busy} onClick={run} disabled={(tool === 'adjust' && !percent.trim()) || (tool === 'copy' && !name.trim())}>
+            {tool === 'fill' ? 'Fill amounts' : tool === 'copy' ? 'Create copy' : 'Adjust'}
+          </Button>
+        </>
+      }
+    >
+      <form
+        className="flex flex-col gap-3"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void run();
+        }}
+      >
+        {tool === 'fill' && (
+          <>
+            <p className="text-sm text-navy/60">
+              Replaces the amounts for {sliceLabel} with what actually happened in a fiscal year
+              {budget.kind === 'balance_sheet' ? ' (each month-end balance)' : ' (each month’s income and expenses)'}.
+            </p>
+            <div>
+              <Label htmlFor="bt-year">Actuals of fiscal year</Label>
+              <Input id="bt-year" type="number" min={2000} max={2100} value={year} onChange={(e) => setYear(e.target.value)} autoFocus />
+            </div>
+          </>
+        )}
+        {tool === 'copy' && (
+          <>
+            <div>
+              <Label htmlFor="bt-name">Name of the copy</Label>
+              <Input id="bt-name" value={name} onChange={(e) => setName(e.target.value)} autoFocus maxLength={255} />
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <Label htmlFor="bt-year">Fiscal year</Label>
+                <Input id="bt-year" type="number" min={2000} max={2100} value={year} onChange={(e) => setYear(e.target.value)} />
+              </div>
+              <div>
+                <Label htmlFor="bt-pct">Change every amount by (%)</Label>
+                <Input id="bt-pct" inputMode="decimal" value={percent} onChange={(e) => setPercent(e.target.value)} placeholder="e.g. 5 or -10" />
+              </div>
+            </div>
+            <label className="flex items-center gap-2 text-sm text-navy">
+              <input type="checkbox" className="accent-electric" checked={asForecast} onChange={(e) => setAsForecast(e.target.checked)} />
+              Save the copy as a forecast
+            </label>
+          </>
+        )}
+        {tool === 'adjust' && (
+          <>
+            <p className="text-sm text-navy/60">Raises or lowers the amounts for {sliceLabel} by a percentage.</p>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <Label htmlFor="bt-pct">Change by (%)</Label>
+                <Input id="bt-pct" inputMode="decimal" value={percent} onChange={(e) => setPercent(e.target.value)} placeholder="e.g. 5 or -10" autoFocus />
+              </div>
+              <div>
+                <Label htmlFor="bt-from">Starting with</Label>
+                <Select id="bt-from" value={fromMonth} onChange={(e) => setFromMonth(e.target.value)}>
+                  <option value="">The first month of the year</option>
+                  {MONTHS.map((m, i) => (
+                    <option key={m} value={String(i + 1)}>
+                      {m}
+                    </option>
+                  ))}
+                </Select>
+              </div>
+            </div>
+          </>
+        )}
+        <button type="submit" className="hidden" aria-hidden="true" tabIndex={-1} />
+      </form>
+    </Modal>
   );
 }
