@@ -246,7 +246,7 @@ domTest('"Pressing Enter moves between fields" on: Enter goes to the next field 
   await until(() => saved === 1, 'Ctrl+Enter records');
 });
 
-domTest('? and F1 open the Help window; it lists exactly the keys that work, in Intuit\'s groups', async () => {
+domTest('? and F1 open the Help window; it lists exactly the keys that work, in Intuit’s groups', async () => {
   await mount(
     <main>
       <ShortcutsHelp />
