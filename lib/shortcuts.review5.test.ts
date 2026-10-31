@@ -151,7 +151,7 @@ describe('leaveRisk: the command bar and the title-bar menus judge by the field 
 
 describe('navigateGuarded (desktop menus, command bar)', () => {
   // The leave / stay decision itself is tested with the real guard in a browser engine:
-  // test/dom/leaveGuard.dom.tsx (test/leaveGuardDom.test.ts).
+  // test/dom/keyboardShell.dom.tsx (test/keyboardDom.test.ts).
   it('hands the page to the leave-this-form guard, which decides', () => {
     const shell = new EventTarget();
     const asked: string[] = [];
@@ -227,5 +227,5 @@ describe('F5 with typed work on screen', () => {
 
   // What F5 does — asks over typed work, refreshes the page in place, and never lets a held-down
   // F5 through to the window's reload — is tested by pressing F5 on the real guard in a browser
-  // engine: test/dom/leaveGuard.dom.tsx (test/leaveGuardDom.test.ts).
+  // engine: test/dom/keyboardShell.dom.tsx (test/keyboardDom.test.ts).
 });
