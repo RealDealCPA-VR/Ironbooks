@@ -40,8 +40,8 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
   },
   '/calendar': {
     title: 'Calendar',
-    what: 'A month view of what you entered each day, what is due (invoices, bills) and your to-dos.',
-    first: 'Click a day to see everything on it or to add a to-do.',
+    what: 'A day, week or month view of what you entered each day, what is due (invoices, bills) and your to-dos, with an Upcoming & Past Due list.',
+    first: 'Click a day to see everything on it or to add a to-do. Preferences > Calendar sets the view you start in and how far the Upcoming & Past Due list looks.',
   },
   '/reminders': {
     title: 'Reminders',
@@ -372,8 +372,8 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
   },
   '/settings': {
     title: 'Preferences',
-    what: 'Settings for the whole company and just for you, such as features you use and the menu style.',
-    first: 'Open a category on the left, change what you need and save.',
+    what: 'Settings for the whole company and just for you, such as features you use, the menu style and the mail server that sends your forms (Send Forms).',
+    first: 'Open a category on the left, change what you need and save. Each category has a My Preferences and a Company Preferences tab.',
     qb: 'Edit > Preferences',
   },
   // team backups
