@@ -787,6 +787,30 @@ export function dueDateForTerms(dateIso: string, terms: string | null | undefine
   return addDaysIso(dateIso, TERMS_DAYS[terms as TermsValue]);
 }
 
+/** Preferences > Integrated Applications (prefsperms A2): what may reach the company file. */
+export type IntegratedApp = 'employeePortal' | 'phoneReceipts';
+
+export const INTEGRATED_APP_LABELS: Record<IntegratedApp, string> = {
+  employeePortal: 'The employee portal',
+  phoneReceipts: 'Phone receipt capture',
+};
+
+/**
+ * May this application reach the company file? `settings` is companies.settings (raw): the
+ * master switch "Don't allow any applications to access this company file" wins, then each
+ * application's own switch (both default to allowed, so existing files keep working).
+ */
+export function integratedAppAllowed(settings: unknown, app: IntegratedApp): boolean {
+  const s = settings && typeof settings === 'object' ? (settings as Record<string, unknown>) : {};
+  if (s.integratedAppsBlocked === true) return false;
+  return app === 'employeePortal' ? s.allowEmployeePortal !== false : s.allowPhoneReceipts !== false;
+}
+
+/** The plain refusal for an application the company turned off. */
+export function integratedAppOffMessage(app: IntegratedApp): string {
+  return `${INTEGRATED_APP_LABELS[app]} is turned off for this company file (Preferences > Integrated Applications).`;
+}
+
 /**
  * Desktop View > "Show icons on the Home page" (prefsperms A2): the Home workflow steps the company
  * turned off. Only the Home icons: the pages stay in the menus (QB hides just the icons).

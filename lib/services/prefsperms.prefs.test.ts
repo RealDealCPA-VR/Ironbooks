@@ -10,16 +10,40 @@
  *  - Desktop View, Search, Calendar, Integrated Applications: the settings resolve safely and
  *    take effect (Home icons, start page, portal / phone-receipt access).
  */
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { eq } from 'drizzle-orm';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-prefsperms-prefs');
 process.env.BKA_DATA_DIR = TEST_DIR;
+process.env.BKA_AUTH_SECRET = 'prefsperms-prefs-secret';
+
+const h = vi.hoisted(() => ({ cookies: new Map<string, string>() }));
+vi.mock('next/headers', () => ({
+  cookies: async () => ({
+    get: (n: string) => (h.cookies.has(n) ? { name: n, value: h.cookies.get(n)! } : undefined),
+    set: () => undefined,
+    delete: () => undefined,
+  }),
+  headers: async () => new Headers(),
+}));
 
 import { closeDb, getDb, type DB } from '@/lib/db';
-import { accounts, invoices, users } from '@/lib/db/schema';
+import { NextRequest } from 'next/server';
+import { accounts, employees, invoices, users } from '@/lib/db/schema';
+import { PORTAL_COOKIE, getPortalEmployeeId, hashPassword } from '@/lib/auth';
+import {
+  DEFAULT_MY_PREFERENCES,
+  homeIconHiddenHrefs,
+  integratedAppAllowed,
+  resolveCompanyPreferences,
+  resolveMyPreferences,
+} from '@/lib/preferences';
+import { isRestorablePath, startPageTarget } from '@/lib/startPage';
+import { myPreferencesSchema } from '@/lib/validation/prefs';
+import { POST as portalLogin } from '@/app/api/portal/login/route';
+import { UploadTokenError, createUploadToken, uploadLinkStatus } from './receipts';
 import type { ServiceContext } from './_base';
 import { createCompany, updateCompany } from './company';
 import { createManualEntry } from './journal';
@@ -159,5 +183,85 @@ describe('A2: Finance Charge preferences take effect', () => {
     const onRows = on.customers.find((c) => c.customerId === customerId)!.overdueInvoices;
     expect(onRows.length).toBe(2);
     await updateFinanceChargeSettings(ctx, { assessOnFinanceCharges: false });
+  });
+});
+
+describe('A2: Integrated Applications decide what may reach the company file', () => {
+  it('the master switch overrides each application', () => {
+    expect(integratedAppAllowed({}, 'employeePortal')).toBe(true);
+    expect(integratedAppAllowed({ allowEmployeePortal: false }, 'employeePortal')).toBe(false);
+    expect(integratedAppAllowed({ allowPhoneReceipts: false }, 'employeePortal')).toBe(true);
+    expect(integratedAppAllowed({ integratedAppsBlocked: true }, 'phoneReceipts')).toBe(false);
+    expect(integratedAppAllowed(null, 'phoneReceipts')).toBe(true);
+  });
+
+  it('employee portal: no sign-in, and signed-in employees are signed out', async () => {
+    const pw = 'Portal-Pass-2026';
+    const [emp] = await db
+      .insert(employees)
+      .values({ companyId: ctx.companyId, firstName: 'Eve', lastName: 'Employee', email: 'eve@acme.test', portalPasswordHash: await hashPassword(pw) } as never)
+      .returning();
+    const login = () =>
+      portalLogin(new NextRequest('http://localhost/api/portal/login', { method: 'POST', body: JSON.stringify({ email: 'eve@acme.test', password: pw }) }));
+    const ok = await login();
+    expect(ok.status).toBe(200);
+    const cookie = /bka_portal=([^;]+)/.exec(ok.headers.get('set-cookie') ?? '')![1];
+    h.cookies.set(PORTAL_COOKIE, cookie);
+    expect(await getPortalEmployeeId()).toBe(emp.id);
+
+    await updateCompany(ctx, { settings: { allowEmployeePortal: false } } as never);
+    expect(await getPortalEmployeeId()).toBeNull();
+    const refused = await login();
+    expect(refused.status).toBe(403);
+    expect((await refused.json()).error).toMatch(/Integrated Applications/);
+
+    await updateCompany(ctx, { settings: { allowEmployeePortal: true, integratedAppsBlocked: true } } as never);
+    expect(await getPortalEmployeeId()).toBeNull();
+    await updateCompany(ctx, { settings: { integratedAppsBlocked: false } } as never);
+    expect(await getPortalEmployeeId()).toBe(emp.id);
+    h.cookies.clear();
+  });
+
+  it('phone receipt links: no new links, and existing ones stop working', async () => {
+    const link = await createUploadToken(ctx);
+    expect((await uploadLinkStatus(db, link.token)).remaining).toBeGreaterThan(0);
+    await updateCompany(ctx, { settings: { allowPhoneReceipts: false } } as never);
+    await expect(uploadLinkStatus(db, link.token)).rejects.toBeInstanceOf(UploadTokenError);
+    await expect(uploadLinkStatus(db, link.token)).rejects.toMatchObject({ problem: 'apps_off' });
+    await expect(createUploadToken(ctx)).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    await updateCompany(ctx, { settings: { allowPhoneReceipts: true } } as never);
+    expect((await uploadLinkStatus(db, link.token)).remaining).toBeGreaterThan(0);
+  });
+});
+
+describe('A2: Desktop View, Search and Calendar settings', () => {
+  it('Home page icons the company turned off', () => {
+    const prefs = resolveCompanyPreferences({ homeShowBills: false, homeShowStatements: false });
+    expect([...homeIconHiddenHrefs(prefs)].sort()).toEqual(['/bills', '/pay-bills', '/reports/statements']);
+    expect(homeIconHiddenHrefs(resolveCompanyPreferences({})).size).toBe(0);
+  });
+
+  it('"Go back to where I left off" only redirects the opening Home page to a real app page', () => {
+    expect(startPageTarget('last', '/dashboard', '/invoices?id=1')).toBe('/invoices?id=1');
+    expect(startPageTarget('home', '/dashboard', '/invoices')).toBeNull();
+    expect(startPageTarget('last', '/bills', '/invoices')).toBeNull();
+    expect(startPageTarget('last', '/dashboard', '/login')).toBeNull();
+    expect(startPageTarget('last', '/dashboard', '//evil.example')).toBeNull();
+    expect(startPageTarget('last', '/dashboard', '/api/users')).toBeNull();
+    expect(isRestorablePath('/reports/profit-loss?from=2026-01-01')).toBe(true);
+  });
+
+  it('My Preferences resolve and validate the new keys', () => {
+    const m = resolveMyPreferences({ startPage: 'x', calendarView: 'year', calendarWeek: 'tue', calendarPastDueDays: -3, searchDefault: 'web' });
+    expect(m).toMatchObject({ startPage: 'home', calendarView: 'month', calendarWeek: 'company', calendarPastDueDays: 30, searchDefault: 'pages' });
+    expect(resolveMyPreferences({ calendarView: 'week', calendarUpcomingDays: 14, showSearchBox: false })).toMatchObject({
+      calendarView: 'week',
+      calendarUpcomingDays: 14,
+      showSearchBox: false,
+    });
+    expect(DEFAULT_MY_PREFERENCES.showSearchBox).toBe(true);
+    expect(myPreferencesSchema.safeParse({ calendarView: 'week', calendarWeek: 'mon_fri', calendarPastDueDays: 10 }).success).toBe(true);
+    expect(myPreferencesSchema.safeParse({ calendarPastDueDays: 1.5 }).success).toBe(false);
+    expect(myPreferencesSchema.safeParse({ searchDefault: 'web' }).success).toBe(false);
   });
 });

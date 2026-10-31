@@ -16,6 +16,7 @@ import { getDb, resolveDataDir } from '@/lib/db';
 import { companies, employees, users } from '@/lib/db/schema';
 import { touchSession } from '@/lib/services/sessions';
 import { getRequestOrigin } from '@/lib/net/requestInfo';
+import { integratedAppAllowed } from '@/lib/preferences';
 
 export const SESSION_COOKIE = 'bka_session';
 export const PORTAL_COOKIE = 'bka_portal'; // employee self-service session
@@ -338,6 +339,9 @@ export async function getPortalEmployeeId(): Promise<string | null> {
   if (!emp || !emp.isActive || !emp.portalPasswordHash) return null;
   // An archived (soft-deleted) company's employees lose portal access (lib/context isArchivedCompany).
   if (isArchivedSettings(emp.companySettings)) return null;
+  // prefsperms A2: Preferences > Integrated Applications can turn the employee portal off; that
+  // also ends sessions already signed in.
+  if (!integratedAppAllowed(emp.companySettings, 'employeePortal')) return null;
   const expected = Buffer.from(portalPasswordVersion(emp.portalPasswordHash));
   const got = Buffer.from(token.pv);
   if (got.length !== expected.length || !crypto.timingSafeEqual(got, expected)) return null;
