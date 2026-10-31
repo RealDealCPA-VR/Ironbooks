@@ -10,11 +10,12 @@
  *    original values.
  */
 import { and, asc, desc, eq, gte, inArray, lt, lte, or, sql } from 'drizzle-orm';
-import { auditLogs, companies, journalEntries, journalEntryLines, users } from '@/lib/db/schema';
+import { accounts, auditLogs, classes, companies, journalEntries, journalEntryLines, users } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import type { ServiceContext } from '../_base';
 import { maskForContext } from '../access';
 import { companyDayBound } from '../preferences';
+import { resolveEntityNames } from '../journal';
 
 /** A 'when it happened' filter: a calendar day is read in the company's time zone (Preferences). */
 export type HappenedBound = Date | string | null | undefined;
@@ -37,10 +38,284 @@ export interface ClosingDateExceptionRow {
   source: 'override' | 'entered_after_close';
 }
 
+/** One line of a transaction version on the exception report (QB: Account / Name / Memo / Debit / Credit). */
+export interface ExceptionLine {
+  account: string;
+  className: string | null;
+  name: string | null;
+  memo: string | null;
+  debit: string | null;
+  credit: string | null;
+}
+
+/** A transaction as it is now ('latest') or as it was before a change ('prior'). */
+export interface ExceptionVersion {
+  state: 'latest' | 'prior';
+  entryId: string;
+  entryNumber: number | null;
+  date: string;
+  description: string | null;
+  amount: string;
+  /** latest: when it was entered; prior: when it was changed (replaced, voided or reclassified). */
+  at: string;
+  /** Who entered it (latest) or who changed it (prior). */
+  user: string | null;
+  lines: ExceptionLine[];
+}
+
+/**
+ * QB's Closing Date Exception report shows each changed transaction once, with its LATEST values
+ * and every PRIOR version changed in the closed period. A document edit voids its entry and posts
+ * a new one (the void and the new post are both exceptions), a General Journal edit names its
+ * replacement in the audit trail, a reclassify re-points lines in place (its audit row keeps the
+ * old accounts and classes), and a void leaves no latest version.
+ */
+export interface ClosingDateExceptionGroup {
+  key: string;
+  /** "Invoice", "Check / Expense", "General Journal"… */
+  typeLabel: string;
+  transactionDate: string;
+  closingDate: string | null;
+  /** What happened, newest first (Added / Voided / Reclassified / Entered after close). */
+  changes: Array<{ operation: string; source: ClosingDateExceptionRow['source']; at: string; user: string | null }>;
+  /** Null when the transaction is void now. */
+  latest: ExceptionVersion | null;
+  prior: ExceptionVersion[];
+  lastChangedAt: string;
+}
+
+const SOURCE_TYPE_LABELS: Record<string, string> = {
+  invoice: 'Invoice',
+  'invoice-cogs': 'Invoice (cost of goods sold)',
+  salesreceipt: 'Sales Receipt',
+  credit_memo: 'Credit Memo',
+  payment: 'Payment',
+  bill: 'Bill',
+  bill_payment: 'Bill Payment',
+  vendor_credit: 'Bill Credit',
+  expense: 'Check / Expense',
+  deposit: 'Deposit',
+  transfer: 'Transfer',
+  paycheck: 'Paycheck',
+  item_receipt: 'Item Receipt',
+  inventory_transfer: 'Inventory Transfer',
+  item: 'Inventory Adjustment',
+  refund: 'Refund',
+  tax_agency: 'Sales Tax Payment',
+  sales_tax_adj: 'Sales Tax Adjustment',
+  expense_report: 'Expense Report',
+  fixed_asset: 'Depreciation',
+};
+
+const UUID_IN_REF = /^([a-z_-]+):([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
+
+/** Group the exception rows by transaction with prior vs latest values (see ClosingDateExceptionGroup). */
+async function exceptionGroups(ctx: ServiceContext, rows: ClosingDateExceptionRow[]): Promise<ClosingDateExceptionGroup[]> {
+  if (rows.length === 0) return [];
+  type Head = { id: string; entryNumber: number; date: Date; description: string; status: string; sourceRef: string | null; createdAt: Date; voidedAt: Date | null; user: string | null };
+  const heads = new Map<string, Head>();
+  const loadHeads = async (where: ReturnType<typeof and>) => {
+    const found = await ctx.db
+      .select({
+        id: journalEntries.id,
+        entryNumber: journalEntries.entryNumber,
+        date: journalEntries.date,
+        description: journalEntries.description,
+        status: journalEntries.status,
+        sourceRef: journalEntries.sourceRef,
+        createdAt: journalEntries.createdAt,
+        voidedAt: journalEntries.voidedAt,
+        user: users.name,
+      })
+      .from(journalEntries)
+      .leftJoin(users, eq(journalEntries.createdBy, users.id))
+      .where(where);
+    for (const h of found) heads.set(h.id, { ...h, status: String(h.status) });
+  };
+  const rowIds = [...new Set(rows.map((r) => r.entryId))];
+  for (let i = 0; i < rowIds.length; i += 1000) {
+    await loadHeads(and(eq(journalEntries.companyId, ctx.companyId), inArray(journalEntries.id, rowIds.slice(i, i + 1000))));
+  }
+  // Every entry of the same document (its earlier and later versions share its source).
+  const docRefs = [...new Set([...heads.values()].map((h) => h.sourceRef).filter((s): s is string => !!s && UUID_IN_REF.test(s)))];
+  for (let i = 0; i < docRefs.length; i += 1000) {
+    await loadHeads(and(eq(journalEntries.companyId, ctx.companyId), inArray(journalEntries.sourceRef, docRefs.slice(i, i + 1000))));
+  }
+
+  // Union-find over entries: same document, or a General Journal entry and its replacement.
+  const parent = new Map<string, string>();
+  const find = (x: string): string => {
+    let r = x;
+    while (parent.has(r) && parent.get(r) !== r) r = parent.get(r)!;
+    parent.set(x, r);
+    return r;
+  };
+  const union = (a: string, b: string) => {
+    const ra = find(a);
+    const rb = find(b);
+    if (ra !== rb) parent.set(rb, ra);
+  };
+  const byDoc = new Map<string, string>();
+  for (const h of heads.values()) {
+    parent.set(h.id, parent.get(h.id) ?? h.id);
+    if (h.sourceRef && UUID_IN_REF.test(h.sourceRef)) {
+      const first = byDoc.get(h.sourceRef);
+      if (first) union(first, h.id);
+      else byDoc.set(h.sourceRef, h.id);
+    }
+  }
+  // Entry audits: replacements (journal edits) and the accounts / classes before a reclassify.
+  const entryAudits = [] as Array<{ entityId: string; oldValues: unknown; newValues: unknown; createdAt: Date }>;
+  for (let i = 0; i < rowIds.length; i += 1000) {
+    entryAudits.push(
+      ...(await ctx.db
+        .select({ entityId: auditLogs.entityId, oldValues: auditLogs.oldValues, newValues: auditLogs.newValues, createdAt: auditLogs.createdAt })
+        .from(auditLogs)
+        .where(
+          and(
+            eq(auditLogs.companyId, ctx.companyId),
+            eq(auditLogs.entityType, 'journal_entry'),
+            eq(auditLogs.action, 'update'),
+            inArray(auditLogs.entityId, rowIds.slice(i, i + 1000)),
+          ),
+        )),
+    );
+  }
+  const replacements: string[] = [];
+  for (const a of entryAudits) {
+    const by = ((a.newValues ?? {}) as Record<string, unknown>).replacedBy;
+    if (typeof by === 'string' && /^[0-9a-f-]{36}$/i.test(by)) {
+      replacements.push(by);
+      parent.set(by, parent.get(by) ?? by);
+      union(a.entityId, by);
+    }
+  }
+  const missing = replacements.filter((id) => !heads.has(id));
+  if (missing.length) await loadHeads(and(eq(journalEntries.companyId, ctx.companyId), inArray(journalEntries.id, missing)));
+
+  // Lines of every entry involved, with account / class / name labels.
+  const ids = [...heads.keys()];
+  const lines = [] as Array<{ id: string; entryId: string; accountId: string; code: string; acct: string; classId: string | null; memo: string | null; debit: string | null; credit: string | null; entityType: string | null; entityId: string | null }>;
+  for (let i = 0; i < ids.length; i += 1000) {
+    lines.push(
+      ...(await ctx.db
+        .select({
+          id: journalEntryLines.id,
+          entryId: journalEntryLines.journalEntryId,
+          accountId: journalEntryLines.accountId,
+          code: accounts.code,
+          acct: accounts.name,
+          classId: journalEntryLines.classId,
+          memo: journalEntryLines.memo,
+          debit: journalEntryLines.debit,
+          credit: journalEntryLines.credit,
+          entityType: journalEntryLines.entityType,
+          entityId: journalEntryLines.entityId,
+        })
+        .from(journalEntryLines)
+        .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
+        .where(inArray(journalEntryLines.journalEntryId, ids.slice(i, i + 1000)))),
+    );
+  }
+  const acctRows = await ctx.db.select({ id: accounts.id, code: accounts.code, name: accounts.name }).from(accounts).where(eq(accounts.companyId, ctx.companyId));
+  const acctLabel = new Map(acctRows.map((a) => [a.id, `${a.code} · ${a.name}`]));
+  const classRows = await ctx.db.select({ id: classes.id, name: classes.name }).from(classes).where(eq(classes.companyId, ctx.companyId));
+  const className = new Map(classRows.map((c) => [c.id, c.name]));
+  const names = await resolveEntityNames(ctx, lines);
+  const linesOf = new Map<string, typeof lines>();
+  for (const l of lines) (linesOf.get(l.entryId) ?? linesOf.set(l.entryId, []).get(l.entryId)!).push(l);
+
+  const toLine = (l: (typeof lines)[number], override?: { accountId?: string | null; classId?: string | null }): ExceptionLine => {
+    const accountId = override?.accountId ?? l.accountId;
+    const classId = override && 'classId' in override ? override.classId ?? null : l.classId;
+    return {
+      account: acctLabel.get(accountId) ?? `${l.code} · ${l.acct}`,
+      className: classId ? className.get(classId) ?? null : null,
+      name: l.entityType && l.entityId ? names.get(`${l.entityType}:${l.entityId}`) ?? null : null,
+      memo: l.memo ?? null,
+      debit: l.debit && !Money.isZero(l.debit) ? toAmountString(l.debit) : null,
+      credit: l.credit && !Money.isZero(l.credit) ? toAmountString(l.credit) : null,
+    };
+  };
+  const total = (ls: ExceptionLine[]) => toAmountString(ls.reduce((s, l) => s.plus(Money.of(l.debit ?? 0)), Money.zero()));
+
+  const groups = new Map<string, ClosingDateExceptionGroup>();
+  const rowsByGroup = new Map<string, ClosingDateExceptionRow[]>();
+  for (const r of rows) {
+    const g = heads.has(r.entryId) ? find(r.entryId) : r.entryId;
+    (rowsByGroup.get(g) ?? rowsByGroup.set(g, []).get(g)!).push(r);
+  }
+  const membersOf = new Map<string, Head[]>();
+  for (const h of heads.values()) {
+    const g = find(h.id);
+    (membersOf.get(g) ?? membersOf.set(g, []).get(g)!).push(h);
+  }
+  for (const [g, grows] of rowsByGroup) {
+    const members = (membersOf.get(g) ?? []).sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+    const posted = members.filter((m) => m.status === 'posted');
+    let latest: ExceptionVersion | null = null;
+    if (posted.length) {
+      const main = posted[0];
+      const ls = posted.flatMap((m) => (linesOf.get(m.id) ?? []).map((l) => toLine(l)));
+      latest = {
+        state: 'latest',
+        entryId: main.id,
+        entryNumber: main.entryNumber,
+        date: main.date.toISOString().slice(0, 10),
+        description: main.description,
+        amount: total(ls),
+        at: posted[posted.length - 1].createdAt.toISOString(),
+        user: posted[posted.length - 1].user ?? null,
+        lines: ls,
+      };
+    }
+    const prior: ExceptionVersion[] = [];
+    for (const r of grows) {
+      const h = heads.get(r.entryId);
+      if (!h) continue;
+      const own = linesOf.get(h.id) ?? [];
+      if (r.operation === 'void') {
+        const ls = own.map((l) => toLine(l));
+        prior.push({ state: 'prior', entryId: h.id, entryNumber: h.entryNumber, date: h.date.toISOString().slice(0, 10), description: h.description, amount: total(ls), at: r.at, user: r.user, lines: ls });
+      } else if (r.operation === 'reclassify') {
+        // The reclassify audit row written with this change keeps each line's account and class before it.
+        const at = new Date(r.at).getTime();
+        const audit = entryAudits
+          .filter((a) => a.entityId === h.id && Array.isArray(((a.oldValues ?? {}) as Record<string, unknown>).reclassify))
+          .sort((a, b) => Math.abs(a.createdAt.getTime() - at) - Math.abs(b.createdAt.getTime() - at))[0];
+        const before = new Map<string, { accountId: string | null; classId: string | null }>();
+        for (const x of ((audit?.oldValues ?? {}) as { reclassify?: Array<{ lineId: string; accountId: string | null; classId: string | null }> }).reclassify ?? []) {
+          before.set(x.lineId, { accountId: x.accountId, classId: x.classId });
+        }
+        const ls = own.map((l) => (before.has(l.id) ? toLine(l, before.get(l.id)) : toLine(l)));
+        prior.push({ state: 'prior', entryId: h.id, entryNumber: h.entryNumber, date: h.date.toISOString().slice(0, 10), description: h.description, amount: total(ls), at: r.at, user: r.user, lines: ls });
+      }
+    }
+    prior.sort((a, b) => b.at.localeCompare(a.at));
+    const anyHead = heads.get(grows[0].entryId);
+    const prefix = anyHead?.sourceRef ? (UUID_IN_REF.exec(anyHead.sourceRef)?.[1] ?? anyHead.sourceRef.split(':')[0]) : 'manual';
+    const typeLabel = SOURCE_TYPE_LABELS[prefix] ?? 'General Journal';
+    const changes = grows
+      .map((r) => ({ operation: r.operation, source: r.source, at: r.at, user: r.user }))
+      .sort((a, b) => b.at.localeCompare(a.at));
+    groups.set(g, {
+      key: g,
+      typeLabel,
+      transactionDate: latest?.date ?? grows[0].transactionDate,
+      closingDate: grows.map((r) => r.closingDate).find((c) => c) ?? null,
+      changes,
+      latest,
+      prior,
+      lastChangedAt: changes[0].at,
+    });
+  }
+  return [...groups.values()].sort((a, b) => b.lastChangedAt.localeCompare(a.lastChangedAt));
+}
+
 export async function closingDateExceptionReport(
   ctx: ServiceContext,
   rangeIn: { from?: HappenedBound; to?: HappenedBound } = {},
-): Promise<{ closingDate: string | null; rows: ClosingDateExceptionRow[] }> {
+): Promise<{ closingDate: string | null; rows: ClosingDateExceptionRow[]; groups: ClosingDateExceptionGroup[] }> {
   const range = {
     from: await companyDayBound(ctx, rangeIn.from, 'from'),
     to: await companyDayBound(ctx, rangeIn.to, 'to', true),
@@ -153,7 +428,7 @@ export async function closingDateExceptionReport(
     }
   }
   rows.sort((a, b) => b.at.localeCompare(a.at));
-  return { closingDate: cd, rows };
+  return { closingDate: cd, rows, groups: await exceptionGroups(ctx, rows) };
 }
 
 interface LateEntry {
