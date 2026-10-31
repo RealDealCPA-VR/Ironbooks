@@ -2338,6 +2338,8 @@ export const collectionNotes = pgTable('collection_notes', {
   done: boolean('done').notNull().default(false),
   createdBy: uuid('created_by'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
+  /** salesar (C9): how the customer was contacted ('call', 'email', 'letter'...); null = a plain note. */
+  contactMethod: varchar('contact_method', { length: 20 }),
 });
 
 // ---- wave2 purchases ----

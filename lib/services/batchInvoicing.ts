@@ -15,7 +15,7 @@
  * as a "Statement charge".
  */
 import { and, asc, eq, inArray } from 'drizzle-orm';
-import { customers, invoiceLines, invoices, items } from '@/lib/db/schema';
+import { customers, invoiceLines, invoices, items, paymentTerms } from '@/lib/db/schema';
 import { Money } from '@/lib/money';
 import { type ServiceContext, ServiceError, notFound, validation } from './_base';
 import {
@@ -25,7 +25,30 @@ import {
   getInvoice,
   updateInvoice,
 } from './invoices';
-import { dueDateFromTermsList } from './lists/terms';
+import { type TermsLike, computeDueDate, dueDateFromTermsList, findTermsRef, termsLabel } from './lists/terms';
+
+/**
+ * A customer's terms on a new invoice (C6): the Terms list entry the customer was given
+ * (customers.termsId — still the right entry after it is renamed, and it wins over a legacy
+ * `terms` text that disagrees with it), else the legacy text looked up on the Terms list, else
+ * the text as typed (legacy parser). Returns the label stored on the invoice and its due date.
+ */
+async function customerInvoiceTerms(
+  ctx: ServiceContext,
+  cust: { termsId: string | null; terms: string | null },
+  date: Date,
+): Promise<{ terms: string | null; dueDate: Date | null }> {
+  let row: typeof paymentTerms.$inferSelect | null = null;
+  if (cust.termsId) {
+    [row = null] = await ctx.db
+      .select()
+      .from(paymentTerms)
+      .where(and(eq(paymentTerms.companyId, ctx.companyId), eq(paymentTerms.id, cust.termsId)));
+  }
+  if (!row) row = await findTermsRef(ctx, cust.terms);
+  if (row) return { terms: termsLabel(row), dueDate: computeDueDate(row as TermsLike, date) };
+  return { terms: cust.terms ?? null, dueDate: await dueDateFromTermsList(ctx, cust.terms, date) };
+}
 
 const DAY_MS = 86_400_000;
 
@@ -82,6 +105,7 @@ export async function createBatchInvoices(
       id: customers.id,
       displayName: customers.displayName,
       terms: customers.terms,
+      termsId: customers.termsId,
       taxable: customers.taxable,
       taxRateId: customers.taxRateId,
       isActive: customers.isActive,
@@ -103,11 +127,13 @@ export async function createBatchInvoices(
     }
     const useCustomerRate = input.useCustomerTaxRate !== false && input.taxRateId === undefined;
     const taxRateId = useCustomerRate ? (cust.taxable ? cust.taxRateId : null) : (input.taxRateId ?? null);
+    // Due date and terms from the customer's Terms list entry (not the free-text copy).
+    const terms = await customerInvoiceTerms(ctx, cust, input.date);
     const invoiceInput: CreateInvoiceInput = {
       customerId: id,
       date: input.date,
-      dueDate: input.dueDate ?? (await dueDateFromTermsList(ctx, cust.terms, input.date)),
-      terms: cust.terms ?? null,
+      dueDate: input.dueDate ?? terms.dueDate,
+      terms: terms.terms,
       lines: input.lines.map((l) => ({ ...l, taxable: cust.taxable ? l.taxable : false })),
       taxRateId,
       classId: input.classId ?? null,
@@ -193,11 +219,11 @@ function chargeToInvoiceInput(input: StatementChargeInput, termsDue: Date | null
 /** Due date under the customer's terms (Terms list, else the legacy parser), or null. */
 async function customerTermsDue(ctx: ServiceContext, customerId: string, date: Date): Promise<Date | null> {
   const [c] = await ctx.db
-    .select({ terms: customers.terms })
+    .select({ terms: customers.terms, termsId: customers.termsId })
     .from(customers)
     .where(and(eq(customers.companyId, ctx.companyId), eq(customers.id, customerId)));
   if (!c) throw notFound('Customer');
-  return dueDateFromTermsList(ctx, c.terms, date);
+  return (await customerInvoiceTerms(ctx, c, date)).dueDate;
 }
 
 export async function createStatementCharge(ctx: ServiceContext, input: StatementChargeInput) {

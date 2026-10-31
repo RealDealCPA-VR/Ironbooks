@@ -2,10 +2,15 @@
 /**
  * Income Tracker (wave2 sales C9) — QB's money bar: what is not billed yet, what is billed but
  * not due, what is overdue, and what came in during the last 30 days. Click a bar to filter;
- * select rows for batch actions (email, queue to print / email, turn into invoices).
+ * select rows for batch actions (email, queue to print / email, turn into invoices). Unbilled
+ * billable time & costs are listed too (time priced with billing rate levels, B13); each row has
+ * its own action: Receive Payment on open invoices, Create invoice on time & costs (opens the
+ * invoice form for the customer with its Time/Costs list), Turn into invoice on estimates and
+ * sales orders.
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import { TrendingUp } from 'lucide-react';
 import {
   Badge,
@@ -28,6 +33,8 @@ import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
 import { useCreditLimitConfirm } from '@/components/sales/SalesExtras';
+import { receivePaymentHref } from '@/app/payments/deepLink';
+import { PREFILL_EVENT, stashPrefill } from '@/lib/commands/prefill';
 
 type Bucket = 'unbilled' | 'unpaid' | 'overdue' | 'paid';
 
@@ -44,6 +51,11 @@ interface Row {
   openBalance: string;
   status: string;
   daysOverdue: number | null;
+  /** Unbilled time / cost rows: what it is ("Design · 2.00 h × 95.00 (Senior rate)"). */
+  detail?: string | null;
+  /** Cost rows: the bill or check the cost is on. */
+  source?: 'bill' | 'expense';
+  docId?: string | null;
 }
 
 interface Tracker {
@@ -53,7 +65,7 @@ interface Tracker {
 }
 
 const BARS: Array<{ key: Bucket; label: string; hint: string; color: string }> = [
-  { key: 'unbilled', label: 'Not billed yet', hint: 'Estimates, sales orders and billable time', color: 'bg-slate-400' },
+  { key: 'unbilled', label: 'Not billed yet', hint: 'Estimates, sales orders, billable time & costs', color: 'bg-slate-400' },
   { key: 'unpaid', label: 'Billed, not due', hint: 'Open invoices not yet past due', color: 'bg-electric' },
   { key: 'overdue', label: 'Overdue', hint: 'Open invoices past their due date', color: 'bg-red-500' },
   { key: 'paid', label: 'Paid (last 30 days)', hint: 'Payments and sales receipts', color: 'bg-emerald' },
@@ -63,6 +75,7 @@ const TYPE_LABEL: Record<string, string> = {
   estimate: 'Estimate',
   sales_order: 'Sales Order',
   time: 'Billable time',
+  cost: 'Billable cost',
   invoice: 'Invoice',
   statement_charge: 'Statement charge',
   payment: 'Payment',
@@ -79,7 +92,21 @@ const LINK: Record<string, string> = {
   sales_receipt: '/sales-receipts',
 };
 
-const FORM_TYPES = new Set(['estimate', 'sales_order', 'invoice', 'statement_charge', 'sales_receipt']);
+/** Pages that open a record from ?focus=<id> (lib/useFocusParam.ts). */
+const FOCUS_TYPES = new Set(['estimate', 'sales_order', 'invoice', 'payment', 'sales_receipt']);
+
+/** Where a row's type link goes: the record itself where the page can open it. */
+function rowHref(r: Row): string {
+  if (r.type === 'cost') {
+    const base = r.source === 'bill' ? '/bills' : '/expenses';
+    return r.docId ? `${base}?focus=${r.docId}` : base;
+  }
+  const base = LINK[r.type] ?? '#';
+  return FOCUS_TYPES.has(r.type) ? `${base}?focus=${r.id}` : base;
+}
+
+/** Rows a batch action can take: sales forms (email / print / convert) and time & costs (convert). */
+const FORM_TYPES = new Set(['estimate', 'sales_order', 'invoice', 'statement_charge', 'sales_receipt', 'time', 'cost']);
 
 export default function IncomeTrackerPage() {
   const [data, setData] = useState<Tracker | null>(null);
@@ -93,6 +120,7 @@ export default function IncomeTrackerPage() {
   const [asOf, setAsOf] = useState('');
   const [customerId, setCustomerId] = useState('');
   const [customers, setCustomers] = useState<Array<{ id: string; displayName: string }>>([]);
+  const router = useRouter();
 
   useEffect(() => {
     api
@@ -131,8 +159,33 @@ export default function IncomeTrackerPage() {
   const picked = rows.filter((r) => selected.has(key(r)));
   const maxBar = Math.max(1, ...BARS.map((b) => Number(data?.totals[b.key].amount ?? 0)));
 
-  async function run(action: 'email' | 'queue_print' | 'queue_email' | 'convert') {
-    const items = picked.map((r) => ({ type: r.type, id: r.id }));
+  /**
+   * "Create invoice" on a time / cost row: open a new invoice for the customer; the invoice form
+   * lists the customer's unbilled time & costs to tick (prefill handoff, lib/commands/prefill.ts).
+   */
+  function createInvoiceFor(r: Row) {
+    if (!r.customerId) return;
+    let ok = false;
+    try {
+      ok = stashPrefill(window.sessionStorage, {
+        kind: 'invoice',
+        customerId: r.customerId,
+        lines: [],
+        note: `From the Income Tracker: tick ${r.customerName}'s billable time & costs under "Add billable time & costs".`,
+      });
+    } catch {
+      ok = false;
+    }
+    if (!ok) {
+      toast('Could not open the invoice form. Open Invoices and pick the customer.', 'danger');
+      return;
+    }
+    router.push('/invoices');
+    setTimeout(() => window.dispatchEvent(new Event(PREFILL_EVENT)), 0);
+  }
+
+  async function run(action: 'email' | 'queue_print' | 'queue_email' | 'convert', only?: Row[]) {
+    const items = (only ?? picked).map((r) => ({ type: r.type, id: r.id }));
     if (items.length === 0) {
       toast('Select at least one row first.', 'danger');
       return;
@@ -274,6 +327,7 @@ export default function IncomeTrackerPage() {
                     <Th numeric>Amount</Th>
                     <Th numeric>Open balance</Th>
                     <Th>Status</Th>
+                    <Th>Action</Th>
                   </Tr>
                 </thead>
                 <tbody>
@@ -296,9 +350,10 @@ export default function IncomeTrackerPage() {
                         />
                       </Td>
                       <Td>
-                        <Link href={LINK[r.type] ?? '#'} className="text-electric hover:underline">
+                        <Link href={rowHref(r)} className="text-electric hover:underline">
                           {TYPE_LABEL[r.type] ?? r.type}
                         </Link>
+                        {r.detail && <div className="max-w-xs truncate text-xs text-navy/50" title={r.detail}>{r.detail}</div>}
                       </Td>
                       <Td className="font-medium text-navy">{r.customerName}</Td>
                       <Td>{r.number ? `#${r.number}` : '—'}</Td>
@@ -315,6 +370,30 @@ export default function IncomeTrackerPage() {
                           <Badge tone="neutral">Not billed</Badge>
                         ) : (
                           <Badge tone="info">Open</Badge>
+                        )}
+                      </Td>
+                      <Td>
+                        {(r.type === 'invoice' || r.type === 'statement_charge') &&
+                        (r.bucket === 'unpaid' || r.bucket === 'overdue') &&
+                        r.customerId ? (
+                          <Link
+                            href={receivePaymentHref(r.customerId, r.id)}
+                            className="whitespace-nowrap text-sm font-semibold text-electric hover:underline"
+                          >
+                            Receive payment
+                          </Link>
+                        ) : (r.type === 'time' || r.type === 'cost') && r.customerId ? (
+                          <Button size="sm" variant="secondary" onClick={() => createInvoiceFor(r)}>
+                            Create invoice
+                          </Button>
+                        ) : r.type === 'estimate' || r.type === 'sales_order' ? (
+                          <Button size="sm" variant="secondary" disabled={running} onClick={() => run('convert', [r])}>
+                            Turn into invoice
+                          </Button>
+                        ) : (
+                          <Link href={rowHref(r)} className="text-sm text-electric hover:underline">
+                            Open
+                          </Link>
                         )}
                       </Td>
                     </Tr>

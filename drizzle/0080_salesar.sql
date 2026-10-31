@@ -66,3 +66,8 @@ CREATE TABLE IF NOT EXISTS "billing_group_members" (
 CREATE UNIQUE INDEX IF NOT EXISTS "billing_group_members_uq" ON "billing_group_members" ("group_id", "customer_id");
 --> statement-breakpoint
 CREATE INDEX IF NOT EXISTS "billing_group_members_customer_idx" ON "billing_group_members" ("customer_id");
+--> statement-breakpoint
+-- 6. Collections Center contacts (C9): how a collection note's contact was made ('call', 'email',
+--    'letter', 'statement', 'visit', 'other'); NULL = a plain note (not a contact). The latest
+--    contact is the customer's "last contacted".
+ALTER TABLE "collection_notes" ADD COLUMN IF NOT EXISTS "contact_method" varchar(20);

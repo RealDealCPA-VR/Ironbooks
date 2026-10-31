@@ -54,12 +54,40 @@ interface TimeEntry {
   description: string | null;
   invoicedInvoiceId: string | null;
   createdAt: string;
+  /** B13: the hourly rate billing uses (typed rate > billing rate level > item price > 0). */
+  billingRate?: string;
+  billingAmount?: string;
+  rateSource?: 'entry' | 'billing_rate_level' | 'item_price' | 'none';
+  rateLevelName?: string | null;
+}
+
+interface ServiceItem {
+  id: string;
+  name: string;
+  type: string;
+  isActive?: boolean;
+}
+
+/** GET /api/billing-rate-levels/resolve — what an hour bills at when no rate is typed. */
+interface ResolvedRate {
+  rate: string | null;
+  source: 'billing_rate_level' | 'item_price' | 'none';
+  levelName: string | null;
+}
+
+/** Where a listed entry's rate came from, in plain words ("Senior rate", "item price"). */
+function rateNote(e: TimeEntry): string | null {
+  if (e.rateSource === 'billing_rate_level') return e.rateLevelName ? `${e.rateLevelName} rate` : 'billing rate level';
+  if (e.rateSource === 'item_price') return 'item price';
+  return null;
 }
 
 interface LogTimeForm {
   /** QB timesheet Name: the employee whose hours these are (needed to pay them in a pay run). */
   employeeId: string;
   customerId: string;
+  /** Service item worked (prices the hour: billing rate level / item price). */
+  serviceItemId: string;
   date: string;
   hours: string;
   rate: string;
@@ -71,6 +99,7 @@ interface LogTimeForm {
 const emptyForm = (): LogTimeForm => ({
   employeeId: '',
   customerId: '',
+  serviceItemId: '',
   date: todayISO(),
   hours: '',
   rate: '',
@@ -87,9 +116,9 @@ const displayDescription = (e: TimeEntry) => (e.description ?? '').replace(PAID_
 // Helpers
 // ---------------------------------------------------------------------------
 
-/** Decimal-safe hours x rate (never float math for money). */
+/** What the entry bills (the server's hours x billing rate; else hours x typed rate, Decimal-safe). */
 function entryAmount(entry: TimeEntry) {
-  return Money.mul(entry.hours, entry.rate ?? '0');
+  return entry.billingAmount != null ? Money.of(entry.billingAmount) : Money.mul(entry.hours, entry.rate ?? '0');
 }
 
 /** Group entries by customerId, returning only billable + uninvoiced ones */
@@ -126,6 +155,32 @@ export default function TimeTrackingPage() {
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [pendingBill, setPendingBill] = useState<string | null>(null);
+  const [serviceItems, setServiceItems] = useState<ServiceItem[]>([]);
+  const [resolved, setResolved] = useState<ResolvedRate | null>(null);
+
+  // Service items for the Log Time form (optional: a user without the items list still logs time).
+  useEffect(() => {
+    api
+      .get<{ items: ServiceItem[] }>('/api/items')
+      .then((r) => setServiceItems((r.items ?? []).filter((i) => i.type === 'service')))
+      .catch(() => setServiceItems([]));
+  }, []);
+
+  // B13: what an hour of this item bills at for this employee when no rate is typed.
+  useEffect(() => {
+    setResolved(null);
+    if (!showLog || !form.serviceItemId) return;
+    let live = true;
+    const qs = new URLSearchParams({ itemId: form.serviceItemId });
+    if (form.employeeId) qs.set('employeeId', form.employeeId);
+    api
+      .get<ResolvedRate>(`/api/billing-rate-levels/resolve?${qs}`)
+      .then((r) => live && setResolved(r))
+      .catch(() => live && setResolved(null));
+    return () => {
+      live = false;
+    };
+  }, [showLog, form.serviceItemId, form.employeeId]);
 
   // Filters
   const [filterBillable, setFilterBillable] = useState<'all' | 'yes' | 'no'>('all');
@@ -169,6 +224,7 @@ export default function TimeTrackingPage() {
       await api.post('/api/time-entries', {
         employeeId: form.employeeId || null,
         customerId: form.customerId || null,
+        serviceItemId: form.serviceItemId || null,
         date: form.date,
         hours: form.hours,
         rate: form.rate ? form.rate : null,
@@ -350,10 +406,17 @@ export default function TimeTrackingPage() {
                   <Td className="max-w-xs truncate">{displayDescription(e)}</Td>
                   <Td numeric>{parseFloat(e.hours).toFixed(2)}</Td>
                   <Td numeric>
-                    {e.rate ? formatCurrency(e.rate) : '—'}
+                    {(e.billingRate ?? e.rate) && Number(e.billingRate ?? e.rate) > 0 ? (
+                      <>
+                        {formatCurrency(e.billingRate ?? e.rate ?? '0')}
+                        {rateNote(e) && <div className="text-xs text-navy/50">{rateNote(e)}</div>}
+                      </>
+                    ) : (
+                      '—'
+                    )}
                   </Td>
                   <Td numeric>
-                    {e.rate ? formatCurrency(entryAmount(e)) : '—'}
+                    {(e.billingRate ?? e.rate) && Number(e.billingRate ?? e.rate) > 0 ? formatCurrency(entryAmount(e)) : '—'}
                   </Td>
                   <Td>
                     {e.billable ? (
@@ -452,6 +515,24 @@ export default function TimeTrackingPage() {
           </div>
 
           <div>
+            <Label htmlFor="time-item">Service item</Label>
+            <Select
+              id="time-item"
+              value={form.serviceItemId}
+              onChange={(e) => setForm((f) => ({ ...f, serviceItemId: e.target.value }))}
+            >
+              <option value="">— No service item —</option>
+              {serviceItems
+                .filter((it) => it.isActive !== false || it.id === form.serviceItemId)
+                .map((it) => (
+                  <option key={it.id} value={it.id}>
+                    {it.name}
+                  </option>
+                ))}
+            </Select>
+          </div>
+
+          <div>
             <Label>Date</Label>
             <Input
               type="date"
@@ -485,9 +566,22 @@ export default function TimeTrackingPage() {
             </div>
           </div>
 
-          {form.hours && form.rate && (
+          {!form.rate && resolved?.rate && Number(resolved.rate) > 0 && (
+            <p className="text-xs text-navy/60" role="status">
+              Leave the rate blank to bill {formatCurrency(resolved.rate)}/hr
+              {resolved.source === 'billing_rate_level'
+                ? ` (${resolved.levelName ?? 'billing rate level'} rate)`
+                : ' (the item’s price)'}
+              .
+            </p>
+          )}
+
+          {form.hours && (form.rate || (resolved?.rate && Number(resolved.rate) > 0)) && (
             <p className="text-sm text-navy/70">
-              Amount: <span className="font-semibold">{formatCurrency(Money.mul(form.hours || '0', form.rate || '0'))}</span>
+              Amount:{' '}
+              <span className="font-semibold">
+                {formatCurrency(Money.mul(form.hours || '0', form.rate || resolved?.rate || '0'))}
+              </span>
             </p>
           )}
 

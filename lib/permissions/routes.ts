@@ -364,6 +364,12 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/collections': r('customers', 'GET'),
   '/api/collections/notes': r('customers', 'GET POST'),
   '/api/collections/notes/[id]': r('customers', 'PATCH'),
+  // salesar (C6/C9): Billing Groups for Batch Invoicing; Collections Center actions.
+  '/api/billing-groups': r('customers', 'GET POST'),
+  '/api/billing-groups/[id]': r('customers', 'GET PATCH DELETE'),
+  '/api/collections/contacts': r('customers', 'POST'),
+  '/api/collections/email': r('customers', 'POST:print'),
+  '/api/collections/letter': r('customers', 'POST:print'),
   '/api/time-entries/bill': r('customers', 'POST'),
 
   // ---- Vendors & Payables ----

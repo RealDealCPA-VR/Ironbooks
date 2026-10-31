@@ -256,6 +256,9 @@ interface BillableTime {
   description: string | null;
   hours: string;
   rate: string;
+  /** B13: where the rate came from ('billing_rate_level' → "<level> rate"). */
+  rateSource?: string;
+  rateLevelName?: string | null;
   amount: string;
   serviceItemId: string | null;
   jobId: string | null;
@@ -1564,7 +1567,8 @@ function InvoiceModal({
                   <Badge tone="info">Time</Badge>
                   <span className="text-navy/50">{t.date ? formatDate(t.date) : ''}</span>
                   <span className="flex-1 truncate text-navy/80">
-                    {t.description ?? 'Time entry'} ({Number(t.hours)}h × {formatCurrency(t.rate)})
+                    {t.description ?? 'Time entry'} ({Number(t.hours)}h × {formatCurrency(t.rate)}
+                    {t.rateSource === 'billing_rate_level' && t.rateLevelName ? `, ${t.rateLevelName} rate` : ''})
                   </span>
                   <span className="tabular-nums font-semibold text-navy/80">
                     {formatCurrency(t.amount)}
