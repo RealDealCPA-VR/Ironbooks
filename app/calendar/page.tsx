@@ -9,7 +9,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { CalendarDays, CheckCircle2, ChevronLeft, ChevronRight, Circle, Plus, Trash2 } from 'lucide-react';
-import { Badge, Button, Card, Input, Label, Modal, PageHeader, Select, Spinner, toast } from '@/components/ui';
+import { Badge, Button, Card, ConfirmDialog, Input, Label, Modal, PageHeader, Select, Spinner, toast } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { usePreferences } from '@/lib/usePreferences';
@@ -153,7 +153,11 @@ export default function CalendarPage() {
     }
   }
 
+  /** The to-do Delete was pressed on: deleting asks first (one stray click or Ctrl+D lost it). */
+  const [deleting, setDeleting] = useState<Todo | null>(null);
+
   async function deleteTodo(id: string) {
+    setDeleting(null);
     try {
       await api.del(`/api/todos/${id}`);
       await Promise.all([load(), loadTodos()]);
@@ -282,7 +286,7 @@ export default function CalendarPage() {
                         {t.title}
                       </span>
                     </button>
-                    <button type="button" onClick={() => void deleteTodo(t.id)} className="rounded p-1 text-red-400 hover:bg-red-50" aria-label="Delete to-do">
+                    <button type="button" onClick={() => setDeleting(t)} className="rounded p-1 text-red-400 hover:bg-red-50" aria-label="Delete to-do">
                       <Trash2 className="h-3.5 w-3.5" />
                     </button>
                   </li>
@@ -347,6 +351,15 @@ export default function CalendarPage() {
           </div>
         </div>
       </Modal>
+      <ConfirmDialog
+        open={deleting !== null}
+        title="Delete this to-do?"
+        message={deleting ? <>&ldquo;{deleting.title}&rdquo; will be deleted. This cannot be undone.</> : null}
+        confirmLabel="Delete"
+        tone="danger"
+        onConfirm={() => deleting && void deleteTodo(deleting.id)}
+        onClose={() => setDeleting(null)}
+      />
     </main>
   );
 }
