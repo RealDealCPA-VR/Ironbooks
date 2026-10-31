@@ -47,6 +47,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { usePreferences } from '@/lib/usePreferences';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/dates';
 import { mergePrefills } from '@/lib/bankRules/core';
@@ -207,6 +208,8 @@ export default function BankReviewPage() {
   const [offers, setOffers] = useState<RuleOffer[]>([]);
   const [bulkFailures, setBulkFailures] = useState<BulkResult['failed']>([]);
   const [classList, setClassList] = useState<ClassRow[]>([]);
+  // A1: "Use class tracking" off hides the Class picker (unless a class is already chosen).
+  const classOn = usePreferences().company.classTrackingEnabled;
   const [rowClassId, setRowClassId] = useState<Record<string, string>>({});
   const [askingAll, setAskingAll] = useState(false);
   // p1 fx: exchange rate for adding feed lines of a foreign-currency account (blank = list rate).
@@ -732,7 +735,7 @@ export default function BankReviewPage() {
                 </option>
               ))}
             </Select>
-            {classList.length > 0 && (
+            {classList.length > 0 && (classOn || !!rowClassId[txn.id]) && (
               <Select
                 aria-label="Class"
                 className="min-w-[120px] w-auto"

@@ -10,6 +10,7 @@ import { useEffect, useState } from 'react';
 import { Input, Label, Select } from '@/components/ui';
 import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
+import { usePreferences } from '@/lib/usePreferences';
 import type { ReportControl } from '@/lib/reports/catalog';
 
 export type Params = Record<string, string>;
@@ -117,6 +118,8 @@ export default function ReportFilters({
   showAdvanced: boolean;
 }) {
   const [opts, setOpts] = useState<FilterOptions | null>(null);
+  // A1 (prefsperms): "Use class tracking" off hides the Class filter and "Total by Class".
+  const classOn = usePreferences().company.classTrackingEnabled;
   const has = (c: ReportControl) => controls.includes(c);
   useEffect(() => {
     if (controls.some((c) => NEEDS_OPTIONS.includes(c))) {
@@ -261,7 +264,7 @@ export default function ReportFilters({
           <Input id="rf-overdays" inputMode="numeric" placeholder="Any" value={params.overDays ?? ''} onChange={(e) => set('overDays', e.target.value.replace(/[^0-9]/g, ''))} />
         </Field>
       )}
-      {has('class') && pick('classId', 'Class', opts?.classes, <Help term="class" />)}
+      {has('class') && (classOn || !!params.classId) && pick('classId', 'Class', opts?.classes, <Help term="class" />)}
       {has('customer') && pick('customerId', 'Customer:Job', opts?.customers)}
       {has('vendor') && pick('vendorId', 'Vendor', opts?.vendors)}
       {has('job') && pick('jobId', 'Job', opts?.jobs)}
@@ -356,7 +359,7 @@ export default function ReportFilters({
             <option value="name">Name</option>
             <option value="type">Transaction type</option>
             <option value="month">Month</option>
-            <option value="class">Class</option>
+            {(classOn || params.subtotalBy === 'class') && <option value="class">Class</option>}
           </Select>
         </Field>
       )}

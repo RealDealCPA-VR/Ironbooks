@@ -26,6 +26,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { usePreferences } from '@/lib/usePreferences';
 import { todayISO } from '@/lib/dates';
 import { Money, formatCurrency } from '@/lib/money';
 import {
@@ -270,6 +271,8 @@ function RuleModal({
 }) {
   const [d, setD] = useState<RuleDraft>(() => draftFrom(rule));
   const [saving, setSaving] = useState(false);
+  // A1: "Use class tracking" off hides the Classes condition (unless the rule already has one).
+  const classOn = usePreferences().company.classTrackingEnabled;
   useEffect(() => {
     if (open) setD(draftFrom(rule));
   }, [open, rule]);
@@ -436,7 +439,9 @@ function RuleModal({
             <MultiPick label="Customers (incl. their jobs)" options={lookups.customers} value={d.conditions.customerIds} onChange={(customerIds) => setCond({ customerIds })} />
             <MultiPick label="Customer types" options={lookups.customerTypes} value={d.conditions.customerTypeIds} onChange={(customerTypeIds) => setCond({ customerTypeIds })} />
             <MultiPick label="Jobs" options={lookups.jobs} value={d.conditions.jobIds} onChange={(jobIds) => setCond({ jobIds })} />
-            <MultiPick label="Classes" options={lookups.classes} value={d.conditions.classIds} onChange={(classIds) => setCond({ classIds })} />
+            {(classOn || d.conditions.classIds.length > 0) && (
+              <MultiPick label="Classes" options={lookups.classes} value={d.conditions.classIds} onChange={(classIds) => setCond({ classIds })} />
+            )}
             <MultiPick label="Sales reps" options={lookups.salesReps} value={d.conditions.salesRepIds} onChange={(salesRepIds) => setCond({ salesRepIds })} />
           </div>
           {(d.conditions.jobIds.length > 0 || d.conditions.classIds.length > 0 || d.conditions.salesRepIds.length > 0) && (
@@ -1086,6 +1091,7 @@ function PriceCheck({ items, customers, lookups }: { items: Item[]; customers: C
   const [qty, setQty] = useState('1');
   const [date, setDate] = useState(() => todayISO());
   const [classId, setClassId] = useState('');
+  const classOn = usePreferences().company.classTrackingEnabled;
   const [repId, setRepId] = useState('');
   const [quote, setQuote] = useState<PriceQuote | null>(null);
   const [loading, setLoading] = useState(false);
@@ -1142,15 +1148,17 @@ function PriceCheck({ items, customers, lookups }: { items: Item[]; customers: C
           <Input id="pc-date" type="date" value={date} onChange={(e) => setDate(e.target.value)} />
         </div>
         <Button onClick={check} loading={loading}>Check</Button>
-        <div className="md:col-span-2">
-          <Label htmlFor="pc-class">Class</Label>
-          <Select id="pc-class" value={classId} onChange={(e) => setClassId(e.target.value)}>
-            <option value="">—</option>
-            {lookups.classes.map((c) => (
-              <option key={c.id} value={c.id}>{c.name}</option>
-            ))}
-          </Select>
-        </div>
+        {classOn && (
+          <div className="md:col-span-2">
+            <Label htmlFor="pc-class">Class</Label>
+            <Select id="pc-class" value={classId} onChange={(e) => setClassId(e.target.value)}>
+              <option value="">—</option>
+              {lookups.classes.map((c) => (
+                <option key={c.id} value={c.id}>{c.name}</option>
+              ))}
+            </Select>
+          </div>
+        )}
         <div className="md:col-span-2">
           <Label htmlFor="pc-rep">Sales rep</Label>
           <Select id="pc-rep" value={repId} onChange={(e) => setRepId(e.target.value)}>
