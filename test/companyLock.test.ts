@@ -92,6 +92,30 @@ describe('company file lock', () => {
     expect(lock.checkHeld(a.lock).held).toBe(true);
   });
 
+  it('two computers taking over the same stale lock at the same instant: only one gets it', () => {
+    // Review round 5 leftover: both judged the lock stale within milliseconds. Computer A takes
+    // it over right after B has checked it (B's afterCheck hook) — B must not then remove A's
+    // fresh lock and take it too.
+    const file = companyFile('Race');
+    lock.acquire(file, { computer: 'GONE-PC' });
+    age(file, lock.STALE_MS + 5_000);
+    const judged = lock.acquire(file).holder;
+    expect(judged.stale).toBe(true);
+    let a: { ok: boolean; lock?: { token: string } } | null = null;
+    const b = lock.takeOver(file, judged, { appUser: 'B' }, {
+      afterCheck: () => {
+        a = lock.takeOver(file, judged, { appUser: 'A' });
+      },
+    });
+    expect(a).not.toBeNull();
+    expect(a!.ok).toBe(true);
+    expect(b.ok).toBe(false);
+    expect(lock.checkHeld(a!.lock).held).toBe(true);
+    expect(lock.readHolder(file).owner.appUser).toBe('A');
+    // Nothing left lying around next to the company file.
+    expect(fs.readdirSync(root).filter((n) => n.includes('Race') && n.includes('takeover'))).toEqual([]);
+  });
+
   it('heartbeats keep owner details and recreate a deleted lock folder', () => {
     const file = companyFile('Beat');
     const a = lock.acquire(file);

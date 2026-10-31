@@ -2034,7 +2034,11 @@ function buildMenu() {
         { role: 'quit' },
       ],
     },
-    // Native menu shortcuts reach the window before the page, so none may take a QuickBooks key:
+    // Native menu shortcuts and the page share the keyboard, so none may take a QuickBooks key. On
+    // Windows and Linux a menu accelerator fires only for a key the page leaves unhandled (the page
+    // sees every keydown first; one it calls preventDefault on never reaches the menu — the F5
+    // guard of a form with unsaved changes relies on this). On macOS the menu's key equivalents are
+    // matched BEFORE the page sees the key, so there a menu shortcut always wins.
     // Redo stays on Ctrl+Shift+Z here (fields still redo with Ctrl+Y; Ctrl+Y is QB's Transaction
     // Journal) and Minimize has no shortcut on Windows / Linux (Ctrl+M is QB's Memorize).
     {

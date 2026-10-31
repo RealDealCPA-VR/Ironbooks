@@ -205,14 +205,41 @@ function acquire(companyFile, info = {}) {
 /**
  * Take over a stale lock (the person opening the file agreed). Only removes the lock when it is
  * still the one that was judged stale (same token), so a holder that came back meanwhile keeps it.
+ * Two computers taking over at the same instant: an atomic rename-aside + verify lets only one in.
+ * `hooks.afterCheck` (tests only) runs between the check and the takeover.
  */
-function takeOver(companyFile, staleHolder, info = {}) {
+function takeOver(companyFile, staleHolder, info = {}, hooks = {}) {
   const dir = lockDirFor(companyFile);
   const current = readHolder(companyFile);
   if (current) {
-    const sameLock = (current.owner && current.owner.token) === (staleHolder && staleHolder.owner && staleHolder.owner.token);
+    const staleToken = staleHolder && staleHolder.owner ? staleHolder.owner.token : undefined;
+    const sameLock = (current.owner && current.owner.token) === staleToken;
     if (!sameLock || !current.stale) return { ok: false, holder: current };
-    fs.rmSync(dir, { recursive: true, force: true });
+    if (typeof hooks.afterCheck === 'function') hooks.afterCheck(); // tests: another computer acts now
+    // Two computers may judge the same lock stale within milliseconds. Removing it (rm) after the
+    // check could remove the OTHER computer's fresh lock, so both would hold the file. Instead the
+    // lock is moved aside with one atomic rename and then verified: only the computer that moved
+    // the STALE lock goes on (to an atomic mkdir in acquire); one that moved a fresh lock puts it
+    // straight back and reports the new holder.
+    const aside = `${dir}.takeover-${crypto.randomBytes(6).toString('hex')}`;
+    try {
+      fs.renameSync(dir, aside);
+    } catch (err) {
+      // Gone already (the other computer moved it first): whoever mkdirs first in acquire wins.
+      if (!err || err.code !== 'ENOENT') return { ok: false, holder: readHolder(companyFile) || current, error: err };
+      return acquire(companyFile, info);
+    }
+    const moved = readJson(path.join(aside, OWNER_FILE));
+    if ((moved ? moved.token : undefined) !== staleToken) {
+      try {
+        fs.renameSync(aside, dir);
+      } catch {
+        // The holder's heartbeat recreated its lock meanwhile: it still holds the file.
+        fs.rmSync(aside, { recursive: true, force: true });
+      }
+      return { ok: false, holder: readHolder(companyFile) };
+    }
+    fs.rmSync(aside, { recursive: true, force: true });
   }
   return acquire(companyFile, info);
 }
