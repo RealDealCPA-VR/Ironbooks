@@ -1885,6 +1885,47 @@ function fromAppOrigin(event) {
   }
 }
 
+/**
+ * Keyboard parity (QuickBooks keys): menu items whose keys the PAGE handles show the key but do
+ * not register it (Windows / Linux), so the page's own rules apply — Ctrl+O copies a register
+ * transaction, Ctrl+Z also undoes the QuickBooks date keys, F5 asks before refreshing over typed
+ * work, Alt+Left asks before leaving a form. macOS needs real key equivalents for Edit.
+ */
+const shownKey = (accelerator) =>
+  process.platform === 'darwin' ? {} : { accelerator, registerAccelerator: false };
+/** Tell the page to do a menu action (components/DesktopBridge.tsx PAGE_MENU_ACTIONS). */
+const pageAction = (action) => () => mainWindow?.webContents.send('menu', action);
+/** The Favorites menu: the signed-in person's favorite pages (components/FavoritesMenu.tsx). */
+let favoriteItems = [];
+/** One window close that already passed the unsaved-work question. */
+let closeAnswered = false;
+
+/** Does the page hold typed work that closing would lose (components/LeaveGuard.tsx)? */
+async function pageHasUnsavedWork(win) {
+  try {
+    // A page that does not answer (hung, still loading) never keeps the window from closing.
+    const answer = win.webContents.executeJavaScript('Boolean(window.__ironbooksUnsavedWork && window.__ironbooksUnsavedWork())', true);
+    return Boolean(await Promise.race([answer, new Promise((r) => setTimeout(() => r(false), 1500))]));
+  } catch {
+    return false;
+  }
+}
+
+/** Alt+F4 / File > Exit with a form being typed: ask before it is lost. Resolves true to close. */
+async function confirmCloseOverUnsavedWork(win) {
+  if (!(await pageHasUnsavedWork(win))) return true;
+  const { response } = await dialog.showMessageBox(win, {
+    type: 'warning',
+    noLink: true,
+    message: 'Close Ironbooks?',
+    detail: 'A form has changes that are not recorded yet. Closing now loses them.',
+    buttons: ['Close Without Recording', 'Cancel'],
+    defaultId: 1,
+    cancelId: 1,
+  });
+  return response === 0;
+}
+
 function buildMenu() {
   const cfg = loadConfig();
   const current = remoteHostOrigin ? cfg.remoteFile || null : currentCompanyLocation();
@@ -1904,7 +1945,8 @@ function buildMenu() {
       label: 'File',
       submenu: [
         { label: 'New Company…', accelerator: 'CmdOrCtrl+Shift+N', click: () => { createCompanyFlow(); } },
-        { label: 'Open or Restore Company…', accelerator: 'CmdOrCtrl+O', click: () => { openCompanyFlow(); } },
+        // No Ctrl+O here: in QuickBooks (and the app) Ctrl+O copies a register transaction.
+        { label: 'Open or Restore Company…', click: () => { openCompanyFlow(); } },
         {
           label: 'Open Previous Company',
           submenu: recentItems.length
@@ -1965,27 +2007,45 @@ function buildMenu() {
         { label: "Accountant's Copy…", click: () => navigate('/accountant/accountants-copy') },
         { label: 'Create Period Copy…', click: () => navigate('/accountant/period-copy') },
         { type: 'separator' },
-        { role: 'quit' },
+        // Exit closes the window, so a form being typed asks first (Alt+F4 does the same).
+        process.platform === 'darwin' ? { role: 'quit' } : { label: 'Exit', ...shownKey('Alt+F4'), click: () => (mainWindow ? mainWindow.close() : app.quit()) },
       ],
     },
     // Native menu shortcuts reach the window before the page, so none may take a QuickBooks key:
     // Redo stays on Ctrl+Shift+Z here (fields still redo with Ctrl+Y; Ctrl+Y is QB's Transaction
-    // Journal) and Minimize has no shortcut on Windows / Linux (Ctrl+M is QB's Memorize).
+    // Journal) and Minimize has no shortcut on Windows / Linux (Ctrl+M is QB's Memorize). On
+    // Windows / Linux the edit keys are shown only: the page's fields handle them (Ctrl+Z also
+    // undoes a QuickBooks date key).
     {
       label: 'Edit',
       submenu: [
-        { role: 'undo' },
-        { role: 'redo', accelerator: process.platform === 'darwin' ? 'Cmd+Shift+Z' : 'Ctrl+Shift+Z' },
+        { role: 'undo', ...shownKey('Ctrl+Z') },
+        { role: 'redo', ...(process.platform === 'darwin' ? { accelerator: 'Cmd+Shift+Z' } : shownKey('Ctrl+Shift+Z')) },
         { type: 'separator' },
-        { role: 'cut' },
-        { role: 'copy' },
-        { role: 'paste' },
+        { role: 'cut', ...shownKey('Ctrl+X') },
+        { role: 'copy', ...shownKey('Ctrl+C') },
+        { role: 'paste', ...shownKey('Ctrl+V') },
       ],
     },
-    // Reload on F5 (not the default Ctrl+R): Ctrl+R is the QB "Registers" shortcut in the app.
-    { label: 'View', submenu: [{ role: 'reload', accelerator: 'F5' }, { role: 'toggleDevTools' }, { type: 'separator' }, { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' }, { type: 'separator' }, { role: 'togglefullscreen' }] },
-    // QB menus: Company, Customers, Vendors, Employees, Banking, Reports, Lists (electron/menuRoutes.js).
-    ...buildSectionMenus(navigate),
+    // F5 is QuickBooks' Refresh: the page refreshes its data, asking first over typed work (never
+    // the window's own reload, and never Ctrl+R — the QB "Use Register" key).
+    { label: 'View', submenu: [{ label: 'Refresh', ...shownKey('F5'), click: pageAction('refresh') }, { role: 'toggleDevTools' }, { type: 'separator' }, { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' }, { type: 'separator' }, { role: 'togglefullscreen' }] },
+    // QuickBooks' order: Lists, Favorites, then Company … Reports (electron/menuRoutes.js).
+    ...(() => {
+      const sections = buildSectionMenus(navigate);
+      const lists = sections.filter((s) => s.label === 'Lists');
+      const favorites = {
+        label: 'Favorites',
+        submenu: [
+          ...(favoriteItems.length
+            ? favoriteItems.map((f) => ({ label: f.label, click: () => navigate(f.route) }))
+            : [{ label: 'No favorites yet', enabled: false }]),
+          { type: 'separator' },
+          { label: 'Customize Favorites…', click: pageAction('customize-favorites') },
+        ],
+      };
+      return [...lists, favorites, ...sections.filter((s) => s.label !== 'Lists')];
+    })(),
     {
       label: 'Window',
       submenu: [
@@ -1993,8 +2053,14 @@ function buildMenu() {
         ...(process.platform === 'darwin' ? [{ role: 'zoom' }, { role: 'front' }] : []),
         { role: 'togglefullscreen' },
         { type: 'separator' },
-        { label: 'Back', accelerator: 'Alt+Left', click: () => mainWindow?.webContents.navigationHistory?.goBack?.() },
-        { label: 'Forward', accelerator: 'Alt+Right', click: () => mainWindow?.webContents.navigationHistory?.goForward?.() },
+        { label: 'Open Window List', click: pageAction('window-list') },
+        { label: 'Next Window', ...shownKey('Ctrl+Tab'), click: pageAction('window-next') },
+        { label: 'Previous Window', ...shownKey('Ctrl+Shift+Tab'), click: pageAction('window-prev') },
+        { label: 'Close Window', ...shownKey('Ctrl+F4'), click: pageAction('window-close') },
+        { type: 'separator' },
+        // Through the page, so a form being typed asks before it is left.
+        { label: 'Back', ...shownKey('Alt+Left'), click: pageAction('history-back') },
+        { label: 'Forward', ...shownKey('Alt+Right'), click: pageAction('history-forward') },
         { type: 'separator' },
         { label: 'Home', click: () => navigate('/dashboard') },
       ],
@@ -2002,6 +2068,10 @@ function buildMenu() {
     {
       label: 'Help',
       submenu: [
+        { label: 'Ironbooks Help', ...shownKey('F1'), click: pageAction('help') },
+        { label: 'Keyboard Shortcuts (?)', click: pageAction('keyboard-shortcuts') },
+        { label: 'Product Information', ...shownKey('F2'), click: pageAction('product-info') },
+        { type: 'separator' },
         { label: 'Run Setup Interview…', click: () => navigate('/onboarding') },
         sandboxMenuItem(),
         { type: 'separator' },
@@ -2241,6 +2311,21 @@ async function createWindow() {
   // Closing the window with a company file open: keep it on screen while the file is saved into
   // the company file (before-quit), so any question about that save has a window to appear on.
   mainWindow.on('close', (e) => {
+    // Alt+F4 / File > Exit with a form being typed: ask first (the page knows: LeaveGuard).
+    if (!quittingAfterBackup && !closeAnswered) {
+      e.preventDefault();
+      const win = mainWindow;
+      confirmCloseOverUnsavedWork(win).then((close) => {
+        if (!close || win.isDestroyed()) return;
+        if (openFile) app.quit();
+        else {
+          closeAnswered = true;
+          win.close();
+        }
+      });
+      return;
+    }
+    closeAnswered = false;
     if (openFile && !quittingAfterBackup) {
       e.preventDefault();
       app.quit();
@@ -2468,6 +2553,16 @@ ipcMain.handle('chrome:theme', (e, raw) => {
 // The application menu is not shown as a bar (the window has no frame); the page lists its
 // top-level labels in the title bar and opens each one as a native popup.
 ipcMain.handle('chrome:menus', (e) => (fromAppOrigin(e) ? windowTheme.menuLabels(Menu.getApplicationMenu()) : []));
+// The Favorites menu (components/FavoritesMenu.tsx): the signed-in person's favorite pages.
+ipcMain.handle('chrome:setFavorites', (e, items) => {
+  if (!fromAppOrigin(e) || !Array.isArray(items)) return false;
+  favoriteItems = items
+    .filter((f) => f && typeof f.label === 'string' && typeof f.route === 'string' && /^\/[a-z0-9][a-z0-9\-/_]*$/i.test(f.route))
+    .slice(0, 30)
+    .map((f) => ({ label: f.label.slice(0, 80), route: f.route.slice(0, 200) }));
+  if (!startScreenMode) buildMenu();
+  return true;
+});
 ipcMain.handle('chrome:popupMenu', (e, index, x, y) => {
   if (!fromAppOrigin(e) || !mainWindow) return false;
   const item = Menu.getApplicationMenu()?.items?.[Number(index)];

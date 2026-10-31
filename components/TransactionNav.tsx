@@ -10,7 +10,8 @@
  *  - Journal (Ctrl+Y; Ctrl+H for its history) shows the journal entry the transaction posted.
  *
  * Moving away from changes you have not saved asks first ("Discard your changes?"). Changes are
- * noticed by comparing the form's fields with how they were once the transaction had loaded, so
+ * noticed by comparing the form's fields with how they were just before the first edit
+ * (trackFormChanges in components/ui.tsx — the same tracker the dialog's Esc question uses), so
  * every form gets this without tracking its own state.
  *
  * The buttons carry data-shortcut="prev|next|revert" (components/FormShortcuts.tsx presses them);
@@ -18,8 +19,11 @@
  */
 import * as React from 'react';
 import { BookOpen, ChevronLeft, ChevronRight, RotateCcw } from 'lucide-react';
-import { Button, ConfirmDialog } from '@/components/ui';
+import { Button, ConfirmDialog, trackFormChanges } from '@/components/ui';
 import { AccessKeyText } from '@/components/AccessKey';
+
+/** The form's field values as one string (components/ui.tsx; also used by components/ErrorFixPanel). */
+export { fieldSnapshot } from '@/components/ui';
 
 /** Window event asking components/KeyboardCommands.tsx to show a transaction's journal entry. */
 export const SHOW_JOURNAL_EVENT = 'ib:show-journal';
@@ -36,34 +40,22 @@ export interface TransactionNavProps {
   loadKey: string;
 }
 
-const FIELDS = 'input:not([type="hidden"]):not([type="file"]), select, textarea';
-
-/** The form's field values, in page order, as one string (also used by components/ErrorFixPanel). */
-export function fieldSnapshot(scope: HTMLElement | null): string {
-  if (!scope) return '';
-  return Array.from(scope.querySelectorAll<HTMLInputElement>(FIELDS))
-    .filter((el) => !el.closest('[data-nav-ignore]'))
-    .map((el) => (el.type === 'checkbox' || el.type === 'radio' ? String(el.checked) : el.value))
-    .join('\u0001');
-}
-
 export function TransactionNav({ sourceRef, onPrevious, onNext, onRevert, loadKey }: TransactionNavProps) {
   const ref = React.useRef<HTMLDivElement>(null);
-  const baseline = React.useRef<string | null>(null);
   const [pending, setPending] = React.useState<(() => void) | null>(null);
 
   const scope = () => (ref.current?.closest('[role="dialog"], form, [data-shortcut-scope]') as HTMLElement | null) ?? null;
 
-  // Once the transaction has loaded (its fields fill in over a moment), remember how it looks.
+  // A different transaction (or a fresh blank form) is in the form: it starts out unchanged.
   React.useEffect(() => {
-    baseline.current = null;
-    const t = setTimeout(() => {
-      baseline.current = fieldSnapshot(scope());
-    }, 900);
-    return () => clearTimeout(t);
+    const s = scope();
+    if (s) trackFormChanges(s).reset();
   }, [loadKey]);
 
-  const changed = () => baseline.current !== null && fieldSnapshot(scope()) !== baseline.current;
+  const changed = () => {
+    const s = scope();
+    return s ? trackFormChanges(s).changed() : false;
+  };
   const guard = (fn: (() => void) | null) => () => {
     if (!fn) return;
     if (changed()) setPending(() => fn);

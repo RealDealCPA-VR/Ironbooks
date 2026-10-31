@@ -28,6 +28,7 @@ import {
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import { listItemPrefill } from '@/lib/keyboardTargets';
 import { isInventoryAssetAccount } from '@/lib/accountTypes';
 import { useFocusParam } from '@/lib/useFocusParam';
 import { usePreferences } from '@/lib/usePreferences';
@@ -419,7 +420,7 @@ function ItemsPageContent() {
             </thead>
             <tbody>
               {items.map((item) => (
-                <Tr key={item.id}>
+                <Tr key={item.id} data-use-prefill={listItemPrefill({ item })}>
                   <Td className="font-semibold text-navy">
                     <span title={item.description ?? undefined}>{item.name}</span>
                   </Td>

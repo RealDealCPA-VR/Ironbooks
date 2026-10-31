@@ -393,3 +393,30 @@ tr[data-list-active] > th {
     display: none;
   }
 }
+
+/*
+ * My Preferences > General > Screen density = Compact (components/PreferenceBehaviors.tsx sets
+ * html[data-density]): tighter table rows and fields so lists, registers and forms show about as
+ * many rows as QuickBooks Desktop. Element + attribute selectors outrank the single-class
+ * Tailwind paddings without !important.
+ */
+html[data-density='compact'] table th,
+html[data-density='compact'] table td {
+  padding-top: 0.25rem;
+  padding-bottom: 0.25rem;
+}
+html[data-density='compact'] table th:not([class*='px-0']),
+html[data-density='compact'] table td:not([class*='px-0']) {
+  padding-left: 0.625rem;
+  padding-right: 0.625rem;
+}
+html[data-density='compact'] main input:not([type='checkbox']):not([type='radio']):not([type='range']):not([type='color']),
+html[data-density='compact'] main select,
+html[data-density='compact'] [role='dialog'] input:not([type='checkbox']):not([type='radio']):not([type='range']):not([type='color']),
+html[data-density='compact'] [role='dialog'] select {
+  padding-top: 0.25rem;
+  padding-bottom: 0.25rem;
+}
+html[data-density='compact'] main .space-y-6 > * + * {
+  margin-top: 1rem;
+}

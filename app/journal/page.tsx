@@ -32,6 +32,7 @@ import {
   toast,
   toastError,
   useGridKeys,
+  DocNumberInput,
 } from '@/components/ui';
 import { Help } from '@/components/Help';
 import { TypeaheadSelect } from '@/components/TypeaheadSelect';
@@ -477,7 +478,7 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
         </div>
         <div>
           <Label htmlFor="je-ref">Reference (optional)</Label>
-          <Input
+          <DocNumberInput
             id="je-ref"
             placeholder="e.g. JE-001"
             maxLength={100}

@@ -7,9 +7,9 @@
  *    recursive-descent parser supporting + - * / and parentheses, in decimal arithmetic.
  *  - adjustDateForKey: QuickBooks date-entry keys (+ - T W K M H Y R [ ] ; ') for date inputs.
  *  - stepDocNumber: + / - in check and invoice number fields (<DocNumberInput>).
- *  - GLOBAL_SHORTCUTS / globalShortcutFor and the *_KEY_HELP tables: the single source of truth
- *    for the global handlers (components/AppShell.tsx GlobalShortcuts, components/KeyboardCommands.tsx)
- *    and the "?" help modal.
+ *  - GLOBAL_SHORTCUTS / globalShortcutFor: the single source of truth for the global handlers
+ *    (components/AppShell.tsx GlobalShortcuts, components/KeyboardCommands.tsx). The "?" help
+ *    lists lib/qbShortcuts.ts: QuickBooks' complete list, each key marked done or why not.
  *  - isEditableTarget: shared guard so global shortcuts ignore keystrokes in fields.
  *  - formShortcutFor / pickShortcutButton / gridKeyAction: pure key logic behind Ctrl+N / Ctrl+S /
  *    Save & New / Alt+S / Alt+A / Esc (components/FormShortcuts.tsx) and the line-grid keys.
@@ -214,6 +214,24 @@ export function committedAmountText(raw: string): string | null {
 // ---------------------------------------------------------------------------
 
 /**
+ * Where "today" comes from for the T key and for an empty date field: the company's calendar
+ * (Company Preferences > time zone), registered by components/PreferenceBehaviors.tsx. Until a
+ * company is open (sign-in, setup interview) it is this computer's own day — never the UTC day.
+ */
+let companyToday: (() => string | null) | null = null;
+
+/** Register (or clear, with null) the company's "today" for the QuickBooks date keys. */
+export function setDateKeyToday(fn: (() => string | null) | null) {
+  companyToday = fn;
+}
+
+function todayDate(today?: string): Date {
+  const iso = today ?? companyToday?.() ?? null;
+  const d = iso ? parseISO(iso) : null;
+  return d && isValid(d) ? d : new Date();
+}
+
+/**
  * Apply a QB date-entry key to a yyyy-MM-dd value:
  *   + / =  next day                -      previous day
  *   t      today
@@ -224,12 +242,17 @@ export function committedAmountText(raw: string): string | null {
  *   ; / '  same day previous / next month (Jan 31 → Feb 28)
  * Returns the new yyyy-MM-dd string, or null when the key is not a date key
  * (so the caller lets the event through untouched). Empty/invalid `current`
- * falls back to today.
+ * falls back to today: `today` when given, else the company's (setDateKeyToday).
+ *
+ * ; and ': QuickBooks' own Help and the long-standing lists (QBK Accounting, Axpert Advisors)
+ * give ; = last month and ' = next month — left / right on the keyboard, like [ ] and - +.
+ * Intuit's current web article lists them the other way round; the keyboard layout and the
+ * in-product Help win (lib/qbShortcuts.ts).
  */
-export function adjustDateForKey(key: string, current?: string): string | null {
+export function adjustDateForKey(key: string, current?: string, today?: string): string | null {
   if (key.length > 1) return null; // named keys (ArrowUp, Tab, ...) pass through
-  const parsed = current ? parseISO(current) : new Date();
-  const base = isValid(parsed) ? parsed : new Date();
+  const parsed = current ? parseISO(current) : todayDate(today);
+  const base = isValid(parsed) ? parsed : todayDate(today);
   let next: Date;
   switch (key.toLowerCase()) {
     case '+':
@@ -240,7 +263,7 @@ export function adjustDateForKey(key: string, current?: string): string | null {
       next = addDays(base, -1);
       break;
     case 't':
-      next = new Date();
+      next = todayDate(today);
       break;
     case 'w':
       next = startOfWeek(base);
@@ -278,6 +301,57 @@ export function adjustDateForKey(key: string, current?: string): string | null {
   return format(next, 'yyyy-MM-dd');
 }
 
+/**
+ * A date typed the QuickBooks way, as yyyy-MM-dd (null when it is not a date):
+ *   "10/24" or "10-24"  -> October 24 of the current year
+ *   "1024"              -> October 24 of the current year
+ *   "24"                -> the 24th of the current month
+ *   "10/24/26"          -> 2026-10-24 (two-digit years are 20xx)
+ *   "10/24/2026", "102426", "10242026" and "2026-10-24" as written.
+ * "Current" follows the company's today (setDateKeyToday) unless `today` is given.
+ */
+export function parseTypedDate(text: string, today?: string): string | null {
+  const t = text.trim();
+  if (!t) return null;
+  const now = todayDate(today);
+  const iso = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(t);
+  let y: number;
+  let m: number;
+  let d: number;
+  if (iso) {
+    [y, m, d] = [Number(iso[1]), Number(iso[2]), Number(iso[3])];
+  } else {
+    const parts = t.split(/[/.\-\s]+/).filter(Boolean);
+    let nums: string[];
+    if (parts.length === 1 && /^\d+$/.test(parts[0])) {
+      const s = parts[0];
+      if (s.length <= 2) nums = [String(now.getMonth() + 1), s];
+      else if (s.length === 3 || s.length === 4) nums = [s.slice(0, s.length - 2), s.slice(-2)];
+      else if (s.length === 6 || s.length === 8) nums = [s.slice(0, 2), s.slice(2, 4), s.slice(4)];
+      else return null;
+    } else if (parts.length >= 2 && parts.length <= 3 && parts.every((p) => /^\d+$/.test(p))) {
+      nums = parts;
+    } else {
+      return null;
+    }
+    m = Number(nums[0]);
+    d = Number(nums[1]);
+    if (nums[2] === undefined) y = now.getFullYear();
+    else if (nums[2].length <= 2) y = 2000 + Number(nums[2]);
+    else if (nums[2].length === 4) y = Number(nums[2]);
+    else return null;
+  }
+  if (m < 1 || m > 12 || d < 1 || d > 31 || y < 1900 || y > 2999) return null;
+  const date = new Date(y, m - 1, d);
+  if (date.getMonth() !== m - 1 || date.getDate() !== d) return null; // Feb 30 and the like
+  return format(date, 'yyyy-MM-dd');
+}
+
+/** Alt+Down in a date field: open its calendar (QB "Open calendar to select a date"). */
+export function isCalendarKey(e: KeyLike): boolean {
+  return e.key === 'ArrowDown' && e.altKey && !ctrlOrCmd(e) && !e.shiftKey;
+}
+
 // ---------------------------------------------------------------------------
 // Document numbers (+ / - in check and invoice number fields)
 // ---------------------------------------------------------------------------
@@ -309,7 +383,9 @@ export function stepDocNumber(key: string, value: string): string | null {
 
 /**
  * What a non-navigation shortcut does. Handled by components/KeyboardCommands.tsx, except
- * 'memorize' (components/MemorizeButton.tsx) and 'palette' (components/CommandPalette.tsx).
+ * 'memorize' (components/MemorizeButton.tsx), 'palette' / 'search' (components/CommandPalette.tsx),
+ * the window keys (components/WindowList.tsx), 'refresh' (components/LeaveGuard.tsx) and
+ * 'shortcuts' (components/AppShell.tsx).
  */
 export type GlobalCommand =
   | 'edit'
@@ -321,16 +397,46 @@ export type GlobalCommand =
   | 'open-list'
   | 'help'
   | 'memorize'
-  | 'palette';
+  | 'palette'
+  /** Ctrl+R: the highlighted account's register, else the register list. */
+  | 'register'
+  /** Ctrl+G: the register of the other account of the highlighted register transaction. */
+  | 'transfer'
+  /** Ctrl+O: copy the highlighted register transaction (Ctrl+V pastes it on the blank line). */
+  | 'copy-transaction'
+  /** Ctrl+V on a register's blank line after Ctrl+O; anywhere else Ctrl+V pastes text. */
+  | 'paste-transaction'
+  /** Ctrl+U: use the list item — take the picker's highlighted entry, or "use" a list row. */
+  | 'use'
+  /** F2 / Ctrl+1: Product Information. */
+  | 'product-info'
+  /** F3 / Ctrl+2: Search. */
+  | 'search'
+  /** Ctrl+F4: close the open form, else the page (back to the window before it). */
+  | 'close-window'
+  /** Ctrl+Tab / Ctrl+F6, and with Shift the other way: the next / previous open window. */
+  | 'next-window'
+  | 'prev-window'
+  /** F5: refresh the window's data. */
+  | 'refresh'
+  /** ?: the keyboard shortcuts list. */
+  | 'shortcuts';
 
 export interface ShortcutDef {
   /** Human-readable combo for the help modal, e.g. 'Ctrl+I'. */
   keys: string;
-  /** Lowercase letter matched with ctrl/cmd held; absent for display-only rows. */
+  /** Lowercase letter (or digit) matched with ctrl/cmd held. */
   ctrlKey?: string;
   /** Named key matched with no modifier held (F1). */
   key?: string;
-  /** Destination for navigation shortcuts (components/AppShell.tsx GlobalShortcuts). */
+  /** Named key matched with ctrl/cmd held (Ctrl+F4, Ctrl+Tab). */
+  ctrlNamed?: string;
+  /** Named key matched with ctrl/cmd and Shift held (Ctrl+Shift+Tab). */
+  ctrlShiftNamed?: string;
+  /**
+   * Destination for navigation shortcuts (components/AppShell.tsx GlobalShortcuts). With a
+   * `command` too, the command decides from what is selected and falls back to the page.
+   */
   href?: string;
   /** Action for the other shortcuts. */
   command?: GlobalCommand;
@@ -343,7 +449,7 @@ export interface ShortcutDef {
   description: string;
 }
 
-/** QuickBooks Desktop's global keys. */
+/** QuickBooks Desktop's global keys (the full QuickBooks list, with sources: lib/qbShortcuts.ts). */
 export const GLOBAL_SHORTCUTS: ShortcutDef[] = [
   { keys: 'Ctrl+W', ctrlKey: 'w', href: '/expenses?new=1', description: 'Write Checks' },
   { keys: 'Ctrl+I', ctrlKey: 'i', href: '/invoices?new=1', description: 'Create Invoices' },
@@ -355,7 +461,13 @@ export const GLOBAL_SHORTCUTS: ShortcutDef[] = [
     inFields: false,
     description: 'Chart of Accounts (in a text field Ctrl+A still selects the text)',
   },
-  { keys: 'Ctrl+R', ctrlKey: 'r', href: '/registers', description: 'Use Register' },
+  {
+    keys: 'Ctrl+R',
+    ctrlKey: 'r',
+    href: '/registers',
+    command: 'register',
+    description: "Use Register: the highlighted account's register, else choose an account",
+  },
   { keys: 'Ctrl+T', ctrlKey: 't', href: '/recurring', description: 'Memorized Transaction List' },
   { keys: 'Ctrl+F', ctrlKey: 'f', href: '/find', description: 'Find transactions' },
   { keys: 'Ctrl+E', ctrlKey: 'e', command: 'edit', inFields: false, description: 'Edit the selected row of a list or register' },
@@ -378,9 +490,49 @@ export const GLOBAL_SHORTCUTS: ShortcutDef[] = [
   { keys: 'Ctrl+M', ctrlKey: 'm', command: 'memorize', description: 'Memorize the open transaction' },
   { keys: 'Ctrl+L', ctrlKey: 'l', command: 'open-list', description: 'Open the drop-down list of the field you are in' },
   { keys: 'Ctrl+K', ctrlKey: 'k', command: 'palette', description: 'Search & command palette' },
+  {
+    keys: 'Ctrl+G',
+    ctrlKey: 'g',
+    command: 'transfer',
+    inFields: false,
+    description: "In a register: go to the other account's register for the highlighted transaction",
+  },
+  {
+    keys: 'Ctrl+O',
+    ctrlKey: 'o',
+    command: 'copy-transaction',
+    inFields: false,
+    description: 'In a register: copy the highlighted transaction (Ctrl+V on the blank line pastes it)',
+  },
+  {
+    keys: 'Ctrl+V',
+    ctrlKey: 'v',
+    command: 'paste-transaction',
+    description: "In a register, after Ctrl+O: paste the transaction on the blank line (elsewhere it pastes text)",
+  },
+  { keys: 'Ctrl+U', ctrlKey: 'u', command: 'use', description: 'Use the highlighted list item' },
+  { keys: 'Ctrl+1', ctrlKey: '1', command: 'product-info', description: 'Product Information' },
+  { keys: 'Ctrl+2', ctrlKey: '2', command: 'search', description: 'Search' },
   { keys: 'F1', key: 'F1', command: 'help', description: 'Help for this page' },
-  { keys: '?', description: 'Show this shortcuts help' },
+  { keys: 'F2', key: 'F2', command: 'product-info', description: 'Product Information' },
+  { keys: 'F3', key: 'F3', command: 'search', description: 'Search' },
+  { keys: 'F5', key: 'F5', command: 'refresh', description: "Refresh the window's lists and totals" },
+  { keys: 'Ctrl+F4', ctrlNamed: 'F4', command: 'close-window', description: 'Close the open form or window' },
+  { keys: 'Ctrl+Tab', ctrlNamed: 'Tab', command: 'next-window', description: 'Next open window' },
+  { keys: 'Ctrl+F6', ctrlNamed: 'F6', command: 'next-window', description: 'Next open window' },
+  { keys: 'Ctrl+Shift+Tab', ctrlShiftNamed: 'Tab', command: 'prev-window', description: 'Previous open window' },
+  { keys: 'Ctrl+Shift+F6', ctrlShiftNamed: 'F6', command: 'prev-window', description: 'Previous open window' },
+  { keys: '?', command: 'shortcuts', inFields: false, description: 'Show this shortcuts help' },
 ];
+
+/** The a-z letter or 0-9 digit of a Ctrl+key press (physical key on other layouts: Ctrl+1 on AZERTY). */
+function ctrlCharOf(e: KeyLike): string | null {
+  const letter = letterOf(e);
+  if (letter) return letter;
+  if (/^[0-9]$/.test(e.key)) return e.key;
+  const m = /^Digit([0-9])$/.exec(e.code ?? '');
+  return m ? m[1] : null;
+}
 
 /**
  * The global shortcut a key press asks for, or null. `editable`: the key was typed in a text
@@ -388,13 +540,18 @@ export const GLOBAL_SHORTCUTS: ShortcutDef[] = [
  * physical key as a fallback so Ctrl+letter works on non-Latin keyboard layouts.
  */
 export function globalShortcutFor(e: KeyLike, editable: boolean): ShortcutDef | null {
-  if (e.altKey || e.shiftKey) return null;
+  if (e.altKey) return null;
   let def: ShortcutDef | undefined;
-  if (ctrlOrCmd(e)) {
-    const letter = letterOf(e);
-    if (!letter) return null;
-    def = GLOBAL_SHORTCUTS.find((s) => s.ctrlKey === letter);
-  } else {
+  if (ctrlOrCmd(e) && e.shiftKey) {
+    def = GLOBAL_SHORTCUTS.find((s) => s.ctrlShiftNamed && s.ctrlShiftNamed === e.key);
+  } else if (ctrlOrCmd(e)) {
+    if (e.key.length > 1) def = GLOBAL_SHORTCUTS.find((s) => s.ctrlNamed && s.ctrlNamed === e.key);
+    if (!def) {
+      const c = ctrlCharOf(e);
+      if (!c) return null;
+      def = GLOBAL_SHORTCUTS.find((s) => s.ctrlKey === c);
+    }
+  } else if (!e.shiftKey) {
     def = GLOBAL_SHORTCUTS.find((s) => s.key && s.key === e.key);
   }
   if (!def || (editable && def.inFields === false)) return null;
@@ -404,62 +561,35 @@ export function globalShortcutFor(e: KeyLike, editable: boolean): ShortcutDef | 
 /** Lowercase key for QB "Memorize Transaction" (Ctrl+M) — listened for by MemorizeButton. */
 export const MEMORIZE_SHORTCUT = 'm';
 
-/** Display-only rows for the help modal: QB date keys (live in any date field). */
-export const DATE_KEY_HELP: { keys: string; description: string }[] = [
-  { keys: '+ / -', description: 'Next / previous day' },
-  { keys: 'T', description: 'Today' },
-  { keys: 'W / K', description: 'First / last day of the week' },
-  { keys: 'M / H', description: 'First / last day of the month' },
-  { keys: 'Y / R', description: 'First / last day of the year' },
-  { keys: '[ / ]', description: 'Same day last / next week' },
-  { keys: "; / '", description: 'Same day last / next month' },
-];
-
-/** Display-only rows for the help modal: line-grid keys (every transaction form's lines). */
-export const GRID_KEY_HELP: { keys: string; description: string }[] = [
-  { keys: 'Tab / Shift+Tab', description: 'Next / previous cell' },
-  { keys: 'Enter / Down', description: 'Next line (adds one on the last line)' },
-  { keys: 'Up', description: 'Previous line' },
-  { keys: 'Ctrl+Insert', description: 'Insert a line' },
-  { keys: 'Ctrl+D / Ctrl+Delete', description: 'Delete the current line' },
-  { keys: 'Alt+Down / Ctrl+L', description: 'Open a picker list; arrows + Enter choose' },
-];
-
-/** Display-only rows for the help modal: lists, centers, registers and reports (useListKeys). */
-export const LIST_KEY_HELP: { keys: string; description: string }[] = [
-  { keys: 'Up / Down', description: 'Move the highlight' },
-  { keys: 'Home / End, Ctrl+PgUp / Ctrl+PgDn', description: 'First / last row' },
-  { keys: 'PgUp / PgDn', description: 'A page up / down' },
-  { keys: 'Type a name', description: 'Jump to the first row that starts with it' },
-  { keys: 'Enter', description: 'Open the highlighted row (QuickZoom on reports)' },
-  { keys: 'Ctrl+E / Ctrl+D', description: 'Edit / delete the highlighted row' },
-];
-
-/** Display-only rows for the help modal: amount-field QuickMath. */
-export const AMOUNT_KEY_HELP: { keys: string; description: string }[] = [
-  { keys: '+ - * / ( )', description: 'Type math in amount fields; Enter or Tab calculates' },
-];
-
-/** Display-only rows for the help modal: check / invoice / document number fields. */
-export const NUMBER_KEY_HELP: { keys: string; description: string }[] = [
-  { keys: '+ / -', description: 'Next / previous number (check no., invoice #, …)' },
-];
+/** Input types that hold a choice, not typed text (a checkbox's Ctrl+E is still Edit). */
+const NON_TEXT_INPUTS = new Set(['checkbox', 'radio', 'button', 'submit', 'reset', 'image', 'file', 'range', 'color']);
 
 /**
- * True when the keyboard event originates inside a text-editing control
- * (input/textarea/select or contentEditable) so global single-key shortcuts
- * must not fire.
+ * True when the keyboard event originates inside a control you type into (a text input,
+ * textarea, select or contentEditable), so global single-key shortcuts must not fire and keys
+ * like Ctrl+A / Ctrl+E stay with the field. Checkboxes, radios and buttons are not: the QB keys
+ * (Ctrl+E, Ctrl+Q, ?, …) work there as on the page.
  */
 export function isEditableTarget(target: EventTarget | null): boolean {
   if (!target || typeof (target as HTMLElement).tagName !== 'string') return false;
   const el = target as HTMLElement;
   const tag = el.tagName;
-  return (
-    tag === 'INPUT' ||
-    tag === 'TEXTAREA' ||
-    tag === 'SELECT' ||
-    el.isContentEditable === true
-  );
+  if (tag === 'INPUT') return !NON_TEXT_INPUTS.has(String((el as HTMLInputElement).type ?? 'text').toLowerCase());
+  return tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable === true;
+}
+
+/**
+ * True for any field that holds part of a form's work: what isEditableTarget covers plus
+ * checkboxes and radios (the bills ticked in Pay Bills, the payments in Make Deposits).
+ */
+export function isFormField(target: EventTarget | null): boolean {
+  if (!target || typeof (target as HTMLElement).tagName !== 'string') return false;
+  const el = target as HTMLElement;
+  if (el.tagName === 'INPUT') {
+    const type = String((el as HTMLInputElement).type ?? 'text').toLowerCase();
+    return type !== 'hidden' && type !== 'button' && type !== 'submit' && type !== 'reset' && type !== 'image';
+  }
+  return isEditableTarget(el);
 }
 
 // ---------------------------------------------------------------------------
@@ -467,42 +597,108 @@ export function isEditableTarget(target: EventTarget | null): boolean {
 // ---------------------------------------------------------------------------
 
 /**
- * Leaving the page now could drop typed work: a form dialog (with fields) is open, or the cursor
- * is in a field on the page (not a search box). `root` is the document (a stand-in in tests).
+ * Marks a page with answers that live only on screen until a last step saves them (the setup
+ * interview): `<div data-unsaved-work>`. Leaving or reloading asks first while it is there.
+ */
+export const UNSAVED_WORK_ATTR = 'data-unsaved-work';
+
+/**
+ * Leaving the page now could drop typed work: a form dialog (with fields) is open, a page says
+ * it holds unsaved answers (data-unsaved-work), or the cursor is in a field on the page (not a
+ * search box). `root` is the document (a stand-in in tests).
  */
 export function mightLoseWork(target: EventTarget | null, root: Pick<ParentNode, 'querySelectorAll'> = document): boolean {
   const dialogs = Array.from(root.querySelectorAll<HTMLElement>('[role="dialog"][data-modal]'));
   if (dialogs.some((d) => d.querySelector('input:not([type="hidden"]), select, textarea'))) return true;
+  if (root.querySelectorAll(`[${UNSAVED_WORK_ATTR}]`).length > 0) return true;
   const el = target as HTMLElement | null;
-  return isEditableTarget(el) && !!el?.closest?.('main') && (el as HTMLInputElement).type !== 'search';
+  return isFormField(el) && !!el?.closest?.('main') && (el as HTMLInputElement).type !== 'search';
 }
 
 /**
- * F5 (no modifiers): the desktop app's View > Reload. QuickBooks users press it to refresh a list
- * (QB's F5); here it reloads the whole window, so with typed work on screen the shell asks first.
+ * Whether leaving could lose work, judged from where the cursor is — or, when the command bar or
+ * the title-bar menu has taken the focus (they live outside the page), from the field the cursor
+ * was in just before (`remembered`, kept by components/LeaveGuard.tsx). So choosing a page from
+ * the command bar, or with the mouse from the menu bar, asks exactly when Ctrl+W from that field
+ * would.
+ */
+export function leaveRisk(
+  active: Element | null,
+  remembered: Element | null,
+  root: Pick<ParentNode, 'querySelectorAll'> = document,
+): boolean {
+  if (mightLoseWork(active, root)) return true;
+  const onPage = !!active?.closest?.('main, [role="dialog"]') && !active?.closest?.('[data-shell-chrome]');
+  if (onPage || !remembered) return false;
+  return (remembered as Element & { isConnected?: boolean }).isConnected !== false && mightLoseWork(remembered, root);
+}
+
+/**
+ * F5 (no modifiers): QB's "Refresh list". Here the window's data is fetched again
+ * (components/LeaveGuard.tsx); with typed work on screen it asks first.
  */
 export function isReloadKey(e: KeyLike): boolean {
   return e.key === 'F5' && !ctrlOrCmd(e) && !e.altKey && !e.shiftKey;
 }
 
 /**
- * Asks the app shell (components/AppShell.tsx GlobalShortcuts) to open a page: it asks "Leave
- * this form?" first when typed work could be lost, exactly like the QuickBooks keys (Ctrl+W, …).
+ * Asks the leave-this-form guard (components/LeaveGuard.tsx, on every page) to open a page: it
+ * asks "Leave this form?" first when typed work could be lost, exactly like the QuickBooks keys
+ * (Ctrl+W, …). detail: { href, go? } — `go` runs instead of a plain router push once leaving is
+ * decided (the command bar hands a pre-filled form over that way); or { history: 'back' | 'forward' }.
  */
 export const NAVIGATE_REQUEST_EVENT = 'ironbooks:navigate';
 
+export interface NavigateRequest {
+  href?: string;
+  history?: 'back' | 'forward';
+  go?: (href: string) => void;
+}
+
 /**
- * Open `href` the way the QuickBooks keys do — through the app shell's leave-this-form check —
- * for the desktop menus and the command bar. Falls back to `push` when no app shell is listening
- * (sign-in screens, which have no work to lose). Returns whether the shell took it.
+ * Open `href` the way the QuickBooks keys do — through the leave-this-form check — for the
+ * desktop menus, the command bar and the keys. Falls back to `push` when no guard is listening
+ * (only in tests: components/LeaveGuard.tsx is mounted on every page). Returns whether the guard
+ * took it.
  */
-export function navigateGuarded(href: string, push: (href: string) => void, target: EventTarget = window): boolean {
-  const ev = new CustomEvent(NAVIGATE_REQUEST_EVENT, { detail: { href }, cancelable: true });
+export function navigateGuarded(
+  href: string,
+  push: (href: string) => void,
+  target: EventTarget = window,
+  options: { go?: (href: string) => void } = {},
+): boolean {
+  const detail: NavigateRequest = { href, go: options.go };
+  const ev = new CustomEvent(NAVIGATE_REQUEST_EVENT, { detail, cancelable: true });
   target.dispatchEvent(ev);
   if (ev.defaultPrevented) return true;
-  push(href);
+  (options.go ?? push)(href);
   return false;
 }
+
+/** Window > Back / Forward (Alt+Left / Alt+Right) through the same check. */
+export function historyGuarded(direction: 'back' | 'forward', target: EventTarget = window): boolean {
+  const detail: NavigateRequest = { history: direction };
+  const ev = new CustomEvent(NAVIGATE_REQUEST_EVENT, { detail, cancelable: true });
+  target.dispatchEvent(ev);
+  if (ev.defaultPrevented) return true;
+  if (typeof window !== 'undefined') {
+    if (direction === 'back') window.history.back();
+    else window.history.forward();
+  }
+  return false;
+}
+
+/**
+ * F5 / View > Refresh: asks components/LeaveGuard.tsx to refresh the window (fetch its data
+ * again), asking first when typed work could be lost.
+ */
+export const REFRESH_REQUEST_EVENT = 'ironbooks:refresh-request';
+
+/**
+ * Sent once a refresh is decided. The page area (components/PageRefresh.tsx) starts the page
+ * over in place and marks the event handled; on screens without it the window reloads.
+ */
+export const PAGE_REFRESH_EVENT = 'ironbooks:refresh-page';
 
 // ---------------------------------------------------------------------------
 // Pure key classification (unit-tested; the DOM wiring lives in useGridKeys, useListKeys,
@@ -534,6 +730,41 @@ function letterOf(e: KeyLike): string | null {
 export function altLetter(e: KeyLike): string | null {
   if (!e.altKey || ctrlOrCmd(e) || e.shiftKey) return null;
   return letterOf(e);
+}
+
+/**
+ * QuickBooks Desktop's menu-bar letters: Alt+F File, Alt+E Edit, Alt+V View, Alt+L Lists,
+ * Alt+A Favorites, Alt+C Company, Alt+U Customers, Alt+O Vendors, Alt+Y Employees, Alt+B Banking,
+ * Alt+R Reports, Alt+W Window, Alt+H Help (lib/qbShortcuts.ts has the sources). In an open form
+ * the form's buttons keep their letters (Alt+S, Alt+A, Alt+R, Alt+P, Alt+N).
+ */
+export const MENU_MNEMONICS: Readonly<Record<string, string>> = {
+  File: 'f',
+  Edit: 'e',
+  View: 'v',
+  Lists: 'l',
+  Favorites: 'a',
+  Company: 'c',
+  Customers: 'u',
+  Vendors: 'o',
+  Employees: 'y',
+  Banking: 'b',
+  Reports: 'r',
+  Window: 'w',
+  Help: 'h',
+};
+
+/** The menu (index in `menus`) an Alt+letter press opens, or -1. */
+export function menuForKey(e: KeyLike, menus: readonly string[]): number {
+  const letter = altLetter(e);
+  return letter ? menus.findIndex((m) => MENU_MNEMONICS[m] === letter) : -1;
+}
+
+/** The menu a plain letter opens while the menu bar has the keyboard (after Alt alone), or -1. */
+export function menuForLetter(e: KeyLike, menus: readonly string[]): number {
+  if (e.altKey || ctrlOrCmd(e)) return -1;
+  const letter = letterOf(e);
+  return letter ? menus.findIndex((m) => MENU_MNEMONICS[m] === letter) : -1;
 }
 
 /** Form-level actions QuickBooks users expect on every list / form page. */
@@ -579,6 +810,38 @@ export function formShortcutFor(e: KeyLike): FormShortcutAction | null {
   if (letter) return FORM_ALT_KEYS[letter] ?? null;
   if (key === 'Escape' && !ctrlOrCmd(e) && !e.altKey && !e.shiftKey) return 'cancel';
   return null;
+}
+
+/** Where a plain Enter was pressed, as enterRecordsForm needs it. */
+export interface EnterContext {
+  tag: string;
+  /** input type. */
+  type?: string;
+  /** An open picker list (aria-expanded="true") takes Enter for itself. */
+  expanded?: boolean;
+  /** In a line grid (data-grid-row): Enter goes down a line there. */
+  inGrid?: boolean;
+  /** In a list / register (data-list): Enter opens the row, or records the register's blank line. */
+  inList?: boolean;
+  /** In a real <form>: the browser submits it. */
+  inNativeForm?: boolean;
+}
+
+/** Input types where Enter is not "record": choices, buttons, search boxes. */
+const ENTER_SKIP_TYPES = new Set(['checkbox', 'radio', 'button', 'submit', 'reset', 'file', 'image', 'search', 'range', 'color']);
+
+/**
+ * QuickBooks: Enter in a field of a transaction records it (the form's Save & Close) — unless
+ * "Pressing Enter moves between fields" is on (components/PreferenceBehaviors.tsx takes Enter
+ * first then). Not in text areas (a new line), line grids (the next line), lists and registers,
+ * open picker lists, search boxes, or a real <form> (which submits itself).
+ */
+export function enterRecordsForm(e: KeyLike, c: EnterContext): boolean {
+  if (e.key !== 'Enter' || ctrlOrCmd(e) || e.altKey || e.shiftKey) return false;
+  if (c.expanded || c.inGrid || c.inList || c.inNativeForm) return false;
+  const tag = c.tag.toUpperCase();
+  if (tag === 'SELECT') return true;
+  return tag === 'INPUT' && !ENTER_SKIP_TYPES.has((c.type || 'text').toLowerCase());
 }
 
 export interface FormShortcutEnv {
@@ -752,7 +1015,7 @@ export function isOpenListKey(e: KeyLike): boolean {
 }
 
 /** What a key does inside a line grid. 'next' on the last line adds a line. */
-export type GridKeyAction = 'insert' | 'remove' | 'next' | 'prev' | null;
+export type GridKeyAction = 'insert' | 'remove' | 'next' | 'prev' | 'copy-line' | 'paste-line' | null;
 
 /** The focused cell, as the grid key logic needs it. */
 export interface GridCell {
@@ -770,11 +1033,18 @@ const ARROW_SKIP_TYPES = new Set(['date', 'datetime-local', 'month', 'week', 'ti
 /**
  * Line-grid keys (QB ergonomics):
  *   Ctrl+Insert insert a line · Ctrl+Delete or Ctrl+D delete the line ·
+ *   Ctrl+Alt+Y copy the line · Ctrl+Alt+V paste it into a blank line (QB 2018 and later) ·
  *   Enter / Down next line (adds one on the last line) · Up previous line.
  * Tab / Shift+Tab are left to the browser (cell to cell across the row, then the next row).
  */
 export function gridKeyAction(e: KeyLike, cell: GridCell): GridKeyAction {
   const tag = cell.tag.toUpperCase();
+  if (ctrlOrCmd(e) && e.altKey && !e.shiftKey) {
+    const letter = letterOf(e);
+    if (letter === 'y') return 'copy-line';
+    if (letter === 'v') return 'paste-line';
+    return null;
+  }
   if (ctrlOrCmd(e) && !e.altKey && !e.shiftKey) {
     if (e.key === 'Insert') return 'insert';
     if (e.key === 'Delete' || e.key === 'd' || e.key === 'D' || e.code === 'KeyD') return 'remove';
@@ -806,19 +1076,6 @@ export function dateKeyForTextField(key: string, value: string, parse: (s: strin
   if (!iso) return null;
   return adjustDateForKey(key, iso);
 }
-
-/** Display-only rows for the help modal: form keys (components/FormShortcuts.tsx). */
-export const FORM_KEY_HELP: { keys: string; description: string }[] = [
-  { keys: 'Ctrl+N', description: 'New (on a list page: opens a new form)' },
-  { keys: 'Ctrl+S', description: 'Save the open form' },
-  { keys: 'Alt+S / Ctrl+Alt+S / Ctrl+Enter', description: 'Save & New' },
-  { keys: 'Alt+A', description: 'Save & Close' },
-  { keys: 'Alt+R', description: 'Revert a saved transaction / clear a new one' },
-  { keys: 'Alt+P / Alt+N', description: 'Previous / next saved transaction of the same kind' },
-  { keys: 'Esc', description: 'Close the dialog / cancel' },
-  { keys: 'Tab / Shift+Tab', description: 'Next / previous field' },
-  { keys: 'Alt+underlined letter', description: 'Press that button' },
-];
 
 // ---------------------------------------------------------------------------
 // useGridKeys: keyboard ergonomics for line-item grids
@@ -872,11 +1129,109 @@ function focusAfterRender(container: HTMLElement, rowSelector: string, rowIdx: n
   requestAnimationFrame(attempt);
 }
 
+/** One cell of a copied line (Ctrl+Alt+Y), by what kind of field it is. */
+export interface CopiedCell {
+  kind: 'text' | 'select' | 'check' | 'combo';
+  value: string;
+  checked?: boolean;
+}
+
+/** The copied line, for Ctrl+Alt+V (QB keeps one line on its clipboard, for this session). */
+let lineClipboard: CopiedCell[] | null = null;
+
+/** The value-holding cells of a grid row (buttons left out), in Tab order. */
+function lineFields(row: Element | undefined): HTMLElement[] {
+  return cellsOf(row).filter((el) => el.tagName !== 'BUTTON' && !(el as HTMLInputElement).readOnly);
+}
+
+function cellKind(el: HTMLElement): CopiedCell['kind'] {
+  if (el.tagName === 'SELECT') return 'select';
+  const type = ((el as HTMLInputElement).type || 'text').toLowerCase();
+  if (type === 'checkbox' || type === 'radio') return 'check';
+  return el.getAttribute('role') === 'combobox' ? 'combo' : 'text';
+}
+
+/** What Ctrl+Alt+Y copies from a line: each field's value (a picker's shown name). */
+export function copyLineCells(row: Element): CopiedCell[] {
+  return lineFields(row).map((el) => {
+    const kind = cellKind(el);
+    const input = el as HTMLInputElement;
+    return kind === 'check' ? { kind, value: input.value, checked: input.checked } : { kind, value: input.value };
+  });
+}
+
+/** A line with nothing typed in it yet (selects and checkboxes keep their defaults on a new line). */
+export function isBlankLine(cells: CopiedCell[]): boolean {
+  return cells.every((c) => c.kind === 'select' || c.kind === 'check' || c.value.trim() === '');
+}
+
+export function setLineClipboard(cells: CopiedCell[] | null) {
+  lineClipboard = cells;
+}
+export function getLineClipboard(): CopiedCell[] | null {
+  return lineClipboard;
+}
+
+const nextFrame = () => new Promise<void>((r) => (typeof requestAnimationFrame === 'function' ? requestAnimationFrame(() => r()) : setTimeout(r, 0)));
+
+function setFieldValue(el: HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement, value: string) {
+  const proto = el.tagName === 'SELECT' ? HTMLSelectElement.prototype : el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+  const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+  if (setter) setter.call(el, value);
+  else el.value = value;
+  el.dispatchEvent(new Event(el.tagName === 'SELECT' ? 'change' : 'input', { bubbles: true }));
+}
+
+/**
+ * Ctrl+Alt+V: fill a line's fields from the copied line, in order, the way typing would — so a
+ * picked item still fills its rate and description first, and the copied ones then win. Pickers
+ * (comboboxes) get the shown name typed and are left, which chooses the entry by its exact name.
+ * Returns how many fields were filled.
+ */
+export async function pasteLineCells(row: Element, cells: CopiedCell[]): Promise<number> {
+  let filled = 0;
+  for (let i = 0; i < cells.length; i++) {
+    const el = lineFields(row)[i] as HTMLInputElement | undefined;
+    const c = cells[i];
+    if (!el || cellKind(el) !== c.kind) continue;
+    if (c.kind === 'check') {
+      if (el.checked !== Boolean(c.checked)) el.click();
+    } else if (c.kind === 'combo') {
+      el.focus();
+      setFieldValue(el, c.value);
+      await nextFrame();
+      el.blur();
+    } else {
+      setFieldValue(el, c.value);
+    }
+    filled++;
+    await nextFrame();
+  }
+  return filled;
+}
+
+/** Run `fn` on row `rowIdx` once the grid has re-rendered with a different number of rows. */
+function afterRowsChange(container: HTMLElement, rowSelector: string, fromCount: number, rowIdx: number, fn: (row: HTMLElement) => void) {
+  let tries = 0;
+  const attempt = () => {
+    const rows = Array.from(container.querySelectorAll<HTMLElement>(rowSelector));
+    if (rows.length !== fromCount && rows.length > 0) {
+      fn(rows[Math.min(rowIdx, rows.length - 1)]);
+      return;
+    }
+    if (++tries < 10) requestAnimationFrame(attempt);
+  };
+  requestAnimationFrame(attempt);
+}
+
 /**
  * Keyboard handling for line-item grids (QB ergonomics):
  *
  *   Ctrl+Insert          insert a line (above the current one when `insertRow` is given)
  *   Ctrl+Delete / Ctrl+D delete the line containing the focused cell
+ *   Ctrl+Alt+Y           copy the line (QB 2018+)
+ *   Ctrl+Alt+V           paste the copied line into this line when it is blank, else into a new
+ *                        blank line above it (below the last one when the grid can only append)
  *   Enter / Down         same cell on the next line; on the last line adds a line and moves there
  *   Up                   same cell on the previous line
  *   Tab / Shift+Tab      browser default: across the cells of a row, then on to the next row
@@ -938,6 +1293,26 @@ export function useGridKeys(options: GridKeysOptions): {
         return;
       }
       if (rowIdx < 0) return;
+      if (action === 'copy-line') {
+        e.preventDefault();
+        setLineClipboard(copyLineCells(rows[rowIdx]));
+        return;
+      }
+      if (action === 'paste-line') {
+        const copied = getLineClipboard();
+        if (!copied) return;
+        e.preventDefault();
+        if (isBlankLine(copyLineCells(rows[rowIdx]))) {
+          void pasteLineCells(rows[rowIdx], copied).then(() => focusCell(cellsOf(rows[rowIdx])[0]));
+        } else if (insertRowRef.current) {
+          insertRowRef.current(rowIdx);
+          afterRowsChange(container, rowSelector, rows.length, rowIdx, (row) => void pasteLineCells(row, copied).then(() => focusCell(cellsOf(row)[0])));
+        } else {
+          addRowRef.current();
+          afterRowsChange(container, rowSelector, rows.length, rows.length, (row) => void pasteLineCells(row, copied).then(() => focusCell(cellsOf(row)[0])));
+        }
+        return;
+      }
       if (action === 'remove') {
         e.preventDefault();
         removeRowRef.current(rowIdx);
@@ -993,6 +1368,65 @@ export function listKeyAction(e: KeyLike): ListKeyAction | null {
   if (e.altKey || e.shiftKey) return null;
   if (ctrlOrCmd(e)) return e.key === 'PageUp' ? 'home' : e.key === 'PageDown' ? 'end' : null;
   return LIST_KEYS[e.key] ?? null;
+}
+
+/** Ctrl+PgUp / Ctrl+PgDn (no other modifier): -1 / 1, else null. */
+export function monthKeyDirection(e: KeyLike): -1 | 1 | null {
+  if (!ctrlOrCmd(e) || e.altKey || e.shiftKey) return null;
+  return e.key === 'PageUp' ? -1 : e.key === 'PageDown' ? 1 : null;
+}
+
+/**
+ * QuickBooks' Ctrl+PgUp / Ctrl+PgDn in a register: the previous / next month. `dates` are the
+ * rows' dates (YYYY-MM-DD, oldest first, as a register lists them); `current` the highlighted row
+ * (-1: none — Ctrl+PgUp then starts from the newest, Ctrl+PgDn from the oldest). Returns the
+ * first row of the month before / after the highlighted row's month — when that month has no
+ * transactions, the nearest one in that direction — or the first / last row at either end.
+ */
+export function registerMonthIndex(dates: readonly string[], current: number, dir: -1 | 1): number {
+  const n = dates.length;
+  if (n === 0) return -1;
+  if (current < 0 || current >= n) return dir === -1 ? n - 1 : 0;
+  const monthOf = (d: string) => d.slice(0, 7);
+  const cur = monthOf(dates[current]);
+  if (dir === 1) {
+    for (let i = current + 1; i < n; i++) if (monthOf(dates[i]) > cur) return i;
+    return n - 1;
+  }
+  // The latest earlier month that has rows, then its first row.
+  let target: string | null = null;
+  for (let i = current - 1; i >= 0; i--) {
+    if (monthOf(dates[i]) < cur) {
+      target = monthOf(dates[i]);
+      break;
+    }
+  }
+  if (target === null) return 0;
+  return dates.findIndex((d) => monthOf(d) === target);
+}
+
+/**
+ * Left / Right (no modifiers) in a list or report: scroll a column to the left / right, as in
+ * QuickBooks' wide reports. Null for every other key.
+ */
+export function listScrollKey(e: KeyLike): 'left' | 'right' | null {
+  if (e.altKey || e.shiftKey || ctrlOrCmd(e)) return null;
+  return e.key === 'ArrowLeft' ? 'left' : e.key === 'ArrowRight' ? 'right' : null;
+}
+
+/**
+ * Where a column scroll lands: the next column edge right of `scrollLeft` (or left of it), given
+ * the columns' left edges in scroll coordinates, kept within 0..maxScroll. Null when there is
+ * nowhere to go (already at that end), so the key is left alone.
+ */
+export function nextColumnScroll(edges: readonly number[], scrollLeft: number, maxScroll: number, dir: 'left' | 'right'): number | null {
+  if (maxScroll <= 0) return null;
+  const sorted = [...new Set(edges.map((x) => Math.max(0, Math.round(x))))].sort((a, b) => a - b);
+  let to: number | undefined;
+  if (dir === 'right') to = sorted.find((x) => x > scrollLeft + 1) ?? maxScroll;
+  else to = [...sorted].reverse().find((x) => x < scrollLeft - 1) ?? 0;
+  const clamped = Math.min(maxScroll, Math.max(0, to));
+  return Math.abs(clamped - scrollLeft) < 1 ? null : clamped;
 }
 
 /**
@@ -1147,6 +1581,34 @@ function rowLabels(row: HTMLElement): string[] {
     .map((c) => c.textContent ?? '');
 }
 
+/** The element that scrolls a list sideways: the list itself, a wrapper inside it, or one around it. */
+function sidewaysScroller(container: HTMLElement): HTMLElement | null {
+  const scrolls = (el: HTMLElement) => {
+    if (el.scrollWidth <= el.clientWidth + 1) return false;
+    const o = getComputedStyle(el).overflowX;
+    return o === 'auto' || o === 'scroll';
+  };
+  if (scrolls(container)) return container;
+  const table = container.querySelector('table');
+  for (let el = table?.parentElement ?? null; el && el !== container; el = el.parentElement) if (scrolls(el)) return el;
+  for (let el = container.parentElement; el && el !== document.body; el = el.parentElement) if (scrolls(el)) return el;
+  return null;
+}
+
+/** Left / Right: scroll the list's table a column sideways. True when it scrolled. */
+function scrollListColumn(container: HTMLElement, dir: 'left' | 'right'): boolean {
+  const scroller = sidewaysScroller(container);
+  if (!scroller) return false;
+  const table = container.querySelector('table');
+  const row = table?.querySelector('thead tr') ?? table?.querySelector('tbody tr');
+  const base = scroller.getBoundingClientRect().left - scroller.scrollLeft;
+  const edges = Array.from((row as HTMLTableRowElement | null)?.cells ?? []).map((c) => c.getBoundingClientRect().left - base);
+  const to = nextColumnScroll(edges, scroller.scrollLeft, scroller.scrollWidth - scroller.clientWidth, dir);
+  if (to === null) return false;
+  scroller.scrollLeft = to;
+  return true;
+}
+
 /** Rows per PgUp / PgDn: what fits in the list's own scroll area, else in the window. */
 function pageSizeOf(container: HTMLElement, rows: HTMLElement[]): number {
   const rowHeight = rows[0]?.getBoundingClientRect().height || 32;
@@ -1249,6 +1711,15 @@ export function quickReportHref(kind: QuickReportKind, id: string): string {
   return `/reports/std/transaction-detail-by-account?dates=all&${QUICK_REPORT_PARAM[kind]}=${encodeURIComponent(id)}`;
 }
 
+/**
+ * QB Ctrl+R / Ctrl+U ("Use Account") on the Chart of Accounts: a balance-sheet account opens its
+ * register; an income or expense account — which has no register in QuickBooks — its QuickReport.
+ * Rows carry it as data-register.
+ */
+export function accountRegisterHref(id: string, type: string): string {
+  return ['asset', 'liability', 'equity'].includes(type) ? `/registers/${encodeURIComponent(id)}` : quickReportHref('account', id);
+}
+
 export interface ListKeysOptions<T extends HTMLElement> {
   /** The container's ref, when the page already holds one (e.g. to scroll it). */
   ref?: React.RefObject<T | null>;
@@ -1271,6 +1742,7 @@ export interface ListKeysProps<T extends HTMLElement> {
  *
  *   Up / Down       move the highlighted row        Home / End   first / last row
  *   PgUp / PgDn     a page at a time                Enter        open the row (openListRow)
+ *   Left / Right    a wide report or list scrolls a column sideways
  *   typing a name   jump to the first row that starts with it (QB type-ahead)
  *   click           highlights the row
  *
@@ -1305,6 +1777,14 @@ export function useListKeys<T extends HTMLElement = HTMLDivElement>(options: Lis
       if (!rows.length) return;
       const active = activeListRow(container);
       const current = active ? rows.indexOf(active) : -1;
+      // A register (rows dated with data-row-date): Ctrl+PgUp / Ctrl+PgDn go a month back / on.
+      const month = monthKeyDirection(e);
+      const dates = month ? rows.map((r) => r.getAttribute('data-row-date') ?? '') : [];
+      if (month && dates.every((d) => /^\d{4}-\d{2}-\d{2}/.test(d))) {
+        e.preventDefault();
+        setActiveListRow(container, rows[registerMonthIndex(dates, current, month)]);
+        return;
+      }
       const action = listKeyAction(e);
       if (action === 'open') {
         if (current >= 0 && openListRow(rows[current], 'open')) e.preventDefault();
@@ -1313,6 +1793,11 @@ export function useListKeys<T extends HTMLElement = HTMLDivElement>(options: Lis
       if (action) {
         e.preventDefault();
         setActiveListRow(container, rows[nextListIndex(action, current, rows.length, pageSizeOf(container, rows))]);
+        return;
+      }
+      const sideways = listScrollKey(e);
+      if (sideways) {
+        if (scrollListColumn(container, sideways)) e.preventDefault();
         return;
       }
       const now = Date.now();

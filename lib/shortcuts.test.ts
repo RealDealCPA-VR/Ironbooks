@@ -188,21 +188,36 @@ describe('GLOBAL_SHORTCUTS table', () => {
     });
   });
 
-  it('maps the QB command keys (no navigation) to their commands', () => {
-    const byKey = Object.fromEntries(
-      GLOBAL_SHORTCUTS.filter((s) => s.command).map((s) => [s.ctrlKey ?? s.key, s.command]),
-    );
+  it('maps the QB command keys to their commands', () => {
+    const byKey = Object.fromEntries(GLOBAL_SHORTCUTS.filter((s) => s.command).map((s) => [s.keys, s.command]));
     expect(byKey).toEqual({
-      e: 'edit',
-      d: 'delete',
-      p: 'print',
-      y: 'journal',
-      h: 'history',
-      q: 'quick-report',
-      m: 'memorize',
-      l: 'open-list',
-      k: 'palette',
+      'Ctrl+E': 'edit',
+      'Ctrl+D': 'delete',
+      'Ctrl+P': 'print',
+      'Ctrl+Y': 'journal',
+      'Ctrl+H': 'history',
+      'Ctrl+Q': 'quick-report',
+      'Ctrl+M': 'memorize',
+      'Ctrl+L': 'open-list',
+      'Ctrl+K': 'palette',
+      // Ctrl+R opens the highlighted account's register, else the list of registers (its href).
+      'Ctrl+R': 'register',
+      'Ctrl+G': 'transfer',
+      'Ctrl+O': 'copy-transaction',
+      'Ctrl+V': 'paste-transaction',
+      'Ctrl+U': 'use',
+      'Ctrl+1': 'product-info',
+      'Ctrl+2': 'search',
       F1: 'help',
+      F2: 'product-info',
+      F3: 'search',
+      F5: 'refresh',
+      'Ctrl+F4': 'close-window',
+      'Ctrl+Tab': 'next-window',
+      'Ctrl+F6': 'next-window',
+      'Ctrl+Shift+Tab': 'prev-window',
+      'Ctrl+Shift+F6': 'prev-window',
+      '?': 'shortcuts',
     });
   });
 

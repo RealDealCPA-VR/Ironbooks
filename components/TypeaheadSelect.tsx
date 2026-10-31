@@ -13,20 +13,25 @@
  * Leaving the field with typed text keeps an exact match (a full name or an account number),
  * clears the choice when the text was erased, and otherwise puts the chosen entry's label back
  * (rules in resolveTypedChoice, lib/typeahead.ts).
+ *
+ * With `onUnknown` (QuickBooks Quick Add on a form's name field): leaving the field with text that
+ * names nothing in the list calls onUnknown(text) instead, so the form can offer to add the name.
  */
 import * as React from 'react';
 import { Typeahead, type TypeaheadProps } from '@/components/Typeahead';
-import { type TypeaheadChoice, choicesToOptions, labelForId, resolveTypedChoice } from '@/lib/typeahead';
+import { type TypeaheadChoice, choiceForTypedText, choicesToOptions, labelForId, resolveTypedChoice } from '@/lib/typeahead';
 
 export interface TypeaheadSelectProps extends Omit<TypeaheadProps, 'value' | 'onChange' | 'options' | 'onPick' | 'allowFreeText'> {
   /** Chosen id ('' = none). */
   value: string;
   onChange: (id: string) => void;
   choices: TypeaheadChoice[];
+  /** The typed text matches no entry (QuickBooks Quick Add): offer to add it. */
+  onUnknown?: (text: string) => void;
 }
 
 export const TypeaheadSelect = React.forwardRef<HTMLInputElement, TypeaheadSelectProps>(function TypeaheadSelect(
-  { value, onChange, choices, onFocus, onBlur, ...rest },
+  { value, onChange, choices, onUnknown, onFocus, onBlur, ...rest },
   ref,
 ) {
   const options = React.useMemo(() => choicesToOptions(choices), [choices]);
@@ -67,6 +72,12 @@ export const TypeaheadSelect = React.forwardRef<HTMLInputElement, TypeaheadSelec
         focused.current = false;
         if (dirty.current) {
           dirty.current = false;
+          if (onUnknown && text.trim() && choiceForTypedText(choices, text, value) === null) {
+            setText(label);
+            onUnknown(text.trim());
+            onBlur?.(e);
+            return;
+          }
           const id = resolveTypedChoice(choices, text, value);
           setText(labelForId(choices, id));
           if (id !== value) onChange(id);

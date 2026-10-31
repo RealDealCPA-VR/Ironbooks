@@ -39,11 +39,11 @@ const links = (groups: typeof navGroups) => groups.flatMap((g) => g.links);
 const NONE = new Set<string>();
 
 describe('Simple mode menu', () => {
-  it('is the default for new users and lives in My Preferences (General)', () => {
-    expect(DEFAULT_MY_PREFERENCES.navMode).toBe('simple');
-    expect(resolveMyPreferences({}).navMode).toBe('simple');
-    expect(resolveMyPreferences({ navMode: 'advanced' }).navMode).toBe('advanced');
-    expect(resolveMyPreferences({ navMode: 'weird' }).navMode).toBe('simple');
+  it('is a choice in My Preferences (General); new users start with every menu, as in QuickBooks', () => {
+    expect(DEFAULT_MY_PREFERENCES.navMode).toBe('advanced');
+    expect(resolveMyPreferences({}).navMode).toBe('advanced');
+    expect(resolveMyPreferences({ navMode: 'simple' }).navMode).toBe('simple');
+    expect(resolveMyPreferences({ navMode: 'weird' }).navMode).toBe('advanced');
     expect(PREFERENCE_CATEGORIES.find((c) => c.id === 'general')!.my).toContain('navMode');
     expect(myPreferencesSchema.safeParse({ navMode: 'advanced' }).success).toBe(true);
     expect(myPreferencesSchema.safeParse({ navMode: 'expert' }).success).toBe(false);

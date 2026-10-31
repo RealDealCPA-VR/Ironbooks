@@ -10,6 +10,9 @@
  *  - Account: find-as-you-type over the chart of accounts. Typing a name that isn't there (or
  *    the + button) opens Add Account and puts the new account on the row.
  *  - Picking a payee with history fills the account (vendor default → last used → learned model).
+ *  - QuickBooks' Ctrl+O / Ctrl+V: a transaction copied from the register (Ctrl+O) is pasted on
+ *    this line by Ctrl+V while it is blank (marked data-blank): payee, account, memo and amount,
+ *    with this line's date and the next number, ready to record with Enter.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Plus } from 'lucide-react';
@@ -37,6 +40,7 @@ import {
   type RegisterEntryKind,
   type RegisterSide,
 } from '@/lib/registerEntryPlan';
+import { PASTE_TRANSACTION_EVENT, type CopiedTransaction } from '@/lib/keyboardTargets';
 
 export interface RegisterEntryAccount {
   id: string;
@@ -129,6 +133,28 @@ export function RegisterEntryRow({
   }, []);
 
   const blocked = registerEntryBlockedReason(register);
+  const blank = !number.trim() && !payee.trim() && !accountText.trim() && !memo.trim() && !amounts.increase.trim() && !amounts.decrease.trim();
+
+  // Ctrl+V after Ctrl+O (components/KeyboardCommands.tsx): the copied transaction on this line.
+  const pasteRef = useRef<(t: CopiedTransaction) => void>(() => {});
+  pasteRef.current = (t: CopiedTransaction) => {
+    setPickedBoth(null);
+    setPayeeBoth(t.payee);
+    const known = accountChoices.some((c) => c.id === t.accountId);
+    setAccountBoth(t.accountId, known ? labelForId(accountChoices, t.accountId) : t.accountLabel);
+    setMemo(t.memo);
+    setAmounts(t.side === 'increase' ? { increase: t.amount, decrease: '' } : { increase: '', decrease: t.amount });
+    setNote('Pasted from the copied transaction. Check the date, then press Enter to record it.');
+    setTimeout(() => dateRef.current?.focus(), 0);
+  };
+  useEffect(() => {
+    function onPaste(e: Event) {
+      const t = (e as CustomEvent<CopiedTransaction>).detail;
+      if (t) pasteRef.current(t);
+    }
+    window.addEventListener(PASTE_TRANSACTION_EVENT, onPaste);
+    return () => window.removeEventListener(PASTE_TRANSACTION_EVENT, onPaste);
+  }, []);
 
   // ---- Choices -----------------------------------------------------------------------------
   const accountChoices: TypeaheadChoice[] = useMemo(
@@ -312,6 +338,7 @@ export function RegisterEntryRow({
     <>
       <tr
         data-register-entry
+        data-blank={blank ? '' : undefined}
         className="bg-electric/5 border-t-2 border-electric/20"
         onKeyDown={(e) => {
           const t = e.target as HTMLElement;

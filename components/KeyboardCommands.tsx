@@ -16,7 +16,17 @@
  *            (data-source-ref="invoice:<id>", looked up via /api/journal-entries/for-source)
  *   Ctrl+Q   QuickReport of the selected customer / vendor / employee / account (data-quick-report)
  *   Ctrl+L   open the list of the focused <select> (<Typeahead> pickers handle it themselves)
- *   F1       help for this page (the "What is this page?" bubble), else Help in a new window
+ *   Ctrl+U   use the list item: in an open list, take the highlighted entry; on a list row, use it
+ *            (data-use-prefill: a new form for the customer / vendor / item; data-use-href: an
+ *            account's register, a memorized transaction entered; or the row's data-shortcut="use")
+ *   Ctrl+G   in a register: the register of the selected transaction's other account
+ *            (data-transfer-href), at that transaction
+ *   Ctrl+O   in a register: copy the selected transaction (data-copy-transaction); Ctrl+V on the
+ *            blank line (or on the register) pastes it there, ready to record with Enter
+ *
+ * F1 / ? are components/ShortcutsHelp.tsx, F2 / Ctrl+1 components/ProductInfo.tsx, F3 / Ctrl+2 and
+ * Ctrl+K components/CommandPalette.tsx, the window keys components/WindowList.tsx, F5
+ * components/LeaveGuard.tsx, Ctrl+M components/MemorizeButton.tsx.
  *
  * The selected row is the highlighted row (useListKeys) of the list that has focus, or of the
  * page's first list while nothing has focus. With nothing focused, the list keys themselves —
@@ -26,57 +36,31 @@
 import * as React from 'react';
 import { usePathname, useRouter } from 'next/navigation';
 import EntryDetailModal from '@/components/EntryDetailModal';
-import { openDialog } from '@/components/FormShortcuts';
 import { SHOW_JOURNAL_EVENT } from '@/components/TransactionNav';
 import { toast } from '@/components/ui';
 import {
-  activeListRow,
   commandButton,
   globalShortcutFor,
   isEditableTarget,
   listKeyAction,
-  listRows,
+  listScrollKey,
+  navigateGuarded,
   openListRow,
   typeAheadChar,
 } from '@/lib/shortcuts';
-
-/** Focus is on the page itself (nothing focused), not on a control. */
-function onPage(target: HTMLElement | null): boolean {
-  return !target || target === document.body || target === document.documentElement || target.tagName === 'MAIN';
-}
-
-/** The page's first list that has rows (outside dialogs). */
-function firstList(): HTMLElement | null {
-  const main = document.querySelector('main') ?? document.body;
-  return (
-    Array.from(main.querySelectorAll<HTMLElement>('[data-list]')).find(
-      (l) => !l.closest('[role="dialog"]') && listRows(l).length > 0,
-    ) ?? null
-  );
-}
-
-/** The list a command acts on: the one holding focus, else (nothing focused, no dialog) the page's first. */
-function currentList(target: HTMLElement | null, dialog: HTMLElement | null): HTMLElement | null {
-  const own = target?.closest?.('[data-list]') as HTMLElement | null;
-  // A dialog drawn inside a list (a report's QuickZoom window) is not part of that list.
-  const box = target?.closest?.('[role="dialog"]');
-  if (own && (!box || box.contains(own))) return own;
-  return !dialog && onPage(target) ? firstList() : null;
-}
-
-/** The selected row: the row holding focus (a button in it), else the list's highlighted row. */
-function selectedRow(target: HTMLElement | null, dialog: HTMLElement | null): HTMLElement | null {
-  const list = currentList(target, dialog);
-  if (!list) return null;
-  const own = target?.closest?.('tr') as HTMLElement | null;
-  if (own && listRows(list).includes(own)) return own;
-  return activeListRow(list);
-}
-
-/** The open form: the top dialog, else the form / data-shortcut-scope holding focus. */
-function formScope(target: HTMLElement | null, dialog: HTMLElement | null): HTMLElement | null {
-  return dialog ?? (target?.closest?.('form, [data-shortcut-scope]') as HTMLElement | null);
-}
+import {
+  PASTE_TRANSACTION_EVENT,
+  firstList,
+  formScope,
+  getCopiedTransaction,
+  onPageBody,
+  openDialog,
+  parseCopiedTransaction,
+  pasteTransactionTarget,
+  selectedRow,
+  setCopiedTransaction,
+} from '@/lib/keyboardTargets';
+import { PREFILL_EVENT, PREFILL_PATHS, formPrefillSchema, stashPrefill } from '@/lib/commands/prefill';
 
 /** Buttons on a line of the form's grid or a row of a list in it act on that line, not the form. */
 const onLineOrRow = (el: HTMLElement) => !!el.closest('[data-grid-row], [data-list] tbody tr');
@@ -116,8 +100,8 @@ async function entryForSource(ref: string): Promise<string | null> {
  * to the page's first list, focusing it, the way a QB center's list has focus when it opens.
  */
 function forwardToList(e: KeyboardEvent, target: HTMLElement | null, dialog: HTMLElement | null) {
-  if (dialog || !onPage(target)) return;
-  if (!listKeyAction(e) && typeAheadChar(e, '') === null) return;
+  if (dialog || !onPageBody(target)) return;
+  if (!listKeyAction(e) && !listScrollKey(e) && typeAheadChar(e, '') === null) return;
   const list = firstList();
   if (!list) return;
   e.preventDefault();
@@ -135,6 +119,38 @@ function forwardToList(e: KeyboardEvent, target: HTMLElement | null, dialog: HTM
       cancelable: true,
     }),
   );
+}
+
+/**
+ * Ctrl+U on a list row: a new form for the row (data-use-prefill, through the command bar's
+ * prefill hand-off), a page (data-use-href), or the row's own "use" button. True when it acted.
+ */
+export function useListRow(row: HTMLElement, go: (href: string) => void): boolean {
+  const prefillRaw = row.getAttribute('data-use-prefill');
+  if (prefillRaw) {
+    try {
+      const prefill = formPrefillSchema.parse(JSON.parse(prefillRaw));
+      if (stashPrefill(window.sessionStorage, prefill)) {
+        go(PREFILL_PATHS[prefill.kind]);
+        // A page that is already open picks the prefill up from this event.
+        window.setTimeout(() => window.dispatchEvent(new Event(PREFILL_EVENT)), 0);
+        return true;
+      }
+    } catch {
+      /* a malformed row: fall through to its other uses */
+    }
+  }
+  const href = row.getAttribute('data-use-href') || row.getAttribute('data-register');
+  if (href) {
+    go(href);
+    return true;
+  }
+  const btn = row.querySelector<HTMLElement>('[data-shortcut="use"]:not([disabled])');
+  if (btn) {
+    btn.click();
+    return true;
+  }
+  return false;
 }
 
 export default function KeyboardCommands() {
@@ -157,6 +173,7 @@ export default function KeyboardCommands() {
   }, []);
 
   React.useEffect(() => {
+    const go = (href: string) => navigateGuarded(href, (h) => router.push(h));
     function onKeyDown(e: KeyboardEvent) {
       if (e.defaultPrevented || e.isComposing) return;
       const target = e.target as HTMLElement | null;
@@ -219,7 +236,7 @@ export default function KeyboardCommands() {
           const href = selectedRow(target, dialog)?.getAttribute('data-quick-report');
           if (href) {
             e.preventDefault();
-            router.push(href);
+            go(href);
           }
           return;
         }
@@ -235,16 +252,56 @@ export default function KeyboardCommands() {
           }
           return;
         }
-        case 'help': {
+        case 'use': {
+          // An open picker list: take its highlighted entry (as Enter does).
+          if (target?.getAttribute('aria-expanded') === 'true') {
+            e.preventDefault();
+            target.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true, cancelable: true }));
+            return;
+          }
+          const row = editable ? null : selectedRow(target, dialog);
+          if (row && useListRow(row, go)) e.preventDefault();
+          return;
+        }
+        case 'transfer': {
+          const row = selectedRow(target, dialog);
+          if (!row) return;
+          const href = row.getAttribute('data-transfer-href');
           e.preventDefault();
-          const pageHelp = dialog ? null : document.querySelector<HTMLElement>('[data-page-help] button');
-          if (pageHelp) pageHelp.click();
-          // A new window, so an open form is never left behind.
-          else window.open('/help', '_blank', 'noopener');
+          if (href) go(href);
+          else if (row.hasAttribute('data-split'))
+            toast('This transaction uses several accounts (-split-). Open it (Enter) to see each account.', 'info');
+          else toast('This transaction has no other account to go to.', 'info');
+          return;
+        }
+        case 'copy-transaction': {
+          const row = selectedRow(target, dialog);
+          if (!row || !row.closest('[data-list]')?.querySelector('[data-register-entry]')) return;
+          e.preventDefault();
+          const copied = parseCopiedTransaction(row.getAttribute('data-copy-transaction'));
+          if (!copied) {
+            toast(
+              row.hasAttribute('data-split')
+                ? 'A transaction with several accounts (-split-) cannot be copied to the blank line. Open it and use Memorize (Ctrl+M) to repeat it.'
+                : 'This transaction cannot be copied.',
+              'info',
+            );
+            return;
+          }
+          setCopiedTransaction(copied);
+          toast('Transaction copied. Press Ctrl+V on the blank line at the bottom to paste it.', 'success');
+          return;
+        }
+        case 'paste-transaction': {
+          const copied = getCopiedTransaction();
+          const line = copied ? pasteTransactionTarget(target) : null;
+          if (!copied || !line) return; // Ctrl+V pastes text as usual
+          e.preventDefault();
+          window.dispatchEvent(new CustomEvent(PASTE_TRANSACTION_EVENT, { detail: copied }));
           return;
         }
         default:
-          return; // memorize / palette: MemorizeButton and CommandPalette listen themselves
+          return; // the other commands have their own components (see the header comment)
       }
     }
     window.addEventListener('keydown', onKeyDown);

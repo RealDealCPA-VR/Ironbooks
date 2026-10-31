@@ -34,6 +34,7 @@ import {
   Th,
   Tr,
   toast, toastError,
+  DocNumberInput,
 } from '@/components/ui';
 import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
@@ -713,7 +714,7 @@ export default function PayBillsPage() {
           </div>
           <div className="lg:col-span-2">
             <Label htmlFor="pb-ref">Reference / Check #</Label>
-            <Input
+            <DocNumberInput
               id="pb-ref"
               placeholder={method === 'check' && toPrint ? 'assigned when printed' : 'e.g. 1042'}
               value={method === 'check' && toPrint ? '' : reference}
@@ -1054,7 +1055,7 @@ export default function PayBillsPage() {
               </div>
               <div>
                 <Label htmlFor="ep-ref">Check # / Ref</Label>
-                <Input id="ep-ref" value={editPay.toPrint ? '' : editRef} disabled={editPay.toPrint} placeholder={editPay.toPrint ? 'assigned when printed' : ''} onChange={(e) => setEditRef(e.target.value)} />
+                <DocNumberInput id="ep-ref" value={editPay.toPrint ? '' : editRef} disabled={editPay.toPrint} placeholder={editPay.toPrint ? 'assigned when printed' : ''} onChange={(e) => setEditRef(e.target.value)} />
               </div>
             </div>
             <div>

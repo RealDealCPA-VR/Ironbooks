@@ -28,7 +28,7 @@ import { filterActions, canOpenHref, type PermissionMap } from '@/lib/commands/a
 import { PREFILL_EVENT, stashPrefill, type FormPrefill } from '@/lib/commands/prefill';
 import type { Area } from '@/lib/permissions/model';
 import { toast } from '@/components/ui';
-import { navigateGuarded } from '@/lib/shortcuts';
+import { globalShortcutFor, isEditableTarget, navigateGuarded } from '@/lib/shortcuts';
 
 /** Fired on window to open the command bar from anywhere (e.g. the header button). */
 export const OPEN_COMMAND_BAR_EVENT = 'ironbooks:open-command-bar';
@@ -134,15 +134,24 @@ export default function CommandPalette({
   const pathname = usePathname();
   useEffect(() => setOpen(false), [pathname]);
 
-  // Open / close: Ctrl/Cmd+K toggles; the header button and openCommandBar() dispatch
-  // OPEN_COMMAND_BAR_EVENT. (Ctrl+F is QB's Find: the Find Transactions page, lib/shortcuts.ts.)
+  // Open / close: Ctrl/Cmd+K toggles; F3 / Ctrl+2 (QuickBooks' Search) open it; the header button
+  // and openCommandBar() dispatch OPEN_COMMAND_BAR_EVENT. (Ctrl+F is QB's Find: the Find
+  // Transactions page, lib/shortcuts.ts.)
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === 'k') {
+      if (e.defaultPrevented) return;
+      const command = globalShortcutFor(e, isEditableTarget(e.target))?.command;
+      if (command === 'palette') {
         e.preventDefault();
         setOpen((o) => {
           if (!o) restoreFocus.current = document.activeElement as HTMLElement | null;
           return !o;
+        });
+      } else if (command === 'search') {
+        e.preventDefault();
+        setOpen((o) => {
+          if (!o) restoreFocus.current = document.activeElement as HTMLElement | null;
+          return true;
         });
       }
     }
@@ -212,19 +221,25 @@ export default function CommandPalette({
         setPanelRows([]);
         return;
       }
-      let ok = false;
-      try {
-        ok = stashPrefill(window.sessionStorage, prefill);
-      } catch {
-        ok = false;
-      }
       setOpen(false);
-      router.push(href);
-      // A page that is already open picks the prefill up from this event; a page that is
-      // about to open reads it on mount.
-      setTimeout(() => window.dispatchEvent(new Event(PREFILL_EVENT)), 0);
-      if (!ok) toast('Could not pass the details to the form — fill it in by hand.', 'danger');
-      for (const n of notes) toast(n, 'info');
+      // Like the QuickBooks keys: a form typed on the page (or open behind the bar) asks before
+      // it is left; the prefilled form is handed over and opened only once leaving is decided.
+      navigateGuarded(href, (h) => router.push(h), window, {
+        go: (h) => {
+          let ok = false;
+          try {
+            ok = stashPrefill(window.sessionStorage, prefill);
+          } catch {
+            ok = false;
+          }
+          router.push(h);
+          // A page that is already open picks the prefill up from this event; a page that is
+          // about to open reads it on mount.
+          setTimeout(() => window.dispatchEvent(new Event(PREFILL_EVENT)), 0);
+          if (!ok) toast('Could not pass the details to the form — fill it in by hand.', 'danger');
+          for (const n of notes) toast(n, 'info');
+        },
+      });
     },
     [hiddenPaths, router],
   );
@@ -445,6 +460,9 @@ export default function CommandPalette({
         aria-modal="true"
         aria-labelledby="cb-title"
         aria-describedby="cb-help"
+        // The command bar is the shell's, not the page's: leaving from it asks about the field the
+        // cursor was in before it opened (components/LeaveGuard.tsx).
+        data-shell-chrome=""
         className="relative z-10 w-full max-w-2xl rounded-2xl bg-white shadow-2xl border border-slate-100 overflow-hidden"
         onKeyDown={(e) => {
           if (e.key === 'Escape') {

@@ -30,21 +30,15 @@ import ReceiptDropZone from './ReceiptDropZone'; // receipt capture: drop a rece
 import { BackupIndicator, BackupWarningBanner } from './BackupStatus'; // team backups
 import FormShortcuts from './FormShortcuts';
 import KeyboardCommands from './KeyboardCommands';
-import {
-  AMOUNT_KEY_HELP,
-  DATE_KEY_HELP,
-  FORM_KEY_HELP,
-  GLOBAL_SHORTCUTS,
-  GRID_KEY_HELP,
-  LIST_KEY_HELP,
-  NAVIGATE_REQUEST_EVENT,
-  NUMBER_KEY_HELP,
-  globalShortcutFor,
-  isEditableTarget,
-  isReloadKey,
-  mightLoseWork,
-} from '@/lib/shortcuts';
-import { ConfirmDialog, Modal, toast } from '@/components/ui';
+import PageRefresh from './PageRefresh';
+import ProductInfo from './ProductInfo';
+import WindowList from './WindowList';
+import FavoritesMenu from './FavoritesMenu';
+import { globalShortcutFor, isEditableTarget, navigateGuarded } from '@/lib/shortcuts';
+import { openDialog, selectedRow } from '@/lib/keyboardTargets';
+import { COMPANY_RENAMED_EVENT, type CompanyRenamed } from '@/lib/companyRename';
+import { toast } from '@/components/ui';
+import { usePickerKeys } from '@/lib/menuKeys';
 import { Briefcase, Building2, ChevronDown, ChevronRight, LogOut, Search, Sparkles } from 'lucide-react';
 
 // Routes that render without the app chrome (full-screen).
@@ -111,6 +105,10 @@ function CompanyChip({
   const [fileDir, setFileDir] = React.useState<string | null>(null);
   const [canClose, setCanClose] = React.useState(false);
   const rootRef = React.useRef<HTMLDivElement>(null);
+  const chipRef = React.useRef<HTMLButtonElement>(null);
+  const listRef = React.useRef<HTMLDivElement>(null);
+  // Up / Down / Home / End and a company's first letter move through the list (QB pickers).
+  const picker = usePickerKeys<HTMLDivElement>();
 
   React.useEffect(() => {
     let cancelled = false;
@@ -132,6 +130,27 @@ function CompanyChip({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Renamed in Company Information or Manage companies: the chip (and the window title, which
+  // follows it) shows the new name at once.
+  const companyRef = React.useRef(company);
+  companyRef.current = company;
+  React.useEffect(() => {
+    function onRenamed(e: Event) {
+      const r = (e as CustomEvent<CompanyRenamed>).detail;
+      const cur = companyRef.current;
+      if (!r || !cur || (r.id !== null && r.id !== cur.id)) {
+        // Another company in the list: the switcher re-reads the list next time it opens.
+        setList(null);
+        return;
+      }
+      onCompany({ id: cur.id, name: r.name });
+      setList(null);
+      void companyFileBridge()?.setDisplayName?.(r.name)?.catch?.(() => {});
+    }
+    window.addEventListener(COMPANY_RENAMED_EVENT, onRenamed);
+    return () => window.removeEventListener(COMPANY_RENAMED_EVENT, onRenamed);
+  }, [onCompany]);
+
   // Close the dropdown on outside click / Escape.
   React.useEffect(() => {
     if (!open) return;
@@ -139,7 +158,12 @@ function CompanyChip({
       if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false);
     }
     function onKey(e: KeyboardEvent) {
-      if (e.key === 'Escape') setOpen(false);
+      if (e.key !== 'Escape') return;
+      // Esc closes the list only (not the window): the keyboard goes back to the chip.
+      e.preventDefault();
+      const inList = rootRef.current?.contains(document.activeElement);
+      setOpen(false);
+      if (inList) chipRef.current?.focus();
     }
     document.addEventListener('mousedown', onDown);
     document.addEventListener('keydown', onKey);
@@ -203,7 +227,19 @@ function CompanyChip({
   return (
     <div ref={rootRef} className="relative">
       <button
+        ref={chipRef}
         onClick={toggle}
+        onKeyDown={(e) => {
+          // Down opens the list and puts the keyboard in it.
+          if (e.key === 'ArrowDown' && !e.altKey && !e.ctrlKey) {
+            e.preventDefault();
+            if (!open) void toggle();
+            window.setTimeout(() => {
+              const items = listRef.current?.querySelectorAll<HTMLElement>('[role="option"]');
+              (Array.from(items ?? []).find((el) => el.getAttribute('aria-selected') === 'true') ?? items?.[0])?.focus();
+            }, 60);
+          }
+        }}
         aria-haspopup="listbox"
         aria-expanded={open}
         title="Active company — click to switch"
@@ -215,7 +251,10 @@ function CompanyChip({
       </button>
       {open && (
         <div
+          ref={listRef}
           role="listbox"
+          aria-label="Switch company"
+          onKeyDown={picker.onKeyDown}
           className="absolute right-0 mt-2 w-72 rounded-xl bg-white/95 backdrop-blur-xl shadow-2xl border border-slate-200/70 p-1 z-50"
         >
           <div className="px-3 pt-2 pb-1 text-[11px] font-semibold text-navy/40">
@@ -298,130 +337,40 @@ function CompanyChip({
   );
 }
 
-function ShortcutRow({ keys, description }: { keys: string; description: string }) {
-  return (
-    <div className="flex items-center justify-between py-1.5">
-      <span className="text-sm text-navy/70">{description}</span>
-      <kbd className="rounded-md border border-slate-200 bg-slate-50 px-2 py-0.5 text-xs font-medium text-navy shadow-[0_1px_0_rgb(var(--slate-200))] whitespace-nowrap">
-        {keys}
-      </kbd>
-    </div>
-  );
-}
-
-function ShortcutGroup({ title, rows }: { title: string; rows: { keys: string; description: string }[] }) {
-  return (
-    <div>
-      <div className="text-[11px] font-bold uppercase tracking-wider text-navy/40 mb-1">{title}</div>
-      {rows.map((s) => (
-        <ShortcutRow key={s.keys} keys={s.keys} description={s.description} />
-      ))}
-    </div>
-  );
-}
-
 /**
- * App-wide keyboard shortcuts (QB Desktop's keys, GLOBAL_SHORTCUTS in lib/shortcuts.ts):
- * Ctrl+W Write Checks, Ctrl+I Create Invoices, Ctrl+J Customer Center, Ctrl+A Chart of
- * Accounts, Ctrl+R Use Register, Ctrl+T Memorized Transactions, Ctrl+F Find — from inside
- * fields too, as in QB (except Ctrl+A, which selects a field's text) — and "?" opens the
- * shortcuts help. The other commands (Ctrl+E / D / P / Y / H / Q / L, F1) are
- * components/KeyboardCommands.tsx; Ctrl+K is CommandPalette; Ctrl+M is MemorizeButton.
+ * The QuickBooks keys that open a window (GLOBAL_SHORTCUTS in lib/shortcuts.ts): Ctrl+W Write
+ * Checks, Ctrl+I Create Invoices, Ctrl+J Customer Center, Ctrl+A Chart of Accounts, Ctrl+R Use
+ * Register (the highlighted account's register, as on QuickBooks' Chart of Accounts, else the
+ * list of registers), Ctrl+T Memorized Transactions, Ctrl+F Find — from inside fields too, as in
+ * QB (except Ctrl+A, which selects a field's text).
  *
- * The app shows one page at a time where QB would open a second window, so leaving a form with
- * typed work asks first (mightLoseWork) — for these keys and for the desktop menus and the
- * command bar, which ask through NAVIGATE_REQUEST_EVENT (navigateGuarded).
+ * The app shows one page at a time where QB would open a second window, so every one goes
+ * through the leave-this-form check (navigateGuarded → components/LeaveGuard.tsx). The other keys:
+ * components/KeyboardCommands.tsx (Ctrl+E / D / P / Y / H / Q / L / U / G / O / V),
+ * ShortcutsHelp (F1, ?), ProductInfo (F2, Ctrl+1), CommandPalette (Ctrl+K, F3, Ctrl+2),
+ * WindowList (Ctrl+Tab, Ctrl+F6, Ctrl+F4), LeaveGuard (F5), MemorizeButton (Ctrl+M).
  */
 function GlobalShortcuts() {
   const router = useRouter();
-  const [helpOpen, setHelpOpen] = React.useState(false);
-  const [leaveTo, setLeaveTo] = React.useState<string | null>(null);
-  const [reloadAsk, setReloadAsk] = React.useState(false);
-
-  React.useEffect(() => {
-    function onNavigateRequest(e: Event) {
-      const href = (e as CustomEvent<{ href?: string }>).detail?.href;
-      if (typeof href !== 'string' || !href) return;
-      e.preventDefault();
-      setHelpOpen(false);
-      if (mightLoseWork(document.activeElement)) setLeaveTo(href);
-      else router.push(href);
-    }
-    window.addEventListener(NAVIGATE_REQUEST_EVENT, onNavigateRequest);
-    return () => window.removeEventListener(NAVIGATE_REQUEST_EVENT, onNavigateRequest);
-  }, [router]);
 
   React.useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if (e.defaultPrevented || e.isComposing) return;
-      // F5 reloads the desktop window (View > Reload) — QB users press it to refresh a list. With
-      // typed work on screen, ask first instead of wiping the open form.
-      if (isReloadKey(e) && !e.repeat && mightLoseWork(e.target)) {
-        e.preventDefault();
-        setReloadAsk(true);
-        return;
-      }
-      const editable = isEditableTarget(e.target);
-      const sc = globalShortcutFor(e, editable);
-      if (sc?.href) {
-        e.preventDefault();
-        setHelpOpen(false);
-        // Already there (Ctrl+F on Find): QB just brings that window forward.
-        if (sc.href === window.location.pathname) return;
-        if (mightLoseWork(e.target)) setLeaveTo(sc.href);
-        else router.push(sc.href);
-        return;
-      }
-      if (e.key === '?' && !editable && !e.ctrlKey && !e.metaKey && !e.altKey) {
-        e.preventDefault();
-        setHelpOpen(true);
-      }
+      const target = e.target as HTMLElement | null;
+      const sc = globalShortcutFor(e, isEditableTarget(target));
+      if (!sc?.href) return;
+      e.preventDefault();
+      // Ctrl+R on a highlighted account: its register (QB's Chart of Accounts).
+      const href = (sc.command === 'register' && selectedRow(target, openDialog())?.getAttribute('data-register')) || sc.href;
+      // Already there (Ctrl+F on Find): QB just brings that window forward.
+      if (href === window.location.pathname) return;
+      navigateGuarded(href, (h) => router.push(h));
     }
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [router]);
 
-  return (
-    <>
-      <Modal open={helpOpen} onClose={() => setHelpOpen(false)} title="Keyboard Shortcuts (QuickBooks keys)" size="lg">
-        <div className="grid grid-cols-1 gap-x-8 gap-y-4 md:grid-cols-2">
-          <div className="space-y-4">
-            <ShortcutGroup title="Anywhere" rows={GLOBAL_SHORTCUTS} />
-          </div>
-          <div className="space-y-4">
-            <ShortcutGroup title="Forms" rows={FORM_KEY_HELP} />
-            <ShortcutGroup title="Lists, centers & registers" rows={LIST_KEY_HELP} />
-            <ShortcutGroup title="Date fields" rows={DATE_KEY_HELP} />
-            <ShortcutGroup title="Amount & number fields" rows={[...AMOUNT_KEY_HELP, ...NUMBER_KEY_HELP]} />
-            <ShortcutGroup title="Line grids" rows={GRID_KEY_HELP} />
-          </div>
-        </div>
-      </Modal>
-      <ConfirmDialog
-        open={leaveTo !== null}
-        title="Leave this form?"
-        message="Ironbooks shows one window at a time. Anything typed here and not saved will be lost."
-        confirmLabel="Leave"
-        onConfirm={() => {
-          const href = leaveTo;
-          setLeaveTo(null);
-          if (href) router.push(href);
-        }}
-        onClose={() => setLeaveTo(null)}
-      />
-      <ConfirmDialog
-        open={reloadAsk}
-        title="Reload this window?"
-        message="Reloading starts this page over. Anything typed here and not saved will be lost."
-        confirmLabel="Reload"
-        onConfirm={() => {
-          setReloadAsk(false);
-          window.location.reload();
-        }}
-        onClose={() => setReloadAsk(false)}
-      />
-    </>
-  );
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -516,7 +465,8 @@ function SidebarSearch({
   function go(href: string) {
     setOpen(false);
     setQ('');
-    router.push(href);
+    // Like the QuickBooks keys: a form being typed on the page asks before it is left.
+    navigateGuarded(href, (h) => router.push(h));
   }
 
   return (
@@ -603,6 +553,14 @@ function NavItems({
   collapsed: ReadonlySet<string>;
   onToggle: (heading: string) => void;
 }) {
+  const router = useRouter();
+  // A plain click (or Enter) on a menu link asks before leaving a form being typed on the page;
+  // Ctrl / Shift / middle clicks keep the browser's own behavior.
+  const onLinkClick = (href: string) => (e: React.MouseEvent<HTMLAnchorElement>) => {
+    if (e.defaultPrevented || e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
+    e.preventDefault();
+    navigateGuarded(href, (h) => router.push(h));
+  };
   return (
     <>
       {groups.map((group) => {
@@ -642,6 +600,7 @@ function NavItems({
                   <Link
                     key={nav.label}
                     href={linkHref(nav)}
+                    onClick={onLinkClick(linkHref(nav))}
                     prefetch={false}
                     title={nav.qb && nav.qb !== nav.label ? `${nav.label} (QuickBooks: ${nav.qb})` : nav.label}
                     aria-current={active ? 'page' : undefined}
@@ -747,7 +706,10 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
 
   return (
     <div className="min-h-screen flex bg-offwhite">
-      <aside className="w-20 lg:w-60 sticky top-[var(--titlebar-h)] h-screen bg-chrome/80 backdrop-blur-xl z-10 flex flex-col pt-4 pb-3 px-2 lg:px-3 border-r border-slate-200/80">
+      <aside
+        data-shell-chrome
+        className="w-20 lg:w-60 sticky top-[var(--titlebar-h)] h-screen bg-chrome/80 backdrop-blur-xl z-10 flex flex-col pt-4 pb-3 px-2 lg:px-3 border-r border-slate-200/80"
+      >
         <div className="flex items-center justify-center lg:justify-start gap-2.5 lg:px-2 mb-4 shrink-0">
           <div className="rounded-[10px] bg-gradient-to-b from-electric/85 to-electric h-9 w-9 flex items-center justify-center shadow-sm">
             <Briefcase className="text-white h-[18px] w-[18px]" />
@@ -794,7 +756,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         </div>
       </aside>
       <main className="flex-1 flex flex-col min-w-0">
-        <header className="relative z-20 flex items-center justify-end gap-3 px-6 pt-4 pb-1">
+        <header className="relative z-20 flex items-center justify-end gap-3 px-6 pt-4 pb-1" data-shell-chrome>
           {/* "What is this page?" — plain-language help for the current screen (lib/pageHelp.ts). */}
           {pageHelpFor(pathname) ? (
             <span className="mr-auto text-sm text-navy/60" data-page-help>
@@ -828,7 +790,8 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         </header>
         <BackupWarningBanner />
         <AccountantCopyBanner pathname={pathname} />
-        {blockedGate ? <FeatureOff gate={blockedGate} /> : children}
+        {/* F5 (QuickBooks' Refresh) starts the page area over in place: components/PageRefresh.tsx. */}
+        <PageRefresh>{blockedGate ? <FeatureOff gate={blockedGate} /> : children}</PageRefresh>
       </main>
       <CommandPalette permissions={me?.permissions} hiddenPaths={hiddenPaths} />
       <AssistantPanel open={assistantOpen} onClose={closeAssistant} />
@@ -838,6 +801,9 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       <ReceiptDropZone enabled={canDo(me, 'lists', 'create')} />
       <FormShortcuts />
       <KeyboardCommands />
+      <ProductInfo />
+      <WindowList />
+      <FavoritesMenu permissions={me?.permissions} hiddenPaths={hiddenPaths} />
       <TitleSync company={company?.name ?? null} />
     </div>
   );

@@ -4,7 +4,7 @@
  */
 import { z } from 'zod';
 import { zUuid } from './helpers';
-import { FORM_TYPES } from '@/lib/preferences';
+import { FORM_TYPES, MAX_FAVORITES, isFavoritePath } from '@/lib/preferences';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -51,6 +51,11 @@ export const myPreferencesSchema = z
     startWithPayee: z.boolean(),
     showHomeWorkflow: z.boolean(),
     navMode: z.enum(['simple', 'advanced']),
+    density: z.enum(['comfortable', 'compact']),
+    // The Favorites menu: in-app page paths, in order.
+    favorites: z
+      .array(z.string().refine(isFavoritePath, 'must be a page of the app, like /invoices'))
+      .max(MAX_FAVORITES, `can hold at most ${MAX_FAVORITES} pages`),
   })
   .partial()
   .strict();

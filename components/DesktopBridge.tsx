@@ -23,7 +23,33 @@ import { Download, RefreshCw, X } from 'lucide-react';
 import { Button, toast, toastError } from '@/components/ui';
 import { startSandbox } from '@/lib/sandboxClient';
 import { savePortableCompanyFile, saveShareableLedger } from '@/lib/companyFileClient';
-import { navigateGuarded } from '@/lib/shortcuts';
+import { historyGuarded, navigateGuarded } from '@/lib/shortcuts';
+import { requestRefresh } from '@/components/LeaveGuard';
+import { openHelpWindow } from '@/components/ShortcutsHelp';
+import { OPEN_PRODUCT_INFO_EVENT } from '@/components/ProductInfo';
+import { OPEN_WINDOW_LIST_EVENT, WINDOW_COMMAND_EVENT, type WindowCommand } from '@/components/WindowList';
+import { CUSTOMIZE_FAVORITES_EVENT } from '@/components/FavoritesMenu';
+
+/**
+ * Desktop menu items that act in the page (electron/main.js sends them as 'menu' actions). Back /
+ * Forward and View > Refresh go through the leave-this-form check, never straight to the window.
+ */
+const PAGE_MENU_ACTIONS: Record<string, () => void> = {
+  refresh: () => requestRefresh(),
+  'history-back': () => void historyGuarded('back'),
+  'history-forward': () => void historyGuarded('forward'),
+  'keyboard-shortcuts': () => openHelpWindow('shortcuts'),
+  help: () => openHelpWindow('page'),
+  'product-info': () => window.dispatchEvent(new Event(OPEN_PRODUCT_INFO_EVENT)),
+  'window-list': () => window.dispatchEvent(new Event(OPEN_WINDOW_LIST_EVENT)),
+  'customize-favorites': () => window.dispatchEvent(new Event(CUSTOMIZE_FAVORITES_EVENT)),
+  ...Object.fromEntries(
+    (['close', 'next', 'prev'] as WindowCommand[]).map((action) => [
+      `window-${action}`,
+      () => window.dispatchEvent(new CustomEvent(WINDOW_COMMAND_EVENT, { detail: { action } })),
+    ]),
+  ),
+};
 
 type Unsubscribe = (() => void) | void;
 /** Mirrors updateState in electron/main.js. */
@@ -139,6 +165,11 @@ export default function DesktopBridge() {
           toastError(err, 'The sandbox copy could not be made.');
           router.push('/sandbox');
         });
+        return;
+      }
+      const pageAction = PAGE_MENU_ACTIONS[action];
+      if (pageAction) {
+        pageAction();
         return;
       }
       const exp = MENU_EXPORTS[action];

@@ -18,7 +18,9 @@
  *
  * Keyboard (QB): Up / Down / PgUp / PgDn / Home / End move through the transactions, Enter
  * opens one (QuickZoom), typing a payee jumps to it, Ctrl+Y / Ctrl+H show its Transaction
- * Journal / History (useListKeys + components/KeyboardCommands.tsx).
+ * Journal / History, Ctrl+G opens the other account's register at the same transaction
+ * (?entry=<journal entry> highlights it there), Ctrl+O copies a transaction and Ctrl+V on the
+ * blank line pastes it (useListKeys + components/KeyboardCommands.tsx).
  */
 import { SUBTYPE_LABELS } from '@/lib/accountTypes';
 import { Suspense, useCallback, useEffect, useRef, useState } from 'react';
@@ -37,13 +39,15 @@ import {
   toast,
   useListKeys,
 } from '@/components/ui';
+import { setActiveListRow } from '@/lib/shortcuts';
+import { usePickerKeys } from '@/lib/menuKeys';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/dates';
 import EntryDetailModal, { sourceRefLink } from '@/components/EntryDetailModal';
 import { RegisterEntryRow } from '@/components/RegisterEntryRow';
 import WhyChanged from '@/components/WhyChanged';
-import { registerBody, showEntryRow } from './registerView';
+import { copyOfRow, registerBody, showEntryRow, transferHref } from './registerView';
 
 // ---------------------------------------------------------------------------
 // Types (mirror GET /api/registers/[accountId])
@@ -189,14 +193,23 @@ const NEW_TRANSACTION_LINKS = [
 function NewTransactionMenu() {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  // Up / Down / Home / End and a choice's first letter move through it (Windows menus).
+  const picker = usePickerKeys<HTMLDivElement>();
 
   useEffect(() => {
     if (!open) return;
+    // Opened from the keyboard or the mouse: the first choice takes the keyboard.
+    menuRef.current?.querySelector<HTMLElement>('[role="menuitem"]')?.focus();
     function onClick(e: MouseEvent) {
       if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
     }
     function onKeyDown(e: KeyboardEvent) {
-      if (e.key === 'Escape') setOpen(false);
+      if (e.key !== 'Escape') return;
+      // Esc closes the menu only (not the window), and the keyboard goes back to its button.
+      e.preventDefault();
+      setOpen(false);
+      ref.current?.querySelector<HTMLElement>('button[aria-haspopup]')?.focus();
     }
     document.addEventListener('mousedown', onClick);
     document.addEventListener('keydown', onKeyDown);
@@ -208,17 +221,34 @@ function NewTransactionMenu() {
 
   return (
     <div className="relative" ref={ref}>
-      <Button onClick={() => setOpen((v) => !v)}>
+      <Button
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+        onKeyDown={(e) => {
+          if (e.key === 'ArrowDown' && !open) {
+            e.preventDefault();
+            setOpen(true);
+          }
+        }}
+      >
         <Plus className="h-4 w-4" /> New Transaction <ChevronDown className="h-3.5 w-3.5" />
       </Button>
       {open && (
-        <div className="absolute right-0 mt-2 w-48 rounded-xl bg-white shadow-xl border border-slate-100 py-1.5 z-20">
+        <div
+          ref={menuRef}
+          role="menu"
+          aria-label="New transaction"
+          onKeyDown={picker.onKeyDown}
+          className="absolute right-0 mt-2 w-48 rounded-xl bg-white shadow-xl border border-slate-100 py-1.5 z-20"
+        >
           {NEW_TRANSACTION_LINKS.map((l) => (
             <Link
               key={l.href}
               href={l.href}
+              role="menuitem"
               onClick={() => setOpen(false)}
-              className="block px-4 py-2 text-sm text-navy hover:bg-electric/5 hover:text-electric transition-colors"
+              className="block px-4 py-2 text-sm text-navy hover:bg-electric/5 hover:text-electric focus:bg-electric/10 outline-none transition-colors"
             >
               {l.label}
             </Link>
@@ -293,11 +323,23 @@ function RegisterPageInner() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [accountId]);
 
-  // Newest at bottom: keep the register scrolled to the latest transaction.
+  // Newest at bottom: keep the register scrolled to the latest transaction — unless Ctrl+G in
+  // another register opened this one at a transaction (?entry=), which is highlighted instead.
+  const focusEntry = searchParams.get('entry');
+  const focusedEntry = useRef<string | null>(null);
   useEffect(() => {
     const el = scrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [result]);
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+    if (!focusEntry || focusedEntry.current === focusEntry || !result) return;
+    const row = Array.from(el.querySelectorAll<HTMLElement>('tbody > tr[data-journal-entry]')).find(
+      (r) => r.getAttribute('data-journal-entry') === focusEntry,
+    );
+    if (!row) return;
+    focusedEntry.current = focusEntry;
+    setActiveListRow(el, row);
+    el.focus({ preventScroll: true });
+  }, [result, focusEntry]);
 
   const handleRowClick = (row: RegisterRow) => {
     const source = sourceRefLink(row.sourceRef);
@@ -485,6 +527,7 @@ function RegisterPageInner() {
 
                   {result.rows.map((row) => {
                     const source = sourceRefLink(row.sourceRef);
+                    const copy = copyOfRow(row, result.account.type, !!fxCur);
                     return (
                       <tr
                         key={row.lineId}
@@ -493,6 +536,10 @@ function RegisterPageInner() {
                         title={source ? `Open ${source.label}` : 'View journal entry'}
                         data-journal-entry={row.journalEntryId}
                         data-list-label={row.description}
+                        data-row-date={String(row.date).slice(0, 10)}
+                        data-transfer-href={transferHref(row) ?? undefined}
+                        data-split={row.otherAccount && !row.otherAccount.id ? '' : undefined}
+                        data-copy-transaction={copy ? JSON.stringify(copy) : undefined}
                       >
                         <Td className="whitespace-nowrap">{formatDate(row.date)}</Td>
                         <Td className="text-navy/60 text-xs font-mono whitespace-nowrap">

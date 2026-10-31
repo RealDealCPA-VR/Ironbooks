@@ -39,6 +39,7 @@ export function NewNameModal({
   onClose,
   onCreated,
   onUseOnce,
+  types,
 }: {
   open: boolean;
   /** The text typed into the payee field. */
@@ -49,7 +50,10 @@ export function NewNameModal({
   onCreated: (created: CreatedName) => void;
   /** Keep the typed text as a one-time payee; omit to hide the option. */
   onUseOnce?: () => void;
+  /** The lists this field can use (an invoice: Customer only). Default: all four. */
+  types?: NameType[];
 }) {
+  const choices = types?.length ? CHOICES.filter((c) => types.includes(c.type)) : CHOICES;
   const [type, setType] = useState<NameType>(suggestedType ?? 'vendor');
   const [displayName, setDisplayName] = useState(name);
   const [first, setFirst] = useState('');
@@ -127,10 +131,11 @@ export function NewNameModal({
       }
     >
       <div className="flex flex-col gap-4">
+        {choices.length > 1 && (
         <div>
           <Label>Who is this?</Label>
           <div role="radiogroup" aria-label="Name type" className="grid grid-cols-2 gap-2 mt-1">
-            {CHOICES.map((c) => {
+            {choices.map((c) => {
               const Icon = c.icon;
               const on = c.type === type;
               return (
@@ -154,6 +159,7 @@ export function NewNameModal({
             })}
           </div>
         </div>
+        )}
 
         {type === 'employee' ? (
           <>

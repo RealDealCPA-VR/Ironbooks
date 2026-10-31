@@ -113,6 +113,7 @@ export default function RegistersIndexPage() {
                     {rows.map((a) => (
                       <Tr
                         key={a.id}
+                        data-register={`/registers/${a.id}`}
                         onClick={() => router.push(`/registers/${a.id}`)}
                         className="cursor-pointer group"
                       >

@@ -106,6 +106,12 @@ contextBridge.exposeInMainWorld('bookkeeper', {
     setTheme: (theme) => ipcRenderer.invoke('chrome:theme', theme),
     menus: () => ipcRenderer.invoke('chrome:menus'),
     popupMenu: (index, x, y) => ipcRenderer.invoke('chrome:popupMenu', Number(index), Number(x), Number(y)),
+    // The Favorites menu's pages (components/FavoritesMenu.tsx): [{ label, route }].
+    setFavorites: (items) =>
+      ipcRenderer.invoke(
+        'chrome:setFavorites',
+        Array.isArray(items) ? items.map((f) => ({ label: String(f && f.label), route: String(f && f.route) })) : [],
+      ),
   },
   isDesktop: true,
 });

@@ -4,9 +4,8 @@
  * access-key labels.
  */
 import { describe, it, expect } from 'vitest';
+import { shortcutsHelpGroups } from './qbShortcuts';
 import {
-  FORM_KEY_HELP,
-  GRID_KEY_HELP,
   type KeyLike,
   accessKeyParts,
   dateKeyForTextField,
@@ -203,13 +202,12 @@ describe('accessKeyParts', () => {
   });
 });
 
-describe('help tables', () => {
-  it('list the form and grid keys shown in the "?" overlay', () => {
-    const form = FORM_KEY_HELP.map((r) => r.keys).join(' | ');
-    for (const s of ['Ctrl+N', 'Ctrl+S', 'Alt+S', 'Ctrl+Alt+S / Ctrl+Enter', 'Alt+A', 'Alt+R', 'Alt+P / Alt+N', 'Esc']) {
-      expect(form).toContain(s);
+describe('shortcuts help', () => {
+  it('lists the form and line keys under "Forms and transactions"', () => {
+    const forms = shortcutsHelpGroups({ desktop: false }).find((g) => g.id === 'forms');
+    const keys = (forms?.rows ?? []).map((r) => r.keys);
+    for (const s of ['Ctrl+N', 'Ctrl+S', 'Alt+S', 'Ctrl+Enter', 'Alt+A', 'Alt+R', 'Alt+P', 'Alt+N', 'Ctrl+Ins / Ctrl+Del', 'Ctrl+L', 'Ctrl+Alt+Y', 'Ctrl+Alt+V']) {
+      expect(keys).toContain(s);
     }
-    const grid = GRID_KEY_HELP.map((r) => r.keys).join(' | ');
-    for (const s of ['Ctrl+Insert', 'Ctrl+D', 'Enter / Down', 'Tab', 'Ctrl+L']) expect(grid).toContain(s);
   });
 });

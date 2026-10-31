@@ -9,12 +9,24 @@
 import { afterAll, describe, expect, it } from 'vitest';
 import { lastCalendarYear, thisYearStart } from '@/app/accountant/_shared';
 import { todayISO } from '@/lib/dates';
+import { expectAllPassed, runDomFile } from './domHarness';
 
 const originalTz = process.env.TZ;
 afterAll(() => {
   if (originalTz === undefined) delete process.env.TZ;
   else process.env.TZ = originalTz;
 });
+
+/** Local wall-clock times either side of New Year (month 1–12), with the local date they are. */
+const CLOCKS: Array<{ at: [number, number, number, number, number]; date: string }> = [
+  { at: [2026, 12, 31, 23, 30], date: '2026-12-31' },
+  { at: [2026, 12, 31, 23, 59], date: '2026-12-31' },
+  { at: [2027, 1, 1, 0, 0], date: '2027-01-01' },
+  { at: [2027, 1, 1, 0, 30], date: '2027-01-01' },
+  { at: [2027, 1, 1, 8, 0], date: '2027-01-01' },
+  { at: [2026, 10, 30, 12, 0], date: '2026-10-30' },
+];
+const ZONES = ['America/Los_Angeles', 'America/New_York', 'UTC', 'Asia/Tokyo', 'Pacific/Auckland'];
 
 describe('Accountant Center date defaults follow the local calendar', () => {
   it('New Year’s Eve, 11:30 pm in Los Angeles (already January 1 in UTC)', () => {
@@ -31,15 +43,45 @@ describe('Accountant Center date defaults follow the local calendar', () => {
     expect(lastCalendarYear(ny)).toEqual({ from: '2026-01-01', to: '2026-12-31' });
   });
 
-  it('the trial balance range never starts after today', () => {
-    process.env.TZ = 'America/New_York';
-    expect(thisYearStart() <= todayISO()).toBe(true);
-  });
+  // Every clock either side of New Year, in zones west of, on and east of UTC: the trial balance
+  // range (thisYearStart → today) is this local year up to today, and Period Copy's year is the
+  // one that ended the day before it began. A UTC-year version fails in Los Angeles / New York on
+  // New Year's Eve and in Tokyo / Auckland on New Year's morning; the check below proves those
+  // clocks really are another year in UTC.
+  for (const tz of ZONES) {
+    it(`the trial balance range never starts after today, and Period Copy's year is finished (${tz})`, () => {
+      process.env.TZ = tz;
+      let straddles = 0;
+      for (const { at, date } of CLOCKS) {
+        const [y, m, d, h, min] = at;
+        const now = new Date(y, m - 1, d, h, min);
+        const label = `${date} ${h}:${String(min).padStart(2, '0')} in ${tz}`;
+        expect(todayISO(now), label).toBe(date);
+        if (now.getUTCFullYear() !== now.getFullYear()) straddles++;
 
-  it('the pages use these helpers', async () => {
-    const fs = await import('node:fs');
-    for (const f of ['app/accountant/working-trial-balance/page.tsx', 'app/accountant/period-copy/page.tsx']) {
-      expect(fs.readFileSync(f, 'utf8'), f).not.toContain('getUTCFullYear');
-    }
-  });
+        const from = thisYearStart(now);
+        expect(from, label).toBe(`${date.slice(0, 4)}-01-01`);
+        expect(from <= date, `${label}: ${from} starts after today`).toBe(true);
+
+        const last = lastCalendarYear(now);
+        const prev = Number(date.slice(0, 4)) - 1;
+        expect(last, label).toEqual({ from: `${prev}-01-01`, to: `${prev}-12-31` });
+        expect(last.to < from, `${label}: the year to copy ends before this one begins`).toBe(true);
+      }
+      if (tz !== 'UTC') expect(straddles, `some clock is another year in UTC in ${tz}`).toBeGreaterThan(0);
+    });
+  }
+
+  // The pages themselves, on the same kind of fixed clocks, in a browser window
+  // (test/dom/accountantDates.dom.tsx): what they show and the requests they send.
+  for (const tz of ['America/Los_Angeles', 'Asia/Tokyo']) {
+    it(`Working Trial Balance and Period Copy open on these dates (${tz})`, async () => {
+      process.env.TZ = tz;
+      expectAllPassed(await runDomFile('test/dom/accountantDates.dom.tsx'), [
+        `the window runs in ${tz}, where a UTC year boundary falls inside these clocks`,
+        'Working Trial Balance: opens on January 1 of this year through today, and loads that range',
+        'Period Copy: opens on last calendar year, and creates the copy for it',
+      ]);
+    }, 180_000);
+  }
 });

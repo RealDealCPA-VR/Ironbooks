@@ -23,7 +23,7 @@ import {
   PageHeader,
   toast,
 } from '@/components/ui';
-import { quickReportHref } from '@/lib/shortcuts';
+import { accountRegisterHref, quickReportHref } from '@/lib/shortcuts';
 import { Help } from '@/components/Help';
 import WhyChanged from '@/components/WhyChanged';
 import { api, ApiError } from '@/lib/client';
@@ -275,6 +275,7 @@ function AccountRow({ node, depth, onDeactivate, onReactivate, onEdit }: Account
         key={node.id}
         className={node.isActive ? '' : 'opacity-60'}
         data-quick-report={quickReportHref('account', node.id)}
+        data-register={accountRegisterHref(node.id, node.type)}
       >
         {showNumbers && (
           <Td>

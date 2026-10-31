@@ -40,7 +40,8 @@ import {
   attentionAmountCurrency,
   type AttentionKind,
 } from '@/lib/attentionKinds';
-import { nextMenuIndex } from '@/lib/menuKeys';
+import { pickerKeyMove } from '@/lib/menuKeys';
+import { TYPE_AHEAD_MS } from '@/lib/shortcuts';
 import type { AttentionItem, AttentionResult } from '@/lib/services/attention';
 import { cn } from '@/lib/utils';
 
@@ -414,6 +415,7 @@ function LaterMenu({ title, onSnooze, onDismiss }: { title: string; onSnooze: (d
   const [startAt, setStartAt] = useState<'first' | 'last'>('first');
   const buttonRef = useRef<HTMLButtonElement>(null);
   const itemRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const typedRef = useRef({ text: '', at: 0 });
 
   const choices: Array<{ label: string; danger?: boolean; run: () => void }> = [
     { label: 'Remind me tomorrow', run: () => onSnooze(1) },
@@ -456,10 +458,14 @@ function LaterMenu({ title, onSnooze, onDismiss }: { title: string; onSnooze: (d
       return;
     }
     const items = itemRefs.current.filter(Boolean) as HTMLButtonElement[];
-    const next = nextMenuIndex(e.key, items.indexOf(document.activeElement as HTMLButtonElement), items.length);
-    if (next !== null) {
+    // Arrows, Home / End, and a letter jumps to the choice starting with it (Windows menus).
+    const now = Date.now();
+    const sofar = now - typedRef.current.at > TYPE_AHEAD_MS ? '' : typedRef.current.text;
+    const move = pickerKeyMove(e, items.indexOf(document.activeElement as HTMLButtonElement), items.map((b) => b.textContent ?? ''), sofar);
+    if (move) {
       e.preventDefault();
-      items[next].focus();
+      typedRef.current = { text: move.typed, at: now };
+      if (move.index >= 0) items[move.index]?.focus();
     }
   }
 

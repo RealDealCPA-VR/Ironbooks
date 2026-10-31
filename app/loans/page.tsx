@@ -26,6 +26,7 @@ import {
   Tr,
   toast,
   toastError,
+  DocNumberInput,
 } from '@/components/ui';
 import { api } from '@/lib/client';
 import { todayISO } from '@/lib/dates';
@@ -612,7 +613,7 @@ export default function LoansPage() {
           </div>
           <div>
             <Label htmlFor="lp-ref">{payKind === 'check' ? 'Check #' : 'Bill #'}</Label>
-            <Input id="lp-ref" value={pay.toPrint ? '' : pay.reference} disabled={pay.toPrint} placeholder={payKind === 'check' ? 'auto' : 'optional'} onChange={(e) => setPay((p) => ({ ...p, reference: e.target.value }))} />
+            <DocNumberInput id="lp-ref" value={pay.toPrint ? '' : pay.reference} disabled={pay.toPrint} placeholder={payKind === 'check' ? 'auto' : 'optional'} onChange={(e) => setPay((p) => ({ ...p, reference: e.target.value }))} />
             {payKind === 'check' && (
               <label className="mt-2 flex items-center gap-2 text-sm text-navy/70 select-none">
                 <input type="checkbox" className="h-4 w-4 accent-electric" checked={pay.toPrint} onChange={(e) => setPay((p) => ({ ...p, toPrint: e.target.checked }))} />

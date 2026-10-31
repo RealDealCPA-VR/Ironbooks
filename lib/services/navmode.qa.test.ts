@@ -50,10 +50,10 @@ afterAll(async () => {
 });
 
 describe('Menu style (navMode) preference', () => {
-  it('new owner, new member and a new company all start in Simple mode', async () => {
-    expect(await navModeOf(t.ctx)).toBe('simple');
-    expect(await navModeOf(viewer)).toBe('simple');
-    expect(await navModeOf(otherCo)).toBe('simple');
+  it('new owner, new member and a new company all start with every menu (QuickBooks users)', async () => {
+    expect(await navModeOf(t.ctx)).toBe('advanced');
+    expect(await navModeOf(viewer)).toBe('advanced');
+    expect(await navModeOf(otherCo)).toBe('advanced');
   });
 
   it('refuses anything but simple / advanced (400) and stores nothing', async () => {
@@ -63,27 +63,27 @@ describe('Menu style (navMode) preference', () => {
       expect(res.status, JSON.stringify(bad)).toBe(400);
     }
     expect(myPreferencesSchema.safeParse({ navMode: 'advanced' }).success).toBe(true);
-    expect(await navModeOf(t.ctx)).toBe('simple');
+    expect(await navModeOf(t.ctx)).toBe('advanced');
   });
 
   it('a view-only member can switch their own menu (no books data changes)', async () => {
     ctx = viewer;
-    const res = await patch({ navMode: 'advanced' });
+    const res = await patch({ navMode: 'simple' });
     expect(res.status).toBe(200);
-    expect(await navModeOf(viewer)).toBe('advanced');
+    expect(await navModeOf(viewer)).toBe('simple');
   });
 
   it("one person's choice never changes another person's or another company's menu", async () => {
     ctx = t.ctx;
-    expect((await patch({ navMode: 'advanced' })).status).toBe(200);
-    expect(await navModeOf(t.ctx)).toBe('advanced');
-    // Same person, other company in the same file: untouched.
-    expect(await navModeOf(otherCo)).toBe('simple');
-    // Viewer switches back; the owner keeps Advanced.
-    ctx = viewer;
     expect((await patch({ navMode: 'simple' })).status).toBe(200);
-    expect(await navModeOf(viewer)).toBe('simple');
-    expect(await navModeOf(t.ctx)).toBe('advanced');
+    expect(await navModeOf(t.ctx)).toBe('simple');
+    // Same person, other company in the same file: untouched.
+    expect(await navModeOf(otherCo)).toBe('advanced');
+    // Viewer switches back; the owner keeps Simple.
+    ctx = viewer;
+    expect((await patch({ navMode: 'advanced' })).status).toBe(200);
+    expect(await navModeOf(viewer)).toBe('advanced');
+    expect(await navModeOf(t.ctx)).toBe('simple');
   });
 
   it('switching the menu keeps other saved preferences, and saving others keeps the menu', async () => {
@@ -103,13 +103,13 @@ describe('Menu style (navMode) preference', () => {
     expect(a.navMode).toBe('simple');
   });
 
-  it('a garbage stored value (hand-edited / older build) falls back to Simple, never crashes', async () => {
+  it('a garbage stored value (hand-edited / older build) falls back to every menu, never crashes', async () => {
     const [u] = await t.db.insert(users).values({ email: `garbage-${Date.now()}@test.local`, name: 'g', passwordHash: 'x' }).returning();
     const { userCompanies } = await import('@/lib/db/schema');
     await t.db.insert(userCompanies).values({ userId: u.id, companyId: t.ctx.companyId, role: 'viewer' });
     await t.db.insert(userPreferences).values({ companyId: t.ctx.companyId, userId: u.id, prefs: { navMode: 'expert' } });
     const g: ServiceContext = { db: t.db, companyId: t.ctx.companyId, userId: u.id };
-    expect((await getMyPreferences(g)).navMode).toBe('simple');
+    expect((await getMyPreferences(g)).navMode).toBe('advanced');
   });
 });
 

@@ -1,6 +1,7 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useMemo, useState, useCallback } from 'react';
+import { NameField } from '@/components/NameField';
 import { RotateCcw, Plus, PlusCircle, MinusCircle, Pencil } from 'lucide-react';
 import {
   AmountInput,
@@ -198,12 +199,15 @@ interface NewMemoModalProps {
   nav?: React.ReactNode;
   onClose: () => void;
   customers: Customer[];
+  /** Quick Add put a new customer on the list. */
+  onCustomerAdded?: (c: Customer) => void;
   items: Item[];
   taxRates: TaxRate[];
   onCreated: () => void;
 }
 
-function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCreated, nav = null }: NewMemoModalProps) {
+function NewMemoModal({ open, editing, onClose, customers, onCustomerAdded, items, taxRates, onCreated, nav = null }: NewMemoModalProps) {
+  const customerChoices = useMemo(() => customers.map((c) => ({ id: c.id, label: c.displayName })), [customers]);
   const [customerId, setCustomerId] = useState('');
   const [date, setDate] = useState(() => todayISO());
   const [memoNote, setMemoNote] = useState('');
@@ -450,7 +454,7 @@ function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCr
         </>
       }
     >
-      <div className="space-y-4">
+      <div className="space-y-4" data-qb-tab-order="">
         {nav}
         {editing && (
           <div className="rounded-lg bg-amber-50 border border-amber-200 px-3 py-2 text-xs text-amber-800">
@@ -481,17 +485,16 @@ function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCr
         {/* Customer */}
         <div>
           <Label htmlFor="cm-customer">Customer *</Label>
-          <Select
+          <NameField
             id="cm-customer"
+            nameType="customer"
             value={customerId}
-            onChange={(e) => setCustomerId(e.target.value)}
+            choices={customerChoices}
+            onChange={setCustomerId}
+            onAdded={(n) => onCustomerAdded?.({ id: n.id, displayName: n.label })}
+            placeholder="Type a customer name…"
             autoFocus
-          >
-            <option value="">Select a customer…</option>
-            {customers.map((c) => (
-              <option key={c.id} value={c.id}>{c.displayName}</option>
-            ))}
-          </Select>
+          />
         </div>
 
         {/* Credit No. + Date */}
@@ -1126,6 +1129,7 @@ export default function CreditMemosPage() {
           setEditTarget(null);
         }}
         customers={customers}
+        onCustomerAdded={(c) => setCustomers((prev) => [...prev, c])}
         items={items}
         taxRates={taxRates}
         onCreated={fetchData}

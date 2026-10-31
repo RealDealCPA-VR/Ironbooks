@@ -1233,7 +1233,8 @@ export default function RecurringPage() {
                         variant="ghost"
                         size="sm"
                         onClick={() => setRunNowTarget(tpl)}
-                        title="Generate this document now"
+                        title="Generate this document now (Ctrl+U)"
+                        data-shortcut="use"
                       >
                         <Clock className="h-3.5 w-3.5" />
                         Enter Now

@@ -65,7 +65,10 @@ export default function PayrollReportsPage() {
   // State wage worksheet: the last finished quarter (the one the state report is due for).
   const [quarter, setQuarter] = useState(String(lastCompletedQuarter().quarter));
   const [wyear, setWyear] = useState(String(lastCompletedQuarter().year));
-  const [data, setData] = useState<unknown>(null);
+  // The answer and the report it answers: after the Report picker changes, the previous report's
+  // answer (or a late one) must never be drawn by the new report's view (it crashed on the shape).
+  const [result, setResult] = useState<{ report: ReportKey; body: unknown } | null>(null);
+  const data = result && result.report === report ? result.body : null;
   const [loading, setLoading] = useState(false);
 
   const run = useCallback(async () => {
@@ -75,9 +78,10 @@ export default function PayrollReportsPage() {
         report === 'state-wage'
           ? `/api/payroll/state-wage-worksheet?state=${encodeURIComponent(state)}&year=${wyear}&quarter=${quarter}`
           : `/api/payroll/reports?report=${report}&from=${from}&to=${to}`;
-      setData(await api.get(url));
+      const body = await api.get(url);
+      setResult({ report, body });
     } catch (err) {
-      setData(null);
+      setResult(null);
       toast(err instanceof ApiError ? err.message : 'Could not run the report.', 'danger');
     } finally {
       setLoading(false);
@@ -86,7 +90,7 @@ export default function PayrollReportsPage() {
 
   useEffect(() => {
     if (report !== 'state-wage') void run();
-    else setData(null);
+    else setResult(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [report]);
 

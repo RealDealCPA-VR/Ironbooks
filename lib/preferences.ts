@@ -308,8 +308,29 @@ export interface MyPreferences {
   startWithPayee: boolean;
   // Desktop
   showHomeWorkflow: boolean;
-  /** p1 ux: 'simple' = everyday tasks only (default for new users); 'advanced' = every menu. */
+  /**
+   * 'advanced' = every menu (the default: people coming from QuickBooks expect the full menus);
+   * 'simple' = everyday tasks only, for those who choose it.
+   */
   navMode: 'simple' | 'advanced';
+  /**
+   * Screen density: 'compact' fits more rows in lists, registers and forms (closer to the
+   * QuickBooks Desktop screens); 'comfortable' is the roomier layout.
+   */
+  density: 'comfortable' | 'compact';
+  /**
+   * QB Favorites menu (Alt+A in the desktop app): the pages this person put on it, in order
+   * (Favorites > Customize Favorites, components/FavoritesMenu.tsx).
+   */
+  favorites: string[];
+}
+
+/** Most pages on the Favorites menu (QuickBooks allows 30). */
+export const MAX_FAVORITES = 30;
+
+/** A Favorites entry: an in-app page path ('/invoices', '/reports/profit-loss'). */
+export function isFavoritePath(v: unknown): v is string {
+  return typeof v === 'string' && v.length <= 200 && /^\/[a-z0-9][a-z0-9\-/_]*$/i.test(v) && !v.includes('//');
 }
 
 export const DEFAULT_MY_PREFERENCES: MyPreferences = {
@@ -329,7 +350,9 @@ export const DEFAULT_MY_PREFERENCES: MyPreferences = {
   spellIgnoreInternetAddresses: true,
   startWithPayee: true,
   showHomeWorkflow: true,
-  navMode: 'simple',
+  navMode: 'advanced',
+  density: 'comfortable',
+  favorites: [],
 };
 
 export const MY_PREFERENCE_KEYS = Object.keys(DEFAULT_MY_PREFERENCES) as (keyof MyPreferences)[];
@@ -390,6 +413,7 @@ export const PREFERENCE_CATEGORIES: Array<{
       'autoRecallLastTransaction',
       'showHomeWorkflow',
       'navMode',
+      'density',
     ],
   },
   {
@@ -562,7 +586,10 @@ export function resolveCompanyPreferences(settings: unknown): CompanyPreferences
 export function resolveMyPreferences(stored: unknown): MyPreferences {
   // warnWhenDeleting is always on (lib/preferenceFields.ts `fixed`): deleting/voiding always asks.
   const my = { ...overlay(DEFAULT_MY_PREFERENCES, stored), warnWhenDeleting: true };
-  if (my.navMode !== 'advanced') my.navMode = 'simple';
+  if (my.navMode !== 'simple') my.navMode = 'advanced';
+  if (my.density !== 'compact') my.density = 'comfortable';
+  const favorites = Array.isArray(my.favorites) ? my.favorites.filter(isFavoritePath) : [];
+  my.favorites = [...new Set(favorites)].slice(0, MAX_FAVORITES);
   return my;
 }
 

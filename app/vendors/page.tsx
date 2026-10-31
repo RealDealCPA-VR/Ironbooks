@@ -29,6 +29,7 @@ import {
   toast,
 } from '@/components/ui';
 import { quickReportHref } from '@/lib/shortcuts';
+import { listItemPrefill } from '@/lib/keyboardTargets';
 import { api } from '@/lib/client';
 // wave2 prefs: default terms from Preferences + attachments on the record
 import { usePreferences } from '@/lib/usePreferences';
@@ -365,7 +366,7 @@ function VendorsPageContent() {
             </thead>
             <tbody>
               {vendors.map((v) => (
-                <Tr key={v.id} data-quick-report={quickReportHref('vendor', v.id)}>
+                <Tr key={v.id} data-quick-report={quickReportHref('vendor', v.id)} data-use-prefill={listItemPrefill({ vendorId: v.id })}>
                   <Td>
                     <div className="font-semibold text-navy">{v.displayName}</div>
                     {v.companyName && (

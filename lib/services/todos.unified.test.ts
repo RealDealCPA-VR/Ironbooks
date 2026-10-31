@@ -144,10 +144,10 @@ describe('migration 0039: one To Do store', () => {
     for (const id of [legacyOpen.id, legacyDone.id, legacyInactive.id, calDone.id]) await deleteTodo(t.ctx, id);
   });
 
-  it('existing members keep the full menu; brand-new members start in Simple mode', async () => {
+  it('existing members keep the full menu; brand-new members start with every menu too', async () => {
     // The owner created by the test kit existed when the migration ran again above.
     await t.db.delete(userPreferences).where(eq(userPreferences.userId, t.ctx.userId!));
-    expect((await getMyPreferences(t.ctx)).navMode).toBe('simple'); // a new user: no stored prefs
+    expect((await getMyPreferences(t.ctx)).navMode).toBe('advanced'); // a new user: no stored prefs
     await rerunMigration();
     expect((await getMyPreferences(t.ctx)).navMode).toBe('advanced');
   });
