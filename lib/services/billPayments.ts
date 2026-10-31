@@ -27,7 +27,7 @@
  */
 import { assertAccountantDatesOpen } from './accountantCopy/guard';
 import { overAppliedFixes } from '@/lib/errorFixes';
-import { isBankAccount, isPaymentSourceAccount } from '@/lib/accountTypes';
+import { isBankAccount, isCreditCardAccount, isPaymentSourceAccount } from '@/lib/accountTypes';
 import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import type Decimal from 'decimal.js';
 import { Money, toAmountString } from '@/lib/money';
@@ -236,6 +236,13 @@ async function preparePayment(ctx: ServiceContext, input: PayBillsInput): Promis
   if (input.method === 'check' && !isBankAccount(payAcct)) {
     throw validation(
       'A check is written on a bank account. Pick a bank account to pay from, or choose Credit Card as the payment method.',
+    );
+  }
+  // ... and a "Credit Card" payment is charged to a credit card account: one drawn on Checking was
+  // accepted, and the 1099 card-settled exclusion then left a bank-paid bill off the 1099s.
+  if (input.method === 'credit_card' && !isCreditCardAccount(payAcct)) {
+    throw validation(
+      'A credit card payment is charged to a credit card account. Pick the credit card to pay from, or choose another payment method (Check for a bank account).',
     );
   }
 

@@ -303,6 +303,31 @@ describe('vendor1099Report', () => {
 // ---------------------------------------------------------------------------
 
 describe('Pay Credit Card and reconciled loans', () => {
+  it('Pay Bills: a credit card payment drawn on a bank account is refused (the 1099 card exclusion keys on it)', async () => {
+    const v = await vendor('Card pay vendor');
+    const bill = await createBill(ctx, { vendorId: v.id, date: d('2026-03-01'), lines: [{ accountId: acct['6300'], amount: '40.00' }] });
+    await expectCode(
+      payBills(ctx, {
+        vendorId: v.id,
+        date: d('2026-03-05'),
+        method: 'credit_card',
+        paymentAccountId: acct['1000'],
+        applications: [{ billId: bill.id, amountApplied: '40.00' }],
+      }),
+      'VALIDATION',
+      /credit card account/,
+    );
+    // From the card itself it is fine.
+    const ok = await payBills(ctx, {
+      vendorId: v.id,
+      date: d('2026-03-05'),
+      method: 'credit_card',
+      paymentAccountId: acct['2100'],
+      applications: [{ billId: bill.id, amountApplied: '40.00' }],
+    });
+    expect(ok.method).toBe('credit_card');
+  });
+
   it('payCreditCard refuses a pay-from account that is not a bank account', async () => {
     await expectCode(
       payCreditCard(ctx, { creditCardAccountId: acct['2100'], paymentAccountId: acct['6300'], amount: '50.00', date: d('2026-03-05') }),

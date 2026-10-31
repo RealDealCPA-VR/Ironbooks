@@ -54,3 +54,14 @@ describe('Enter Bills: the due date follows the bill date and terms (D5)', () =>
     expect(src).toContain('dueTyped.current = Boolean(e.target.value);');
   });
 });
+
+describe('Pay Bills: the payment method follows the pay-from account', () => {
+  it('Edit Payment has a Method field and sends it (it always resent the saved method)', () => {
+    const src = fs.readFileSync('app/pay-bills/page.tsx', 'utf8');
+    expect(src).toContain('method: editMethod,');
+    expect(src).not.toContain('method: editPay.method,');
+    expect(src).toContain('id="ep-method"');
+    // Picking an account sets the matching method, on the Pay Bills form and in Edit Payment.
+    expect(src.match(/methodForAccount\(accounts\.find/g)?.length).toBe(2);
+  });
+});
