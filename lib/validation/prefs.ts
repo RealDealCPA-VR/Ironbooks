@@ -55,6 +55,16 @@ export const myPreferencesSchema = z
     bccMe: z.boolean(),
     showHomeWorkflow: z.boolean(),
     navMode: z.enum(['simple', 'advanced']),
+    // prefsperms A2: Desktop View, Search and Calendar.
+    startPage: z.enum(['home', 'last']),
+    showSearchBox: z.boolean(),
+    searchDefault: z.enum(['pages', 'everything']),
+    calendarView: z.enum(['day', 'week', 'month', 'last']),
+    calendarWeek: z.enum(['company', 'sun_sat', 'mon_sun', 'mon_fri']),
+    calendarShowEntered: z.boolean(),
+    calendarShowDue: z.boolean(),
+    calendarPastDueDays: z.number().int('must be a whole number of days').min(0).max(365),
+    calendarUpcomingDays: z.number().int('must be a whole number of days').min(0).max(365),
   })
   .partial()
   .strict();

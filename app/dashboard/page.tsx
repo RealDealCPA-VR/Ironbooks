@@ -21,7 +21,7 @@ import { listAccounts } from '@/lib/services/accounts';
 import { trialBalance } from '@/lib/services/reports';
 import { allWorkflowHrefs, buildAccountBalances } from '@/lib/homeWorkflow';
 import { getPreferences } from '@/lib/services/company';
-import { featureHiddenPaths } from '@/lib/preferences';
+import { featureHiddenPaths, homeIconHiddenHrefs } from '@/lib/preferences';
 import { pageAccessFor } from '@/lib/permissions/routes';
 import type { ServiceContext } from '@/lib/services/_base';
 import HomeWorkflow from '@/components/HomeWorkflow';
@@ -57,11 +57,14 @@ const CHART = {
  * feature is on (Preferences). The Home diagram shows only these, like QB hides icons.
  */
 async function allowedWorkflowHrefs(ctx: ServiceContext): Promise<string[]> {
-  const hidden = featureHiddenPaths(await getPreferences(ctx));
+  const prefs = await getPreferences(ctx);
+  const hidden = featureHiddenPaths(prefs);
+  // prefsperms A2: Preferences > Desktop View "Show icons on the Home page".
+  const iconsOff = homeIconHiddenHrefs(prefs);
   return allWorkflowHrefs().filter((href) => {
     if (href.startsWith('#')) return true;
     const path = href.split('?')[0];
-    if (hidden.has(path)) return false;
+    if (hidden.has(path) || iconsOff.has(path)) return false;
     // prefsperms: the step's activity (Invoices, Pay Bills, …), else its area.
     const need = pageAccessFor(path);
     if (!ctx.access || !need) return true;
@@ -109,7 +112,7 @@ export default async function DashboardPage({ searchParams }: { searchParams: Pr
       <HomeTabs active="overview" />
 
       {/* QuickBooks-style workflow diagram: click any step to start that task
-          (My Preferences > General can hide it). */}
+          (My Preferences > Desktop View can hide it). */}
       {myPrefs.showHomeWorkflow && (
         <HomeWorkflow balances={balances} allowedHrefs={allowedHrefs} showBalances={showBalances} />
       )}

@@ -12,7 +12,7 @@
  *    decimal point" (amount fields), and the remembered default date on new transaction forms.
  */
 import * as React from 'react';
-import { usePathname } from 'next/navigation';
+import { usePathname, useRouter } from 'next/navigation';
 import { setWriteHooks } from '@/lib/client';
 import { usePreferences } from '@/lib/usePreferences';
 import {
@@ -25,6 +25,8 @@ import {
   transactionTarget,
 } from '@/lib/prefBehaviors';
 import { PAGE_FORM_KEYS, formKeyForSave, recallFormDate, rememberFormDate } from '@/lib/smartDefaults';
+import { useMe } from '@/lib/usePermissions';
+import { isRestorablePath, lastPageKey, startPageTarget, startedKey } from '@/lib/startPage';
 
 const DATA_CHANGED_KEY = 'bka:dataChangedAt';
 
@@ -63,8 +65,33 @@ function labelTextFor(el: HTMLInputElement): string {
 export default function PreferenceBehaviors() {
   const prefs = usePreferences();
   const pathname = usePathname() || '';
+  const router = useRouter();
+  const { me } = useMe();
   const ref = React.useRef(prefs);
   ref.current = prefs;
+
+  // ---- Desktop View "When I open a company file" (prefsperms A2, lib/startPage.ts) ----
+  // The first page of each opening of a company file may jump to where the person left off;
+  // after that every page they visit is remembered (on this computer, per person and file).
+  React.useEffect(() => {
+    if (!prefs.loaded || !me?.id || !me.companyId) return;
+    try {
+      const startKey = startedKey(me.id, me.companyId);
+      const lastKey = lastPageKey(me.id, me.companyId);
+      if (!sessionStorage.getItem(startKey)) {
+        sessionStorage.setItem(startKey, '1');
+        const target = startPageTarget(prefs.my.startPage, pathname, localStorage.getItem(lastKey));
+        if (target) {
+          router.replace(target);
+          return;
+        }
+      }
+      const here = pathname + window.location.search;
+      if (isRestorablePath(here)) localStorage.setItem(lastKey, here);
+    } catch {
+      /* storage unavailable: always start at Home */
+    }
+  }, [prefs.loaded, prefs.my.startPage, me?.id, me?.companyId, pathname, router]);
 
   // ---- save-time prompts + after-save effects (API client write hooks) ----
   React.useEffect(() => {

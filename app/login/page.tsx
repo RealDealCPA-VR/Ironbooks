@@ -16,6 +16,7 @@ import { AccessKeyText } from '@/components/AccessKey';
 import { api } from '@/lib/client';
 import { safeNext } from '@/lib/safeNext';
 import { afterFailedSignIn } from '@/lib/loginForm';
+import { clearStartedFlags } from '@/lib/startPage';
 
 interface FileInfo {
   companyName: string | null;
@@ -128,6 +129,9 @@ export default function LoginPage() {
       } catch {
         /* the shell is optional */
       }
+      // prefsperms A2 (Desktop View): this sign-in opens the company file again, so "where I left
+      // off" may apply once more (lib/startPage.ts).
+      clearStartedFlags();
       // Only a page of this app (never another site or a javascript: URL — lib/safeNext.ts).
       const next = safeNext(new URLSearchParams(window.location.search).get('next'), '/dashboard', ['/login']);
       // gapsb K: an expired password (or one an Admin asked to change) must be replaced first.

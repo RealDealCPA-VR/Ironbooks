@@ -247,6 +247,20 @@ export interface CompanyPreferences {
   payrollStandardHours: number;
   payrollExpenseAccountId: string | null;
   payrollLiabilityAccountId: string | null;
+  // Desktop View (prefsperms A2): QB "Show icons on the Home page" (Company Preferences).
+  /** Sales Receipts on the Home page workflow. */
+  homeShowSalesReceipts: boolean;
+  /** Statements and Statement Charges on the Home page workflow. */
+  homeShowStatements: boolean;
+  /** Enter Bills and Pay Bills on the Home page workflow. */
+  homeShowBills: boolean;
+  // Integrated Applications (prefsperms A2): what may reach the company file besides the app.
+  /** QB "Don't allow any applications to access this company file". */
+  integratedAppsBlocked: boolean;
+  /** The employee self-service portal (pay stubs) may sign employees in. */
+  allowEmployeePortal: boolean;
+  /** Phone receipt-capture links may upload into this company file. */
+  allowPhoneReceipts: boolean;
 }
 
 // Feature switches default to ON (class tracking, progress invoicing and units of measure too) so
@@ -313,6 +327,12 @@ export const DEFAULT_COMPANY_PREFERENCES: CompanyPreferences = {
   payrollStandardHours: 40,
   payrollExpenseAccountId: null,
   payrollLiabilityAccountId: null,
+  homeShowSalesReceipts: true,
+  homeShowStatements: true,
+  homeShowBills: true,
+  integratedAppsBlocked: false,
+  allowEmployeePortal: true,
+  allowPhoneReceipts: true,
 };
 
 /** Per-user ("My Preferences") settings. */
@@ -353,6 +373,29 @@ export interface MyPreferences {
   showHomeWorkflow: boolean;
   /** p1 ux: 'simple' = everyday tasks only (default for new users); 'advanced' = every menu. */
   navMode: 'simple' | 'advanced';
+  /**
+   * Desktop View (prefsperms A2): QB "Show Home page when opening a company file" / "Save the
+   * desktop": 'home' opens Home, 'last' goes back to the page I was on when I left.
+   */
+  startPage: 'home' | 'last';
+  // Search (prefsperms A2): QB My Preferences > Search.
+  /** Show the search box in the menu (QB "Show Search field in the Icon Bar"). */
+  showSearchBox: boolean;
+  /** What Enter searches: pages only, or everything in the company file (names, transactions). */
+  searchDefault: 'pages' | 'everything';
+  // Calendar (prefsperms A2): QB My Preferences > Calendar.
+  /** The view the calendar opens in ('last' = the one I used last). */
+  calendarView: 'day' | 'week' | 'month' | 'last';
+  /** Weekly view: which days ('company' = the first day of the week from Time & Expenses). */
+  calendarWeek: 'company' | 'sun_sat' | 'mon_sun' | 'mon_fri';
+  /** Show transactions entered on each day. */
+  calendarShowEntered: boolean;
+  /** Show transactions due on each day. */
+  calendarShowDue: boolean;
+  /** Upcoming & Past Due list: past-due items from this many days back. */
+  calendarPastDueDays: number;
+  /** Upcoming & Past Due list: items due within this many days. */
+  calendarUpcomingDays: number;
 }
 
 export const DEFAULT_MY_PREFERENCES: MyPreferences = {
@@ -376,6 +419,15 @@ export const DEFAULT_MY_PREFERENCES: MyPreferences = {
   bccMe: false,
   showHomeWorkflow: true,
   navMode: 'simple',
+  startPage: 'home',
+  showSearchBox: true,
+  searchDefault: 'pages',
+  calendarView: 'month',
+  calendarWeek: 'company',
+  calendarShowEntered: true,
+  calendarShowDue: true,
+  calendarPastDueDays: 30,
+  calendarUpcomingDays: 7,
 };
 
 export const MY_PREFERENCE_KEYS = Object.keys(DEFAULT_MY_PREFERENCES) as (keyof MyPreferences)[];
@@ -391,6 +443,11 @@ export const PREFERENCE_CATEGORIES: Array<{
   label: string;
   company: (keyof CompanyPreferences)[];
   my: (keyof MyPreferences)[];
+  /**
+   * prefsperms A2: a plain explanation shown on a tab, for QB settings Ironbooks fixes on
+   * (Search's "Update automatically": search always reads the live file).
+   */
+  notes?: { company?: string; my?: string };
 }> = [
   {
     id: 'accounting',
@@ -434,7 +491,6 @@ export const PREFERENCE_CATEGORIES: Array<{
       'warnWhenDeleting',
       'defaultDate',
       'autoRecallLastTransaction',
-      'showHomeWorkflow',
       'navMode',
     ],
   },
@@ -529,6 +585,46 @@ export const PREFERENCE_CATEGORIES: Array<{
     my: [],
   },
   { id: 'currencies', label: 'Multiple Currencies', company: ['multiCurrencyEnabled'], my: [] },
+  // prefsperms A2: the QB categories that were missing.
+  {
+    id: 'calendar',
+    label: 'Calendar',
+    company: [],
+    my: ['calendarView', 'calendarWeek', 'calendarShowEntered', 'calendarShowDue', 'calendarPastDueDays', 'calendarUpcomingDays'],
+  },
+  {
+    id: 'desktop',
+    label: 'Desktop View',
+    company: ['homeShowSalesReceipts', 'homeShowStatements', 'homeShowBills'],
+    my: ['showHomeWorkflow', 'startPage'],
+    notes: {
+      my: 'Ironbooks always works in one window, so QuickBooks\' "One window / Multiple windows" choice does not apply. Colors and light or dark mode are under Appearance.',
+      company: 'Estimates, sales orders, sales tax, inventory, payroll and time tracking show on the Home page when they are turned on in their own preferences.',
+    },
+  },
+  // Finance Charge: edited by its own pane (app/settings/FinanceChargePreference.tsx); the
+  // settings live in companies.settings.financeCharges (lib/services/financeCharges.ts).
+  { id: 'financeCharge', label: 'Finance Charge', company: [], my: [] },
+  {
+    id: 'integratedApps',
+    label: 'Integrated Applications',
+    company: ['integratedAppsBlocked', 'allowEmployeePortal', 'allowPhoneReceipts'],
+    my: [],
+    notes: {
+      company:
+        'Ironbooks has no add-on programs that connect to the company file the way QuickBooks SDK applications do, so there is no certificate list. These are the ways something other than Ironbooks\' own screens can reach this file. Cloud AI and email are controlled under Privacy & Network; other computers on your network under Multi-user.',
+    },
+  },
+  {
+    id: 'search',
+    label: 'Search',
+    company: [],
+    my: ['showSearchBox', 'searchDefault'],
+    notes: {
+      company:
+        'Search always looks at the company file as it is right now, so there is no search index to update (QuickBooks\' "Update automatically" setting is not needed).',
+    },
+  },
   {
     id: 'payroll',
     label: 'Payroll & Employees',
@@ -609,6 +705,13 @@ export function resolveMyPreferences(stored: unknown): MyPreferences {
   // warnWhenDeleting is always on (lib/preferenceFields.ts `fixed`): deleting/voiding always asks.
   const my = { ...overlay(DEFAULT_MY_PREFERENCES, stored), warnWhenDeleting: true };
   if (my.navMode !== 'advanced') my.navMode = 'simple';
+  if (my.startPage !== 'last') my.startPage = 'home';
+  if (my.searchDefault !== 'everything') my.searchDefault = 'pages';
+  if (!['day', 'week', 'month', 'last'].includes(my.calendarView)) my.calendarView = 'month';
+  if (!['company', 'sun_sat', 'mon_sun', 'mon_fri'].includes(my.calendarWeek)) my.calendarWeek = 'company';
+  const days = (v: unknown, def: number) => (Number.isInteger(v) && (v as number) >= 0 && (v as number) <= 365 ? (v as number) : def);
+  my.calendarPastDueDays = days(my.calendarPastDueDays, DEFAULT_MY_PREFERENCES.calendarPastDueDays);
+  my.calendarUpcomingDays = days(my.calendarUpcomingDays, DEFAULT_MY_PREFERENCES.calendarUpcomingDays);
   return my;
 }
 
@@ -682,6 +785,23 @@ export function addDaysIso(iso: string, days: number): string {
 export function dueDateForTerms(dateIso: string, terms: string | null | undefined): string {
   if (!dateIso || !terms || !(terms in TERMS_DAYS)) return '';
   return addDaysIso(dateIso, TERMS_DAYS[terms as TermsValue]);
+}
+
+/**
+ * Desktop View > "Show icons on the Home page" (prefsperms A2): the Home workflow steps the company
+ * turned off. Only the Home icons: the pages stay in the menus (QB hides just the icons).
+ */
+export function homeIconHiddenHrefs(
+  prefs: Pick<CompanyPreferences, 'homeShowSalesReceipts' | 'homeShowStatements' | 'homeShowBills'>,
+): Set<string> {
+  const out = new Set<string>();
+  if (prefs.homeShowSalesReceipts === false) out.add('/sales-receipts');
+  if (prefs.homeShowStatements === false) out.add('/reports/statements');
+  if (prefs.homeShowBills === false) {
+    out.add('/bills');
+    out.add('/pay-bills');
+  }
+  return out;
 }
 
 /** Account label honoring "Show account numbers" and the Reports account-display preference. */

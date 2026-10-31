@@ -154,6 +154,13 @@ export const companySettingsSchema = z.object({
   defaultMarkupPercent: z.number().min(0).max(1000).optional(),
   // Multiple Currencies
   multiCurrencyEnabled: z.boolean().optional(),
+  // prefsperms A2: Desktop View (Home page icons) and Integrated Applications.
+  homeShowSalesReceipts: z.boolean().optional(),
+  homeShowStatements: z.boolean().optional(),
+  homeShowBills: z.boolean().optional(),
+  integratedAppsBlocked: z.boolean().optional(),
+  allowEmployeePortal: z.boolean().optional(),
+  allowPhoneReceipts: z.boolean().optional(),
 });
 export type CompanySettingsBody = z.infer<typeof companySettingsSchema>;
 
