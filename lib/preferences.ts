@@ -35,6 +35,12 @@ export const REMINDER_KEYS = [
   'moneyToDeposit',
   'purchaseOrdersToPrint',
   'toDoNotes',
+  // J7 (feature round, accountant): the rest of QB's Reminders list.
+  'almostDueInvoices',
+  'overdueBills',
+  'paychecksToPrint',
+  'assembliesToBuild',
+  'liabilitiesDue',
 ] as const;
 export type ReminderKey = (typeof REMINDER_KEYS)[number];
 export type ReminderMode = 'summary' | 'list' | 'off';
@@ -56,6 +62,11 @@ export const REMINDER_LABELS: Record<ReminderKey, string> = {
   moneyToDeposit: 'Money to deposit',
   purchaseOrdersToPrint: 'Open purchase orders',
   toDoNotes: 'To-dos',
+  almostDueInvoices: 'Almost due invoices',
+  overdueBills: 'Overdue bills',
+  paychecksToPrint: 'Paychecks to print',
+  assembliesToBuild: 'Assemblies to build',
+  liabilitiesDue: 'Payroll liabilities due',
 };
 
 export const DEFAULT_REMINDERS: Record<ReminderKey, ReminderSetting> = {
@@ -70,6 +81,12 @@ export const DEFAULT_REMINDERS: Record<ReminderKey, ReminderSetting> = {
   moneyToDeposit: { mode: 'summary', days: 0 },
   purchaseOrdersToPrint: { mode: 'summary', days: 5 },
   toDoNotes: { mode: 'list', days: 0 },
+  // QB: almost due invoices 5 days before the due date; liabilities 5 days before they are due.
+  almostDueInvoices: { mode: 'summary', days: 5 },
+  overdueBills: { mode: 'summary', days: 0 },
+  paychecksToPrint: { mode: 'summary', days: 5 },
+  assembliesToBuild: { mode: 'summary', days: 0 },
+  liabilitiesDue: { mode: 'summary', days: 5 },
 };
 
 export const FORM_TYPES = [

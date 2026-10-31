@@ -7,12 +7,18 @@
  * look-ahead window in days. Categories the member can't view (Users & Roles) are left out, and
  * a failing source never breaks the rest of the list.
  */
-import { and, eq, gt, inArray, isNull, lte, sql } from 'drizzle-orm';
+import { and, eq, gt, gte, inArray, isNull, lte, sql } from 'drizzle-orm';
 import {
+  assemblyComponents,
   bills,
   customers,
+  employees,
   expenses,
   invoices,
+  items as itemsTable,
+  paychecks,
+  paymentsReceived,
+  pendingBuilds,
   purchaseOrders,
   recurringTemplates,
   salesOrders,
@@ -34,14 +40,21 @@ import { getPreferences } from './company';
 import { listUndepositedPayments } from './deposits';
 import { reorderReport } from './inventoryOps';
 import { todosToRemind } from './todos';
+import { payrollLiabilityBalances } from './payrollReports';
+import { effectiveHomeCurrency } from './multiCurrency';
 
 export interface ReminderItem {
   id: string;
   label: string;
   /** 'YYYY-MM-DD' (due / scheduled / document date). */
   date: string | null;
+  /** In the document's own currency (see `currency`). */
   amount: string | null;
   href: string;
+  /** Foreign-currency documents: their currency code (null / absent = home currency). */
+  currency?: string | null;
+  /** Foreign-currency documents: the amount in home currency at the document's exchange rate. */
+  homeAmount?: string | null;
 }
 
 export interface ReminderSection {
@@ -73,6 +86,11 @@ const AREA: Record<ReminderKey, Area | null> = {
   moneyToDeposit: 'banking',
   purchaseOrdersToPrint: 'vendors',
   toDoNotes: null,
+  almostDueInvoices: 'customers',
+  overdueBills: 'vendors',
+  paychecksToPrint: 'payroll',
+  assembliesToBuild: 'inventory',
+  liabilitiesDue: 'payroll',
 };
 
 const HREF: Record<ReminderKey, string> = {
@@ -87,7 +105,35 @@ const HREF: Record<ReminderKey, string> = {
   moneyToDeposit: '/deposits',
   purchaseOrdersToPrint: '/purchase-orders',
   toDoNotes: '/todos',
+  almostDueInvoices: '/reports/open-invoices',
+  overdueBills: '/pay-bills',
+  paychecksToPrint: '/print-checks',
+  assembliesToBuild: '/assemblies',
+  liabilitiesDue: '/pay-liabilities',
 };
+
+/**
+ * A foreign-currency document's amount with its home value at the document's exchange rate (the
+ * value the books carry it at), so a section total never adds euros to dollars.
+ */
+function fx(amount: string | null, currency: string | null | undefined, rate: string | null | undefined, home: string) {
+  if (amount === null || !currency || currency.toUpperCase() === home) return { amount, currency: null, homeAmount: null };
+  const r = rate && !Money.isZero(rate) ? Money.of(rate) : Money.of(1);
+  return { amount, currency: currency.toUpperCase(), homeAmount: toAmountString(Money.of(amount).times(r)) };
+}
+
+/** The 15th of the month after `iso` ('YYYY-MM-DD'): when a monthly depositor's payroll taxes are due. */
+function fifteenthOfNextMonth(iso: string): string {
+  const [y, m] = iso.split('-').map(Number);
+  const d = new Date(Date.UTC(y, m, 15));
+  return d.toISOString().slice(0, 10);
+}
+
+/** Last day of the month before `iso`. */
+function endOfPreviousMonth(iso: string): string {
+  const [y, m] = iso.split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1, 0)).toISOString().slice(0, 10);
+}
 
 function isoDay(d: Date | string | null | undefined): string | null {
   if (!d) return null;
@@ -108,15 +154,24 @@ function printFlag(table: unknown): unknown {
   return (table as Record<string, unknown>).toBePrinted;
 }
 
-type Source = (ctx: ServiceContext, today: string, days: number) => Promise<ReminderItem[]>;
+/** Per-request facts a few sources share (home currency, whether a split category is on). */
+interface SourceEnv {
+  home: string;
+  /** Overdue bills have their own section (Preferences), so Bills to pay lists the ones not yet due. */
+  overdueBillsShown: boolean;
+}
+
+type Source = (ctx: ServiceContext, today: string, days: number, env: SourceEnv) => Promise<ReminderItem[]>;
 
 const SOURCES: Record<ReminderKey, Source> = {
-  async checksToPrint(ctx) {
+  async checksToPrint(ctx, _today, _days, env) {
     const rows = await ctx.db
       .select({
         id: expenses.id,
         date: expenses.date,
         total: expenses.total,
+        currency: expenses.currency,
+        rate: expenses.exchangeRate,
         payeeName: expenses.payeeName,
         vendorName: vendors.displayName,
       })
@@ -127,7 +182,7 @@ const SOURCES: Record<ReminderKey, Source> = {
       id: r.id,
       label: `Check to ${r.vendorName ?? r.payeeName ?? 'payee'}`,
       date: isoDay(r.date),
-      amount: r.total,
+      ...fx(r.total, r.currency, r.rate, env.home),
       href: '/print-checks',
     }));
   },
@@ -141,7 +196,7 @@ const SOURCES: Record<ReminderKey, Source> = {
       .where(and(eq(invoices.companyId, ctx.companyId), eq(flag as never, true)));
     return rows.map((r) => ({ id: r.id, label: `Invoice ${r.n} — ${r.customer}`, date: isoDay(r.date), amount: r.total, href: `/invoices?focus=${r.id}` }));
   },
-  async overdueInvoices(ctx, today, days) {
+  async overdueInvoices(ctx, today, days, env) {
     // QB: "remind me N days after the due date".
     const cutoff = endOfDay(addDaysIso(today, -days - 1));
     const rows = await ctx.db
@@ -150,6 +205,8 @@ const SOURCES: Record<ReminderKey, Source> = {
         n: sql<string>`COALESCE(NULLIF(${invoices.refNumber}, ''), CAST(${invoices.invoiceNumber} AS TEXT))`,
         due: invoices.dueDate,
         balance: invoices.balanceDue,
+        currency: invoices.currency,
+        rate: invoices.exchangeRate,
         customer: customers.displayName,
       })
       .from(invoices)
@@ -166,7 +223,38 @@ const SOURCES: Record<ReminderKey, Source> = {
       id: r.id,
       label: `Invoice ${r.n} — ${r.customer}`,
       date: isoDay(r.due),
-      amount: r.balance,
+      ...fx(r.balance, r.currency, r.rate, env.home),
+      href: `/invoices?focus=${r.id}`,
+    }));
+  },
+  async almostDueInvoices(ctx, today, days, env) {
+    // QB "Almost Due Invoices": open invoices due within the next N days (not yet overdue).
+    const rows = await ctx.db
+      .select({
+        id: invoices.id,
+        n: sql<string>`COALESCE(NULLIF(${invoices.refNumber}, ''), CAST(${invoices.invoiceNumber} AS TEXT))`,
+        due: invoices.dueDate,
+        balance: invoices.balanceDue,
+        currency: invoices.currency,
+        rate: invoices.exchangeRate,
+        customer: customers.displayName,
+      })
+      .from(invoices)
+      .innerJoin(customers, eq(customers.id, invoices.customerId))
+      .where(
+        and(
+          eq(invoices.companyId, ctx.companyId),
+          inArray(invoices.status, ['open', 'partial', 'overdue']),
+          gt(invoices.balanceDue, '0'),
+          gte(invoices.dueDate, new Date(`${today}T00:00:00.000Z`)),
+          lte(invoices.dueDate, endOfDay(addDaysIso(today, days))),
+        ),
+      );
+    return rows.map((r) => ({
+      id: r.id,
+      label: `Invoice ${r.n} — ${r.customer}`,
+      date: isoDay(r.due),
+      ...fx(r.balance, r.currency, r.rate, env.home),
       href: `/invoices?focus=${r.id}`,
     }));
   },
@@ -203,28 +291,102 @@ const SOURCES: Record<ReminderKey, Source> = {
       href: '/inventory-ops',
     }));
   },
-  async billsToPay(ctx, today, days) {
+  async billsToPay(ctx, today, days, env) {
+    const horizon = addDaysIso(today, days);
+    // With Overdue bills on, this section is the bills coming due (QB lists the two apart).
+    return (await openBillItems(ctx, env)).filter(
+      (b) => (b.date ?? '') <= horizon && (!env.overdueBillsShown || (b.date ?? '') >= today),
+    );
+  },
+  async overdueBills(ctx, today, _days, env) {
+    return (await openBillItems(ctx, env))
+      .filter((b) => (b.date ?? '') < today)
+      .map((b) => ({ ...b, label: `${b.label} (overdue)` }));
+  },
+  async paychecksToPrint(ctx, today, days) {
+    // Paychecks queued for Print Checks (number stamped when printed), dated within the window.
     const rows = await ctx.db
-      .select({ id: bills.id, n: bills.billNumber, due: bills.dueDate, date: bills.date, balance: bills.balanceDue, vendor: vendors.displayName })
-      .from(bills)
-      .innerJoin(vendors, eq(vendors.id, bills.vendorId))
-      .where(
-        and(
-          eq(bills.companyId, ctx.companyId),
-          inArray(bills.status, ['open', 'partial', 'overdue']),
-          gt(bills.balanceDue, '0'),
-        ),
-      );
+      .select({
+        id: paychecks.id,
+        date: paychecks.payDate,
+        net: paychecks.netPay,
+        first: employees.firstName,
+        last: employees.lastName,
+      })
+      .from(paychecks)
+      .innerJoin(employees, eq(employees.id, paychecks.employeeId))
+      .where(and(eq(paychecks.companyId, ctx.companyId), eq(paychecks.toPrint, true), isNull(paychecks.voidedAt), eq(paychecks.entryType, 'paycheck')));
     const horizon = addDaysIso(today, days);
     return rows
-      .filter((r) => (isoDay(r.due ?? r.date) ?? '') <= horizon)
+      .filter((r) => (isoDay(r.date) ?? '') <= horizon)
       .map((r) => ({
         id: r.id,
-        label: `Bill${r.n ? ` ${r.n}` : ''} — ${r.vendor}`,
-        date: isoDay(r.due ?? r.date),
-        amount: r.balance,
-        href: '/pay-bills',
+        label: `Paycheck to ${`${r.first ?? ''} ${r.last ?? ''}`.trim() || 'employee'}`,
+        date: isoDay(r.date),
+        amount: r.net,
+        href: '/print-checks',
       }));
+  },
+  async assembliesToBuild(ctx) {
+    // QB "Assemblies to Build": pending builds waiting on components, and assemblies at or below
+    // their build point (the assembly's reorder point) with no pending build for them.
+    const pending = await ctx.db
+      .select({ id: pendingBuilds.id, itemId: pendingBuilds.assemblyItemId, qty: pendingBuilds.quantity, date: pendingBuilds.date, name: itemsTable.name })
+      .from(pendingBuilds)
+      .innerJoin(itemsTable, eq(itemsTable.id, pendingBuilds.assemblyItemId))
+      .where(and(eq(pendingBuilds.companyId, ctx.companyId), eq(pendingBuilds.status, 'pending')));
+    const out: ReminderItem[] = pending.map((p) => ({
+      id: p.id,
+      label: `Pending build: ${Number(p.qty)} × ${p.name}`,
+      date: isoDay(p.date),
+      amount: null,
+      href: '/assemblies',
+    }));
+    const queued = new Set(pending.map((p) => p.itemId));
+    const assemblies = await ctx.db
+      .selectDistinct({ id: itemsTable.id, name: itemsTable.name, onHand: itemsTable.quantityOnHand, point: itemsTable.reorderPoint })
+      .from(itemsTable)
+      .innerJoin(assemblyComponents, eq(assemblyComponents.assemblyItemId, itemsTable.id))
+      .where(and(eq(itemsTable.companyId, ctx.companyId), eq(itemsTable.isActive, true)));
+    for (const a of assemblies) {
+      if (a.point === null || queued.has(a.id)) continue;
+      if (Money.lte(a.onHand ?? 0, a.point)) {
+        out.push({
+          id: a.id,
+          label: `${a.name}: ${Number(a.onHand ?? 0)} on hand (build point ${Number(a.point)})`,
+          date: null,
+          amount: null,
+          href: '/assemblies',
+        });
+      }
+    }
+    return out;
+  },
+  async liabilitiesDue(ctx, today, days) {
+    // Payroll taxes and withholdings by payroll item, due on the monthly deposit schedule: what was
+    // owed at the end of last month is due on the 15th of this month (overdue after it), what has
+    // accrued since is due on the 15th of next month (shown once inside the look-ahead window).
+    const prevEnd = endOfPreviousMonth(today);
+    const before = await payrollLiabilityBalances(ctx, { asOf: new Date(`${prevEnd}T12:00:00.000Z`) });
+    const now = await payrollLiabilityBalances(ctx, { asOf: new Date(`${today}T12:00:00.000Z`) });
+    const dueThisMonth = fifteenthOfNextMonth(prevEnd);
+    const dueNextMonth = fifteenthOfNextMonth(today);
+    const horizon = addDaysIso(today, days);
+    const out: ReminderItem[] = [];
+    const prior = new Map(before.items.map((i) => [i.name, i]));
+    for (const it of now.items) {
+      const was = Money.of(prior.get(it.name)?.balance ?? 0);
+      const is = Money.of(it.balance);
+      const owedThen = was.isPositive() ? (was.lessThan(is) ? was : is) : Money.zero();
+      const accruedSince = Money.of(it.balance).minus(owedThen);
+      if (owedThen.isPositive()) {
+        out.push({ id: `${it.name}:${dueThisMonth}`, label: `${it.name}${dueThisMonth < today ? ' (overdue)' : ''}`, date: dueThisMonth, amount: toAmountString(owedThen), href: '/pay-liabilities' });
+      }
+      if (accruedSince.isPositive() && dueNextMonth <= horizon) {
+        out.push({ id: `${it.name}:${dueNextMonth}`, label: it.name, date: dueNextMonth, amount: toAmountString(accruedSince), href: '/pay-liabilities' });
+      }
+    }
+    return out;
   },
   async memorizedTransactionsDue(ctx, today, days) {
     const rows = await ctx.db
@@ -242,13 +404,34 @@ const SOURCES: Record<ReminderKey, Source> = {
         href: '/recurring',
       }));
   },
-  async moneyToDeposit(ctx) {
+  async moneyToDeposit(ctx, _today, _days, env) {
     const rows = await listUndepositedPayments(ctx);
+    // Foreign customer payments: their own exchange rate (invoice payment lines: the invoice's).
+    const foreign = rows.filter((r) => r.currency && r.currency.toUpperCase() !== env.home);
+    const rates = new Map<string, string | null>();
+    const payIds = foreign.filter((r) => r.kind === 'payment').map((r) => r.id);
+    const invIds = foreign.filter((r) => r.kind === 'invoice_payment').map((r) => r.id);
+    if (payIds.length) {
+      for (const p of await ctx.db
+        .select({ id: paymentsReceived.id, rate: paymentsReceived.exchangeRate })
+        .from(paymentsReceived)
+        .where(and(eq(paymentsReceived.companyId, ctx.companyId), inArray(paymentsReceived.id, payIds)))) {
+        rates.set(p.id, p.rate);
+      }
+    }
+    if (invIds.length) {
+      for (const i of await ctx.db
+        .select({ id: invoices.id, rate: invoices.exchangeRate })
+        .from(invoices)
+        .where(and(eq(invoices.companyId, ctx.companyId), inArray(invoices.id, invIds)))) {
+        rates.set(i.id, i.rate);
+      }
+    }
     return rows.map((r) => ({
       id: r.id,
       label: `${r.kind === 'payment' ? 'Payment' : 'Sales receipt'} from ${r.customerName ?? 'customer'}`,
       date: isoDay(r.date),
-      amount: r.amount,
+      ...fx(r.amount, r.currency, rates.get(r.id) ?? null, env.home),
       href: '/deposits',
     }));
   },
@@ -276,6 +459,31 @@ const SOURCES: Record<ReminderKey, Source> = {
   },
 };
 
+/** Open bills (balance in the bill's currency, home value at its rate), dated by due date. */
+async function openBillItems(ctx: ServiceContext, env: SourceEnv): Promise<ReminderItem[]> {
+  const rows = await ctx.db
+    .select({
+      id: bills.id,
+      n: bills.billNumber,
+      due: bills.dueDate,
+      date: bills.date,
+      balance: bills.balanceDue,
+      currency: bills.currency,
+      rate: bills.exchangeRate,
+      vendor: vendors.displayName,
+    })
+    .from(bills)
+    .innerJoin(vendors, eq(vendors.id, bills.vendorId))
+    .where(and(eq(bills.companyId, ctx.companyId), inArray(bills.status, ['open', 'partial', 'overdue']), gt(bills.balanceDue, '0')));
+  return rows.map((r) => ({
+    id: r.id,
+    label: `Bill${r.n ? ` ${r.n}` : ''} — ${r.vendor}`,
+    date: isoDay(r.due ?? r.date),
+    ...fx(r.balance, r.currency, r.rate, env.home),
+    href: '/pay-bills',
+  }));
+}
+
 function canView(ctx: ServiceContext, area: Area | null): boolean {
   if (!area || !ctx.access) return true;
   return can(ctx.access, area, 'view');
@@ -285,21 +493,32 @@ export async function getReminders(ctx: ServiceContext, opts: { today?: string }
   const prefs = await getPreferences(ctx);
   const today = opts.today ?? todayInTimeZone(prefs.timezone);
   const sections: ReminderSection[] = [];
+  let home = 'USD';
+  try {
+    home = ((await effectiveHomeCurrency(ctx)) ?? 'USD').toUpperCase();
+  } catch {
+    /* no currency list: every amount is home currency */
+  }
+  const env: SourceEnv = {
+    home,
+    overdueBillsShown: prefs.reminders.overdueBills.mode !== 'off' && canView(ctx, AREA.overdueBills),
+  };
   for (const key of REMINDER_KEYS) {
     const setting = prefs.reminders[key];
     if (setting.mode === 'off' || !canView(ctx, AREA[key])) continue;
     let items: ReminderItem[];
     try {
-      items = await SOURCES[key](ctx, today, setting.days);
+      items = await SOURCES[key](ctx, today, setting.days, env);
     } catch (err) {
       console.warn(`[reminders] ${key} unavailable:`, err instanceof Error ? err.message : err);
       continue;
     }
     if (items.length === 0) continue;
     items.sort((a, b) => (a.date ?? '').localeCompare(b.date ?? ''));
+    // The total is in home currency: foreign documents count at their home value.
     const withAmounts = items.filter((i) => i.amount !== null);
     const total = withAmounts.length
-      ? toAmountString(withAmounts.reduce((s, i) => s.plus(Money.of(i.amount!)), Money.of(0)))
+      ? toAmountString(withAmounts.reduce((s, i) => s.plus(Money.of(i.homeAmount ?? i.amount!)), Money.of(0)))
       : null;
     sections.push({
       key,
