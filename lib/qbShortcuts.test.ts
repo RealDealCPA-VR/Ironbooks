@@ -149,18 +149,18 @@ const CHECKS: Record<string, () => void> = {
 
   // ---- Forms ----
   'forms|Ctrl+Ins / Ctrl+Del': () => {
-    const cell = { tag: 'INPUT', type: 'text', rowIdx: 0, rowCount: 2 };
+    const cell = { tag: 'INPUT', type: 'text' };
     expect(gridKeyAction(ctrl('Insert'), cell)).toBe('insert');
     expect(gridKeyAction(ctrl('Delete'), cell)).toBe('remove');
   },
   'forms|Ctrl+Alt+Y': () => {
-    expect(gridKeyAction(key('y', { ctrlKey: true, altKey: true }), { tag: 'INPUT', type: 'text', rowIdx: 0, rowCount: 1 })).toBe('copy-line');
+    expect(gridKeyAction(key('y', { ctrlKey: true, altKey: true }), { tag: 'INPUT', type: 'text' })).toBe('copy-line');
     dom(FORMS, 'Ctrl+Alt+Y copies a line; Ctrl+Alt+V pastes it into a blank line, or above a filled one')();
   },
-  'forms|Ctrl+Alt+V': () => expect(gridKeyAction(key('v', { ctrlKey: true, altKey: true }), { tag: 'INPUT', type: 'text', rowIdx: 0, rowCount: 1 })).toBe('paste-line'),
+  'forms|Ctrl+Alt+V': () => expect(gridKeyAction(key('v', { ctrlKey: true, altKey: true }), { tag: 'INPUT', type: 'text' })).toBe('paste-line'),
   'forms|Up / Down': () => {
-    expect(gridKeyAction(key('ArrowDown'), { tag: 'INPUT', type: 'text', rowIdx: 0, rowCount: 2 })).toBe('next');
-    expect(gridKeyAction(key('ArrowUp'), { tag: 'INPUT', type: 'text', rowIdx: 1, rowCount: 2 })).toBe('prev');
+    expect(gridKeyAction(key('ArrowDown'), { tag: 'INPUT', type: 'text' })).toBe('next');
+    expect(gridKeyAction(key('ArrowUp'), { tag: 'INPUT', type: 'text' })).toBe('prev');
   },
   'forms|Ctrl+L': () => {
     expect(global(ctrl('l'))).toBe('open-list');
