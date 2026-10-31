@@ -230,6 +230,41 @@ describe('working copy decisions', () => {
     expect(session.readState(conf.workDir)).toMatchObject({ unsavedSince: null, base: { saveId: 's2' } });
   });
 
+  it('unsaved work left in the working copy of ANOTHER path to the same file (mapped drive vs UNC) is kept as a copy at open', async () => {
+    // Review round 5 leftover: working copies are keyed by path, so unsaved work made through
+    // S:\Books\X.ironbooks stayed invisible when the file was opened as \\SERVER\Books\X.ironbooks.
+    const src = path.join(root, 'two-src');
+    fs.mkdirSync(path.join(src, 'base'), { recursive: true });
+    fs.writeFileSync(path.join(src, 'PG_VERSION'), '17\n');
+    fs.writeFileSync(path.join(src, 'base', 'rows'), 'v1');
+    const share = path.join(root, 'two-share');
+    fs.mkdirSync(share, { recursive: true });
+    const viaUnc = path.join(share, 'Two Paths.ironbooks');
+    await format.writeCompanyFile(viaUnc, {
+      manifest: { formatVersion: 1, fileId: 'fid-two', companyName: 'Two Paths', saveId: 's1', savedAt: 'x' },
+      entries: format.snapshotDir(src),
+    });
+    // A second path to the very same file (a hard link stands in for the mapped drive letter).
+    const mapped = path.join(root, 'two-mapped', 'Two Paths.ironbooks');
+    fs.mkdirSync(path.dirname(mapped), { recursive: true });
+    fs.linkSync(viaUnc, mapped);
+    const wr = path.join(root, 'TwoWorking');
+    const viaMapped = await session.prepareWorkingCopy(mapped, { root: wr });
+    fs.writeFileSync(path.join(viaMapped.dataDir, 'base', 'rows'), 'v1+unsaved via S:');
+    session.writeState(viaMapped.workDir, { unsavedSince: '2026-10-24T10:00:00Z', closedCleanly: false });
+
+    const opened = await session.prepareWorkingCopy(viaUnc, { root: wr });
+    expect(opened.plan).toBe('extract');
+    expect(opened.otherPathCopies).toHaveLength(1);
+    const kept = path.join(root, 'two-kept');
+    await format.extractCompanyFile(opened.otherPathCopies[0], kept);
+    expect(fs.readFileSync(path.join(kept, 'base', 'rows'), 'utf8')).toBe('v1+unsaved via S:');
+    expect(path.dirname(opened.otherPathCopies[0])).toBe(share);
+    // Kept once: the other working copy no longer counts as unsaved (and is refreshed when used).
+    expect(session.readState(viaMapped.workDir)).toMatchObject({ unsavedSince: null, base: null });
+    expect((await session.prepareWorkingCopy(viaUnc, { root: wr })).otherPathCopies ?? []).toHaveLength(0);
+  });
+
   it('never prunes a working copy that holds unsaved changes', () => {
     const wr = path.join(root, 'Prune');
     const old = path.join(wr, 'old-aaaaaaaaaaaa');

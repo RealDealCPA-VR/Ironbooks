@@ -800,6 +800,9 @@ async function openSingleFileForLaunch(filePath) {
     sealed: prep.sealed || null,
     training: Boolean(prep.manifest && prep.manifest.training),
     keptOnThisComputer: prep.keptOnThisComputer || null,
+    // Unsaved work made through another path to this same file (mapped drive vs UNC path).
+    otherPathCopies: prep.otherPathCopies || [],
+    otherPathUnsaved: prep.otherPathUnsaved || [],
   };
   try {
     companySession.pruneWorkingCopies(workingRoot(), [prep.workDir]);
@@ -2176,9 +2179,36 @@ function buildStartMenu() {
 }
 
 /** After opening: say so when unsaved work from last time was recovered or kept as a copy. */
+/**
+ * The same company file was also opened on this computer through another path (a mapped drive vs
+ * its UNC path), and changes made that way never reached the file: they were kept as separate
+ * "unsaved changes" copies next to it (electron/companySession.js keepWorkThroughOtherPaths) — or,
+ * for books protected with passwords, left where they are until the file is opened that way.
+ */
+function noteWorkThroughOtherPaths(name) {
+  const copies = openFile.otherPathCopies || [];
+  const left = openFile.otherPathUnsaved || [];
+  if (!copies.length && !left.length) return;
+  const detail = copies.length
+    ? `They were made when this computer opened the same file through another path (for example a mapped drive letter instead of \\\\SERVER\\share), and never reached the file. They are kept here:\n\n${copies.join('\n')}\n\nOpen that copy to compare it with ${name} and re-enter anything that is missing.`
+    : `They were made when this computer opened the same file as ${left.join(', ')}, and never reached the file. Open the file through that path once and sign in: Ironbooks saves them then.`;
+  dialog
+    .showMessageBox(mainWindow, {
+      noLink: true,
+      type: 'info',
+      message: copies.length ? `Unsaved changes for ${name} were kept as a separate copy.` : `This computer has unsaved changes for ${name}.`,
+      detail,
+      buttons: copies.length ? ['OK', 'Show in Folder'] : ['OK'],
+    })
+    .then(({ response }) => {
+      if (response === 1 && copies[0]) shell.showItemInFolder(copies[0]);
+    });
+}
+
 function noteRecoveredWork() {
   if (!openFile || !mainWindow) return;
   const name = companyFile.locationName(openFile.path);
+  noteWorkThroughOtherPaths(name);
   if (openFile.plan === 'recover') {
     dialog.showMessageBox(mainWindow, {
       noLink: true,

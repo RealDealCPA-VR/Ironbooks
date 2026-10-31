@@ -284,7 +284,10 @@ async function prepareWorkingCopy(companyFile, { root, onConflict, appVersion, k
     dataExists,
     workingFingerprint: dataExists ? logFingerprint(dataDirOf(workDir)) : undefined,
   });
-  if (format.isSealedManifest(manifest)) return prepareSealed(companyFile, { workDir, state, manifest, plan, onConflict });
+  // Unsaved work made through another path to this same file (mapped drive vs UNC): kept apart.
+  const others = await keepWorkThroughOtherPaths(companyFile, root, manifest, appVersion);
+  const otherPaths = { otherPathCopies: others.copies, otherPathUnsaved: others.protectedLeft };
+  if (format.isSealedManifest(manifest)) return { ...(await prepareSealed(companyFile, { workDir, state, manifest, plan, onConflict })), ...otherPaths };
   let conflictCopy = null;
   let keptOnThisComputer = null;
   if (plan === 'conflict') {
@@ -328,7 +331,83 @@ async function prepareWorkingCopy(companyFile, { root, onConflict, appVersion, k
     lastUsedAt: now,
     closedCleanly: false,
   });
-  return { workDir, dataDir: dataDirOf(workDir), plan, manifest, conflictCopy, keptOnThisComputer, sealed: null };
+  return { workDir, dataDir: dataDirOf(workDir), plan, manifest, conflictCopy, keptOnThisComputer, sealed: null, ...otherPaths };
+}
+
+/**
+ * True when two paths reach the very same file on disk — a mapped drive and its UNC path
+ * (S:\Books\X.ironbooks and \\SERVER\Books\X.ironbooks), a symbolic or hard link: same volume and
+ * file index. A file system that reports no file index falls back to the same size and timestamp.
+ */
+function sameFileOnDisk(a, b) {
+  try {
+    const sa = fs.statSync(a, { bigint: true });
+    const sb = fs.statSync(b, { bigint: true });
+    if (sa.ino && sb.ino) return sa.ino === sb.ino && sa.dev === sb.dev;
+    return sa.size === sb.size && sa.mtimeNs === sb.mtimeNs;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Working copies are kept per PATH (an "unsaved changes" copy shares its original's file id, so
+ * keying by file id would mix files). The same company file opened through another path — a
+ * mapped drive vs its UNC path — therefore has its own working copy. This finds the other working
+ * copies of THIS file (same file id, the same file on disk) that hold work the file does not have.
+ */
+function workThroughOtherPaths(companyFile, root, manifest) {
+  const out = [];
+  if (!root || !manifest || !manifest.fileId) return out;
+  let names = [];
+  try {
+    names = fs.readdirSync(root);
+  } catch {
+    return out;
+  }
+  const mine = pathKey(workingDirFor(companyFile, root));
+  for (const n of names) {
+    const dir = path.join(root, n);
+    if (pathKey(dir) === mine) continue;
+    const st = readState(dir);
+    if (!st || !st.companyFile || st.fileId !== manifest.fileId || pathKey(st.companyFile) === pathKey(companyFile)) continue;
+    if (!hasData(dir)) continue;
+    const unsaved = Boolean(st.unsavedSince) || crashedWithUnsavedBooks(st, logFingerprint(dataDirOf(dir)));
+    if (!unsaved || !sameFileOnDisk(st.companyFile, companyFile)) continue;
+    out.push({ workDir: dir, companyFile: st.companyFile, unsavedSince: st.unsavedSince || null });
+  }
+  return out;
+}
+
+/**
+ * Keep the unsaved work of other paths to this file (workThroughOtherPaths) as separate company
+ * files next to it, like any "unsaved changes" copy, so it is never silently left behind. Books
+ * protected with passwords are never written out here in plain text (this shell has no key): they
+ * are reported instead, and stay where they are. Returns { copies, protectedLeft }.
+ */
+async function keepWorkThroughOtherPaths(companyFile, root, manifest, appVersion) {
+  const copies = [];
+  const protectedLeft = [];
+  for (const w of workThroughOtherPaths(companyFile, root, manifest)) {
+    if (isProtectedData(dataDirOf(w.workDir))) {
+      protectedLeft.push(w.companyFile);
+      continue;
+    }
+    try {
+      const target = conflictCopyPath(companyFile, require('node:os').hostname());
+      await writeWorkingCopyAs(w.workDir, target, {
+        companyName: `${manifest.companyName || format.companyFileBaseName(companyFile)} (unsaved changes)`,
+        appVersion,
+      });
+      // Kept once: that working copy no longer counts as unsaved, and is refreshed from the file
+      // the next time it is used (base: null) instead of saving the same work a second time.
+      writeState(w.workDir, { unsavedSince: null, closedCleanly: true, base: null, conflictCopy: target });
+      copies.push(target);
+    } catch {
+      /* the work stays where it is; it surfaces when the file is opened through that path again */
+    }
+  }
+  return { copies, protectedLeft };
 }
 
 /** lib/services/fileProtection.ts PROTECTED_MARKER: the folder's books are protected with passwords. */
@@ -481,6 +560,8 @@ module.exports = {
   prepareWorkingCopy,
   discardProtectedWorkingData,
   pruneWorkingCopies,
+  workThroughOtherPaths,
+  sameFileOnDisk,
   latestMigrationAt,
   savedByNewerVersion,
   logFingerprint,
