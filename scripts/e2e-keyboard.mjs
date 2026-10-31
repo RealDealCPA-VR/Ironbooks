@@ -4,10 +4,13 @@
  *
  *   npm run build && npx electron-builder --dir && npm run test:e2e:keyboard
  *
- * Throwaway settings / working-copy folders (IRONBOOKS_USER_DATA, LOCALAPPDATA). Checks: Ctrl+J
- * Customer Center, Ctrl+A Chart of Accounts, Ctrl+W Write Checks, Ctrl+I Create Invoices with the
- * cursor in the first field, QB date keys in a date field, Ctrl+M not minimizing the window, and
- * arrow keys + Enter in a list. Screenshots go to E2E_SHOTS.
+ * Throwaway settings / working-copy folders (IRONBOOKS_USER_DATA, LOCALAPPDATA). Checks each key
+ * family in the real app: Ctrl+J / Ctrl+A / Ctrl+W / Ctrl+I / Ctrl+R / Ctrl+G (never closing or
+ * reloading the window), list type-ahead and Enter, QB date keys, + / - on a form number,
+ * QuickBooks' Tab order on Create Invoices, Esc on a changed form ("Record your changes?"),
+ * Alt+P / Alt+N / Alt+R / Ctrl+Y, Ctrl+M not minimizing, F5 refreshing in place, Alt+Left asking
+ * over typed work, Ctrl+Tab between open windows, ? / F2 / F3 windows, and Alt alone taking the
+ * menu bar. Screenshots go to E2E_SHOTS.
  */
 import { spawn, execFile } from 'node:child_process';
 import { createRequire } from 'node:module';
@@ -62,17 +65,30 @@ const ownProcs = `Get-Process -Name Ironbooks -ErrorAction SilentlyContinue | Wh
  * into whatever window is in front). `k` is a KeyboardEvent key ('j', 'Enter', '+').
  */
 let page = null;
-const VK = { Enter: 13, Escape: 27, ArrowDown: 40, ArrowUp: 38, Home: 36, End: 35, '+': 187, '-': 189 };
+const VK = {
+  Enter: 13, Escape: 27, ArrowDown: 40, ArrowUp: 38, ArrowLeft: 37, ArrowRight: 39, Home: 36, End: 35, Tab: 9, Alt: 18,
+  PageUp: 33, PageDown: 34, F1: 112, F2: 113, F3: 114, F4: 115, F5: 116, F6: 117, '+': 187, '-': 189, '?': 191, ';': 186, "'": 222,
+};
+const CODES = { '+': 'Equal', '-': 'Minus', '?': 'Slash', ';': 'Semicolon', "'": 'Quote', Alt: 'AltLeft' };
 async function press(k, { ctrl = false, shift = false, alt = false } = {}) {
-  const modifiers = (alt ? 1 : 0) | (ctrl ? 2 : 0) | (shift || k === '+' ? 8 : 0);
+  const modifiers = (alt ? 1 : 0) | (ctrl ? 2 : 0) | (shift || k === '+' || k === '?' ? 8 : 0);
   const single = k.length === 1;
-  const code = k === '+' ? 'Equal' : k === '-' ? 'Minus' : single ? `Key${k.toUpperCase()}` : k;
+  const code = CODES[k] ?? (single && /[a-z]/i.test(k) ? `Key${k.toUpperCase()}` : single && /\d/.test(k) ? `Digit${k}` : k);
   const vk = VK[k] ?? (single ? k.toUpperCase().charCodeAt(0) : 0);
   const base = { key: k, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk, modifiers };
   await page.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', ...base });
   if (single && !ctrl && !alt) await page.send('Input.dispatchKeyEvent', { type: 'char', text: k, unmodifiedText: k, ...base });
   await page.send('Input.dispatchKeyEvent', { type: 'keyUp', ...base });
   await sleep(500);
+}
+
+/** Type text as key presses (one character at a time, so the page sees real typing). */
+async function typeText(text) {
+  for (const ch of text) {
+    await page.send('Input.dispatchKeyEvent', { type: 'keyDown', key: ch, text: ch, unmodifiedText: ch });
+    await page.send('Input.dispatchKeyEvent', { type: 'keyUp', key: ch });
+  }
+  await sleep(300);
 }
 
 async function minimized() {
@@ -228,9 +244,11 @@ async function main() {
   assert(await until(async () => /Edit Invoice #1/.test(await title()), 10_000), `Alt+P again opens the one before it (${await title()})`);
   await press('n', { alt: true });
   assert(await until(async () => /Edit Invoice #2/.test(await title()), 10_000), `Alt+N moves to the next one (${await title()})`);
-  await sleep(1500); // the toolbar notes how the invoice looks once it has loaded
+  await sleep(1500);
   const descSel = `[role="dialog"] input[placeholder="Description"]`;
-  await page.eval(`(() => { const el = document.querySelector('${descSel}'); const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set; set.call(el, 'Changed by mistake'); el.dispatchEvent(new Event('input', { bubbles: true })); })()`);
+  // Typed with the keyboard (the form notes how it looked at the first key press).
+  await page.eval(`(() => { const el = document.querySelector('${descSel}'); el.focus(); el.select(); })()`);
+  await typeText('Changed by mistake');
   await press('r', { alt: true });
   const asked = await until(() => page.eval(`[...document.querySelectorAll('[role="dialog"] h2')].some((h) => /Discard your changes/.test(h.textContent || ''))`), 5_000);
   assert(asked, 'Alt+R with unsaved changes asks "Discard your changes?" first');
@@ -275,6 +293,119 @@ async function main() {
   await until(() => page.eval(`location.pathname === '/expenses' && document.readyState === 'complete'`));
   await sleep(2500);
   assert(await page.eval(`!!document.querySelector('[data-shortcut-scope] [data-shortcut="prev"]')`), '/expenses: Write Checks has Previous / Next / Revert');
+
+  // ---------------------------------------------------------------------------------------------
+  // Keyboard parity (feature round): one check per key family, pressed in the real app.
+  // ---------------------------------------------------------------------------------------------
+  const go = async (route) => {
+    await page.eval(`location.assign('${route}')`);
+    await until(() => page.eval(`location.pathname === '${route.split('?')[0]}' && document.readyState === 'complete'`));
+    await sleep(2500);
+  };
+  const dialogTitle = () =>
+    page.eval(`(() => { const d = [...document.querySelectorAll('[role="dialog"]')].pop(); return d ? (d.querySelector('h2')?.textContent || '') : ''; })()`);
+  const focusedId = () =>
+    page.eval(`(() => { const a = document.activeElement; return a ? (a.id || a.getAttribute('aria-label') || (a.textContent || '').trim().slice(0, 30) || a.tagName) : ''; })()`);
+
+  // Ctrl+W / Ctrl+R never close or reload the window: a marker on the window survives them.
+  await go('/dashboard');
+  await page.eval(`window.__e2eMarker = 'still here'`);
+  await press('r', { ctrl: true });
+  assert(await until(async () => (await path_()).startsWith('/registers'), 10_000), 'Ctrl+R opens Use Register');
+  await press('w', { ctrl: true });
+  assert(await until(async () => (await path_()).startsWith('/expenses'), 10_000), 'Ctrl+W opens Write Checks');
+  assert((await page.eval(`window.__e2eMarker`)) === 'still here', 'Ctrl+R / Ctrl+W never reloaded or closed the window');
+
+  // Ctrl+R on the Chart of Accounts: the highlighted account's register.
+  await go('/accounts');
+  await page.eval(`document.querySelector('[data-list]')?.focus()`);
+  await typeText('Accounts Payable');
+  const regHref = await page.eval(`document.querySelector('[data-list] [data-list-active]')?.getAttribute('data-register') || ''`);
+  await press('r', { ctrl: true });
+  assert(regHref && (await until(async () => (await path_()) === regHref, 10_000)), `Ctrl+R on the highlighted account opens its register (${regHref})`);
+
+  // Ctrl+G in a register: the other account's register, at the same transaction.
+  await sleep(2500);
+  await page.eval(`document.querySelector('[data-list]')?.focus()`);
+  await press('End');
+  const transfer = await page.eval(`document.querySelector('[data-list] [data-list-active]')?.getAttribute('data-transfer-href') || ''`);
+  await press('g', { ctrl: true });
+  assert(transfer && (await until(async () => (await path_()) === transfer, 10_000)), `Ctrl+G opens the transfer account's register (${transfer})`);
+  await page.shot('k6-ctrl-g');
+
+  // Create Invoices: QuickBooks' Tab order, + / - on the number, Esc asks over typed work.
+  await go('/invoices');
+  await press('i', { ctrl: true });
+  await sleep(2500);
+  const order = [await focusedId()];
+  for (let i = 0; i < 6; i++) {
+    await press('Tab');
+    order.push(await focusedId());
+  }
+  const at = (id) => order.indexOf(id);
+  assert(at('inv-class') === at('inv-customer') + 1, `Tab: Customer, then Class (${order.join(' > ')})`);
+  assert(at('inv-date') >= 0 && at('inv-number') > at('inv-date'), `Tab: the date before the invoice number (${order.join(' > ')})`);
+  await page.eval(`document.getElementById('inv-number')?.focus()`);
+  const before = await page.eval(`document.getElementById('inv-number')?.value || ''`);
+  await press('+');
+  const after = await page.eval(`document.getElementById('inv-number')?.value || ''`);
+  assert(before && after !== before, `+ steps the invoice number (${before} -> ${after})`);
+  await press('Escape');
+  assert(await until(async () => /Record your changes/.test(await dialogTitle()), 5_000), 'Esc on a changed invoice asks "Record your changes?"');
+  await press('n');
+  await sleep(800);
+  assert(
+    !(await page.eval(`[...document.querySelectorAll('[role="dialog"] h2')].some((h) => /Invoice/.test(h.textContent || ''))`)),
+    'No closes it without recording',
+  );
+
+  // F5 refreshes the page in place (the window is not reloaded).
+  await go('/customers');
+  await page.eval(`window.__e2eMarker = 'f5'`);
+  await press('F5');
+  await sleep(2000);
+  assert((await page.eval(`window.__e2eMarker`)) === 'f5' && (await path_()).startsWith('/customers'), 'F5 refreshes the window without reloading it');
+
+  // Alt+Left over typed work asks first.
+  await press('w', { ctrl: true });
+  await sleep(2500);
+  await page.eval(`document.getElementById('exp-memo')?.focus()`);
+  await typeText('Typed memo');
+  await press('ArrowLeft', { alt: true });
+  assert(await until(async () => /Leave this form/.test(await dialogTitle()), 5_000), 'Alt+Left over a typed check asks "Leave this form?"');
+  await press('Escape');
+
+  // Ctrl+Tab: the next open window.
+  await go('/customers');
+  await go('/accounts');
+  await page.eval(`document.activeElement?.blur?.()`);
+  await press('Tab', { ctrl: true });
+  assert(await until(async () => !(await path_()).startsWith('/accounts'), 10_000), `Ctrl+Tab moves to the next open window (${await path_()})`);
+
+  // ? Help (in Intuit's groups), F2 Product Information, F3 technical details.
+  await go('/dashboard');
+  await page.eval(`document.activeElement?.blur?.()`);
+  await press('?');
+  assert(await until(() => page.eval(`!!document.querySelector('[data-help-shortcuts] [data-shortcut-group]')`), 5_000), '? opens the keyboard shortcuts, in groups');
+  await page.shot('k7-shortcuts');
+  await press('Escape');
+  await press('F2');
+  assert(
+    await until(() => page.eval(`/Keys Co/.test(document.querySelector('[data-product-info]')?.closest('[role="dialog"]')?.innerText || '')`), 8_000),
+    'F2 shows Product Information for the company file',
+  );
+  await press('F3');
+  assert(await until(() => page.eval(`!!document.querySelector('[data-product-tech]')`), 5_000), 'F3 there shows the technical details');
+  await page.shot('k8-product-info');
+  await press('Escape');
+
+  // Alt alone: the menu bar takes the keyboard (its letters show); Esc gives it back.
+  await page.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Alt', code: 'AltLeft', windowsVirtualKeyCode: 18, nativeVirtualKeyCode: 18, modifiers: 1 });
+  await page.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Alt', code: 'AltLeft', windowsVirtualKeyCode: 18, nativeVirtualKeyCode: 18, modifiers: 0 });
+  await sleep(500);
+  assert(await page.eval(`!!document.activeElement?.closest('nav[aria-label="Application menu"]')`), 'Alt alone puts the keyboard on the menu bar');
+  await page.shot('k9-alt-menu-bar');
+  await press('Escape');
 
   console.log(`\nScreenshots: ${SHOTS}`);
   console.log(failures === 0 ? 'E2E KEYBOARD PASSED' : `E2E KEYBOARD FAILED (${failures})`);
