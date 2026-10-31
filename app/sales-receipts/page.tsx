@@ -80,6 +80,7 @@ import {
 import {
   type CustomerTaxStatus,
   type TaxCodeEntry,
+  activeTaxItemId,
   customerMessagePayload,
   defaultPaymentMethodValue,
   filledLineTaxCode,
@@ -88,6 +89,8 @@ import {
   paymentMethodDisplay,
   paymentMethodPayload,
   paymentMethodValue,
+  taxItemChoices,
+  taxItemLabel,
   withShownTaxable,
 } from '@/lib/salesFormListsClient';
 
@@ -123,6 +126,8 @@ interface TaxRate {
   id: string;
   name: string;
   rate: string;
+  /** false = made inactive (offered only on a receipt that already has it). */
+  isActive?: boolean | null;
 }
 
 interface SalesReceipt {
@@ -285,7 +290,12 @@ function NewReceiptModal({
   const custDefaults = useCustomerSalesDefaults(open ? customerId : null);
   useEffect(() => {
     if (!custDefaults || editing) return;
-    setTaxRateId(custDefaults.taxable ? (recalledTaxRef.current ?? custDefaults.taxRateId ?? '') : '');
+    // A new receipt never starts on a tax item that has been made inactive.
+    setTaxRateId(
+      custDefaults.taxable
+        ? (activeTaxItemId(recalledTaxRef.current, taxRates) ?? activeTaxItemId(custDefaults.taxRateId, taxRates) ?? '')
+        : '',
+    );
     const st = defaultShipToState(custDefaults);
     if (st) setShip((prev) => ({ ...prev, shipTo: st }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -396,9 +406,10 @@ function NewReceiptModal({
       if (!live || !d) return;
       const h = d.header;
       if (h.classId) setClassId(h.classId);
-      if (h.taxRateId) {
-        recalledTaxRef.current = h.taxRateId;
-        setTaxRateId(h.taxRateId);
+      const recalledTax = activeTaxItemId(h.taxRateId, taxRates);
+      if (recalledTax) {
+        recalledTaxRef.current = recalledTax;
+        setTaxRateId(recalledTax);
       }
       if (h.memo) {
         const m = h.memo;
@@ -803,9 +814,10 @@ function NewReceiptModal({
             <Label htmlFor="sr-tax">Sales Tax</Label>
             <Select id="sr-tax" value={taxRateId} onChange={(e) => setTaxRateId(e.target.value)}>
               <option value="">No tax</option>
-              {taxRates.map((t) => (
+              {/* Active items, plus the receipt's own item if it has been made inactive since. */}
+              {taxItemChoices(taxRates, taxRateId).map((t) => (
                 <option key={t.id} value={t.id}>
-                  {t.name} ({(parseFloat(t.rate) * 100).toFixed(2)}%)
+                  {taxItemLabel(t)}
                 </option>
               ))}
             </Select>
@@ -921,7 +933,8 @@ function SalesReceiptsPageContent() {
         api.get<Customer[]>('/api/customers'),
         api.get<{ items: Item[] }>('/api/items'),
         api.get<Account[]>('/api/accounts'),
-        api.get<TaxRate[]>('/api/tax-rates'),
+        // Inactive items too: an edited receipt still shows (and taxes at) its saved item.
+        api.get<TaxRate[]>('/api/tax-rates?includeInactive=true'),
       ]);
       setReceipts(receiptList);
       setCustomers(custList);

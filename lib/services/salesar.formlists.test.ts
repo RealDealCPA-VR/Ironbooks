@@ -23,13 +23,14 @@ import { getSalesReceipt } from './salesReceipts';
 import { getCreditMemo } from './creditMemos';
 import { getEstimate } from './estimates';
 import { getSalesOrder } from './salesOrders';
-import { createTaxRate } from './salesTax';
+import { createTaxRate, updateTaxRate } from './salesTax';
 import { createEntry, listEntries } from './lists/simpleLists';
 import { previewSalesTotals } from '@/lib/salesLineMath';
 import {
   type DepositMethodItem,
   type PaymentMethodEntry,
   type TaxCodeEntry,
+  activeTaxItemId,
   customerMessageChoices,
   customerMessagePayload,
   defaultPaymentMethodValue,
@@ -46,6 +47,8 @@ import {
   shownLineTaxCode,
   standardTaxCode,
   taxCodeChoices,
+  taxItemChoices,
+  taxItemLabel,
   withShownTaxable,
 } from '@/lib/salesFormListsClient';
 
@@ -62,6 +65,7 @@ import { PATCH as estimatePATCH } from '@/app/api/estimates/[id]/route';
 import { POST as salesOrdersPOST } from '@/app/api/sales-orders/route';
 import { PUT as salesOrderPUT } from '@/app/api/sales-orders/[id]/route';
 import { GET as undepositedGET } from '@/app/api/deposits/undeposited/route';
+import { GET as taxRatesGET } from '@/app/api/tax-rates/route';
 
 // ---------------------------------------------------------------------------
 // Pure: lib/salesFormListsClient.ts
@@ -149,6 +153,38 @@ describe('B9. Sales Tax Code column — the code a line gets and shows', () => {
     const shown = withShownTaxable(rows, CODES, null);
     expect(shown[0]).toBe(rows[0]);
     expect(shown[1]).not.toBe(rows[1]);
+  });
+});
+
+describe('Sales tax items made inactive (the form\'s Tax picker)', () => {
+  const rates = [
+    { id: 'r-state', name: 'State Tax', rate: '0.082500', isActive: true },
+    { id: 'r-city', name: 'City Tax', rate: '0.0100', isActive: false },
+    { id: 'r-old', name: 'Old County', rate: '0.05', isActive: false },
+    { id: 'r-legacy', name: 'Legacy', rate: '0.07' }, // rows without the flag count as active
+  ];
+
+  it('a new document is offered the active items only', () => {
+    expect(taxItemChoices(rates, '').map((t) => t.id)).toEqual(['r-state', 'r-legacy']);
+    expect(taxItemChoices(rates, null).map((t) => t.id)).toEqual(['r-state', 'r-legacy']);
+    expect(taxItemChoices(rates, 'r-state').map((t) => t.id)).toEqual(['r-state', 'r-legacy']);
+  });
+
+  it("an edited document also gets its saved item, labelled inactive, and previews that item's tax", () => {
+    const choices = taxItemChoices(rates, 'r-city');
+    expect(choices.map((t) => t.id)).toEqual(['r-state', 'r-city', 'r-legacy']);
+    expect(choices.map(taxItemLabel)).toEqual(['State Tax (8.25%)', 'City Tax (1.00%) (inactive)', 'Legacy (7.00%)']);
+    // The selected item is found in the full list (loaded with ?includeInactive=true): its rate is the preview's.
+    const selected = rates.find((t) => t.id === 'r-city')!;
+    expect(previewSalesTotals([{ quantity: '2', rate: '50', taxable: true }], selected.rate).tax).toBeCloseTo(1, 2);
+  });
+
+  it('a new document never starts on an inactive customer / recalled tax item', () => {
+    expect(activeTaxItemId('r-state', rates)).toBe('r-state');
+    expect(activeTaxItemId('r-city', rates)).toBeNull();
+    expect(activeTaxItemId(null, rates)).toBeNull();
+    // Not in the list (still loading): kept — the server checks it belongs to the company.
+    expect(activeTaxItemId('r-unknown', [])).toBe('r-unknown');
   });
 });
 
@@ -247,7 +283,12 @@ let rate: string;
 function req(url: string, body: unknown, method = 'POST') {
   const u = new URL(`http://localhost${url}`);
   return Object.assign(
-    new Request(u, { method, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }),
+    new Request(
+      u,
+      body === undefined
+        ? { method }
+        : { method, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) },
+    ),
     { nextUrl: u },
   ) as never;
 }
@@ -511,6 +552,42 @@ describe('Routes pass customerMessageId and line salesTaxCodeId through (B8 / B9
     const inv = await getInvoice(ctx, created.id);
     expect(inv.taxAmount).toBe('0.00');
     expect(inv.lines.map((l) => [l.salesTaxCodeId, l.taxable])).toEqual([[non, false], [non, false]]);
+  });
+});
+
+describe('Editing a document whose sales tax item was made inactive', () => {
+  it('the form still lists the saved item (and only for that document), and the edit keeps its tax', async () => {
+    const f = await fixtures();
+    const created = await ok(
+      await invoicesPOST(req('/api/invoices', { customerId: f.cust, date: '2026-04-01', taxRateId: rate, lines: formLines(f, tax, tax) })),
+    );
+    expect((await getInvoice(ctx, created.id)).taxAmount).toBe('15.00');
+    await updateTaxRate(ctx, rate, { isActive: false });
+
+    // What the forms load: every item, inactive ones included.
+    const all = (await (await taxRatesGET(req('/api/tax-rates?includeInactive=true', undefined, 'GET'))).json()) as Array<{
+      id: string;
+      name: string;
+      rate: string;
+      isActive: boolean;
+    }>;
+    expect(all.find((t) => t.id === rate)?.isActive).toBe(false);
+    // A new invoice is not offered it; the saved one is, labelled inactive.
+    expect(taxItemChoices(all, '').some((t) => t.id === rate)).toBe(false);
+    const saved = taxItemChoices(all, rate).find((t) => t.id === rate)!;
+    expect(taxItemLabel(saved)).toBe(`State ${seq} (10.00%) (inactive)`);
+    expect(activeTaxItemId(rate, all)).toBeNull();
+
+    // Saving the edit with the saved item keeps it and its tax.
+    await ok(
+      await invoicePUT(
+        req(`/api/invoices/${created.id}`, { customerId: f.cust, date: '2026-04-01', taxRateId: rate, memo: 'edited', lines: formLines(f, tax, tax) }, 'PUT'),
+        params(created.id),
+      ),
+    );
+    const inv = await getInvoice(ctx, created.id);
+    expect(inv.taxRateId).toBe(rate);
+    expect(inv.taxAmount).toBe('15.00');
   });
 });
 

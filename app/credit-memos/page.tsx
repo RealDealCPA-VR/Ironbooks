@@ -66,7 +66,15 @@ import {
   useCustomerMessages,
   useSalesTaxCodes,
 } from '@/components/sales/FormLists';
-import { customerMessagePayload, itemLineTaxCode, lineTaxPayload, withShownTaxable } from '@/lib/salesFormListsClient';
+import {
+  activeTaxItemId,
+  customerMessagePayload,
+  itemLineTaxCode,
+  lineTaxPayload,
+  taxItemChoices,
+  taxItemLabel,
+  withShownTaxable,
+} from '@/lib/salesFormListsClient';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -150,6 +158,8 @@ interface TaxRate {
   id: string;
   name: string;
   rate: string; // fraction, e.g. "0.082500"
+  /** false = made inactive (offered only on a memo that already has it). */
+  isActive?: boolean | null;
 }
 
 interface LineRow {
@@ -237,7 +247,8 @@ function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCr
   const custDefaults = useCustomerSalesDefaults(open ? customerId : null);
   useEffect(() => {
     if (!custDefaults || editing) return;
-    setTaxRateId(custDefaults.taxable ? (custDefaults.taxRateId ?? '') : '');
+    // A new memo never starts on a tax item that has been made inactive.
+    setTaxRateId(custDefaults.taxable ? (activeTaxItemId(custDefaults.taxRateId, taxRates) ?? '') : '');
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [custDefaults]);
   // salesar: Customer Message (B8) and the per-line Sales Tax Code column (B9).
@@ -688,9 +699,10 @@ function NewMemoModal({ open, editing, onClose, customers, items, taxRates, onCr
             onChange={(e) => setTaxRateId(e.target.value)}
           >
             <option value="">No tax</option>
-            {taxRates.map((t) => (
+            {/* Active items, plus the memo's own item if it has been made inactive since. */}
+            {taxItemChoices(taxRates, taxRateId).map((t) => (
               <option key={t.id} value={t.id}>
-                {t.name} ({(parseFloat(t.rate) * 100).toFixed(2)}%)
+                {taxItemLabel(t)}
               </option>
             ))}
           </Select>
@@ -1008,7 +1020,8 @@ function CreditMemosPageContent() {
         api.get<Customer[]>('/api/customers'),
         api.get<Account[]>('/api/accounts').catch(() => [] as Account[]),
         api.get<{ items: Item[] }>('/api/items').catch(() => ({ items: [] as Item[] })),
-        api.get<TaxRate[]>('/api/tax-rates').catch(() => [] as TaxRate[]),
+        // Inactive items too: an edited memo still shows (and taxes at) its saved item.
+        api.get<TaxRate[]>('/api/tax-rates?includeInactive=true').catch(() => [] as TaxRate[]),
       ]);
       setMemos(memoList);
       setCustomers(custList);

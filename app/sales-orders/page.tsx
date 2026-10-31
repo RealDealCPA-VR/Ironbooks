@@ -54,7 +54,14 @@ import {
 import { TransactionNav, useAdjacentTransactions } from '@/components/TransactionNav';
 // salesar (B8 / B9): Customer Message picker and the per-line Sales Tax Code column.
 import { CustomerMessageField, customerTaxStatus, useCustomerMessages, useSalesTaxCodes } from '@/components/sales/FormLists';
-import { customerMessagePayload, lineTaxPayload, withShownTaxable } from '@/lib/salesFormListsClient';
+import {
+  activeTaxItemId,
+  customerMessagePayload,
+  lineTaxPayload,
+  taxItemChoices,
+  taxItemLabel,
+  withShownTaxable,
+} from '@/lib/salesFormListsClient';
 import { usePreferences } from '@/lib/usePreferences';
 
 // ---------------------------------------------------------------------------
@@ -108,6 +115,8 @@ interface TaxRate {
   id: string;
   name: string;
   rate: string;
+  /** false = made inactive (offered only on an order that already has it). */
+  isActive?: boolean | null;
 }
 
 interface SalesOrderDetail extends SalesOrder {
@@ -176,7 +185,12 @@ function NewOrderModal({ open, editing, onClose, customers, items, taxRates, onC
   const recalledTaxRef = useRef<string | null>(null);
   useEffect(() => {
     if (!custDefaults || editing) return;
-    setTaxRateId(custDefaults.taxable ? (recalledTaxRef.current ?? custDefaults.taxRateId ?? '') : '');
+    // A new order never starts on a tax item that has been made inactive.
+    setTaxRateId(
+      custDefaults.taxable
+        ? (activeTaxItemId(recalledTaxRef.current, taxRates) ?? activeTaxItemId(custDefaults.taxRateId, taxRates) ?? '')
+        : '',
+    );
     const st = defaultShipToState(custDefaults);
     if (st) setShip((prev) => ({ ...prev, shipTo: st }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -244,9 +258,10 @@ function NewOrderModal({ open, editing, onClose, customers, items, taxRates, onC
     let live = true;
     void recall(customerId).then((d) => {
       if (!live || !d) return;
-      if (d.header.taxRateId) {
-        recalledTaxRef.current = d.header.taxRateId;
-        setTaxRateId(d.header.taxRateId);
+      const recalledTax = activeTaxItemId(d.header.taxRateId, taxRates);
+      if (recalledTax) {
+        recalledTaxRef.current = recalledTax;
+        setTaxRateId(recalledTax);
       }
       const m = d.header.memo;
       if (m) setMemo((prev) => prev || m);
@@ -384,9 +399,10 @@ function NewOrderModal({ open, editing, onClose, customers, items, taxRates, onC
           <Label htmlFor="so-taxrate">Sales Tax</Label>
           <Select id="so-taxrate" value={taxRateId} onChange={(e) => setTaxRateId(e.target.value)}>
             <option value="">No tax</option>
-            {taxRates.map((t) => (
+            {/* Active items, plus the order's own item if it has been made inactive since. */}
+            {taxItemChoices(taxRates, taxRateId).map((t) => (
               <option key={t.id} value={t.id}>
-                {t.name} ({(parseFloat(t.rate) * 100).toFixed(2)}%)
+                {taxItemLabel(t)}
               </option>
             ))}
           </Select>
@@ -710,7 +726,8 @@ function SalesOrdersPageContent() {
           // Non-fatal; lines can still be typed without an item.
         });
       api
-        .get<TaxRate[]>('/api/tax-rates')
+        // Inactive items too: an edited order still shows (and taxes at) its saved item.
+        .get<TaxRate[]>('/api/tax-rates?includeInactive=true')
         .then((r) => setTaxRates(Array.isArray(r) ? r : []))
         .catch(() => {
           // Non-fatal; the tax picker just stays empty.

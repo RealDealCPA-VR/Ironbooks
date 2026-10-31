@@ -59,9 +59,12 @@ import {
   type CustomerMessageEntry,
   type CustomerTaxStatus,
   type TaxCodeEntry,
+  activeTaxItemId,
   customerMessagePayload,
   filledLineTaxCode,
   lineTaxPayload,
+  taxItemChoices,
+  taxItemLabel,
   withShownTaxable,
 } from '@/lib/salesFormListsClient';
 
@@ -122,6 +125,8 @@ interface TaxRate {
   id: string;
   name: string;
   rate: string; // fraction, e.g. "0.082500"
+  /** false = made inactive (offered only on an estimate that already has it). */
+  isActive?: boolean | null;
 }
 
 interface EstimateLineForm {
@@ -290,9 +295,10 @@ function EstimateFormBody({
             onChange={(e) => onChange('taxRateId', e.target.value)}
           >
             <option value="">No tax</option>
-            {taxRates.map((t) => (
+            {/* Active items, plus the estimate's own item if it has been made inactive since. */}
+            {taxItemChoices(taxRates, form.taxRateId).map((t) => (
               <option key={t.id} value={t.id}>
-                {t.name} ({(parseFloat(t.rate) * 100).toFixed(2)}%)
+                {taxItemLabel(t)}
               </option>
             ))}
           </Select>
@@ -397,7 +403,12 @@ function EstimatesPageContent() {
     if (!custDefaults || editingId) return;
     setAddForm((prev) => ({
       ...prev,
-      taxRateId: custDefaults.taxable ? (recalledTaxRef.current ?? custDefaults.taxRateId ?? prev.taxRateId) : '',
+      // A new estimate never starts on a tax item that has been made inactive.
+      taxRateId: custDefaults.taxable
+        ? (activeTaxItemId(recalledTaxRef.current, taxRates) ??
+          activeTaxItemId(custDefaults.taxRateId, taxRates) ??
+          prev.taxRateId)
+        : '',
     }));
     const st = defaultShipToState(custDefaults);
     if (st) setSendFlags((prev) => ({ ...prev, shipTo: st }));
@@ -418,7 +429,7 @@ function EstimatesPageContent() {
     let live = true;
     void recall(customerId).then((d) => {
       if (!live || !d) return;
-      const tax = d.header.taxRateId;
+      const tax = activeTaxItemId(d.header.taxRateId, taxRates);
       if (tax) recalledTaxRef.current = tax;
       const m = d.header.memo;
       setAddForm((prev) => ({
@@ -487,7 +498,8 @@ function EstimatesPageContent() {
 
   const fetchTaxRates = useCallback(async () => {
     try {
-      const data = await api.get<TaxRate[]>('/api/tax-rates');
+      // Inactive items too: an edited estimate still shows (and taxes at) its saved item.
+      const data = await api.get<TaxRate[]>('/api/tax-rates?includeInactive=true');
       setTaxRates(data);
     } catch {
       // Non-fatal; the tax dropdown just won't populate.

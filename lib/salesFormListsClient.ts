@@ -17,6 +17,7 @@
  *
  * Pure (no React, no I/O): tested by lib/services/salesar.formlists.test.ts.
  */
+import { Money } from '@/lib/money';
 
 // ---------------------------------------------------------------------------
 // List entries (GET /api/lists/:list)
@@ -209,6 +210,49 @@ export function taxCodeChoices(
 
 export function taxCodeLabel(c: TaxCodeEntry): string {
   return `${c.code}${c.isActive === false ? ' (inactive)' : ''}`;
+}
+
+// ---------------------------------------------------------------------------
+// Sales tax items (the form's "Tax" item: GET /api/tax-rates?includeInactive=true)
+// ---------------------------------------------------------------------------
+
+export interface TaxItemEntry {
+  id: string;
+  name: string;
+  /** Fraction, e.g. "0.082500". */
+  rate: string;
+  isActive?: boolean | null;
+}
+
+/**
+ * The sales tax items the form's Tax picker offers: the active items plus the one the document
+ * has, even when that item was made inactive after it was saved — so an edit still shows (and
+ * previews the tax of) the saved item. A new document only ever sees active items.
+ */
+export function taxItemChoices<T extends TaxItemEntry>(rates: readonly T[], currentId: string | null | undefined): T[] {
+  return rates.filter((t) => t.isActive !== false || (!!currentId && t.id === currentId));
+}
+
+/** "State Tax (8.25%)", "(inactive)" after an item made inactive. */
+export function taxItemLabel(t: TaxItemEntry): string {
+  let pct: string;
+  try {
+    pct = Money.mul(t.rate, 100).toFixed(2);
+  } catch {
+    pct = '?';
+  }
+  return `${t.name} (${pct}%)${t.isActive === false ? ' (inactive)' : ''}`;
+}
+
+/**
+ * A tax item a NEW document may start with (the customer's tax item, the one recalled from the
+ * last document): kept while it is active, or not in the list yet (still loading); null when it
+ * has been made inactive, as QB never fills an inactive item into a new form.
+ */
+export function activeTaxItemId(id: string | null | undefined, rates: readonly TaxItemEntry[]): string | null {
+  if (!id) return null;
+  const t = rates.find((r) => r.id === id);
+  return t && t.isActive === false ? null : id;
 }
 
 // ---------------------------------------------------------------------------

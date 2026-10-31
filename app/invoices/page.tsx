@@ -80,10 +80,13 @@ import type { FormPrefill } from '@/lib/commands/prefill';
 // salesar (B8 / B9): Customer Message picker and the per-line Sales Tax Code column.
 import { CustomerMessageField, LineTaxCodeCell, customerTaxStatus, useCustomerMessages, useSalesTaxCodes } from '@/components/sales/FormLists';
 import {
+  activeTaxItemId,
   customerMessagePayload,
   filledLineTaxCode,
   itemLineTaxCode,
   lineTaxPayload,
+  taxItemChoices,
+  taxItemLabel,
   withShownTaxable,
 } from '@/lib/salesFormListsClient';
 
@@ -130,6 +133,8 @@ interface TaxRate {
   id: string;
   name: string;
   rate: string; // fraction, e.g. "0.082500"
+  /** false = made inactive (offered only on a document that already has it). */
+  isActive?: boolean | null;
 }
 
 interface ClassRow {
@@ -481,7 +486,12 @@ function InvoiceModal({
   const custDefaults = useCustomerSalesDefaults(open ? customerId : null);
   useEffect(() => {
     if (!custDefaults || editing) return;
-    setTaxRateId(custDefaults.taxable ? (recalledTaxRef.current ?? custDefaults.taxRateId ?? '') : '');
+    // A new invoice never starts on a tax item that has been made inactive.
+    setTaxRateId(
+      custDefaults.taxable
+        ? (activeTaxItemId(recalledTaxRef.current, taxRates) ?? activeTaxItemId(custDefaults.taxRateId, taxRates) ?? '')
+        : '',
+    );
     const st = defaultShipToState(custDefaults);
     if (st) setShip((prev) => ({ ...prev, shipTo: st }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -664,9 +674,10 @@ function InvoiceModal({
       }
       if (h.salesRepId) setSalesRepId(h.salesRepId);
       if (h.classId) setClassId(h.classId);
-      if (h.taxRateId) {
-        recalledTaxRef.current = h.taxRateId;
-        setTaxRateId(h.taxRateId);
+      const recalledTax = activeTaxItemId(h.taxRateId, taxRates);
+      if (recalledTax) {
+        recalledTaxRef.current = recalledTax;
+        setTaxRateId(recalledTax);
       }
       if (h.memo) {
         const m = h.memo;
@@ -1300,9 +1311,10 @@ function InvoiceModal({
               onChange={(e) => setTaxRateId(e.target.value)}
             >
               <option value="">No tax</option>
-              {taxRates.map((t) => (
+              {/* Active items, plus the invoice's own item if it has been made inactive since. */}
+              {taxItemChoices(taxRates, taxRateId).map((t) => (
                 <option key={t.id} value={t.id}>
-                  {t.name} ({(parseFloat(t.rate) * 100).toFixed(2)}%)
+                  {taxItemLabel(t)}
                 </option>
               ))}
             </Select>
@@ -1803,7 +1815,8 @@ function InvoicesPageContent() {
           api.get<Customer[]>('/api/customers'),
           api.get<{ configured: boolean }>('/api/email/status'),
           api.get<{ items: Item[] }>('/api/items'),
-          api.get<TaxRate[]>('/api/tax-rates'),
+          // Inactive items too: an edited invoice still shows (and taxes at) its saved item.
+          api.get<TaxRate[]>('/api/tax-rates?includeInactive=true'),
           api.get<ClassRow[]>('/api/classes'),
           api.get<Job[]>('/api/jobs'),
         ]);
