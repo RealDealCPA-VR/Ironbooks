@@ -11,11 +11,18 @@
  *     server, the old session is refused (passwords are per open of the file), the Admin signs in
  *     and the invoice is there.
  *
+ * The password belongs to the company file (filecrypto): the Admin set up at step 2 protects the
+ * new file (the default), so every save is encrypted — the raw encrypted entries hold neither the
+ * company's nor the customer's name. Workstation B is a FRESH install (its own user data, no
+ * BKA_AUTH_SECRET): its server starts sealed, a wrong password is refused without decrypting
+ * anything, and the right one opens the file with ONE sign-in. After B's clean close its plain-text
+ * working copy is gone.
+ *
  * Usage: npm run build && npm run test:e2e:file
  */
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -41,11 +48,24 @@ function assert(cond, msg) {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/** The bytes of a company file after its plain first entry (the manifest): the encrypted part. */
+function bytesAfterManifest(file) {
+  const buf = readFileSync(file);
+  const nameLen = buf.readUInt16LE(26);
+  const extraLen = buf.readUInt16LE(28);
+  const csize = buf.readUInt32LE(18);
+  return buf.subarray(30 + nameLen + extraLen + csize);
+}
+
 /** A server on a working copy, like startNextServer in electron/main.js. */
 function startServer({ port, prep, lock, token }) {
+  const env = { ...process.env };
+  delete env.BKA_AUTH_SECRET; // nothing machine-bound: only the file's own secrets
   const proc = spawn(process.execPath, [path.join(root, '.next', 'standalone', 'server.js')], {
     env: {
-      ...process.env,
+      ...env,
+      // Protected with passwords: the sign-in decrypts the file (lib/db/sealed.ts).
+      BKA_COMPANY_SEALED: prep.sealed || '',
       NODE_ENV: 'production',
       PORT: String(port),
       HOSTNAME: '127.0.0.1',
@@ -141,6 +161,7 @@ async function main() {
     challengeAnswer: 'Rex',
   });
   assert(signup.status === 201, 'the Admin is set up with a user name and a challenge question');
+  assert(signup.data?.protected === true && /^[0-9A-Z]{4}(-[0-9A-Z]{4}){5}$/.test(signup.data?.recoveryKey || ''), 'a new company file is protected from its first save; the recovery key is shown once');
   const accounts = (await A.call('GET', '/api/accounts')).data;
   const income = Array.isArray(accounts) ? accounts.find((a) => a.code === '4000') : null;
   const customer = (await A.call('POST', '/api/customers', { displayName: 'Oak Street Apartments' })).data;
@@ -162,6 +183,13 @@ async function main() {
     saved = Boolean(st && st.status === 'saved' && m && m.saveId !== 'new');
   }
   assert(saved, 'autosave wrote the company file within a minute');
+  const sealedManifest = format.readCompanyManifest(companyFile);
+  assert(format.isSealedManifest(sealedManifest) && sealedManifest.formatVersion === 2, 'the saved company file is encrypted (format 2, key slots in its manifest)');
+  const encrypted = bytesAfterManifest(companyFile);
+  assert(
+    !encrypted.includes(Buffer.from('Acme Plumbing')) && !encrypted.includes(Buffer.from('Oak Street Apartments')) && !encrypted.includes(Buffer.from('Pat Owner')),
+    'the raw encrypted entries contain no plain-text company, customer or user name',
+  );
 
   const close = await A.call('POST', '/api/company-file/close', null, A.internal);
   assert(close.status === 200 && close.data?.ok, 'closing saves and closes the database');
@@ -176,14 +204,22 @@ async function main() {
   // 4. Workstation B opens the same file from the share.
   const lockB = companyLock.acquire(companyFile);
   assert(lockB.ok, 'workstation B can now open it');
-  const prepB = await companySession.prepareWorkingCopy(companyFile, { root: path.join(sandbox, 'B', 'Working') });
+  // B is a fresh install: a brand-new user data folder that has never seen the file.
+  const prepB = await companySession.prepareWorkingCopy(companyFile, { root: path.join(sandbox, 'B-fresh-install', 'Working') });
+  assert(prepB.sealed === 'extract', 'B opens the protected file sealed: nothing is decrypted before a sign-in');
   const B = startServer({ port: 3992, prep: prepB, lock: lockB.lock, token: randomBytes(16).toString('hex') });
   if (!(await B.up())) throw new Error('server B did not start');
+  const infoB = (await B.call('GET', '/api/company-file/info')).data;
+  assert(infoB?.protected === true && infoB?.companyName === 'Acme Plumbing', "B's sign-in screen names the company from the file's plain manifest");
   Object.assign(B.cookies, oldCookies);
-  const stale = (await B.call('GET', '/api/auth/me')).data;
-  assert(stale === null, "A's sign-in does not carry over: the password is asked again on every open");
+  const stale = await B.call('GET', '/api/auth/me');
+  assert(stale.data === null || stale.status === 401 || stale.status === 403, "A's sign-in does not carry over: the password is asked again on every open");
+  const wrong = await B.call('POST', '/api/auth/login', { email: 'admin', password: 'not-the-password' });
+  const unknown = await B.call('POST', '/api/auth/login', { email: 'nobody', password: 'secret123' });
+  assert(wrong.status === 401 && unknown.status === 401 && wrong.data?.error === unknown.data?.error, 'a wrong password and an unknown user name get the same answer');
+  assert(!existsSync(path.join(prepB.dataDir, 'PG_VERSION')), 'nothing was decrypted for a wrong password');
   const login = await B.call('POST', '/api/auth/login', { email: 'admin', password: 'secret123' });
-  assert(login.status === 200, 'the Admin signs in on B with the password stored in the file');
+  assert(login.status === 200, 'the Admin signs in on B with the password stored in the file: one sign-in decrypts it and starts the session');
   const invoices = (await B.call('GET', '/api/invoices')).data;
   const list = Array.isArray(invoices) ? invoices : invoices?.items ?? invoices?.data ?? [];
   assert(list.some((x) => x.id === invoice?.id && x.total === '1850.00'), 'the invoice entered on A is in the company file on B');
@@ -192,6 +228,7 @@ async function main() {
 
   const closeB = await B.call('POST', '/api/company-file/close', null, B.internal);
   assert(closeB.status === 200, 'B closes the file');
+  assert(!existsSync(prepB.dataDir), "after B's clean close its plain-text working copy is gone");
   companyLock.release(lockB.lock);
 
   console.log(failures === 0 ? '\nE2E COMPANY FILE PASSED' : `\nE2E COMPANY FILE FAILED (${failures} assertion(s))`);
