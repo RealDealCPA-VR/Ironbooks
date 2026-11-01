@@ -58,6 +58,7 @@ import { usePriceQuotes, samePrice } from '@/lib/usePriceQuotes';
 import { PriceSourceBadge } from '@/components/PriceSourceBadge';
 import { previewSalesTotals } from '@/lib/salesLineMath';
 import { TransactionNav, useAdjacentTransactions } from '@/components/TransactionNav';
+import AttachmentPanel from '@/components/AttachmentPanel'; // J9 Doc Center
 
 // ---------------------------------------------------------------------------
 // Types
@@ -677,6 +678,7 @@ function NewMemoModal({ open, editing, onClose, customers, onCustomerAdded, item
           </div>
         </div>
       </div>
+      <AttachmentPanel className="mt-4" entityType="credit_memo" entityId={editing?.id} />
     </Modal>
   );
 }

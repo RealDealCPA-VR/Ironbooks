@@ -107,7 +107,11 @@ export async function getCalendar(
       .innerJoin(customers, eq(customers.id, estimates.customerId))
       .where(and(eq(estimates.companyId, ctx.companyId), or(inRange(estimates.date), inRange(estimates.expirationDate))));
     for (const r of est) {
-      add(day(r.date), { id: r.id, kind: 'estimate', type: 'entered', label: `Estimate ${r.n} — ${r.customer}`, amount: r.total, href: '/estimates' });
+      // A void estimate is no longer a transaction (like a void invoice above). A closed one was
+      // still entered that day (QB lists it), it just has nothing left to expire.
+      if (r.status !== 'void') {
+        add(day(r.date), { id: r.id, kind: 'estimate', type: 'entered', label: `Estimate ${r.n} — ${r.customer}`, amount: r.total, href: '/estimates' });
+      }
       if (r.exp && !['closed', 'rejected', 'void'].includes(r.status)) {
         add(day(r.exp), { id: r.id, kind: 'estimate', type: 'due', label: `Estimate ${r.n} expires — ${r.customer}`, amount: r.total, href: '/estimates' });
       }
@@ -115,7 +119,7 @@ export async function getCalendar(
     const so = await ctx.db
       .select({ id: salesOrders.id, n: sql<string>`COALESCE(NULLIF(${salesOrders.refNumber}, ''), CAST(${salesOrders.orderNumber} AS TEXT))`, date: salesOrders.date, total: salesOrders.total })
       .from(salesOrders)
-      .where(and(eq(salesOrders.companyId, ctx.companyId), inRange(salesOrders.date)));
+      .where(and(eq(salesOrders.companyId, ctx.companyId), ne(salesOrders.status, 'void'), inRange(salesOrders.date)));
     for (const r of so) add(day(r.date), { id: r.id, kind: 'sales_order', type: 'entered', label: `Sales order ${r.n}`, amount: r.total, href: '/sales-orders' });
     const pay = await ctx.db
       .select({ id: paymentsReceived.id, date: paymentsReceived.date, amount: paymentsReceived.amount, customer: customers.displayName })
@@ -147,7 +151,13 @@ export async function getCalendar(
       .select({ id: purchaseOrders.id, n: sql<string>`COALESCE(NULLIF(${purchaseOrders.refNumber}, ''), CAST(${purchaseOrders.poNumber} AS TEXT))`, date: purchaseOrders.date, exp: purchaseOrders.expectedDate, total: purchaseOrders.total, status: purchaseOrders.status, vendor: vendors.displayName })
       .from(purchaseOrders)
       .innerJoin(vendors, eq(vendors.id, purchaseOrders.vendorId))
-      .where(and(eq(purchaseOrders.companyId, ctx.companyId), or(inRange(purchaseOrders.date), inRange(purchaseOrders.expectedDate))));
+      .where(
+        and(
+          eq(purchaseOrders.companyId, ctx.companyId),
+          ne(purchaseOrders.status, 'void'),
+          or(inRange(purchaseOrders.date), inRange(purchaseOrders.expectedDate)),
+        ),
+      );
     for (const r of po) {
       add(day(r.date), { id: r.id, kind: 'purchase_order', type: 'entered', label: `P.O. ${r.n} — ${r.vendor}`, amount: r.total, href: '/purchase-orders' });
       if (r.exp && ['open', 'partial'].includes(r.status)) {

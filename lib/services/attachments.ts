@@ -26,6 +26,7 @@ import {
   bills,
   creditMemos,
   customers,
+  deposits,
   employees,
   estimates,
   expenses,
@@ -222,6 +223,8 @@ const FILING_TABLES = {
   item: items,
   lead: leads,
   form_template: formTemplates,
+  // J9 (feature round, accountant): Make Deposits has an attachment panel too.
+  deposit: deposits,
 } as const;
 
 /**
@@ -248,6 +251,7 @@ const RECORD_AREAS: Record<keyof typeof FILING_TABLES, Area | null> = {
   item: 'lists',
   lead: 'customers',
   form_template: null,
+  deposit: 'banking',
 };
 
 function isFilingType(t: string): t is keyof typeof FILING_TABLES {

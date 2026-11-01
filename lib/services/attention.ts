@@ -22,6 +22,7 @@
  * services/routes as the full screens (categorize → bankCategorize.categorize → posting.ts).
  * Works fully with AI off: the AI error kind lists the rules-based scan's stored findings.
  */
+import { systemAccountIdOrNull } from './accountRoles';
 import fs from 'node:fs';
 import path from 'node:path';
 import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lte, lt, ne, notInArray, or, sql } from 'drizzle-orm';
@@ -647,13 +648,7 @@ const payrollTaxSource: Source = async ({ ctx, today, payrollLiabilityAccountId 
       .where(and(eq(accounts.id, liabId), eq(accounts.companyId, ctx.companyId)));
     if (!ok) liabId = null;
   }
-  if (!liabId) {
-    const [row] = await ctx.db
-      .select({ id: accounts.id })
-      .from(accounts)
-      .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, '2300')));
-    liabId = row?.id ?? null;
-  }
+  if (!liabId) liabId = await systemAccountIdOrNull(ctx, 'payroll_liabilities'); // by role (accountRoles.ts)
   if (!liabId) return { items: [] };
   const monthExpr = sql<string>`to_char(${journalEntries.date}, 'YYYY-MM')`;
   const rows = await ctx.db

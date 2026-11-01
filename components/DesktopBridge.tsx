@@ -29,6 +29,7 @@ import { openHelpWindow } from '@/components/ShortcutsHelp';
 import { OPEN_PRODUCT_INFO_EVENT } from '@/components/ProductInfo';
 import { OPEN_WINDOW_LIST_EVENT, WINDOW_COMMAND_EVENT, type WindowCommand } from '@/components/WindowList';
 import { CUSTOMIZE_FAVORITES_EVENT } from '@/components/FavoritesMenu';
+import { SetClosingDateHost, openSetClosingDate } from '@/components/SetClosingDateDialog';
 
 /**
  * Desktop menu items that act in the page (electron/main.js sends them as 'menu' actions). Back /
@@ -154,6 +155,11 @@ export default function DesktopBridge() {
         b.company?.open?.();
         return;
       }
+      // Accountant / Company / File > Utilities > Set Closing Date: the dialog opens over this window.
+      if (action === 'set-closing-date') {
+        openSetClosingDate();
+        return;
+      }
       // File > Save Company File Now finished.
       if (action === 'company-file-saved') {
         toast('Company file saved.', 'success');
@@ -199,7 +205,8 @@ export default function DesktopBridge() {
 
   const visible = ['available', 'downloading', 'ready', 'error'].includes(update.state);
   const key = `${update.state}:${update.version ?? ''}`;
-  if (!visible || dismissed === key) return null;
+  // The Set Closing Date dialog host renders nothing until a menu (or the Accountant Center) opens it.
+  if (!visible || dismissed === key) return <SetClosingDateHost />;
 
   async function download() {
     try {
@@ -246,6 +253,8 @@ export default function DesktopBridge() {
   }
 
   return (
+    <>
+    <SetClosingDateHost />
     <div className="fixed bottom-4 left-4 z-[200] max-w-sm" role="status" aria-live="polite">
       <div className="flex items-start gap-3 rounded-2xl border border-slate-100 bg-white p-4 shadow-2xl">
         <div className="mt-0.5 rounded-lg bg-electric/10 p-2">
@@ -296,5 +305,6 @@ export default function DesktopBridge() {
         </button>
       </div>
     </div>
+    </>
   );
 }

@@ -24,6 +24,7 @@
  *   - Voiding (or a ledger-changing edit) puts the returned stock back at the cost it left with.
  */
 
+import { systemAccountIdByCode, systemAccountIdOrNull } from './accountRoles';
 import { assertAccountantDatesOpen } from './accountantCopy/guard';
 import { isDepositTargetAccount } from '@/lib/accountTypes';
 import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
@@ -143,26 +144,23 @@ export interface ApplyToBillInput {
 
 /** Resolve the Accounts Payable account (code '2000') for this company. */
 async function resolveApAccount(ctx: ServiceContext): Promise<string> {
-  const [row] = await ctx.db
-    .select({ id: accounts.id })
-    .from(accounts)
-    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, '2000')));
-  if (!row) {
+  // By role, not by number: the Accounts Payable account (lib/services/accountRoles.ts), the same
+  // one bill payments, bill credits and item receipts use.
+  const id = await systemAccountIdOrNull(ctx, 'accounts_payable');
+  if (!id) {
     throw new ServiceError(
       'NOT_FOUND',
       'Accounts Payable account (code 2000) not found. Ensure the default chart of accounts is seeded.',
     );
   }
-  return row.id;
+  return id;
 }
 
 async function accountIdByCode(ctx: ServiceContext, code: string): Promise<string> {
-  const [row] = await ctx.db
-    .select({ id: accounts.id })
-    .from(accounts)
-    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, code)));
-  if (!row) throw notFound(`Account with code ${code}`);
-  return row.id;
+  // The system numbers (2000 A/P, 1300 Inventory Asset, 5000 COGS, 2200 Sales Tax Payable, 2300
+  // Payroll Liabilities) resolve by role, so a chart converted from QuickBooks with other numbers
+  // posts to the right account (lib/services/accountRoles.ts). Other numbers: as before.
+  return systemAccountIdByCode(ctx, code);
 }
 
 /**

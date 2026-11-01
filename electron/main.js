@@ -41,7 +41,7 @@ const { app, BrowserWindow, Menu, dialog, ipcMain, nativeTheme, shell, session }
     // Fall back to the default (new) userData location.
   }
 })();
-const { buildSectionMenus } = require('./menuRoutes');
+const { buildSectionMenus, buildUtilitiesMenu } = require('./menuRoutes');
 const spelling = require('./spelling');
 const windowTheme = require('./windowTheme');
 const startScreen = require('./startScreen');
@@ -2075,6 +2075,8 @@ function buildMenu() {
         // QB File > Send Company File > Accountant's Copy (I1) and File > Create Copy > Period Copy (I7).
         { label: "Accountant's Copy…", click: () => navigate('/accountant/accountants-copy') },
         { label: 'Create Period Copy…', click: () => navigate('/accountant/period-copy') },
+        // QB File > Utilities (find, import / export, verify / rebuild, condense, closing date).
+        buildUtilitiesMenu(navigate, sendMenuAction),
         { type: 'separator' },
         // Exit closes the window, so a form being typed asks first (Alt+F4 does the same).
         process.platform === 'darwin' ? { role: 'quit' } : { label: 'Exit', ...shownKey('Alt+F4'), click: () => (mainWindow ? mainWindow.close() : app.quit()) },
@@ -2105,7 +2107,7 @@ function buildMenu() {
     { label: 'View', submenu: [{ label: 'Refresh', ...shownKey('F5'), click: pageAction('refresh') }, { role: 'toggleDevTools' }, { type: 'separator' }, { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' }, { type: 'separator' }, { role: 'togglefullscreen' }] },
     // QuickBooks' order: Lists, Favorites, then Company … Reports (electron/menuRoutes.js).
     ...(() => {
-      const sections = buildSectionMenus(navigate);
+      const sections = buildSectionMenus(navigate, process.platform, sendMenuAction);
       const lists = sections.filter((s) => s.label === 'Lists');
       const favorites = {
         label: 'Favorites',
@@ -2155,6 +2157,11 @@ function buildMenu() {
     },
   ];
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
+
+/** An in-app menu action (e.g. 'set-closing-date' opens that dialog over the current window). */
+function sendMenuAction(action) {
+  mainWindow?.webContents.send('menu', action);
 }
 
 function navigate(route) {

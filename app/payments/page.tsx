@@ -62,6 +62,7 @@ function cleanPaymentBody(body: PaymentBody): PaymentBody {
 // cmdbar: "receive payment from Acme" opens Receive Payments with the customer picked.
 import { usePrefill } from '@/lib/commands/usePrefill';
 import { TransactionNav, useAdjacentTransactions } from '@/components/TransactionNav';
+import AttachmentPanel from '@/components/AttachmentPanel'; // J9 Doc Center
 
 // ---------------------------------------------------------------------------
 // Types
@@ -1270,6 +1271,7 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
           </div>
         )}
       </div>
+      <AttachmentPanel className="mt-4" entityType="payment_received" entityId={editing?.id} />
     </Modal>
   );
 }

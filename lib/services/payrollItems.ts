@@ -26,6 +26,7 @@
  * and 2300 (Payroll Liabilities). Seeding is idempotent and skipped when the
  * company already has any payroll items.
  */
+import { systemAccountIdByCodeOrNull } from './accountRoles';
 import { and, asc, eq, inArray } from 'drizzle-orm';
 import { Money } from '@/lib/money';
 import { accounts, payrollItems } from '@/lib/db/schema';
@@ -382,11 +383,8 @@ export async function updatePayrollItem(
 // ---------------------------------------------------------------------------
 
 async function accountIdByCodeOrNull(ctx: ServiceContext, code: string): Promise<string | null> {
-  const [row] = await ctx.db
-    .select({ id: accounts.id })
-    .from(accounts)
-    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, code)));
-  return row?.id ?? null;
+  // 2300 Payroll Liabilities resolves by role (lib/services/accountRoles.ts); others by number.
+  return systemAccountIdByCodeOrNull(ctx, code);
 }
 
 /**

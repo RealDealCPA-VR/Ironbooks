@@ -25,6 +25,7 @@
  *     build/unbuild, since this module's averageCost math never touches
  *     layers; route those items through fifo.ts instead.
  */
+import { systemAccountId } from './accountRoles';
 import { randomUUID } from 'node:crypto';
 import { and, desc, eq, inArray } from 'drizzle-orm';
 import { accounts, assemblyComponents, items, pendingBuilds } from '@/lib/db/schema';
@@ -167,12 +168,8 @@ async function loadItem(ctx: ServiceContext, itemId: string) {
 /** The item's inventory asset account (item.assetAccountId ?? code 1300). */
 async function inventoryAccountOf(ctx: ServiceContext, item: { assetAccountId: string | null }): Promise<string> {
   if (item.assetAccountId) return item.assetAccountId;
-  const [row] = await ctx.db
-    .select({ id: accounts.id })
-    .from(accounts)
-    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, '1300')));
-  if (!row) throw notFound('Account with code 1300');
-  return row.id;
+  // The Inventory Asset account by role (lib/services/accountRoles.ts), like every posting path.
+  return systemAccountId(ctx, 'inventory_asset');
 }
 
 /**

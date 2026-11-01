@@ -444,6 +444,8 @@ async function vendorCreditPayload(ctx: ServiceContext, id: string): Promise<P> 
       classId: l.classId,
       customerId: l.customerId,
       jobId: l.jobId,
+      // P1 purchases: the site / bin / serial numbers / lot the returned stock leaves.
+      ...invOf(l as unknown as P),
     })),
   };
 }

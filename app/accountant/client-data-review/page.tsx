@@ -6,11 +6,14 @@ import { ClipboardCheck, CheckCircle2 } from 'lucide-react';
 import { Badge, Button, Card, Input, Label, PageHeader, Select, Spinner, toast, toastError } from '@/components/ui';
 import { api } from '@/lib/client';
 import { BackToCenter, money, today } from '../_shared';
+import { SetClosingDateDialog } from '@/components/SetClosingDateDialog';
 
 type Fix =
   | { kind: 'apply_customer_credit'; refType: 'payment' | 'credit_memo'; refId: string }
   | { kind: 'apply_vendor_credit'; refId: string }
-  | { kind: 'link'; href: string; label: string };
+  | { kind: 'link'; href: string; label: string }
+  | { kind: 'clear_undeposited'; depositId: string; lineId: string; items: Array<{ kind: string; id: string }> }
+  | { kind: 'set_closing_date'; suggested: string | null };
 interface Issue {
   id: string;
   title: string;
@@ -49,6 +52,9 @@ export default function ClientDataReviewPage() {
     void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  /** Set Closing Date dialog: undefined = closed, else the suggested date. */
+  const [closingOpen, setClosingOpen] = useState<string | null | undefined>(undefined);
 
   async function act(id: string, body: Record<string, unknown>, done: string) {
     setBusy(id);
@@ -155,6 +161,23 @@ export default function ClientDataReviewPage() {
                               Apply to open bills
                             </Button>
                           )}
+                          {i.fix?.kind === 'clear_undeposited' && (
+                            <Button
+                              size="sm"
+                              loading={busy === i.id}
+                              onClick={() => {
+                                const f = i.fix as { depositId: string; lineId: string; items: Array<{ kind: string; id: string }> };
+                                void act(i.id, { action: 'clear_undeposited', depositId: f.depositId, lineId: f.lineId, items: f.items }, 'The deposit now takes the payment out of Undeposited Funds.');
+                              }}
+                            >
+                              Clear up
+                            </Button>
+                          )}
+                          {i.fix?.kind === 'set_closing_date' && (
+                            <Button size="sm" variant="secondary" onClick={() => setClosingOpen((i.fix as { suggested: string | null }).suggested)}>
+                              Set Closing Date…
+                            </Button>
+                          )}
                         </li>
                       ))}
                     </ul>
@@ -163,6 +186,15 @@ export default function ClientDataReviewPage() {
               ))}
           </section>
         ))
+      )}
+      {closingOpen !== undefined && (
+        <SetClosingDateDialog
+          suggestedDate={closingOpen}
+          onClose={() => {
+            setClosingOpen(undefined);
+            void load();
+          }}
+        />
       )}
     </main>
   );

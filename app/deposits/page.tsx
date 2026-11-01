@@ -1,6 +1,7 @@
 'use client';
 
 import { Suspense, useEffect, useState, useCallback } from 'react';
+import AttachmentPanel from '@/components/AttachmentPanel'; // J9 Doc Center
 import { Landmark, Pencil, Plus, Trash2 } from 'lucide-react';
 import {
   AmountInput,
@@ -644,6 +645,7 @@ function MakeDepositModal({
           </div>
         )}
       </div>
+      <AttachmentPanel className="mt-4" entityType="deposit" entityId={editing?.id} />
     </Modal>
   );
 }

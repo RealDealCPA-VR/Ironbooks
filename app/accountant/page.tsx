@@ -19,6 +19,7 @@ import { Badge, Card, PageHeader, Table, Td, Th, Tr } from '@/components/ui';
 import { getPageContext } from '@/lib/context';
 import { formatCurrency } from '@/lib/money';
 import { accountantCenterSummary } from '@/lib/services/accountant/accountantCenter';
+import { SetClosingDateLink } from './SetClosingDateLink';
 
 export const dynamic = 'force-dynamic';
 
@@ -56,7 +57,7 @@ export default async function AccountantCenterPage() {
         <Card className="p-4">
           <div className="text-xs uppercase tracking-wide text-navy/50">Closing date</div>
           <div className="text-xl font-bold text-navy">{s.closingDate ?? 'Not set'}</div>
-          <Link className="text-sm text-electric hover:underline" href="/settings">Change in Settings</Link>
+          <SetClosingDateLink />
         </Card>
         <Card className="p-4">
           <div className="text-xs uppercase tracking-wide text-navy/50">Sales tax owed (books)</div>

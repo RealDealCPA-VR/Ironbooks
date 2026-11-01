@@ -23,6 +23,7 @@
  * The default deposit account is 1050 Undeposited Funds so counter sales sit
  * with received payments until the bookkeeper makes a bank deposit.
  */
+import { systemAccountIdByCode } from './accountRoles';
 import { and, eq, inArray, isNull, ne, sql } from 'drizzle-orm';
 import { assertSalesTaxAllowed } from '@/lib/featureGate';
 import { Money, allocate, toAmountString } from '@/lib/money';
@@ -140,12 +141,10 @@ export interface CreateSalesReceiptInput {
 
 /** Look up an account id by code, scoped to the company. Throws NOT_FOUND. */
 async function accountIdByCode(ctx: ServiceContext, code: string): Promise<string> {
-  const [row] = await ctx.db
-    .select({ id: accounts.id })
-    .from(accounts)
-    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, code)));
-  if (!row) throw notFound(`Account with code ${code}`);
-  return row.id;
+  // The system numbers (2000 A/P, 1300 Inventory Asset, 5000 COGS, 2200 Sales Tax Payable, 2300
+  // Payroll Liabilities) resolve by role, so a chart converted from QuickBooks with other numbers
+  // posts to the right account (lib/services/accountRoles.ts). Other numbers: as before.
+  return systemAccountIdByCode(ctx, code);
 }
 
 /** Look up an account by code, creating it if missing (older companies may lack 1050). */

@@ -6,8 +6,10 @@
  *   unapplied_customer_credits   customer payments / credit memos with money not applied while
  *                                the same customer has open invoices → "Apply" (oldest first,
  *                                through payments.applyPayment / creditMemos.applyToInvoice)
- *   undeposited_funds            payments & sales receipts sitting in Undeposited Funds for more
- *                                than N days → open Make Deposits
+ *   undeposited_funds            Clear Up Undeposited Funds: payments still in Undeposited Funds
+ *                                whose money a deposit ALSO recorded straight to income → "Clear up"
+ *                                (the deposit takes the payment instead); other payments waiting
+ *                                more than N days → open Make Deposits (clientDataReviewTasks.ts)
  *   unapplied_vendor_credits     bill credits not applied while the vendor has open bills
  *                                → "Apply" (vendorCredits.applyToBill)
  *   item_setup                   items missing income / asset accounts, negative stock, inactive
@@ -19,10 +21,17 @@
  *   prior_balances               the transactions behind those changes (dated in the reviewed
  *                                period but entered/changed after the review) → open/audit
  *
+ *   unapplied_bill_payments      checks written to A/P and bill payments not applied to bills
+ *   vendor_1099                  1099 vendors without a tax ID, accounts paid to 1099 vendors not
+ *                                mapped to a 1099 box
+ *   employee_defaults            employees missing pay rate, SSN, W-4 status, address, hire date
+ *   closing_date                 closing date missing / before the reviewed period / without a
+ *                                password; closed-period changes since the last review
+ *
  * Task status (not started / in progress / completed) and review snapshots are stored per company
  * (client_review_tasks / client_review_snapshots); every change is audited.
  */
-import { and, asc, desc, eq, gt, lte, ne, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, gt, inArray, lte, ne, sql } from 'drizzle-orm';
 import {
   accounts,
   bills,
@@ -41,19 +50,32 @@ import {
 } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from '../_base';
-import { listUndepositedPayments } from '../deposits';
 import { applyPayment } from '../payments';
 import { applyToInvoice } from '../creditMemos';
 import { applyToBill } from '../vendorCredits';
 import { journalOpenItems, resolveEntityNames } from '../journal';
 import { requirePermission } from '../access';
+import { isIsoDate } from '@/lib/onboarding';
+import { systemAccountIdOrNull } from '../accountRoles';
+import {
+  closingDateIssues,
+  employeeDefaultIssues,
+  undepositedFundsIssues,
+  unappliedVendorPaymentIssues,
+  vendor1099Issues,
+} from './clientDataReviewTasks';
 
 export const REVIEW_TASKS = [
   { key: 'unapplied_customer_credits', group: 'Customers', title: 'Fix unapplied customer payments and credits' },
   { key: 'undeposited_funds', group: 'Customers', title: 'Clear up Undeposited Funds' },
   { key: 'unapplied_vendor_credits', group: 'Vendors', title: 'Fix unapplied vendor payments and credits' },
   { key: 'item_setup', group: 'Items', title: 'Review item setup' },
+  // Feature round (accountant, I13): the rest of QB's review tasks.
+  { key: 'unapplied_bill_payments', group: 'Vendors', title: 'Fix unapplied bill payments and checks to Accounts Payable' },
+  { key: 'vendor_1099', group: 'Vendors', title: 'Review 1099 vendors and map 1099 accounts' },
   { key: 'payroll_liabilities', group: 'Payroll', title: 'Find incorrectly paid payroll liabilities' },
+  { key: 'employee_defaults', group: 'Payroll', title: 'Review employee defaults' },
+  { key: 'closing_date', group: 'Closing', title: 'Set the closing date and review closed-period changes' },
   { key: 'compare_balances', group: 'Account balances', title: 'Compare balances with the last review' },
   { key: 'prior_balances', group: 'Account balances', title: 'Troubleshoot prior account balances' },
 ] as const;
@@ -67,7 +89,11 @@ export interface ReviewIssue {
   /** Fix action the UI offers: an API action, or a link to the screen that fixes it. */
   fix?: { kind: 'apply_customer_credit'; refType: 'payment' | 'credit_memo'; refId: string }
     | { kind: 'apply_vendor_credit'; refId: string }
-    | { kind: 'link'; href: string; label: string };
+    | { kind: 'link'; href: string; label: string }
+    // Clear Up Undeposited Funds: the deposit takes these payments in place of its direct line.
+    | { kind: 'clear_undeposited'; depositId: string; lineId: string; items: Array<{ kind: 'payment' | 'sales_receipt' | 'invoice_payment'; id: string }> }
+    // Opens the Set Closing Date dialog (suggested: the end of the reviewed period).
+    | { kind: 'set_closing_date'; suggested: string | null };
 }
 
 export interface ReviewTaskResult {
@@ -149,26 +175,6 @@ async function unappliedCustomerCredits(ctx: ServiceContext): Promise<ReviewIssu
   return out;
 }
 
-async function undepositedFunds(ctx: ServiceContext, olderThanDays: number): Promise<ReviewIssue[]> {
-  let items: Awaited<ReturnType<typeof listUndepositedPayments>> = [];
-  try {
-    items = await listUndepositedPayments(ctx);
-  } catch (err) {
-    if (err instanceof ServiceError && err.code === 'NOT_FOUND') return []; // no UF account
-    throw err;
-  }
-  const cutoff = Date.now() - olderThanDays * 86_400_000;
-  return items
-    .filter((i) => i.date.getTime() <= cutoff)
-    .map((i) => ({
-      id: `${i.kind}:${i.id}`,
-      title: `${i.customerName ?? 'Walk-in'}: ${i.kind === 'payment' ? 'payment' : 'sales receipt'} of ${i.date.toISOString().slice(0, 10)} not yet deposited`,
-      detail: `${toAmountString(i.amount)} has been waiting in Undeposited Funds for more than ${olderThanDays} days. Deposit it, or void it if it was recorded twice.`,
-      amount: toAmountString(i.amount),
-      fix: { kind: 'link' as const, href: '/deposits', label: 'Make deposits' },
-    }));
-}
-
 async function unappliedVendorCredits(ctx: ServiceContext): Promise<ReviewIssue[]> {
   const open = await ctx.db
     .select({ vendorId: bills.vendorId, n: sql<number>`COUNT(*)` })
@@ -191,8 +197,17 @@ async function unappliedVendorCredits(ctx: ServiceContext): Promise<ReviewIssue[
       fix: n > 0 ? { kind: 'apply_vendor_credit' as const, refId: c.id } : { kind: 'link' as const, href: '/vendor-credits', label: 'Open bill credits' },
     };
   });
-  // I11: General Journal debits to A/P for a vendor are vendor credits too.
-  const journalCredits = (await journalOpenItems(ctx, 'ap')).filter((j) => Money.lt(j.amount, 0));
+  // I11: General Journal debits to A/P for a vendor are vendor credits too. Checks / card charges
+  // written to A/P are unapplied vendor PAYMENTS (their own task, unapplied_bill_payments).
+  const apItems = (await journalOpenItems(ctx, 'ap')).filter((j) => Money.lt(j.amount, 0));
+  const apRefs = apItems.length
+    ? await ctx.db
+        .select({ id: journalEntries.id, sourceRef: journalEntries.sourceRef })
+        .from(journalEntries)
+        .where(and(eq(journalEntries.companyId, ctx.companyId), inArray(journalEntries.id, [...new Set(apItems.map((j) => j.journalEntryId))])))
+    : [];
+  const fromCheck = new Set(apRefs.filter((r) => (r.sourceRef ?? '').startsWith('expense:')).map((r) => r.id));
+  const journalCredits = apItems.filter((j) => !fromCheck.has(j.journalEntryId));
   const names = await resolveEntityNames(ctx, journalCredits);
   for (const j of journalCredits) {
     const name = names.get(`vendor:${j.entityId}`) ?? 'Vendor';
@@ -233,11 +248,10 @@ async function itemSetup(ctx: ServiceContext): Promise<ReviewIssue[]> {
 }
 
 async function payrollLiabilityMispayments(ctx: ServiceContext): Promise<ReviewIssue[]> {
-  const [acct] = await ctx.db
-    .select({ id: accounts.id })
-    .from(accounts)
-    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, '2300')));
-  if (!acct) return [];
+  // The Payroll Liabilities account by role (lib/services/accountRoles.ts), the one paychecks use.
+  const liabId = await systemAccountIdOrNull(ctx, 'payroll_liabilities');
+  if (!liabId) return [];
+  const acct = { id: liabId };
   const rows = await ctx.db
     .select({
       lineId: journalEntryLines.id,
@@ -317,7 +331,9 @@ export async function latestSnapshot(ctx: ServiceContext) {
 
 /** "Mark review complete": capture balances as of the review period end. */
 export async function takeReviewSnapshot(ctx: ServiceContext, input: { asOf: string; note?: string | null }) {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(input.asOf ?? '')) throw validation('asOf must be YYYY-MM-DD.');
+  // A real calendar day: "2026-13-01" made endOfDay() an Invalid Date (a 500), and "2026-02-31"
+  // was stored as typed while its balances rolled on to March 3.
+  if (!isIsoDate(input.asOf)) throw validation('The review period end must be a real date (YYYY-MM-DD).');
   const balances = await naturalBalancesAsOf(ctx, endOfDay(input.asOf));
   return inTransaction(ctx, async (tx) => {
     const [row] = await tx.db
@@ -433,16 +449,22 @@ export async function clientDataReview(
     .where(eq(clientReviewTasks.companyId, ctx.companyId));
   const status = new Map(statusRows.map((s) => [s.taskKey, s]));
   const cmp = await compareBalances(ctx);
+  const snap = await latestSnapshot(ctx);
+  // The review year (1099s): the reviewed period's year, else this year.
+  const reviewYear = snap ? Number(snap.asOf.slice(0, 4)) : new Date().getUTCFullYear();
   const found: Record<ReviewTaskKey, ReviewIssue[]> = {
     unapplied_customer_credits: await unappliedCustomerCredits(ctx),
-    undeposited_funds: await undepositedFunds(ctx, opts.undepositedOlderThanDays ?? 30),
+    undeposited_funds: await undepositedFundsIssues(ctx, opts.undepositedOlderThanDays ?? 30),
     unapplied_vendor_credits: await unappliedVendorCredits(ctx),
+    unapplied_bill_payments: await unappliedVendorPaymentIssues(ctx),
+    vendor_1099: await vendor1099Issues(ctx, reviewYear),
     item_setup: await itemSetup(ctx),
     payroll_liabilities: await payrollLiabilityMispayments(ctx),
+    employee_defaults: await employeeDefaultIssues(ctx),
+    closing_date: await closingDateIssues(ctx, snap ? { asOf: snap.asOf, at: snap.createdAt } : null),
     compare_balances: cmp.issues,
     prior_balances: cmp.prior,
   };
-  const snap = await latestSnapshot(ctx);
   return {
     tasks: REVIEW_TASKS.map((t) => ({
       key: t.key,

@@ -396,6 +396,12 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
     first: 'Pick the first and last day of the period and click "Create Period Copy".',
     qb: 'Period Copy',
   },
+  // ---- feature round (accountant) ----
+  '/system-accounts': {
+    title: 'System Accounts',
+    what: 'The accounts Ironbooks posts to on its own: Accounts Payable, Inventory, Cost of Goods Sold, Sales Tax and Payroll Liabilities. A converted QuickBooks file may number them differently.',
+    first: 'Check the account each line posts to. If one is wrong, choose the right account and click Save.',
+  },
 };
 
 /** The help for a path (longest matching prefix, so /registers/abc gets the Registers help). */

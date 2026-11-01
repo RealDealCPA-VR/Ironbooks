@@ -37,6 +37,7 @@
  * Multi-tenant safety: every query is scoped by ctx.companyId.
  * Money: all arithmetic uses Money/toAmountString — never JS floats.
  */
+import { systemAccountIdByCode } from './accountRoles';
 import { isBankAccount, isCreditCardAccount } from '@/lib/accountTypes';
 import { and, asc, desc, eq, gte, inArray, isNull, lte } from 'drizzle-orm';
 import type Decimal from 'decimal.js';
@@ -180,12 +181,10 @@ interface PreparedExpense {
 // ---------------------------------------------------------------------------
 
 async function accountIdByCode(ctx: ServiceContext, code: string): Promise<string> {
-  const [row] = await ctx.db
-    .select({ id: accounts.id })
-    .from(accounts)
-    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, code)));
-  if (!row) throw notFound(`Account with code ${code}`);
-  return row.id;
+  // The system numbers (2000 A/P, 1300 Inventory Asset, 5000 COGS, 2200 Sales Tax Payable, 2300
+  // Payroll Liabilities) resolve by role, so a chart converted from QuickBooks with other numbers
+  // posts to the right account (lib/services/accountRoles.ts). Other numbers: as before.
+  return systemAccountIdByCode(ctx, code);
 }
 
 async function prepareExpense(

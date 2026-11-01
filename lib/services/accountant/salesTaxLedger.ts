@@ -33,6 +33,7 @@
  * memos, payments and adjustments are recognized on their own date. Cash-basis figures are a
  * report view; they intentionally do not tie to the accrual GL.
  */
+import { systemAccountIds } from '../accountRoles';
 import { and, eq, inArray, lte, sql } from 'drizzle-orm';
 import {
   accounts,
@@ -129,12 +130,19 @@ export async function salesTaxLiabilityAccounts(
     .where(eq(accounts.companyId, ctx.companyId));
   // An agency account only counts when it is a plain liability account: a misconfigured agency
   // pointing at A/P, a credit card or payroll liabilities must not pull those ledgers in.
+  // The Sales Tax Payable account by role (lib/services/accountRoles.ts): invoices, receipts and
+  // credit memos post their tax there, so it is in scope whatever its number; the payroll
+  // liabilities account (by role) never is.
+  const roles = await systemAccountIds(ctx);
+  const salesTaxId = roles.get('sales_tax_payable') ?? null;
+  const payrollId = roles.get('payroll_liabilities') ?? null;
   const usable = (a: (typeof rows)[number]) =>
     a.type === 'liability' &&
     !['accounts_payable', 'credit_card'].includes(a.subtype as string) &&
-    !['2000', '2100', '2300'].includes(a.code);
+    !['2000', '2100', '2300'].includes(a.code) &&
+    a.id !== payrollId;
   return rows
-    .filter((a) => a.code === SALES_TAX_PAYABLE_CODE || (ids.has(a.id) && usable(a)))
+    .filter((a) => a.id === salesTaxId || a.code === SALES_TAX_PAYABLE_CODE || (ids.has(a.id) && usable(a)))
     .map((a) => ({ id: a.id, code: a.code, name: a.name }));
 }
 

@@ -46,6 +46,7 @@
  * to the GL — through postJournalEntry, like every other document — with a
  * sourceRef of `iif:…` so re-importing the same file skips duplicates.
  */
+import { systemAccountIdOrNull } from './accountRoles';
 import { createHash } from 'node:crypto';
 import Papa from 'papaparse';
 import { and, eq, like } from 'drizzle-orm';
@@ -1492,6 +1493,7 @@ export async function importIIF(
   content: string,
   opts: ImportIifOptions = {},
 ): Promise<ImportCounts> {
+  assertImportSize(content);
   // A bulk load: fresh planner statistics afterwards (PGlite has no autovacuum; best-effort).
   // One import at a time per company: two runs of the same file at once both passed the
   // "already imported?" checks and posted every transaction / open bill twice (importLock.ts).
@@ -2284,7 +2286,8 @@ async function importItemRow(
   }
   // The file already brings in the inventory asset account's balance: create the stock (layer,
   // quantity, average cost) without posting it again.
-  const assetIdForStock = assetAccountId ?? lookup.byCode.get('1300')?.id ?? null;
+  // Items without their own asset account stock into the Inventory Asset account by role.
+  const assetIdForStock = assetAccountId ?? (await systemAccountIdOrNull(ctx, 'inventory_asset')) ?? lookup.byCode.get('1300')?.id ?? null;
   const ledgerCarried = !!opening && !!assetIdForStock && !!input.carriedAccountIds?.has(assetIdForStock);
 
   try {
@@ -2888,6 +2891,7 @@ async function importCustomerRows(ctx: ServiceContext, rows: Row[], mapping: Csv
 
 /** Parse a CSV string and insert customers using the supplied column mapping. */
 export async function importCustomersCSV(ctx: ServiceContext, content: string, mapping: CsvColumnMapping): Promise<ImportCounts> {
+  assertImportSize(content);
   return withImportLock(ctx, () => withPlannerStats(ctx.db, 'customer import', () => importCustomerRows(ctx, parseCsvRows(content), mapping)));
 }
 
@@ -2943,6 +2947,7 @@ async function importVendorRows(ctx: ServiceContext, rows: Row[], mapping: CsvCo
 
 /** Parse a CSV string and insert vendors using the supplied column mapping. */
 export async function importVendorsCSV(ctx: ServiceContext, content: string, mapping: CsvColumnMapping): Promise<ImportCounts> {
+  assertImportSize(content);
   return withImportLock(ctx, () => withPlannerStats(ctx.db, 'vendor import', () => importVendorRows(ctx, parseCsvRows(content), mapping)));
 }
 
@@ -3020,6 +3025,7 @@ async function importItemRows(ctx: ServiceContext, rows: Row[], mapping: ItemsCs
 
 /** Parse a CSV string and insert items using the supplied column mapping. */
 export async function importItemsCSV(ctx: ServiceContext, content: string, mapping: ItemsCsvMapping): Promise<ImportCounts> {
+  assertImportSize(content);
   return withImportLock(ctx, () => withPlannerStats(ctx.db, 'item import', () => importItemRows(ctx, parseCsvRows(content), mapping)));
 }
 
@@ -3098,6 +3104,7 @@ async function importAccountRows(ctx: ServiceContext, rows: Row[], mapping: Acco
  * silently dropped.
  */
 export async function importAccountsCSV(ctx: ServiceContext, content: string, mapping: AccountsCsvMapping): Promise<ImportCounts> {
+  assertImportSize(content);
   return withImportLock(ctx, () => withPlannerStats(ctx.db, 'account import', () => importAccountRows(ctx, parseCsvRows(content), mapping)));
 }
 
@@ -3106,6 +3113,20 @@ export async function importAccountsCSV(ctx: ServiceContext, content: string, ma
 // ---------------------------------------------------------------------------
 
 export type ListImportKind = 'customers' | 'vendors' | 'items' | 'accounts';
+
+/** Largest QuickBooks file these imports read (the GL and open-items imports cap at the same). */
+export const MAX_QB_IMPORT_BYTES = 60 * 1024 * 1024;
+
+/**
+ * Refuse a file over MAX_QB_IMPORT_BYTES before it is parsed (IIF / CSV text or .xlsx bytes):
+ * the other import paths already did; these read any size into memory.
+ */
+export function assertImportSize(content: string | Uint8Array): void {
+  const bytes = typeof content === 'string' ? Buffer.byteLength(content, 'utf8') : content.byteLength;
+  if (bytes > MAX_QB_IMPORT_BYTES) {
+    throw new ServiceError('VALIDATION', 'The file is larger than 60 MB. Export a smaller date range or list from QuickBooks and import it in parts.');
+  }
+}
 
 /** Rows of the first worksheet that has a header row (first row with 2+ non-empty cells). */
 export function xlsxRows(bytes: Uint8Array): { headers: string[]; rows: Row[]; sheet: string } {
@@ -3135,6 +3156,7 @@ export async function importListXlsx(
   bytes: Uint8Array,
   mapping: Record<string, string>,
 ): Promise<ImportCounts> {
+  assertImportSize(bytes);
   let rows: Row[];
   try {
     rows = xlsxRows(bytes).rows;

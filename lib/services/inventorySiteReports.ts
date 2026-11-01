@@ -18,6 +18,7 @@
  * Committed (open sales orders) and on-PO quantities carry no site in this app; they are
  * attributed to the default site, where un-sited documents land.
  */
+import { systemAccountIdOrNull } from './accountRoles';
 import { and, asc, eq, inArray, isNull, sql } from 'drizzle-orm';
 import {
   accounts,
@@ -643,11 +644,9 @@ export async function verifySiteInvariants(
   // 4. Inventory asset GL == inventory valuation.
   const valuation = await inventoryValuation(ctx);
   const accountIds = new Set(itemRows.map((i) => i.assetAccountId).filter(Boolean) as string[]);
-  const [acct1300] = await ctx.db
-    .select({ id: accounts.id })
-    .from(accounts)
-    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, '1300')));
-  if (acct1300) accountIds.add(acct1300.id);
+  // The Inventory Asset account by role (lib/services/accountRoles.ts), the one postings use.
+  const inventoryRoleId = await systemAccountIdOrNull(ctx, 'inventory_asset');
+  if (inventoryRoleId) accountIds.add(inventoryRoleId);
   let gl = Money.zero();
   if (accountIds.size > 0) {
     const accts = await ctx.db

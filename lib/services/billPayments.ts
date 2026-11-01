@@ -25,6 +25,7 @@
  * Multi-tenant safety: every query is scoped by ctx.companyId.
  * Money: all arithmetic uses Money/toAmountString — never JS floats.
  */
+import { systemAccountIdOrNull } from './accountRoles';
 import { assertAccountantDatesOpen } from './accountantCopy/guard';
 import { overAppliedFixes } from '@/lib/errorFixes';
 import { isBankAccount, isCreditCardAccount, isPaymentSourceAccount } from '@/lib/accountTypes';
@@ -144,17 +145,15 @@ export interface VendorCreditUse {
 
 /** Resolve the A/P account (code '2000') for a company. */
 async function resolveApAccount(ctx: ServiceContext): Promise<string> {
-  const [apRow] = await ctx.db
-    .select({ id: accounts.id })
-    .from(accounts)
-    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, '2000')));
-  if (!apRow) {
+  // By role, not by number (lib/services/accountRoles.ts): the A/P account bills post to.
+  const id = await systemAccountIdOrNull(ctx, 'accounts_payable');
+  if (!id) {
     throw new ServiceError(
       'NOT_FOUND',
       'Accounts Payable account (code 2000) not found. Seed the default chart of accounts first.',
     );
   }
-  return apRow.id;
+  return id;
 }
 
 /** Derive a bill's docStatus from its post-payment balances. */

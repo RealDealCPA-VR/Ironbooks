@@ -13,6 +13,7 @@
  *    entry / account / amounts);
  *  - employees: refused when both have paychecks (it would merge two people's W-2 wages).
  */
+import { systemAccountIdOrNull } from '../accountRoles';
 import { and, eq, inArray, sql } from 'drizzle-orm';
 import Decimal from 'decimal.js';
 import {
@@ -73,11 +74,7 @@ async function rewriteTemplates(tx: ServiceContext, fromId: string, toId: string
 
 async function inventoryAccountId(ctx: ServiceContext, item: { assetAccountId: string | null }): Promise<string | null> {
   if (item.assetAccountId) return item.assetAccountId;
-  const [row] = await ctx.db
-    .select({ id: accounts.id })
-    .from(accounts)
-    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, '1300')));
-  return row?.id ?? null;
+  return systemAccountIdOrNull(ctx, 'inventory_asset'); // by role (lib/services/accountRoles.ts)
 }
 
 async function hasLayers(ctx: ServiceContext, itemId: string): Promise<boolean> {
@@ -293,10 +290,7 @@ async function mergeItemsInTx(ctx: ServiceContext, fromId: string, toId: string)
         const invAcct = await inventoryAccountId(tx, to);
         const [cogs] = to.expenseAccountId
           ? [{ id: to.expenseAccountId }]
-          : await tx.db
-              .select({ id: accounts.id })
-              .from(accounts)
-              .where(and(eq(accounts.companyId, tx.companyId), eq(accounts.code, '5000')));
+          : await systemAccountIdOrNull(tx, 'cost_of_goods_sold').then((id) => (id ? [{ id }] : [])); // by role
         if (!invAcct || !cogs) throw validation('Set up an inventory asset and cost of goods sold account before merging these items.');
         const amount = toAmountString(diff.abs());
         const memo = `Rounding from merging item "${from.name}" into "${to.name}"`;

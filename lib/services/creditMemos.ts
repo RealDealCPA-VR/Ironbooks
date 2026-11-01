@@ -43,6 +43,7 @@
  * reverses the main GL entry AND every restock entry, removing the restocked
  * quantity from stock again.
  */
+import { systemAccountIdByCode } from './accountRoles';
 import { assertAccountantDatesOpen } from './accountantCopy/guard';
 import { averageAfter, takeAccountantCost } from './accountantCopy/inventoryCost';
 import { cogsAccountForItem, fifoLayerValue, valueRemainderAfter } from './inventory';
@@ -155,12 +156,10 @@ export interface ApplyToInvoiceInput {
 
 /** Look up an account id by COA code, scoped to the company. Throws NOT_FOUND. */
 async function accountIdByCode(ctx: ServiceContext, code: string): Promise<string> {
-  const [row] = await ctx.db
-    .select({ id: accounts.id })
-    .from(accounts)
-    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, code)));
-  if (!row) throw notFound(`Account with code ${code}`);
-  return row.id;
+  // The system numbers (2000 A/P, 1300 Inventory Asset, 5000 COGS, 2200 Sales Tax Payable, 2300
+  // Payroll Liabilities) resolve by role, so a chart converted from QuickBooks with other numbers
+  // posts to the right account (lib/services/accountRoles.ts). Other numbers: as before.
+  return systemAccountIdByCode(ctx, code);
 }
 
 /** inventory_layers.source_ref of the FIFO layer a credit memo line's restock creates. */

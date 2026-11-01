@@ -391,8 +391,13 @@ export async function readPdfLines(bytes: Uint8Array): Promise<PdfLine[][]> {
       pages.push(groupLines(items));
       page.cleanup();
     }
+  } catch (err) {
+    // A page pdf.js can't read past opening the file (a broken page tree, a damaged content
+    // stream) is a plain message, like a file that can't be opened — never an unexpected error.
+    if (err instanceof ServiceError) throw err;
+    throw fail(`Page ${pages.length + 1} of this PDF could not be read. Re-save it from QuickBooks with File → Save as PDF, or export the report to Excel or CSV instead.`);
   } finally {
-    await doc.destroy();
+    await doc.destroy().catch(() => undefined);
   }
   return pages;
 }

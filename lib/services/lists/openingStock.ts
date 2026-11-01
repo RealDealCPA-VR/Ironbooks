@@ -22,6 +22,7 @@
  * layer when 'fifo') are created exactly the same way but NO journal entry is posted, which would count the value
  * twice. Matching the item values to that imported balance is then the file's responsibility.
  */
+import { systemAccountIdByCode } from '../accountRoles';
 import { and, eq } from 'drizzle-orm';
 import Decimal from 'decimal.js';
 import { accounts, inventoryLayers, items } from '@/lib/db/schema';
@@ -99,12 +100,10 @@ export function planOpeningStock(input: OpeningStockInput, itemType: string, tra
 }
 
 async function accountIdByCode(ctx: ServiceContext, code: string): Promise<string> {
-  const [row] = await ctx.db
-    .select({ id: accounts.id })
-    .from(accounts)
-    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, code)));
-  if (!row) throw notFound(`Account with code ${code}`);
-  return row.id;
+  // The system numbers (2000 A/P, 1300 Inventory Asset, 5000 COGS, 2200 Sales Tax Payable, 2300
+  // Payroll Liabilities) resolve by role, so a chart converted from QuickBooks with other numbers
+  // posts to the right account (lib/services/accountRoles.ts). Other numbers: as before.
+  return systemAccountIdByCode(ctx, code);
 }
 
 /** Create an item, optionally with an opening quantity on hand (see module doc). */

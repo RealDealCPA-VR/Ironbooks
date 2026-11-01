@@ -17,6 +17,9 @@ interface ReminderItem {
   label: string;
   date: string | null;
   amount: string | null;
+  /** Foreign-currency documents: currency code and home value (the section total is in home currency). */
+  currency?: string | null;
+  homeAmount?: string | null;
   href: string;
 }
 interface ReminderSection {
@@ -87,7 +90,12 @@ export default function RemindersList({ compact = false }: { compact?: boolean }
                       {i.date && <span className="mr-2 tabular-nums text-navy/40">{i.date}</span>}
                       {i.label}
                     </Link>
-                    {i.amount !== null && <span className="shrink-0 tabular-nums text-navy/70">{formatCurrency(i.amount)}</span>}
+                    {i.amount !== null && (
+                      <span className="shrink-0 tabular-nums text-navy/70">
+                        {i.currency ? `${i.currency} ${i.amount}` : formatCurrency(i.amount)}
+                        {i.currency && i.homeAmount ? <span className="ml-1 text-xs text-navy/40">({formatCurrency(i.homeAmount)})</span> : null}
+                      </span>
+                    )}
                   </li>
                 ))}
                 {s.count > s.items.length && (

@@ -47,6 +47,7 @@ import {
 } from '@/components/sales/DocNumberField';
 import { TransactionNav, useAdjacentTransactions } from '@/components/TransactionNav';
 import { saveWithDuplicateCheck } from '@/lib/purchasesClient';
+import AttachmentPanel from '@/components/AttachmentPanel'; // J9 Doc Center
 
 // ---------------------------------------------------------------------------
 // Types
@@ -729,6 +730,7 @@ function NewPoModal({ open, onClose, vendors, accounts, items, onCreated, editId
           </span>
         </div>
       </div>
+      <AttachmentPanel className="mt-4" entityType="purchase_order" entityId={editId} />
     </Modal>
   );
 }

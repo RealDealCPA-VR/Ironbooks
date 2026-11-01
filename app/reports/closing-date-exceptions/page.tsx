@@ -30,28 +30,52 @@ export default async function ClosingDateExceptionsPage({
   const { timezone } = await getPreferences(ctx);
   const report = await closingDateExceptionReport(ctx, { from: day(p.from), to: day(p.to) });
 
+  // QB layout: each changed transaction once, its Latest values, then each Prior version changed
+  // in the closed period (lib/services/accountant/auditReports.ts exceptionGroups).
+  const changeText = (c: { operation: string; source: string }) =>
+    c.source === 'override' ? `${OP_LABEL[c.operation] ?? c.operation} with password` : 'Entered after close';
+  const exportRows: Array<Array<string | number>> = [];
+  for (const g of report.groups) {
+    const versions = [...(g.latest ? [g.latest] : []), ...g.prior];
+    if (!g.latest) {
+      exportRows.push([localDateTime(g.lastChangedAt, timezone), g.changes[0]?.user ?? '', `${g.typeLabel}: ${g.changes.map(changeText).join(', ')}`, 'Latest', '', g.transactionDate, 'Void', '', '', '', '']);
+    }
+    for (const v of versions) {
+      for (const l of v.lines) {
+        exportRows.push([
+          localDateTime(v.at, timezone),
+          v.user ?? '',
+          `${g.typeLabel}: ${g.changes.map(changeText).join(', ')}`,
+          v.state === 'latest' ? 'Latest' : 'Prior',
+          v.entryNumber ?? '',
+          v.date,
+          l.account,
+          l.name ?? '',
+          l.memo ?? v.description ?? '',
+          l.debit ?? '',
+          l.credit ?? '',
+        ]);
+      }
+    }
+  }
   const exportTable: ExportTable = {
     filename: 'closing-date-exceptions',
     title: 'Closing Date Exception Report',
     subtitle: report.closingDate ? `Closing date ${report.closingDate}` : 'No closing date set',
     columns: [
-      { header: 'Changed on' },
+      { header: 'Entered / last modified' },
       { header: 'User' },
-      { header: 'What happened' },
+      { header: 'Transaction' },
+      { header: 'State' },
       { header: 'Entry #' },
-      { header: 'Transaction date' },
-      { header: 'Description' },
-      { header: 'Amount', numeric: true },
+      { header: 'Date' },
+      { header: 'Account' },
+      { header: 'Name' },
+      { header: 'Memo' },
+      { header: 'Debit', numeric: true },
+      { header: 'Credit', numeric: true },
     ],
-    rows: report.rows.map((r) => [
-      localDateTime(r.at, timezone),
-      r.user ?? '',
-      r.source === 'override' ? OP_LABEL[r.operation] ?? r.operation : 'Entered after close',
-      r.entryNumber ?? '',
-      r.transactionDate,
-      r.description ?? '',
-      r.amount ?? '',
-    ]),
+    rows: exportRows,
   };
 
   return (
@@ -79,48 +103,74 @@ export default async function ClosingDateExceptionsPage({
         <Card className="p-6">
           <p className="mb-4 text-sm text-navy/60">
             Every change to transactions dated on or before the closing date <Help term="closing-date" />, made with the
-            closing-date password, and entries in the closed period that were added after the books were closed.
+            closing-date password, and entries in the closed period that were added after the books were closed. Each
+            transaction shows its latest values and, under them, the prior values it had before each change.
           </p>
           <Table>
             <thead>
               <tr>
-                <Th>Changed on</Th>
+                <Th>State</Th>
+                <Th>Entered / changed</Th>
                 <Th>User</Th>
-                <Th>What happened</Th>
                 <Th>Entry</Th>
-                <Th>Transaction date</Th>
-                <Th>Description</Th>
-                <Th numeric>Amount</Th>
+                <Th>Date</Th>
+                <Th>Account</Th>
+                <Th>Name</Th>
+                <Th>Memo</Th>
+                <Th numeric>Debit</Th>
+                <Th numeric>Credit</Th>
               </tr>
             </thead>
-            <tbody>
-              {report.rows.length === 0 && (
+            {report.groups.length === 0 && (
+              <tbody>
                 <tr>
-                  <Td colSpan={7} className="py-8 text-center text-navy/40">No changes were made to the closed period.</Td>
+                  <Td colSpan={10} className="py-8 text-center text-navy/40">No changes were made to the closed period.</Td>
                 </tr>
-              )}
-              {report.rows.map((r) => (
-                <Tr key={`${r.auditLogId ?? 'je'}-${r.entryId}`}>
-                  <Td className="whitespace-nowrap">{localDateTime(r.at, timezone)}</Td>
-                  <Td>{r.user ?? '—'}</Td>
-                  <Td>
-                    {r.source === 'override' ? (
-                      <Badge tone="warning">{OP_LABEL[r.operation] ?? r.operation} with password</Badge>
-                    ) : (
-                      <Badge tone="danger">Entered after close</Badge>
-                    )}
+              </tbody>
+            )}
+            {report.groups.map((g) => (
+              <tbody key={g.key}>
+                <tr className="bg-slate-50">
+                  <Td colSpan={10} className="font-semibold">
+                    {g.typeLabel} dated {g.transactionDate}{' '}
+                    {g.changes.map((c, i) => (
+                      <Badge key={i} tone={c.source === 'override' ? 'warning' : 'danger'} className="ml-1">
+                        {changeText(c)}
+                      </Badge>
+                    ))}
+                    {g.closingDate && <span className="ml-2 text-xs font-normal text-navy/50">closed through {g.closingDate}</span>}
                   </Td>
-                  <Td>
-                    <Link href={`/journal?focus=${r.entryId}`} className="hover:text-electric hover:underline">
-                      {r.entryNumber ? `#${r.entryNumber}` : 'Open'}
-                    </Link>
-                  </Td>
-                  <Td>{r.transactionDate}</Td>
-                  <Td>{r.description ?? ''}</Td>
-                  <Td numeric>{r.amount ? formatCurrency(r.amount) : ''}</Td>
-                </Tr>
-              ))}
-            </tbody>
+                </tr>
+                {!g.latest && (
+                  <Tr>
+                    <Td><Badge tone="void">Latest</Badge></Td>
+                    <Td colSpan={9} className="text-navy/60">Void now: the prior values below are what it was before.</Td>
+                  </Tr>
+                )}
+                {[...(g.latest ? [g.latest] : []), ...g.prior].map((v) =>
+                  v.lines.map((l, i) => (
+                    <Tr key={`${v.state}-${v.entryId}-${v.at}-${i}`} className={v.state === 'prior' ? 'text-navy/60' : ''}>
+                      <Td>{i === 0 ? <Badge tone={v.state === 'latest' ? 'success' : 'neutral'}>{v.state === 'latest' ? 'Latest' : 'Prior'}</Badge> : null}</Td>
+                      <Td className="whitespace-nowrap">{i === 0 ? localDateTime(v.at, timezone) : ''}</Td>
+                      <Td>{i === 0 ? v.user ?? '—' : ''}</Td>
+                      <Td>
+                        {i === 0 ? (
+                          <Link href={`/journal?focus=${v.entryId}`} className="hover:text-electric hover:underline">
+                            {v.entryNumber ? `#${v.entryNumber}` : 'Open'}
+                          </Link>
+                        ) : null}
+                      </Td>
+                      <Td>{i === 0 ? v.date : ''}</Td>
+                      <Td>{l.account}{l.className ? <span className="text-xs text-navy/50"> · {l.className}</span> : null}</Td>
+                      <Td>{l.name ?? ''}</Td>
+                      <Td>{l.memo ?? (i === 0 ? v.description ?? '' : '')}</Td>
+                      <Td numeric>{l.debit ? formatCurrency(l.debit) : ''}</Td>
+                      <Td numeric>{l.credit ? formatCurrency(l.credit) : ''}</Td>
+                    </Tr>
+                  )),
+                )}
+              </tbody>
+            ))}
           </Table>
         </Card>
       </div>

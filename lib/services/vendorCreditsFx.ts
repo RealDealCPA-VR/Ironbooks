@@ -18,6 +18,7 @@
  * Refunding a foreign credit takes its home A/P at the credit's rate and puts the cash in the bank
  * at the refund's rate; the difference is again a realized gain/loss.
  */
+import { systemAccountIdOrNull } from './accountRoles';
 import { and, eq, gt, inArray, isNull, sql } from 'drizzle-orm';
 import Decimal from 'decimal.js';
 import {
@@ -161,12 +162,10 @@ function creditHomeUnapplied(credit: VendorCreditRow): Decimal {
 }
 
 async function apAccountId(ctx: ServiceContext): Promise<string> {
-  const [row] = await ctx.db
-    .select({ id: accounts.id })
-    .from(accounts)
-    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, '2000')));
-  if (!row) throw notFound('Accounts Payable account (2000)');
-  return row.id;
+  // By role, not by number (lib/services/accountRoles.ts): the A/P account bills post to.
+  const id = await systemAccountIdOrNull(ctx, 'accounts_payable');
+  if (!id) throw notFound('Accounts Payable account (2000)');
+  return id;
 }
 
 /** Post the realized gain/loss of an application: diff = home relieved on bill - home taken from credit. */

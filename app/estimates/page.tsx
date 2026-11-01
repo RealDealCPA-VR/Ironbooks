@@ -52,6 +52,7 @@ import {
 import PrefillNotice from '@/components/PrefillNotice';
 import { usePrefill } from '@/lib/commands/usePrefill';
 import { TransactionNav, useAdjacentTransactions } from '@/components/TransactionNav';
+import AttachmentPanel from '@/components/AttachmentPanel'; // J9 Doc Center
 
 // ---------------------------------------------------------------------------
 // Types
@@ -916,6 +917,7 @@ export default function EstimatesPage() {
             idPrefix="est"
           />
         </div>
+        <AttachmentPanel className="mt-4" entityType="estimate" entityId={editingId} />
         {dupConfirm.dialog}
       </Modal>
 

@@ -14,8 +14,9 @@
  * Refused, with a plain message (QuickBooks parity — nothing is changed):
  *  - moving an ITEM line to another account (QB only allows a class change on item lines; the
  *    account comes from the item) — change the item's account or edit the document instead;
- *  - a class change on a document that keeps no class per line (sales receipt, credit memo, vendor
- *    credit, deposit) — the next save would drop it;
+ *  - a class change on a document that keeps no class per line (sales receipt, credit memo,
+ *    deposit) — the next save would drop it. Bill credits keep a class on every row (P1 purchases)
+ *    and are matched by account AND class like bills;
  *  - a line that can't be matched to the document's rows;
  *  - lines posted by documents that rebuild their lines from their own settings when saved
  *    (paychecks, item receipts, expense reports, payments, bill payments, refunds, bounced checks,
@@ -250,21 +251,27 @@ async function loadDoc(ctx: ServiceContext, kind: DocKind, id: string): Promise<
     const [h] = await ctx.db.select().from(vendorCredits).where(and(eq(vendorCredits.id, id), eq(vendorCredits.companyId, c)));
     if (!h) return null;
     const rows = await ctx.db.select().from(vendorCreditLines).where(eq(vendorCreditLines.vendorCreditId, id));
+    const it = await itemInfo(ctx, rows.map((r) => r.itemId));
+    const rate = Money.of(h.exchangeRate ?? 1);
+    // Since P1 purchases each bill credit row keeps its Class (and Customer:Job), and
+    // vendorCredits.postingLinesFor credits each row's account with that class. A returned
+    // inventory item credits the inventory account with the stock's COST (home currency; the
+    // price difference goes to Cost of Goods Sold), so that row is matched on its cost.
     return {
       kind,
-      label: 'Bill credit',
+      label: h.refNumber ? `Bill credit ${h.refNumber}` : 'Bill credit',
       postedEntryId: h.postedEntryId,
-      rate: Money.of(1),
-      lineClass: false,
+      rate,
+      lineClass: true,
       lines: rows.map((r) => ({
         table: kind,
         id: r.id,
         accountId: r.accountId,
-        classId: null,
+        classId: r.classId,
         dir: 'credit' as const,
-        amount: Money.of(r.amount),
-        itemId: null,
-        itemName: null,
+        amount: r.itemId && r.costAmount != null ? Money.of(r.costAmount).dividedBy(rate) : Money.of(r.amount),
+        itemId: r.itemId,
+        itemName: it.get(r.itemId ?? '')?.name ?? null,
         description: r.description,
       })),
     };
@@ -453,7 +460,7 @@ export async function applyDocumentSync(
     else if (r.table === 'expense') await tx.db.update(expenseLines).set({ ...acct, ...cls }).where(eq(expenseLines.id, r.id));
     else if (r.table === 'salesreceipt') await tx.db.update(salesReceiptLines).set(acct).where(eq(salesReceiptLines.id, r.id));
     else if (r.table === 'credit_memo') await tx.db.update(creditMemoLines).set(acct).where(eq(creditMemoLines.id, r.id));
-    else if (r.table === 'vendor_credit') await tx.db.update(vendorCreditLines).set(acct).where(eq(vendorCreditLines.id, r.id));
+    else if (r.table === 'vendor_credit') await tx.db.update(vendorCreditLines).set({ ...acct, ...cls }).where(eq(vendorCreditLines.id, r.id));
     else if (r.table === 'deposit') {
       if (!change.account) continue;
       await tx.db

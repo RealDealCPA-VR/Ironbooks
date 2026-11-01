@@ -414,10 +414,16 @@ function parseRunDate(v: string | Date | null | undefined): Date | null {
  * as sensitive as running memorized transactions (/api/recurring/run needs Accounting). Lists
  * permission alone may still rename/regroup any template and edit remind-only or never
  * templates, which only post when a user with the document's own permission enters them.
+ * An automatic template also needs the right to create that kind of document (Customers for
+ * invoices, Vendors for bills, Banking for checks…): it enters them unattended, so a member who
+ * may not create bills could otherwise have bills entered on their behalf.
  * Trusted contexts (no `access`) are unrestricted, as everywhere else.
  */
-async function assertMayAutomate(ctx: ServiceContext): Promise<void> {
-  if (ctx.access) await requireEffectivePermission(ctx, 'accounting', 'create');
+async function assertMayAutomate(ctx: ServiceContext, docType: string): Promise<void> {
+  if (!ctx.access) return;
+  await requireEffectivePermission(ctx, 'accounting', 'create');
+  const area = DOC_AREA[docType as DocType];
+  if (area) await requireEffectivePermission(ctx, area, 'create');
 }
 
 export async function createTemplate(ctx: ServiceContext, input: CreateTemplateInput) {
@@ -443,7 +449,7 @@ export async function createTemplate(ctx: ServiceContext, input: CreateTemplateI
   // The view-only check, the insert and its audit entry commit together: a refused call leaves
   // nothing behind.
   return inTransaction(ctx, async (tx) => {
-    if (mode === 'automatic') await assertMayAutomate(tx);
+    if (mode === 'automatic') await assertMayAutomate(tx, input.docType);
     const [row] = await tx.db
       .insert(recurringTemplates)
       .values({
@@ -522,7 +528,7 @@ export async function updateTemplate(ctx: ServiceContext, id: string, input: Upd
     // Anything that changes what, when or how often an AUTOMATIC template posts (payload, schedule,
     // remaining, re-activation, switching to automatic) needs Accounting. Rename/regroup is a list edit.
     const touchesPosting = Object.keys(patch).some((k) => k !== 'name' && k !== 'groupName');
-    if (mode === 'automatic' && touchesPosting) await assertMayAutomate(tx);
+    if (mode === 'automatic' && touchesPosting) await assertMayAutomate(tx, before.docType);
     const [row] = await tx.db
       .update(recurringTemplates)
       .set(patch)

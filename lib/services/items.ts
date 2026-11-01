@@ -11,6 +11,7 @@
  * document is created and calls postJournalEntry. This service only manages
  * the item record and validates the linked account references.
  */
+import { systemAccountIdOrNull } from './accountRoles';
 import { and, asc, eq, ilike, ne, sql } from 'drizzle-orm';
 import { accounts, assemblyComponents, inventoryLayers, inventoryMovements, items } from '@/lib/db/schema';
 import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from './_base';
@@ -391,11 +392,7 @@ async function assertAssetAccountChangeAllowed(
   // A null asset account means the 1300 fallback used by every posting path.
   const effective = async (accountId: string | null) => {
     if (accountId) return accountId;
-    const [row] = await ctx.db
-      .select({ id: accounts.id })
-      .from(accounts)
-      .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, '1300')));
-    return row?.id ?? null;
+    return systemAccountIdOrNull(ctx, 'inventory_asset'); // by role (lib/services/accountRoles.ts)
   };
   if ((await effective(item.assetAccountId)) === (await effective(newAssetAccountId))) return;
   const hasStock = !Money.of(item.quantityOnHand ?? '0').isZero();

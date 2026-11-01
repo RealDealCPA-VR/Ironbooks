@@ -105,6 +105,8 @@ export const DOC_DIGEST: Record<Exclude<DocType, 'inventory_adjustment'>, Digest
     table: 'vendor_credits',
     exclude: ['updated_at', 'created_at', 'status', 'unapplied', 'refunded_amount', 'home_unapplied', 'posted_entry_id'],
     children: [{ table: 'vendor_credit_lines', fk: 'vendor_credit_id', exclude: ['id', 'vendor_credit_id', 'cost_amount'], ordered: true }],
+    // P1 purchases: returned stock leaves a site / bin with its serial numbers and lot.
+    inv: 'vendor_credit',
     state: VOID_BY_STATUS,
     date: 'date',
   },
@@ -261,11 +263,20 @@ function selectSql(type: VersionedType): { digest: string; state: string; date: 
   return { digest: nameDigestSql(type as NameType), state: `CASE WHEN t.is_active THEN 'live' ELSE 'inactive' END`, date: 'NULL::timestamp' };
 }
 
+/**
+ * The column holding a record's version, as record locking reads it (concurrency.versionField):
+ * items are versioned by edited_at, which only an edit moves (updated_at also moves on every
+ * sale or receipt), so the baseline must take the same column or every item would look changed.
+ */
+function versionColumn(type: VersionedType): string {
+  return type === 'item' ? 'edited_at' : 'updated_at';
+}
+
 /** INSERT … SELECT of the baseline rows (version, digest, state) of every record of one type. */
 export function baselineInsertSql(type: VersionedType, copyId: string, companyId: string): SQL {
   const s = selectSql(type);
   return sql`INSERT INTO accountant_copy_baseline (copy_id, entity_type, entity_id, version, digest, state)
-    SELECT ${copyId}::uuid, ${type}, t.id, t.updated_at, ${sql.raw(s.digest)}, ${sql.raw(s.state)}
+    SELECT ${copyId}::uuid, ${type}, t.id, t.${sql.raw(versionColumn(type))}, ${sql.raw(s.digest)}, ${sql.raw(s.state)}
       FROM ${sql.raw(tableOf(type))} t WHERE t.company_id = ${companyId}::uuid`;
 }
 

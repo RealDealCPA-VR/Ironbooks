@@ -16,6 +16,8 @@ import Decimal from 'decimal.js';
 import { bills, expenses, recurringTemplates, vendors } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, validation } from './_base';
+import { can } from '@/lib/permissions/model';
+import { requirePermission } from './access';
 import { advanceDate, createTemplate, type Frequency } from './recurring';
 import { getBill } from './bills';
 import { getExpense } from './expenses';
@@ -130,20 +132,36 @@ export function detectPatterns(docs: Doc[], asOf: Date): RecurringSuggestion[] {
   return out.sort((a, b) => b.confidence - a.confidence);
 }
 
-/** Recurring patterns in this company's bills/expenses that are not memorized yet. */
+/** The area a memorized bill / check belongs to (the permission of its own screens). */
+const DOC_AREA = { bill: 'vendors', expense: 'banking' } as const;
+
+/** True when the caller may view that kind of document (trusted contexts: yes). */
+function mayView(ctx: ServiceContext, docType: 'bill' | 'expense'): boolean {
+  return !ctx.access || can(ctx.access, DOC_AREA[docType], 'view');
+}
+
+/**
+ * Recurring patterns in this company's bills/expenses that are not memorized yet. Only the
+ * documents the caller may view are read: a suggestion names the vendor and its typical amount,
+ * so a member with the Lists right alone (the route's right) sees no bills or checks through it.
+ */
 export async function detectRecurring(ctx: ServiceContext, asOf: Date = new Date()): Promise<RecurringSuggestion[]> {
   const since = new Date(asOf.getTime() - 548 * DAY);
   const [billRows, expRows, templates] = await Promise.all([
-    ctx.db
-      .select({ id: bills.id, vendorId: bills.vendorId, payee: vendors.displayName, date: bills.date, total: bills.total })
-      .from(bills)
-      .innerJoin(vendors, eq(bills.vendorId, vendors.id))
-      .where(and(eq(bills.companyId, ctx.companyId), ne(bills.status, 'void'), gte(bills.date, since))),
-    ctx.db
-      .select({ id: expenses.id, vendorId: expenses.vendorId, vendorName: vendors.displayName, payeeName: expenses.payeeName, date: expenses.date, total: expenses.total })
-      .from(expenses)
-      .leftJoin(vendors, eq(expenses.vendorId, vendors.id))
-      .where(and(eq(expenses.companyId, ctx.companyId), isNull(expenses.voidedAt), gte(expenses.date, since))),
+    mayView(ctx, 'bill')
+      ? ctx.db
+          .select({ id: bills.id, vendorId: bills.vendorId, payee: vendors.displayName, date: bills.date, total: bills.total })
+          .from(bills)
+          .innerJoin(vendors, eq(bills.vendorId, vendors.id))
+          .where(and(eq(bills.companyId, ctx.companyId), ne(bills.status, 'void'), gte(bills.date, since)))
+      : Promise.resolve([]),
+    mayView(ctx, 'expense')
+      ? ctx.db
+          .select({ id: expenses.id, vendorId: expenses.vendorId, vendorName: vendors.displayName, payeeName: expenses.payeeName, date: expenses.date, total: expenses.total })
+          .from(expenses)
+          .leftJoin(vendors, eq(expenses.vendorId, vendors.id))
+          .where(and(eq(expenses.companyId, ctx.companyId), isNull(expenses.voidedAt), gte(expenses.date, since)))
+      : Promise.resolve([]),
     ctx.db
       .select({ template: recurringTemplates.template })
       .from(recurringTemplates)
@@ -189,9 +207,15 @@ export interface MemorizeInput {
   autoEnter?: boolean;
 }
 
-/** Memorize a detected pattern via the normal recurring-template service. */
+/**
+ * Memorize a detected pattern via the normal recurring-template service. The source bill / check
+ * is read with its own area's view right (Vendors / Banking — the route only guarantees Lists);
+ * an automatic one also needs that area's create right (it will enter bills / checks by itself).
+ */
 export async function memorizeSuggestion(ctx: ServiceContext, input: MemorizeInput) {
   if (!input.name?.trim()) throw validation('A name is required.');
+  if (input.docType !== 'bill' && input.docType !== 'expense') throw validation('Only bills and checks can be memorized here.');
+  requirePermission(ctx, DOC_AREA[input.docType], input.autoEnter ? 'create' : 'view');
   let template: Record<string, unknown>;
   if (input.docType === 'bill') {
     const b = await getBill(ctx, input.sourceDocId);
