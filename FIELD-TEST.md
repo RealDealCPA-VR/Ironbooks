@@ -99,6 +99,8 @@ Do this section without touching the mouse.
 - [ ] **Esc** closes the form. **Ctrl+W** opens Write Checks, **Ctrl+J** the Customer Center,
   **Ctrl+A** the Chart of Accounts.
 - [ ] In a list, the arrow keys move the highlight, typing a name jumps to it, and **Enter** opens it.
+- [ ] In the Customer Center and Vendor Center, the right side shows the highlighted name's balance
+  and transactions, and follows the arrow keys. **Full List** switches to the wide list and back.
 - [ ] **?** shows every shortcut. Note any QuickBooks key you reached for that did something different.
 
 ## 8. Download and install

@@ -38,6 +38,7 @@ import { formatCurrency } from '@/lib/money';
 import { useFocusParam } from '@/lib/useFocusParam';
 import { EntityNotes } from '@/components/lists/EntityNotes';
 import Link from 'next/link';
+import CenterDetail, { CENTER_ROW_ATTR, useCenterLayout, useCenterSelection } from '@/components/lists/CenterDetail';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -305,6 +306,18 @@ function VendorsPageContent() {
   // Render
   // ---------------------------------------------------------------------------
 
+  const vendorTerms = (v: (typeof vendors)[number]) =>
+    (v.termsId ? termsList.find((t) => t.id === v.termsId)?.name : undefined) ?? termsLabel(v.terms);
+
+  // QB Vendor Center: the list on the left, the chosen vendor's transactions on the right.
+  const [layout, setLayout] = useCenterLayout();
+  const wide = layout === 'list';
+  const center = useCenterSelection(
+    vendors.map((v) => v.id),
+    !wide && !loading,
+  );
+  const selected = vendors.find((v) => v.id === center.selectedId) ?? null;
+
   return (
     <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader
@@ -312,6 +325,13 @@ function VendorsPageContent() {
         icon={Truck}
         action={
           <div className="flex items-center gap-2">
+            <Button
+              variant="secondary"
+              onClick={() => setLayout(wide ? 'center' : 'list')}
+              title={wide ? 'Show the list beside the chosen vendor and its transactions' : 'Show the full vendor list with every column'}
+            >
+              {wide ? 'Center View' : 'Full List'}
+            </Button>
             <Button
               variant="secondary"
               onClick={() => window.open('/api/export/vendors.csv', '_blank')}
@@ -333,7 +353,8 @@ function VendorsPageContent() {
         }
       />
 
-      <Card className="p-0 overflow-hidden">
+      <div ref={center.ref} className={wide ? undefined : 'grid items-start gap-4 lg:grid-cols-[minmax(18rem,26rem)_1fr]'}>
+      <Card className={wide ? 'p-0 overflow-hidden' : 'p-0 max-h-[80vh] overflow-auto'}>
         {loading ? (
           <div className="flex items-center justify-center py-20 text-navy/40 text-sm gap-2">
             <Spinner className="h-5 w-5 text-electric" />
@@ -356,23 +377,35 @@ function VendorsPageContent() {
             <thead>
               <tr>
                 <Th>Vendor</Th>
-                <Th>Email</Th>
-                <Th>Phone</Th>
-                <Th>Terms</Th>
-                <Th>1099</Th>
+                {wide && (
+                  <>
+                    <Th>Email</Th>
+                    <Th>Phone</Th>
+                    <Th>Terms</Th>
+                    <Th>1099</Th>
+                  </>
+                )}
                 <Th numeric>Balance</Th>
-                <Th className="text-right">Actions</Th>
+                <Th className="text-right">{wide ? 'Actions' : <span className="sr-only">Actions</span>}</Th>
               </tr>
             </thead>
             <tbody>
               {vendors.map((v) => (
-                <Tr key={v.id} data-quick-report={quickReportHref('vendor', v.id)} data-use-prefill={listItemPrefill({ vendorId: v.id })}>
+                <Tr
+                  key={v.id}
+                  {...{ [CENTER_ROW_ATTR]: v.id }}
+                  data-list-label={v.displayName}
+                  data-quick-report={quickReportHref('vendor', v.id)}
+                  data-use-prefill={listItemPrefill({ vendorId: v.id })}
+                >
                   <Td>
                     <div className="font-semibold text-navy">{v.displayName}</div>
-                    {v.companyName && (
+                    {wide && v.companyName && (
                       <div className="text-xs text-navy/50 mt-0.5">{v.companyName}</div>
                     )}
                   </Td>
+                  {wide && (
+                  <>
                   <Td>
                     {v.email ? (
                       <a
@@ -397,9 +430,7 @@ function VendorsPageContent() {
                     )}
                   </Td>
                   <Td>
-                    <span className="text-sm text-navy/70">
-                      {(v.termsId ? termsList.find((t) => t.id === v.termsId)?.name : undefined) ?? termsLabel(v.terms)}
-                    </span>
+                    <span className="text-sm text-navy/70">{vendorTerms(v)}</span>
                   </Td>
                   <Td>
                     {v.is1099 ? (
@@ -408,6 +439,8 @@ function VendorsPageContent() {
                       <span className="text-navy/30 text-sm">—</span>
                     )}
                   </Td>
+                  </>
+                  )}
                   <Td numeric>
                     <span
                       className={
@@ -446,6 +479,17 @@ function VendorsPageContent() {
           </Table>
         )}
       </Card>
+      {!wide && !loading && vendors.length > 0 && (
+        <CenterDetail
+          kind="vendor"
+          record={selected ? { ...selected, termsLabel: vendorTerms(selected) } : null}
+          onEdit={(id) => {
+            const v = vendors.find((x) => x.id === id);
+            if (v) openEdit(v);
+          }}
+        />
+      )}
+      </div>
 
       {/* ---- Add / Edit Modal ---- */}
       <Modal

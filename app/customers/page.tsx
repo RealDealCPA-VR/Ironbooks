@@ -32,6 +32,7 @@ import { EntityNotes } from '@/components/lists/EntityNotes';
 import { Help } from '@/components/Help';
 import Link from 'next/link';
 import { ShipToEditor, shipToRowsFrom, shipToRowsPayload, type ShipToRow } from '@/components/sales/ShipToEditor';
+import CenterDetail, { CENTER_ROW_ATTR, useCenterLayout, useCenterSelection } from '@/components/lists/CenterDetail';
 import type { ShipToAddress } from '@/lib/shipTo';
 
 // ---------------------------------------------------------------------------
@@ -714,6 +715,15 @@ function CustomersPageContent() {
   const termsLabel = (c: Customer) =>
     (c.termsId ? termsList.find((t) => t.id === c.termsId)?.name : undefined) ?? termsLabelFor(c.terms);
 
+  // QB Customer Center: the list on the left, the chosen customer's transactions on the right.
+  const [layout, setLayout] = useCenterLayout();
+  const wide = layout === 'list';
+  const center = useCenterSelection(
+    customers.map((c) => c.id),
+    !wide && !loading,
+  );
+  const selected = customers.find((c) => c.id === center.selectedId) ?? null;
+
   return (
     <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader
@@ -730,7 +740,14 @@ function CustomersPageContent() {
               />
               Show inactive
             </label>
-            {customFieldNames.length > 0 && (
+            <Button
+              variant="secondary"
+              onClick={() => setLayout(wide ? 'center' : 'list')}
+              title={wide ? 'Show the list beside the chosen customer and its transactions' : 'Show the full customer list with every column'}
+            >
+              {wide ? 'Center View' : 'Full List'}
+            </Button>
+            {wide && customFieldNames.length > 0 && (
               <label className="flex items-center gap-2 text-sm text-navy/60 cursor-pointer select-none">
                 <input
                   type="checkbox"
@@ -771,7 +788,8 @@ function CustomersPageContent() {
         }
       />
 
-      <Card>
+      <div ref={center.ref} className={wide ? undefined : 'grid items-start gap-4 lg:grid-cols-[minmax(18rem,26rem)_1fr]'}>
+      <Card className={wide ? undefined : 'max-h-[80vh] overflow-auto'}>
         {loading ? (
           <div className="flex items-center justify-center py-20 text-navy/40">
             <Spinner className="h-6 w-6" />
@@ -796,21 +814,36 @@ function CustomersPageContent() {
             <thead>
               <tr>
                 <Th>Name</Th>
-                <Th>Company</Th>
-                <Th>Email</Th>
-                <Th>Phone</Th>
-                <Th>Terms</Th>
-                {showCustomCols &&
-                  customFieldNames.map((name) => <Th key={name}>{name}</Th>)}
+                {wide && (
+                  <>
+                    <Th>Company</Th>
+                    <Th>Email</Th>
+                    <Th>Phone</Th>
+                    <Th>Terms</Th>
+                    {showCustomCols &&
+                      customFieldNames.map((name) => <Th key={name}>{name}</Th>)}
+                  </>
+                )}
                 <Th numeric>Balance</Th>
-                <Th>Status</Th>
-                <Th className="text-right">Actions</Th>
+                {wide && <Th>Status</Th>}
+                <Th className="text-right">{wide ? 'Actions' : <span className="sr-only">Actions</span>}</Th>
               </tr>
             </thead>
             <tbody>
               {customers.map((c) => (
-                <Tr key={c.id} data-quick-report={quickReportHref('customer', c.id)} data-use-prefill={listItemPrefill({ customerId: c.id })}>
-                  <Td className="font-semibold text-navy">{c.displayName}</Td>
+                <Tr
+                  key={c.id}
+                  {...{ [CENTER_ROW_ATTR]: c.id }}
+                  data-list-label={c.displayName}
+                  data-quick-report={quickReportHref('customer', c.id)}
+                  data-use-prefill={listItemPrefill({ customerId: c.id })}
+                >
+                  <Td className="font-semibold text-navy">
+                    {c.displayName}
+                    {!wide && !c.isActive && <span className="ml-2 text-xs font-normal text-navy/40">(inactive)</span>}
+                  </Td>
+                  {wide && (
+                  <>
                   <Td className="text-navy/70">{c.companyName ?? '-'}</Td>
                   <Td className="text-navy/70">
                     {c.email ? (
@@ -832,9 +865,12 @@ function CustomersPageContent() {
                         {c.customFields?.[name] || '-'}
                       </Td>
                     ))}
+                  </>
+                  )}
                   <Td numeric className="font-semibold text-navy">
                     {formatCurrency(c.balance)}
                   </Td>
+                  {wide && (
                   <Td>
                     {c.isActive ? (
                       <Badge tone="success">Active</Badge>
@@ -842,6 +878,7 @@ function CustomersPageContent() {
                       <Badge tone="neutral">Inactive</Badge>
                     )}
                   </Td>
+                  )}
                   <Td className="text-right">
                     <div className="flex items-center justify-end gap-1">
                       <Button
@@ -849,9 +886,10 @@ function CustomersPageContent() {
                         size="sm"
                         onClick={() => openEditModal(c)}
                         title="Edit customer"
+                        aria-label={wide ? undefined : 'Edit customer'}
                       >
                         <Pencil className="h-3.5 w-3.5" />
-                        Edit
+                        {wide && 'Edit'}
                       </Button>
                       {c.isActive && (
                         <Button
@@ -859,10 +897,11 @@ function CustomersPageContent() {
                           size="sm"
                           onClick={() => setDeactivateTarget(c)}
                           title="Deactivate customer"
+                          aria-label={wide ? undefined : 'Deactivate customer'}
                           className="text-red-500 hover:bg-red-50"
                         >
                           <UserX className="h-3.5 w-3.5" />
-                          Deactivate
+                          {wide && 'Deactivate'}
                         </Button>
                       )}
                     </div>
@@ -873,6 +912,17 @@ function CustomersPageContent() {
           </Table>
         )}
       </Card>
+      {!wide && !loading && customers.length > 0 && (
+        <CenterDetail
+          kind="customer"
+          record={selected ? { ...selected, termsLabel: termsLabel(selected) } : null}
+          onEdit={(id) => {
+            const c = customers.find((x) => x.id === id);
+            if (c) openEditModal(c);
+          }}
+        />
+      )}
+      </div>
 
       {/* ---- Add customer modal ---- */}
       <Modal

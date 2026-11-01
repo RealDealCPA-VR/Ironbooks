@@ -14,4 +14,8 @@ describe('QuickBooks keys in the browser', () => {
   it('partial dates and name fields with Quick Add', async () => {
     expectAllPassed(await runDomFile('test/dom/nameFieldDates.dom.tsx'));
   }, 180_000);
+
+  it('Customer / Vendor Center: arrows and type-ahead choose the name, the right side follows', async () => {
+    expectAllPassed(await runDomFile('test/dom/centerView.dom.tsx'));
+  }, 180_000);
 });
