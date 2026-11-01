@@ -29,7 +29,7 @@ import { api } from '@/lib/client';
 import MemorizeButton from '@/components/MemorizeButton';
 import { formatCurrency } from '@/lib/money';
 import { formatDate, todayISO } from '@/lib/dates';
-import { useNewParam } from '@/lib/useFocusParam';
+import { useFocusId, useNewParam } from '@/lib/useFocusParam';
 // wave2 prefs: Checking > default account for Make Deposits; date warnings
 import { usePreferences } from '@/lib/usePreferences';
 import { useErrorFixes } from '@/components/ErrorFixPanel';
@@ -50,6 +50,8 @@ import {
   type ExtraLine,
   type UndepositedItem,
 } from '@/lib/depositEdit';
+// salesar (B7): Payment Method list names and QB's "View payment method type" on Payments to Deposit.
+import { depositMethodLabel, depositMethodViews, matchesDepositMethodView } from '@/lib/salesFormListsClient';
 
 /** Body sent to /api/deposits (fix patches address its paths, e.g. "paymentIds", "depositAccountId"). */
 type DepositBody = Record<string, unknown> & {
@@ -138,12 +140,15 @@ function MakeDepositModal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, editing]);
 
-  // QB groups "Payments to Deposit" by method — offer a method filter.
-  const methods = [...new Set(undepositedItems.map((p) => p.method))];
-  const visibleItems =
-    methodFilter === 'all'
-      ? undepositedItems
-      : undepositedItems.filter((p) => p.method === methodFilter);
+  // QB "View payment method type": all, cash and checks, credit cards, or one Payment Method list
+  // entry ("Visa"), so card receipts can be deposited apart from checks (the bank batches them).
+  const methodViews = depositMethodViews(undepositedItems);
+  const methodView = methodViews.some((v) => v.value === methodFilter) ? methodFilter : 'all';
+  const visibleItems = undepositedItems.filter((p) => matchesDepositMethodView(p, methodView));
+  // Payments picked under another view stay on the deposit: say so, so nothing is deposited unseen.
+  const hiddenSelected = undepositedItems.filter(
+    (p) => selectedIds.has(p.id) && !matchesDepositMethodView(p, methodView),
+  ).length;
 
   function toggleItem(id: string) {
     setSelectedIds((prev) => {
@@ -428,20 +433,22 @@ function MakeDepositModal({
           <div className="flex items-center justify-between mb-2 gap-2">
             <Label className="mb-0">Payments in Undeposited Funds <Help term="undeposited-funds" /></Label>
             <span className="flex items-center gap-3">
-              {methods.length > 1 && (
-                <select
-                  value={methodFilter}
-                  onChange={(e) => setMethodFilter(e.target.value)}
-                  className="text-xs border border-slate-200 rounded-md px-2 py-1 text-navy/70 bg-white"
-                  aria-label="Filter by payment method"
-                >
-                  <option value="all">All methods</option>
-                  {methods.map((m) => (
-                    <option key={m} value={m}>
-                      {m.replace('_', ' ')}
-                    </option>
-                  ))}
-                </select>
+              {methodViews.length > 0 && (
+                <label className="flex items-center gap-1.5 text-xs text-navy/60">
+                  <span>View payment method</span>
+                  <select
+                    value={methodView}
+                    onChange={(e) => setMethodFilter(e.target.value)}
+                    className="text-xs border border-slate-200 rounded-md px-2 py-1 text-navy/70 bg-white"
+                    aria-label="View payment method type"
+                  >
+                    {methodViews.map((v) => (
+                      <option key={v.value} value={v.value}>
+                        {v.label} ({v.count})
+                      </option>
+                    ))}
+                  </select>
+                </label>
               )}
               {visibleItems.length > 0 && (
                 <button
@@ -498,7 +505,8 @@ function MakeDepositModal({
                       </div>
                       <div className="flex gap-3 text-xs text-navy/50 mt-0.5">
                         <span>{formatDate(p.date)}</span>
-                        <span className="capitalize">{p.method.replace('_', ' ')}</span>
+                        {/* The Payment Method list entry ("Visa"), else the type ("Check"). */}
+                        <span>{depositMethodLabel(p)}</span>
                         {p.reference && <span>#{p.reference}</span>}
                       </div>
                     </div>
@@ -508,6 +516,13 @@ function MakeDepositModal({
             </div>
           )}
         </div>
+
+        {hiddenSelected > 0 && (
+          <p className="-mt-3 text-xs text-amber-700" role="status">
+            {hiddenSelected} selected payment{hiddenSelected !== 1 ? 's are' : ' is'} not shown in this view
+            and will still be deposited. Choose &quot;All payment methods&quot; to see {hiddenSelected !== 1 ? 'them' : 'it'}.
+          </p>
+        )}
 
         {/* Additional deposit lines (e.g. owner contribution) */}
         <div>
@@ -729,6 +744,8 @@ function DepositsPageContent() {
 
   // Quick Actions navigate here with ?new=1 — open the Make Deposit modal.
   useNewParam(openModal);
+  // Drill-downs (the transaction log) link here with ?focus=<id> — open that deposit.
+  useFocusId(true, (id) => void openEdit(id));
 
   function handleCreated() {
     fetchDeposits();

@@ -26,7 +26,7 @@ import {
 } from '@/lib/db/schema';
 import { Money, formatCurrency, toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError, validation } from '../_base';
-import { createInvoice, getInvoice, postDraftInvoice, updateInvoice, voidInvoice, type CreateInvoiceInput } from '../invoices';
+import { billableSourceOf, createInvoice, getInvoice, postDraftInvoice, updateInvoice, voidInvoice, type CreateInvoiceInput } from '../invoices';
 import { createSalesReceipt, getSalesReceipt, updateSalesReceipt, voidSalesReceipt, type CreateSalesReceiptInput } from '../salesReceipts';
 import { createCreditMemo, getCreditMemo, updateCreditMemo, voidCreditMemo, type CreateCreditMemoInput } from '../creditMemos';
 import { getPayment, receivePayment, updatePayment, voidPayment, type ReceivePaymentInput } from '../payments';
@@ -223,6 +223,9 @@ async function invoicePayload(ctx: ServiceContext, id: string): Promise<P> {
       jobId: l.jobId,
       // Progress-invoicing link (the invoice form round-trips it; removing it travels too).
       estimateLineId: l.estimateLineId ?? null,
+      // The billable cost / time the line bills (r5 sales): the import keeps the client's cost billed
+      // even when the accountant re-priced and re-worded the line (content matching would miss it).
+      billableSource: billableSourceOf(l.billableSource),
       ...invOf(l as P),
       // What this file's COGS entry for the line cost (posted inventory lines only).
       ...(l.itemType === 'inventory' && costs.has(`cogs:${l.lineOrder}`) ? { cost: costs.get(`cogs:${l.lineOrder}`) } : {}),

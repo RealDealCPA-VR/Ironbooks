@@ -4,7 +4,7 @@
 import { z } from 'zod';
 import { zDate, zDecimal, zDocNumber, zLines, zUuid } from './helpers';
 import { inventoryLineFields } from './inventorySites';
-import { sendFlagFields, shippingFields } from './sales';
+import { sendFlagFields, customerMessageField, shippingFields } from './sales';
 
 export const salesReceiptLineSchema = z.object({
   itemId: zUuid.nullish(),
@@ -15,6 +15,8 @@ export const salesReceiptLineSchema = z.object({
   rate: zDecimal.nullish(),
   /** Defaults to true (matches prior route behavior). */
   taxable: z.boolean().default(true),
+  /** salesar (B9): the line's Sales Tax Code; the server sets `taxable` from it. */
+  salesTaxCodeId: zUuid.nullish(),
   taxRateId: zUuid.nullish(),
   /** Advanced Inventory: site/bin/serial/lot the stock is sold from. */
   ...inventoryLineFields,
@@ -37,11 +39,14 @@ export const createSalesReceiptSchema = z.object({
       }),
     })
     .nullish(),
+  /** salesar (B7): Payment Method list entry; its type is stored as the method. */
+  paymentMethodId: zUuid.nullish(),
   reference: z.string().nullish(),
   memo: z.string().nullish(),
   classId: zUuid.nullish(),
   lines: zLines(salesReceiptLineSchema),
   ...shippingFields,
   ...sendFlagFields,
+  ...customerMessageField,
 });
 export type CreateSalesReceiptBody = z.infer<typeof createSalesReceiptSchema>;

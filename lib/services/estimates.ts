@@ -7,14 +7,25 @@
  *   - accepted  → customer agreed to the quote
  *   - rejected  → customer declined
  *   - closed    → converted into an invoice (convertedInvoiceId is set)
+ *   - void      → Edit > Void Estimate (voidEstimate): kept, marked VOID, read-only, out of every
+ *                 open list; deleteEstimate removes it (Edit > Delete). Both are refused while an
+ *                 invoice made from it stands, and both are listed on the Voided/Deleted report.
  *
  * `convertToInvoice` is the only mutation that touches the GL, and it does so
  * by delegating entirely to `createInvoice` from the invoices service.
  */
 import { assertAccountantMayConvert, assertDividingDateOpen } from './accountantCopy/guard';
-import { and, eq, inArray } from 'drizzle-orm';
+import { and, eq, inArray, ne, or, sql } from 'drizzle-orm';
 import { Money, toAmountString } from '@/lib/money';
-import { estimates, estimateLines, customers, taxRates, classes, items } from '@/lib/db/schema';
+import { estimates, estimateLines, customers, taxRates, classes, items, invoiceLines, invoices } from '@/lib/db/schema';
+import {
+  assertMayVoidOrDelete,
+  auditSnapshot,
+  listRefs,
+  refuseInAccountantCopy,
+  unfileAttachments,
+} from './nonPostingDocs';
+import { resolveCustomerMessage, storedLineTaxCode } from './salesFormLists';
 import {
   type ServiceContext,
   ServiceError,
@@ -43,6 +54,8 @@ import {
 // ---------------------------------------------------------------------------
 
 export interface EstimateLineInput {
+  /** Edit only: the saved estimate line this row updates (it keeps its id, and the links of invoices made from it). */
+  id?: string | null;
   itemId?: string | null;
   description?: string | null;
   quantity: string | number;
@@ -50,6 +63,8 @@ export interface EstimateLineInput {
   rate?: string | number | null;
   /** Defaults to true. */
   taxable?: boolean;
+  /** salesar (B9): the line's Sales Tax Code; `taxable` follows it (salesFormLists.applyLineTaxCodes). */
+  salesTaxCodeId?: string | null;
   /** Class for this line; carried onto the invoice lines that bill it. */
   classId?: string | null;
 }
@@ -80,9 +95,11 @@ export interface CreateEstimateInput {
   /** wave2 sales (C7): queue for batch printing / emailing. */
   toBePrinted?: boolean;
   toBeEmailed?: boolean;
+  /** salesar (B8): Customer Message list entry printed at the foot of the estimate. Edit: omitted = kept. */
+  customerMessageId?: string | null;
 }
 
-export type EstimateStatus = 'draft' | 'accepted' | 'rejected' | 'closed';
+export type EstimateStatus = 'draft' | 'accepted' | 'rejected' | 'closed' | 'void';
 
 /** One estimate line in a "selected items / different percentage of each item" progress bill. */
 export interface ProgressLineInput {
@@ -286,6 +303,7 @@ export async function createEstimate(ctx: ServiceContext, input: CreateEstimateI
         shipTo: input.shipTo ?? null,
         toBePrinted: input.toBePrinted ?? false,
         toBeEmailed: input.toBeEmailed ?? false,
+        customerMessageId: await resolveCustomerMessage(tx, input.customerMessageId),
       })
       .returning();
 
@@ -298,6 +316,7 @@ export async function createEstimate(ctx: ServiceContext, input: CreateEstimateI
         rate: cl.rate,
         amount: cl.amount,
         taxable: cl.taxable,
+        salesTaxCodeId: storedLineTaxCode(input.lines?.[cl.lineOrder], cl.taxable),
         classId: cl.classId,
         lineOrder: cl.lineOrder,
         pricing: cl.pricing as Record<string, unknown> | null,
@@ -393,6 +412,11 @@ async function updateEstimateStatusInTx(
     .where(and(eq(estimates.companyId, ctx.companyId), eq(estimates.id, id)));
   if (!estimate) throw notFound('Estimate');
 
+  // Void is its own action (Edit > Void Estimate): same rules as voidEstimate, in this transaction.
+  if (status === 'void') return voidEstimateInTx(ctx, id);
+  if (estimate.status === 'void') {
+    throw new ServiceError('CONFLICT', 'This estimate is void, so its status can no longer be changed.');
+  }
   if (estimate.status === 'closed') {
     throw new ServiceError('CONFLICT', 'Cannot change the status of a closed (converted) estimate.');
   }
@@ -429,6 +453,181 @@ async function updateEstimateStatusInTx(
 }
 
 // ---------------------------------------------------------------------------
+// voidEstimate / deleteEstimate (QB Edit > Void Estimate / Edit > Delete Estimate)
+// ---------------------------------------------------------------------------
+
+type EstimateRow = typeof estimates.$inferSelect;
+
+async function loadEstimateRow(ctx: ServiceContext, id: string): Promise<EstimateRow> {
+  const [est] = await ctx.db
+    .select()
+    .from(estimates)
+    .where(and(eq(estimates.companyId, ctx.companyId), eq(estimates.id, id)));
+  if (!est) throw notFound('Estimate');
+  return est;
+}
+
+/**
+ * Refuse a void / delete while an invoice made from the estimate stands (any status but void —
+ * a pending invoice too): the invoice it was converted to, and every invoice with a line linked
+ * to one of its lines (progress invoices). Billing recorded before per-line links existed (prior
+ * amounts) counts as well. Voided invoices don't block (voiding gave the estimate its amounts back).
+ */
+async function assertEstimateUnlinked(ctx: ServiceContext, est: EstimateRow, verb: 'voided' | 'deleted') {
+  const linked = await ctx.db
+    .select({ ref: invoices.refNumber, n: invoices.invoiceNumber })
+    .from(invoices)
+    .where(
+      and(
+        eq(invoices.companyId, ctx.companyId),
+        ne(invoices.status, 'void'),
+        or(
+          est.convertedInvoiceId ? eq(invoices.id, est.convertedInvoiceId) : sql`false`,
+          sql`${invoices.id} IN (
+            SELECT ${invoiceLines.invoiceId} FROM ${invoiceLines}
+            JOIN ${estimateLines} ON ${estimateLines.id} = ${invoiceLines.estimateLineId}
+            WHERE ${estimateLines.estimateId} = ${est.id}
+          )`,
+        ),
+      ),
+    )
+    .orderBy(invoices.invoiceNumber);
+  const action = verb === 'voided' ? 'void' : 'delete';
+  if (linked.length > 0) {
+    const one = linked.length === 1;
+    throw new ServiceError(
+      'CONFLICT',
+      `${one ? 'Invoice' : 'Invoices'} ${listRefs(linked.map((r) => docRef(r.ref, r.n)))} ${one ? 'was' : 'were'} made from this estimate, so it can't be ${verb}. ` +
+        `Void ${one ? 'that invoice' : 'those invoices'} first, then ${action} the estimate.`,
+      { linkedInvoices: linked.map((r) => docRef(r.ref, r.n)) },
+    );
+  }
+  const prior = await ctx.db
+    .select({ id: estimateLines.id })
+    .from(estimateLines)
+    .where(
+      and(
+        eq(estimateLines.estimateId, est.id),
+        or(sql`${estimateLines.priorQtyInvoiced} > 0`, sql`${estimateLines.priorAmountInvoiced} > 0`),
+      ),
+    )
+    .limit(1);
+  if (Money.gt(est.priorAmountInvoiced ?? '0', 0) || prior.length > 0) {
+    throw new ServiceError(
+      'CONFLICT',
+      `Part of this estimate has already been invoiced, so it can't be ${verb}. It stays on file with the invoices made from it.`,
+    );
+  }
+}
+
+/** Number, date, customer and amount of the estimate, kept in the audit trail of a void / delete. */
+async function estimateAuditValues(ctx: ServiceContext, est: EstimateRow) {
+  const [c] = await ctx.db
+    .select({ name: customers.displayName })
+    .from(customers)
+    .where(and(eq(customers.companyId, ctx.companyId), eq(customers.id, est.customerId)));
+  return {
+    ...auditSnapshot({
+      number: docRef(est.refNumber, est.estimateNumber),
+      date: est.date,
+      name: c?.name ?? null,
+      partyKey: 'customerName',
+      total: est.total,
+      status: est.status,
+      memo: est.memo,
+    }),
+    estimateNumber: est.estimateNumber,
+    refNumber: est.refNumber,
+    customerId: est.customerId,
+  };
+}
+
+/**
+ * Void an estimate (QB Edit > Void Estimate): it stays on file marked VOID with its amounts, can
+ * no longer be edited, invoiced or have its status changed, and drops out of every open list.
+ * Refused while an invoice made from it stands. Voiding a void estimate is a no-op.
+ */
+export async function voidEstimate(ctx: ServiceContext, id: string) {
+  assertMayVoidOrDelete(ctx, 'estimate');
+  return inTransaction(ctx, (tx) => voidEstimateInTx(tx, id));
+}
+
+async function voidEstimateInTx(ctx: ServiceContext, id: string) {
+  const est = await loadEstimateRow(ctx, id);
+  if (est.status === 'void') return est;
+  await assertDividingDateOpen(ctx, est.date); // Accountant's Copy (I1)
+  // The changes file carries an estimate's draft / accepted / rejected status, not a void.
+  await refuseInAccountantCopy(ctx, 'Voiding an estimate', 'Mark it Rejected instead (that is sent back).');
+  await assertEstimateUnlinked(ctx, est, 'voided');
+  const [updated] = await ctx.db
+    .update(estimates)
+    .set({ status: 'void', updatedAt: new Date() })
+    .where(and(eq(estimates.id, id), eq(estimates.companyId, ctx.companyId)))
+    .returning();
+  await writeAudit(ctx, {
+    action: 'void',
+    entityType: 'estimate',
+    entityId: id,
+    oldValues: await estimateAuditValues(ctx, est),
+    newValues: { status: 'void' },
+  });
+  return updated;
+}
+
+/**
+ * Delete an estimate (QB Edit > Delete Estimate, Ctrl+D): its lines go with it, documents filed
+ * to it go back to the Doc Center inbox, and voided invoices that once billed it lose their link.
+ * The audit trail keeps its number, date, customer, amount and lines (Voided/Deleted report).
+ * Refused while an invoice made from it stands; a void estimate can be deleted.
+ */
+export async function deleteEstimate(ctx: ServiceContext, id: string): Promise<{ id: string; deleted: true }> {
+  assertMayVoidOrDelete(ctx, 'estimate');
+  return inTransaction(ctx, async (tx) => {
+    const est = await loadEstimateRow(tx, id);
+    await assertDividingDateOpen(tx, est.date); // Accountant's Copy (I1)
+    await refuseInAccountantCopy(tx, 'Deleting an estimate', 'Mark it Rejected instead (that is sent back).');
+    await assertEstimateUnlinked(tx, est, 'deleted');
+    const lines = await tx.db
+      .select()
+      .from(estimateLines)
+      .where(eq(estimateLines.estimateId, id))
+      .orderBy(estimateLines.lineOrder);
+    const lineIds = lines.map((l) => l.id);
+    // Only voided invoices can still name its lines (standing ones were refused above).
+    if (lineIds.length > 0) {
+      await tx.db.update(invoiceLines).set({ estimateLineId: null }).where(inArray(invoiceLines.estimateLineId, lineIds));
+    }
+    const unfiled = await unfileAttachments(tx, 'estimate', id);
+    const before = await estimateAuditValues(tx, est);
+    await tx.db.delete(estimateLines).where(eq(estimateLines.estimateId, id));
+    await tx.db.delete(estimates).where(and(eq(estimates.id, id), eq(estimates.companyId, tx.companyId)));
+    await writeAudit(tx, {
+      action: 'delete',
+      entityType: 'estimate',
+      entityId: id,
+      oldValues: {
+        ...before,
+        expirationDate: est.expirationDate,
+        subtotal: est.subtotal,
+        taxAmount: est.taxAmount,
+        lines: lines.map((l) => ({
+          itemId: l.itemId,
+          description: l.description,
+          quantity: l.quantity,
+          rate: l.rate,
+          amount: l.amount,
+          taxable: l.taxable,
+          salesTaxCodeId: l.salesTaxCodeId,
+          classId: l.classId,
+        })),
+      },
+      newValues: unfiled > 0 ? { attachmentsUnfiled: unfiled } : null,
+    });
+    return { id, deleted: true as const };
+  });
+}
+
+// ---------------------------------------------------------------------------
 // convertToInvoice
 // ---------------------------------------------------------------------------
 
@@ -455,6 +654,9 @@ export async function convertToInvoice(
   return inTransaction(ctx, async (tx) => {
     const estimate = await getEstimate(tx, estimateId);
 
+    if (estimate.status === 'void') {
+      throw new ServiceError('CONFLICT', 'This estimate is void, so it cannot be turned into an invoice.');
+    }
     if (estimate.status === 'closed' || estimate.convertedInvoiceId) {
       throw new ServiceError('CONFLICT', 'Estimate has already been converted to an invoice.');
     }
@@ -478,6 +680,7 @@ export async function convertToInvoice(
       quantity: l.quantity,
       rate: l.rate,
       taxable: l.taxable,
+      salesTaxCodeId: l.salesTaxCodeId ?? null,
       classId: l.classId ?? null,
       pricing: { origin: 'estimate' },
       estimateLineId: l.id,
@@ -491,6 +694,8 @@ export async function convertToInvoice(
       date: await companyToday(tx),
       lines: invoiceLines,
       memo: estimate.memo ?? undefined,
+      // The estimate's customer message carries over (QB copies it onto the invoice).
+      customerMessageId: estimate.customerMessageId ?? null,
       // wave2 sales: carry the quoted tax rate (stored since 0027) so the invoice total matches.
       taxRateId: estimate.taxRateId ?? null,
       // The estimate's ship-to carries over (none → the customer's default ship-to).
@@ -565,6 +770,9 @@ export async function createProgressInvoice(
 
     if (estimate.status === 'rejected') {
       throw new ServiceError('CONFLICT', 'Cannot invoice a rejected estimate.');
+    }
+    if (estimate.status === 'void') {
+      throw new ServiceError('CONFLICT', 'This estimate is void, so it cannot be invoiced.');
     }
 
     // Subtotal items only add up the lines above them — nothing to bill on their own.
@@ -722,6 +930,7 @@ export async function createProgressInvoice(
       memo: `Progress billing (${progressLabel}) for Estimate #${estRef}`,
       // Sales tax is charged on the invoice itself, at the estimate's rate, on taxable lines.
       taxRateId: estimate.taxRateId ?? null,
+      customerMessageId: estimate.customerMessageId ?? null,
       shipTo: estimate.shipTo ?? undefined,
       overrideCreditLimit: input.overrideCreditLimit,
       // Over-billing was checked (and, if asked, allowed) just above against the same figures.
@@ -733,6 +942,7 @@ export async function createProgressInvoice(
         rate: b.line.rate,
         amount: toAmountString(b.amount),
         taxable: b.line.taxable,
+        salesTaxCodeId: b.line.salesTaxCodeId ?? null,
         classId: b.line.classId ?? null,
         pricing: { origin: 'estimate' },
         estimateLineId: b.line.id,
@@ -776,6 +986,9 @@ export async function updateEstimate(ctx: ServiceContext, id: string, input: Cre
   // Accountant's Copy (I1): both the estimate's date and the new one.
   await assertDividingDateOpen(ctx, existing.date);
   await assertDividingDateOpen(ctx, input.date);
+  if (existing.status === 'void') {
+    throw new ServiceError('CONFLICT', 'This estimate is void, so it can no longer be changed.');
+  }
   if (existing.status === 'closed' || existing.convertedInvoiceId) {
     throw new ServiceError(
       'CONFLICT',
@@ -796,16 +1009,42 @@ export async function updateEstimate(ctx: ServiceContext, id: string, input: Cre
       .select()
       .from(estimates)
       .where(and(eq(estimates.companyId, tx.companyId), eq(estimates.id, id)));
-    if (!current || current.status === 'closed' || current.status === 'partial') {
+    if (!current || current.status === 'closed' || current.status === 'partial' || current.status === 'void') {
       throw new ServiceError('CONFLICT', 'This estimate changed while you were editing it — reload and try again.');
     }
     const renum = await renumberDoc(
       tx, 'estimate', id, { refNumber: current.refNumber, number: current.estimateNumber },
       input.refNumber, { allowDuplicate: input.allowDuplicateNumber === true },
     );
+    // Each row keeps the id of the saved line it edits (the id it sends, else the line at the same
+    // place with the same item), so pending invoices linked to it (estimateLineId) keep their links;
+    // replacing every line with new ids left those links pointing at deleted lines. Links to lines
+    // the edit removes are cleared (only pending invoices can have them: a billed estimate is locked).
+    const savedIds = new Set(existing.lines.map((l) => l.id));
+    const keptIds = new Map<number, string>();
+    const used = new Set<string>();
+    input.lines.forEach((l, i) => {
+      if (l.id && savedIds.has(l.id) && !used.has(l.id)) {
+        keptIds.set(i, l.id);
+        used.add(l.id);
+      }
+    });
+    input.lines.forEach((l, i) => {
+      if (keptIds.has(i) || l.id) return;
+      const o = existing.lines.find((x) => x.lineOrder === i);
+      if (o && !used.has(o.id) && (o.itemId ?? null) === (l.itemId ?? null)) {
+        keptIds.set(i, o.id);
+        used.add(o.id);
+      }
+    });
+    const removedIds = existing.lines.filter((l) => !used.has(l.id)).map((l) => l.id);
+    if (removedIds.length) {
+      await tx.db.update(invoiceLines).set({ estimateLineId: null }).where(inArray(invoiceLines.estimateLineId, removedIds));
+    }
     await tx.db.delete(estimateLines).where(eq(estimateLines.estimateId, id));
     await tx.db.insert(estimateLines).values(
       computedLines.map((cl) => ({
+        ...(keptIds.has(cl.lineOrder) ? { id: keptIds.get(cl.lineOrder)! } : {}),
         estimateId: id,
         itemId: cl.itemId,
         description: cl.description,
@@ -813,6 +1052,7 @@ export async function updateEstimate(ctx: ServiceContext, id: string, input: Cre
         rate: cl.rate,
         amount: cl.amount,
         taxable: cl.taxable,
+        salesTaxCodeId: storedLineTaxCode(input.lines?.[cl.lineOrder], cl.taxable),
         classId: cl.classId,
         lineOrder: cl.lineOrder,
         pricing: cl.pricing as Record<string, unknown> | null,
@@ -833,6 +1073,7 @@ export async function updateEstimate(ctx: ServiceContext, id: string, input: Cre
         shipTo: input.shipTo !== undefined ? input.shipTo : current.shipTo,
         toBePrinted: input.toBePrinted ?? current.toBePrinted,
         toBeEmailed: input.toBeEmailed ?? current.toBeEmailed,
+        customerMessageId: await resolveCustomerMessage(tx, input.customerMessageId, current.customerMessageId),
         updatedAt: new Date(),
       })
       .where(eq(estimates.id, id))

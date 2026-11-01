@@ -75,6 +75,8 @@ import {
   memorizedReportGroups, otherNames, payRuns, paymentMethods, paymentTerms, payrollItems,
   priceLevelItems, priceLevels, priceRules, qbGlImports, receiptScans, reportSchedules,
   salesTaxCodes, shipViaMethods, todoItems, todos, uomSetUnits, uomSets, vehicles, vendorTypes,
+  // salesar: Billing Groups (C6)
+  billingGroupMembers, billingGroups,
 } from '@/lib/db/schema';
 import { ServiceError, type ServiceContext } from './_base';
 import { cloneAttachmentFileForRestore, normalizeStoragePath, safeAttachmentPath } from './attachments';
@@ -999,6 +1001,9 @@ const COMPANY_TABLES: CompanyTableSpec[] = [
   { name: 'journalItemApplications', table: journalItemApplications, joins: [], companyCol: journalItemApplications.companyId },
   { name: 'bouncedChecks', table: bouncedChecks, joins: [], companyCol: bouncedChecks.companyId },
   { name: 'collectionNotes', table: collectionNotes, joins: [], companyCol: collectionNotes.companyId },
+  // salesar (0080): Billing Groups and their customers (after customers).
+  { name: 'billingGroups', table: billingGroups, joins: [], companyCol: billingGroups.companyId },
+  { name: 'billingGroupMembers', table: billingGroupMembers, joins: [], companyCol: billingGroupMembers.companyId },
   // ---- wave2 purchases: Loan Manager + check printer setup (after vendors/accounts/expenses/bills) ----
   { name: 'loans', table: loans, joins: [], companyCol: loans.companyId },
   { name: 'loanPayments', table: loanPayments, joins: [], companyCol: loanPayments.companyId },

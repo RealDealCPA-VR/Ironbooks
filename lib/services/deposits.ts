@@ -72,6 +72,7 @@ import { syncLineMemos } from './entryLineMemos';
 import { subledgerAccountReason } from '@/lib/registerEntryPlan';
 import { homeAmounts } from './currencies';
 import { currencyRate, exchangeGainLossLine, foreignCode, homeCode, toHome } from './exchangeRates';
+import { paymentMethodNames } from './salesFormLists';
 
 /** p1 fx: home amount each payment's posted entry put into Undeposited Funds (debits - credits). */
 async function postedUndepositedHome(
@@ -161,6 +162,13 @@ export interface UndepositedItem {
   customerName: string | null;
   date: Date;
   method: string;
+  /**
+   * salesar (B7): the Payment Method list entry the payment / sales receipt was received with
+   * ("Visa"), so Payments to Deposit can show and group by it (QB "View payment method type").
+   * Null for items saved with a bare type (they show and group by their type).
+   */
+  paymentMethodId?: string | null;
+  paymentMethodName?: string | null;
   reference: string | null;
   amount: string;
   /** p1 fx: payment currency (null = home); `amount` is in it. */
@@ -405,6 +413,7 @@ export async function listUndepositedPayments(
     ...invRows.map((r) => r.customerId),
   ]);
   const home = await homeCode(ctx);
+  const methodNames = await paymentMethodNames(ctx, [...pmtRows.map((r) => r.paymentMethodId), ...srRows.map((r) => r.paymentMethodId)]);
 
   const items: UndepositedItem[] = [
     ...pmtRows.map((r) => ({
@@ -414,6 +423,8 @@ export async function listUndepositedPayments(
       customerName: custMap.get(r.customerId) ?? null,
       date: r.date,
       method: r.method,
+      paymentMethodId: r.paymentMethodId ?? null,
+      paymentMethodName: r.paymentMethodId ? (methodNames.get(r.paymentMethodId) ?? null) : null,
       reference: r.reference,
       amount: r.amount,
       currency: foreignCode(r.currency, home),
@@ -425,6 +436,8 @@ export async function listUndepositedPayments(
       customerName: r.customerId ? (custMap.get(r.customerId) ?? null) : null,
       date: r.date,
       method: r.method,
+      paymentMethodId: r.paymentMethodId ?? null,
+      paymentMethodName: r.paymentMethodId ? (methodNames.get(r.paymentMethodId) ?? null) : null,
       reference: r.reference ?? `Sales Receipt #${r.refNumber || r.receiptNumber}`,
       amount: r.total,
       currency: null,
@@ -1275,7 +1288,101 @@ export async function getDeposit(ctx: ServiceContext, id: string) {
     .from(depositLines)
     .where(eq(depositLines.depositId, id));
 
-  return { ...deposit, lines };
+  return { ...deposit, lines: await withLineSources(ctx, lines) };
+}
+
+/**
+ * salesar (B7): what each payment / sales receipt / invoice-payment line of a saved deposit came
+ * from — its method type, Payment Method list entry, customer, reference and date — so the edit
+ * form lists them as Payments to Deposit does (and its "View payment method" filter groups them).
+ */
+export interface DepositLineSource {
+  method: string;
+  paymentMethodId: string | null;
+  paymentMethodName: string | null;
+  customerId: string | null;
+  customerName: string | null;
+  reference: string | null;
+  date: Date;
+}
+
+async function withLineSources<L extends { paymentId: string | null; description: string | null }>(
+  ctx: ServiceContext,
+  lines: L[],
+): Promise<Array<L & { source: DepositLineSource | null }>> {
+  const RECEIPT = 'salesReceipt:';
+  const INVOICE = 'invoicePayment:';
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const paymentIds = lines.map((l) => l.paymentId).filter((x): x is string => !!x);
+  const receiptIds = lines
+    .map((l) => (l.description?.startsWith(RECEIPT) ? l.description.slice(RECEIPT.length) : ''))
+    .filter((x) => uuid.test(x));
+  const invoiceIds = lines
+    .map((l) => (l.description?.startsWith(INVOICE) ? l.description.slice(INVOICE.length) : ''))
+    .filter((x) => uuid.test(x));
+  const pmts = paymentIds.length
+    ? await ctx.db
+        .select({
+          id: paymentsReceived.id,
+          method: paymentsReceived.method,
+          paymentMethodId: paymentsReceived.paymentMethodId,
+          customerId: paymentsReceived.customerId,
+          reference: paymentsReceived.reference,
+          date: paymentsReceived.date,
+        })
+        .from(paymentsReceived)
+        .where(and(eq(paymentsReceived.companyId, ctx.companyId), inArray(paymentsReceived.id, paymentIds)))
+    : [];
+  const receipts = receiptIds.length
+    ? await ctx.db
+        .select({
+          id: salesReceipts.id,
+          method: salesReceipts.method,
+          paymentMethodId: salesReceipts.paymentMethodId,
+          customerId: salesReceipts.customerId,
+          reference: salesReceipts.reference,
+          refNumber: salesReceipts.refNumber,
+          receiptNumber: salesReceipts.receiptNumber,
+          date: salesReceipts.date,
+        })
+        .from(salesReceipts)
+        .where(and(eq(salesReceipts.companyId, ctx.companyId), inArray(salesReceipts.id, receiptIds)))
+    : [];
+  const invs = invoiceIds.length
+    ? await ctx.db
+        .select({ id: invoices.id, customerId: invoices.customerId, date: invoices.date })
+        .from(invoices)
+        .where(and(eq(invoices.companyId, ctx.companyId), inArray(invoices.id, invoiceIds)))
+    : [];
+  const names = await customerNameMap(ctx, [...pmts, ...receipts, ...invs].map((r) => r.customerId));
+  const methodNames = await paymentMethodNames(ctx, [...pmts, ...receipts].map((r) => r.paymentMethodId));
+  const src = (r: { method: string; paymentMethodId: string | null; customerId: string | null; reference: string | null; date: Date }): DepositLineSource => ({
+    method: r.method,
+    paymentMethodId: r.paymentMethodId ?? null,
+    paymentMethodName: r.paymentMethodId ? (methodNames.get(r.paymentMethodId) ?? null) : null,
+    customerId: r.customerId,
+    customerName: r.customerId ? (names.get(r.customerId) ?? null) : null,
+    reference: r.reference,
+    date: r.date,
+  });
+  const byPayment = new Map(pmts.map((r) => [r.id, src(r)]));
+  const byReceipt = new Map(
+    receipts.map((r) => [r.id, src({ ...r, reference: r.reference ?? `Sales Receipt #${r.refNumber || r.receiptNumber}` })]),
+  );
+  const byInvoice = new Map(
+    invs.map((r) => [r.id, src({ method: 'other', paymentMethodId: null, customerId: r.customerId, reference: null, date: r.date })]),
+  );
+  return lines.map((l) => {
+    const desc = l.description ?? '';
+    const source = l.paymentId
+      ? byPayment.get(l.paymentId)
+      : desc.startsWith(RECEIPT)
+        ? byReceipt.get(desc.slice(RECEIPT.length))
+        : desc.startsWith(INVOICE)
+          ? byInvoice.get(desc.slice(INVOICE.length))
+          : undefined;
+    return { ...l, source: source ?? null };
+  });
 }
 
 // ---------------------------------------------------------------------------

@@ -456,6 +456,13 @@
       "when": 1781400081000,
       "tag": "0081_purchbank",
       "breakpoints": true
+    },
+    {
+      "idx": 82,
+      "version": "7",
+      "when": 1781400082000,
+      "tag": "0082_salesar",
+      "breakpoints": true
     }
   ]
 }

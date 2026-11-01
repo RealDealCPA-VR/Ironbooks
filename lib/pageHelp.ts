@@ -58,7 +58,7 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
   '/invoices/batch': {
     title: 'Invoice many customers',
     what: 'Send the same charge (for example a monthly fee) to a group of customers in one go.',
-    first: 'Pick the customers, add the items once, then create the invoices.',
+    first: 'Pick the customers (or a saved Billing Group), add the items once, then create the invoices.',
     qb: 'Batch Invoicing',
   },
   '/payments': {
@@ -117,14 +117,14 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
   },
   '/income-tracker': {
     title: 'Money coming in',
-    what: 'One view of estimates, unbilled orders, open and overdue invoices, and money paid in the last 30 days.',
-    first: 'Click a coloured bar to see those transactions.',
+    what: 'One view of estimates, unbilled orders, unbilled time and costs, open and overdue invoices, and money paid in the last 30 days.',
+    first: 'Click a coloured bar to see those transactions; use a row’s action to receive a payment or bill time and costs.',
     qb: 'Income Tracker',
   },
   '/collections-center': {
     title: 'Collect overdue payments',
     what: 'Customers who are late paying, with how much and how late, so you can follow up.',
-    first: 'Pick a customer to email a reminder or add a note.',
+    first: 'On a customer, log a call, email the overdue invoices or a statement, print a collection letter, or receive a payment.',
     qb: 'Collections Center',
   },
   '/sales-reps': {
@@ -208,6 +208,12 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
     what: 'See the sales tax you collected and owe each tax agency, and pay it.',
     first: 'Pick the bank account and the "show tax due through" date, tick the agencies to pay, then pay.',
     qb: 'Pay Sales Tax',
+  },
+  '/sales-tax-components': {
+    title: 'Sales Tax Items',
+    what: 'The sales tax rates you charge and the tax agency each one is paid to. Inactive items stay on old sales but are not offered on new ones.',
+    first: 'Click "New sales tax item", give it a name and a rate, and pick (or add) its tax agency.',
+    qb: 'Sales Tax Items (Item List)',
   },
   '/onboarding': {
     title: 'Setup Interview',

@@ -5,7 +5,7 @@
 import { z } from 'zod';
 import { zDate, zDecimal, zDocNumber, zLines, zMoney, zUuid } from './helpers';
 import { inventoryLineFields } from './inventorySites';
-import { creditLimitOverrideField, sendFlagFields, shippingFields } from './sales';
+import { creditLimitOverrideField, sendFlagFields, customerMessageField, shippingFields } from './sales';
 
 export const invoiceLineSchema = z.object({
   itemId: zUuid.nullish(),
@@ -16,6 +16,8 @@ export const invoiceLineSchema = z.object({
   rate: zDecimal.nullish(),
   /** Defaults to true in the service. */
   taxable: z.boolean().optional(),
+  /** salesar (B9): the line's Sales Tax Code; the server sets `taxable` from it. */
+  salesTaxCodeId: zUuid.nullish(),
   taxRateId: zUuid.nullish(),
   classId: zUuid.nullish(),
   jobId: zUuid.nullish(),
@@ -69,6 +71,7 @@ const invoiceCoreFields = {
   // wave2 sales: shipping fields, send queues, credit-limit override
   ...shippingFields,
   ...sendFlagFields,
+  ...customerMessageField,
   ...creditLimitOverrideField,
   /** Save even though a line bills more than 100% of its estimate line (PROGRESS_OVERBILL). */
   allowOverBilling: z.boolean().optional(),

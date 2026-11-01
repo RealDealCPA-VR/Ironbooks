@@ -601,7 +601,8 @@ export const DOC_SHAPES: Record<DocType, Shape> = {
     lines: {
       arr: {
         itemId: 'id?', accountId: 'id?', description: 'str?', quantity: 'dec', rate: 'dec?', taxable: 'bool?',
-        taxRateId: 'id?', classId: 'id?', jobId: 'id?', estimateLineId: 'id?', cost: 'dec?', ...INV,
+        taxRateId: 'id?', classId: 'id?', jobId: 'id?', estimateLineId: 'id?',
+        billableSource: { obj: { kind: 'str', id: 'id' }, opt: true }, cost: 'dec?', ...INV,
       },
     },
   },

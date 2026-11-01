@@ -28,6 +28,8 @@ import {
   items,
   salesReceipts,
   salesReceiptLines,
+  creditMemos,
+  creditMemoLines,
 } from '@/lib/db/schema';
 import { toAmountString, Money } from '@/lib/money';
 import {
@@ -39,6 +41,7 @@ import {
   inTransaction,
 } from './_base';
 import { assertListDeleteAllowed } from './accountantCopy/guard';
+import { assertTypeAssignable } from './typeLists';
 
 // ---------------------------------------------------------------------------
 // Shared types
@@ -50,12 +53,15 @@ export interface CreateJobInput {
   budget?: string | number | null;
   startDate?: Date | null;
   endDate?: Date | null;
+  /** B4: Job Type list entry (QB "Job Type"; a job report filter). */
+  jobTypeId?: string | null;
 }
 
 export type UpdateJobInput = Partial<CreateJobInput> & { status?: string };
 
 export interface JobProfitabilityLineItem {
-  source: 'invoice_line' | 'bill_line' | 'expense_line';
+  /** credit_memo_line: a credit memo line for the job (a return or a write-off) — negative revenue. */
+  source: 'invoice_line' | 'credit_memo_line' | 'bill_line' | 'expense_line';
   id: string;
   description: string | null;
   amount: string;
@@ -86,6 +92,8 @@ export interface JobSummaryRow {
   profit: string;
   isActive: boolean;
   createdAt: Date;
+  /** B4: the job's Job Type (null = none). */
+  jobTypeId: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -131,6 +139,7 @@ export async function getJob(ctx: ServiceContext, id: string) {
 export async function createJob(ctx: ServiceContext, input: CreateJobInput) {
   validateCreateInput(input);
   if (input.customerId) await assertRefInCompany(ctx, customers, input.customerId, 'Customer');
+  await assertTypeAssignable(ctx, 'job', input.jobTypeId);
   return inTransaction(ctx, async (tx) => {
     const [job] = await tx.db
       .insert(jobs)
@@ -141,6 +150,7 @@ export async function createJob(ctx: ServiceContext, input: CreateJobInput) {
         budget: input.budget != null ? toAmountString(input.budget) : null,
         startDate: input.startDate ?? null,
         endDate: input.endDate ?? null,
+        jobTypeId: input.jobTypeId ?? null,
         status: 'active',
         isActive: true,
       })
@@ -169,11 +179,13 @@ export async function updateJob(ctx: ServiceContext, id: string, input: UpdateJo
   };
   validateCreateInput(merged);
   if (input.customerId) await assertRefInCompany(ctx, customers, input.customerId, 'Customer');
+  if (input.jobTypeId !== undefined) await assertTypeAssignable(ctx, 'job', input.jobTypeId, existing.jobTypeId);
 
   return inTransaction(ctx, async (tx) => {
     const patch: Record<string, unknown> = {};
     if (input.name !== undefined) patch.name = input.name.trim();
     if (input.customerId !== undefined) patch.customerId = input.customerId;
+    if (input.jobTypeId !== undefined) patch.jobTypeId = input.jobTypeId;
     if (input.budget !== undefined) patch.budget = input.budget != null ? toAmountString(input.budget) : null;
     if (input.startDate !== undefined) patch.startDate = input.startDate;
     if (input.endDate !== undefined) patch.endDate = input.endDate;
@@ -340,6 +352,36 @@ async function jobFacts(ctx: ServiceContext, jobIds: string[]): Promise<JobFact[
     });
   }
 
+  // Credit memo lines for the job (returns, write-offs) reduce its revenue, as in the Job
+  // Profitability reports (reportsJobsTime.ts) and QuickBooks.
+  const memoJob = sql<string | null>`COALESCE(${creditMemoLines.jobId}, ${creditMemos.jobId})`;
+  const memoLines = await ctx.db
+    .select({
+      id: creditMemoLines.id,
+      jobId: memoJob,
+      description: creditMemoLines.description,
+      amount: creditMemoLines.amount,
+    })
+    .from(creditMemoLines)
+    .innerJoin(creditMemos, eq(creditMemoLines.creditMemoId, creditMemos.id))
+    .leftJoin(items, and(eq(creditMemoLines.itemId, items.id), eq(items.companyId, ctx.companyId)))
+    .where(
+      and(
+        eq(creditMemos.companyId, ctx.companyId),
+        sql`${memoJob} IN (${sql.join(jobIds.map((id) => sql`${id}::uuid`), sql`, `)})`,
+        ne(creditMemos.status, 'void'),
+        REVENUE_LINE_ONLY,
+      ),
+    );
+  for (const l of memoLines) {
+    if (!l.jobId) continue;
+    out.push({
+      jobId: l.jobId,
+      kind: 'revenue',
+      line: { source: 'credit_memo_line', id: l.id, description: l.description, amount: toAmountString(Money.of(l.amount).negated()) },
+    });
+  }
+
   // Cost: bill lines and check / expense lines tagged to the job.
   const billCostLines = await ctx.db
     .select({
@@ -404,7 +446,7 @@ export async function jobProfitability(ctx: ServiceContext, jobId: string): Prom
   const budgetVariance = job.budget != null ? profit.minus(Money.of(job.budget)) : null;
 
   // Revenue lines first, then bill costs, then direct expenses (as before).
-  const order = { invoice_line: 0, bill_line: 1, expense_line: 2 } as const;
+  const order = { invoice_line: 0, credit_memo_line: 1, bill_line: 2, expense_line: 3 } as const;
   const lines = facts.map((f) => f.line).sort((a, b) => order[a.source] - order[b.source]);
 
   return {
@@ -437,6 +479,7 @@ export async function jobsSummary(ctx: ServiceContext): Promise<JobSummaryRow[]>
       endDate: jobs.endDate,
       isActive: jobs.isActive,
       createdAt: jobs.createdAt,
+      jobTypeId: jobs.jobTypeId,
     })
     .from(jobs)
     .leftJoin(
@@ -465,6 +508,7 @@ export async function jobsSummary(ctx: ServiceContext): Promise<JobSummaryRow[]>
       endDate: j.endDate,
       isActive: j.isActive,
       createdAt: j.createdAt,
+      jobTypeId: j.jobTypeId ?? null,
       revenue: toAmountString(revenue),
       cost: toAmountString(cost),
       profit: toAmountString(profit),

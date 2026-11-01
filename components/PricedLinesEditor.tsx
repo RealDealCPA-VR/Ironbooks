@@ -13,6 +13,8 @@ import { usePriceQuotes, samePrice, type QuoteHeader } from '@/lib/usePriceQuote
 import { PriceSourceBadge } from '@/components/PriceSourceBadge';
 import { TypeaheadSelect } from '@/components/TypeaheadSelect';
 import type { TypeaheadChoice } from '@/lib/typeahead';
+import { LineTaxCodeCell } from '@/components/sales/FormLists';
+import { type CustomerTaxStatus, type TaxCodeEntry, itemLineTaxCode } from '@/lib/salesFormListsClient';
 
 export interface PricedLineItem {
   id: string;
@@ -21,6 +23,8 @@ export interface PricedLineItem {
   description?: string | null;
   salesPrice: string | null;
   taxable?: boolean;
+  /** salesar (B9): the item's Sales Tax Code (a picked item defaults the line to it). */
+  salesTaxCodeId?: string | null;
   isActive?: boolean;
 }
 
@@ -30,6 +34,8 @@ export interface PricedLineValue {
   quantity: string;
   rate: string;
   taxable: boolean;
+  /** salesar (B9): the line's Sales Tax Code ('' / absent = the standard code for `taxable`). */
+  salesTaxCodeId?: string;
   /** The user typed the rate — automatic prices leave it alone. */
   rateManual?: boolean;
   /** Class for this line (shown only when the form passes `classes`). */
@@ -49,6 +55,8 @@ export function PricedLinesEditor({
   header,
   showTaxable = false,
   classes,
+  taxCodes,
+  customerTax = null,
 }: {
   items: PricedLineItem[];
   lines: PricedLineValue[];
@@ -57,6 +65,14 @@ export function PricedLinesEditor({
   showTaxable?: boolean;
   /** When given (and not empty), each line gets a Class picker. */
   classes?: Array<{ id: string; name: string }>;
+  /**
+   * salesar (B9): the Sales Tax Code list. When given, the Tax column is a Sales Tax Code picker
+   * (QB's "Tax" column) and a picked item defaults the line to its code; without it the column
+   * stays a Tax checkbox.
+   */
+  taxCodes?: TaxCodeEntry[];
+  /** The customer's tax status (a non-taxable customer's lines show its non-taxable code). */
+  customerTax?: CustomerTaxStatus | null;
 }) {
   const latest = useRef(lines);
   latest.current = lines;
@@ -89,11 +105,14 @@ export function PricedLinesEditor({
   }
   function pickItem(idx: number, itemId: string) {
     const it = byId.get(itemId);
+    // The item's Sales Tax Code (else Tax / Non by its taxable flag) when the code list is used.
+    const code = it && taxCodes ? itemLineTaxCode(it, taxCodes) : null;
     patch(idx, {
       itemId,
       description: it ? (it.description || it.name) : latest.current[idx].description,
       rate: it ? (it.salesPrice ?? '0') : latest.current[idx].rate,
-      taxable: it ? it.taxable !== false : latest.current[idx].taxable,
+      taxable: code ? code.taxable : it ? it.taxable !== false : latest.current[idx].taxable,
+      ...(code ? { salesTaxCodeId: code.salesTaxCodeId } : {}),
       rateManual: false,
     });
   }
@@ -154,7 +173,18 @@ export function PricedLinesEditor({
                 />
               )}
             </div>
-            {showTaxable && (
+            {showTaxable && taxCodes && (
+              <div className="col-span-1 pt-1">
+                <LineTaxCodeCell
+                  row={{ ...line, itemType: byId.get(line.itemId)?.type ?? null }}
+                  codes={taxCodes}
+                  customer={customerTax}
+                  label={`Line ${idx + 1} sales tax code`}
+                  onChange={(p) => patch(idx, p)}
+                />
+              </div>
+            )}
+            {showTaxable && !taxCodes && (
               <div className="col-span-1 flex justify-center pt-2">
                 <input
                   type="checkbox"

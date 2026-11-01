@@ -8,11 +8,14 @@
  * Rules:
  *  - No direct GL posting; GL happens only through createInvoice.
  *  - All queries are scoped to ctx.companyId.
- *  - Rate fallback: entry.rate → service item salesPrice → 0.
+ *  - Rate fallback (B13): entry.rate → the employee's billing rate level → service item
+ *    salesPrice → 0 (lists/billingRates.resolveTimeEntryRates, shared by every billing path).
  */
 import { and, eq, inArray, isNull, like } from 'drizzle-orm';
 import { Money, toAmountString } from '@/lib/money';
 import { timeEntries, customers, items, employees, jobs } from '@/lib/db/schema';
+import { resolveTimeEntryRates, type TimeRateSource } from './lists/billingRates';
+import { companyToday } from './salesDates';
 import {
   type ServiceContext,
   ServiceError,
@@ -24,6 +27,7 @@ import {
 } from './_base';
 import { createInvoice } from './invoices';
 import { assertAccountantMayBillCosts } from './accountantCopy/guard';
+import { assertLineJobs } from './jobCustomers';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -59,11 +63,6 @@ export interface ListTimeEntriesFilter {
   invoiced?: boolean;
 }
 
-/** Today's local calendar day at UTC midnight (the convention every stored document date uses). */
-function todayCalendarDay(now: Date = new Date()): Date {
-  return new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
-}
-
 // ---------------------------------------------------------------------------
 // listTimeEntries
 // ---------------------------------------------------------------------------
@@ -83,6 +82,36 @@ export async function listTimeEntries(ctx: ServiceContext, filter: ListTimeEntri
       if (isInvoiced !== filter.invoiced) return false;
     }
     return true;
+  });
+}
+
+/** A time entry with the rate it bills at (B13) — what the Time Tracking page lists. */
+export type TimeEntryWithBillingRate = typeof timeEntries.$inferSelect & {
+  /** Hourly rate billing uses: typed rate → billing rate level → item price → 0. */
+  billingRate: string;
+  /** hours × billingRate (2 decimals). */
+  billingAmount: string;
+  rateSource: TimeRateSource;
+  /** The billing rate level's name when the rate comes from one. */
+  rateLevelName: string | null;
+};
+
+/** listTimeEntries plus each entry's billing rate and where it comes from. */
+export async function listTimeEntriesWithRates(
+  ctx: ServiceContext,
+  filter: ListTimeEntriesFilter = {},
+): Promise<TimeEntryWithBillingRate[]> {
+  const rows = await listTimeEntries(ctx, filter);
+  const rates = await resolveTimeEntryRates(ctx, rows);
+  return rows.map((r) => {
+    const rate = rates.get(r.id)!;
+    return {
+      ...r,
+      billingRate: rate.rate,
+      billingAmount: toAmountString(Money.round2(Money.mul(r.hours, rate.rate))),
+      rateSource: rate.source,
+      rateLevelName: rate.levelName,
+    };
   });
 }
 
@@ -122,6 +151,10 @@ export async function createTimeEntry(ctx: ServiceContext, input: TimeEntryInput
     if (!cust) throw notFound('Customer');
   }
   await assertTimeRefsOwned(ctx, input);
+  // The job must be one of the customer's (time with only a job is that job's customer's).
+  const jobLine = { customerId: input.customerId ?? null, jobId: input.jobId ?? null };
+  await assertLineJobs(ctx, [jobLine], { fill: true, what: 'time entry' });
+  input = { ...input, customerId: jobLine.customerId };
 
   const rate = input.rate != null ? toAmountString(input.rate) : null;
 
@@ -203,6 +236,13 @@ export async function updateTimeEntry(
     if (!cust) throw notFound('Customer');
   }
   await assertTimeRefsOwned(ctx, update);
+  if (update.jobId !== undefined || update.customerId !== undefined) {
+    await assertLineJobs(
+      ctx,
+      [{ customerId: update.customerId !== undefined ? update.customerId : existing.customerId, jobId: update.jobId !== undefined ? update.jobId : existing.jobId }],
+      { what: 'time entry' },
+    );
+  }
 
   const patch: Partial<typeof timeEntries.$inferInsert> = {};
   if (update.employeeId !== undefined) patch.employeeId = update.employeeId;
@@ -276,10 +316,11 @@ export async function deleteTimeEntry(ctx: ServiceContext, id: string) {
  * customer, create an invoice via createInvoice (which posts the GL entry), then
  * stamp invoicedInvoiceId on each entry.
  *
- * Rate resolution order per entry:
+ * Rate resolution order per entry (lists/billingRates.resolveTimeEntryRates):
  *   1. entry.rate (if set)
- *   2. service item salesPrice (if serviceItemId set)
- *   3. 0
+ *   2. the employee's billing rate level (custom rate for the service item, else its fixed rate)
+ *   3. service item salesPrice (if serviceItemId set)
+ *   4. 0
  */
 export async function billTimeToInvoice(
   ctx: ServiceContext,
@@ -311,28 +352,13 @@ export async function billTimeToInvoice(
     throw new ServiceError('VALIDATION', 'No unbilled billable time entries for this customer.');
   }
 
-  // Resolve service item prices for any entries that reference one.
-  const itemIds = [...new Set(entries.map((e) => e.serviceItemId).filter(Boolean) as string[])];
-  const itemPriceMap = new Map<string, string | null>();
-  if (itemIds.length > 0) {
-    const itemRows = await ctx.db
-      .select({ id: items.id, salesPrice: items.salesPrice })
-      .from(items)
-      .where(and(eq(items.companyId, ctx.companyId)));
-    for (const r of itemRows) {
-      if (itemIds.includes(r.id)) itemPriceMap.set(r.id, r.salesPrice);
-    }
-  }
+  // B13: entry rate → the person's billing rate level → service item price → 0 (the same
+  // resolver the Time/Costs list and the Income Tracker use).
+  const rates = await resolveTimeEntryRates(ctx, entries);
 
   // Build invoice lines: one line per time entry.
   const lines = entries.map((e) => {
-    let resolvedRate: string | number = '0';
-    if (e.rate != null && Money.gt(e.rate, 0)) {
-      resolvedRate = e.rate;
-    } else if (e.serviceItemId) {
-      const itemPrice = itemPriceMap.get(e.serviceItemId);
-      if (itemPrice != null) resolvedRate = itemPrice;
-    }
+    const resolvedRate = rates.get(e.id)!.rate;
 
     return {
       itemId: e.serviceItemId ?? null,
@@ -367,9 +393,9 @@ export async function billTimeToInvoice(
   return inTransaction(ctx, async (tx) => {
     const invoice = await createInvoice(tx, {
       customerId,
-      // Today's calendar day on this computer, stored at UTC midnight like every document date
+      // Today on the company's calendar, stored at UTC midnight like every document date
       // (`new Date()` is the current instant: in the evening west of UTC it is already tomorrow).
-      date: todayCalendarDay(),
+      date: await companyToday(tx),
       lines,
     });
     // Re-check "still unbilled" in the UPDATE and count the rows: the entries were read before

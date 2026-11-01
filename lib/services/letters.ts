@@ -35,6 +35,11 @@ import { type ServiceContext, notFound, validation, writeAudit } from './_base';
 import { getPreferences } from './company';
 import { docRef } from './docNumbers';
 import { assertWrite } from './rbac';
+import { foreignCode } from './fxLines';
+import { effectiveHomeCurrency } from './multiCurrency';
+
+/** Home value of a document-currency amount at the document's booked rate (2 decimals). */
+const homeOf = (amount: string, rate: string | null | undefined) => Money.round2(Money.mul(amount, Money.of(rate ?? 1)));
 
 export const RECIPIENT_TYPES = ['customer', 'vendor', 'employee', 'lead'] as const;
 export type RecipientType = (typeof RECIPIENT_TYPES)[number];
@@ -253,6 +258,7 @@ export async function listRecipients(ctx: ServiceContext, opts: ListRecipientsOp
   const prefs = await getPreferences(ctx);
   const today = opts.today ?? todayInTimeZone(prefs.timezone);
   const idFilter = opts.ids && opts.ids.length > 0 ? new Set(opts.ids) : null;
+  const home = await effectiveHomeCurrency(ctx);
   let list: Recipient[] = [];
 
   if (opts.type === 'customer') {
@@ -268,7 +274,9 @@ export async function listRecipients(ctx: ServiceContext, opts: ListRecipientsOp
         ref: invoices.refNumber,
         date: invoices.date,
         due: invoices.dueDate,
-        balance: invoices.balanceDue,
+        docBalance: invoices.balanceDue,
+        currency: invoices.currency,
+        rate: invoices.exchangeRate,
       })
       .from(invoices)
       .where(
@@ -277,9 +285,18 @@ export async function listRecipients(ctx: ServiceContext, opts: ListRecipientsOp
           inArray(invoices.status, ['open', 'partial', 'overdue']),
           gt(invoices.balanceDue, '0'),
         ),
+      )
+      // Letters print in the home currency, like A/R: a foreign invoice counts at the home value it
+      // was booked at (its balance x its rate). It used to be added in its own currency (EUR 100
+      // and USD 30 printed as a balance of 130.00).
+      .then((rows) =>
+        rows.map((r) => {
+          const cur = foreignCode(r.currency, home);
+          return { ...r, cur, balance: cur ? toAmountString(homeOf(r.docBalance, r.rate)) : r.docBalance };
+        }),
       );
     // Unapplied credits (credit memos + payments not yet applied to an invoice) reduce what is owed.
-    // Voiding zeroes `unapplied`, but filter void/voided rows anyway.
+    // Voiding zeroes `unapplied`, but filter void/voided rows anyway. Home value, as above.
     const credit = new Map<string, ReturnType<typeof Money.zero>>();
     const addCredit = (id: string, amt: string) => {
       if (Money.isPositive(amt)) credit.set(id, (credit.get(id) ?? Money.zero()).plus(Money.of(amt)));
@@ -290,7 +307,7 @@ export async function listRecipients(ctx: ServiceContext, opts: ListRecipientsOp
       .where(and(eq(creditMemos.companyId, ctx.companyId), ne(creditMemos.status, 'void'), gt(creditMemos.unapplied, '0')));
     for (const m of memoCredits) addCredit(m.customerId, m.amt);
     const payCredits = await ctx.db
-      .select({ customerId: paymentsReceived.customerId, amt: paymentsReceived.unapplied })
+      .select({ customerId: paymentsReceived.customerId, amt: paymentsReceived.unapplied, currency: paymentsReceived.currency, rate: paymentsReceived.exchangeRate })
       .from(paymentsReceived)
       .where(
         and(
@@ -299,7 +316,9 @@ export async function listRecipients(ctx: ServiceContext, opts: ListRecipientsOp
           gt(paymentsReceived.unapplied, '0'),
         ),
       );
-    for (const p of payCredits) addCredit(p.customerId, p.amt);
+    for (const p of payCredits) {
+      addCredit(p.customerId, foreignCode(p.currency, home) ? toAmountString(homeOf(p.amt, p.rate)) : p.amt);
+    }
 
     const byCustomer = new Map<string, typeof open>();
     for (const o of open) {
@@ -327,7 +346,8 @@ export async function listRecipients(ctx: ServiceContext, opts: ListRecipientsOp
           }
           lines.push(
             // The number printed on the invoice (typed / alphanumeric), not the internal sequence.
-            `  Invoice ${docRef(i.ref, i.n)}  dated ${dayOf(i.date)}${i.due ? `, due ${dayOf(i.due)}` : ''}: ${formatCurrency(i.balance)}${days > 0 ? ` (${days} days overdue)` : ''}`,
+            // A foreign invoice shows what the customer owes in its currency and the home value.
+            `  Invoice ${docRef(i.ref, i.n)}  dated ${dayOf(i.date)}${i.due ? `, due ${dayOf(i.due)}` : ''}: ${i.cur ? `${i.cur} ${toAmountString(i.docBalance)} (${formatCurrency(i.balance)})` : formatCurrency(i.balance)}${days > 0 ? ` (${days} days overdue)` : ''}`,
           );
         }
         const credits = credit.get(r.id) ?? Money.zero();
@@ -358,17 +378,24 @@ export async function listRecipients(ctx: ServiceContext, opts: ListRecipientsOp
   } else if (opts.type === 'vendor') {
     const rows = await ctx.db.select().from(vendors).where(eq(vendors.companyId, ctx.companyId)).orderBy(asc(vendors.displayName));
     const open = await ctx.db
-      .select({ vendorId: bills.vendorId, balance: bills.balanceDue })
+      .select({ vendorId: bills.vendorId, balance: bills.balanceDue, currency: bills.currency, rate: bills.exchangeRate })
       .from(bills)
       .where(and(eq(bills.companyId, ctx.companyId), inArray(bills.status, ['open', 'partial', 'overdue'])));
     const owed = new Map<string, ReturnType<typeof Money.zero>>();
-    for (const b of open) owed.set(b.vendorId, (owed.get(b.vendorId) ?? Money.zero()).plus(Money.of(b.balance)));
+    // Home currency, like A/P: a foreign bill at the home value it was booked at.
+    for (const b of open) {
+      const amt = foreignCode(b.currency, home) ? homeOf(b.balance, b.rate) : Money.of(b.balance);
+      owed.set(b.vendorId, (owed.get(b.vendorId) ?? Money.zero()).plus(amt));
+    }
     // Unapplied vendor credits reduce what we owe (QB's vendor balance), so vendor balances tie to A/P.
     const vCredits = await ctx.db
-      .select({ vendorId: vendorCredits.vendorId, amt: vendorCredits.unapplied })
+      .select({ vendorId: vendorCredits.vendorId, amt: vendorCredits.unapplied, homeAmt: vendorCredits.homeUnapplied, currency: vendorCredits.currency })
       .from(vendorCredits)
       .where(and(eq(vendorCredits.companyId, ctx.companyId), ne(vendorCredits.status, 'void'), gt(vendorCredits.unapplied, '0')));
-    for (const c of vCredits) owed.set(c.vendorId, (owed.get(c.vendorId) ?? Money.zero()).minus(Money.of(c.amt)));
+    for (const c of vCredits) {
+      const amt = foreignCode(c.currency, home) && c.homeAmt != null ? Money.of(c.homeAmt) : Money.of(c.amt);
+      owed.set(c.vendorId, (owed.get(c.vendorId) ?? Money.zero()).minus(amt));
+    }
     list = rows
       .filter((r) => opts.includeInactive || r.isActive)
       .map((r) => ({

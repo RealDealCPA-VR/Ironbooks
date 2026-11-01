@@ -25,6 +25,8 @@ export interface SalesReceiptPdfData {
   };
   lines: SalesFormPdfLine[];
   shipping?: SalesShippingInfo | null;
+  /** salesar (B8): the receipt's Customer Message. */
+  customerMessage?: string | null;
 }
 
 const METHOD_LABEL: Record<string, string> = {
@@ -55,6 +57,7 @@ export async function renderSalesReceiptPdf(data: SalesReceiptPdfData, template?
           { label: 'Total paid', value: r.total, emphasis: 'total' as const },
         ],
         memo: r.memo ?? null,
+        customerMessage: data.customerMessage ?? null,
       },
       template.design,
       template.logo,
@@ -78,6 +81,7 @@ export async function renderSalesReceiptPdf(data: SalesReceiptPdfData, template?
       ['Tax', data.receipt.tax],
       ['Total paid', data.receipt.total],
     ],
-    note: data.receipt.memo ? `Memo: ${data.receipt.memo}` : 'Thank you for your business.',
+    message: data.customerMessage ?? null,
+    note: data.receipt.memo ? `Memo: ${data.receipt.memo}` : data.customerMessage ? null : 'Thank you for your business.',
   });
 }

@@ -43,6 +43,7 @@ import type { ServiceContext } from './_base';
 import { customerNames, dayStr, entryIdsForSourceRefs, parseDay, resolveRange, stdHref } from './reportEngine';
 import { rangeLabel } from './reportsStandard';
 import { docRef } from './docNumbers';
+import { jobsOfType } from './reportTypeFilters';
 
 const amt = (v: Decimal) => toAmountString(v);
 
@@ -128,12 +129,13 @@ async function jobFacts(ctx: ServiceContext, range: { from?: Date; to?: Date }):
     if (k) out.push({ kind: 'revenue', jobKey: k, date: r.date, type: 'Sales Receipt', num: docRef(r.ref, r.num), sourceRef: `salesreceipt:${r.id}`, itemOrAccount: r.item ?? r.memo ?? '', memo: r.memo ?? '', qty: Money.of(r.qty), amount: Money.of(r.amount) });
   }
   for (const r of await ctx.db
-    .select({ id: creditMemos.id, num: creditMemos.memoNumber, ref: creditMemos.refNumber, date: creditMemos.date, customerId: creditMemos.customerId, item: items.name, memo: creditMemoLines.description, qty: creditMemoLines.quantity, amount: creditMemoLines.amount })
+    .select({ id: creditMemos.id, num: creditMemos.memoNumber, ref: creditMemos.refNumber, date: creditMemos.date, customerId: creditMemos.customerId, headJob: creditMemos.jobId, jobId: creditMemoLines.jobId, item: items.name, memo: creditMemoLines.description, qty: creditMemoLines.quantity, amount: creditMemoLines.amount })
     .from(creditMemoLines)
     .innerJoin(creditMemos, eq(creditMemoLines.creditMemoId, creditMemos.id))
     .leftJoin(items, and(eq(creditMemoLines.itemId, items.id), eq(items.companyId, c)))
     .where(and(eq(creditMemos.companyId, c), ne(creditMemos.status, 'void'), REVENUE_LINE_ONLY, ...dateConds(creditMemos.date)))) {
-    out.push({ kind: 'revenue', jobKey: `cust:${r.customerId}`, date: r.date, type: 'Credit Memo', num: docRef(r.ref, r.num), sourceRef: `credit_memo:${r.id}`, itemOrAccount: r.item ?? r.memo ?? '', memo: r.memo ?? '', qty: Money.of(r.qty).negated(), amount: Money.of(r.amount).negated() });
+    // salesar: a credit memo (a write-off too) counts against its own Customer:Job when it has one.
+    out.push({ kind: 'revenue', jobKey: keyOf(r.jobId ?? r.headJob, r.customerId)!, date: r.date, type: 'Credit Memo', num: docRef(r.ref, r.num), sourceRef: `credit_memo:${r.id}`, itemOrAccount: r.item ?? r.memo ?? '', memo: r.memo ?? '', qty: Money.of(r.qty).negated(), amount: Money.of(r.amount).negated() });
   }
   for (const r of await ctx.db
     .select({ id: bills.id, num: bills.billNumber, date: bills.date, customerId: billLines.customerId, jobId: billLines.jobId, item: items.name, account: accounts.name, memo: billLines.description, qty: billLines.quantity, amount: billLines.amount, fx: bills.exchangeRate })
@@ -183,9 +185,19 @@ function rangeText(r: { from?: Date; to?: Date }) {
   return r.from && r.to ? rangeLabel(r.from, r.to) : 'All dates';
 }
 
+/**
+ * B4: Job Type filter — only the facts of Jobs-list jobs of that type (subtypes included). A
+ * customer without a Jobs-list job has no job type, so its own lines drop out, as in QB.
+ */
+async function ofJobType(ctx: ServiceContext, p: ReportParams, facts: JobFact[]): Promise<JobFact[]> {
+  if (!p.jobTypeId) return facts;
+  const keep = await jobsOfType(ctx, p.jobTypeId);
+  return facts.filter((f) => f.jobKey.startsWith('job:') && keep.has(f.jobKey.slice(4)));
+}
+
 export async function jobProfitabilitySummary(ctx: ServiceContext, p: ReportParams): Promise<StdReport> {
   const range = optRange(p);
-  const facts = await jobFacts(ctx, range);
+  const facts = await ofJobType(ctx, p, await jobFacts(ctx, range));
   const { label } = await jobLabels(ctx);
   const sums = new Map<string, { cost: Decimal; revenue: Decimal }>();
   for (const f of facts) {
@@ -207,7 +219,7 @@ export async function jobProfitabilitySummary(ctx: ServiceContext, p: ReportPara
         depth: 0,
         kind: 'data' as const,
         cells: { label: name, cost: amt(v.cost), revenue: amt(v.revenue), diff: amt(v.revenue.minus(v.cost)) },
-        href: stdHref('job-profitability-detail', { [kind === 'job' ? 'jobId' : 'customerId']: id, from: p.from, to: p.to }),
+        href: stdHref('job-profitability-detail', { [kind === 'job' ? 'jobId' : 'customerId']: id, from: p.from, to: p.to, jobTypeId: p.jobTypeId }),
       };
     });
   rows.push({ id: 'jps:grand', depth: 0, kind: 'grand', cells: { label: 'TOTAL', cost: amt(tc), revenue: amt(tr), diff: amt(tr.minus(tc)) } });
@@ -217,7 +229,7 @@ export async function jobProfitabilitySummary(ctx: ServiceContext, p: ReportPara
 export async function jobProfitabilityDetail(ctx: ServiceContext, p: ReportParams): Promise<StdReport> {
   const range = optRange(p);
   const want = p.jobId ? `job:${p.jobId}` : p.customerId ? `cust:${p.customerId}` : null;
-  const facts = (await jobFacts(ctx, range)).filter((f) => !want || f.jobKey === want);
+  const facts = (await ofJobType(ctx, p, await jobFacts(ctx, range))).filter((f) => !want || f.jobKey === want);
   const { label } = await jobLabels(ctx);
   const entryIds = await entryIdsForSourceRefs(ctx, facts.map((f) => f.sourceRef));
   const rows: StdRow[] = [];
@@ -282,10 +294,19 @@ async function estimateFacts(ctx: ServiceContext, range: { from?: Date; to?: Dat
 
 export async function jobEstimatesVsActuals(ctx: ServiceContext, p: ReportParams): Promise<StdReport> {
   const range = optRange(p);
-  const [est, facts, { names }] = await Promise.all([estimateFacts(ctx, range), jobFacts(ctx, range), jobLabels(ctx)]);
+  const [allEst, allFacts, { names }] = await Promise.all([estimateFacts(ctx, range), jobFacts(ctx, range), jobLabels(ctx)]);
   const jobCustomer = new Map<string, string | null>();
   const jobRows = await ctx.db.select({ id: jobs.id, customerId: jobs.customerId }).from(jobs).where(eq(jobs.companyId, ctx.companyId));
   for (const j of jobRows) jobCustomer.set(j.id, j.customerId);
+  // B4: Job Type — actuals of the jobs of that type; estimates are made out to the customer (not
+  // to a job), so a customer's estimates count when the customer has a job of that type.
+  const facts = await ofJobType(ctx, p, allFacts);
+  let est = allEst;
+  if (p.jobTypeId) {
+    const typed = await jobsOfType(ctx, p.jobTypeId);
+    const owners = new Set(jobRows.filter((j) => typed.has(j.id) && j.customerId).map((j) => j.customerId as string));
+    est = allEst.filter((e) => owners.has(e.customerId));
+  }
   const sums = new Map<string, { est: Decimal; rev: Decimal; cost: Decimal }>();
   const get = (id: string) => sums.get(id) ?? { est: Money.zero(), rev: Money.zero(), cost: Money.zero() };
   for (const e of est) {
@@ -342,7 +363,12 @@ export async function jobEstimatesVsActuals(ctx: ServiceContext, p: ReportParams
       { key: 'cost', header: 'Act. Cost', type: 'money' },
     ],
     rows,
-    notes: ['Estimates record selling prices only, so estimated cost is not shown.'],
+    notes: [
+      'Estimates record selling prices only, so estimated cost is not shown.',
+      ...(p.jobTypeId
+        ? ['Job type filter: actual amounts are those of the jobs of this type; estimates are made out to the customer, so they count for each customer that has a job of this type.']
+        : []),
+    ],
   };
 }
 

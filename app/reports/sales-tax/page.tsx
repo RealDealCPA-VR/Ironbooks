@@ -11,6 +11,7 @@ import {
   salesTaxRevenueSummary,
 } from '@/lib/services/accountant/salesTaxLedger';
 import { getPreferences } from '@/lib/services/company';
+import { todayInTimeZone } from '@/lib/preferences';
 import ReportToolbar, { type ExportTable } from '../_components/ReportToolbar';
 
 export const dynamic = 'force-dynamic';
@@ -29,7 +30,8 @@ export default async function SalesTaxReportPage({
   const p = await searchParams;
   // p1 purchases: default to the company's sales tax basis and its last filing period (QB).
   const prefs = await getPreferences(ctx);
-  const period = lastFilingPeriod(prefs.salesTaxFrequency as SalesTaxFrequency);
+  // The last complete period before today on the company's calendar (not the UTC day).
+  const period = lastFilingPeriod(prefs.salesTaxFrequency as SalesTaxFrequency, todayInTimeZone(prefs.timezone));
   const fromStr = p.from && /^\d{4}-\d{2}-\d{2}$/.test(p.from) ? p.from : period.from;
   const toStr = p.to && /^\d{4}-\d{2}-\d{2}$/.test(p.to) ? p.to : period.to;
   const basis = p.basis === 'cash' || p.basis === 'accrual' ? p.basis : prefs.salesTaxBasis === 'cash' ? 'cash' : 'accrual';

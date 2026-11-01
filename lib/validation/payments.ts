@@ -67,6 +67,8 @@ export const receivePaymentSchema = z.object({
       message: 'method must be cash, check, credit_card, ach, bank_transfer, or other',
     }),
   }),
+  /** salesar (B7): Payment Method list entry ("Visa"); its type is stored as the method. */
+  paymentMethodId: zUuid.nullish(),
   reference: z.string().nullish(),
   /** May be 0 when the payment only applies credits/discounts (checked in the service). */
   amount: zMoneyNonNegative,

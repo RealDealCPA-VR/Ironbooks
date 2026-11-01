@@ -15,7 +15,8 @@
  *
  * No direct GL posting here — the GL is written exclusively by createInvoice.
  */
-import { and, asc, eq, inArray, isNull, ne } from 'drizzle-orm';
+import { and, asc, eq, gt, inArray, isNotNull, isNull, lte, ne, or } from 'drizzle-orm';
+import { alias, type AnyPgColumn } from 'drizzle-orm/pg-core';
 import { assertAccountantMayBillCosts } from './accountantCopy/guard';
 import { Money, toAmountString } from '@/lib/money';
 import {
@@ -25,7 +26,7 @@ import {
   customers,
   expenses,
   expenseLines,
-  items,
+  invoices,
   timeEntries,
 } from '@/lib/db/schema';
 import {
@@ -36,10 +37,14 @@ import {
   validation,
 } from './_base';
 import { createInvoice, type CreateInvoiceInput, type InvoiceLineInput } from './invoices';
+import { resolveTimeEntryRates, type TimeRateSource } from './lists/billingRates';
 import { getPreferences } from './company';
 import { homeAmounts } from './currencies';
 import { currencyRate, foreignCode } from './exchangeRates';
 import { effectiveHomeCurrency } from './multiCurrency';
+
+/** The `[payroll:<paycheckId>]` marker on time paid in payroll (timeTracking.ts) — never billed. */
+const PAYROLL_TAG_RE = /\s*\[payroll:[^\]\s]+\]/g;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -49,6 +54,10 @@ export interface UnbilledCost {
   /** bill_lines.id or expense_lines.id */
   id: string;
   source: 'bill' | 'expense';
+  /** The bill / check-expense the cost is on. */
+  docId?: string;
+  /** The customer the cost is billable to. */
+  customerId?: string;
   date: Date;
   /** Bill number or expense payee/reference — where the cost came from. */
   ref: string | null;
@@ -66,13 +75,22 @@ export interface UnbilledCost {
 export interface UnbilledTime {
   /** time_entries.id */
   id: string;
+  customerId?: string;
   date: Date;
   description: string | null;
   hours: string;
-  /** Resolved rate: entry.rate → service item salesPrice → 0. */
+  /**
+   * Resolved rate (B13, lists/billingRates.resolveTimeEntryRates): the entry's typed rate → the
+   * person's billing rate level → the service item's sales price → 0.
+   */
   rate: string;
+  /** Where `rate` came from (shown on the Time/Costs list, e.g. "Senior rate"). */
+  rateSource: TimeRateSource;
+  /** The billing rate level's name when `rateSource` is 'billing_rate_level'. */
+  rateLevelName: string | null;
   /** hours * rate, 2dp. */
   amount: string;
+  employeeId: string | null;
   serviceItemId: string | null;
   jobId: string | null;
 }
@@ -107,11 +125,35 @@ export async function listUnbilled(
     .from(customers)
     .where(and(eq(customers.companyId, ctx.companyId), eq(customers.id, customerId)));
   if (!cust) throw notFound('Customer');
+  return unbilledBillables(ctx, { customerId });
+}
+
+/**
+ * Unbilled billable costs + time for one customer or (no customerId) for every customer.
+ *
+ * `asOf` (the Income Tracker's as-of day) rebuilds the list for that day: sources dated after it
+ * are left out, and a source billed by an invoice dated after it (or by a voided invoice) was
+ * still unbilled then. Without `asOf` it is the live list: whatever no invoice bills now.
+ */
+export async function unbilledBillables(
+  ctx: ServiceContext,
+  opts: { customerId?: string; asOf?: Date } = {},
+): Promise<UnbilledBillables> {
+  const { customerId } = opts;
+  /** Last instant of the as-of day (anything dated that day counts). */
+  const cutoff = opts.asOf
+    ? new Date(Date.UTC(opts.asOf.getUTCFullYear(), opts.asOf.getUTCMonth(), opts.asOf.getUTCDate()) + 86_400_000 - 1)
+    : null;
+  const billedInv = alias(invoices, 'billed_inv');
+  /** "Not billed (yet)" for a billed-invoice column: live, or as of the cutoff. */
+  const unbilledBy = (col: AnyPgColumn) =>
+    cutoff ? or(isNull(col), gt(billedInv.date, cutoff), eq(billedInv.status, 'void'))! : isNull(col);
 
   // --- Reimbursable bill lines ---
   const billRows = await ctx.db
     .select({
       id: billLines.id,
+      customerId: billLines.customerId,
       description: billLines.description,
       amount: billLines.amount,
       jobId: billLines.jobId,
@@ -124,12 +166,14 @@ export async function listUnbilled(
     })
     .from(billLines)
     .innerJoin(bills, eq(billLines.billId, bills.id))
+    .leftJoin(billedInv, eq(billedInv.id, billLines.billedInvoiceId))
     .where(
       and(
         eq(bills.companyId, ctx.companyId),
         ne(bills.status, 'void'),
-        eq(billLines.customerId, customerId),
-        isNull(billLines.billedInvoiceId),
+        customerId ? eq(billLines.customerId, customerId) : isNotNull(billLines.customerId),
+        unbilledBy(billLines.billedInvoiceId),
+        cutoff ? lte(bills.date, cutoff) : undefined,
       ),
     )
     .orderBy(bills.date);
@@ -138,6 +182,7 @@ export async function listUnbilled(
   const expenseRows = await ctx.db
     .select({
       id: expenseLines.id,
+      customerId: expenseLines.customerId,
       description: expenseLines.description,
       amount: expenseLines.amount,
       jobId: expenseLines.jobId,
@@ -151,56 +196,52 @@ export async function listUnbilled(
     })
     .from(expenseLines)
     .innerJoin(expenses, eq(expenseLines.expenseId, expenses.id))
+    .leftJoin(billedInv, eq(billedInv.id, expenseLines.billedInvoiceId))
     .where(
       and(
         eq(expenses.companyId, ctx.companyId),
         isNull(expenses.voidedAt),
-        eq(expenseLines.customerId, customerId),
-        isNull(expenseLines.billedInvoiceId),
+        customerId ? eq(expenseLines.customerId, customerId) : isNotNull(expenseLines.customerId),
+        unbilledBy(expenseLines.billedInvoiceId),
+        cutoff ? lte(expenses.date, cutoff) : undefined,
       ),
     )
     .orderBy(expenses.date);
 
   // --- Unbilled billable time (same selection as timeTracking.billTimeToInvoice) ---
-  const timeRows = await ctx.db
-    .select()
-    .from(timeEntries)
-    .where(
-      and(
-        eq(timeEntries.companyId, ctx.companyId),
-        eq(timeEntries.customerId, customerId),
-        eq(timeEntries.billable, true),
-        isNull(timeEntries.invoicedInvoiceId),
-      ),
-    )
-    .orderBy(timeEntries.date);
+  const timeRows = (
+    await ctx.db
+      .select({ e: timeEntries })
+      .from(timeEntries)
+      .leftJoin(billedInv, eq(billedInv.id, timeEntries.invoicedInvoiceId))
+      .where(
+        and(
+          eq(timeEntries.companyId, ctx.companyId),
+          customerId ? eq(timeEntries.customerId, customerId) : isNotNull(timeEntries.customerId),
+          eq(timeEntries.billable, true),
+          unbilledBy(timeEntries.invoicedInvoiceId),
+          cutoff ? lte(timeEntries.date, cutoff) : undefined,
+        ),
+      )
+      .orderBy(timeEntries.date)
+  ).map((r) => r.e);
 
-  // Rate resolution: entry.rate → service item salesPrice → 0 (mirrors billTimeToInvoice).
-  const itemIds = [...new Set(timeRows.map((e) => e.serviceItemId).filter(Boolean) as string[])];
-  const itemPriceMap = new Map<string, string | null>();
-  if (itemIds.length > 0) {
-    const itemRows = await ctx.db
-      .select({ id: items.id, salesPrice: items.salesPrice })
-      .from(items)
-      .where(and(eq(items.companyId, ctx.companyId), inArray(items.id, itemIds)));
-    for (const r of itemRows) itemPriceMap.set(r.id, r.salesPrice);
-  }
-
+  // B13: entry rate → the person's billing rate level → service item price → 0.
+  const rates = await resolveTimeEntryRates(ctx, timeRows);
   const time: UnbilledTime[] = timeRows.map((e) => {
-    let rate = Money.zero();
-    if (e.rate != null && Money.gt(e.rate, 0)) {
-      rate = Money.of(e.rate);
-    } else if (e.serviceItemId) {
-      const itemPrice = itemPriceMap.get(e.serviceItemId);
-      if (itemPrice != null) rate = Money.of(itemPrice);
-    }
+    const r = rates.get(e.id)!;
     return {
       id: e.id,
+      customerId: e.customerId!,
       date: e.date,
-      description: e.description ?? null,
+      // The payroll link is internal bookkeeping — it never shows on the customer's invoice.
+      description: (e.description ?? '').replace(PAYROLL_TAG_RE, '').trim() || null,
       hours: e.hours,
-      rate: toAmountString(rate),
-      amount: toAmountString(Money.round2(Money.mul(e.hours, rate))),
+      rate: r.rate,
+      rateSource: r.source,
+      rateLevelName: r.levelName,
+      amount: toAmountString(Money.round2(Money.mul(e.hours, r.rate))),
+      employeeId: e.employeeId ?? null,
       serviceItemId: e.serviceItemId ?? null,
       jobId: e.jobId ?? null,
     };
@@ -245,6 +286,8 @@ export async function listUnbilled(
     ...billRows.map((r) => ({
       id: r.id,
       source: 'bill' as const,
+      docId: r.docId,
+      customerId: r.customerId!,
       date: r.date,
       ref: r.billNumber ?? null,
       description: r.description ?? null,
@@ -255,6 +298,8 @@ export async function listUnbilled(
     ...expenseRows.map((r) => ({
       id: r.id,
       source: 'expense' as const,
+      docId: r.docId,
+      customerId: r.customerId!,
       date: r.date,
       ref: r.payeeName ?? r.reference ?? null,
       description: r.description ?? null,

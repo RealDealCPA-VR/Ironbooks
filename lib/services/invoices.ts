@@ -32,7 +32,7 @@
 import { systemAccountIdByCode } from './accountRoles';
 import { assertAccountantDatesOpen, assertAccountantMayBillCosts } from './accountantCopy/guard';
 import { hasAccountantCost } from './accountantCopy/inventoryCost';
-import { and, eq, inArray, isNull, ne, or, sql } from 'drizzle-orm';
+import { and, eq, inArray, isNull, ne, notInArray, or, sql } from 'drizzle-orm';
 import { assertSalesTaxAllowed } from '@/lib/featureGate';
 import { creditLimitFixes } from '@/lib/errorFixes';
 import { assertStockAvailable } from './stockWarning';
@@ -79,6 +79,8 @@ import {
 } from './inventorySites';
 import { type AppliedPricing, resolveLinePricing } from './pricing';
 import { applyCustomerShipToDefault, applyCustomerTaxDefaults } from './customerDefaults';
+import { assertDocumentJob, assertLineJobs } from './jobCustomers';
+import { resolveCustomerMessage, storedLineTaxCode } from './salesFormLists';
 import { dueDateFromTermsList } from './lists/terms';
 import { allocateDocNumber, docRef, renumberDoc } from './docNumbers';
 import {
@@ -115,6 +117,11 @@ export interface InvoiceLineInput extends InventoryLineDetail {
   pricing?: { origin?: string | null } | null;
   /** Whether this line participates in tax calculation. Defaults true. */
   taxable?: boolean;
+  /**
+   * salesar (B9): the line's Sales Tax Code ("Tax", "Non", ...). The server decides `taxable`
+   * from it, else from the item's code (customerDefaults / salesFormLists.applyLineTaxCodes).
+   */
+  salesTaxCodeId?: string | null;
   /** Per-line tax rate override (UUID of a taxRates row). When set, this line is taxed at this
    *  rate instead of the invoice-level rate (supports mixed-jurisdiction invoices). */
   taxRateId?: string | null;
@@ -209,6 +216,8 @@ export interface CreateInvoiceInput {
   poNumber?: string | null;
   toBePrinted?: boolean;
   toBeEmailed?: boolean;
+  /** salesar (B8): Customer Message list entry printed at the foot of the invoice. Edit: omitted = kept. */
+  customerMessageId?: string | null;
   /**
    * The user saw the "over credit limit" warning and chose to save anyway. Without it, an
    * invoice that pushes the customer over their credit limit is refused with a
@@ -785,6 +794,10 @@ async function prepareInvoice(
       .where(and(eq(jobs.companyId, ctx.companyId), inArray(jobs.id, jobIds)));
     const found = new Set(rows.map((r) => r.id));
     for (const id of jobIds) if (!found.has(id)) throw notFound(`Job ${id}`);
+    // The invoice's job and each line's job must be jobs of the invoice's customer (job costing
+    // would otherwise put this income on another customer's job).
+    await assertDocumentJob(ctx, input.customerId, headerJobId);
+    await assertLineJobs(ctx, input.lines.map((l) => ({ customerId: input.customerId, jobId: l.jobId ?? null })));
   }
 
   // Estimate links (progress invoicing): each must be a line of an estimate of this company
@@ -817,6 +830,12 @@ async function prepareInvoice(
         throw new ServiceError(
           'CONFLICT',
           `Line ${i + 1} bills estimate ${el.estimateRef || el.estimateNumber}, which the customer rejected. Mark the estimate accepted before invoicing it.`,
+        );
+      }
+      if (el.estimateStatus === 'void') {
+        throw new ServiceError(
+          'CONFLICT',
+          `Line ${i + 1} bills estimate ${el.estimateRef || el.estimateNumber}, which is void. A void estimate can't be invoiced.`,
         );
       }
       if ((el.itemId ?? null) !== (l.itemId ?? null)) {
@@ -983,7 +1002,9 @@ async function prepareInvoice(
       lineOrder: i,
       kind,
       pricing: kind === 'income' ? pricedLines[i].pricing : null,
-      estimateLineId: kind === 'income' || kind === 'discount' ? (l.estimateLineId ?? null) : null,
+      // A sales-tax item line of an estimate is billed by the progress invoice's own sales-tax line:
+      // its link counts it as billed, so the estimate can close once everything is billed.
+      estimateLineId: kind === 'income' || kind === 'discount' || kind === 'sales_tax' ? (l.estimateLineId ?? null) : null,
       billableSource: kind === 'income' ? billableSourceOf(l.billableSource) : null,
     });
   }
@@ -1625,6 +1646,7 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
         memo: input.memo ?? null,
         customFields: input.customFields ?? null,
         ...shippingColumns(input),
+        customerMessageId: await resolveCustomerMessage(tx, input.customerMessageId),
         isStatementCharge: input.isStatementCharge === true,
         // postedEntryId filled below after posting (stays null for drafts)
       })
@@ -1645,6 +1667,7 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
         rate: cl.rate,
         amount: cl.amount,
         taxable: cl.taxable,
+        salesTaxCodeId: storedLineTaxCode(input.lines?.[cl.lineOrder], cl.taxable),
         taxRateId: cl.taxRateId,
         classId: cl.classId,
         jobId: cl.jobId,
@@ -1925,7 +1948,7 @@ function keepEstimateLinks(
     for (let i = 0; i < lines.length; i++) {
       const cl = lines[i];
       if (cl.estimateLineId || inputLines[cl.lineOrder]?.estimateLineId !== undefined) continue;
-      if (cl.kind !== 'income' && cl.kind !== 'discount') continue;
+      if (cl.kind !== 'income' && cl.kind !== 'discount' && cl.kind !== 'sales_tax') continue;
       const at = pool.findIndex((o) => match(o, cl));
       if (at < 0) continue;
       cl.estimateLineId = pool[at].estimateLineId;
@@ -1935,7 +1958,7 @@ function keepEstimateLinks(
 }
 
 /** A well-formed billable link, or null. */
-function billableSourceOf(v: unknown): BillableSource | null {
+export function billableSourceOf(v: unknown): BillableSource | null {
   if (!v || typeof v !== 'object') return null;
   const { kind, id } = v as { kind?: unknown; id?: unknown };
   if ((kind !== 'bill_line' && kind !== 'expense_line' && kind !== 'time_entry') || typeof id !== 'string' || !id) {
@@ -1957,8 +1980,12 @@ const sameSource = (a: BillableSource | null, b: BillableSource | null) => !!a &
  *  - a line that states nothing (or an ignored link) takes the old linked line with the same item,
  *    description and rate, then the same item and description, then the same item, account and
  *    rate.
- * Moving the invoice to another customer drops every link (those costs are owed by the old
- * customer). releaseDroppedBillables then unbills what no new line bills.
+ * Moving the invoice to another customer drops the old links (those costs are owed by the old
+ * customer); a link a line states is billed when that cost / time is unbilled and owed by the NEW
+ * customer — Undo of an edit that moved the invoice away sends the old customer and the old lines
+ * with their links, so the cost it gave back is billed on the invoice again (it used to come back
+ * on the invoice while listed unbilled, and could be billed twice). releaseDroppedBillables then
+ * unbills what no new line bills.
  */
 async function keepBillableLinks(
   tx: ServiceContext,
@@ -1976,7 +2003,10 @@ async function keepBillableLinks(
   customerChanged: boolean,
 ) {
   if (customerChanged) {
-    for (const cl of lines) cl.billableSource = null;
+    for (const cl of lines) {
+      const stated = inputLines[cl.lineOrder]?.billableSource !== undefined ? cl.billableSource : null;
+      cl.billableSource = stated && (await claimBillable(tx, invoiceId, customerId, stated)) ? stated : null;
+    }
     return;
   }
   const pool = oldLines
@@ -2097,8 +2127,9 @@ async function claimBillable(tx: ServiceContext, invoiceId: string, customerId: 
 /**
  * After an edit replaced an invoice's lines: the billable costs / time its OLD lines billed that
  * no new line bills any more become unbilled again (only rows still stamped with this invoice).
- * A new customer releases everything stamped with the invoice, as a void does. Returns what was
- * released (for the audit trail).
+ * A new customer releases everything stamped with the invoice, as a void does — except what the
+ * new lines bill for the new customer (keepBillableLinks claimed it). Returns what was released
+ * (for the audit trail).
  */
 async function releaseDroppedBillables(
   tx: ServiceContext,
@@ -2109,20 +2140,31 @@ async function releaseDroppedBillables(
 ): Promise<BillableSource[]> {
   const released: BillableSource[] = [];
   if (customerChanged) {
+    const keep = (kind: BillableSource['kind']) =>
+      newLines.map((l) => l.billableSource).filter((s): s is BillableSource => !!s && s.kind === kind).map((s) => s.id);
+    const keptTime = keep('time_entry');
+    const keptBill = keep('bill_line');
+    const keptExpense = keep('expense_line');
     const t = await tx.db
       .update(timeEntries)
       .set({ invoicedInvoiceId: null })
-      .where(and(eq(timeEntries.companyId, tx.companyId), eq(timeEntries.invoicedInvoiceId, invoiceId)))
+      .where(
+        and(
+          eq(timeEntries.companyId, tx.companyId),
+          eq(timeEntries.invoicedInvoiceId, invoiceId),
+          keptTime.length ? notInArray(timeEntries.id, keptTime) : undefined,
+        ),
+      )
       .returning({ id: timeEntries.id });
     const b = await tx.db
       .update(billLines)
       .set({ billedInvoiceId: null })
-      .where(eq(billLines.billedInvoiceId, invoiceId))
+      .where(and(eq(billLines.billedInvoiceId, invoiceId), keptBill.length ? notInArray(billLines.id, keptBill) : undefined))
       .returning({ id: billLines.id });
     const e = await tx.db
       .update(expenseLines)
       .set({ billedInvoiceId: null })
-      .where(eq(expenseLines.billedInvoiceId, invoiceId))
+      .where(and(eq(expenseLines.billedInvoiceId, invoiceId), keptExpense.length ? notInArray(expenseLines.id, keptExpense) : undefined))
       .returning({ id: expenseLines.id });
     released.push(
       ...b.map((r) => ({ kind: 'bill_line' as const, id: r.id })),
@@ -2214,6 +2256,19 @@ function keepExactProgressAmounts(
     const [o] = pool.splice(at, 1);
     return { ...l, amount: o.amount };
   });
+}
+
+/** Sales-order quantities invoiced by this invoice follow an edit of it (salesOrders.syncSoInvoicingForInvoiceEdit). */
+async function syncSalesOrderClaims(
+  tx: ServiceContext,
+  invoiceId: string,
+  customerChanged: boolean,
+  oldLines: Array<{ lineOrder: number; itemId: string | null; quantity: string }>,
+  newLines: ComputedLine[],
+) {
+  // Lazy import: salesOrders.ts imports this module (createInvoice).
+  const { syncSoInvoicingForInvoiceEdit } = await import('./salesOrders');
+  await syncSoInvoicingForInvoiceEdit(tx, { invoiceId, customerChanged, oldLines, newLines });
 }
 
 export async function updateInvoice(ctx: ServiceContext, id: string, input: CreateInvoiceInput) {
@@ -2310,6 +2365,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
       await keepBillableLinks(
         tx, id, input.customerId, prep.computedLines, input.lines, oldDraftLines, input.customerId !== invoice.customerId,
       );
+      await syncSalesOrderClaims(tx, id, input.customerId !== invoice.customerId, oldDraftLines, prep.computedLines);
       await tx.db.delete(invoiceLines).where(eq(invoiceLines.invoiceId, id));
       await tx.db.insert(invoiceLines).values(
         prep.computedLines.map((cl) => ({
@@ -2321,6 +2377,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
           rate: cl.rate,
           amount: cl.amount,
           taxable: cl.taxable,
+          salesTaxCodeId: storedLineTaxCode(input.lines?.[cl.lineOrder], cl.taxable),
           taxRateId: cl.taxRateId,
           classId: cl.classId,
           jobId: cl.jobId,
@@ -2369,6 +2426,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
           customFields:
             input.customFields !== undefined ? input.customFields : invoice.customFields,
           ...shippingColumns(input, invoice),
+          customerMessageId: await resolveCustomerMessage(tx, input.customerMessageId, invoice.customerMessageId),
           updatedAt: new Date(),
         })
         .where(eq(invoices.id, id))
@@ -2439,6 +2497,8 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
     await keepBillableLinks(
       tx, id, input.customerId, prep.computedLines, input.lines, oldLines, input.customerId !== invoice.customerId,
     );
+    // An invoice made from a sales order: the order's invoiced quantities follow the edited lines.
+    await syncSalesOrderClaims(tx, id, input.customerId !== invoice.customerId, oldLines, prep.computedLines);
     // The edited lines replace this invoice's old ones, so invoiced-to-date leaves it out.
     await checkEstimateOverBilling(tx, prep.computedLines, {
       excludeInvoiceId: id,
@@ -2473,6 +2533,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
         rate: cl.rate,
         amount: cl.amount,
         taxable: cl.taxable,
+        salesTaxCodeId: storedLineTaxCode(input.lines?.[cl.lineOrder], cl.taxable),
         taxRateId: cl.taxRateId,
         classId: cl.classId,
         jobId: cl.jobId,
@@ -2528,6 +2589,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
         customFields:
           input.customFields !== undefined ? input.customFields : invoice.customFields,
         ...shippingColumns(input, invoice),
+        customerMessageId: await resolveCustomerMessage(tx, input.customerMessageId, invoice.customerMessageId),
         postedEntryId: entry.id,
         updatedAt: new Date(),
       })
@@ -2647,6 +2709,7 @@ export async function getInvoice(ctx: ServiceContext, id: string) {
       rate: invoiceLines.rate,
       amount: invoiceLines.amount,
       taxable: invoiceLines.taxable,
+      salesTaxCodeId: invoiceLines.salesTaxCodeId,
       classId: invoiceLines.classId,
       jobId: invoiceLines.jobId,
       taxRateId: invoiceLines.taxRateId,

@@ -61,6 +61,7 @@ import {
 } from './inventorySites';
 import { type AppliedPricing, resolveLinePricing } from './pricing';
 import { applyCustomerShipToDefault, applyCustomerTaxDefaults } from './customerDefaults';
+import { resolveCustomerMessage, resolvePaymentMethod, storedLineTaxCode } from './salesFormLists';
 import { allocateDocNumber, docRef, renumberDoc } from './docNumbers';
 import { shippingColumns } from './invoices';
 import { assertHomeCurrencyAccounts } from './currencies';
@@ -98,6 +99,8 @@ export interface SalesReceiptLineInput extends InventoryLineDetail {
   rate?: string | number | null;
   /** Whether this line participates in tax calculation. Defaults true. */
   taxable?: boolean;
+  /** salesar (B9): the line's Sales Tax Code; `taxable` follows it (salesFormLists.applyLineTaxCodes). */
+  salesTaxCodeId?: string | null;
   /** Per-line tax rate override (UUID of a taxRates row). */
   taxRateId?: string | null;
 }
@@ -118,8 +121,10 @@ export interface CreateSalesReceiptInput {
   taxRateId?: string | null;
   /** Where the money lands. Defaults to 1050 Undeposited Funds. */
   depositAccountId?: string | null;
-  /** Payment method. Defaults to 'cash'. */
+  /** Payment method type. Defaults to 'cash' (the Payment Method entry's type when one is picked). */
   method?: SalesReceiptMethod | null;
+  /** salesar (B7): Payment Method list entry ("Visa", "E-Check"); its type becomes `method`. */
+  paymentMethodId?: string | null;
   /** Free-form reference (check #, card auth, etc.). */
   reference?: string | null;
   memo?: string | null;
@@ -133,6 +138,8 @@ export interface CreateSalesReceiptInput {
   poNumber?: string | null;
   toBePrinted?: boolean;
   toBeEmailed?: boolean;
+  /** salesar (B8): Customer Message list entry printed at the foot of the receipt. Edit: omitted = kept. */
+  customerMessageId?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -396,6 +403,8 @@ async function postSalesReceiptDocument(
   receipt: { id: string; receiptNumber: number; refNumber?: string | null },
   input: CreateSalesReceiptInput,
   prep: PreparedSalesReceipt,
+  /** Edit: a line that sends no site / bin / serial / lot keeps the one it was saved with. */
+  opts: { carryForward?: boolean } = {},
 ) {
   const { depositAccountId, taxPayableId, itemMap, computedLines, grossIncome, taxAmount, total } = prep;
   // The number shown on the GL: the typed ref number, else the legacy integer.
@@ -413,6 +422,7 @@ async function postSalesReceiptDocument(
         rate: cl.rate,
         amount: cl.amount,
         taxable: cl.taxable,
+        salesTaxCodeId: storedLineTaxCode(input.lines?.[cl.lineOrder], cl.taxable),
         classId: input.classId ?? null,
         taxRateId: cl.taxRateId,
         lineOrder: cl.lineOrder,
@@ -552,6 +562,9 @@ async function postSalesReceiptDocument(
       };
     }),
     memo: `Sales Receipt #${shownNumber}`,
+    // An edit from a client that does not send the line detail must not move the stock to the
+    // default site (invoices carry it forward the same way).
+    carryForward: opts.carryForward === true,
   });
 
   return { insertedLines, entry, cogsEntries };
@@ -562,6 +575,9 @@ export async function createSalesReceipt(ctx: ServiceContext, input: CreateSales
   input = await applyCustomerTaxDefaults(ctx, input, { defaultRate: true });
   input = await applyCustomerShipToDefault(ctx, input);
   if (input.classId) await assertRefInCompany(ctx, classes, input.classId, 'Class');
+  // B7: a Payment Method list entry decides the method type stored with it.
+  const pm = await resolvePaymentMethod(ctx, { paymentMethodId: input.paymentMethodId, method: input.method ?? 'cash' });
+  input = { ...input, method: pm.method };
   const prep = await prepareSalesReceipt(ctx, input);
   const { method, depositAccountId, subtotal, taxAmount, total } = prep;
 
@@ -582,6 +598,7 @@ export async function createSalesReceipt(ctx: ServiceContext, input: CreateSales
         // Persisted for the sales-tax liability engine (lib/services/accountant/salesTaxLedger.ts).
         taxRateId: input.taxRateId ?? null,
         method,
+        paymentMethodId: pm.paymentMethodId,
         reference: input.reference ?? null,
         status: 'paid',
         classId: input.classId ?? null,
@@ -591,6 +608,7 @@ export async function createSalesReceipt(ctx: ServiceContext, input: CreateSales
         depositAccountId,
         memo: input.memo ?? null,
         ...shippingColumns(input),
+        customerMessageId: await resolveCustomerMessage(tx, input.customerMessageId),
         // postedEntryId filled below after posting
       })
       .returning();
@@ -910,6 +928,14 @@ export async function updateSalesReceipt(ctx: ServiceContext, id: string, input:
     .from(salesReceiptLines)
     .where(eq(salesReceiptLines.salesReceiptId, id));
   await assertSalesTaxAllowed(ctx, input, [existing.taxRateId, ...keptTaxLines.map((l) => l.taxRateId)]);
+  // B7: the Payment Method entry (an edit that does not send it keeps the saved one while the
+  // method type stays the same).
+  const pm = await resolvePaymentMethod(
+    ctx,
+    { paymentMethodId: input.paymentMethodId, method: input.method ?? 'cash' },
+    { paymentMethodId: existing.paymentMethodId ?? null, method: existing.method },
+  );
+  input = { ...input, method: pm.method, paymentMethodId: pm.paymentMethodId };
 
   const prep = await prepareSalesReceipt(ctx, input);
   await assertDepositedReceiptEdit(ctx, id, existing, prep, input);
@@ -1003,6 +1029,7 @@ async function updateSalesReceiptInTx(
       },
       input,
       prep,
+      { carryForward: true },
     );
 
     const [updated] = await tx.db
@@ -1011,6 +1038,7 @@ async function updateSalesReceiptInTx(
         customerId: input.customerId ?? null,
         date: input.date,
         method: prep.method,
+        paymentMethodId: input.paymentMethodId ?? null,
         reference: input.reference ?? null,
         classId: input.classId ?? null,
         subtotal: toAmountString(prep.subtotal),
@@ -1021,6 +1049,7 @@ async function updateSalesReceiptInTx(
         taxRateId: input.taxRateId ?? null,
         ...(renum ? { refNumber: renum.refNumber, receiptNumber: renum.number } : {}),
         ...shippingColumns(input, receipt),
+        customerMessageId: await resolveCustomerMessage(tx, input.customerMessageId, receipt.customerMessageId),
         postedEntryId: entry.id,
       })
       .where(eq(salesReceipts.id, id))

@@ -3,7 +3,8 @@
  *
  * Income Tracker (QB "Income Tracker"): one screen with four money bars —
  *   Unbilled  — open estimates (not yet fully invoiced), open sales orders (uninvoiced
- *               quantity), and billable time not yet on an invoice;
+ *               quantity), and billable time & costs not yet on an invoice (time priced with
+ *               billing rate levels, costs from bills / checks — the invoice's Time/Costs list);
  *   Unpaid    — open invoices/statement charges not yet past due;
  *   Overdue   — open invoices/statement charges past their due date;
  *   Paid      — payments and sales receipts received in the last 30 days;
@@ -17,7 +18,6 @@
  * posting, permissions and the audit trail behave exactly as when done one at a time).
  */
 import { and, asc, desc, eq, gt, gte, inArray, isNull, lt, lte, ne, or, sql } from 'drizzle-orm';
-import { alias } from 'drizzle-orm/pg-core';
 import {
   auditLogs,
   collectionNotes,
@@ -30,10 +30,12 @@ import {
   salesOrderLines,
   salesOrders,
   salesReceipts,
-  timeEntries,
 } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
+import { type BillableSelection, createInvoiceWithBillables, unbilledBillables } from './billables';
+import type { TimeRateSource } from './lists/billingRates';
+import { customerTerms, termsLabel } from './lists/terms';
 import { convertToInvoice as convertEstimate } from './estimates';
 import { convertToInvoice as convertSalesOrder } from './salesOrders';
 import { type SalesFormKind, sendQueuedEmails, setSendFlags } from './salesForms';
@@ -54,7 +56,7 @@ export type TrackerBucket = 'unbilled' | 'unpaid' | 'overdue' | 'paid';
 
 export interface TrackerRow {
   bucket: TrackerBucket;
-  /** estimate | sales_order | time | invoice | statement_charge | payment | sales_receipt */
+  /** estimate | sales_order | time | cost | invoice | statement_charge | payment | sales_receipt */
   type: string;
   id: string;
   customerId: string | null;
@@ -69,6 +71,14 @@ export interface TrackerRow {
   status: string;
   /** Days past due (overdue rows only). */
   daysOverdue: number | null;
+  /** Unbilled time / cost rows: what it is ("Design · 2.00 h × 95.00 (Senior rate)"). */
+  detail?: string | null;
+  /** Time rows: where the hourly rate came from (B13) and the billing rate level's name. */
+  rateSource?: TimeRateSource;
+  rateLevelName?: string | null;
+  /** Cost rows: the bill or check (expense) the cost is on. */
+  source?: 'bill' | 'expense';
+  docId?: string | null;
 }
 
 export interface IncomeTracker {
@@ -114,15 +124,15 @@ export async function incomeTracker(
     .select({ id: estimates.id, customerId: estimates.customerId, num: estimates.estimateNumber, ref: estimates.refNumber, date: estimates.date, exp: estimates.expirationDate, total: estimates.total, invoiced: estimates.amountInvoiced, status: estimates.status, convertedInvoiceId: estimates.convertedInvoiceId })
     .from(estimates)
     .where(and(...estConds));
-  // Amounts billed from each estimate by invoices dated AFTER the day (not yet billed on it).
+  // Amounts billed from each estimate by invoices dated AFTER the day (not yet billed on it), in
+  // the same terms as estimates.amountInvoiced: the posted invoices' totals, sales tax included
+  // (estimateBilling.refreshEstimateBilling). Summing their pre-tax line amounts instead left the
+  // tax of a later bill counted as billed on the day.
   const estBilledLater = new Map<string, ReturnType<typeof Money.zero>>();
   const convertedLater = new Set<string>();
   if (ests.length > 0) {
-    for (const r of await ctx.db
-      .select({
-        estimateId: estimateLines.estimateId,
-        amount: sql<string>`COALESCE(SUM(CAST(${invoiceLines.amount} AS NUMERIC)), 0)`,
-      })
+    const laterBills = await ctx.db
+      .selectDistinct({ estimateId: estimateLines.estimateId, invoiceId: invoices.id, total: invoices.total })
       .from(invoiceLines)
       .innerJoin(estimateLines, eq(estimateLines.id, invoiceLines.estimateLineId))
       .innerJoin(invoices, eq(invoices.id, invoiceLines.invoiceId))
@@ -130,12 +140,13 @@ export async function incomeTracker(
         and(
           eq(invoices.companyId, ctx.companyId),
           nonVoidInvoice,
+          ne(invoices.status, 'draft'),
           gt(invoices.date, cutoff),
           inArray(estimateLines.estimateId, ests.map((e) => e.id)),
         ),
-      )
-      .groupBy(estimateLines.estimateId)) {
-      estBilledLater.set(r.estimateId, Money.of(r.amount));
+      );
+    for (const r of laterBills) {
+      estBilledLater.set(r.estimateId, (estBilledLater.get(r.estimateId) ?? Money.zero()).plus(Money.of(r.total)));
     }
     const convIds = ests.map((e) => e.convertedInvoiceId).filter((x): x is string => !!x);
     if (convIds.length > 0) {
@@ -209,26 +220,39 @@ export async function incomeTracker(
     }
   }
 
-  // --- Unbilled: billable time not yet invoiced on the day ---
-  const billedInv = alias(invoices, 'billed_inv');
-  const teConds = [
-    eq(timeEntries.companyId, ctx.companyId),
-    eq(timeEntries.billable, true),
-    sql`${timeEntries.customerId} IS NOT NULL`,
-    lte(timeEntries.date, cutoff),
-    or(isNull(timeEntries.invoicedInvoiceId), gt(billedInv.date, cutoff), eq(billedInv.status, 'void'))!,
-  ];
-  if (custFilter) teConds.push(eq(timeEntries.customerId, custFilter));
-  for (const t of await ctx.db
-    .select({ id: timeEntries.id, customerId: timeEntries.customerId, date: timeEntries.date, hours: timeEntries.hours, rate: timeEntries.rate, description: timeEntries.description })
-    .from(timeEntries)
-    .leftJoin(billedInv, eq(billedInv.id, timeEntries.invoicedInvoiceId))
-    .where(and(...teConds))) {
-    const amount = Money.round2(Money.mul(t.hours, t.rate ?? 0));
+  // --- Unbilled: billable time & costs not yet invoiced on the day (C9) ---
+  // The invoice form's Time/Costs list as of the day (billables.unbilledBillables): time valued the
+  // way billing will price it (typed rate > billing rate level > item price, B13), costs from
+  // bills / checks at their home-currency cost (before any markup).
+  const billables = await unbilledBillables(ctx, { customerId: custFilter, asOf: today });
+  for (const t of billables.time) {
+    const hours = Money.of(t.hours).toFixed(2);
+    const rateNote =
+      t.rateSource === 'billing_rate_level' && t.rateLevelName
+        ? ` (${t.rateLevelName} rate)`
+        : t.rateSource === 'none'
+          ? ' (no rate yet)'
+          : '';
     rows.push({
-      bucket: 'unbilled', type: 'time', id: t.id, customerId: t.customerId, customerName: '',
-      number: null, date: iso(t.date)!, dueDate: null, amount: toAmountString(amount),
-      openBalance: toAmountString(amount), status: `${Money.of(t.hours).toFixed(2)} h`, daysOverdue: null,
+      bucket: 'unbilled', type: 'time', id: t.id, customerId: t.customerId ?? null, customerName: '',
+      number: null, date: iso(t.date)!, dueDate: null, amount: t.amount,
+      openBalance: t.amount, status: `${hours} h`, daysOverdue: null,
+      detail: `${t.description ? `${t.description} · ` : ''}${hours} h × ${t.rate}${rateNote}`,
+      rateSource: t.rateSource,
+      rateLevelName: t.rateLevelName,
+    });
+  }
+  for (const c of billables.costs) {
+    const what = c.description ?? (c.source === 'bill' ? 'Billable cost from a bill' : 'Billable expense from a check');
+    rows.push({
+      bucket: 'unbilled', type: 'cost', id: c.id, customerId: c.customerId ?? null, customerName: '',
+      // A bill's number; a check / expense shows its payee in the detail instead.
+      number: c.source === 'bill' ? c.ref : null, date: iso(c.date)!, dueDate: null,
+      amount: toAmountString(c.amount), openBalance: toAmountString(c.amount),
+      status: c.source === 'bill' ? 'bill' : 'check', daysOverdue: null,
+      detail: c.source === 'expense' && c.ref ? `${c.ref} · ${what}` : what,
+      source: c.source,
+      docId: c.docId ?? null,
     });
   }
 
@@ -404,6 +428,58 @@ const FORM_OF: Record<string, SalesFormKind | undefined> = {
   sales_receipt: 'sales_receipt',
 };
 
+/** Unbilled time / cost rows (billed through billables.createInvoiceWithBillables). */
+const BILLABLE_TYPES = new Set(['time', 'cost']);
+
+/**
+ * "Turn into invoices" on unbilled time & cost rows: one invoice per customer, dated today on the
+ * company's calendar, carrying the picked rows (time at its billing rate, costs at cost plus the
+ * default markup) — the same invoice the invoice form's Time/Costs list makes. Due date follows the
+ * customer's terms. A customer that cannot be invoiced (credit limit, closed period...) is reported
+ * for its rows; the others still bill.
+ */
+async function invoiceBillables(
+  ctx: ServiceContext,
+  rows: Array<{ type: string; id: string }>,
+  result: TrackerActionResult,
+  opts?: { overrideCreditLimit?: boolean },
+) {
+  const live = await unbilledBillables(ctx);
+  const timeBy = new Map(live.time.map((t) => [t.id, t]));
+  const costBy = new Map(live.costs.map((c) => [c.id, c]));
+  const byCustomer = new Map<string, { rows: Array<{ type: string; id: string }>; sel: Required<Pick<BillableSelection, 'billLineIds' | 'expenseLineIds' | 'timeEntryIds'>> }>();
+  for (const r of rows) {
+    const t = r.type === 'time' ? timeBy.get(r.id) : undefined;
+    const c = r.type === 'cost' ? costBy.get(r.id) : undefined;
+    const customerId = t?.customerId ?? c?.customerId;
+    if (!customerId) {
+      result.failed.push({ ...r, error: 'Already billed (or no longer billable).' });
+      continue;
+    }
+    const g = byCustomer.get(customerId) ?? { rows: [], sel: { billLineIds: [], expenseLineIds: [], timeEntryIds: [] } };
+    g.rows.push(r);
+    if (t) g.sel.timeEntryIds.push(t.id);
+    else if (c?.source === 'bill') g.sel.billLineIds.push(c.id);
+    else if (c) g.sel.expenseLineIds.push(c.id);
+    byCustomer.set(customerId, g);
+  }
+  const date = byCustomer.size ? await companyToday(ctx) : null;
+  for (const [customerId, g] of byCustomer) {
+    try {
+      const terms = await customerTerms(ctx, customerId);
+      const inv = await createInvoiceWithBillables(
+        ctx,
+        { customerId, date: date!, terms: terms ? termsLabel(terms) : null, lines: [], overrideCreditLimit: opts?.overrideCreditLimit },
+        g.sel,
+      );
+      for (const r of g.rows) result.done.push({ ...r, detail: `Invoice #${docRef(inv.refNumber, inv.invoiceNumber)}` });
+    } catch (err) {
+      if (!(err instanceof ServiceError) || err.code === 'FORBIDDEN') throw err;
+      for (const r of g.rows) result.failed.push({ ...r, error: err.message });
+    }
+  }
+}
+
 /**
  * Run a batch action on Income Tracker rows. Each row is handled on its own (one failure is
  * reported, the rest still run). 'convert' turns estimates / sales orders into invoices.
@@ -416,6 +492,12 @@ export async function runTrackerAction(
 ): Promise<TrackerActionResult> {
   if (items.length === 0) throw validation('Select at least one row.');
   const result: TrackerActionResult = { done: [], failed: [] };
+  if (action === 'convert' && items.some((i) => BILLABLE_TYPES.has(i.type))) {
+    // Unbilled time & costs: one invoice per customer with the picked rows (C9).
+    await invoiceBillables(ctx, items.filter((i) => BILLABLE_TYPES.has(i.type)), result, opts);
+    items = items.filter((i) => !BILLABLE_TYPES.has(i.type));
+    if (items.length === 0) return result;
+  }
   if (action === 'email') {
     const forms = items.filter((i) => FORM_OF[i.type]).map((i) => ({ kind: FORM_OF[i.type]!, id: i.id }));
     for (const i of items) if (!FORM_OF[i.type]) result.failed.push({ ...i, error: 'This kind of row cannot be emailed.' });
@@ -439,7 +521,7 @@ export async function runTrackerAction(
           const inv = await convertSalesOrder(ctx, it.id, { overrideCreditLimit: opts?.overrideCreditLimit });
           result.done.push({ ...it, detail: `Invoice #${docRef(inv.refNumber, inv.invoiceNumber)}` });
         } else {
-          throw validation('Only estimates and sales orders can be turned into invoices.');
+          throw validation('Only estimates, sales orders and unbilled time & costs can be turned into invoices.');
         }
       } else {
         throw validation(`Unknown action "${String(action)}".`);
@@ -476,6 +558,8 @@ export interface CollectionsCustomer {
   totalDue: string;
   invoices: CollectionsInvoice[];
   lastNote: { note: string; createdAt: string; followUpDate: string | null } | null;
+  /** C9: the latest recorded contact (call, email, letter...) — "last contacted". */
+  lastContact: { at: string; method: string; note: string } | null;
   nextFollowUp: string | null;
 }
 
@@ -541,6 +625,7 @@ export async function collectionsCenter(
         const c = custBy.get(cid);
         const mine = notes.filter((n) => n.customerId === cid);
         const open = mine.filter((n) => !n.done && n.followUpDate).map((n) => n.followUpDate!.getTime());
+        const contact = mine.find((n) => n.contactMethod);
         return {
           customerId: cid,
           customerName: c?.name ?? 'Customer',
@@ -550,6 +635,9 @@ export async function collectionsCenter(
           invoices: list,
           lastNote: mine[0]
             ? { note: mine[0].note, createdAt: mine[0].createdAt.toISOString(), followUpDate: iso(mine[0].followUpDate) }
+            : null,
+          lastContact: contact
+            ? { at: contact.createdAt.toISOString(), method: contact.contactMethod!, note: contact.note }
             : null,
           nextFollowUp: open.length ? iso(new Date(Math.min(...open))) : null,
         };

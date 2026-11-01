@@ -24,6 +24,8 @@ import { resolvePartyTerms, resolveSalesTaxCode } from './lists/fields';
 import { getPreferences } from './preferences';
 import { defaultShipTo, normalizeShipToAddresses, shipToAddressFields, type ShipToAddress } from '@/lib/shipTo';
 import { assertAccountantListEdit, assertListDeleteAllowed } from './accountantCopy/guard';
+import { assertTypeAssignable } from './typeLists';
+import { type OpeningBalanceInput, type OpeningBalanceResult, postCustomerOpeningBalance } from './openingBalances';
 
 /** Validate the named ship-to list; the default one also becomes `shippingAddress`. */
 function resolveShipTos(list: Array<Partial<ShipToAddress>> | null | undefined): ShipToAddress[] | null {
@@ -92,9 +94,14 @@ export interface CreateCustomerInput {
    * Also settable from Advanced Pricing (PATCH /api/pricing/customers/:id).
    */
   priceLevelId?: string | null;
+  /** B4: Customer Type list entry (a report filter and a price-rule condition). */
+  customerTypeId?: string | null;
 }
 
 export type UpdateCustomerInput = Partial<CreateCustomerInput>;
+
+/** New Customer: the record plus QB's "Opening Balance ... as of" (lib/services/openingBalances.ts). */
+export type NewCustomerInput = CreateCustomerInput & OpeningBalanceInput;
 
 export interface CustomerBalanceSummaryRow {
   customerId: string;
@@ -164,11 +171,22 @@ export async function getCustomer(ctx: ServiceContext, id: string) {
 // Mutations
 // ---------------------------------------------------------------------------
 
-/** Create a new customer record (no GL impact — only master data). */
-export async function createCustomer(ctx: ServiceContext, input: CreateCustomerInput) {
+/**
+ * Create a new customer record (master data). With an opening balance (QB New Customer "Opening
+ * Balance ... as of"), the invoice recording it is posted in the SAME transaction: when the
+ * posting is refused (closing date, ...) the customer is not created either.
+ */
+export async function createCustomer(
+  ctx: ServiceContext,
+  input: NewCustomerInput,
+): Promise<Awaited<ReturnType<typeof createCustomerInTx>> & { openingBalanceDoc?: OpeningBalanceResult }> {
   // The unique-name check runs in the same transaction as the insert (two creates at once must
   // not both add the same name).
-  return inTransaction(ctx, (tx) => createCustomerInTx(tx, input));
+  return inTransaction(ctx, async (tx) => {
+    const row = await createCustomerInTx(tx, input);
+    const ob = await postCustomerOpeningBalance(tx, row.id, input);
+    return ob ? { ...row, openingBalanceDoc: ob } : row;
+  });
 }
 
 async function createCustomerInTx(ctx: ServiceContext, input: CreateCustomerInput) {
@@ -207,6 +225,7 @@ async function createCustomerInTx(ctx: ServiceContext, input: CreateCustomerInpu
     requirePriceLevelChangeAccess(ctx, input.priceLevelId, null);
     await assertRefInCompany(ctx, priceLevels, input.priceLevelId, 'Price level');
   }
+  await assertTypeAssignable(ctx, 'customer', input.customerTypeId);
 
   const termsRes = await resolvePartyTerms(ctx, { termsId: input.termsId, terms: input.terms });
   const taxCode = input.salesTaxCodeId ? await resolveSalesTaxCode(ctx, input.salesTaxCodeId) : null;
@@ -242,6 +261,7 @@ async function createCustomerInTx(ctx: ServiceContext, input: CreateCustomerInpu
       taxExemptionReason: input.taxExemptionReason?.trim() || null,
       taxRateId: input.taxRateId ?? null,
       priceLevelId: input.priceLevelId ?? null,
+      customerTypeId: input.customerTypeId ?? null,
       parentId: input.parentId ?? null,
       notes: input.notes ?? null,
     })
@@ -328,6 +348,9 @@ export async function updateCustomer(
   // current value is harmless.
   requirePriceLevelChangeAccess(ctx, patch.priceLevelId, before.priceLevelId);
   if (patch.priceLevelId) await assertRefInCompany(ctx, priceLevels, patch.priceLevelId, 'Price level');
+  if (patch.customerTypeId !== undefined) {
+    await assertTypeAssignable(ctx, 'customer', patch.customerTypeId, before.customerTypeId);
+  }
 
   const termsRes = await resolvePartyTerms(ctx, { termsId: patch.termsId, terms: patch.terms });
   let shipTos = patch.shipToAddresses !== undefined ? resolveShipTos(patch.shipToAddresses) : undefined;
@@ -391,6 +414,8 @@ export async function updateCustomer(
         patch.taxRateId !== undefined ? patch.taxRateId ?? null : before.taxRateId,
       priceLevelId:
         patch.priceLevelId !== undefined ? patch.priceLevelId ?? null : before.priceLevelId,
+      customerTypeId:
+        patch.customerTypeId !== undefined ? patch.customerTypeId ?? null : before.customerTypeId,
       parentId:
         patch.parentId !== undefined ? patch.parentId ?? null : before.parentId,
       notes:
@@ -544,4 +569,47 @@ export async function customerBalanceSummary(
     result.sort((a, b) => a.displayName.localeCompare(b.displayName));
   }
   return result;
+}
+
+// ---------------------------------------------------------------------------
+// Customer Center list with balances (home currency, from the A/R ledger)
+// ---------------------------------------------------------------------------
+
+/**
+ * Customers with their balance as the A/R ledger has it (home currency, by name — the same figure
+ * as Customer Balance Summary): `balance` is the customer's own, `balanceTotal` adds its
+ * sub-customers and jobs (QB's "Balance Total" column). The stored customers.balance column is
+ * never maintained by the posting engine, so the Customer Center showed 0.00 for everyone.
+ */
+export async function listCustomersWithBalances(ctx: ServiceContext, opts?: { includeInactive?: boolean }) {
+  const rows = await listCustomers(ctx, opts);
+  // Lazy import: the report engine imports the document services, which import this module.
+  const { ledgerTotalsByName, loadAccountMeta } = await import('./reportEngine');
+  const meta = await loadAccountMeta(ctx);
+  const own = new Map<string, ReturnType<typeof Money.zero>>();
+  for (const t of await ledgerTotalsByName(ctx, meta, { sections: ['ar'] })) {
+    if (t.nameType !== 'customer' || !t.nameId) continue;
+    own.set(t.nameId, (own.get(t.nameId) ?? Money.zero()).plus(t.natural));
+  }
+  // Every customer (also inactive ones) carries its balance up to its parents.
+  const all = await ctx.db
+    .select({ id: customers.id, parentId: customers.parentId })
+    .from(customers)
+    .where(eq(customers.companyId, ctx.companyId));
+  const parentOf = new Map(all.map((c) => [c.id, c.parentId]));
+  const total = new Map<string, ReturnType<typeof Money.zero>>();
+  for (const [id, amt] of own) {
+    const seen = new Set<string>();
+    let cur: string | null | undefined = id;
+    while (cur && !seen.has(cur)) {
+      seen.add(cur);
+      total.set(cur, (total.get(cur) ?? Money.zero()).plus(amt));
+      cur = parentOf.get(cur);
+    }
+  }
+  return rows.map((r) => ({
+    ...r,
+    balance: toAmountString(own.get(r.id) ?? Money.zero()),
+    balanceTotal: toAmountString(total.get(r.id) ?? Money.zero()),
+  }));
 }

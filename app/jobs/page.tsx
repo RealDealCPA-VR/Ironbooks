@@ -15,9 +15,11 @@ import {
   Modal,
   PageHeader,
   EmptyState,
+  Select,
   Spinner,
   toast,
 } from '@/components/ui';
+import Link from 'next/link';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
@@ -36,6 +38,58 @@ interface Job {
   endDate: string | null;
   isActive: boolean;
   createdAt: string;
+  /** B4: Job Type list entry. */
+  jobTypeId?: string | null;
+}
+
+/** B4: Job Type list entry (GET /api/lists/job-types). */
+interface JobTypeOption {
+  id: string;
+  name: string;
+  parentId: string | null;
+  isActive: boolean;
+}
+
+/** "Parent:Child" name of a Job Type. */
+function jobTypeName(id: string | null | undefined, all: JobTypeOption[]): string {
+  const path: string[] = [];
+  const seen = new Set<string>();
+  for (let cur = all.find((t) => t.id === id); cur && !seen.has(cur.id); cur = cur.parentId ? all.find((t) => t.id === cur!.parentId) : undefined) {
+    seen.add(cur.id);
+    path.unshift(cur.name);
+  }
+  return path.join(':');
+}
+
+/** Job Type picker: active types (plus the current one), "Parent:Child" names, sorted. */
+function JobTypeSelect({
+  id,
+  value,
+  types,
+  onChange,
+  disabled,
+}: {
+  id: string;
+  value: string;
+  types: JobTypeOption[];
+  onChange: (v: string) => void;
+  disabled?: boolean;
+}) {
+  return (
+    <Select id={id} value={value} disabled={disabled} onChange={(e) => onChange(e.target.value)}>
+      <option value="">—</option>
+      {types
+        .filter((t) => t.isActive || t.id === value)
+        .map((t) => ({ t, name: jobTypeName(t.id, types) }))
+        .sort((a, b) => a.name.localeCompare(b.name))
+        .map(({ t, name }) => (
+          <option key={t.id} value={t.id}>
+            {name}
+            {t.isActive ? '' : ' — inactive'}
+          </option>
+        ))}
+    </Select>
+  );
 }
 
 interface JobSummaryRow extends Job {
@@ -52,7 +106,7 @@ interface Customer {
 }
 
 interface ProfitabilityLine {
-  source: 'invoice_line' | 'bill_line' | 'expense_line';
+  source: 'invoice_line' | 'credit_memo_line' | 'bill_line' | 'expense_line';
   id: string;
   description: string | null;
   amount: string;
@@ -74,6 +128,7 @@ interface JobFormState {
   budget: string;
   startDate: string;
   endDate: string;
+  jobTypeId: string;
 }
 
 const EMPTY_FORM: JobFormState = {
@@ -81,6 +136,7 @@ const EMPTY_FORM: JobFormState = {
   budget: '',
   startDate: '',
   endDate: '',
+  jobTypeId: '',
 };
 
 // ---------------------------------------------------------------------------
@@ -97,13 +153,14 @@ function profitTone(profit: string): 'success' | 'danger' | 'neutral' {
 function sourceLabel(source: ProfitabilityLine['source']): string {
   switch (source) {
     case 'invoice_line': return 'Revenue';
+    case 'credit_memo_line': return 'Credit Memo';
     case 'bill_line': return 'Bill Cost';
     case 'expense_line': return 'Direct Expense';
   }
 }
 
 function sourceTone(source: ProfitabilityLine['source']): 'success' | 'danger' {
-  return source === 'invoice_line' ? 'success' : 'danger';
+  return source === 'invoice_line' || source === 'credit_memo_line' ? 'success' : 'danger';
 }
 
 // ---------------------------------------------------------------------------
@@ -113,9 +170,11 @@ function sourceTone(source: ProfitabilityLine['source']): 'success' | 'danger' {
 function JobForm({
   form,
   onChange,
+  jobTypes,
 }: {
   form: JobFormState;
   onChange: (field: keyof JobFormState, value: string) => void;
+  jobTypes: JobTypeOption[];
 }) {
   return (
     <div className="flex flex-col gap-4">
@@ -129,6 +188,14 @@ function JobForm({
           onChange={(e) => onChange('name', e.target.value)}
           required
         />
+      </div>
+      <div>
+        <Label htmlFor="jobType">Job type</Label>
+        <JobTypeSelect id="jobType" value={form.jobTypeId} types={jobTypes} onChange={(v) => onChange('jobTypeId', v)} />
+        <p className="mt-1 text-xs text-navy/50">
+          Groups jobs (New Construction, Repair…) so job reports can be filtered by type. Edit the choices on the{' '}
+          <Link href="/lists?list=job-types" className="text-electric hover:underline">Job Types list</Link>.
+        </p>
       </div>
       <div>
         <Label htmlFor="budget">Budget ($)</Label>
@@ -173,12 +240,33 @@ function JobForm({
 function ProfitabilityPanel({
   jobId,
   onClose,
+  jobTypes,
+  onJobTypeChanged,
 }: {
   jobId: string;
   onClose: () => void;
+  jobTypes: JobTypeOption[];
+  onJobTypeChanged: () => void;
 }) {
   const [data, setData] = useState<(Job & { profitability: JobProfitability }) | null>(null);
   const [loading, setLoading] = useState(true);
+  const [typeSaving, setTypeSaving] = useState(false);
+
+  // B4: change the job's Job Type (saved right away, like QB's Edit Job > Job Info).
+  async function saveJobType(jobTypeId: string) {
+    if (!data) return;
+    setTypeSaving(true);
+    try {
+      await api.patch(`/api/jobs/${jobId}`, { jobTypeId: jobTypeId || null });
+      setData({ ...data, jobTypeId: jobTypeId || null });
+      toast('Job type saved', 'success');
+      onJobTypeChanged();
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Failed to save the job type', 'danger');
+    } finally {
+      setTypeSaving(false);
+    }
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -202,8 +290,10 @@ function ProfitabilityPanel({
   }, [jobId, onClose]);
 
   const p = data?.profitability;
-  const revLines = p?.lines.filter((l) => l.source === 'invoice_line') ?? [];
-  const costLines = p?.lines.filter((l) => l.source !== 'invoice_line') ?? [];
+  // Credit memo lines (returns, write-offs) are negative revenue of the job.
+  const isRevenue = (l: ProfitabilityLine) => l.source === 'invoice_line' || l.source === 'credit_memo_line';
+  const revLines = p?.lines.filter(isRevenue) ?? [];
+  const costLines = p?.lines.filter((l) => !isRevenue(l)) ?? [];
 
   return (
     <Modal
@@ -218,6 +308,20 @@ function ProfitabilityPanel({
         </div>
       ) : (
         <>
+          {/* Job type (B4) */}
+          <div className="mb-4 flex items-center gap-3">
+            <Label htmlFor="panelJobType" className="mb-0 whitespace-nowrap">Job type</Label>
+            <div className="w-64">
+              <JobTypeSelect
+                id="panelJobType"
+                value={data?.jobTypeId ?? ''}
+                types={jobTypes}
+                disabled={typeSaving}
+                onChange={(v) => void saveJobType(v)}
+              />
+            </div>
+          </div>
+
           {/* Summary cards */}
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-4">
             <div className="rounded-xl bg-emerald/10 p-4 text-center">
@@ -361,6 +465,15 @@ export default function JobsPage() {
   // Profitability panel
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
 
+  // B4: Job Type list (non-fatal: the picker is just empty)
+  const [jobTypes, setJobTypes] = useState<JobTypeOption[]>([]);
+  useEffect(() => {
+    api
+      .get<{ entries: JobTypeOption[] }>('/api/lists/job-types?includeInactive=true')
+      .then((d) => setJobTypes(Array.isArray(d.entries) ? d.entries : []))
+      .catch(() => {});
+  }, []);
+
   // ---------------------------------------------------------------------------
   // Data fetching
   // ---------------------------------------------------------------------------
@@ -431,6 +544,7 @@ export default function JobsPage() {
         budget: addForm.budget ? addForm.budget : undefined,
         startDate: addForm.startDate || undefined,
         endDate: addForm.endDate || undefined,
+        jobTypeId: addForm.jobTypeId || undefined,
       });
       toast('Job created', 'success');
       setAddOpen(false);
@@ -493,6 +607,7 @@ export default function JobsPage() {
               <tr>
                 <Th>Job Name</Th>
                 <Th>Customer</Th>
+                <Th>Job Type</Th>
                 <Th>Status</Th>
                 <Th>Start</Th>
                 <Th>End</Th>
@@ -518,6 +633,7 @@ export default function JobsPage() {
                     </div>
                   </Td>
                   <Td className="text-navy/70">{j.customerName ?? '-'}</Td>
+                  <Td className="text-navy/70">{jobTypeName(j.jobTypeId, jobTypes) || '-'}</Td>
                   <Td>
                     {j.isActive ? (
                       <Badge tone="success">Active</Badge>
@@ -575,7 +691,7 @@ export default function JobsPage() {
             handleAdd();
           }}
         >
-          <JobForm form={addForm} onChange={updateAddForm} />
+          <JobForm form={addForm} onChange={updateAddForm} jobTypes={jobTypes} />
         </form>
       </Modal>
 
@@ -584,6 +700,8 @@ export default function JobsPage() {
         <ProfitabilityPanel
           jobId={selectedJobId}
           onClose={() => setSelectedJobId(null)}
+          jobTypes={jobTypes}
+          onJobTypeChanged={() => void fetchJobs()}
         />
       )}
     </main>

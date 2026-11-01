@@ -1,8 +1,10 @@
 'use client';
 /**
- * Sales Tax Components page.
+ * Sales Tax Items page (QB Item List: Sales Tax Items, plus their components).
  *
- * Two sections:
+ * Three sections:
+ * 0. Sales Tax Items (components/lists/SalesTaxItemsPanel.tsx) — add, rename, re-rate, set the
+ *    agency of, inactivate / reactivate, show inactive.
  * 1. Component editor — pick a tax rate, edit its named components (name / agency / rate),
  *    shows combined total; Save replaces the components and recomputes the parent rate.
  * 2. Sales-Tax-by-Agency report — date range picker, shows collected tax split per agency/component.
@@ -25,6 +27,7 @@ import {
   Tr,
   toast,
 } from '@/components/ui';
+import { SalesTaxItemsPanel } from '@/components/lists/SalesTaxItemsPanel';
 
 // ---------------------------------------------------------------------------
 // Types (mirroring server shape)
@@ -396,9 +399,23 @@ export default function SalesTaxComponentsPage() {
     });
   }, [selectedRateId]);
 
+  // B18: an item added, renamed, re-rated or made (in)active on the Sales Tax Items list above.
+  const handleItemsChanged = useCallback(() => {
+    api.get<TaxRate[]>('/api/tax-rates').then((rates) => {
+      setTaxRates(rates);
+      const r = rates.find((t) => t.id === selectedRateId) ?? rates[0];
+      setSelectedRateId(r?.id ?? '');
+      setParentRate(r?.rate ?? null);
+    });
+    api.get<TaxAgency[]>('/api/tax-agencies').then(setAgencies).catch(() => {});
+  }, [selectedRateId]);
+
   return (
     <main className="min-h-screen bg-offwhite p-8 font-sans">
-      <PageHeader title="Sales Tax Components" icon={Percent} />
+      <PageHeader title="Sales Tax Items" icon={Percent} />
+
+      {/* B18: create, rename, re-rate, set the agency of, and inactivate sales tax items. */}
+      <SalesTaxItemsPanel onChanged={handleItemsChanged} />
 
       {/* ------------------------------------------------------------------ */}
       {/* Section 1: Component editor                                          */}
@@ -445,7 +462,7 @@ export default function SalesTaxComponentsPage() {
 
         {!selectedRateId && !loadingRates && (
           <p className="text-navy/40 italic text-sm">
-            No tax rates found. Create one at Settings &rsaquo; Tax Rates first.
+            No active sales tax items. Add one in Sales Tax Items above first.
           </p>
         )}
       </Card>

@@ -66,14 +66,14 @@ export async function POST(req: NextRequest) {
         chargeLineId: b.chargeLineId ?? null,
         amount: b.amount,
         date: b.date ?? null,
-      });
+      }, { side: 'ar' }); // this screen's side only (an A/P credit is not applied here)
       return NextResponse.json({ application }, { status: 201 });
     }
     if (b.action === 'apply_payment') {
       const payment = await applyPaymentToJournalCharges(ctx, { paymentId: b.paymentId, items: b.items });
       return NextResponse.json({ payment });
     }
-    const application = await unapplyJournalApplication(ctx, b.applicationId);
+    const application = await unapplyJournalApplication(ctx, b.applicationId, { side: 'ar' });
     return NextResponse.json({ application });
   } catch (err) {
     return routeError(err, 'POST /api/payments/journal-items');

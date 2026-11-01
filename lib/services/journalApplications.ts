@@ -698,6 +698,12 @@ export async function applyJournalCredit(
     amount: string | number;
     date?: Date | null;
   },
+  /**
+   * The side the caller's screen works on (Receive Payments: 'ar', Pay Bills: 'ap'). A credit of the
+   * other side is refused as not found — an A/P vendor credit could otherwise be applied through
+   * the customers-area route by a user without vendor permission (the side came from the line).
+   */
+  opts: { side?: Side } = {},
 ) {
   // No date given: today on this computer's calendar (a ledger date), never the current instant.
   const date = input.date ?? ledgerToday();
@@ -705,6 +711,8 @@ export async function applyJournalCredit(
   if (targets !== 1) {
     throw validation('Pick the invoice, bill or General Journal charge to apply the credit to.');
   }
+  if (opts.side === 'ar' && input.billId) throw validation('Pick an invoice or a General Journal charge of this customer.');
+  if (opts.side === 'ap' && input.invoiceId) throw validation('Pick a bill or a General Journal charge of this vendor.');
   return inTransaction(ctx, async (tx) => {
     await assertCopyDates(tx, { lineIds: [input.journalLineId, input.chargeLineId], invoiceId: input.invoiceId, billId: input.billId });
     await assertPeriodOpen(tx, date);
@@ -716,6 +724,7 @@ export async function applyJournalCredit(
         .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
         .where(eq(journalEntryLines.id, input.journalLineId));
       const side: Side = line?.subtype === 'accounts_payable' ? 'ap' : 'ar';
+      if (opts.side && side !== opts.side) throw notFound('Journal credit');
       const item = await loadItem(tx, side, input.journalLineId);
       rows = await applyJournalOffsets(tx, {
         side,
@@ -762,13 +771,18 @@ export async function applyJournalCredit(
  * the bill payment — edit or void the bill payment instead. Respects the closing date (the
  * application's date).
  */
-export async function unapplyJournalApplication(ctx: ServiceContext, applicationId: string) {
+export async function unapplyJournalApplication(
+  ctx: ServiceContext,
+  applicationId: string,
+  /** The caller's side (see applyJournalCredit): an application of the other side is not found. */
+  opts: { side?: Side } = {},
+) {
   return inTransaction(ctx, async (tx) => {
     const [app] = await tx.db
       .select()
       .from(journalItemApplications)
       .where(and(eq(journalItemApplications.id, applicationId), eq(journalItemApplications.companyId, tx.companyId)));
-    if (!app) throw notFound('Application');
+    if (!app || (opts.side && app.side !== opts.side)) throw notFound('Application');
     if (app.kind === 'bill_payment') {
       throw new ServiceError(
         'CONFLICT',

@@ -2,18 +2,23 @@
 /**
  * Batch Invoicing (wave2 sales C6) — bill the same items to a group of customers at once.
  * Each invoice is a normal, fully posted invoice; customers who cannot be billed (inactive, over
- * their credit limit) are listed afterwards instead of blocking the rest.
+ * their credit limit) are listed afterwards instead of blocking the rest. Billing Groups (QB's
+ * Billing Group drop-down, salesar C6): pick a group to select its customers, save the selection
+ * as a group (<Add New>), update, rename or delete groups. A blank due date follows each
+ * customer's Terms list entry.
  */
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { Layers } from 'lucide-react';
 import {
   Badge,
   Button,
   Card,
+  ConfirmDialog,
   DateInput,
   Input,
   Label,
+  Modal,
   PageHeader,
   Select,
   Table,
@@ -53,6 +58,13 @@ interface Result {
   created: Array<{ customerId: string; customerName: string; invoiceNumber: number; total: string }>;
   skipped: Array<{ customerId: string; customerName: string; reason: string; code: string }>;
 }
+/** GET /api/billing-groups (lib/services/billingGroups.ts). */
+interface BillingGroup {
+  id: string;
+  name: string;
+  customerIds: string[];
+}
+const ADD_NEW = '__add_new__';
 
 export default function BatchInvoicingPage() {
   const [customers, setCustomers] = useState<Customer[]>([]);
@@ -71,6 +83,98 @@ export default function BatchInvoicingPage() {
   const [lines, setLines] = useState<PricedLineValue[]>([emptyPricedLine()]);
   const [saving, setSaving] = useState(false);
   const [result, setResult] = useState<Result | null>(null);
+  // Billing Groups.
+  const [groups, setGroups] = useState<BillingGroup[]>([]);
+  const [groupId, setGroupId] = useState('');
+  const [groupDialog, setGroupDialog] = useState<'new' | 'rename' | null>(null);
+  const [groupName, setGroupName] = useState('');
+  const [groupBusy, setGroupBusy] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+
+  const loadGroups = useCallback(async () => {
+    try {
+      const r = await api.get<{ groups: BillingGroup[] }>('/api/billing-groups');
+      setGroups(r.groups ?? []);
+    } catch {
+      setGroups([]);
+    }
+  }, []);
+  useEffect(() => {
+    void loadGroups();
+  }, [loadGroups]);
+  const group = groups.find((g) => g.id === groupId) ?? null;
+
+  /** QB's Billing Group drop-down: a group selects its (active) customers; <Add New> saves the selection. */
+  function pickGroup(value: string) {
+    if (value === ADD_NEW) {
+      setGroupName('');
+      setGroupDialog('new');
+      return;
+    }
+    setGroupId(value);
+    const g = groups.find((x) => x.id === value);
+    if (!g) return;
+    const active = new Set(customers.filter((c) => c.isActive !== false).map((c) => c.id));
+    const members = g.customerIds.filter((id) => active.has(id));
+    setPicked(new Set(members));
+    setTypeFilter('');
+    setSearch('');
+    const inactive = g.customerIds.length - members.length;
+    if (inactive > 0) toast(`${inactive} inactive customer${inactive === 1 ? ' is' : 's are'} in this group and not picked.`, 'info');
+  }
+
+  async function saveGroupDialog() {
+    if (!groupName.trim()) return toast('Give the billing group a name.', 'danger');
+    setGroupBusy(true);
+    try {
+      if (groupDialog === 'new') {
+        const g = await api.post<BillingGroup>('/api/billing-groups', { name: groupName, customerIds: [...picked] });
+        await loadGroups();
+        setGroupId(g.id);
+        toast(`Billing group "${g.name}" saved with ${g.customerIds.length} customer${g.customerIds.length === 1 ? '' : 's'}.`, 'success');
+      } else if (group) {
+        await api.patch(`/api/billing-groups/${group.id}`, { name: groupName });
+        await loadGroups();
+        toast('Billing group renamed.', 'success');
+      }
+      setGroupDialog(null);
+    } catch (err) {
+      toastError(err, 'Could not save the billing group.');
+    } finally {
+      setGroupBusy(false);
+    }
+  }
+
+  /** Replace the group's customers with the current selection. */
+  async function updateGroupMembers() {
+    if (!group) return;
+    setGroupBusy(true);
+    try {
+      await api.patch(`/api/billing-groups/${group.id}`, { customerIds: [...picked] });
+      await loadGroups();
+      toast(`"${group.name}" now has ${picked.size} customer${picked.size === 1 ? '' : 's'}.`, 'success');
+    } catch (err) {
+      toastError(err, 'Could not update the billing group.');
+    } finally {
+      setGroupBusy(false);
+    }
+  }
+
+  async function deleteGroup() {
+    if (!group) return;
+    setGroupBusy(true);
+    try {
+      await api.del(`/api/billing-groups/${group.id}`);
+      setGroupId('');
+      setConfirmDelete(false);
+      await loadGroups();
+      toast('Billing group deleted (its customers are unchanged).', 'success');
+    } catch (err) {
+      toastError(err, 'Could not delete the billing group.');
+    } finally {
+      setGroupBusy(false);
+    }
+  }
 
   useEffect(() => {
     api.get<Customer[]>('/api/customers').then((c) => setCustomers(Array.isArray(c) ? c : [])).catch(() => {});
@@ -139,6 +243,52 @@ export default function BatchInvoicingPage() {
         <Card className="p-4 lg:col-span-1">
           <h2 className="font-bold text-navy mb-2">1. Who to bill</h2>
           <div className="space-y-2">
+            <div>
+              <Label htmlFor="bi-group">Billing group</Label>
+              <Select id="bi-group" value={groupId} onChange={(e) => pickGroup(e.target.value)}>
+                <option value="">— No group (pick customers below) —</option>
+                {groups.map((g) => (
+                  <option key={g.id} value={g.id}>
+                    {g.name} ({g.customerIds.length})
+                  </option>
+                ))}
+                <option value={ADD_NEW}>&lt;Add New&gt; — save the picked customers as a group</option>
+              </Select>
+              <div className="mt-1 flex flex-wrap gap-2 text-sm">
+                {group ? (
+                  <>
+                    <button type="button" className="text-electric hover:underline disabled:opacity-50" disabled={groupBusy} onClick={updateGroupMembers}>
+                      Save picked customers to this group
+                    </button>
+                    <button
+                      type="button"
+                      className="text-electric hover:underline"
+                      onClick={() => {
+                        setGroupName(group.name);
+                        setGroupDialog('rename');
+                      }}
+                    >
+                      Rename
+                    </button>
+                    <button type="button" className="text-red-600 hover:underline" onClick={() => setConfirmDelete(true)}>
+                      Delete group
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    className="text-electric hover:underline disabled:opacity-50"
+                    disabled={picked.size === 0}
+                    onClick={() => {
+                      setGroupName('');
+                      setGroupDialog('new');
+                    }}
+                  >
+                    Save selection as a group
+                  </button>
+                )}
+              </div>
+            </div>
             <Input placeholder="Search customers" value={search} onChange={(e) => setSearch(e.target.value)} aria-label="Search customers" />
             {types.length > 0 && (
               <Select value={typeFilter} onChange={(e) => setTypeFilter(e.target.value)} aria-label="Customer type">
@@ -189,7 +339,7 @@ export default function BatchInvoicingPage() {
             <div>
               <Label htmlFor="bi-due">Due date</Label>
               <DateInput id="bi-due" value={dueDate} onChange={(e) => setDueDate(e.target.value)} />
-              <p className="text-xs text-navy/40 mt-1">Blank = from each customer&apos;s terms.</p>
+              <p className="text-xs text-navy/40 mt-1">Blank = from each customer&apos;s Terms (Terms list).</p>
             </div>
             <div>
               <Label htmlFor="bi-tax">Sales tax</Label>
@@ -260,6 +410,55 @@ export default function BatchInvoicingPage() {
           )}
         </Card>
       )}
+
+      <Modal
+        open={groupDialog !== null}
+        onClose={() => setGroupDialog(null)}
+        title={groupDialog === 'rename' ? 'Rename billing group' : 'New billing group'}
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setGroupDialog(null)}>Cancel</Button>
+            <Button type="submit" form="bi-group-form" loading={groupBusy} data-shortcut="save">
+              Save
+            </Button>
+          </>
+        }
+      >
+        <form
+          id="bi-group-form"
+          onSubmit={(e) => {
+            e.preventDefault();
+            void saveGroupDialog();
+          }}
+          className="space-y-2"
+        >
+          <Label htmlFor="bi-group-name" required>Group name</Label>
+          <Input
+            id="bi-group-name"
+            autoFocus
+            maxLength={100}
+            value={groupName}
+            onChange={(e) => setGroupName(e.target.value)}
+            placeholder="e.g. Monthly retainer clients"
+          />
+          {groupDialog === 'new' && (
+            <p className="text-xs text-navy/50">
+              The {picked.size} customer{picked.size === 1 ? '' : 's'} picked now will be in the group. Pick the group
+              next time to select them all at once.
+            </p>
+          )}
+        </form>
+      </Modal>
+      <ConfirmDialog
+        open={confirmDelete}
+        title="Delete billing group?"
+        message={`"${group?.name ?? ''}" will be deleted. Its customers are not changed.`}
+        confirmLabel="Delete"
+        tone="danger"
+        loading={groupBusy}
+        onConfirm={deleteGroup}
+        onClose={() => setConfirmDelete(false)}
+      />
     </main>
   );
 }

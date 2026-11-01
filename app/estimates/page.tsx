@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { Suspense, useEffect, useRef, useState, useCallback } from 'react';
 import { ClipboardList, Plus, ArrowRight, Percent, Pencil } from 'lucide-react';
 import { previewSalesTotals } from '@/lib/salesLineMath';
 import { estimateLineNumbers } from './estimateLines';
@@ -24,6 +24,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { useFocusId } from '@/lib/useFocusParam';
 import { todayISO } from '@/lib/dates';
 import { usePreferences } from '@/lib/usePreferences';
 import { recallNote, useSmartDefaults } from '@/lib/useSmartDefaults';
@@ -52,7 +53,24 @@ import {
 import PrefillNotice from '@/components/PrefillNotice';
 import { usePrefill } from '@/lib/commands/usePrefill';
 import { TransactionNav, useAdjacentTransactions } from '@/components/TransactionNav';
+<<<<<<< HEAD
 import AttachmentPanel from '@/components/AttachmentPanel'; // J9 Doc Center
+=======
+// salesar (B8 / B9): Customer Message picker and the per-line Sales Tax Code column.
+import { CustomerMessageField, customerTaxStatus, useCustomerMessages, useSalesTaxCodes } from '@/components/sales/FormLists';
+import {
+  type CustomerMessageEntry,
+  type CustomerTaxStatus,
+  type TaxCodeEntry,
+  activeTaxItemId,
+  customerMessagePayload,
+  filledLineTaxCode,
+  lineTaxPayload,
+  taxItemChoices,
+  taxItemLabel,
+  withShownTaxable,
+} from '@/lib/salesFormListsClient';
+>>>>>>> feat/salesar
 
 // ---------------------------------------------------------------------------
 // Types
@@ -78,6 +96,8 @@ interface Estimate {
   taxRateId?: string | null;
   toBePrinted?: boolean;
   toBeEmailed?: boolean;
+  /** Customer Message list entry printed at the foot of the estimate. */
+  customerMessageId?: string | null;
 }
 
 interface EstimateDetailLine {
@@ -88,6 +108,8 @@ interface EstimateDetailLine {
   rate: string;
   amount: string;
   taxable: boolean;
+  /** The line's Sales Tax Code (null on lines saved before codes: shown by `taxable`). */
+  salesTaxCodeId?: string | null;
   classId?: string | null;
   /** Progress invoicing: invoiced so far on this line (units, dollars before tax, percent). */
   qtyInvoiced?: string;
@@ -107,14 +129,20 @@ interface TaxRate {
   id: string;
   name: string;
   rate: string; // fraction, e.g. "0.082500"
+  /** false = made inactive (offered only on an estimate that already has it). */
+  isActive?: boolean | null;
 }
 
 interface EstimateLineForm {
+  /** The saved line this row edits (sent back so the line keeps its id and its invoice links). */
+  id?: string;
   itemId: string;
   description: string;
   quantity: string;
   rate: string;
   taxable: boolean;
+  /** The line's Sales Tax Code ('' = the standard code for `taxable`). */
+  salesTaxCodeId?: string;
   /** Advanced pricing: the user typed the rate (automatic prices leave it alone). */
   rateManual?: boolean;
   /** Class for the line; progress invoices carry it onto their lines. */
@@ -127,6 +155,8 @@ interface EstimateForm {
   expirationDate: string;
   taxRateId: string;
   memo: string;
+  /** Customer Message list entry ('' = none). */
+  customerMessageId: string;
   lines: EstimateLineForm[];
 }
 
@@ -146,6 +176,7 @@ const EMPTY_FORM: EstimateForm = {
   expirationDate: '',
   taxRateId: '',
   memo: '',
+  customerMessageId: '',
   lines: [{ ...EMPTY_LINE }],
 };
 
@@ -181,6 +212,9 @@ function EstimateFormBody({
   onChange,
   onLinesChange,
   recallText,
+  taxCodes,
+  customerTax,
+  messages,
 }: {
   form: EstimateForm;
   customers: Customer[];
@@ -191,9 +225,15 @@ function EstimateFormBody({
   onLinesChange: (lines: EstimateLineForm[]) => void;
   /** Smart defaults: what was filled in from the customer's last estimate. */
   recallText?: string;
+  /** Sales Tax Code list (B9) and the customer's tax status. */
+  taxCodes: TaxCodeEntry[];
+  customerTax: CustomerTaxStatus | null;
+  /** Customer Message list (B8). */
+  messages: CustomerMessageEntry[];
 }) {
-  // Mirror the service/invoice math (item-type aware): tax applies to taxable lines only,
-  // discount items subtract, subtotal items add nothing.
+  // Mirror the service/invoice math (item-type aware): tax applies to taxable lines only (each
+  // line's Sales Tax Code decides; a non-taxable customer is taxed nothing), discount items
+  // subtract, subtotal items add nothing.
   const selectedRate = taxRates.find((t) => t.id === form.taxRateId);
   const { salesTaxEnabled: salesTaxOn, classTrackingEnabled: classTrackingOn } = usePreferences().company;
   const {
@@ -201,7 +241,11 @@ function EstimateFormBody({
     tax: taxAmount,
     total,
   } = previewSalesTotals(
-    form.lines.map((l) => ({ ...l, itemType: items.find((i) => i.id === l.itemId)?.type ?? null })),
+    withShownTaxable(
+      form.lines.map((l) => ({ ...l, itemType: items.find((i) => i.id === l.itemId)?.type ?? null })),
+      taxCodes,
+      customerTax,
+    ),
     selectedRate ? parseFloat(selectedRate.rate) || 0 : 0,
   );
 
@@ -255,9 +299,10 @@ function EstimateFormBody({
             onChange={(e) => onChange('taxRateId', e.target.value)}
           >
             <option value="">No tax</option>
-            {taxRates.map((t) => (
+            {/* Active items, plus the estimate's own item if it has been made inactive since. */}
+            {taxItemChoices(taxRates, form.taxRateId).map((t) => (
               <option key={t.id} value={t.id}>
-                {t.name} ({(parseFloat(t.rate) * 100).toFixed(2)}%)
+                {taxItemLabel(t)}
               </option>
             ))}
           </Select>
@@ -271,7 +316,10 @@ function EstimateFormBody({
           lines={form.lines}
           onChange={onLinesChange}
           header={{ customerId: form.customerId || null, date: form.date }}
-          showTaxable
+          // QB's per-line "Tax" column (Sales Tax Code) only while sales tax is on (or the estimate has a tax item).
+          showTaxable={salesTaxOn || !!form.taxRateId}
+          taxCodes={taxCodes}
+          customerTax={customerTax}
           // Class pickers only while "Use class tracking" is on (or a line already has a class).
           classes={classTrackingOn || form.lines.some((l) => l.classId) ? classes : undefined}
         />
@@ -285,6 +333,14 @@ function EstimateFormBody({
           <span className="font-bold text-navy">Total: {formatCurrency(total)}</span>
         </div>
       </div>
+
+      {/* QB "Customer Message" under the lines: printed on the estimate. */}
+      <CustomerMessageField
+        id="est-message"
+        value={form.customerMessageId}
+        onChange={(id) => onChange('customerMessageId', id)}
+        messages={messages}
+      />
 
       <div>
         <Label htmlFor="memo">Memo</Label>
@@ -306,6 +362,15 @@ function EstimateFormBody({
 // ---------------------------------------------------------------------------
 
 export default function EstimatesPage() {
+  // useFocusId reads the URL (useSearchParams), which needs a Suspense boundary.
+  return (
+    <Suspense fallback={null}>
+      <EstimatesPageContent />
+    </Suspense>
+  );
+}
+
+function EstimatesPageContent() {
   // Preferences > Jobs & Estimates 'Use progress invoicing' (the server refuses it when off).
   const progressOn = usePreferences().company.progressInvoicingEnabled;
   const [estimates, setEstimates] = useState<Estimate[]>([]);
@@ -332,13 +397,22 @@ export default function EstimatesPage() {
   const dupConfirm = useDuplicateNumberConfirm();
   // Customer defaults: tax item and ship-to address (new estimates).
   const custDefaults = useCustomerSalesDefaults(addOpen ? addForm.customerId : null);
+  // salesar: Sales Tax Code column (B9) and Customer Message (B8) lists.
+  const taxCodes = useSalesTaxCodes(addOpen);
+  const customerMessages = useCustomerMessages(addOpen);
+  const customerTax = customerTaxStatus(custDefaults);
   /** Tax item recalled from the last estimate — wins over the customer's default tax item. */
   const recalledTaxRef = useRef<string | null>(null);
   useEffect(() => {
     if (!custDefaults || editingId) return;
     setAddForm((prev) => ({
       ...prev,
-      taxRateId: custDefaults.taxable ? (recalledTaxRef.current ?? custDefaults.taxRateId ?? prev.taxRateId) : '',
+      // A new estimate never starts on a tax item that has been made inactive.
+      taxRateId: custDefaults.taxable
+        ? (activeTaxItemId(recalledTaxRef.current, taxRates) ??
+          activeTaxItemId(custDefaults.taxRateId, taxRates) ??
+          prev.taxRateId)
+        : '',
     }));
     const st = defaultShipToState(custDefaults);
     if (st) setSendFlags((prev) => ({ ...prev, shipTo: st }));
@@ -359,7 +433,7 @@ export default function EstimatesPage() {
     let live = true;
     void recall(customerId).then((d) => {
       if (!live || !d) return;
-      const tax = d.header.taxRateId;
+      const tax = activeTaxItemId(d.header.taxRateId, taxRates);
       if (tax) recalledTaxRef.current = tax;
       const m = d.header.memo;
       setAddForm((prev) => ({
@@ -428,7 +502,8 @@ export default function EstimatesPage() {
 
   const fetchTaxRates = useCallback(async () => {
     try {
-      const data = await api.get<TaxRate[]>('/api/tax-rates');
+      // Inactive items too: an edited estimate still shows (and taxes at) its saved item.
+      const data = await api.get<TaxRate[]>('/api/tax-rates?includeInactive=true');
       setTaxRates(data);
     } catch {
       // Non-fatal; the tax dropdown just won't populate.
@@ -474,7 +549,8 @@ export default function EstimatesPage() {
             description: l.description ?? '',
             quantity: l.quantity ?? '1',
             rate: l.rate ?? '',
-            taxable: l.taxable ?? true,
+            // The item's Sales Tax Code unless the command said taxable / not (B9).
+            ...filledLineTaxCode(l.itemId ? items.find((it) => it.id === l.itemId) : null, taxCodes, l.taxable),
             rateManual: !!l.rateFromUser,
           }))
         : [{ ...EMPTY_LINE }],
@@ -493,6 +569,9 @@ export default function EstimatesPage() {
     setLoadCount((n) => n + 1);
   }
 
+  // Drill-downs (the transaction log, the Income Tracker) link here with ?focus=<id>.
+  useFocusId(true, (id) => void openEditModal({ id } as Estimate));
+
   /** Edit a saved estimate (allowed until it has been turned into an invoice). */
   async function openEditModal(estimate: Estimate) {
     try {
@@ -503,12 +582,17 @@ export default function EstimatesPage() {
         expirationDate: detail.expirationDate ? detail.expirationDate.slice(0, 10) : '',
         taxRateId: detail.taxRateId ?? '',
         memo: detail.memo ?? '',
+        // The saved message shows even if it was made inactive since.
+        customerMessageId: detail.customerMessageId ?? '',
         lines: detail.lines.map((l) => ({
+          id: l.id,
           itemId: l.itemId ?? '',
           description: l.description ?? '',
           quantity: String(Number(l.quantity)),
           rate: String(Number(l.rate)),
           taxable: l.taxable,
+          // Lines saved before codes have none: they show the standard code for `taxable`.
+          salesTaxCodeId: l.salesTaxCodeId ?? '',
           rateManual: true,
           classId: l.classId ?? '',
         })),
@@ -562,12 +646,16 @@ export default function EstimatesPage() {
         expirationDate: addForm.expirationDate || null,
         taxRateId: addForm.taxRateId || null,
         memo: addForm.memo || null,
+        // null clears a saved message.
+        customerMessageId: customerMessagePayload(addForm.customerMessageId),
         lines: addForm.lines.map((l, i) => ({
+          ...(editingId && l.id ? { id: l.id } : {}),
           itemId: l.itemId || null,
           description: l.description.trim(),
           // Blank rate on an item line: the server prices it (advanced pricing).
           ...(numbers[i] as { quantity: string; rate: string | number | null }),
-          taxable: l.taxable,
+          // The line's Sales Tax Code (the server decides taxability from it).
+          ...lineTaxPayload({ ...l, itemType: items.find((it) => it.id === l.itemId)?.type ?? null }, taxCodes, customerTax),
           classId: l.classId || null,
         })),
       };
@@ -907,6 +995,9 @@ export default function EstimatesPage() {
           onChange={handleFormChange}
           onLinesChange={(lines) => setAddForm((prev) => ({ ...prev, lines }))}
           recallText={editingId ? '' : recallText}
+          taxCodes={taxCodes}
+          customerTax={customerTax}
+          messages={customerMessages}
         />
         <div className="mt-4">
           <ShippingSection

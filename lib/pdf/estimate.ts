@@ -30,6 +30,8 @@ export interface EstimatePdfData {
   shipTo?: Record<string, string> | null;
   lines: EstimatePdfLine[];
   currency?: string;
+  /** salesar (B8): the estimate's Customer Message. */
+  customerMessage?: string | null;
 }
 
 export async function renderEstimatePdf(data: EstimatePdfData, template?: PdfTemplate | null): Promise<Uint8Array> {
@@ -58,6 +60,7 @@ export async function renderEstimatePdf(data: EstimatePdfData, template?: PdfTem
         { label: 'Total', value: e.total, emphasis: 'total' as const },
       ],
       memo: e.memo,
+      customerMessage: data.customerMessage ?? null,
     },
     template?.design,
     template?.logo,

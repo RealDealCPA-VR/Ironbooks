@@ -1,6 +1,7 @@
 'use client';
 
-import { Suspense, useEffect, useMemo, useState, useCallback } from 'react';
+import { Suspense, useEffect, useMemo, useRef, useState, useCallback } from 'react';
+import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import { HandCoins, Plus } from 'lucide-react';
 import {
   AmountInput,
@@ -27,7 +28,7 @@ import { api } from '@/lib/client';
 import { todayISO } from '@/lib/dates';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
-import { useNewParam } from '@/lib/useFocusParam';
+import { useFocusId, useNewParam } from '@/lib/useFocusParam';
 import { isDepositTargetAccount } from '@/lib/accountTypes';
 // wave2 prefs: Payments > auto-apply / auto-calculate / Undeposited Funds; date warnings
 import { usePreferences } from '@/lib/usePreferences';
@@ -62,7 +63,32 @@ function cleanPaymentBody(body: PaymentBody): PaymentBody {
 // cmdbar: "receive payment from Acme" opens Receive Payments with the customer picked.
 import { usePrefill } from '@/lib/commands/usePrefill';
 import { TransactionNav, useAdjacentTransactions } from '@/components/TransactionNav';
+<<<<<<< HEAD
 import AttachmentPanel from '@/components/AttachmentPanel'; // J9 Doc Center
+=======
+// salesar: Payment Method list entry (B7), credits split across invoices (C4), deep link.
+import { PaymentMethodField, usePaymentMethods } from '@/components/sales/FormLists';
+import {
+  type PaymentMethodEntry,
+  paymentMethodDisplay,
+  paymentMethodPayload,
+  paymentMethodValue,
+} from '@/lib/salesFormListsClient';
+import {
+  type CreditUse,
+  JE_PREFIX,
+  creditLeftFor,
+  creditParts,
+  creditPartsOn as partsOn,
+  creditRequest,
+  creditUseFromPayment,
+  creditUsed,
+  overdrawnCredits,
+  takesCharges,
+} from './creditSplit';
+import { CreditsDialog } from './CreditsDialog';
+import { parseReceivePaymentLink, prefillFromLink } from './deepLink';
+>>>>>>> feat/salesar
 
 // ---------------------------------------------------------------------------
 // Types
@@ -75,6 +101,8 @@ interface Payment {
   /** P1: returned by the paged list. */
   customerName?: string | null;
   method: string;
+  /** salesar (B7): the Payment Method list entry (null: saved with a bare type). */
+  paymentMethodId?: string | null;
   amount: string;
   unapplied: string;
   reference: string | null;
@@ -223,13 +251,25 @@ interface AvailableCredit {
   ref: string;
   date: string;
   available: string;
+  /** salesar C4: the credit's currency (null = home); usable only on a payment in that currency. */
+  currency?: string | null;
 }
 
+/** C3: GET /api/payments/discounts — the server's early-payment discount for one invoice. */
 interface DiscountSuggestion {
   invoiceId: string;
+  /** Terms the discount comes from (a Terms list entry's name, or older free text). */
+  terms?: string | null;
+  /** Discount percent the terms offer ('0' when none). */
+  percent?: string;
   eligible: boolean;
+  /** The terms' percent of the invoice amount, less discounts already taken, capped at the open balance. */
   suggested: string;
+  /** Last day the discount can be taken. */
   discountDate: string | null;
+  /** The invoice amount the percent applies to. */
+  invoiceAmount?: string;
+  alreadyTaken?: string;
 }
 
 interface ReceivePaymentModalProps {
@@ -244,12 +284,32 @@ interface ReceivePaymentModalProps {
   accounts: Account[];
   /** cmdbar: customer picked from the command bar for a NEW payment. */
   prefillCustomerId?: string | null;
+  /** Deep link (/payments?customerId=&invoiceId=): the invoice selected with its open amount. */
+  prefillInvoiceId?: string | null;
+  /** B7: the Payment Method list entries (inactive included). */
+  paymentMethods?: PaymentMethodEntry[];
 }
 
-/** "Apply to" targets in the credits table: an invoice id, or `je:<line id>` for a JE charge. */
-const JE_PREFIX = 'je:';
+/** B7: a new payment starts on the "Check" entry (else the first active check entry, else the bare type). */
+function defaultMethodValue(entries: readonly PaymentMethodEntry[]): string {
+  const active = entries.filter((e) => e.isActive !== false);
+  const check =
+    active.find((e) => e.type === 'check' && e.name.trim().toLowerCase() === 'check') ?? active.find((e) => e.type === 'check');
+  return check ? `pm:${check.id}` : 'type:check';
+}
 
-function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accounts, prefillCustomerId = null, nav = null }: ReceivePaymentModalProps) {
+function ReceivePaymentModal({
+  open,
+  editing,
+  onClose,
+  onSaved,
+  customers,
+  accounts,
+  prefillCustomerId = null,
+  prefillInvoiceId = null,
+  paymentMethods = [],
+  nav = null,
+}: ReceivePaymentModalProps) {
   const today = todayISO();
   const prefs = usePreferences();
   // Preferences > Payments: once the user edits one side by hand, stop recalculating it.
@@ -259,6 +319,10 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
   const [customerId, setCustomerId] = useState('');
   const [date, setDate] = useState(today);
   const [method, setMethod] = useState<string>('check');
+  // B7: the Payment Method picker value — `pm:<list entry id>`, or `type:<type>` for a payment
+  // saved before the list was used (lib/salesFormListsClient.ts).
+  const [methodValue, setMethodValue] = useState('type:check');
+  const methodTouched = useRef(false);
   const [amount, setAmount] = useState('');
   const [reference, setReference] = useState('');
   const [memo, setMemo] = useState('');
@@ -275,9 +339,14 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
   const [applicationAmounts, setApplicationAmounts] = useState<Record<string, string>>({});
   const [discountAmounts, setDiscountAmounts] = useState<Record<string, string>>({});
   const [suggestions, setSuggestions] = useState<Record<string, DiscountSuggestion>>({});
-  // credit id -> { invoiceId (or je:<charge line id>), amount }
+  // C4: credit id -> target (invoice id, or je:<charge line id>) -> amount: one credit can be
+  // split over several invoices (app/payments/creditSplit.ts).
   const [credits, setCredits] = useState<AvailableCredit[]>([]);
-  const [creditUse, setCreditUse] = useState<Record<string, { invoiceId: string; amount: string }>>({});
+  const [creditUse, setCreditUse] = useState<CreditUse>({});
+  /** The invoice / charge whose Credits window is open. */
+  const [creditsFor, setCreditsFor] = useState<{ target: string; title: string; balanceDue: string; discount: string } | null>(null);
+  // Deep link: the invoice to select once the customer's invoices are loaded (new payment only).
+  const linkInvoiceRef = useRef<string | null>(null);
   // I11: open General Journal charges (journal line id -> cash applied).
   const [journalCharges, setJournalCharges] = useState<JournalOpenRow[]>([]);
   const [journalAmounts, setJournalAmounts] = useState<Record<string, string>>({});
@@ -314,10 +383,15 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
   // Reset / prefill when the modal opens.
   useEffect(() => {
     if (!open) return;
+    methodTouched.current = !!editing;
+    linkInvoiceRef.current = editing ? null : prefillInvoiceId;
+    setCreditsFor(null);
     if (editing) {
       setCustomerId(editing.customerId);
       setDate(editing.date.slice(0, 10));
       setMethod(editing.method);
+      // B7: the saved list entry, or the bare type of a payment saved before the list.
+      setMethodValue(paymentMethodValue(editing));
       setAmount(String(Number(editing.amount)));
       setReference(editing.reference ?? '');
       setMemo(editing.memo ?? '');
@@ -329,6 +403,7 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
       setCustomerId(prefillCustomerId ?? '');
       setDate(today);
       setMethod('check');
+      setMethodValue(defaultMethodValue(paymentMethods));
       setAmount('');
       setReference('');
       setMemo('');
@@ -351,7 +426,14 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
     fixer.clear();
     setShowErrors(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, editing, today, prefillCustomerId]);
+  }, [open, editing, today, prefillCustomerId, prefillInvoiceId]);
+
+  // B7: the Payment Method list arrives after the form opened — a new payment the user has not
+  // touched moves onto the "Check" entry.
+  useEffect(() => {
+    if (!open || editing || methodTouched.current) return;
+    setMethodValue(defaultMethodValue(paymentMethods));
+  }, [open, editing, paymentMethods]);
 
   useEffect(() => {
     // Preferences > Payments: with Undeposited Funds off, a NEW payment starts on the default bank.
@@ -439,29 +521,35 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
           available: (Number(c.available) + ((c.kind === 'journal_entry' ? journalUsedByMe : usedByMe).get(c.id) ?? 0)).toFixed(2),
         }));
         for (const [id, amt] of usedByMe) {
-          if (!merged.some((c) => c.id === id)) merged.push({ kind: 'credit_memo', id, ref: 'Credit memo', date: '', available: amt.toFixed(2) });
+          if (!merged.some((c) => c.id === id)) merged.push({ kind: 'credit_memo', id, ref: 'Credit memo', date: '', available: amt.toFixed(2), currency: null });
         }
         for (const [id, amt] of journalUsedByMe) {
-          if (!merged.some((c) => c.id === id)) merged.push({ kind: 'journal_entry', id, ref: 'General Journal credit', date: '', available: amt.toFixed(2) });
+          if (!merged.some((c) => c.id === id)) merged.push({ kind: 'journal_entry', id, ref: 'General Journal credit', date: '', available: amt.toFixed(2), currency: null });
         }
         setCredits(merged);
         if (mine) {
           setApplicationAmounts(Object.fromEntries(mine.applications.filter((a) => Number(a.amountApplied) > 0).map((a) => [a.invoiceId, String(Number(a.amountApplied))])));
           setDiscountAmounts(Object.fromEntries(mine.applications.filter((a) => Number(a.discountAmount) > 0).map((a) => [a.invoiceId, String(Number(a.discountAmount))])));
-          setCreditUse(
-            Object.fromEntries([
-              ...mine.credits.map((c) => [c.creditMemoId, { invoiceId: c.invoiceId, amount: String(Number(c.amount)) }] as const),
-              ...myJournal
-                .filter((j) => j.kind === 'invoice_credit' && j.invoiceId)
-                .map((j) => [j.journalLineId, { invoiceId: j.invoiceId!, amount: String(Number(j.amount)) }] as const),
-              ...myOffsets.map((o) => [o.journalLineId, { invoiceId: JE_PREFIX + o.chargeLineId, amount: String(Number(o.amount)) }] as const),
-            ]),
-          );
+          // C4: every part of every credit this payment used (one credit can sit on several invoices).
+          setCreditUse(creditUseFromPayment(mine));
         } else {
           setAppsTouched(false);
           setApplicationAmounts({});
           setDiscountAmounts({});
           setCreditUse({});
+          // Deep link (/payments?customerId=&invoiceId=): that invoice selected with its open amount,
+          // in its currency. Once only — picking another customer starts clean.
+          const linked = linkInvoiceRef.current;
+          linkInvoiceRef.current = null;
+          const pre = prefillFromLink(openInv, linked);
+          if (pre) {
+            const inv = openInv.find((i) => i.id === linked)!;
+            setCurrency(normCur(inv.currency));
+            setApplicationAmounts(pre.applications);
+            setAmount(pre.amount);
+            setAppsTouched(true);
+            setAmountTouched(true);
+          }
         }
       })
       .catch((err) => {
@@ -498,8 +586,12 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
       return;
     }
     let cancelled = false;
+    // C3: computed on the server from each invoice's Terms list entry (percent of the invoice
+    // amount, discount date). While editing, this payment's own discount is offered again.
+    const qs = new URLSearchParams({ customerId, date });
+    if (editing && editing.customerId === customerId) qs.set('paymentId', editing.id);
     api
-      .get<{ discounts: DiscountSuggestion[] }>(`/api/payments/discounts?customerId=${customerId}&date=${date}`)
+      .get<{ discounts: DiscountSuggestion[] }>(`/api/payments/discounts?${qs.toString()}`)
       .then((r) => {
         if (!cancelled) setSuggestions(Object.fromEntries((r.discounts ?? []).map((d) => [d.invoiceId, d])));
       })
@@ -509,7 +601,7 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
     return () => {
       cancelled = true;
     };
-  }, [open, customerId, date]);
+  }, [open, customerId, date, editing]);
 
   // Only invoices in the payment's currency can be paid by it (QB: one currency per payment).
   const visibleInvoices = useMemo(
@@ -522,38 +614,35 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
   );
   // A2: currency fields only while Preferences > Multiple Currencies is on (or the payment is foreign).
   const showCurrency = currencyChoices.length > 1 && (prefs.company.multiCurrencyEnabled || currency !== '');
-  // Credits and General Journal items are home-currency only.
-  const shownCredits = foreign ? [] : credits;
+  // C4: credits in the payment's currency — credit memos and General Journal credits are home
+  // currency; an earlier unapplied payment is in the currency it was received in. General Journal
+  // charges are home currency only.
+  const shownCredits = credits.filter((c) => normCur(c.currency) === currency);
   const shownCharges = foreign ? [] : journalCharges;
-
-  const paymentCreditIds = new Set(credits.filter((c) => c.kind === 'payment').map((c) => c.id));
-  const journalCreditIds = new Set(credits.filter((c) => c.kind === 'journal_entry').map((c) => c.id));
-  const usedCredits = Object.entries(foreign ? {} : creditUse).filter(([, u]) => u.invoiceId && Number(u.amount) > 0);
-  const toCharge = (target: string) => target.startsWith(JE_PREFIX);
-  const creditApps = usedCredits
-    .filter(([id, u]) => !paymentCreditIds.has(id) && !journalCreditIds.has(id) && !toCharge(u.invoiceId))
-    .map(([creditMemoId, u]) => ({ creditMemoId, invoiceId: u.invoiceId, amount: u.amount }));
-  const paymentCreditApps = usedCredits
-    .filter(([id]) => paymentCreditIds.has(id))
-    .map(([paymentId, u]) =>
-      toCharge(u.invoiceId)
-        ? { paymentId, journalLineId: u.invoiceId.slice(JE_PREFIX.length), amount: u.amount }
-        : { paymentId, invoiceId: u.invoiceId, amount: u.amount },
-    );
-  // I11: General Journal A/R credits applied to invoices; P1: ... or to General Journal charges.
-  const journalCreditApps = usedCredits
-    .filter(([id, u]) => journalCreditIds.has(id) && !toCharge(u.invoiceId))
-    .map(([journalLineId, u]) => ({ journalLineId, invoiceId: u.invoiceId, amount: u.amount }));
-  const journalOffsets = usedCredits
-    .filter(([id, u]) => journalCreditIds.has(id) && toCharge(u.invoiceId))
-    .map(([journalLineId, u]) => ({ journalLineId, chargeLineId: u.invoiceId.slice(JE_PREFIX.length), amount: u.amount }));
-  const allCreditApps = usedCredits.map(([, u]) => ({ invoiceId: u.invoiceId, amount: u.amount }));
+  const shownCreditIds = new Set(shownCredits.map((c) => c.id));
+  // Only targets on the form count (an invoice in another currency is not shown).
+  const targetsShown = new Set([
+    ...visibleInvoices.map((i) => i.id),
+    ...shownCharges.map((c) => JE_PREFIX + c.journalLineId),
+  ]);
+  const shownUse: CreditUse = Object.fromEntries(
+    Object.entries(creditUse)
+      .filter(([id]) => shownCreditIds.has(id))
+      .map(([id, byTarget]) => [id, Object.fromEntries(Object.entries(byTarget).filter(([t]) => targetsShown.has(t)))]),
+  );
+  // Credit memos, earlier payments (on invoices or General Journal charges), General Journal
+  // credits on invoices (I11) and on General Journal charges (P1) — each credit possibly in parts.
+  const {
+    credits: creditApps,
+    paymentCredits: paymentCreditApps,
+    journalCredits: journalCreditApps,
+    journalOffsets,
+  } = creditRequest(shownCredits, shownUse);
+  const allCreditApps = creditParts(shownUse, shownCreditIds).map((p) => ({ invoiceId: p.target, amount: p.amount }));
   /** Credits entered against one invoice (or `je:<line>` charge). */
-  const creditOn = (target: string) =>
-    allCreditApps.filter((c) => c.invoiceId === target).reduce((s, c) => s + Number(c.amount), 0);
+  const creditOn = (target: string) => Number(sumMoney(partsOn(shownUse, target, shownCreditIds)).toFixed(2));
   /** The credit amounts on one target, as entered (summed with Decimal by the fix builders). */
-  const creditPartsOn = (target: string) =>
-    allCreditApps.filter((c) => c.invoiceId === target).map((c) => c.amount || '0');
+  const creditPartsOn = (target: string) => partsOn(shownUse, target, shownCreditIds);
 
   const applications = visibleInvoices
     .map((inv) => ({
@@ -579,12 +668,9 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
    * discount taken first can never make the save fail with "more than it owes".
    */
   const cashDueInvoices = (disc = discountAmounts, use = creditUse) => {
-    const deductions: Record<string, number> = {};
+    const deductions: Record<string, string> = {};
     for (const inv of visibleInvoices) {
-      const cred = Object.values(use)
-        .filter((u) => u.invoiceId === inv.id)
-        .reduce((s, u) => s + (Number(u.amount) || 0), 0);
-      deductions[inv.id] = (Number(disc[inv.id]) || 0) + cred;
+      deductions[inv.id] = sumMoney([disc[inv.id], ...partsOn(use, inv.id, shownCreditIds)]).toFixed(2);
     }
     return cashDue(visibleInvoices, deductions);
   };
@@ -610,7 +696,7 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
   };
 
   /** A discount or credit changed: re-spread an auto-applied amount over what is still due. */
-  const reapply = (disc: Record<string, string>, use: Record<string, { invoiceId: string; amount: string }>) => {
+  const reapply = (disc: Record<string, string>, use: CreditUse) => {
     if (prefs.company.autoApplyPayments && !appsTouched && amount) {
       setApplicationAmounts(autoApplyPayment(amount, cashDueInvoices(disc, use)));
     }
@@ -620,8 +706,22 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
     setDiscountAmounts(next);
     reapply(next, creditUse);
   };
-  const setCredit = (creditId: string, value: { invoiceId: string; amount: string }) => {
-    const next = { ...creditUse, [creditId]: value };
+  /** C3: take every discount the server suggests (eligible, not entered yet). */
+  const takeAllDiscounts = () => {
+    const next = { ...discountAmounts };
+    for (const inv of visibleInvoices) {
+      const sug = suggestions[inv.id];
+      if (sug?.eligible && dec(sug.suggested).greaterThan(0) && !dec(next[inv.id]).greaterThan(0)) next[inv.id] = sug.suggested;
+    }
+    setDiscountAmounts(next);
+    reapply(next, creditUse);
+  };
+  const unusedDiscounts = visibleInvoices.filter((inv) => {
+    const sug = suggestions[inv.id];
+    return !!sug?.eligible && dec(sug.suggested).greaterThan(0) && !dec(discountAmounts[inv.id]).greaterThan(0);
+  });
+  /** C4: the credits' parts changed (Credits window). */
+  const changeCreditUse = (next: CreditUse) => {
     setCreditUse(next);
     reapply(discountAmounts, next);
   };
@@ -816,18 +916,23 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
       return;
     }
     const amt = Number(amount || 0);
-    for (const c of shownCredits) {
-      const u = creditUse[c.id];
-      if (u && Number(u.amount) > Number(c.available) + 0.005) {
-        toast(`${c.ref}: only ${formatCurrency(c.available)} of this credit is left.`, 'danger');
-        return;
-      }
+    // C4: the parts of one credit (on several invoices) together never more than it has left.
+    const overdrawn = overdrawnCredits(shownCredits, shownUse)[0];
+    if (overdrawn) {
+      toast(
+        `${overdrawn.ref}: only ${money(overdrawn.available, overdrawn.currency)} of this credit is left, but ${money(creditUsed(shownUse, overdrawn.id).toFixed(2), overdrawn.currency)} of it is used.`,
+        'danger',
+      );
+      return;
     }
+    // B7: the Payment Method list entry (its type is the method), or a bare type.
+    const pm = paymentMethodPayload(methodValue, paymentMethods);
 
     const body: PaymentBody = {
       customerId,
       date,
-      method,
+      method: pm.method ?? method,
+      paymentMethodId: pm.paymentMethodId,
       amount: amt.toFixed(2),
       reference: reference.trim() || null,
       memo: memo.trim() || null,
@@ -1010,15 +1115,19 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
             <FieldError formId="pm" name="date" errors={fieldErrors} />
           </div>
           <div>
-            <Label htmlFor="pm-method">Method</Label>
-            <Select id="pm-method" value={method} onChange={(e) => setMethod(e.target.value)}>
-              <option value="cash">Cash</option>
-              <option value="check">Check</option>
-              <option value="credit_card">Credit Card</option>
-              <option value="ach">ACH</option>
-              <option value="bank_transfer">Bank Transfer</option>
-              <option value="other">Other</option>
-            </Select>
+            {/* B7: QB's Payment Method list ("Visa — Credit card"); a payment saved before the list
+                shows its bare type. Without access to the list the bare types are offered. */}
+            <PaymentMethodField
+              id="pm-method"
+              value={methodValue}
+              entries={paymentMethods}
+              onChange={(v) => {
+                methodTouched.current = true;
+                setMethodValue(v);
+                const t = paymentMethodPayload(v, paymentMethods).method;
+                if (t) setMethod(t);
+              }}
+            />
           </div>
           <div>
             <Label htmlFor="pm-deposit" required={!prefs.company.useUndepositedFunds}>
@@ -1074,11 +1183,18 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
           <div>
             <div className="flex items-center justify-between">
               <Label>Apply to Open Invoices <Help term="ar" /></Label>
-              {(visibleInvoices.length > 0 || shownCharges.length > 0) && (
-                <Button variant="ghost" size="sm" onClick={payAll}>
-                  Pay all
-                </Button>
-              )}
+              <span className="inline-flex gap-1">
+                {unusedDiscounts.length > 0 && (
+                  <Button variant="ghost" size="sm" onClick={takeAllDiscounts} title="Take every early-payment discount the terms allow on this date">
+                    Take discounts ({unusedDiscounts.length})
+                  </Button>
+                )}
+                {(visibleInvoices.length > 0 || shownCharges.length > 0) && (
+                  <Button variant="ghost" size="sm" onClick={payAll}>
+                    Pay all
+                  </Button>
+                )}
+              </span>
             </div>
             {invoicesLoading ? (
               <div className="flex items-center gap-2 py-2 text-sm text-navy/50">
@@ -1097,18 +1213,23 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
                     <tr className="bg-slate-50">
                       <Th>Number</Th>
                       <Th>Date</Th>
+                      <Th numeric>Amount</Th>
                       <Th numeric>Balance Due</Th>
                       <Th numeric>Early-pay discount <Help term="early-payment-discount" side="bottom" /></Th>
+                      <Th numeric>Credits</Th>
                       <Th numeric>Payment</Th>
                     </tr>
                   </thead>
                   <tbody>
                     {visibleInvoices.map((inv) => {
                       const sug = suggestions[inv.id];
+                      const discountTyped = dec(discountAmounts[inv.id]).greaterThan(0);
+                      const creditHere = creditOn(inv.id);
                       return (
                         <Tr key={inv.id}>
                           <Td className="font-medium">Invoice #{invNo(inv)}</Td>
                           <Td>{formatDate(inv.date)}</Td>
+                          <Td numeric>{money(inv.total, currency)}</Td>
                           <Td numeric className="font-semibold">{money(inv.balanceDue, currency)}</Td>
                           <Td numeric>
                             <AmountInput
@@ -1118,13 +1239,46 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
                               onChange={(e) => setDiscount(inv.id, e.target.value)}
                               className="text-right"
                             />
-                            {sug?.eligible && Number(sug.suggested) > 0 && !discountAmounts[inv.id] && (
+                            {/* C3: the server's suggestion — the terms' percent of the invoice amount,
+                                with the last day it can be taken. */}
+                            {sug?.discountDate && (
+                              <span className="mt-1 block text-xs text-navy/50">
+                                {sug.percent ? `${sug.percent}% ` : ''}if paid by {formatDate(sug.discountDate)}
+                                {sug.terms ? ` (${sug.terms})` : ''}
+                              </span>
+                            )}
+                            {sug?.eligible && dec(sug.suggested).greaterThan(0) && !discountTyped && (
                               <button
                                 type="button"
                                 className="mt-1 text-xs text-electric hover:underline"
                                 onClick={() => setDiscount(inv.id, sug.suggested)}
                               >
-                                Take {money(sug.suggested, currency)} (paid by {formatDate(sug.discountDate)})
+                                Take {money(sug.suggested, currency)}
+                              </button>
+                            )}
+                            {sug && !sug.eligible && sug.discountDate && (
+                              <span className="block text-xs text-navy/40">Discount date has passed</span>
+                            )}
+                          </Td>
+                          <Td numeric>
+                            {creditHere > 0 && (
+                              <span className="block font-medium tabular-nums">{money(creditHere, currency)}</span>
+                            )}
+                            {shownCredits.length > 0 && (
+                              <button
+                                type="button"
+                                className="text-xs text-electric hover:underline"
+                                aria-label={`Credits for invoice ${invNo(inv)}`}
+                                onClick={() =>
+                                  setCreditsFor({
+                                    target: inv.id,
+                                    title: `Invoice #${invNo(inv)}`,
+                                    balanceDue: inv.balanceDue,
+                                    discount: discountAmounts[inv.id] ?? '',
+                                  })
+                                }
+                              >
+                                {creditHere > 0 ? 'Change…' : 'Use credits…'}
                               </button>
                             )}
                           </Td>
@@ -1148,8 +1302,26 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
                           {c.memo && <span className="block text-xs font-normal text-navy/50">{c.memo}</span>}
                         </Td>
                         <Td>{c.date ? formatDate(c.date) : ''}</Td>
+                        <Td numeric />
                         <Td numeric className="font-semibold">{formatCurrency(c.open)}</Td>
                         <Td numeric />
+                        <Td numeric>
+                          {creditOn(JE_PREFIX + c.journalLineId) > 0 && (
+                            <span className="block font-medium tabular-nums">{formatCurrency(creditOn(JE_PREFIX + c.journalLineId))}</span>
+                          )}
+                          {shownCredits.some((cr) => takesCharges(cr.kind)) && (
+                            <button
+                              type="button"
+                              className="text-xs text-electric hover:underline"
+                              aria-label={`Credits for ${c.ref}`}
+                              onClick={() =>
+                                setCreditsFor({ target: JE_PREFIX + c.journalLineId, title: c.ref, balanceDue: c.open, discount: '' })
+                              }
+                            >
+                              {creditOn(JE_PREFIX + c.journalLineId) > 0 ? 'Change…' : 'Use credits…'}
+                            </button>
+                          )}
+                        </Td>
                         <Td numeric>
                           <AmountInput
                             placeholder="0.00"
@@ -1188,58 +1360,49 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
               </div>
             )}
 
-            {/* Credits: credit memos, earlier payments, General Journal credits */}
+            {/* C4: available credits (credit memos, earlier payments, General Journal credits) in the
+                payment's currency, with where each is used. A credit is used per invoice from the
+                invoice's "Use credits…" (QB's Discount and Credits window), so one credit can be
+                split over several invoices. */}
             {shownCredits.length > 0 && (visibleInvoices.length > 0 || shownCharges.length > 0) && (
               <div className="mt-4">
-                <Label>Use available credits</Label>
+                <Label>Available credits</Label>
                 <div className="border border-slate-200 rounded-lg overflow-hidden mt-1">
                   <Table>
                     <thead>
                       <tr className="bg-slate-50">
                         <Th>Credit</Th>
+                        <Th>Date</Th>
                         <Th numeric>Available</Th>
-                        <Th>Apply to</Th>
-                        <Th numeric>Amount</Th>
+                        <Th>Used on</Th>
+                        <Th numeric>Left</Th>
                       </tr>
                     </thead>
                     <tbody>
                       {shownCredits.map((c) => {
-                        const use = creditUse[c.id] ?? { invoiceId: '', amount: '' };
-                        // General Journal charges can take a General Journal credit or an earlier
-                        // payment (QB lets any open credit go against any open charge).
-                        const canTakeCharges = c.kind === 'journal_entry' || c.kind === 'payment';
+                        const parts = creditParts(shownUse, new Set([c.id]));
+                        const left = creditLeftFor(c, shownUse);
+                        const over = creditUsed(shownUse, c.id).greaterThan(dec(c.available));
                         return (
                           <Tr key={c.id}>
                             <Td>{c.ref}</Td>
-                            <Td numeric>{formatCurrency(c.available)}</Td>
-                            <Td>
-                              <Select
-                                aria-label={`Apply ${c.ref} to`}
-                                value={use.invoiceId}
-                                onChange={(e) => setCredit(c.id, { ...use, invoiceId: e.target.value })}
-                              >
-                                <option value="">Don&apos;t use</option>
-                                {visibleInvoices.map((inv) => (
-                                  <option key={inv.id} value={inv.id}>
-                                    Invoice #{invNo(inv)} ({formatCurrency(inv.balanceDue)})
-                                  </option>
-                                ))}
-                                {canTakeCharges &&
-                                  shownCharges.map((ch) => (
-                                    <option key={ch.journalLineId} value={JE_PREFIX + ch.journalLineId}>
-                                      {ch.ref} ({formatCurrency(ch.open)})
-                                    </option>
-                                  ))}
-                              </Select>
+                            <Td>{c.date ? formatDate(c.date) : ''}</Td>
+                            <Td numeric>{money(c.available, c.currency)}</Td>
+                            <Td className="text-xs">
+                              {parts.length === 0
+                                ? <span className="text-navy/40">Not used</span>
+                                : parts.map((p) => {
+                                    const inv = visibleInvoices.find((i) => i.id === p.target);
+                                    const ch = shownCharges.find((x) => JE_PREFIX + x.journalLineId === p.target);
+                                    return (
+                                      <span key={p.target} className="block">
+                                        {inv ? `Invoice #${invNo(inv)}` : ch?.ref ?? 'General Journal'}: {money(dec(p.amount).toFixed(2), c.currency)}
+                                      </span>
+                                    );
+                                  })}
                             </Td>
-                            <Td numeric>
-                              <AmountInput
-                                placeholder="0.00"
-                                aria-label={`Amount of ${c.ref}`}
-                                value={use.amount}
-                                onChange={(e) => setCredit(c.id, { ...use, amount: e.target.value })}
-                                className="text-right"
-                              />
+                            <Td numeric className={over ? 'text-red-600 font-semibold' : undefined}>
+                              {over ? `${money(creditUsed(shownUse, c.id).minus(dec(c.available)).toFixed(2), c.currency)} too much` : money(left.toFixed(2), c.currency)}
                             </Td>
                           </Tr>
                         );
@@ -1249,6 +1412,12 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
                 </div>
               </div>
             )}
+            {foreign && credits.some((c) => !c.currency) && (
+              <p className="mt-2 text-xs text-navy/50">
+                Credit memos and General Journal credits are in your home currency, so they can only be used on a
+                home-currency payment.
+              </p>
+            )}
 
             {/* Totals */}
             <div className="mt-3 space-y-1 px-1 text-sm">
@@ -1257,7 +1426,7 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
                 <div className="flex justify-between"><span className="text-navy/60">Discounts</span><span className="font-semibold tabular-nums">{money(discountTotal, currency)}</span></div>
               )}
               {creditTotal > 0 && (
-                <div className="flex justify-between"><span className="text-navy/60">Credits used</span><span className="font-semibold tabular-nums">{formatCurrency(creditTotal)}</span></div>
+                <div className="flex justify-between"><span className="text-navy/60">Credits used</span><span className="font-semibold tabular-nums">{money(creditTotal, currency)}</span></div>
               )}
               {Number(amount) > 0 && (
                 <div className="flex justify-between">
@@ -1271,7 +1440,25 @@ function ReceivePaymentModal({ open, editing, onClose, onSaved, customers, accou
           </div>
         )}
       </div>
+<<<<<<< HEAD
       <AttachmentPanel className="mt-4" entityType="payment_received" entityId={editing?.id} />
+=======
+      {/* C4: credits used on one invoice / General Journal charge (QB's Discount and Credits). */}
+      <CreditsDialog
+        open={!!creditsFor}
+        onClose={() => setCreditsFor(null)}
+        title={creditsFor?.title ?? ''}
+        target={creditsFor?.target ?? ''}
+        balanceDue={creditsFor?.balanceDue ?? '0'}
+        discount={creditsFor?.discount ?? ''}
+        credits={
+          creditsFor && creditsFor.target.startsWith(JE_PREFIX) ? shownCredits.filter((c) => takesCharges(c.kind)) : shownCredits
+        }
+        use={shownUse}
+        onChange={changeCreditUse}
+        fmt={(v) => money(v, currency)}
+      />
+>>>>>>> feat/salesar
     </Modal>
   );
 }
@@ -1775,12 +1962,35 @@ function PaymentsPageContent() {
 
   // Quick Actions navigate here with ?new=1 — open the Receive Payment modal.
   useNewParam(() => setModalOpen(true));
+  // Drill-downs (the transaction log, Client Data Review) link here with ?focus=<id>.
+  useFocusId(true, (id) => void openEdit({ id } as Payment));
   const [prefillCustomerId, setPrefillCustomerId] = useState<string | null>(null);
+  const [prefillInvoiceId, setPrefillInvoiceId] = useState<string | null>(null);
   usePrefill('payment', (p) => {
     setEditTarget(null);
     setPrefillCustomerId(p.customerId ?? null);
+    setPrefillInvoiceId(null);
     setModalOpen(true);
   });
+  // Income Tracker / Collections Center "Receive Payment": /payments?customerId=<id>[&invoiceId=<id>]
+  // opens a NEW payment for the customer (with the invoice selected and its open amount filled).
+  // The parameters are then dropped so a later visit / Back does not open it again.
+  const searchParams = useSearchParams();
+  const router = useRouter();
+  const pathname = usePathname();
+  const link = parseReceivePaymentLink(searchParams);
+  const linkKey = link ? `${link.customerId}:${link.invoiceId ?? ''}` : null;
+  useEffect(() => {
+    if (!link) return;
+    setEditTarget(null);
+    setPrefillCustomerId(link.customerId);
+    setPrefillInvoiceId(link.invoiceId);
+    setModalOpen(true);
+    router.replace(pathname, { scroll: false });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [linkKey]);
+  // B7: the Payment Method list (names on the list, the picker on the form).
+  const paymentMethods = usePaymentMethods(true);
 
   async function handleVoid() {
     if (!voidTarget) return;
@@ -1891,7 +2101,8 @@ function PaymentsPageContent() {
                   <Td className="font-medium text-navy">{nameOf(p)}</Td>
                   <Td>
                     <Badge tone={methodBadgeTone(p.method)}>
-                      {METHOD_LABELS[p.method] ?? p.method}
+                      {/* B7: the Payment Method list entry ("Visa"), else the type. */}
+                      {p.paymentMethodId ? paymentMethodDisplay(p, paymentMethods) : (METHOD_LABELS[p.method] ?? p.method)}
                     </Badge>
                   </Td>
                   <Td className="text-navy/60 text-sm">{p.reference ?? '—'}</Td>
@@ -2008,8 +2219,11 @@ function PaymentsPageContent() {
           setModalOpen(false);
           setEditTarget(null);
           setPrefillCustomerId(null);
+          setPrefillInvoiceId(null);
         }}
         prefillCustomerId={editTarget ? null : prefillCustomerId}
+        prefillInvoiceId={editTarget ? null : prefillInvoiceId}
+        paymentMethods={paymentMethods}
         onSaved={fetchPayments}
         customers={customers}
         accounts={accounts}

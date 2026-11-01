@@ -11,9 +11,11 @@ import {
   Download,
 } from 'lucide-react';
 import {
+  AmountInput,
   Button,
   Card,
   ConfirmDialog,
+  DateInput,
   EmptyState,
   Input,
   Select,
@@ -38,7 +40,11 @@ import { formatCurrency } from '@/lib/money';
 import { useFocusParam } from '@/lib/useFocusParam';
 import { EntityNotes } from '@/components/lists/EntityNotes';
 import Link from 'next/link';
+<<<<<<< HEAD
 import CenterDetail, { CENTER_ROW_ATTR, useCenterLayout, useCenterSelection } from '@/components/lists/CenterDetail';
+=======
+import { todayISO } from '@/lib/dates';
+>>>>>>> feat/salesar
 
 // ---------------------------------------------------------------------------
 // Types
@@ -61,6 +67,27 @@ interface Vendor {
   accountNumber?: string | null;
   currency?: string | null;
   prefillAccountIds?: string[] | null;
+  /** B4: Vendor Type list entry. */
+  vendorTypeId?: string | null;
+}
+
+/** B4: Vendor Type list entry (GET /api/type-lists/vendor). */
+interface TypeOption {
+  id: string;
+  name: string;
+  parentId: string | null;
+  isActive: boolean;
+}
+
+/** "Parent:Child" name of a type list entry. */
+function typeFullName(t: TypeOption, all: TypeOption[]): string {
+  const path: string[] = [];
+  const seen = new Set<string>();
+  for (let cur: TypeOption | undefined = t; cur && !seen.has(cur.id); cur = cur.parentId ? all.find((x) => x.id === cur!.parentId) : undefined) {
+    seen.add(cur.id);
+    path.unshift(cur.name);
+  }
+  return path.join(':');
 }
 
 interface TermsOption {
@@ -96,6 +123,10 @@ interface VendorFormState {
   currency: string;
   /** Always three slots; '' = unused. */
   prefillAccountIds: [string, string, string];
+  vendorTypeId: string;
+  /** New vendor only (QB "Opening Balance ... as of"). */
+  openingBalance: string;
+  openingBalanceDate: string;
 }
 
 const EMPTY_FORM: VendorFormState = {
@@ -111,6 +142,9 @@ const EMPTY_FORM: VendorFormState = {
   accountNumber: '',
   currency: '',
   prefillAccountIds: ['', '', ''],
+  vendorTypeId: '',
+  openingBalance: '',
+  openingBalanceDate: '',
 };
 
 const TERMS_OPTIONS = [
@@ -154,10 +188,20 @@ function VendorsPageContent() {
 
   // Terms list (wave-2 lists)
   const [termsList, setTermsList] = useState<TermsOption[]>([]);
+  // B4: Vendor Type list; an edit sends the type only when the list loaded (never clears it unseen).
+  const [vendorTypes, setVendorTypes] = useState<TypeOption[]>([]);
+  const [vendorTypesLoaded, setVendorTypesLoaded] = useState(false);
   useEffect(() => {
     api
       .get<{ entries: TermsOption[] }>('/api/lists/terms?includeInactive=true')
       .then((d) => setTermsList(d.entries))
+      .catch(() => {});
+    api
+      .get<{ types: TypeOption[] }>('/api/type-lists/vendor')
+      .then((d) => {
+        setVendorTypes(Array.isArray(d.types) ? d.types : []);
+        setVendorTypesLoaded(true);
+      })
       .catch(() => {});
   }, []);
 
@@ -169,7 +213,8 @@ function VendorsPageContent() {
   async function fetchVendors() {
     setLoading(true);
     try {
-      const data = await api.get<Vendor[]>('/api/vendors');
+      // Balances come from the A/P ledger (the stored vendors.balance column is not kept up to date).
+      const data = await api.get<Vendor[]>('/api/vendors?withBalances=true');
       setVendors(data);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Failed to load vendors';
@@ -196,7 +241,7 @@ function VendorsPageContent() {
   function openAdd() {
     setEditingVendor(null);
     // Preferences > Bills: default terms for new vendors.
-    setForm({ ...EMPTY_FORM, terms: prefs.company.defaultVendorTerms });
+    setForm({ ...EMPTY_FORM, terms: prefs.company.defaultVendorTerms, openingBalanceDate: todayISO() });
     setModalOpen(true);
   }
 
@@ -216,6 +261,9 @@ function VendorsPageContent() {
       accountNumber: vendor.accountNumber ?? '',
       currency: vendor.currency ?? '',
       prefillAccountIds: [0, 1, 2].map((i) => vendor.prefillAccountIds?.[i] ?? '') as [string, string, string],
+      vendorTypeId: vendor.vendorTypeId ?? '',
+      openingBalance: '',
+      openingBalanceDate: '',
     });
     setModalOpen(true);
   }
@@ -265,14 +313,26 @@ function VendorsPageContent() {
         accountNumber: form.accountNumber.trim() || null,
         currency: form.currency || null,
         prefillAccountIds: [...new Set(form.prefillAccountIds.filter(Boolean))],
+        ...(vendorTypesLoaded || !editingVendor ? { vendorTypeId: form.vendorTypeId || null } : {}),
       };
 
       if (editingVendor) {
         await api.patch(`/api/vendors/${editingVendor.id}`, payload);
         toast('Vendor updated.', 'success');
       } else {
-        await api.post('/api/vendors', payload);
-        toast('Vendor created.', 'success');
+        // QB "Opening Balance ... as of": recorded as a bill in the same save.
+        const created = await api.post<{ openingBalanceDoc?: { kind: string } }>('/api/vendors', {
+          ...payload,
+          openingBalance: form.openingBalance.trim() || undefined,
+          openingBalanceDate: form.openingBalance.trim() ? form.openingBalanceDate || undefined : undefined,
+        });
+        const ob = created.openingBalanceDoc;
+        toast(
+          ob
+            ? `Vendor created. The opening balance is recorded as ${ob.kind === 'bill' ? 'a bill' : 'a vendor credit'}.`
+            : 'Vendor created.',
+          'success',
+        );
       }
 
       closeModal();
@@ -572,6 +632,56 @@ function VendorsPageContent() {
             </Select>
             <p className="mt-1 text-xs text-navy/50">
               Edit the choices on the <Link href="/lists?list=terms" className="text-electric hover:underline">Terms list</Link>.
+            </p>
+          </div>
+
+          {/* Opening balance (QB New Vendor "Opening Balance ... as of") — new vendors only */}
+          {!editingVendor && (
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <Label htmlFor="openingBalance">Opening balance</Label>
+                <AmountInput
+                  id="openingBalance"
+                  placeholder="0.00"
+                  value={form.openingBalance}
+                  onChange={(e) => setField('openingBalance', e.target.value)}
+                  onValueCommit={(v) => setField('openingBalance', v)}
+                />
+              </div>
+              <div>
+                <Label htmlFor="openingBalanceDate">as of</Label>
+                <DateInput
+                  id="openingBalanceDate"
+                  value={form.openingBalanceDate}
+                  onChange={(e) => setField('openingBalanceDate', e.target.value)}
+                />
+              </div>
+              <p className="col-span-2 -mt-2 text-xs text-navy/50">
+                What you owe this vendor on that date. It is recorded as a bill from the vendor (on
+                Uncategorized Expenses), so it shows in Pay Bills and on A/P aging. Leave blank for none.
+              </p>
+            </div>
+          )}
+
+          {/* Vendor Type (B4) */}
+          <div>
+            <Label htmlFor="vendorType">Vendor type</Label>
+            <Select id="vendorType" value={form.vendorTypeId} onChange={(e) => setField('vendorTypeId', e.target.value)}>
+              <option value="">—</option>
+              {vendorTypes
+                .filter((t) => t.isActive || t.id === form.vendorTypeId)
+                .map((t) => ({ t, name: typeFullName(t, vendorTypes) }))
+                .sort((a, b) => a.name.localeCompare(b.name))
+                .map(({ t, name }) => (
+                  <option key={t.id} value={t.id}>
+                    {name}
+                    {t.isActive ? '' : ' — inactive'}
+                  </option>
+                ))}
+            </Select>
+            <p className="mt-1 text-xs text-navy/50">
+              Groups vendors (Suppliers, Contractors…) for report filters. Edit the choices on the{' '}
+              <Link href="/lists?list=vendor-types" className="text-electric hover:underline">Vendor Types list</Link>.
             </p>
           </div>
 

@@ -13,12 +13,15 @@
  */
 import { and, asc, eq, ne, sql } from 'drizzle-orm';
 import { accounts, vendors } from '@/lib/db/schema';
+import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, assertRefInCompany, inTransaction, notFound, validation, writeAudit } from './_base';
 import { getPreferences } from './preferences';
 import { maskForContext } from './access';
 import { resolvePartyTerms } from './lists/fields';
 import { type VendorPurchaseFieldsInput, resolveVendorPurchaseFields } from './vendorPurchaseFields';
 import { assertAccountantListEdit, assertListDeleteAllowed } from './accountantCopy/guard';
+import { assertTypeAssignable } from './typeLists';
+import { type OpeningBalanceInput, type OpeningBalanceResult, postVendorOpeningBalance } from './openingBalances';
 
 // ---------------------------------------------------------------------------
 // Input types
@@ -43,9 +46,14 @@ export interface CreateVendorInput extends VendorPurchaseFieldsInput {
   notes?: string | null;
   /** Terms list entry (wins over the legacy `terms` string, which is kept in sync). */
   termsId?: string | null;
+  /** B4: Vendor Type list entry (a report filter). */
+  vendorTypeId?: string | null;
 }
 
 export type UpdateVendorInput = Partial<CreateVendorInput>;
+
+/** New Vendor: the record plus QB's "Opening Balance ... as of" (lib/services/openingBalances.ts). */
+export type NewVendorInput = CreateVendorInput & OpeningBalanceInput;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -126,11 +134,23 @@ const isMaskedValue = (v: string | null | undefined) =>
 // Create
 // ---------------------------------------------------------------------------
 
-/** Create a new vendor record for the company. */
-export async function createVendor(ctx: ServiceContext, input: CreateVendorInput) {
+/**
+ * Create a new vendor record for the company. With an opening balance (QB New Vendor "Opening
+ * Balance ... as of"), the bill recording it is posted in the SAME transaction: when the posting
+ * is refused (closing date, no exchange rate for the vendor's currency, ...) the vendor is not
+ * created either.
+ */
+export async function createVendor(
+  ctx: ServiceContext,
+  input: NewVendorInput,
+): Promise<Awaited<ReturnType<typeof createVendorInTx>> & { openingBalanceDoc?: OpeningBalanceResult }> {
   // The unique-name check runs in the same transaction as the insert (two creates at once must
   // not both add the same name).
-  return inTransaction(ctx, (tx) => createVendorInTx(tx, input));
+  return inTransaction(ctx, async (tx) => {
+    const row = await createVendorInTx(tx, input);
+    const ob = await postVendorOpeningBalance(tx, row.id, input);
+    return ob ? { ...row, openingBalanceDoc: ob } : row;
+  });
 }
 
 async function createVendorInTx(ctx: ServiceContext, input: CreateVendorInput) {
@@ -145,6 +165,7 @@ async function createVendorInTx(ctx: ServiceContext, input: CreateVendorInput) {
   }
   const termsRes = await resolvePartyTerms(ctx, { termsId: input.termsId, terms: input.terms });
   const purchaseFields = await resolveVendorPurchaseFields(ctx, input);
+  await assertTypeAssignable(ctx, 'vendor', input.vendorTypeId);
 
   const [row] = await ctx.db
     .insert(vendors)
@@ -162,6 +183,7 @@ async function createVendorInTx(ctx: ServiceContext, input: CreateVendorInput) {
       taxId: input.taxId ?? null,
       defaultExpenseAccountId: input.defaultExpenseAccountId ?? null,
       notes: input.notes ?? null,
+      vendorTypeId: input.vendorTypeId ?? null,
       ...purchaseFields,
     })
     .returning();
@@ -211,6 +233,9 @@ async function updateVendorInTx(ctx: ServiceContext, id: string, patch: UpdateVe
   }
   const termsRes = await resolvePartyTerms(ctx, { termsId: patch.termsId, terms: patch.terms });
   const purchaseFields = await resolveVendorPurchaseFields(ctx, patch, before);
+  if (patch.vendorTypeId !== undefined) {
+    await assertTypeAssignable(ctx, 'vendor', patch.vendorTypeId, before.vendorTypeId);
+  }
 
   const [row] = await ctx.db
     .update(vendors)
@@ -232,6 +257,7 @@ async function updateVendorInTx(ctx: ServiceContext, id: string, patch: UpdateVe
           ? patch.defaultExpenseAccountId
           : before.defaultExpenseAccountId,
       notes: patch.notes !== undefined ? patch.notes : before.notes,
+      vendorTypeId: patch.vendorTypeId !== undefined ? (patch.vendorTypeId ?? null) : before.vendorTypeId,
       ...purchaseFields,
       updatedAt: new Date(),
     })
@@ -307,4 +333,22 @@ export async function reactivateVendor(ctx: ServiceContext, id: string) {
 /** Unmasked vendor row for internal snapshots (Undo restores it through updateVendor). */
 export async function loadVendorUnmasked(ctx: ServiceContext, id: string) {
   return loadVendor(ctx, id);
+}
+
+/**
+ * Vendors with what is owed to each as the A/P ledger has it (home currency, by name — the same
+ * figure as Vendor Balance Summary). The stored vendors.balance column is never maintained by the
+ * posting engine, so the Vendor Center showed 0.00 for everyone.
+ */
+export async function listVendorsWithBalances(ctx: ServiceContext, opts?: { includeInactive?: boolean }) {
+  const rows = await listVendors(ctx, opts);
+  // Lazy import: the report engine imports the document services, which import this module.
+  const { ledgerTotalsByName, loadAccountMeta } = await import('./reportEngine');
+  const meta = await loadAccountMeta(ctx);
+  const owed = new Map<string, ReturnType<typeof Money.zero>>();
+  for (const t of await ledgerTotalsByName(ctx, meta, { sections: ['ap'] })) {
+    if (t.nameType !== 'vendor' || !t.nameId) continue;
+    owed.set(t.nameId, (owed.get(t.nameId) ?? Money.zero()).plus(t.natural));
+  }
+  return rows.map((r) => ({ ...r, balance: toAmountString(owed.get(r.id) ?? Money.zero()) }));
 }

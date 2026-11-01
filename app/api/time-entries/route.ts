@@ -4,7 +4,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
-import { listTimeEntries, createTimeEntry } from '@/lib/services/timeTracking';
+import { listTimeEntriesWithRates, createTimeEntry } from '@/lib/services/timeTracking';
 import { ServiceError } from '@/lib/services/_base';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { createTimeEntrySchema } from '@/lib/validation/timeEntries';
@@ -32,7 +32,8 @@ export async function GET(req: NextRequest) {
     const invoiced =
       invoicedParam === 'true' ? true : invoicedParam === 'false' ? false : undefined;
 
-    const rows = await listTimeEntries(ctx, { customerId, billable, invoiced });
+    // Each entry with the rate billing will use (typed rate > billing rate level > item price, B13).
+    const rows = await listTimeEntriesWithRates(ctx, { customerId, billable, invoiced });
     return NextResponse.json(rows);
   } catch (err) {
     return errorResponse(err);

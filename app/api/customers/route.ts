@@ -5,11 +5,13 @@
  * Query params for GET:
  *   ?includeInactive=true  — include deactivated customers.
  *   ?balanceSummary=true   — instead of the full list, return the balance summary.
+ *   ?withBalances=true     — each customer with its A/R ledger balance (Customer Center).
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import {
   listCustomers,
+  listCustomersWithBalances,
   createCustomer,
   customerBalanceSummary,
 } from '@/lib/services/customers';
@@ -38,7 +40,10 @@ export async function GET(req: NextRequest) {
     }
 
     const includeInactive = searchParams.get('includeInactive') === 'true';
-    const list = await listCustomers(ctx, { includeInactive });
+    const list =
+      searchParams.get('withBalances') === 'true'
+        ? await listCustomersWithBalances(ctx, { includeInactive })
+        : await listCustomers(ctx, { includeInactive });
     return NextResponse.json(list);
   } catch (err) {
     return errorResponse(err);

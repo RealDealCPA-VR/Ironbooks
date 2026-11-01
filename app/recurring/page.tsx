@@ -39,7 +39,10 @@ type DocType =
   | 'credit_memo'
   | 'deposit'
   | 'transfer'
-  | 'purchase_order';
+  | 'purchase_order'
+  | 'estimate'
+  | 'sales_order'
+  | 'vendor_credit';
 /** The document types this page can build from scratch (others are memorized from their forms). */
 type BuildableDocType = 'invoice' | 'bill' | 'journal_entry' | 'expense';
 type Frequency =
@@ -158,7 +161,16 @@ const DOC_BADGES: Record<DocType, { label: string; tone: 'neutral' | 'success' |
   deposit: { label: 'Deposit', tone: 'info' },
   transfer: { label: 'Transfer', tone: 'info' },
   purchase_order: { label: 'Purchase Order', tone: 'neutral' },
+  estimate: { label: 'Estimate', tone: 'info' },
+  sales_order: { label: 'Sales Order', tone: 'success' },
+  vendor_credit: { label: 'Bill Credit', tone: 'warning' },
 };
+
+/** "estimate", "bill credit": what one entry of a memorized transaction creates. */
+function docNoun(docType: DocType | undefined): string {
+  if (!docType) return '';
+  return (DOC_BADGES[docType]?.label ?? docType.replace(/_/g, ' ')).toLowerCase();
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -971,7 +983,7 @@ export default function RecurringPage() {
     setRunNowLoading(true);
     try {
       await api.post('/api/recurring/run', { id: runNowTarget.id });
-      toast(`Generated 1 ${runNowTarget.docType.replace('_', ' ')} from "${runNowTarget.name}"`, 'success');
+      toast(`Generated 1 ${docNoun(runNowTarget.docType)} from "${runNowTarget.name}"`, 'success');
       setRunNowTarget(null);
       await fetchTemplates();
     } catch (err) {
@@ -1381,7 +1393,7 @@ export default function RecurringPage() {
           <>
             Generate one{' '}
             <strong className="text-navy">
-              {runNowTarget?.docType.replace('_', ' ')}
+              {docNoun(runNowTarget?.docType)}
             </strong>{' '}
             from template{' '}
             <strong className="text-navy">&quot;{runNowTarget?.name}&quot;</strong> immediately?

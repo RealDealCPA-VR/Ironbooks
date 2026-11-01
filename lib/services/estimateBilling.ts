@@ -304,8 +304,8 @@ export async function refreshEstimateBilling(
 
   let status = est.status;
   let convertedInvoiceId = est.convertedInvoiceId;
-  if (est.status === 'rejected') {
-    // A rejected estimate keeps its status (invoices cannot bill it; this only guards legacy links).
+  if (est.status === 'rejected' || est.status === 'void') {
+    // A rejected or void estimate keeps its status (invoices cannot bill it; this only guards legacy links).
   } else if (allBilled && anyBilled) {
     status = 'closed';
     convertedInvoiceId = opts.closingInvoiceId ?? est.convertedInvoiceId;

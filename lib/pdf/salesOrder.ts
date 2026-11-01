@@ -22,6 +22,8 @@ export interface SalesOrderPdfData {
   };
   lines: SalesFormPdfLine[];
   shipping?: SalesShippingInfo | null;
+  /** salesar (B8): the order's Customer Message. */
+  customerMessage?: string | null;
 }
 
 /** A `template` (a resolved form template) prints the template layout; without one, the built-in layout. */
@@ -42,6 +44,7 @@ export async function renderSalesOrderPdf(data: SalesOrderPdfData, template?: Pd
         lines: data.lines.map((l) => ({ ...l, ordered: l.quantity, description: l.description || '—' })),
         totals: [{ label: 'Total', value: o.total, emphasis: 'total' as const }],
         memo: o.memo ?? null,
+        customerMessage: data.customerMessage ?? null,
       },
       template.design,
       template.logo,
@@ -57,6 +60,7 @@ export async function renderSalesOrderPdf(data: SalesOrderPdfData, template?: Pd
     shipping: data.shipping,
     lines: data.lines,
     totals: [['Total', data.order.total]],
+    message: data.customerMessage ?? null,
     note: data.order.memo ? `Memo: ${data.order.memo}` : null,
   });
 }

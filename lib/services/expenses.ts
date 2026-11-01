@@ -74,9 +74,13 @@ import {
   reverseDocumentInventory,
 } from './inventorySites';
 import { assertClosedPeriodEdit, planPostedEdit, retitleEntry } from './postedEdit';
+<<<<<<< HEAD
 import { carryReconciledLines, prepareReconciledRepost } from './reconciledEdits';
 import { syncLineMemos } from './entryLineMemos';
 import { subledgerAccountReason } from '@/lib/registerEntryPlan';
+=======
+import { assertLineJobs } from './jobCustomers';
+>>>>>>> feat/salesar
 
 // ---------------------------------------------------------------------------
 // Types
@@ -399,6 +403,9 @@ async function prepareExpense(
     const reason = acct ? subledgerAccountReason(acct) : null;
     if (reason) throw validation(`Line ${i + 1}: ${reason}`);
   }
+
+  // A billable line's job must belong to its customer (a line with only a job takes its customer).
+  await assertLineJobs(ctx, lines, { fill: true });
 
   // QB: a check line on A/R (e.g. refunding a customer) carries that customer's name, and a
   // line on A/P carries the payee vendor, so A/R / A/P aging sees it (posting.ts guard).

@@ -4,9 +4,14 @@
  *  - 'fixed_rate': one hourly rate for every service item billed for the person;
  *  - 'custom': a rate per service item (items without a custom rate use their sales price).
  *
- * Levels are assigned to employees, vendors and other names. `resolveBillingRate` is the hook the
- * time-billing flow (time entries → invoice) calls to price a billable hour; precedence there is
- * QB's: billing rate level of the person > the service item's sales price. No GL impact.
+ * Levels are assigned to employees, vendors and other names. Every time-billing path (the invoice
+ * form's Time/Costs list and its save — lib/services/billables.ts —, Create Invoice from Billable
+ * Time — timeTracking.billTimeToInvoice —, and the Income Tracker's unbilled time) prices a
+ * billable hour with `resolveTimeEntryRates`; precedence is QB's: a rate typed on the time entry >
+ * the person's billing rate level (its custom rate for the entry's service item, else its fixed
+ * rate; a custom level without a rate for that item falls back) > the service item's sales price
+ * > 0. `resolveBillingRate` answers the same question for one person + item (the timesheet's
+ * rate preview). No GL impact.
  */
 import { and, asc, eq, inArray } from 'drizzle-orm';
 import {
@@ -201,9 +206,9 @@ export interface ResolvedBillingRate {
 }
 
 /**
- * Hourly rate to bill for `serviceItemId` worked by the given person. TODO(time billing):
- * lib/services/timeTracking.ts / billables.ts should call this when turning billable time into
- * invoice lines (time entries carry employeeId; vendor/other-name time when those are added).
+ * Hourly rate to bill for `serviceItemId` worked by the given person (no rate typed on the time):
+ * the person's billing rate level, else the item's sales price. Billing itself goes through
+ * `resolveTimeEntryRates` (same precedence, many entries at once).
  */
 export async function resolveBillingRate(
   ctx: ServiceContext,
@@ -243,6 +248,154 @@ export async function resolveBillingRate(
     }
   }
   return { rate: itemPrice, source: itemPrice ? 'item_price' : 'none', levelId: null, levelName: null };
+}
+
+// ---------------------------------------------------------------------------
+// Pricing billable time (B13)
+// ---------------------------------------------------------------------------
+
+/** Where a billable hour's rate came from. */
+export type TimeRateSource = 'entry' | 'billing_rate_level' | 'item_price' | 'none';
+
+/** A billable time entry as the rate resolver needs it (time entries carry the employee). */
+export interface RateableTime {
+  id: string;
+  employeeId?: string | null;
+  vendorId?: string | null;
+  otherNameId?: string | null;
+  serviceItemId?: string | null;
+  /** Rate typed on the entry (null / 0 = none typed). */
+  rate?: string | number | null;
+}
+
+export interface TimeEntryRate {
+  /** Hourly rate: 2 decimals unless the source has more (billing levels keep 4). */
+  rate: string;
+  source: TimeRateSource;
+  levelId: string | null;
+  levelName: string | null;
+}
+
+/** A rate as a string: '95.00', or '33.3333' when the level / item price has more decimals. */
+export function formatBillingRate(v: ReturnType<typeof Money.of>): string {
+  return v.decimalPlaces() <= 2 ? v.toFixed(2) : v.toFixed(4);
+}
+
+/**
+ * The hourly rate to bill for each time entry, by QB's precedence:
+ *   1. a rate typed on the entry (greater than zero);
+ *   2. the person's ACTIVE billing rate level — a fixed-rate level's rate, or a custom level's
+ *      rate for the entry's service item (a custom level with no rate for that item falls back);
+ *   3. the service item's sales price;
+ *   4. 0.
+ * Everything is read in a handful of company-scoped queries, so a long Time/Costs list costs the
+ * same as a short one.
+ */
+export async function resolveTimeEntryRates(
+  ctx: ServiceContext,
+  entries: RateableTime[],
+): Promise<Map<string, TimeEntryRate>> {
+  const out = new Map<string, TimeEntryRate>();
+  if (entries.length === 0) return out;
+  const c = ctx.companyId;
+  const uniq = (vals: Array<string | null | undefined>) => [...new Set(vals.filter((v): v is string => !!v))];
+
+  const itemIds = uniq(entries.map((e) => e.serviceItemId));
+  const priceOf = new Map<string, string | null>();
+  if (itemIds.length) {
+    for (const r of await ctx.db
+      .select({ id: items.id, salesPrice: items.salesPrice })
+      .from(items)
+      .where(and(eq(items.companyId, c), inArray(items.id, itemIds)))) {
+      priceOf.set(r.id, r.salesPrice);
+    }
+  }
+
+  // Person → level id.
+  const levelOfEmployee = new Map<string, string | null>();
+  const levelOfVendor = new Map<string, string | null>();
+  const levelOfOther = new Map<string, string | null>();
+  const empIds = uniq(entries.map((e) => e.employeeId));
+  if (empIds.length) {
+    for (const r of await ctx.db
+      .select({ id: employees.id, v: employees.billingRateLevelId })
+      .from(employees)
+      .where(and(eq(employees.companyId, c), inArray(employees.id, empIds)))) {
+      levelOfEmployee.set(r.id, r.v);
+    }
+  }
+  const vendIds = uniq(entries.map((e) => (e.employeeId ? null : e.vendorId)));
+  if (vendIds.length) {
+    for (const r of await ctx.db
+      .select({ id: vendors.id, v: vendors.billingRateLevelId })
+      .from(vendors)
+      .where(and(eq(vendors.companyId, c), inArray(vendors.id, vendIds)))) {
+      levelOfVendor.set(r.id, r.v);
+    }
+  }
+  const otherIds = uniq(entries.map((e) => (e.employeeId || e.vendorId ? null : e.otherNameId)));
+  if (otherIds.length) {
+    for (const r of await ctx.db
+      .select({ id: otherNames.id, v: otherNames.billingRateLevelId })
+      .from(otherNames)
+      .where(and(eq(otherNames.companyId, c), inArray(otherNames.id, otherIds)))) {
+      levelOfOther.set(r.id, r.v);
+    }
+  }
+  const levelOf = (e: RateableTime): string | null =>
+    e.employeeId
+      ? levelOfEmployee.get(e.employeeId) ?? null
+      : e.vendorId
+        ? levelOfVendor.get(e.vendorId) ?? null
+        : e.otherNameId
+          ? levelOfOther.get(e.otherNameId) ?? null
+          : null;
+
+  const levelIds = uniq(entries.map(levelOf));
+  const levels = new Map<string, typeof billingRateLevels.$inferSelect>();
+  const customRate = new Map<string, string>(); // `${levelId}:${itemId}` → rate
+  if (levelIds.length) {
+    for (const l of await ctx.db
+      .select()
+      .from(billingRateLevels)
+      .where(and(eq(billingRateLevels.companyId, c), inArray(billingRateLevels.id, levelIds)))) {
+      levels.set(l.id, l);
+    }
+    const customIds = [...levels.values()].filter((l) => l.type === 'custom').map((l) => l.id);
+    if (customIds.length && itemIds.length) {
+      for (const r of await ctx.db
+        .select({ levelId: billingRateLevelItems.levelId, itemId: billingRateLevelItems.itemId, rate: billingRateLevelItems.rate })
+        .from(billingRateLevelItems)
+        .where(and(inArray(billingRateLevelItems.levelId, customIds), inArray(billingRateLevelItems.itemId, itemIds)))) {
+        customRate.set(`${r.levelId}:${r.itemId}`, r.rate);
+      }
+    }
+  }
+
+  for (const e of entries) {
+    if (e.rate != null && e.rate !== '' && Money.gt(e.rate, 0)) {
+      out.set(e.id, { rate: formatBillingRate(Money.of(e.rate)), source: 'entry', levelId: null, levelName: null });
+      continue;
+    }
+    const levelId = levelOf(e);
+    const level = levelId ? levels.get(levelId) : undefined;
+    if (level && level.isActive) {
+      let levelRate: string | null = null;
+      if (level.type === 'fixed_rate' && level.fixedRate != null) levelRate = level.fixedRate;
+      else if (level.type === 'custom' && e.serviceItemId) levelRate = customRate.get(`${level.id}:${e.serviceItemId}`) ?? null;
+      if (levelRate != null) {
+        out.set(e.id, { rate: formatBillingRate(Money.of(levelRate)), source: 'billing_rate_level', levelId: level.id, levelName: level.name });
+        continue;
+      }
+    }
+    const price = e.serviceItemId ? priceOf.get(e.serviceItemId) : null;
+    if (price != null) {
+      out.set(e.id, { rate: formatBillingRate(Money.of(price)), source: 'item_price', levelId: null, levelName: null });
+    } else {
+      out.set(e.id, { rate: '0.00', source: 'none', levelId: null, levelName: null });
+    }
+  }
+  return out;
 }
 
 /** Exposed for Clean Up: is the level referenced outside its own rate rows? */

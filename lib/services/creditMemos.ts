@@ -52,6 +52,7 @@ import { assertSalesTaxAllowed } from '@/lib/featureGate';
 import { and, asc, eq, inArray, ne, sql } from 'drizzle-orm';
 import {
   accounts,
+  classes,
   creditMemos,
   creditMemoLines,
   customers,
@@ -80,12 +81,16 @@ import {
 import {
   type ServiceContext,
   ServiceError,
+  assertRefInCompany,
   inTransaction,
   notFound,
   validation,
   writeAudit,
 } from './_base';
 import { applyCustomerTaxDefaults } from './customerDefaults';
+import { resolveCustomerMessage, storedLineTaxCode } from './salesFormLists';
+import { companyToday } from './salesDates';
+import { assertDocumentJob, assertLineJobs } from './jobCustomers';
 import { allocateDocNumber, docRef, renumberDoc } from './docNumbers';
 import { type AppliedPricing, resolveLinePricing } from './pricing';
 import { type SalesLineKind, SalesLineTotals, salesLineKind } from './salesLineKinds';
@@ -113,12 +118,18 @@ export interface CreditMemoLineInput extends InventoryLineDetail {
   accountId?: string | null;
   /** Whether this line participates in tax computation. Defaults true. */
   taxable?: boolean;
+  /** salesar (B9): the line's Sales Tax Code; `taxable` follows it (salesFormLists.applyLineTaxCodes). */
+  salesTaxCodeId?: string | null;
   /**
    * Inventory items only: return the goods to stock (true, default) or treat
    * the return as a damaged-goods write-off (false — no restock, no COGS
    * reversal; the cost stays in COGS).
    */
   restock?: boolean;
+  /** Class of the line (P&L by class); defaults to the memo's class. */
+  classId?: string | null;
+  /** Customer:Job of the line (job costing); defaults to the memo's job. Must be the customer's job. */
+  jobId?: string | null;
 }
 
 export interface CreateCreditMemoInput {
@@ -138,6 +149,11 @@ export interface CreateCreditMemoInput {
   /** wave2 sales (C7): queue for batch printing / emailing. */
   toBePrinted?: boolean;
   toBeEmailed?: boolean;
+  /** salesar: class and Customer:Job of the memo (a write-off takes the invoice's). Edit: omitted = kept. */
+  classId?: string | null;
+  jobId?: string | null;
+  /** salesar (B8): Customer Message list entry printed at the foot of the memo. Edit: omitted = kept. */
+  customerMessageId?: string | null;
 }
 
 export interface ApplyToInvoiceInput {
@@ -232,6 +248,13 @@ async function prepareCreditMemo(ctx: ServiceContext, input: CreateCreditMemoInp
     .where(and(eq(customers.companyId, ctx.companyId), eq(customers.id, input.customerId)));
   if (!customer) throw notFound('Customer');
 
+  // Class and Customer:Job (memo and lines): this company's, and the job one of the customer's.
+  for (const id of new Set([input.classId, ...input.lines.map((l) => l.classId)].filter((x): x is string => !!x))) {
+    await assertRefInCompany(ctx, classes, id, 'Class');
+  }
+  await assertDocumentJob(ctx, input.customerId, input.jobId);
+  await assertLineJobs(ctx, input.lines.map((l) => ({ customerId: input.customerId, jobId: l.jobId ?? null })));
+
   // Load the memo-level tax rate if provided (same pattern as invoices/sales receipts).
   let taxRateDecimal = Money.zero();
   if (input.taxRateId) {
@@ -293,6 +316,8 @@ async function prepareCreditMemo(ctx: ServiceContext, input: CreateCreditMemoInp
     lineOrder: number;
     pricing: AppliedPricing | null;
     kind: SalesLineKind;
+    classId: string | null;
+    jobId: string | null;
   };
 
   // B12 advanced pricing: fill omitted item rates (price rules / price level / customer price)
@@ -349,6 +374,8 @@ async function prepareCreditMemo(ctx: ServiceContext, input: CreateCreditMemoInp
         lineOrder: i,
         pricing: null,
         kind,
+        classId: input.lines[i].classId ?? input.classId ?? null,
+        jobId: input.lines[i].jobId ?? input.jobId ?? null,
       });
       continue;
     }
@@ -374,6 +401,8 @@ async function prepareCreditMemo(ctx: ServiceContext, input: CreateCreditMemoInp
       lineOrder: i,
       pricing: kind === 'income' ? l.pricing : null,
       kind,
+      classId: input.lines[i].classId ?? input.classId ?? null,
+      jobId: input.lines[i].jobId ?? input.jobId ?? null,
     });
   }
 
@@ -431,8 +460,11 @@ async function postCreditMemoDocument(
         amount: cl.amount,
         lineOrder: cl.lineOrder,
         taxable: cl.taxable,
+        salesTaxCodeId: storedLineTaxCode(input.lines?.[cl.lineOrder], cl.taxable),
         restock: cl.restock,
         pricing: cl.pricing as Record<string, unknown> | null,
+        classId: cl.classId,
+        jobId: cl.jobId,
       })),
     )
     .returning();
@@ -450,25 +482,31 @@ async function postCreditMemoDocument(
   // so entryBase = income lines + tax = total + discounts. Subtotal lines post nothing.
   const entryBase = Money.round2(grossIncome.plus(taxAmount));
 
-  const incomeDebits = new Map<string, ReturnType<typeof Money.zero>>();
-  const discountCredits = new Map<string, ReturnType<typeof Money.zero>>();
+  // Summed per account and class (salesar: lines carry a class, so P&L by class sees the credit).
+  const headerClassId = input.classId ?? null;
+  const incomeDebits = new Map<string, { accountId: string; classId: string | null; amount: ReturnType<typeof Money.zero> }>();
+  const discountCredits = new Map<string, { accountId: string; classId: string | null; amount: ReturnType<typeof Money.zero> }>();
   for (const cl of computedLines) {
     if (cl.kind !== 'income' && cl.kind !== 'discount') continue;
     const map = cl.kind === 'income' ? incomeDebits : discountCredits;
-    const prev = map.get(cl.accountId) ?? Money.zero();
-    map.set(cl.accountId, prev.plus(Money.abs(Money.of(cl.amount))));
+    const key = `${cl.accountId}|${cl.classId ?? ''}`;
+    const prev = map.get(key) ?? { accountId: cl.accountId, classId: cl.classId, amount: Money.zero() };
+    prev.amount = prev.amount.plus(Money.abs(Money.of(cl.amount)));
+    map.set(key, prev);
   }
 
   const debitSpecs: Array<{
     accountId: string;
     weight: ReturnType<typeof Money.zero>;
     memo: string;
+    classId: string | null;
   }> = [];
-  for (const [acctId, amount] of incomeDebits) {
+  for (const d of incomeDebits.values()) {
     debitSpecs.push({
-      accountId: acctId,
-      weight: amount,
+      accountId: d.accountId,
+      weight: d.amount,
       memo: `Credit Memo #${shownNumber} — income reversal`,
+      classId: d.classId,
     });
   }
   if (taxAmount.greaterThan(0) && taxPayableId) {
@@ -476,6 +514,7 @@ async function postCreditMemoDocument(
       accountId: taxPayableId,
       weight: taxAmount,
       memo: `Credit Memo #${shownNumber} — sales tax reversal`,
+      classId: headerClassId,
     });
   }
   const creditSpecs: Array<{
@@ -483,9 +522,10 @@ async function postCreditMemoDocument(
     weight: ReturnType<typeof Money.zero>;
     memo: string;
     controlLine?: boolean;
-  }> = [{ accountId: arAccountId, weight: total, memo: `Credit Memo #${shownNumber}`, controlLine: true }];
-  for (const [acctId, amount] of discountCredits) {
-    creditSpecs.push({ accountId: acctId, weight: amount, memo: `Credit Memo #${shownNumber} — discount reversal` });
+    classId: string | null;
+  }> = [{ accountId: arAccountId, weight: total, memo: `Credit Memo #${shownNumber}`, controlLine: true, classId: headerClassId }];
+  for (const c of discountCredits.values()) {
+    creditSpecs.push({ accountId: c.accountId, weight: c.amount, memo: `Credit Memo #${shownNumber} — discount reversal`, classId: c.classId });
   }
 
   const debitAlloc = allocate(entryBase, debitSpecs.map((s) => s.weight));
@@ -497,10 +537,11 @@ async function postCreditMemoDocument(
     credit?: string;
     memo?: string;
     controlLine?: boolean;
+    classId?: string | null;
   }> = [];
   debitSpecs.forEach((s, i) => {
     if (debitAlloc[i].greaterThan(0)) {
-      postingLines.push({ accountId: s.accountId, debit: toAmountString(debitAlloc[i]), memo: s.memo });
+      postingLines.push({ accountId: s.accountId, debit: toAmountString(debitAlloc[i]), memo: s.memo, classId: s.classId });
     }
   });
   creditSpecs.forEach((s, i) => {
@@ -510,6 +551,7 @@ async function postCreditMemoDocument(
         accountId: s.accountId,
         credit: toAmountString(creditAlloc[i]),
         memo: s.memo,
+        classId: s.classId,
         ...(s.controlLine ? { controlLine: true } : {}),
       });
     }
@@ -609,11 +651,13 @@ async function postCreditMemoDocument(
             accountId: inventoryAccountId,
             debit: toAmountString(cost),
             memo: `Credit Memo #${shownNumber} — restock (${meta.name})`,
+            classId: cl.classId,
           },
           {
             accountId: cogsAccountId,
             credit: toAmountString(cost),
             memo: `Credit Memo #${shownNumber} — COGS reversal (${meta.name})`,
+            classId: cl.classId,
           },
         ],
       });
@@ -665,6 +709,9 @@ async function postCreditMemoDocument(
     }),
     movingLineOrders: computedLines.filter((cl) => cl.restock).map((cl) => cl.lineOrder),
     memo: `Credit Memo #${shownNumber}`,
+    // Edit (priorRestock given): a line that sends no site / bin / serial / lot keeps the one it
+    // was saved with, so the returned units do not move to the default site.
+    carryForward: priorRestock !== undefined,
   });
 
   return { insertedLines, entry, restockEntries };
@@ -699,6 +746,9 @@ export async function createCreditMemo(ctx: ServiceContext, input: CreateCreditM
         memo: input.memo ?? null,
         toBePrinted: input.toBePrinted ?? false,
         toBeEmailed: input.toBeEmailed ?? false,
+        classId: input.classId ?? null,
+        jobId: input.jobId ?? null,
+        customerMessageId: await resolveCustomerMessage(tx, input.customerMessageId),
       })
       .returning();
 
@@ -811,7 +861,8 @@ async function creditApplicationDate(
       (err.code === 'PERIOD_CLOSED' || (err.details as { accountantCopy?: boolean } | undefined)?.accountantCopy === true);
     if (!locked) throw err;
   }
-  const today = new Date();
+  // Today on the company's calendar (the UTC day of this instant is tomorrow in a US evening).
+  const today = await companyToday(ctx);
   return { applicationDate: today, periodCheck: await assertPeriodOpen(ctx, today) };
 }
 
@@ -1093,7 +1144,7 @@ async function refundCreditMemoInTx(ctx: ServiceContext, input: RefundCreditMemo
   await assertHomeCurrencyAccounts(ctx, [bankAcct.id], 'Credit memo refunds');
 
   const arAccountId = await accountIdByCode(ctx, '1200');
-  const refundDate = input.date ?? new Date();
+  const refundDate = input.date ?? (await companyToday(ctx));
   // The credit only exists from the memo's date: a refund dated earlier would debit A/R on days
   // when the customer held no credit.
   const day = (d: Date) => new Date(d).toISOString().slice(0, 10);
@@ -1519,6 +1570,13 @@ export async function updateCreditMemo(
   if (!existing) throw notFound('Credit memo');
   if (existing.status === 'void') throw new ServiceError('CONFLICT', 'Cannot edit a voided credit memo.');
   await assertSalesTaxAllowed(ctx, input, [existing.taxRateId]);
+  // An edit that does not mention the class / job keeps the memo's (older clients, the
+  // Accountant's Copy import).
+  input = {
+    ...input,
+    classId: input.classId === undefined ? existing.classId : input.classId,
+    jobId: input.jobId === undefined ? existing.jobId : input.jobId,
+  };
 
   const prep = await prepareCreditMemo(ctx, input);
 
@@ -1604,6 +1662,9 @@ export async function updateCreditMemo(
         ...(renum ? { refNumber: renum.refNumber, memoNumber: renum.number } : {}),
         toBePrinted: input.toBePrinted ?? memo.toBePrinted,
         toBeEmailed: input.toBeEmailed ?? memo.toBeEmailed,
+        classId: input.classId ?? null,
+        jobId: input.jobId ?? null,
+        customerMessageId: await resolveCustomerMessage(tx, input.customerMessageId, memo.customerMessageId),
         postedEntryId: entry.id,
       })
       .where(eq(creditMemos.id, id))

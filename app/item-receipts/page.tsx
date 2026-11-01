@@ -5,7 +5,7 @@
  * List + New Receipt (vendor / optional PO picker prefilling remaining
  * quantities) + Convert to Bill + Void.
  */
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { Suspense, useEffect, useRef, useState, useCallback } from 'react';
 import {
   PackageCheck,
   Plus,
@@ -36,7 +36,11 @@ import {
   useGridKeys,
 } from '@/components/ui';
 import { api } from '@/lib/client';
+<<<<<<< HEAD
 import { saveWithDuplicateCheck } from '@/lib/purchasesClient';
+=======
+import { useFocusParam } from '@/lib/useFocusParam';
+>>>>>>> feat/salesar
 import { todayISO } from '@/lib/dates';
 import {
   BarcodeScanInput,
@@ -721,6 +725,15 @@ function ConvertModal({ receipt, vendorName, onClose, onConverted }: ConvertModa
 // ---------------------------------------------------------------------------
 
 export default function ItemReceiptsPage() {
+  // useFocusParam reads the URL (useSearchParams), which needs a Suspense boundary.
+  return (
+    <Suspense fallback={null}>
+      <ItemReceiptsPageContent />
+    </Suspense>
+  );
+}
+
+function ItemReceiptsPageContent() {
   const [receipts, setReceipts] = useState<ItemReceipt[]>([]);
   const [vendors, setVendors] = useState<Vendor[]>([]);
   const [items, setItems] = useState<Item[]>([]);
@@ -759,6 +772,18 @@ export default function ItemReceiptsPage() {
   useEffect(() => {
     fetchData();
   }, [fetchData]);
+
+  // Links such as the Inventory Center's item history (/item-receipts?focus=<id>): highlight the
+  // receipt, and open it when it can still be edited (its bill not entered yet).
+  const [focusedId, setFocusedId] = useState<string | null>(null);
+  useFocusParam(receipts, loading, (r) => {
+    setFocusedId(r.id);
+    document.getElementById(`item-receipt-row-${r.id}`)?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    if (r.status === 'open') {
+      setEditId(r.id);
+      setShowNew(true);
+    }
+  });
 
   async function handleVoid() {
     if (!voidTarget) return;
@@ -829,7 +854,7 @@ export default function ItemReceiptsPage() {
             </thead>
             <tbody>
               {receipts.map((r) => (
-                <Tr key={r.id}>
+                <Tr key={r.id} id={`item-receipt-row-${r.id}`} className={r.id === focusedId ? 'bg-electric/10' : undefined}>
                   <Td className="font-semibold text-navy">
                     {r.reference ?? r.id.slice(0, 8)}
                   </Td>

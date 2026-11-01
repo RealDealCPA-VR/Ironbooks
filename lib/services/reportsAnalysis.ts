@@ -16,6 +16,7 @@ import { PIVOT_DIMENSIONS, PIVOT_MEASURES } from '@/lib/validation/reports';
 import type { ServiceContext } from './_base';
 import { validation } from './_base';
 import { requireAnyReportAccess } from './reportsAccess';
+import { typeListOptions } from './reportTypeFilters';
 import { balanceSheet } from './reports';
 import { apAging, arAging } from './reportsExtra';
 import { budgetVsActualReport } from './budgets';
@@ -487,6 +488,10 @@ export interface ReportFilterOptions {
   jobs: FilterOption[];
   budgets: (FilterOption & { fiscalYear: number; kind: string; isForecast: boolean })[];
   vehicles: string[];
+  /** B4: Customer / Vendor / Job Type lists ("Parent:Child" names). */
+  customerTypes: FilterOption[];
+  vendorTypes: FilterOption[];
+  jobTypes: FilterOption[];
 }
 
 /**
@@ -496,6 +501,7 @@ export interface ReportFilterOptions {
 export async function reportFilterOptions(ctx: ServiceContext): Promise<ReportFilterOptions> {
   requireAnyReportAccess(ctx);
   const c = ctx.companyId;
+  const typeLists = await typeListOptions(ctx);
   const [meta, custs, vends, cls, its, emps, jbs, bdg, veh] = await Promise.all([
     loadAccountMeta(ctx),
     customerNames(ctx),
@@ -532,5 +538,6 @@ export async function reportFilterOptions(ctx: ServiceContext): Promise<ReportFi
       .map((b) => ({ id: b.id, name: b.name, fiscalYear: b.fiscalYear, kind: b.kind, isForecast: b.isForecast }))
       .sort((a, b) => b.fiscalYear - a.fiscalYear || a.name.localeCompare(b.name)),
     vehicles: [...new Set(veh.map((v) => v.v).filter((v): v is string => !!v))].sort(),
+    ...typeLists,
   };
 }

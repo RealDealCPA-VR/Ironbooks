@@ -29,9 +29,13 @@ export interface FilterOptions {
   jobs: Option[];
   budgets: (Option & { fiscalYear: number; kind: string; isForecast: boolean })[];
   vehicles: string[];
+  /** B4: Customer / Vendor / Job Type lists ("Parent:Child" names). */
+  customerTypes?: Option[];
+  vendorTypes?: Option[];
+  jobTypes?: Option[];
 }
 
-const NEEDS_OPTIONS: ReportControl[] = ['account', 'customer', 'vendor', 'class', 'item', 'employee', 'job', 'budget', 'vehicle'];
+const NEEDS_OPTIONS: ReportControl[] = ['account', 'customer', 'vendor', 'class', 'item', 'employee', 'job', 'budget', 'vehicle', 'customerType', 'vendorType', 'jobType'];
 
 /**
  * How long one load of the filter lists is shared. Long enough for the several filter rows of one
@@ -263,8 +267,11 @@ export default function ReportFilters({
       )}
       {has('class') && pick('classId', 'Class', opts?.classes, <Help term="class" />)}
       {has('customer') && pick('customerId', 'Customer:Job', opts?.customers)}
+      {has('customerType') && pick('customerTypeId', 'Customer type', opts?.customerTypes ?? (opts ? [] : undefined))}
       {has('vendor') && pick('vendorId', 'Vendor', opts?.vendors)}
+      {has('vendorType') && pick('vendorTypeId', 'Vendor type', opts?.vendorTypes ?? (opts ? [] : undefined))}
       {has('job') && pick('jobId', 'Job', opts?.jobs)}
+      {has('jobType') && pick('jobTypeId', 'Job type', opts?.jobTypes ?? (opts ? [] : undefined))}
       {has('employee') && pick('employeeId', 'Employee', opts?.employees)}
       {has('item') && pick('itemId', 'Item', opts?.items)}
       {has('vehicle') && opts && (

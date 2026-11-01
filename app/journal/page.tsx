@@ -42,7 +42,7 @@ import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
 import { firstOfNextMonthISO, todayISO } from '@/lib/dates';
-import { useNewParam } from '@/lib/useFocusParam';
+import { useFocusId, useNewParam } from '@/lib/useFocusParam';
 import EntryDetailModal from '@/components/EntryDetailModal';
 // wave2 prefs: Preferences-driven labels/warnings, memorize (Ctrl+M), attachments
 import { usePreferences } from '@/lib/usePreferences';
@@ -841,6 +841,9 @@ function JournalPageContent() {
     setEditTarget(null);
     setShowForm(true);
   });
+  // Drill-downs (Inventory Center, reports, the transaction log) link here with ?focus=<entry id>:
+  // show that entry's Transaction Journal (any entry, also one a document or adjustment posted).
+  useFocusId(true, (id) => setDetailId(id));
 
   // Previous / Next walk the general journal entries made here (not ones a document posted).
   const manualEntries = entries.filter((e) => !e.sourceRef || e.sourceRef === 'manual');

@@ -39,7 +39,7 @@ import { assertAccountantMayVoidEntry } from './accountantCopy/guard';
 import { balanceFixes, balanceSummary } from '@/lib/errorFixes';
 import { getPreferences } from './company';
 import { nextJournalNumber } from '@/lib/prefBehaviors';
-import { isJournalScreenEntry } from '@/lib/journalScreen';
+import { isJournalScreenEntry, isSalesTaxAgencyEntry } from '@/lib/journalScreen';
 import { assertClosedPeriodEdit, lineKey, sameLedgerLines } from './postedEdit';
 import { carryReconciledLines, prepareReconciledRepost } from './reconciledEdits';
 import {
@@ -783,6 +783,12 @@ export function defaultReversalDate(entryDate: Date): Date {
 /** Refuse to void / reverse a document-posted entry from the journal screen (lib/journalScreen.ts). */
 function assertJournalScreenEntry(sourceRef: string | null | undefined, op: 'void' | 'reverse'): void {
   if (isJournalScreenEntry(sourceRef, op)) return;
+  if (op === 'reverse' && isSalesTaxAgencyEntry(sourceRef)) {
+    throw new ServiceError(
+      'CONFLICT',
+      'A sales tax payment or sales tax adjustment can’t be reversed: the reversal would not count against the tax agency. Void it instead (or record a new adjustment for the agency).',
+    );
+  }
   if (op === 'reverse' && sourceRef?.startsWith('fiscal-close:')) {
     throw new ServiceError(
       'CONFLICT',

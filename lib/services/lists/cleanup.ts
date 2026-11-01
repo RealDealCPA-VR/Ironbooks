@@ -9,6 +9,7 @@
  */
 import { and, eq } from 'drizzle-orm';
 import {
+  billingGroupMembers,
   billingRateLevelItems,
   billingRateLevels,
   classes,
@@ -50,7 +51,16 @@ interface CleanupDef {
 }
 
 const DEFS: Record<CleanupList, CleanupDef> = {
-  customers: { label: 'Customers', tableName: 'customers', table: customers, nameField: 'displayName', entityType: 'customer' },
+  customers: {
+    label: 'Customers',
+    tableName: 'customers',
+    table: customers,
+    nameField: 'displayName',
+    entityType: 'customer',
+    // salesar (C6): a Billing Group membership is the customer's own list setting, not a use —
+    // an otherwise unused inactive customer is removed and drops out of its groups.
+    ownChildren: [{ tableName: 'billing_group_members', table: billingGroupMembers, fk: 'customerId' }],
+  },
   vendors: { label: 'Vendors', tableName: 'vendors', table: vendors, nameField: 'displayName', entityType: 'vendor' },
   items: { label: 'Items', tableName: 'items', table: items, nameField: 'name', entityType: 'item' },
   classes: { label: 'Classes', tableName: 'classes', table: classes, nameField: 'name', entityType: 'class' },

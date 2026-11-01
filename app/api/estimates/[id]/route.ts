@@ -9,6 +9,8 @@
  *          { action: 'progress', lines: [{lineId, percent|quantity|amount}] } — selected lines
  *          (lineAmounts: [{lineId,amount}] still accepted). Billing over 100% of a line answers
  *          409 { code: 'PROGRESS_OVERBILL' }; resend with allowOverBilling: true to save anyway.
+ *          { action: 'void' }                                 — void the estimate (also PATCH { status: 'void' })
+ * DELETE /api/estimates/:id          — delete the estimate (refused while an invoice made from it stands)
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
@@ -19,6 +21,8 @@ import {
   convertToInvoice,
   createProgressInvoice,
   updateEstimate,
+  voidEstimate,
+  deleteEstimate,
   PROGRESS_OVERBILL_WARNING,
   type EstimateStatus,
 } from '@/lib/services/estimates';
@@ -77,7 +81,9 @@ export async function PATCH(req: NextRequest, { params }: RouteContext) {
       return NextResponse.json({ error: 'Missing required field: status' }, { status: 400 });
     }
 
-    const updated = await withVersionCheck(ctx, 'estimate', id, expectedVersion(req), (c) => updateEstimateStatus(c, id, status as EstimateStatus));
+    const updated = await withVersionCheck(ctx, 'estimate', id, expectedVersion(req), (c) =>
+      status === 'void' ? voidEstimate(c, id) : updateEstimateStatus(c, id, status as EstimateStatus),
+    );
     return NextResponse.json(updated);
   } catch (err) {
     return errorResponse(err);
@@ -134,7 +140,23 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       return NextResponse.json(result, { status: 201 });
     }
 
+    if (action === 'void') {
+      // QB Edit > Void Estimate; a stale tab must not void an estimate another user just changed.
+      return NextResponse.json(await withVersionCheck(ctx, 'estimate', id, expectedVersion(req), (c) => voidEstimate(c, id)));
+    }
+
     return NextResponse.json({ error: `Unknown action: "${action}"` }, { status: 400 });
+  } catch (err) {
+    return errorResponse(err);
+  }
+}
+
+/** DELETE /api/estimates/:id — QB Edit > Delete Estimate (Ctrl+D). */
+export async function DELETE(req: NextRequest, { params }: RouteContext) {
+  try {
+    const { id } = await params;
+    const ctx = await getServerContext();
+    return NextResponse.json(await withVersionCheck(ctx, 'estimate', id, expectedVersion(req), (c) => deleteEstimate(c, id)));
   } catch (err) {
     return errorResponse(err);
   }

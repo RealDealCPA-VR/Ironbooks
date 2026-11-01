@@ -73,6 +73,8 @@ import {
   validateJournalChargesForPayment,
 } from './journalApplications';
 import { clearPaymentFxReliefs, ensureLegacyFxRelief, homeAt, invoiceHomeOpenNow, recordPaymentFxRelief } from './fxSubledger'; // p1 fx
+import { companyToday } from './salesDates';
+import { resolvePaymentMethod } from './salesFormLists';
 
 // ---- Types ------------------------------------------------------------------
 
@@ -97,8 +99,13 @@ export interface PaymentCreditInput {
 export interface ReceivePaymentInput {
   customerId: string;
   date: Date;
-  /** Payment method (cash|check|credit_card|ach|bank_transfer|other). */
+  /** Payment method type (cash|check|credit_card|ach|bank_transfer|other). */
   method: 'cash' | 'check' | 'credit_card' | 'ach' | 'bank_transfer' | 'other';
+  /**
+   * salesar (B7): the Payment Method list entry ("Visa", "E-Check"). Its type is stored as
+   * `method`. Edit: omitted keeps the saved entry while the method type stays the same.
+   */
+  paymentMethodId?: string | null;
   reference?: string | null;
   /**
    * Total payment amount received from the customer. May be 0 when the "payment" only applies
@@ -282,78 +289,180 @@ export function parseDiscountTerms(terms: string | null | undefined): DiscountTe
   return { percent: m[1], discountDays: days, netDays: m[3] ? Number(m[3]) : null };
 }
 
-const DAY_MS = 86_400_000;
-
 export interface DiscountSuggestion {
   invoiceId: string;
+  /** The terms the discount comes from: the invoice's, else (invoice saved without terms) the customer's. */
   terms: string | null;
+  /** 'list': a Terms list entry; 'text': older free text that is not on the list; null: no terms. */
+  termsSource: 'list' | 'text' | null;
+  /** Discount percent the terms offer ('0' when they offer none). */
+  percent: string;
   /** Last day the discount can be taken (ISO), or null when the terms carry no discount. */
   discountDate: string | null;
   eligible: boolean;
+  /** The invoice amount the percent applies to: its total, less any retainage held back. */
+  invoiceAmount: string;
+  /** Early-payment discounts other payments already took on this invoice. */
+  alreadyTaken: string;
+  /** What the invoice still owes (with the edited payment's own amounts handed back). */
+  openBalance: string;
   /** Suggested discount (0 when not eligible). */
   suggested: string;
 }
 
 /**
- * Suggest the early-payment discount for paying `invoiceIds` on `paymentDate`, from the
- * customer's terms (QB computes it from the invoice's terms; invoices here carry the customer's).
- * The discount is a percent of the invoice's current balance, rounded to cents.
+ * C3: suggest the early-payment discount for paying the customer's open invoices (or `invoiceIds`)
+ * on `paymentDate`, as QuickBooks does: the terms' discount percent of the invoice AMOUNT (not of
+ * the balance left after part payments) when paid on or before the discount date, less discounts
+ * already taken on the invoice, never more than it still owes.
+ *
+ * The terms are the invoice's own (an invoice saved without terms falls back to the customer's),
+ * resolved on the Terms list (id, code or name — lib/services/lists/terms.ts; standard and
+ * date-driven); free text that is not on the list (older invoices) is parsed as '2% 10 Net 30'.
+ * `paymentId`: the payment being edited — its own cash, discount and credits are handed back to
+ * the invoices it paid and its discount does not count as already taken.
  */
 export async function suggestEarlyPaymentDiscounts(
   ctx: ServiceContext,
-  input: { customerId: string; paymentDate: Date; invoiceIds?: string[] },
+  input: { customerId: string; paymentDate: Date; invoiceIds?: string[]; paymentId?: string | null },
 ): Promise<DiscountSuggestion[]> {
   const [cust] = await ctx.db
-    .select({ terms: customers.terms })
+    .select({ terms: customers.terms, termsId: customers.termsId })
     .from(customers)
     .where(and(eq(customers.companyId, ctx.companyId), eq(customers.id, input.customerId)));
   if (!cust) throw notFound('Customer');
+
+  // The payment being edited: what it put on each invoice comes back (as the form shows it).
+  const giveBack = new Map<string, Decimal>();
+  const addBack = (invoiceId: string | null, amt: Decimal) => {
+    if (invoiceId) giveBack.set(invoiceId, (giveBack.get(invoiceId) ?? Money.zero()).plus(amt));
+  };
+  const editingId = input.paymentId ?? null;
+  if (editingId) {
+    const [p] = await ctx.db
+      .select({ id: paymentsReceived.id })
+      .from(paymentsReceived)
+      .where(and(eq(paymentsReceived.id, editingId), eq(paymentsReceived.companyId, ctx.companyId)));
+    if (!p) throw notFound('Payment');
+    for (const a of await ctx.db
+      .select({ invoiceId: paymentApplications.invoiceId, applied: paymentApplications.amountApplied, discount: paymentApplications.discountAmount })
+      .from(paymentApplications)
+      .where(eq(paymentApplications.paymentId, editingId))) {
+      addBack(a.invoiceId, Money.of(a.applied).plus(Money.of(a.discount ?? 0)));
+    }
+    for (const c of await ctx.db
+      .select({ invoiceId: creditApplications.invoiceId, amount: creditApplications.amount })
+      .from(creditApplications)
+      .where(and(eq(creditApplications.companyId, ctx.companyId), eq(creditApplications.paymentId, editingId)))) {
+      addBack(c.invoiceId, Money.of(c.amount));
+    }
+    for (const j of await ctx.db
+      .select({ invoiceId: journalItemApplications.invoiceId, amount: journalItemApplications.amount })
+      .from(journalItemApplications)
+      .where(
+        and(
+          eq(journalItemApplications.companyId, ctx.companyId),
+          eq(journalItemApplications.paymentId, editingId),
+          eq(journalItemApplications.kind, 'invoice_credit'),
+        ),
+      )) {
+      addBack(j.invoiceId, Money.of(j.amount));
+    }
+  }
+
+  const openStatus = inArray(invoices.status, ['open', 'partial', 'overdue']);
   const conds = [
     eq(invoices.companyId, ctx.companyId),
     eq(invoices.customerId, input.customerId),
-    inArray(invoices.status, ['open', 'partial', 'overdue']),
+    giveBack.size > 0 ? or(openStatus, inArray(invoices.id, [...giveBack.keys()]))! : openStatus,
+    ne(invoices.status, 'void'),
+    ne(invoices.status, 'draft'),
   ];
   if (input.invoiceIds?.length) conds.push(inArray(invoices.id, input.invoiceIds));
   const rows = await ctx.db
-    .select({ id: invoices.id, date: invoices.date, terms: invoices.terms, balanceDue: invoices.balanceDue })
+    .select({
+      id: invoices.id,
+      date: invoices.date,
+      terms: invoices.terms,
+      total: invoices.total,
+      retainage: invoices.retainageAmount,
+      balanceDue: invoices.balanceDue,
+    })
     .from(invoices)
-    .where(and(...conds));
-  // Terms list entries (standard / date-driven) by reference, resolved once per distinct string.
+    .where(and(...conds))
+    .orderBy(invoices.date, invoices.invoiceNumber);
+  if (rows.length === 0) return [];
+
+  // Discounts other (live) payments already took on these invoices.
+  const takenRows = await ctx.db
+    .select({
+      invoiceId: paymentApplications.invoiceId,
+      taken: sql<string>`COALESCE(SUM(CAST(${paymentApplications.discountAmount} AS NUMERIC)), 0)`,
+    })
+    .from(paymentApplications)
+    .innerJoin(paymentsReceived, eq(paymentsReceived.id, paymentApplications.paymentId))
+    .where(
+      and(
+        eq(paymentsReceived.companyId, ctx.companyId),
+        inArray(paymentApplications.invoiceId, rows.map((r) => r.id)),
+        isNull(paymentsReceived.voidedAt),
+        isNull(paymentsReceived.bouncedAt),
+        ...(editingId ? [ne(paymentApplications.paymentId, editingId)] : []),
+      ),
+    )
+    .groupBy(paymentApplications.invoiceId);
+  const taken = new Map(takenRows.map((t) => [t.invoiceId, Money.round2(t.taken)]));
+
+  // Terms list entries by reference, resolved once per distinct reference.
+  const customerRef = cust.termsId ?? cust.terms ?? null;
   const termsCache = new Map<string, TermsRow | null>();
   for (const r of rows) {
-    const ref = r.terms ?? cust.terms ?? null;
+    const ref = r.terms ?? customerRef;
     if (ref && !termsCache.has(ref)) termsCache.set(ref, await findTermsRef(ctx, ref));
   }
-  return rows.map((r) => {
-    const terms = r.terms ?? cust.terms ?? null;
-    const row = terms ? termsCache.get(terms) : null;
-    if (row) {
-      const d = computeDiscount(row as TermsLike, r.date, input.paymentDate, r.balanceDue);
-      return {
-        invoiceId: r.id,
-        terms,
-        discountDate: d.discountDate ? d.discountDate.toISOString().slice(0, 10) : null,
-        eligible: d.eligible,
-        suggested: d.amount ?? '0.00',
-      };
+
+  const out: DiscountSuggestion[] = [];
+  for (const r of rows) {
+    const openBalance = Money.round2(Money.of(r.balanceDue).plus(giveBack.get(r.id) ?? Money.zero()));
+    if (!openBalance.greaterThan(0)) continue;
+    const invoiceAmount = Money.round2(Money.of(r.total).minus(Money.of(r.retainage ?? 0)));
+    const alreadyTaken = taken.get(r.id) ?? Money.zero();
+    const ref = r.terms ?? customerRef;
+    const listRow = ref ? termsCache.get(ref) ?? null : null;
+    let terms: TermsLike | null = listRow as TermsLike | null;
+    let termsSource: DiscountSuggestion['termsSource'] = listRow ? 'list' : null;
+    if (!terms) {
+      const parsed = parseDiscountTerms(ref);
+      if (parsed) {
+        terms = { kind: 'standard', discountPercent: parsed.percent, discountDays: parsed.discountDays, netDays: parsed.netDays };
+        termsSource = 'text';
+      }
     }
-    const parsed = parseDiscountTerms(terms);
-    if (!parsed) {
-      return { invoiceId: r.id, terms, discountDate: null, eligible: false, suggested: '0.00' };
-    }
-    const last = new Date(r.date.getTime() + parsed.discountDays * DAY_MS);
-    const eligible = input.paymentDate.getTime() < last.getTime() + DAY_MS;
-    const suggested = eligible
-      ? Money.round2(Money.mul(r.balanceDue, Money.div(parsed.percent, 100)))
-      : Money.zero();
-    return {
+    const base = {
       invoiceId: r.id,
-      terms,
-      discountDate: last.toISOString().slice(0, 10),
-      eligible,
-      suggested: toAmountString(suggested),
+      terms: listRow ? listRow.name : ref,
+      termsSource,
+      invoiceAmount: toAmountString(invoiceAmount),
+      alreadyTaken: toAmountString(alreadyTaken),
+      openBalance: toAmountString(openBalance),
     };
-  });
+    if (!terms) {
+      out.push({ ...base, percent: '0', discountDate: null, eligible: false, suggested: '0.00' });
+      continue;
+    }
+    const d = computeDiscount(terms, r.date, input.paymentDate, toAmountString(invoiceAmount));
+    let suggested = d.eligible ? Money.of(d.amount ?? 0).minus(alreadyTaken) : Money.zero();
+    if (suggested.greaterThan(openBalance)) suggested = openBalance;
+    if (suggested.lessThan(0)) suggested = Money.zero();
+    out.push({
+      ...base,
+      percent: d.percent,
+      discountDate: d.discountDate ? d.discountDate.toISOString().slice(0, 10) : null,
+      eligible: d.eligible,
+      suggested: toAmountString(suggested),
+    });
+  }
+  return out;
 }
 
 // ---- Available credits (C4) ---------------------------------------------------
@@ -365,14 +474,26 @@ export interface AvailableCredit {
   /** Credit memo number, or the payment's reference. */
   ref: string;
   date: string;
+  /** What is left, in the credit's own currency. */
   available: string;
+  /**
+   * salesar (C4): the credit's currency (null = home). Credit memos and General Journal credits are
+   * home currency; an unapplied payment is in the currency it was received in.
+   */
+  currency: string | null;
 }
 
 /**
  * Open credits a customer can use in Receive Payments: credit memos, unapplied payments and
- * General Journal A/R credits (I11).
+ * General Journal A/R credits (I11). Home-currency credits only unless `includeForeign` (C4:
+ * Receive Payments also offers an unapplied payment in a foreign currency, for invoices in that
+ * currency; the credit-limit check adds the rest up in home currency).
  */
-export async function listAvailableCredits(ctx: ServiceContext, customerId: string): Promise<AvailableCredit[]> {
+export async function listAvailableCredits(
+  ctx: ServiceContext,
+  customerId: string,
+  opts: { includeForeign?: boolean } = {},
+): Promise<AvailableCredit[]> {
   const memos = await ctx.db
     .select({ id: creditMemos.id, memoNumber: creditMemos.memoNumber, refNumber: creditMemos.refNumber, date: creditMemos.date, unapplied: creditMemos.unapplied })
     .from(creditMemos)
@@ -384,8 +505,14 @@ export async function listAvailableCredits(ctx: ServiceContext, customerId: stri
         sql`CAST(${creditMemos.unapplied} AS NUMERIC) > 0`,
       ),
     );
-  const pays = await ctx.db
-    .select({ id: paymentsReceived.id, reference: paymentsReceived.reference, date: paymentsReceived.date, unapplied: paymentsReceived.unapplied })
+  const payRows = await ctx.db
+    .select({
+      id: paymentsReceived.id,
+      reference: paymentsReceived.reference,
+      date: paymentsReceived.date,
+      unapplied: paymentsReceived.unapplied,
+      currency: paymentsReceived.currency,
+    })
     .from(paymentsReceived)
     .where(
       and(
@@ -393,17 +520,24 @@ export async function listAvailableCredits(ctx: ServiceContext, customerId: stri
         eq(paymentsReceived.customerId, customerId),
         isNull(paymentsReceived.voidedAt),
         isNull(paymentsReceived.bouncedAt),
-        isNull(paymentsReceived.currency),
         sql`CAST(${paymentsReceived.unapplied} AS NUMERIC) > 0`,
       ),
     );
-  return [
+  // A payment's Currency holding the home code (any case) is a home payment.
+  const pays: Array<(typeof payRows)[number]> = [];
+  for (const p of payRows) {
+    const currency = await normalizeCurrency(ctx, p.currency);
+    if (currency && !opts.includeForeign) continue;
+    pays.push({ ...p, currency });
+  }
+  const out: AvailableCredit[] = [
     ...memos.map((m) => ({
       kind: 'credit_memo' as const,
       id: m.id,
       ref: `Credit Memo #${docRef(m.refNumber, m.memoNumber)}`,
       date: m.date.toISOString().slice(0, 10),
       available: toAmountString(m.unapplied),
+      currency: null,
     })),
     ...pays.map((p) => ({
       kind: 'payment' as const,
@@ -411,6 +545,7 @@ export async function listAvailableCredits(ctx: ServiceContext, customerId: stri
       ref: p.reference ? `Unapplied payment ${p.reference}` : 'Unapplied payment',
       date: p.date.toISOString().slice(0, 10),
       available: toAmountString(p.unapplied),
+      currency: p.currency,
     })),
     ...(await listJournalOpenItems(ctx, 'ar', customerId)).credits.map((j) => ({
       kind: 'journal_entry' as const,
@@ -418,8 +553,10 @@ export async function listAvailableCredits(ctx: ServiceContext, customerId: stri
       ref: j.ref,
       date: j.date,
       available: j.open,
+      currency: null,
     })),
-  ].sort((a, b) => a.date.localeCompare(b.date));
+  ];
+  return out.sort((a, b) => a.date.localeCompare(b.date));
 }
 
 // ---- Public API -------------------------------------------------------------
@@ -445,7 +582,7 @@ export async function receivePayment(ctx: ServiceContext, input: ReceivePaymentI
     // C4: apply earlier unapplied payments first (no new GL — that money already credited A/R
     // when it was received). postPayment then re-reads invoice balances, so cash + discounts +
     // credits + earlier payments together can never exceed what an invoice owes.
-    const lastPaymentId = await applyEarlierPayments(tx, input.customerId, paymentCredits, null);
+    const lastPaymentId = await applyEarlierPayments(tx, input, null);
 
     if (hasNewMoney(input)) return postPayment(tx, { ...input, paymentCredits: null }, null);
     // Only earlier payments were used: no new payment is recorded (as in QuickBooks).
@@ -473,13 +610,24 @@ function hasNewMoney(input: ReceivePaymentInput): boolean {
  * C4: apply earlier unapplied payments of the customer to invoices or General Journal charges
  * (inside the caller's transaction). `excludeId` is the payment being edited — it can't be its
  * own credit. Returns the id of the last earlier payment used.
+ *
+ * salesar C4: one earlier payment can be split across several invoices (its parts together never
+ * more than it has left — applyPayment checks the sum inside this transaction). It must be in the
+ * currency of the payment being received (a EUR credit on EUR invoices with a EUR payment; mixed
+ * currencies are refused); the realized FX of a foreign credit is posted by the fx subledger rules
+ * (postFxAdjustmentForApplication), dated with this payment, not today.
  */
 async function applyEarlierPayments(
   tx: ServiceContext,
-  customerId: string,
-  paymentCredits: PaymentCreditFromPaymentInput[],
+  input: ReceivePaymentInput,
   excludeId: string | null,
 ): Promise<string | null> {
+  const customerId = input.customerId;
+  const paymentCredits = input.paymentCredits ?? [];
+  const receivingCurrency = await normalizeCurrency(tx, input.currency);
+  // A request that only re-uses earlier payments and names no currency records no payment of its
+  // own: each earlier payment is used in its own currency (applyPayment matches the invoices).
+  const anyCurrency = !excludeId && !hasNewMoney(input) && !(input.currency ?? '').trim();
   type Use = {
     invoices: Array<{ invoiceId: string; amountApplied: string }>;
     journal: Array<{ journalLineId: string; amount: string }>;
@@ -511,6 +659,8 @@ async function applyEarlierPayments(
         customerId: paymentsReceived.customerId,
         bouncedAt: paymentsReceived.bouncedAt,
         voidedAt: paymentsReceived.voidedAt,
+        currency: paymentsReceived.currency,
+        date: paymentsReceived.date,
       })
       .from(paymentsReceived)
       .where(and(eq(paymentsReceived.id, paymentId), eq(paymentsReceived.companyId, tx.companyId)));
@@ -520,7 +670,17 @@ async function applyEarlierPayments(
     }
     if (earlier.voidedAt) throw validation('An earlier payment you tried to use is void, so it has no credit left.');
     if (earlier.bouncedAt) throw validation('An earlier payment you tried to use bounced, so it has no credit left.');
-    if (use.invoices.length > 0) await applyPayment(tx, { paymentId, applications: use.invoices });
+    // salesar C4: one currency per payment — a credit is used in the currency it was received in.
+    const earlierCurrency = await normalizeCurrency(tx, earlier.currency);
+    if (!anyCurrency && earlierCurrency !== receivingCurrency) {
+      throw validation(
+        `The earlier payment you tried to use is in ${earlierCurrency ?? 'your home currency'}, but this payment is in ${receivingCurrency ?? 'your home currency'}. Use it on a ${earlierCurrency ?? 'home-currency'} payment, on invoices in ${earlierCurrency ?? 'your home currency'}.`,
+      );
+    }
+    // The application happens with this payment (never before the credit existed): any realized
+    // FX on a foreign credit is dated then.
+    const applyDate = input.date && input.date.getTime() > earlier.date.getTime() ? input.date : earlier.date;
+    if (use.invoices.length > 0) await applyPayment(tx, { paymentId, applications: use.invoices }, { date: applyDate });
     if (use.journal.length > 0) await applyPaymentToJournalCharges(tx, { paymentId, items: use.journal });
     last = paymentId;
   }
@@ -720,6 +880,14 @@ async function postPayment(
     }
     addRequested(app.invoiceId, Money.round2(app.amountApplied ?? 0).plus(Money.round2(app.discountAmount ?? 0)));
   }
+  // salesar C4: one currency per payment. Credit memos and General Journal credits are recorded in
+  // home currency, so they go with home-currency payments only (a foreign customer's credit is an
+  // unapplied payment in its currency — paymentCredits).
+  if (paymentCurrency && credits.length + journalCredits.length > 0) {
+    throw validation(
+      `Credit memos and General Journal credits are in your home currency, so they can't be used on this ${paymentCurrency} payment. Use them on a home-currency payment.`,
+    );
+  }
   for (const c of [...credits, ...journalCredits]) {
     const inv = checkInvoice(c.invoiceId);
     if (inv.currency) {
@@ -914,11 +1082,26 @@ async function postPayment(
         })
       : null;
 
-  // 2. Insert (or, for an edit, rewrite) the paymentsReceived record
+  // 2. Insert (or, for an edit, rewrite) the paymentsReceived record. B7: the Payment Method list
+  //    entry decides the method type stored with it (salesFormLists.resolvePaymentMethod).
+  const prevMethod = existingId
+    ? (
+        await tx.db
+          .select({ paymentMethodId: paymentsReceived.paymentMethodId, method: paymentsReceived.method })
+          .from(paymentsReceived)
+          .where(eq(paymentsReceived.id, existingId))
+      )[0]
+    : undefined;
+  const pm = await resolvePaymentMethod(
+    tx,
+    { paymentMethodId: input.paymentMethodId, method: input.method },
+    prevMethod ? { paymentMethodId: prevMethod.paymentMethodId ?? null, method: prevMethod.method } : undefined,
+  );
   const header = {
     customerId: input.customerId,
     date: input.date,
-    method: input.method,
+    method: pm.method,
+    paymentMethodId: pm.paymentMethodId,
     reference: input.reference ?? null,
     amount: amountStr,
     unapplied: toAmountString(unapplied),
@@ -997,7 +1180,8 @@ async function postPayment(
     newValues: {
       customerId: input.customerId,
       amount: amountStr,
-      method: input.method,
+      method: pm.method,
+      paymentMethodId: pm.paymentMethodId,
       applications: input.applications,
       journalItems,
       journalCredits,
@@ -1617,7 +1801,7 @@ export async function updatePayment(ctx: ServiceContext, id: string, input: Rece
     // C4: earlier unapplied payments picked while editing are applied too (they used to be
     // dropped silently). They are applied from their own payment, exactly as on a new payment.
     if ((input.paymentCredits ?? []).length > 0) {
-      await applyEarlierPayments(tx, input.customerId, input.paymentCredits!, id);
+      await applyEarlierPayments(tx, input, id);
     }
     return postPayment(tx, { ...input, paymentCredits: null, journalOffsets: keptOffsets ?? input.journalOffsets }, id);
   });
@@ -1660,7 +1844,8 @@ export async function recordBouncedCheck(ctx: ServiceContext, input: RecordBounc
   if (bankFee.lessThan(0) || customerFee.lessThan(0)) throw validation('Fees cannot be negative.');
   if (input.bankFeeAccountId) await assertAccount(ctx, input.bankFeeAccountId, 'Bank fee account', ['expense']);
   if (input.customerFeeAccountId) await assertAccount(ctx, input.customerFeeAccountId, 'Customer fee account', ['revenue']);
-  const date = input.date ?? new Date();
+  // No date: today on the company's calendar (the UTC day of this instant is tomorrow in a US evening).
+  const date = input.date ?? (await companyToday(ctx));
 
   return inTransaction(ctx, async (tx) => {
     // Every check runs on the payment as it is INSIDE the transaction: a void, edit, refund or
@@ -1975,7 +2160,8 @@ async function unapplyFromInvoiceInTx(ctx: ServiceContext, input: UnapplyFromInv
       paymentRate: payment.exchangeRate,
       unappliedBefore: payment.unapplied,
       arAccountId,
-      date: new Date(),
+      // Today on the company's calendar (with the relief record it writes), never the UTC day.
+      date: await companyToday(tx),
       sign: -1,
       description: 'FX adjustment — payment unapplied from invoice',
       sourceRef: `payment:${input.paymentId}`,
@@ -2034,13 +2220,22 @@ export interface ApplyPaymentInput {
  * unapplied balance. No new A/R entry is needed — the full amount was already
  * credited to A/R at receive time — except for an FX plug when rates differ.
  */
-export async function applyPayment(ctx: ServiceContext, input: ApplyPaymentInput) {
+export async function applyPayment(
+  ctx: ServiceContext,
+  input: ApplyPaymentInput,
+  /**
+   * salesar C4 (internal): the day the application happens — a Receive Payment that uses this
+   * payment's credit passes its own date, so realized FX on a foreign credit is dated with it.
+   * Default: today on the company's calendar (Apply later from the payment list).
+   */
+  opts: { date?: Date | null } = {},
+) {
   // Load + validate in the same transaction as the write: two concurrent applies must not both
   // see the full unapplied amount.
-  return inTransaction(ctx, (tx) => applyPaymentInTx(tx, input));
+  return inTransaction(ctx, (tx) => applyPaymentInTx(tx, input, opts));
 }
 
-async function applyPaymentInTx(ctx: ServiceContext, input: ApplyPaymentInput) {
+async function applyPaymentInTx(ctx: ServiceContext, input: ApplyPaymentInput, opts: { date?: Date | null } = {}) {
   if (!input.applications || input.applications.length === 0) {
     throw validation('At least one application is required.');
   }
@@ -2137,6 +2332,9 @@ async function applyPaymentInTx(ctx: ServiceContext, input: ApplyPaymentInput) {
   const existingByInvoice = new Map(existingApps.map((a) => [a.invoiceId, a]));
 
   const arAccountId = await getArAccountId(ctx);
+  // Today on the company's calendar (with the relief record it writes), never the UTC day — or the
+  // date of the Receive Payment this credit is used in.
+  const applyDate = opts.date ?? (await companyToday(ctx));
 
   return inTransaction(ctx, async (tx) => {
     let unappliedLeft = unapplied; // p1 fx: running payment credit for the FX relief rule
@@ -2158,7 +2356,7 @@ async function applyPaymentInTx(ctx: ServiceContext, input: ApplyPaymentInput) {
         paymentRate: payment.exchangeRate,
         unappliedBefore: unappliedLeft,
         arAccountId,
-        date: new Date(),
+        date: applyDate,
         sign: 1,
         description: 'FX adjustment — unapplied payment applied to invoice',
         sourceRef: `payment:${input.paymentId}`,
@@ -2289,7 +2487,7 @@ async function refundPaymentInTx(ctx: ServiceContext, input: RefundPaymentInput)
   // `todayAmount` telescopes today's credit; the refund itself telescopes the credit AS OF its own
   // date (a refund backdated before applies / later refunds entered earlier), and dated plugs
   // (postPaymentCreditFxPlugs) re-telescope the later steps, so A/R equals the aging on every date.
-  const refundDate = input.date ?? new Date();
+  const refundDate = input.date ?? (await companyToday(ctx));
   // The credit only exists from the payment's date: a refund dated earlier would debit A/R on
   // days when the customer held no credit (A/R and the aging would disagree in between).
   if (ymd(refundDate) < ymd(payment.date)) {

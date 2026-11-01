@@ -148,6 +148,10 @@ export async function writeOffInvoices(
       const memo = await createCreditMemo(tx, {
         customerId: inv.customerId,
         date: input.date,
+        // The bad debt goes to the invoice's job and class, like the income it wrote off (job
+        // profitability and P&L by class keep the two together).
+        classId: inv.classId ?? null,
+        jobId: inv.jobId ?? null,
         memo: input.memo?.trim() || `Write-off of invoice #${no} (bad debt)`,
         lines: [
           {

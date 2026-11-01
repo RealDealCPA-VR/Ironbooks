@@ -4,7 +4,9 @@
  *  - Sales tax: a customer's "Tax item" (customers.taxRateId) fills the form's tax rate when
  *    the caller did not choose one, and a customer whose tax code is non-taxable ("Non",
  *    customers.taxable = false) makes every line non-taxable — QB only taxes a taxable item
- *    for a taxable customer.
+ *    for a taxable customer. Each line's Sales Tax Code (salesar B9) is resolved on the server
+ *    from the code it states, else the item's code (salesFormLists.applyLineTaxCodes): an item
+ *    whose code is non-taxable is never taxed, whatever the caller sends.
  *  - Ship to: a new invoice / sales order / sales receipt / estimate whose ship-to was left out
  *    gets the customer's default ship-to address.
  *
@@ -16,12 +18,15 @@ import { customers } from '@/lib/db/schema';
 import { defaultShipTo } from '@/lib/shipTo';
 import { salesTaxOn } from '@/lib/featureGate';
 import type { ServiceContext } from './_base';
+import { applyLineTaxCodes, type TaxCodedLine } from './salesFormLists';
 
 export interface CustomerTaxDefaults {
   /** The customer's default tax item (taxRates row), or null. */
   taxRateId: string | null;
   /** false = the customer's tax code is non-taxable (lines are never taxed). */
   taxable: boolean;
+  /** The customer's Sales Tax Code (Sales Tax Code list), when set. */
+  salesTaxCodeId: string | null;
 }
 
 export async function customerTaxDefaults(
@@ -30,24 +35,25 @@ export async function customerTaxDefaults(
 ): Promise<CustomerTaxDefaults | null> {
   if (!customerId) return null;
   const [row] = await ctx.db
-    .select({ taxRateId: customers.taxRateId, taxable: customers.taxable })
+    .select({ taxRateId: customers.taxRateId, taxable: customers.taxable, salesTaxCodeId: customers.salesTaxCodeId })
     .from(customers)
     .where(and(eq(customers.companyId, ctx.companyId), eq(customers.id, customerId)));
   if (!row) return null;
-  return { taxRateId: row.taxRateId ?? null, taxable: row.taxable !== false };
+  return { taxRateId: row.taxRateId ?? null, taxable: row.taxable !== false, salesTaxCodeId: row.salesTaxCodeId ?? null };
 }
 
 type TaxableDoc = {
   customerId?: string | null;
   taxRateId?: string | null;
-  lines: Array<{ taxable?: boolean | null }>;
+  lines: TaxCodedLine[];
 };
 
 /**
  * Apply the customer's sales-tax defaults to a sales document input:
  *  - `taxRateId` left out (undefined) → the customer's tax item (only when `defaultRate`,
  *    i.e. on create; an explicit null means "no tax" and is kept);
- *  - non-taxable customer → every line `taxable: false`.
+ *  - non-taxable customer → every line `taxable: false`;
+ *  - every line gets its Sales Tax Code and the taxability the code gives (applyLineTaxCodes).
  * Returns a shallow copy; the input is not mutated.
  */
 export async function applyCustomerTaxDefaults<T extends TaxableDoc>(
@@ -61,8 +67,8 @@ export async function applyCustomerTaxDefaults<T extends TaxableDoc>(
   if (opts.defaultRate && input.taxRateId === undefined && d.taxRateId && (await salesTaxOn(ctx))) {
     out = { ...out, taxRateId: d.taxRateId };
   }
-  if (!d.taxable && input.lines.some((l) => l.taxable !== false)) {
-    out = { ...out, lines: input.lines.map((l) => ({ ...l, taxable: false })) };
+  if (Array.isArray(input.lines)) {
+    out = { ...out, lines: await applyLineTaxCodes(ctx, input.lines, { taxable: d.taxable, salesTaxCodeId: d.salesTaxCodeId }) };
   }
   return out;
 }

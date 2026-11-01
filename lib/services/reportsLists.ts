@@ -73,6 +73,7 @@ import {
 import { rangeLabel } from './reportsStandard';
 import { docRef } from './docNumbers';
 import { foreignAmountsByEntry } from './fxSubledger';
+import { customersOfType, nameTypeFilter } from './reportTypeFilters';
 
 const amt = (v: Decimal) => toAmountString(v);
 
@@ -130,12 +131,16 @@ function balanceSummary(
  * (ledgerTotalsByName — every line, however large the file); cash basis: the cash-basis lines.
  */
 async function balancesByName(ctx: ServiceContext, section: 'ar' | 'ap', p: ReportParams, asOf: Date) {
+  // B4: Customer Type / Vendor Type filter — only the names of that type (subtypes included).
+  const ofType = await nameTypeFilter(ctx, p, section);
+  const keep = <T extends Pick<GlLine, 'nameType' | 'nameId'>>(rows: T[]) =>
+    ofType ? rows.filter((l) => l.nameType === (section === 'ar' ? 'customer' : 'vendor') && !!l.nameId && ofType.has(l.nameId)) : rows;
   if (p.basis === 'cash') {
     const { lines, truncated } = await ledgerByName(ctx, section, { ...p, customerId: undefined, vendorId: undefined }, { to: asOf });
-    return { totals: lines, truncated };
+    return { totals: keep(lines), truncated };
   }
   const meta = await loadAccountMeta(ctx);
-  return { totals: await ledgerTotalsByName(ctx, meta, { sections: [section], to: asOf, classId: p.classId }), truncated: false };
+  return { totals: keep(await ledgerTotalsByName(ctx, meta, { sections: [section], to: asOf, classId: p.classId })), truncated: false };
 }
 
 export async function customerBalanceSummary(ctx: ServiceContext, p: ReportParams): Promise<StdReport> {
@@ -169,7 +174,13 @@ export async function vendorBalanceSummary(ctx: ServiceContext, p: ReportParams)
 async function balanceDetail(ctx: ServiceContext, p: ReportParams, section: 'ar' | 'ap'): Promise<StdReport> {
   const asOf = resolveAsOf(p);
   const from = p.from ? (await resolveRange(ctx, { from: p.from, to: dayStr(asOf) })).from : undefined;
-  const { lines, truncated } = await ledgerByName(ctx, section, p, { from, to: asOf });
+  const fetched = await ledgerByName(ctx, section, p, { from, to: asOf });
+  const { truncated } = fetched;
+  // B4: Customer Type / Vendor Type filter (subtypes included; a job takes its customer's type).
+  const ofType = await nameTypeFilter(ctx, p, section);
+  const lines = ofType
+    ? fetched.lines.filter((l) => l.nameType === (section === 'ar' ? 'customer' : 'vendor') && !!l.nameId && ofType.has(l.nameId))
+    : fetched.lines;
   const keys = ['label', 'type', 'date', 'num', 'memo', 'account', 'amount', 'balance'];
   const laid = layoutDetail(lines, {
     columns: detailColumns(keys),
@@ -216,8 +227,12 @@ export async function unpaidBillsDetail(ctx: ServiceContext, p: ReportParams): P
   const asOf = resolveAsOf(p);
   const aging = await apAgingDetail(ctx, asOf);
   const overDays = p.overDays !== undefined ? Number(p.overDays) : null;
+  const ofType = await nameTypeFilter(ctx, p, 'ap'); // B4: Vendor Type
   const docs = aging.rows.filter(
-    (r) => (!p.vendorId || r.entityId === p.vendorId) && (overDays === null || r.daysPastDue > overDays),
+    (r) =>
+      (!p.vendorId || r.entityId === p.vendorId) &&
+      (!ofType || ofType.has(r.entityId)) &&
+      (overDays === null || r.daysPastDue > overDays),
   );
   // QuickZoom: a bill / credit opens its posted entry; a named General Journal A/P line IS its
   // entry (it used to be looked up as a "vendor_credit:" document, so it never opened, and was
@@ -786,10 +801,21 @@ export function cogsOfSalesLine(l: SalesLine, posted: Map<string, Decimal>): Dec
   return Money.zero();
 }
 
+/** B4: only the sales lines of customers of the report's Customer Type (none set = all). */
+async function ofCustomerType(ctx: ServiceContext, p: ReportParams, lines: SalesLine[]): Promise<SalesLine[]> {
+  if (!p.customerTypeId) return lines;
+  const keep = await customersOfType(ctx, p.customerTypeId);
+  return lines.filter((l) => !!l.customerId && keep.has(l.customerId));
+}
+
 async function salesDetail(ctx: ServiceContext, p: ReportParams, by: 'customer' | 'item'): Promise<StdReport> {
   const { from, to } = await resolveRange(ctx, p);
   const basis = p.basis === 'cash' ? 'cash' : undefined;
-  const lines = await salesLinesOnBasis(ctx, { from, to }, { customerId: p.customerId, itemId: p.itemId, classId: p.classId }, basis);
+  const lines = await ofCustomerType(
+    ctx,
+    p,
+    await salesLinesOnBasis(ctx, { from, to }, { customerId: p.customerId, itemId: p.itemId, classId: p.classId }, basis),
+  );
   const names = await customerNames(ctx);
   const entryIds = await entryIdsForSourceRefs(ctx, lines.map((l) => l.sourceRef));
   const groups = new Map<string, { label: string; lines: SalesLine[] }>();
@@ -865,7 +891,11 @@ export const salesByItemDetail = (ctx: ServiceContext, p: ReportParams) => sales
 export async function salesByCustomerSummary(ctx: ServiceContext, p: ReportParams): Promise<StdReport> {
   const { from, to } = await resolveRange(ctx, p);
   const basis = p.basis === 'cash' ? 'cash' : undefined;
-  const lines = await salesLinesOnBasis(ctx, { from, to }, { customerId: p.customerId, itemId: p.itemId, classId: p.classId }, basis);
+  const lines = await ofCustomerType(
+    ctx,
+    p,
+    await salesLinesOnBasis(ctx, { from, to }, { customerId: p.customerId, itemId: p.itemId, classId: p.classId }, basis),
+  );
   const names = await customerNames(ctx);
   const by = new Map<string, Decimal>();
   for (const l of lines) by.set(l.customerId ?? '', (by.get(l.customerId ?? '') ?? Money.zero()).plus(l.amount));
@@ -1580,7 +1610,8 @@ export async function purchasesByItemDetail(ctx: ServiceContext, p: ReportParams
  */
 async function purchasesSummary(ctx: ServiceContext, p: ReportParams, by: 'item' | 'vendor'): Promise<StdReport> {
   const { from, to } = await resolveRange(ctx, p);
-  const lines = await purchaseLines(ctx, p, from, to);
+  const ofType = await nameTypeFilter(ctx, p, 'ap'); // B4: Vendor Type
+  const lines = (await purchaseLines(ctx, p, from, to)).filter((l) => !ofType || (!!l.vendorId && ofType.has(l.vendorId)));
   const acc = new Map<string, { label: string; qty: Decimal; amount: Decimal }>();
   for (const l of lines) {
     const k = (by === 'item' ? l.itemId : l.vendorId) ?? '';

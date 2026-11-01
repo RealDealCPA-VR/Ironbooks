@@ -7,7 +7,7 @@
  * historical assignments keep resolving.
  */
 import { and, asc, eq } from 'drizzle-orm';
-import { customerTypes, vendorTypes, vendors } from '@/lib/db/schema';
+import { customerTypes, jobTypes, vendorTypes, vendors } from '@/lib/db/schema';
 import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from './_base';
 import { assertListDeleteAllowed } from './accountantCopy/guard';
 import { findReferences } from './lists/references';
@@ -140,6 +140,31 @@ export async function deleteType(
     await writeAudit(tx, { action: 'delete', entityType: ENTITY[kind], entityId: id, oldValues: before });
     return { deleted: true, deactivated: false };
   });
+}
+
+const TYPE_TABLE = { customer: customerTypes, vendor: vendorTypes, job: jobTypes } as const;
+const TYPE_LABEL = { customer: 'Customer type', vendor: 'Vendor type', job: 'Job type' } as const;
+
+/**
+ * B4: a Customer / Vendor / Job Type picked on a name's form must be one of this company's types
+ * (never another company's id), and an inactive type cannot be newly picked — keeping the one the
+ * record already has is fine (QB keeps it until you change it).
+ */
+export async function assertTypeAssignable(
+  ctx: ServiceContext,
+  kind: 'customer' | 'vendor' | 'job',
+  typeId: string | null | undefined,
+  currentId?: string | null,
+): Promise<void> {
+  if (!typeId || typeId === currentId) return;
+  // The three tables have the same columns (id, company_id, name, parent_id, is_active).
+  const t = TYPE_TABLE[kind] as typeof customerTypes;
+  const [row] = await ctx.db
+    .select({ id: t.id, isActive: t.isActive })
+    .from(t)
+    .where(and(eq(t.companyId, ctx.companyId), eq(t.id, typeId)));
+  if (!row) throw validation(`${TYPE_LABEL[kind]} does not exist in this company.`);
+  if (!row.isActive) throw validation(`That ${TYPE_LABEL[kind].toLowerCase()} is inactive. Pick an active one, or make it active on the Lists page.`);
 }
 
 /** Assign (or clear, with null) a vendor's type. */

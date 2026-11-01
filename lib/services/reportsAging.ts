@@ -28,6 +28,7 @@ import { validation } from './_base';
 import { getPreferences } from './company';
 import { apAgingDetail, arAgingDetail, type AgingDetailRow } from './reportsExtra';
 import { customerNames, dayStr, entryIdsForSourceRefs, fmtDay, resolveAsOf, stdHref } from './reportEngine';
+import { nameTypeFilter } from './reportTypeFilters';
 
 const amt = (v: Decimal) => toAmountString(v);
 const DAY_MS = 86_400_000;
@@ -146,6 +147,9 @@ export async function openItems(
     rows = rows.filter((r) => keep.has(r.entityId));
   }
   if (side === 'ap' && p.vendorId) rows = rows.filter((r) => r.entityId === p.vendorId);
+  // B4: Customer Type (a job takes its customer's type) / Vendor Type, subtypes included.
+  const ofType = await nameTypeFilter(ctx, p, side);
+  if (ofType) rows = rows.filter((r) => ofType.has(r.entityId));
 
   // Document header extras: terms, P.O. number, class.
   const docIds = rows.filter((r) => r.docType === 'invoice' || r.docType === 'bill').map((r) => r.docId);
@@ -225,7 +229,15 @@ function optionsSubtitle(asOf: Date, fromTxnDate: boolean): string {
 
 /** Params carried into QuickZoom links so the drill-down uses the same aging options. */
 function carry(p: ReportParams, asOf: Date): Record<string, string | undefined> {
-  return { asOf: dayStr(asOf), interval: p.interval, through: p.through, agingFrom: p.agingFrom, classId: p.classId };
+  return {
+    asOf: dayStr(asOf),
+    interval: p.interval,
+    through: p.through,
+    agingFrom: p.agingFrom,
+    classId: p.classId,
+    customerTypeId: p.customerTypeId,
+    vendorTypeId: p.vendorTypeId,
+  };
 }
 
 // ---------------------------------------------------------------------------

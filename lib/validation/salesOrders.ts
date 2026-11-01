@@ -5,7 +5,7 @@
  */
 import { z } from 'zod';
 import { zDate, zDecimal, zDocNumber, zLines, zUuid } from './helpers';
-import { sendFlagFields, shippingFields } from './sales';
+import { sendFlagFields, customerMessageField, shippingFields } from './sales';
 
 export const salesOrderLineSchema = z.object({
   /** Edit only: the existing line this row updates (keeps its invoiced quantity). */
@@ -17,6 +17,8 @@ export const salesOrderLineSchema = z.object({
   rate: zDecimal.nullish(),
   /** QB "Tax" column; defaults to true. */
   taxable: z.boolean().optional(),
+  /** salesar (B9): the line's Sales Tax Code; the server sets `taxable` from it. */
+  salesTaxCodeId: zUuid.nullish(),
 });
 
 export const createSalesOrderSchema = z.object({
@@ -31,6 +33,7 @@ export const createSalesOrderSchema = z.object({
   lines: zLines(salesOrderLineSchema),
   ...shippingFields,
   ...sendFlagFields,
+  ...customerMessageField,
 });
 export type CreateSalesOrderBody = z.infer<typeof createSalesOrderSchema>;
 

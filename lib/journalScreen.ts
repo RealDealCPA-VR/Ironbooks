@@ -33,10 +33,21 @@ const JOURNAL_SCREEN_PREFIXES = [
 /** Exact source refs of GL-only entries (no ':<id>' suffix). FX gain/loss adjustments (currencies.ts). */
 const JOURNAL_SCREEN_EXACT = new Set(['fx_adjustment']);
 
+/**
+ * Pay Sales Tax payments (tax_agency:<agency>) and sales tax adjustments (sales_tax_adj:<agency>)
+ * may be VOIDED from the journal window, but not reversed: the sales tax ledger attributes them to
+ * their agency by that source, and a reversal (reversal:<id>) would land in its unattributed bucket
+ * while the agency kept the payment — the liability by agency would no longer tie to the account.
+ */
+export function isSalesTaxAgencyEntry(sourceRef: string | null | undefined): boolean {
+  return !!sourceRef && (sourceRef.startsWith('tax_agency:') || sourceRef.startsWith('sales_tax_adj:'));
+}
+
 export function isJournalScreenEntry(sourceRef: string | null | undefined, op: 'void' | 'reverse'): boolean {
   if (!sourceRef || sourceRef === 'manual') return true;
   if (JOURNAL_SCREEN_EXACT.has(sourceRef)) return true;
   if (op === 'void' && (sourceRef.startsWith('refund:') || sourceRef.startsWith('fixed_asset:'))) return true;
   if (op === 'reverse' && sourceRef.startsWith('fiscal-close:')) return false;
+  if (op === 'reverse' && isSalesTaxAgencyEntry(sourceRef)) return false;
   return JOURNAL_SCREEN_PREFIXES.some((p) => sourceRef.startsWith(p));
 }

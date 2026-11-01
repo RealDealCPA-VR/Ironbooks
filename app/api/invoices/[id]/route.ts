@@ -1,6 +1,8 @@
 /**
  * GET    /api/invoices/:id   — fetch an invoice with its lines
- * PUT    /api/invoices/:id   — edit an open, unpaid invoice (void + re-post in one transaction)
+ * PUT    /api/invoices/:id   — edit an invoice, also a partly or fully paid one (void + re-post in one
+ *                              transaction; its payments and credits stay applied while the edit keeps
+ *                              them valid — updateInvoice refuses an edit that would not)
  * PATCH  /api/invoices/:id   — alias of PUT (the shared api client exposes patch)
  * DELETE /api/invoices/:id   — void an invoice (reverses its GL entry)
  */

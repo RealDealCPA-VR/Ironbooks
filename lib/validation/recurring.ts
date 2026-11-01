@@ -16,6 +16,9 @@ export const recurringDocTypeSchema = z.enum([
   'deposit',
   'transfer',
   'purchase_order',
+  'estimate',
+  'sales_order',
+  'vendor_credit',
 ]);
 export const recurringFrequencySchema = z.enum([
   'never',
