@@ -43,6 +43,8 @@ import { profitAndLossCashBasis } from './cashBasisReports';
 import { profitAndLossByClass } from './classReports';
 import { transactionDetail } from './reportsExtra';
 import { createBill, voidBill } from './bills';
+import { postJournalEntry } from './posting';
+import { ServiceError } from './_base';
 import { adjustInventory, inventoryValuation, inventoryValuationAsOf, inventoryValuationDetail } from './inventory';
 import { importTransactions, parseCSV } from './import';
 import { setBaseCurrency, upsertCurrency } from './currencies';
@@ -178,11 +180,31 @@ describe('review4 audit of round 3 (bounds / inventory / bank import)', () => {
     await createBill(ctx, {
       vendorId,
       date: new Date('2024-08-01'),
-      lines: [
-        { itemId: id, quantity: 10, unitCost: 10 }, // $100 of stock
-        { accountId: acct['1300'], amount: '20.00', description: 'Freight coded to Inventory Asset (no item)' },
-      ],
+      lines: [{ itemId: id, quantity: 10, unitCost: 10 }], // $100 of stock
     } as never);
+    // A GL amount on Inventory Asset that carries no item (a general journal entry) must not
+    // change the item's valuation.
+    await postJournalEntry(ctx, {
+      date: new Date('2024-08-01'),
+      description: 'Freight on Inventory Asset (no item)',
+      lines: [
+        { accountId: acct['1300'], debit: '20.00' },
+        { accountId: acct['1000'], credit: '20.00' },
+      ],
+    });
+    // And a bill account line on Inventory Asset (no item) is refused, like Undeposited Funds.
+    let caught: unknown;
+    try {
+      await createBill(ctx, {
+        vendorId,
+        date: new Date('2024-08-01'),
+        lines: [{ accountId: acct['1300'], amount: '20.00', description: 'Freight coded to Inventory Asset (no item)' }],
+      } as never);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(ServiceError);
+    expect((caught as ServiceError).code).toBe('VALIDATION');
     const now = (await inventoryValuation(ctx)).items.find((r) => r.id === id)!;
     expect(now.totalValue).toBe('100.00');
     const asOf = (await inventoryValuationAsOf(ctx, new Date('2030-01-01'))).items.find((r) => r.id === id)!;

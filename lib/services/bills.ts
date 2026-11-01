@@ -55,7 +55,6 @@ import { postJournalEntry, voidJournalEntry, type PostingLine } from '@/lib/serv
 import { assertClosedPeriodEdit, retitleEntry, sameLedgerLines } from './postedEdit';
 import { syncLineMemos } from './entryLineMemos';
 import { subledgerAccountReason } from '@/lib/registerEntryPlan';
-import { isUndepositedFunds } from '@/lib/accountTypes';
 import { companyToday } from './salesDates';
 import {
   type DocumentInventoryLine,
@@ -506,11 +505,9 @@ async function prepareBill(
     throw validation('The bill total must be more than zero.');
   }
 
-  // An account line (no item) on Undeposited Funds moves a balance that the Make Deposits list
-  // never shows, so Enter Bills refuses it the way the banking forms do. An inventory asset
-  // account line is allowed: it posts to the GL and the inventory valuation simply never
-  // attributes it to an item (QB lists inventory only through items). A saved bill keeps the
-  // lines it has.
+  // An account line (no item) on Undeposited Funds or an inventory asset account moves a balance
+  // that the Make Deposits list / inventory valuation never shows (QB lists inventory only through
+  // items); the banking forms refuse both the same way. A saved bill keeps the lines it has.
   const accountLineIds = [
     ...new Set(resolvedLines.filter((l) => !l.itemId && !opts.keepLineAccountIds?.has(l.accountId)).map((l) => l.accountId)),
   ];
@@ -523,7 +520,7 @@ async function prepareBill(
     for (const [i, l] of resolvedLines.entries()) {
       if (l.itemId || opts.keepLineAccountIds?.has(l.accountId)) continue;
       const acct = byId.get(l.accountId);
-      const reason = acct && isUndepositedFunds(acct) ? subledgerAccountReason(acct) : null;
+      const reason = acct ? subledgerAccountReason(acct) : null;
       if (reason) throw validation(`Line ${i + 1}: ${reason}`);
     }
   }
