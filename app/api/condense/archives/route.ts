@@ -22,12 +22,14 @@ import { listCondenseArchives, restoreCondenseArchive } from '@/lib/services/con
 import { ServiceError } from '@/lib/services/_base';
 import { requireFileAdmin } from '@/lib/services/access';
 import { assertExclusiveAccess } from '@/lib/services/sessions';
-import { serviceErrorStatus } from '@/lib/routeErrors';
+import { serviceErrorBody, serviceErrorStatus } from '@/lib/routeErrors';
+import { archiveCredentialsFrom, withArchiveCredentialLimit } from '@/lib/net/archiveCredentials';
+import { originFromHeaders } from '@/lib/net/requestInfo';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
     const status = serviceErrorStatus(err.code, { PERIOD_CLOSED: 409 });
-    return NextResponse.json({ error: err.message, code: err.code }, { status });
+    return NextResponse.json(serviceErrorBody(err), { status });
   }
   // Do not leak raw error text (may contain absolute data-dir paths / OS details).
   console.error('[condense/archives] unexpected error:', err);
@@ -72,7 +74,10 @@ async function handlePost(req: NextRequest) {
     if (!archive || archive.companyId !== ctx.companyId) {
       throw new ServiceError('NOT_FOUND', 'Archive copy not found.');
     }
-    const result = await restoreCondenseArchive(ctx, id, dir);
+    const credentials = archiveCredentialsFrom(req.headers);
+    const result = await withArchiveCredentialLimit(credentials, originFromHeaders(req.headers).addr, () =>
+      restoreCondenseArchive(ctx, id, dir, credentials),
+    );
     const { path: _path, dataDir: _dir, ...summary } = result.archive;
     return NextResponse.json({
       restored: true,

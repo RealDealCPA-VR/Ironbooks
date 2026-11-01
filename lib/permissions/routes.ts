@@ -76,6 +76,9 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/auth/change-password': kind('self', 'POST'), // gapsb K: change own password (also when expired)
   '/api/auth/password-policy': kind('public', 'GET'), // gapsb K: the file's password rules for the forms
   '/api/auth/challenge': kind('self', 'GET POST'), // own challenge question for "I forgot my password"
+  '/api/auth/recover': kind('public', 'POST'), // filecrypto: the recovery key sets an Admin's new password (rate-limited, local only)
+  '/api/file-protection': kind('self', 'GET POST'), // filecrypto: protect the company file with passwords (file Admin)
+  '/api/file-protection/recovery-key': kind('self', 'POST'), // filecrypto: make a new recovery key (file Admin)
   '/api/unlock': kind('public', 'POST'),
   '/api/file-lock': { GET: 'member', ...r('users', 'POST:modify') },
   '/api/portal/login': kind('public', 'POST'),
@@ -201,7 +204,7 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   // Company file (team companyfile): portable file = full copy of the file (create, like a
   // backup); restoring one is a restore ('delete', like /api/backup); the shareable ledger
   // and transaction log are exports / an audit view of the books.
-  '/api/portable': r('file_utilities', 'GET:create'),
+  '/api/portable': r('file_utilities', 'GET:create POST:create'), // filecrypto: POST { password } = encrypted .bkp
   '/api/portable/restore': r('file_utilities', 'POST:delete'),
   '/api/portable/shareable': r('file_utilities', 'GET:print'),
   // Single-file company file (lib/services/companyFileSave.ts): anyone signed in sees whether it

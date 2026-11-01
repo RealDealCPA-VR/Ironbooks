@@ -5,9 +5,14 @@
  * and, on success, sets the signed `bka_unlock` cookie that getServerContext + middleware require.
  * Uses the database directly (NOT getServerContext), since the whole point is to run before the
  * file is unlocked.
+ *
+ * A company file protected with passwords that still has to be decrypted (lib/db/sealed.ts): its
+ * file password is inside the encrypted file, so this answers ok with a "sign-in screen only"
+ * token (lib/auth createUnlockToken pre) — the sign-in decrypts the file and then asks for the
+ * file password on the same screen (app/api/auth/login).
  */
 import { NextRequest, NextResponse } from 'next/server';
-import { getDb, withDamagedFileAccess } from '@/lib/db';
+import { getDb, sealedMode, withDamagedFileAccess, withSealedAccess } from '@/lib/db';
 import { getFileLockStatus, verifyFilePassword } from '@/lib/services/fileLock';
 import { UNLOCK_COOKIE, createUnlockToken } from '@/lib/auth';
 import { cookieSecure, originFromHeaders } from '@/lib/net/requestInfo';
@@ -21,7 +26,21 @@ export async function POST(req: NextRequest) {
 }
 
 async function handlePost(req: NextRequest) {
-  const db = await getDb();
+  const sealed = sealedMode();
+  if (sealed === 'extract' || sealed === 'conflict') {
+    const origin = originFromHeaders(req.headers);
+    const res = NextResponse.json({ ok: true, sealed: true });
+    res.cookies.set(UNLOCK_COOKIE, createUnlockToken({ pre: true }), {
+      httpOnly: true,
+      secure: cookieSecure(origin),
+      sameSite: 'lax',
+      path: '/',
+      maxAge: 60 * 60 * 12,
+    });
+    return res;
+  }
+  // The working copy already on this computer ('key'): its file password is readable before sign-in.
+  const db = sealed === 'key' ? await withSealedAccess(() => getDb()) : await getDb();
 
   let password = '';
   try {

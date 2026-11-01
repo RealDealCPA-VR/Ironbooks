@@ -32,6 +32,7 @@ import { api } from '@/lib/client';
 import type { Action, Area, Flag, PermissionGrant, PermissionSet, RoleFlags } from '@/lib/permissions/model';
 import { PasswordRulesHint, meetsPolicy, usePasswordPolicy } from '@/components/PasswordRules';
 import PasswordPolicyEditor from './PasswordPolicyEditor';
+import { NEEDS_SLOT_TEXT, ProtectionUsersNotice, useProtectionStatus } from '@/components/FileProtectionCard';
 
 interface CompanyUser {
   userId: string;
@@ -128,6 +129,8 @@ export default function UsersAndRolesPage() {
   return (
     <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader title="Users & Roles" icon={Users} />
+      {/* filecrypto: users whose password does not open the protected company file yet. */}
+      <ProtectionUsersNotice />
       <div className="mb-4 flex gap-2" role="tablist">
         {(isAdmin ? (['users', 'roles', 'passwords'] as const) : (['users', 'roles'] as const)).map((t) => (
           <button
@@ -181,6 +184,9 @@ function UsersTab({
   const [toggling, setToggling] = useState<CompanyUser | null>(null);
   const [viewing, setViewing] = useState<UserDetail | null>(null);
   const [busy, setBusy] = useState(false);
+  // filecrypto: who can open the protected company file (Admins see every user).
+  const [protection, reloadProtection] = useProtectionStatus();
+  const cannotOpen = new Set((protection?.protected ? protection.users ?? [] : []).filter((p) => !p.canOpen).map((p) => p.userId));
 
   async function toggleActive() {
     if (!toggling) return;
@@ -246,6 +252,11 @@ function UsersTab({
               </Td>
               <Td>
                 {u.isActive ? <Badge tone="success">Active</Badge> : <Badge tone="void">Inactive</Badge>}
+                {u.isActive && cannotOpen.has(u.userId) && (
+                  <span className="mt-1 block text-xs text-amber-700" title="Their password does not open the protected company file yet">
+                    {NEEDS_SLOT_TEXT}
+                  </span>
+                )}
               </Td>
               <Td className="text-right whitespace-nowrap">
                 <Button size="sm" variant="ghost" onClick={() => showPermissions(u)} title="Effective permissions">
@@ -282,7 +293,15 @@ function UsersTab({
           }}
         />
       )}
-      {resetting && <ResetPassword user={resetting} onClose={() => setResetting(null)} />}
+      {resetting && (
+        <ResetPassword
+          user={resetting}
+          onClose={() => {
+            setResetting(null);
+            void reloadProtection();
+          }}
+        />
+      )}
       <ConfirmDialog
         open={!!toggling}
         title={toggling?.isActive ? 'Deactivate user' : 'Reactivate user'}

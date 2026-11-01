@@ -26,7 +26,7 @@
 import { timingSafeEqual } from 'node:crypto';
 import { type NextRequest, NextResponse } from 'next/server';
 import { asc } from 'drizzle-orm';
-import { getDb } from '@/lib/db';
+import { getDb, sealedMode } from '@/lib/db';
 import { companies } from '@/lib/db/schema';
 import { getServerContext } from '@/lib/context';
 import { getCompany } from '@/lib/services/company';
@@ -37,6 +37,7 @@ import { recordBackup } from '@/lib/services/backupHistory';
 import { currentFingerprint } from '@/lib/services/backupFingerprint';
 import { ensureBackupScheduler, runVersionedBackup } from '@/lib/services/backupSchedule';
 import { assertNotSandbox } from '@/lib/services/sandboxState';
+import { protectionForDir } from '@/lib/services/fileProtection';
 import { serviceErrorStatus } from '@/lib/routeErrors';
 import { isInternalRequest } from '@/lib/net/internalToken';
 
@@ -61,6 +62,16 @@ async function internalContext(req: NextRequest): Promise<ServiceContext | null>
 export async function POST(req: NextRequest) {
   try {
     // Fail closed BEFORE producing any backup bytes.
+    // Sealed (a protected file nobody has signed in to yet): the books were never decrypted here this
+    // time, so they did not change — nothing to back up. The scheduler still starts: its checks wait
+    // until someone has signed in (lib/services/backupSchedule.ts).
+    if (sealedMode() && isInternalRequest(req)) {
+      if (req.nextUrl.searchParams.get('start') === '1') {
+        ensureBackupScheduler();
+        return NextResponse.json({ status: 'started', sealed: true });
+      }
+      return NextResponse.json({ status: 'unchanged', sealed: true });
+    }
     let ctx = await internalContext(req);
     if (!ctx && isInternalRequest(req)) {
       // The desktop shell, on a brand-new company file nobody has set up yet: nothing to back up,
@@ -101,7 +112,7 @@ export async function POST(req: NextRequest) {
     }
 
     const fingerprint = currentFingerprint();
-    const { buffer, filename } = createBackup(companyName);
+    const { buffer, filename } = createBackup(companyName, undefined, { protection: await protectionForDir() });
     recordBackup({ source: 'quit', kind: 'full', filename, path: null, sizeBytes: buffer.byteLength, fingerprint, note: 'Automatic backup when the app closed' });
     const arrayBuf: ArrayBuffer = buffer.buffer.slice(
       buffer.byteOffset,

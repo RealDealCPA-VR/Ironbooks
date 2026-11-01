@@ -10,6 +10,10 @@
  *
  * The live company file is never opened, closed or written by a preview, and the temporary
  * folder is always deleted afterwards (plus any left behind by a crash, on the next preview).
+ *
+ * A backup protected with passwords (lib/services/fileProtection.ts) is decrypted — every entry
+ * verified — into that private folder on this computer only: with the open file's own key, or a
+ * user name and password (or the recovery key) of the file it was made from.
  */
 import fs from 'node:fs';
 import os from 'node:os';
@@ -17,7 +21,9 @@ import path from 'node:path';
 import { and, count, eq, isNull, max } from 'drizzle-orm';
 import { closeDb, getDb, NewerCompanyFileError, withDamagedFileAccess } from '@/lib/db';
 import { bills, companies, invoices, journalEntries } from '@/lib/db/schema';
-import { BACKUP_MANIFEST_ENTRY, FILE_LOCAL_FILES, validateBackupZip, verifyRestoredBooks } from './backup';
+import AdmZip from 'adm-zip';
+import { BACKUP_MANIFEST_ENTRY, FILE_LOCAL_FILES, openBackupBuffer, verifyRestoredBooks } from './backup';
+import type { ArchiveCredentials } from './sealedArchives';
 import { trialBalance } from './reports';
 import { ServiceError } from './errors';
 import { Money } from '@/lib/money';
@@ -81,19 +87,23 @@ export function cleanupStalePreviewDirs(now: number = Date.now(), root: string =
 const ymd = (d: Date | null | undefined) => (d ? new Date(d).toISOString().slice(0, 10) : null);
 
 /** Read the manifest fields shown in the preview (tolerates legacy archives without one). */
-function manifestInfo(zip: ReturnType<typeof validateBackupZip>): Pick<BackupPreview, 'backupDate' | 'appVersion' | 'label'> {
-  const entry = zip.getEntry(BACKUP_MANIFEST_ENTRY);
-  if (entry) {
-    try {
-      const m = JSON.parse(zip.readAsText(entry)) as { createdAt?: unknown; appVersion?: unknown; companyName?: unknown };
-      return {
-        backupDate: typeof m.createdAt === 'string' ? m.createdAt : null,
-        appVersion: typeof m.appVersion === 'string' ? m.appVersion : null,
-        label: typeof m.companyName === 'string' ? m.companyName : null,
-      };
-    } catch {
-      /* validateBackupZip already accepted it; fall through to entry times */
-    }
+function manifestInfo(
+  manifest: { createdAt?: unknown; appVersion?: unknown; companyName?: unknown } | null,
+  buffer: Buffer,
+): Pick<BackupPreview, 'backupDate' | 'appVersion' | 'label'> {
+  if (manifest) {
+    return {
+      backupDate: typeof manifest.createdAt === 'string' ? manifest.createdAt : null,
+      appVersion: typeof manifest.appVersion === 'string' ? manifest.appVersion : null,
+      label: typeof manifest.companyName === 'string' ? manifest.companyName : null,
+    };
+  }
+  // A pre-manifest archive (never protected): the newest entry's time.
+  let zip: AdmZip;
+  try {
+    zip = new AdmZip(buffer);
+  } catch {
+    return { backupDate: null, appVersion: null, label: null };
   }
   let newest = 0;
   for (const e of zip.getEntries()) {
@@ -107,15 +117,18 @@ function manifestInfo(zip: ReturnType<typeof validateBackupZip>): Pick<BackupPre
  * Open a backup read-only in a temporary data dir and summarise it. Throws VALIDATION for a file
  * that is not an Ironbooks full backup (same messages as the restore).
  */
-export async function previewBackup(buffer: Buffer): Promise<BackupPreview> {
-  const zip = validateBackupZip(buffer);
-  const info = manifestInfo(zip);
+export async function previewBackup(
+  buffer: Buffer,
+  opts: { credentials?: ArchiveCredentials | null; dataDir?: string } = {},
+): Promise<BackupPreview> {
+  const opened = await openBackupBuffer(buffer, opts);
+  const info = manifestInfo(opened.manifest as Parameters<typeof manifestInfo>[0], buffer);
 
   cleanupStalePreviewDirs();
   const tmpRoot = fs.mkdtempSync(path.join(previewTempRoot(), PREVIEW_DIR_PREFIX));
   const dataDir = path.join(tmpRoot, 'data');
   try {
-    zip.extractAllTo(dataDir, /* overwrite */ true);
+    opened.extractTo(dataDir);
     if (!fs.existsSync(path.join(dataDir, 'PG_VERSION'))) {
       throw new ServiceError('VALIDATION', 'Not an Ironbooks backup file (archive does not contain an Ironbooks company file).');
     }

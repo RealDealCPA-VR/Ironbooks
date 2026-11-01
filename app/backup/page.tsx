@@ -17,6 +17,7 @@ import { api, ApiError } from '@/lib/client';
 import { BackupCenter, type BackupHistoryRow } from '@/components/BackupCenter';
 import { BackupPreviewModal, type BackupPreviewDto } from '@/components/BackupPreviewModal';
 import { notifyBackupChanged } from '@/components/BackupStatus';
+import { CredentialsModal, credentialHeaders, type ArchiveCredentialsInput } from '@/components/FileProtection';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -117,6 +118,36 @@ function PendingBackupRestore({ onFile }: { onFile: (file: File) => void }) {
 export default function BackupPage() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const companyFileInputRef = useRef<HTMLInputElement>(null);
+
+  // ---- filecrypto: a backup protected with another company file's passwords ----
+  // The user name + password (or recovery key) of the file it came from, asked when the server
+  // answers credentialsRequired, then sent in headers (never the URL) for the rest of this restore.
+  const credsRef = useRef<ArchiveCredentialsInput | null>(null);
+  const [credPrompt, setCredPrompt] = useState<{ message: string; error: string | null; resolve: (c: ArchiveCredentialsInput | null) => void } | null>(null);
+
+  function askCredentials(message: string, wrong: boolean): Promise<ArchiveCredentialsInput | null> {
+    return new Promise((resolve) => setCredPrompt({ message, error: wrong ? message : null, resolve }));
+  }
+
+  /** Send a request; while the backup needs credentials, ask for them and send it again. */
+  async function withCredentials(make: (headers: Record<string, string>) => Promise<Response>): Promise<Response> {
+    let res = await make(credentialHeaders(credsRef.current));
+    for (;;) {
+      if (res.status !== 403) return res;
+      const data = await res.clone().json().catch(() => ({}));
+      const details = (data?.details ?? {}) as { credentialsRequired?: boolean; wrongCredentials?: boolean; rateLimited?: boolean };
+      if (!details.credentialsRequired || details.rateLimited) return res;
+      const c = await askCredentials(
+        details.wrongCredentials
+          ? data.error
+          : 'This backup is protected with the passwords of the company file it was made from. Enter a user name and password from that file, or its recovery key.',
+        Boolean(details.wrongCredentials),
+      );
+      if (!c) return res;
+      credsRef.current = c;
+      res = await make(credentialHeaders(c));
+    }
+  }
 
   // ---- Companies (per-company backup selector) ----
   const [companies, setCompanies] = useState<Company[]>([]);
@@ -248,11 +279,14 @@ export default function BackupPage() {
     try {
       const arrayBuffer = await pendingCompanyFile.arrayBuffer();
       const qs = restoreName.trim() ? `?name=${encodeURIComponent(restoreName.trim())}` : '';
-      const res = await fetch(`/api/backup/company${qs}`, {
-        method: 'POST',
-        body: arrayBuffer,
-        headers: { 'Content-Type': 'application/octet-stream' },
-      });
+      credsRef.current = null;
+      const res = await withCredentials((h) =>
+        fetch(`/api/backup/company${qs}`, {
+          method: 'POST',
+          body: arrayBuffer,
+          headers: { 'Content-Type': 'application/octet-stream', ...h },
+        }),
+      );
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         toast(data?.error ?? 'Restore failed. The file may be corrupt or invalid.', 'danger');
@@ -299,13 +333,17 @@ export default function BackupPage() {
   const startFromFile = useCallback((file: File) => {
     setPendingFile(file);
     setPendingVersion(null);
-    void startPreview(async () =>
-      fetch('/api/backups/preview', {
-        method: 'POST',
-        body: await file.arrayBuffer(),
-        headers: { 'Content-Type': 'application/octet-stream' },
-      }),
-    );
+    credsRef.current = null;
+    void startPreview(async () => {
+      const body = await file.arrayBuffer();
+      return withCredentials((h) =>
+        fetch('/api/backups/preview', {
+          method: 'POST',
+          body,
+          headers: { 'Content-Type': 'application/octet-stream', ...h },
+        }),
+      );
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -320,9 +358,8 @@ export default function BackupPage() {
   function handlePreviewVersion(row: BackupHistoryRow) {
     setPendingVersion(row);
     setPendingFile(null);
-    void startPreview(() =>
-      fetch(`/api/backups/preview?id=${encodeURIComponent(row.id)}`, { method: 'POST' }),
-    );
+    credsRef.current = null;
+    void startPreview(() => withCredentials((h) => fetch(`/api/backups/preview?id=${encodeURIComponent(row.id)}`, { method: 'POST', headers: h })));
   }
 
   async function handleRestoreConfirm() {
@@ -331,17 +368,20 @@ export default function BackupPage() {
     try {
       // Same restore path as always (integrity checks, safety copy, single-user mode); a version
       // from the history is read by the server from its own backup folder.
-      const res = pendingVersion
-        ? await fetch('/api/backups/restore', {
-            method: 'POST',
-            body: JSON.stringify({ id: pendingVersion.id }),
-            headers: { 'Content-Type': 'application/json' },
-          })
-        : await fetch('/api/backup', {
-            method: 'POST',
-            body: await pendingFile!.arrayBuffer(),
-            headers: { 'Content-Type': 'application/octet-stream' },
-          });
+      const fileBody = pendingVersion ? null : await pendingFile!.arrayBuffer();
+      const res = await withCredentials((h) =>
+        pendingVersion
+          ? fetch('/api/backups/restore', {
+              method: 'POST',
+              body: JSON.stringify({ id: pendingVersion.id }),
+              headers: { 'Content-Type': 'application/json', ...h },
+            })
+          : fetch('/api/backup', {
+              method: 'POST',
+              body: fileBody,
+              headers: { 'Content-Type': 'application/octet-stream', ...h },
+            }),
+      );
 
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
@@ -457,6 +497,21 @@ export default function BackupPage() {
       <Suspense fallback={null}>
         <PendingBackupRestore onFile={startFromFile} />
       </Suspense>
+      <CredentialsModal
+        open={Boolean(credPrompt)}
+        mode="credentials"
+        title="Protected backup"
+        message={credPrompt?.message ?? ''}
+        error={credPrompt?.error}
+        onSubmit={(c) => {
+          credPrompt?.resolve(c);
+          setCredPrompt(null);
+        }}
+        onCancel={() => {
+          credPrompt?.resolve(null);
+          setCredPrompt(null);
+        }}
+      />
       <main className="min-h-screen bg-offwhite p-8 font-sans">
         <PageHeader title="Backup & Restore" icon={ArchiveRestore} />
 

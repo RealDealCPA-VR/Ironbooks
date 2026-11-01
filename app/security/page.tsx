@@ -1,9 +1,17 @@
 'use client';
+/**
+ * Company > Security: the company file's own passwords (filecrypto: protect the file, who can
+ * open it, the recovery key), your challenge question, and two-factor sign-in.
+ * ?protect=1 (an Admin just signed in to an unprotected file) highlights the protection offer;
+ * ?challenge=1 asks for a challenge question. ?next= continues afterwards.
+ */
 import { useEffect, useState } from 'react';
+import Link from 'next/link';
 import { CheckCircle2, ShieldCheck } from 'lucide-react';
 import { QRCodeSVG } from 'qrcode.react';
 import { Button, Card, Input, Label, PageHeader, Spinner, toast } from '@/components/ui';
 import { ChallengeQuestionCard } from '@/components/ChallengeQuestionCard';
+import { FileProtectionCard } from '@/components/FileProtectionCard';
 import { ApiError, api } from '@/lib/client';
 // Only same-app paths for ?next= (never an open redirect).
 import { safeNext } from '@/lib/safeNext';
@@ -19,9 +27,11 @@ interface Me {
 export default function SecurityPage() {
   // After sign-in, someone without a challenge question is sent here once (app/login).
   const [prompt, setPrompt] = useState<{ next: string } | null>(null);
+  const [protectPrompt, setProtectPrompt] = useState<{ next: string } | null>(null);
   useEffect(() => {
     const q = new URLSearchParams(window.location.search);
     if (q.get('challenge') === '1') setPrompt({ next: safeNext(q.get('next')) });
+    if (q.get('protect') === '1') setProtectPrompt({ next: safeNext(q.get('next')) });
   }, []);
   const [secret, setSecret] = useState('');
   const [otpUrl, setOtpUrl] = useState('');
@@ -96,6 +106,20 @@ export default function SecurityPage() {
   return (
     <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader title="Security" icon={ShieldCheck} />
+      <div className="mb-6">
+        <FileProtectionCard
+          key={protectPrompt ? 'prompt' : 'page'}
+          highlight={Boolean(protectPrompt)}
+          onDone={protectPrompt ? () => (window.location.href = protectPrompt.next) : undefined}
+        />
+        {protectPrompt && (
+          <p className="mt-2 max-w-xl text-sm">
+            <Link href={protectPrompt.next} className="text-electric hover:underline">
+              Continue without protecting the file
+            </Link>
+          </p>
+        )}
+      </div>
       <div className="mb-6">
         <ChallengeQuestionCard
           prompt={Boolean(prompt)}

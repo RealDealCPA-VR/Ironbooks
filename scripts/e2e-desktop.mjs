@@ -13,6 +13,11 @@
  *  5. reopening from the No Company Open list shows the sign-in screen with the company name,
  *     the file's location and the user name filled in; signing in shows the invoice;
  *  6. closing the window saves and releases the file; the invoice is in the company file.
+ *  7. the password belongs to the company file (filecrypto): the file the Admin set up is
+ *     protected (encrypted; its raw encrypted entries hold no company or customer name). It is
+ *     reopened by a FRESH install (a brand-new IRONBOOKS_USER_DATA and LOCALAPPDATA): the sign-in
+ *     screen shows, a wrong password is refused, the right one opens the file with ONE sign-in
+ *     and the invoice is there.
  * Screenshots go to E2E_SHOTS (default: a folder in the temp directory).
  */
 import { spawn, execFile } from 'node:child_process';
@@ -27,6 +32,7 @@ const require = createRequire(import.meta.url);
 const root = process.cwd();
 const format = require(path.join(root, 'electron', 'companyFileFormat.js'));
 const companyLock = require(path.join(root, 'electron', 'companyLock.js'));
+const fileCrypto = require(path.join(root, 'electron', 'fileCrypto.js'));
 const { PGlite } = require('@electric-sql/pglite');
 
 const EXE = process.env.E2E_EXE || path.join(root, 'release', 'win-unpacked', 'Ironbooks.exe');
@@ -65,9 +71,11 @@ async function until(fn, ms = 60_000, step = 500) {
 
 // --- the app ---------------------------------------------------------------
 let app = null;
-function launch() {
+function launch(dataDir = userData, localDir = local) {
+  const env = { ...process.env, IRONBOOKS_USER_DATA: dataDir, LOCALAPPDATA: localDir, ELECTRON_ENABLE_LOGGING: '' };
+  delete env.BKA_AUTH_SECRET; // nothing machine-bound: only the company file's own secrets
   app = spawn(EXE, [`--remote-debugging-port=${PORT}`], {
-    env: { ...process.env, IRONBOOKS_USER_DATA: userData, LOCALAPPDATA: local, ELECTRON_ENABLE_LOGGING: '' },
+    env,
     stdio: 'ignore',
     detached: false,
   });
@@ -162,9 +170,27 @@ function clickNativeButton(name, timeoutSec = 40) {
   return clickHelper(EXE, name, timeoutSec);
 }
 
+/** The bytes of the company file after its plain first entry (the manifest): the encrypted part. */
+function bytesAfterManifest(file) {
+  const buf = fs.readFileSync(file);
+  return buf.subarray(30 + buf.readUInt16LE(26) + buf.readUInt16LE(28) + buf.readUInt32LE(18));
+}
+
+/** True when a decrypted database (a PG_VERSION file) is anywhere under `dir`. */
+function hasPlainBooks(dir) {
+  try {
+    return fs.readdirSync(dir, { recursive: true }).some((n) => String(n).endsWith('PG_VERSION'));
+  } catch {
+    return false;
+  }
+}
+
 async function invoicesInFile() {
   const out = path.join(tmp, `check-${randomBytes(3).toString('hex')}`);
-  await format.extractCompanyFile(companyFile, out);
+  // A protected company file opens with its own user name and password (its key slot).
+  const m = format.readCompanyManifest(companyFile);
+  const fileKey = format.isSealedManifest(m) ? await fileCrypto.unlockWith(m.encryption, { kind: 'password', login: 'Admin', secret: 'secret123' }) : undefined;
+  await format.extractCompanyFile(companyFile, out, { fileKey });
   const pg = new PGlite(out);
   try {
     return (await pg.query("select total::text as total from invoices")).rows.map((r) => r.total);
@@ -299,6 +325,45 @@ async function main() {
   const gone = await until(async () => !(await appRunning()), 90_000);
   assert(gone, 'closing the window quits the app');
   assert(companyLock.readHolder(companyFile) === null, 'the lock is released when the app quits');
+
+  // 7. Protected with its passwords, and portable to a fresh install.
+  const sealed = format.readCompanyManifest(companyFile);
+  assert(format.isSealedManifest(sealed) && sealed.encryption.slots.length >= 2, 'the company file is protected with passwords (encrypted, key slots in its manifest)');
+  const encrypted = bytesAfterManifest(companyFile);
+  assert(!encrypted.includes(Buffer.from('Acme Plumbing')) && !encrypted.includes(Buffer.from('Oak Street Apartments')), 'its raw encrypted entries contain no plain-text company or customer name');
+  assert(!hasPlainBooks(path.join(local, 'Ironbooks', 'Working')), 'after the clean close the plain-text working copy is gone from this computer');
+  const userData2 = path.join(tmp, 'fresh-install', 'userData');
+  const local2 = path.join(tmp, 'fresh-install', 'Local');
+  fs.mkdirSync(userData2, { recursive: true });
+  fs.writeFileSync(path.join(userData2, 'config.json'), JSON.stringify({ companyFile, recentCompanies: [companyFile], theme: { mode: 'light', accent: 'blue' } }));
+  launch(userData2, local2);
+  page = await connect((u) => /^http:\/\/localhost:\d+\//.test(u));
+  const atLogin = await until(() => page.eval(`location.pathname === '/login' && !!document.getElementById('login-password')`), 90_000);
+  assert(atLogin, 'a fresh install opens the protected file at the sign-in screen');
+  await sleep(800);
+  await page.shot('06-fresh-install-sign-in');
+  const typeAndSubmit = (user, pass) =>
+    page.eval(`(() => {
+      const set = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+      const u = document.getElementById('login-user'); set.call(u, ${JSON.stringify(user)}); u.dispatchEvent(new Event('input', { bubbles: true }));
+      const p = document.getElementById('login-password'); set.call(p, ${JSON.stringify(pass)}); p.dispatchEvent(new Event('input', { bubbles: true }));
+      document.querySelector('form button[type="submit"]').click();
+    })()`);
+  await typeAndSubmit('Admin', 'wrong-password');
+  const refusedMsg = await until(() => page.eval(`document.getElementById('login-error')?.textContent || ''`), 30_000);
+  assert(/not correct/i.test(refusedMsg || ''), 'a wrong password is refused');
+  assert(!hasPlainBooks(local2), 'nothing was decrypted for the wrong password');
+  await typeAndSubmit('Admin', 'secret123');
+  const in2 = await until(() => page.eval('location.pathname').then((p) => p !== '/login'), 60_000);
+  assert(in2, 'the right password opens the file with one sign-in');
+  await sleep(2000);
+  await page.eval(`location.assign('/invoices')`);
+  await sleep(4000);
+  await page.shot('07-fresh-install-invoices');
+  assert(await page.eval(`document.body.innerText.includes('Oak Street Apartments')`), 'the invoice is there on the fresh install');
+  await page.send('Runtime.evaluate', { expression: 'window.close()' }).catch(() => {});
+  page.close();
+  assert(await until(async () => !(await appRunning()), 90_000), 'the fresh install quits and releases the file');
   console.log(`\nScreenshots: ${SHOTS}`);
   console.log(failures === 0 ? 'E2E DESKTOP PASSED' : `E2E DESKTOP FAILED (${failures} assertion(s))`);
 }

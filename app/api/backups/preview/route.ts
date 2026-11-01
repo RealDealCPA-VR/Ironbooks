@@ -15,6 +15,8 @@ import { withDamagedFileAccess } from '@/lib/db';
 import { requireFileAdmin } from '@/lib/services/access';
 import { readBackupVersion } from '@/lib/services/backupSchedule';
 import { previewBackup } from '@/lib/services/backupPreview';
+import { archiveCredentialsFrom, withArchiveCredentialLimit } from '@/lib/net/archiveCredentials';
+import { originFromHeaders } from '@/lib/net/requestInfo';
 
 export async function POST(req: NextRequest) {
   return withDamagedFileAccess(async () => {
@@ -32,7 +34,11 @@ export async function POST(req: NextRequest) {
         }
         buffer = Buffer.from(bytes);
       }
-      return NextResponse.json(await previewBackup(buffer));
+      // A backup protected with another company file's passwords: credentials in headers.
+      const credentials = archiveCredentialsFrom(req.headers);
+      return NextResponse.json(
+        await withArchiveCredentialLimit(credentials, originFromHeaders(req.headers).addr, () => previewBackup(buffer, { credentials })),
+      );
     } catch (err) {
       return routeError(err, 'backups/preview');
     }

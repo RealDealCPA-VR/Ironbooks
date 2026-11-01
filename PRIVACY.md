@@ -124,7 +124,18 @@ at once (further sign-ins over the network are refused until someone logs out).
 
 ## Data at rest
 
-- The company file is a local PGlite (embedded Postgres) folder.
+- The company file is a local PGlite (embedded Postgres) database packed into one file
+  (`ABC Company.ironbooks`). A company file **protected with its passwords** (the default for new
+  files; Company > Security for older ones) is encrypted with AES-256-GCM under a random file key;
+  only its own user names and passwords, challenge answers or its recovery key unlock that key
+  (scrypt key slots in the file). Only the company name, file id, save dates and app version stay
+  readable, so the No Company Open list can show the file. Nothing about the password or the key is
+  sent anywhere: unlocking happens on the computer that opens the file.
+- While the file is open its books are decrypted only into a private working copy on that
+  computer (`%LOCALAPPDATA%\Ironbooks\Working`), which is deleted after a clean close.
+- Backups, safety copies, condense archives, Save Copy As and "unsaved changes" copies of a
+  protected file are encrypted the same way. Portable company files and Accountant's Copy transfer
+  files are offered with a password (on by default).
 - Backups (`.bka`) are written to your own disk, including the automatic rotating backups in
   the app's data folder.
 - Sign-in sessions are stored in the company file (`user_sessions`) so admins can see and

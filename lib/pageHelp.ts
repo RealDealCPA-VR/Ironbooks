@@ -363,6 +363,19 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
     first: 'Open a category on the left, change what you need and save.',
     qb: 'Edit > Preferences',
   },
+  // filecrypto: the company file's own passwords
+  '/security': {
+    title: 'Security',
+    what: 'Protects the company file with its own passwords: it is encrypted, and only its user names and passwords (or its recovery key) open it, on any computer.',
+    first: 'An Admin clicks "Protect This Company File with Passwords", then prints or saves the recovery key.',
+    qb: 'Set Up Users and Passwords',
+  },
+  '/login': {
+    title: 'Sign in',
+    what: 'Opens the company file with your user name and password. A protected company file is unlocked on this computer by this same sign-in.',
+    first: 'Type your password and press Enter. Forgot it? Choose "I forgot my password", or use the recovery key.',
+    qb: 'QuickBooks Desktop Login',
+  },
   // team backups
   '/backup': {
     title: 'Back Up & Restore',

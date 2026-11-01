@@ -9,6 +9,11 @@
  * password hash is the sentinel 'dev', doesn't count). The file password still applies.
  * The challenge question (QuickBooks parity) is what "I forgot my password" asks before it
  * resets the Admin's password (app/api/auth/request-reset).
+ *
+ * A new single company file is protected with passwords from its first save (filecrypto,
+ * lib/services/fileProtection.ts): the Admin's password (and challenge answer) get the first key
+ * slots, and the answer carries the file's RECOVERY KEY once, for the setup screen to show (print
+ * or save it — it is the only way back in if every password is lost). `protect: false` opts out.
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { eq, ne, sql } from 'drizzle-orm';
@@ -32,6 +37,13 @@ import { logTransaction } from '@/lib/services/transactionLog';
 import { startSession } from '@/lib/services/sessions';
 import { cookieSecure, originFromHeaders } from '@/lib/net/requestInfo';
 import { MIN_CHALLENGE_ANSWER, isKnownChallengeQuestion, normalizeChallengeAnswer } from '@/lib/challengeQuestions';
+import {
+  abandonFileProtection,
+  companyFileForProtection,
+  fileProtectionWritten,
+  newFileProtection,
+  writeFileProtection,
+} from '@/lib/services/fileProtection';
 
 /** users.name / users.email / companies.name are varchar(255). */
 const MAX_TEXT = 255;
@@ -137,6 +149,11 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: passwordProblemMessage(problems), code: 'VALIDATION' }, { status: 400 });
   }
 
+  // filecrypto: a new single company file is protected from its first save (default on). The file
+  // key is made now and the protection is written in the SAME transaction as the Admin, so no
+  // save can ever hold the Admin and the company without the protection that encrypts them.
+  const pending = companyFileForProtection() && body.protect !== false ? newFileProtection() : null;
+  let recoveryKey: string | null = null;
   let created: { user: typeof users.$inferSelect; companyId: string; sessionId: string };
   try {
     // One transaction, serialised by an advisory lock: the "no real user yet" check, the Admin,
@@ -181,6 +198,13 @@ export async function POST(req: NextRequest) {
         ownerId: user.id,
         settings: { ...NEW_COMPANY_SETTINGS },
       });
+      if (pending) {
+        recoveryKey = await writeFileProtection(tx, pending, {
+          userId: user.id,
+          password,
+          challenge: wantsChallenge ? { question: challengeQuestion, answer: challengeAnswer } : null,
+        });
+      }
       // startSession nests (a savepoint) inside this transaction.
       const session = await startSession(tx, {
         userId: user.id,
@@ -193,6 +217,7 @@ export async function POST(req: NextRequest) {
     });
     created = result;
   } catch (err) {
+    if (pending) abandonFileProtection(pending);
     if (err instanceof ServiceError && err.code === 'FORBIDDEN') {
       return NextResponse.json({ error: err.message, code: 'FORBIDDEN' }, { status: 403 });
     }
@@ -200,7 +225,19 @@ export async function POST(req: NextRequest) {
   }
 
   const { user, companyId, sessionId } = created;
-  const res = NextResponse.json({ id: user.id, name: user.name, email: user.email, companyId }, { status: 201 });
+  if (pending) await fileProtectionWritten(db, pending);
+  const res = NextResponse.json(
+    {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      companyId,
+      // Shown ONCE by the setup screen (print it or save it to a file): the only way back in if
+      // every password is lost.
+      ...(recoveryKey ? { protected: true, recoveryKey } : {}),
+    },
+    { status: 201 },
+  );
   const opts = { httpOnly: true, secure: cookieSecure(origin), sameSite: 'lax' as const, path: '/', maxAge: 60 * 60 * 24 * 30 };
   res.cookies.set(SESSION_COOKIE, createSessionToken(user.id, 'user', sessionId), opts);
   res.cookies.set(COMPANY_COOKIE, companyId, opts);

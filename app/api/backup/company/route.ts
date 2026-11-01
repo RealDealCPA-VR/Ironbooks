@@ -18,13 +18,15 @@ import { ServiceError } from '@/lib/services/_base';
 import { assertExclusiveAccess } from '@/lib/services/sessions';
 import { requireAccessInCompany, requirePermission } from '@/lib/services/access';
 import { recordBackup } from '@/lib/services/backupHistory';
-import { serviceErrorStatus } from '@/lib/routeErrors';
+import { serviceErrorBody, serviceErrorStatus } from '@/lib/routeErrors';
+import { archiveCredentialsFrom, withArchiveCredentialLimit } from '@/lib/net/archiveCredentials';
+import { originFromHeaders } from '@/lib/net/requestInfo';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
     const status =
       serviceErrorStatus(err.code);
-    return NextResponse.json({ error: err.message, code: err.code }, { status });
+    return NextResponse.json(serviceErrorBody(err), { status });
   }
   // Do not leak raw error text (may contain absolute data-dir paths / OS details).
   console.error('[backup/company] unexpected error:', err);
@@ -78,10 +80,13 @@ export async function POST(req: NextRequest) {
     }
 
     const name = req.nextUrl.searchParams.get('name') ?? undefined;
-    const result = await restoreCompanyBackup(ctx.db, Buffer.from(arrayBuffer), {
-      ownerId: ctx.userId,
-      name,
-    });
+    // A backup protected with another company file's passwords opens with a user name + password
+    // (or recovery key) of that file, sent in headers (lib/net/archiveCredentials.ts).
+    const credentials = archiveCredentialsFrom(req.headers);
+    const ownerId = ctx.userId;
+    const result = await withArchiveCredentialLimit(credentials, originFromHeaders(req.headers).addr, () =>
+      restoreCompanyBackup(ctx.db, Buffer.from(arrayBuffer), { ownerId, name, credentials }),
+    );
     return NextResponse.json(result, { status: 201 });
   } catch (err) {
     return errorResponse(err);

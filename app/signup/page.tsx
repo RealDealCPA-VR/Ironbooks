@@ -7,6 +7,11 @@
  * with it when it is copied to a file server, a USB drive or an accountant. Anyone who opens the
  * file must sign in. The challenge question is how a forgotten Admin password is reset, so a copy
  * of the file can't be opened by someone who merely guesses the user name.
+ *
+ * A new single company file is protected with passwords from its first save (filecrypto; on by
+ * default, "Protect this company file" can be unticked): the file is encrypted and only its own
+ * user names and passwords open it, on any computer. The recovery key is shown once, right after
+ * the Admin is created (print it or save it), before the setup interview.
  */
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
@@ -16,12 +21,15 @@ import { api } from '@/lib/client';
 import { MIN_PASSWORD_LENGTH } from '@/lib/passwordPolicy';
 import { CHALLENGE_QUESTIONS } from '@/lib/challengeQuestions';
 import { PasswordRulesHint, usePasswordPolicy } from '@/components/PasswordRules';
+import { RecoveryKeyPanel } from '@/components/FileProtection';
 
 interface FileInfo {
   companyName: string | null;
   fileName: string;
   location: string | null;
   hasUsers: boolean;
+  /** A single company file (.ironbooks): only those can be protected with passwords. */
+  singleFile?: boolean;
 }
 
 export default function SignupPage() {
@@ -36,6 +44,8 @@ export default function SignupPage() {
   });
   const [info, setInfo] = useState<FileInfo | null>(null);
   const [busy, setBusy] = useState(false);
+  const [protect, setProtect] = useState(true);
+  const [recovery, setRecovery] = useState<{ key: string; companyName: string } | null>(null);
   const policy = usePasswordPolicy();
   const set = (k: keyof typeof form) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) =>
     setForm((f) => ({ ...f, [k]: e.target.value }));
@@ -66,13 +76,14 @@ export default function SignupPage() {
     }
     setBusy(true);
     try {
-      await api.post('/api/auth/signup', {
+      const created = await api.post<{ recoveryKey?: string }>('/api/auth/signup', {
         name: form.name,
         email: form.userName,
         password: form.password,
         companyName: form.companyName,
         challengeQuestion: form.challengeQuestion,
         challengeAnswer: form.challengeAnswer,
+        protect: info?.singleFile ? protect : undefined,
       });
       try {
         await (window as unknown as { bookkeeper?: { company?: { signedIn?: (n: string) => Promise<unknown> } } }).bookkeeper?.company?.signedIn?.(
@@ -81,12 +92,33 @@ export default function SignupPage() {
       } catch {
         /* the shell is optional */
       }
+      // The recovery key is shown once (print / save it) before the setup interview.
+      if (created?.recoveryKey) {
+        setRecovery({ key: created.recoveryKey, companyName: form.companyName.trim() || info?.companyName || 'Company' });
+        setBusy(false);
+        return;
+      }
       // Every new company goes through the setup interview (it offers Skip).
       window.location.href = '/onboarding?new=1';
     } catch (err) {
       toast(err instanceof Error ? err.message : 'Setup failed', 'danger');
       setBusy(false);
     }
+  }
+
+  if (recovery) {
+    return (
+      <main className="min-h-screen flex items-center justify-center bg-offwhite bg-[radial-gradient(1200px_600px_at_50%_-10%,rgb(var(--accent)/0.14),transparent)] p-4 font-sans">
+        <Card className="w-full max-w-lg p-8">
+          <RecoveryKeyPanel
+            recoveryKey={recovery.key}
+            companyName={recovery.companyName}
+            doneLabel="Continue to the company setup"
+            onDone={() => (window.location.href = '/onboarding?new=1')}
+          />
+        </Card>
+      </main>
+    );
   }
 
   return (
@@ -181,6 +213,15 @@ export default function SignupPage() {
               <p className="mt-1 text-xs text-navy/50">Not case-sensitive. Write it down somewhere safe.</p>
             </div>
           </fieldset>
+          {info?.singleFile && (
+            <label className="flex items-start gap-2 rounded-xl border border-navy/10 p-4 text-sm text-navy">
+              <input type="checkbox" className="mt-1" checked={protect} onChange={(e) => setProtect(e.target.checked)} />
+              <span>
+                <span className="font-semibold">Protect this company file with passwords</span> (recommended). The file is encrypted:
+                only its own user names and passwords open it, on any computer. You get a recovery key next — print it or save it.
+              </span>
+            </label>
+          )}
           <Button type="submit" className="w-full" loading={busy} disabled={mismatch}>
             Create the Admin and continue
           </Button>

@@ -16,6 +16,11 @@
 // it holds changes the app could not save before it stopped, or replaced by a fresh copy when
 // someone else has saved the file since.
 //
+// A company file protected with passwords (electron/fileCrypto.js) is only ever in plain text
+// here, in this working copy on this computer: the app server makes it from the file when
+// someone signs in, and the shell removes it again after a clean close (discardProtectedWorkingData)
+// — never while it holds changes the file does not have, so crash recovery still works.
+//
 // Pure Node so the open decisions can be unit-tested (test/companySession.test.ts).
 'use strict';
 
@@ -184,7 +189,13 @@ function conflictCopyPath(companyFile, computer, when = new Date()) {
  * folder (`dataDir`) — out as a single company file at `target`. Used to keep unsaved changes
  * that can't be merged, and to pack a restored portable company file.
  */
-async function writeWorkingCopyAs(workDir, target, { companyName, appVersion, fileId, dataDir } = {}) {
+async function writeWorkingCopyAs(workDir, target, { companyName, appVersion, fileId, dataDir, protection } = {}) {
+  // Books protected with passwords are only ever written encrypted (with their own key and slots).
+  if (!protection && isProtectedData(dataDir || dataDirOf(workDir))) {
+    const err = new Error('These books are protected with passwords; they can only be copied by the app after someone signs in.');
+    err.code = 'PROTECTED';
+    throw err;
+  }
   // A separate company file: never with the original's backup history (lib/services/backupHistory.ts
   // BACKUP_HISTORY_FILE), or the copy's backup rotation would delete the original's versions.
   const entries = format
@@ -204,13 +215,15 @@ async function writeWorkingCopyAs(workDir, target, { companyName, appVersion, fi
     },
     backupManifest: {
       app: 'bookkeeper-ai',
-      formatVersion: 1,
+      formatVersion: format.BACKUP_FORMAT_VERSION,
       kind: 'full',
       companyName: companyName || format.companyFileBaseName(target),
       createdAt: now,
       appVersion: appVersion || undefined,
     },
     entries,
+    // A copy of a protected file is protected the same way (same file key and key slots).
+    protection: protection || null,
   });
   return { saveId };
 }
@@ -237,15 +250,24 @@ function savedByNewerVersion(manifest, knownSchemaAt) {
 
 /**
  * Prepare the working copy for opening `companyFile` (the lock is already held). Returns
- * { workDir, dataDir, plan, manifest, conflictCopy? }. `onConflict` decides a 'conflict':
+ * { workDir, dataDir, plan, manifest, conflictCopy?, sealed }. `onConflict` decides a 'conflict':
  * resolve true to keep the unsaved changes as a separate copy and continue, false to stop
  * (then nothing has changed). `knownSchemaAt` (latestMigrationAt of this app's migrations): a
  * company file last saved by a newer version is refused before anything is touched (NEWER_FORMAT).
+ *
+ * A file protected with passwords (sealed) can't be read here: the shell never has its key. The
+ * plan is still worked out here (and the conflict question asked), but the extraction — and an
+ * "unsaved changes" copy, which is protected like the file — is left to the app server, which
+ * does it when someone signs in (lib/services/fileProtection.ts). `sealed` tells it what to do:
+ *   'extract'   make the working copy from the file at sign-in
+ *   'conflict'  keep this working copy's unsaved changes as a protected copy, then extract
+ *   'key'       the working copy is usable (reuse / recover); sign-in only unlocks the file key
+ * null for a file without passwords.
  */
 async function prepareWorkingCopy(companyFile, { root, onConflict, appVersion, knownSchemaAt } = {}) {
   const manifest = format.readCompanyManifest(companyFile);
   if (!manifest) throw new format.NotACompanyFileError('the file has no readable company information');
-  if (savedByNewerVersion(manifest, knownSchemaAt)) {
+  if (savedByNewerVersion(manifest, knownSchemaAt) || Number(manifest.formatVersion) > format.COMPANY_FILE_FORMAT_VERSION) {
     const err = new Error(
       'This company file was saved by a newer version of Ironbooks. Update Ironbooks (Help > Check for Updates) to open it.',
     );
@@ -262,15 +284,28 @@ async function prepareWorkingCopy(companyFile, { root, onConflict, appVersion, k
     dataExists,
     workingFingerprint: dataExists ? logFingerprint(dataDirOf(workDir)) : undefined,
   });
+  // Unsaved work made through another path to this same file (mapped drive vs UNC): kept apart.
+  const others = await keepWorkThroughOtherPaths(companyFile, root, manifest, appVersion);
+  const otherPaths = { otherPathCopies: others.copies, otherPathUnsaved: others.protectedLeft };
+  if (format.isSealedManifest(manifest)) return { ...(await prepareSealed(companyFile, { workDir, state, manifest, plan, onConflict })), ...otherPaths };
   let conflictCopy = null;
+  let keptOnThisComputer = null;
   if (plan === 'conflict') {
     const keep = onConflict ? await onConflict({ state, manifest, workDir }) : true;
     if (!keep) return { workDir, dataDir: dataDirOf(workDir), plan: 'cancelled', manifest };
-    conflictCopy = conflictCopyPath(companyFile, require('node:os').hostname());
-    await writeWorkingCopyAs(workDir, conflictCopy, {
-      companyName: `${manifest.companyName || format.companyFileBaseName(companyFile)} (unsaved changes)`,
-      appVersion,
-    });
+    if (isProtectedData(dataDirOf(workDir))) {
+      // The unsaved changes are of books protected with passwords, and this shell never has their
+      // key: they are never written out in plain text next to the company file. They stay on this
+      // computer as a company folder of their own (it opens with the same user names and passwords).
+      keptOnThisComputer = path.join(workDir, `unsaved changes ${stampOf(new Date())}`);
+      fs.renameSync(dataDirOf(workDir), keptOnThisComputer);
+    } else {
+      conflictCopy = conflictCopyPath(companyFile, require('node:os').hostname());
+      await writeWorkingCopyAs(workDir, conflictCopy, {
+        companyName: `${manifest.companyName || format.companyFileBaseName(companyFile)} (unsaved changes)`,
+        appVersion,
+      });
+    }
   }
   if (plan === 'extract' || plan === 'conflict') {
     fs.rmSync(dataDirOf(workDir), { recursive: true, force: true });
@@ -296,7 +331,163 @@ async function prepareWorkingCopy(companyFile, { root, onConflict, appVersion, k
     lastUsedAt: now,
     closedCleanly: false,
   });
-  return { workDir, dataDir: dataDirOf(workDir), plan, manifest, conflictCopy };
+  return { workDir, dataDir: dataDirOf(workDir), plan, manifest, conflictCopy, keptOnThisComputer, sealed: null, ...otherPaths };
+}
+
+/**
+ * True when two paths reach the very same file on disk — a mapped drive and its UNC path
+ * (S:\Books\X.ironbooks and \\SERVER\Books\X.ironbooks), a symbolic or hard link: same volume and
+ * file index. A file system that reports no file index falls back to the same size and timestamp.
+ */
+function sameFileOnDisk(a, b) {
+  try {
+    const sa = fs.statSync(a, { bigint: true });
+    const sb = fs.statSync(b, { bigint: true });
+    if (sa.ino && sb.ino) return sa.ino === sb.ino && sa.dev === sb.dev;
+    return sa.size === sb.size && sa.mtimeNs === sb.mtimeNs;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Working copies are kept per PATH (an "unsaved changes" copy shares its original's file id, so
+ * keying by file id would mix files). The same company file opened through another path — a
+ * mapped drive vs its UNC path — therefore has its own working copy. This finds the other working
+ * copies of THIS file (same file id, the same file on disk) that hold work the file does not have.
+ */
+function workThroughOtherPaths(companyFile, root, manifest) {
+  const out = [];
+  if (!root || !manifest || !manifest.fileId) return out;
+  let names = [];
+  try {
+    names = fs.readdirSync(root);
+  } catch {
+    return out;
+  }
+  const mine = pathKey(workingDirFor(companyFile, root));
+  for (const n of names) {
+    const dir = path.join(root, n);
+    if (pathKey(dir) === mine) continue;
+    const st = readState(dir);
+    if (!st || !st.companyFile || st.fileId !== manifest.fileId || pathKey(st.companyFile) === pathKey(companyFile)) continue;
+    if (!hasData(dir)) continue;
+    const unsaved = Boolean(st.unsavedSince) || crashedWithUnsavedBooks(st, logFingerprint(dataDirOf(dir)));
+    if (!unsaved || !sameFileOnDisk(st.companyFile, companyFile)) continue;
+    out.push({ workDir: dir, companyFile: st.companyFile, unsavedSince: st.unsavedSince || null });
+  }
+  return out;
+}
+
+/**
+ * Keep the unsaved work of other paths to this file (workThroughOtherPaths) as separate company
+ * files next to it, like any "unsaved changes" copy, so it is never silently left behind. Books
+ * protected with passwords are never written out here in plain text (this shell has no key): they
+ * are reported instead, and stay where they are. Returns { copies, protectedLeft }.
+ */
+async function keepWorkThroughOtherPaths(companyFile, root, manifest, appVersion) {
+  const copies = [];
+  const protectedLeft = [];
+  for (const w of workThroughOtherPaths(companyFile, root, manifest)) {
+    if (isProtectedData(dataDirOf(w.workDir))) {
+      protectedLeft.push(w.companyFile);
+      continue;
+    }
+    try {
+      const target = conflictCopyPath(companyFile, require('node:os').hostname());
+      await writeWorkingCopyAs(w.workDir, target, {
+        companyName: `${manifest.companyName || format.companyFileBaseName(companyFile)} (unsaved changes)`,
+        appVersion,
+      });
+      // Kept once: that working copy no longer counts as unsaved, and is refreshed from the file
+      // the next time it is used (base: null) instead of saving the same work a second time.
+      writeState(w.workDir, { unsavedSince: null, closedCleanly: true, base: null, conflictCopy: target });
+      copies.push(target);
+    } catch {
+      /* the work stays where it is; it surfaces when the file is opened through that path again */
+    }
+  }
+  return { copies, protectedLeft };
+}
+
+/** lib/services/fileProtection.ts PROTECTED_MARKER: the folder's books are protected with passwords. */
+const PROTECTED_MARKER = '.ironbooks-protected';
+
+/** True when a data folder holds books protected with passwords (they are never written out in plain text). */
+function isProtectedData(dataDir) {
+  try {
+    return fs.existsSync(path.join(dataDir, PROTECTED_MARKER));
+  } catch {
+    return false;
+  }
+}
+
+/** "2026-10-24 1032" (local time). */
+function stampOf(when) {
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${when.getFullYear()}-${pad(when.getMonth() + 1)}-${pad(when.getDate())} ${pad(when.getHours())}${pad(when.getMinutes())}`;
+}
+
+/**
+ * prepareWorkingCopy for a sealed (password-protected) company file. Nothing is extracted and no
+ * copy is written here (both need the file key). The state keeps its old base until the server
+ * has extracted the file at sign-in, so a crash before anyone signs in still finds the same plan
+ * (never reuses an old working copy as if it were the file's current save).
+ */
+async function prepareSealed(companyFile, { workDir, state, manifest, plan, onConflict }) {
+  if (plan === 'conflict') {
+    const keep = onConflict ? await onConflict({ state, manifest, workDir }) : true;
+    if (!keep) return { workDir, dataDir: dataDirOf(workDir), plan: 'cancelled', manifest, sealed: null };
+  }
+  if (plan === 'extract') {
+    // An old working copy of another save (nothing unsaved in it): never needed again, and its
+    // books are in plain text on this computer — remove it now.
+    fs.rmSync(dataDirOf(workDir), { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+  }
+  const now = new Date().toISOString();
+  writeState(workDir, {
+    companyFile: path.resolve(companyFile),
+    fileId: manifest.fileId || null,
+    companyName: manifest.companyName || null,
+    // reuse / recover: what this computer last saved (it matches the file); extract / conflict:
+    // the old base, until the server has made the new working copy from the file.
+    base: (state && state.base) || null,
+    unsavedSince: plan === 'recover' ? (state && state.unsavedSince) || now : (state && state.unsavedSince) || null,
+    openedAt: now,
+    lastUsedAt: now,
+    closedCleanly: false,
+    protectedFile: true,
+  });
+  return {
+    workDir,
+    dataDir: dataDirOf(workDir),
+    plan,
+    manifest,
+    conflictCopy: null,
+    sealed: plan === 'extract' ? 'extract' : plan === 'conflict' ? 'conflict' : 'key',
+  };
+}
+
+/**
+ * After a clean close of a protected company file: remove the working copy's books (the plain
+ * text copy on this computer) — only when the state says the last save holds everything and the
+ * file closed cleanly. Side files (protected safety copies, condense archives) and state.json
+ * stay. Returns true when the books were removed.
+ */
+function discardProtectedWorkingData(workDir, companyFile) {
+  const st = readState(workDir);
+  if (!st || st.unsavedSince || st.closedCleanly !== true) return false;
+  const m = format.readCompanyManifest(companyFile);
+  if (!format.isSealedManifest(m)) return false;
+  // The working copy must hold exactly the company file's last save.
+  if (!st.base || !m || st.base.saveId !== m.saveId) return false;
+  try {
+    fs.rmSync(dataDirOf(workDir), { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    writeState(workDir, { dataRemovedAt: new Date().toISOString() });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -306,7 +497,7 @@ async function prepareWorkingCopy(companyFile, { root, onConflict, appVersion, k
  * copies made before a restore, scheduled report exports — and is never deleted with the cache.
  */
 function isCacheEntry(name) {
-  return name === 'data' || name === STATE_FILE || (name.startsWith(`${STATE_FILE}.`) && name.endsWith('.tmp')) || /^data\.(restore-tmp|pre-restore|refused-restore)-\d+$/.test(name);
+  return name === 'data' || name === STATE_FILE || (name.startsWith(`${STATE_FILE}.`) && name.endsWith('.tmp')) || /^data\.(restore-tmp|pre-restore|refused-restore|unseal)-\d+$/.test(name);
 }
 
 /** Remove the cache of working copies not used for a long time, except `keep` (best effort). */
@@ -325,6 +516,16 @@ function pruneWorkingCopies(root, keep = [], now = Date.now()) {
     const st = readState(dir);
     // Never throw away unsaved work, whatever its age.
     if (!st || st.unsavedSince) continue;
+    // A protected file's plain-text books the app server could not remove right after a clean
+    // close (a file was busy for a moment): remove them now (lib/services/companyFileSave.ts).
+    if (st.dataRemovePending === true && st.closedCleanly === true) {
+      try {
+        fs.rmSync(dataDirOf(dir), { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+        writeState(dir, { dataRemovePending: null, dataRemovedAt: new Date(now).toISOString() });
+      } catch {
+        /* still busy: next time */
+      }
+    }
     const last = Date.parse(st.lastUsedAt || st.openedAt || '') || 0;
     if (now - last < WORKING_COPY_MAX_AGE_MS) continue;
     try {
@@ -357,8 +558,13 @@ module.exports = {
   conflictCopyPath,
   writeWorkingCopyAs,
   prepareWorkingCopy,
+  discardProtectedWorkingData,
   pruneWorkingCopies,
+  workThroughOtherPaths,
+  sameFileOnDisk,
   latestMigrationAt,
   savedByNewerVersion,
   logFingerprint,
+  isProtectedData,
+  PROTECTED_MARKER,
 };

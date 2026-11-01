@@ -25,10 +25,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { asc } from 'drizzle-orm';
-import { getDb, resolveDataDir, withDamagedFileAccess } from '@/lib/db';
+import { getDb, resolveDataDir, sealedMode, withDamagedFileAccess } from '@/lib/db';
 import { companies } from '@/lib/db/schema';
 import { ServiceError } from './errors';
 import { createBackup } from './backup';
+import { protectionForDir } from './fileProtection';
 import { currentFingerprint } from './backupFingerprint';
 import { readSandboxMarker, sandboxBlockedError } from './sandboxState';
 import {
@@ -168,7 +169,8 @@ async function doVersionedBackup(source: VersionedSource, opts: VersionedBackupO
     fs.mkdirSync(folder, { recursive: true });
     unreachable = true;
   }
-  const { buffer } = createBackup(opts.companyName ?? undefined, dir);
+  // A protected company file's backups are encrypted like the file (its key and key slots).
+  const { buffer } = createBackup(opts.companyName ?? undefined, dir, { protection: await protectionForDir(dir) });
   const filename = versionFilename(source, opts.companyName ?? null, now);
   const outPath = path.join(folder, filename);
   // Write to a temp name first so a half-written file never looks like a version.
@@ -231,6 +233,8 @@ export async function runScheduledBackupIfDue(
   opts: { dataDir?: string; now?: Date; companyName?: string | null } = {},
 ): Promise<'off' | 'not-due' | 'busy' | VersionedBackupResult['status']> {
   const dir = resolveDataDir(opts.dataDir);
+  // A protected company file nobody has signed in to yet (lib/db/sealed.ts): not decrypted here.
+  if (sealedMode()) return 'not-due';
   if (!fs.existsSync(dir)) return 'not-due';
   // Never from a sandbox / training copy, nor while the server is switched to one (the real
   // file's handle is held closed until the user leaves the sandbox).

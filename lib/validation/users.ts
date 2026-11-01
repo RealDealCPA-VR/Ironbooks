@@ -70,6 +70,8 @@ export const loginSchema = z.object({
   email: z.string().trim().min(1, 'is required').max(255),
   password: z.string().min(1, 'is required').max(200),
   totp: z.union([z.string(), z.number()]).optional().nullable(),
+  /** filecrypto: the company file's own password, asked on the sign-in screen of a protected file. */
+  filePassword: z.string().max(200).optional().nullable(),
 });
 
 const grantAction = z.enum([...ACTIONS, 'full'] as [string, ...string[]]);

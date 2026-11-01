@@ -6,12 +6,16 @@
  * Desktop: Create saves through a native Save dialog; Open runs the shell's flow (pick the
  * .bkp, pick where the new company file goes, restore + verify, offer to open it).
  * Browser: Open uploads the .bkp; it is restored into a new folder next to this company file.
+ *
+ * Passwords (filecrypto): Create offers a password for the file, on by default (it holds every
+ * user and transaction); Open asks for the password of a protected .bkp (sent in a header).
  */
 import { useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { FileArchive, FileSpreadsheet, FileText, FolderInput, ScrollText, Share2 } from 'lucide-react';
 import { Button, Card, Modal, toast } from '@/components/ui';
 import { savePortableCompanyFile, saveShareableLedger } from '@/lib/companyFileClient';
+import { CredentialsModal, FilePasswordFields, filePasswordHeader, filePasswordProblem, type FilePasswordChoice } from '@/components/FileProtection';
 
 interface PortableSummary {
   companyName: string;
@@ -23,7 +27,9 @@ interface PortableSummary {
 }
 
 interface RestoreResult {
-  dataDir: string;
+  dataDir: string | null;
+  /** A single company file written next to the open one (filecrypto restores on a single-file host). */
+  packed?: string;
   companyName: string;
   verified: { tables: number; rows: number; files: number; transactionLogRecords: number };
 }
@@ -46,6 +52,11 @@ export default function ShareCompanyFileCard() {
   const [pending, setPending] = useState<{ file: File; summary: PortableSummary } | null>(null);
   const [restored, setRestored] = useState<RestoreResult | null>(null);
   const [highlight, setHighlight] = useState(false);
+  // filecrypto: the password of the portable file being created / opened.
+  const [creating, setCreating] = useState(false);
+  const [choice, setChoice] = useState<FilePasswordChoice>({ protect: true, password: '', confirm: '' });
+  const [askPassword, setAskPassword] = useState<{ file: File; error: string | null } | null>(null);
+  const [openPassword, setOpenPassword] = useState<string | null>(null);
 
   // Deep link from the desktop File menu (dev fallback) or other pages: ?share=1 / ?restore=portable.
   useEffect(() => {
@@ -54,12 +65,19 @@ export default function ShareCompanyFileCard() {
       setHighlight(true);
       cardRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
+    // File > Create Portable Company File (desktop menu): straight to the password choice.
+    if (params.get('share') === 'portable') setCreating(true);
   }, []);
 
   async function run(kind: 'bkp' | 'xlsx' | 'pdf') {
+    if (kind === 'bkp' && filePasswordProblem(choice)) return;
     setBusy(kind);
     try {
-      const saved = kind === 'bkp' ? await savePortableCompanyFile() : await saveShareableLedger(kind);
+      const saved = kind === 'bkp' ? await savePortableCompanyFile(choice.protect ? choice.password : null) : await saveShareableLedger(kind);
+      if (kind === 'bkp') {
+        setCreating(false);
+        setChoice({ protect: true, password: '', confirm: '' });
+      }
       if (saved) {
         toast(
           kind === 'bkp'
@@ -88,15 +106,26 @@ export default function ShareCompanyFileCard() {
     const file = e.target.files?.[0];
     e.target.value = '';
     if (!file) return;
+    setOpenPassword(null);
+    await inspect(file, null);
+  }
+
+  async function inspect(file: File, password: string | null) {
     setBusy('inspect');
     try {
       const res = await fetch('/api/portable/restore?inspect=1', {
         method: 'POST',
         body: await file.arrayBuffer(),
-        headers: { 'Content-Type': 'application/octet-stream' },
+        headers: { 'Content-Type': 'application/octet-stream', ...filePasswordHeader(password) },
       });
       const data = await res.json().catch(() => ({}));
+      if (res.status === 403 && data?.details?.passwordRequired && !data?.details?.rateLimited) {
+        setAskPassword({ file, error: data.details.wrongPassword ? data.error : null });
+        return;
+      }
       if (!res.ok) throw new Error(data?.error || 'This file could not be read.');
+      setAskPassword(null);
+      setOpenPassword(password);
       setPending({ file, summary: data as PortableSummary });
     } catch (err) {
       toast(err instanceof Error ? err.message : 'This file could not be read.', 'danger');
@@ -112,7 +141,7 @@ export default function ShareCompanyFileCard() {
       const res = await fetch('/api/portable/restore', {
         method: 'POST',
         body: await pending.file.arrayBuffer(),
-        headers: { 'Content-Type': 'application/octet-stream' },
+        headers: { 'Content-Type': 'application/octet-stream', ...filePasswordHeader(openPassword) },
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data?.error || 'The portable file could not be restored.');
@@ -145,7 +174,7 @@ export default function ShareCompanyFileCard() {
               every number matches the original.
             </p>
             <div className="mt-3 flex flex-wrap gap-2">
-              <Button onClick={() => run('bkp')} loading={busy === 'bkp'}>
+              <Button onClick={() => setCreating(true)} loading={busy === 'bkp'}>
                 <FileArchive className="h-4 w-4" /> Create Portable File…
               </Button>
               <Button variant="secondary" onClick={openPortable} loading={busy === 'inspect'}>
@@ -224,6 +253,45 @@ export default function ShareCompanyFileCard() {
       </Modal>
 
       <Modal
+        open={creating}
+        onClose={() => busy !== 'bkp' && setCreating(false)}
+        title="Create portable company file"
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setCreating(false)} disabled={busy === 'bkp'}>
+              Cancel
+            </Button>
+            <Button onClick={() => run('bkp')} loading={busy === 'bkp'} disabled={Boolean(filePasswordProblem(choice))}>
+              Create…
+            </Button>
+          </>
+        }
+      >
+        <form
+          className="space-y-3"
+          onSubmit={(e) => {
+            e.preventDefault();
+            void run('bkp');
+          }}
+        >
+          <p className="text-sm text-navy/70">One compact file with everything in this company file, for moving it or handing it to your accountant.</p>
+          <FilePasswordFields value={choice} onChange={setChoice} what="the portable file" />
+          <button type="submit" className="hidden" aria-hidden tabIndex={-1} />
+        </form>
+      </Modal>
+
+      <CredentialsModal
+        open={Boolean(askPassword)}
+        mode="password"
+        title="Protected portable file"
+        message="This portable company file is protected with a password. Enter the password it was saved with."
+        error={askPassword?.error}
+        busy={busy === 'inspect'}
+        onSubmit={(c) => askPassword && void inspect(askPassword.file, c.password)}
+        onCancel={() => setAskPassword(null)}
+      />
+
+      <Modal
         open={Boolean(restored)}
         onClose={() => setRestored(null)}
         title="Portable file restored and verified"
@@ -232,8 +300,8 @@ export default function ShareCompanyFileCard() {
             <Button variant="secondary" onClick={() => setRestored(null)}>
               Close
             </Button>
-            {desktop && restored && (
-              <Button onClick={() => bridge()?.company?.switch?.(restored.dataDir)}>Open it now</Button>
+            {desktop && restored && (restored.packed || restored.dataDir) && (
+              <Button onClick={() => bridge()?.company?.switch?.((restored.packed || restored.dataDir) as string)}>Open it now</Button>
             )}
           </>
         }
@@ -246,7 +314,7 @@ export default function ShareCompanyFileCard() {
               {` ${restored.verified.files}`} attached file(s) and {restored.verified.transactionLogRecords.toLocaleString()} log
               records all match the original.
             </p>
-            <p className="break-all text-xs text-navy/50">Location: {restored.dataDir}</p>
+            <p className="break-all text-xs text-navy/50">Location: {restored.packed || restored.dataDir}</p>
             {!desktop && <p>Open it from the desktop app with File → Open Company.</p>}
           </div>
         )}

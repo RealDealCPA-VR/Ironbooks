@@ -22,7 +22,7 @@ import { usePathname, useRouter } from 'next/navigation';
 import { Download, RefreshCw, X } from 'lucide-react';
 import { Button, toast, toastError } from '@/components/ui';
 import { startSandbox } from '@/lib/sandboxClient';
-import { savePortableCompanyFile, saveShareableLedger } from '@/lib/companyFileClient';
+import { saveShareableLedger } from '@/lib/companyFileClient';
 import { historyGuarded, navigateGuarded } from '@/lib/shortcuts';
 import { requestRefresh } from '@/components/LeaveGuard';
 import { openHelpWindow } from '@/components/ShortcutsHelp';
@@ -82,13 +82,14 @@ function bridge(): DesktopBridgeApi | undefined {
 
 const MENU_ROUTES: Record<string, string> = {
   import: '/banking',
+  // filecrypto: the portable file is offered with a password (on by default) on the Company File page.
+  'portable-create': '/company-file?share=portable',
   backup: '/backup',
   'transaction-log': '/transaction-log',
 };
 
 /** File-menu exports that fetch from the local server (with the session) and save natively. */
 const MENU_EXPORTS: Record<string, { run: () => Promise<string | null>; done: string }> = {
-  'portable-create': { run: savePortableCompanyFile, done: 'Portable company file saved' },
   'shareable-xlsx': { run: () => saveShareableLedger('xlsx'), done: 'Shareable ledger (Excel) saved' },
   'shareable-pdf': { run: () => saveShareableLedger('pdf'), done: 'Shareable ledger (PDF) saved' },
 };

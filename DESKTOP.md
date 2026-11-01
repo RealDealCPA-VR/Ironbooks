@@ -96,6 +96,52 @@ it. In the desktop app every open of the file asks for the user name and passwor
 bound to that launch — `lib/auth.ts`); the sign-in screen names the company and the file's location
 and pre-fills the last user. "I forgot my password" asks the user's challenge question.
 
+**A company file protected with its passwords** (format 2, on by default for new files; Company >
+Security turns it on for an existing one) is encrypted at rest, so nobody can read or change the
+books by unzipping it, and it opens on any computer with a fresh install for anyone who knows one of
+its passwords — and nobody else:
+
+- *Layout* (`electron/companyFileFormat.js`, `electron/fileCrypto.js`): the manifest stays the
+  plain first entry with only what the No Company Open list shows (company name, file id, save ids,
+  dates, app version) plus the key slots. Every other entry — the database, attachments, the
+  transaction log, the backup manifest — is AES-256-GCM encrypted with a random 256-bit file key,
+  a fresh nonce per entry and per save, under an opaque name, with the container's seal id and the
+  entry's names as additional data; an encrypted index lists the real names. Every entry is
+  verified (tag, then CRC) before a byte of it is written to disk; one entry at a time is in memory.
+  Ironbooks 1.6 refuses format 2 as "saved by a newer version".
+- *Key slots*: the file key wrapped (AES-256-GCM) with a key derived by scrypt (N=2^16, r=8, about
+  250 ms; its own salt) from one secret: one slot per active user with a password, one per user with
+  a challenge question (the normalized answer), and one for the **recovery key** — 24 characters in
+  groups of four, shown once when the file is created or protected (Print / Save to a File). It is
+  the only way back in if every password is lost. Slots are found by an HMAC of the user name, so
+  the manifest names nobody. Slots follow every password path: sign-in (creates a missing slot,
+  re-wraps a stale or weaker one; also for teammates signing in to a hosted file), password change,
+  "I forgot my password", an Admin setting a password, a new user, a changed challenge question, a
+  new recovery key; a deactivated or removed user's slot is left out of the next save.
+- *Opening* is ONE sign-in, the QuickBooks way: the shell locks the file and works out the open plan
+  (and asks the conflict question) without the key, then starts the server *sealed*
+  (`BKA_COMPANY_SEALED` = extract / conflict / key; `lib/db/sealed.ts`): only the sign-in page and
+  its routes work. The sign-in unwraps the file key from the user's slot (an unknown user name costs
+  the same work as a wrong password; attempts are rate-limited), decrypts the file into the working
+  copy, opens the database, checks the password against the users table and starts the session. A
+  company-file password, if the file also has one, is asked on the same screen. The file key lives
+  only in the server's memory — never in state.json, the environment, a log or a URL.
+- *Working copy*: plain text only on this computer (`%LOCALAPPDATA%`). After a clean close it is
+  deleted; it is kept whenever the company file lacks something, so crash recovery still works.
+- *Every copy is protected the same way*: saves, Save Copy As, "unsaved changes" copies, automatic
+  and manual backups (`.bka`), safety copies before a restore / condense / year-end close, condense
+  archives, per-company backups and training files kept from the sandbox. A protected backup
+  restores into its own file without a question; restoring one elsewhere (or File > Open or Restore
+  Company) asks for a user name + password from the file it came from, or its recovery key.
+  Portable company files (`.bkp`) and Accountant's Copy transfer files (`.ibac`) are offered with a
+  password (on by default) that encrypts the whole file; a protected file's key travels inside, so
+  the company file restored from it is protected again.
+- *Upgrading*: a file without passwords opens as before; an Admin signing in is offered "Protect
+  this company file with passwords". Users who have not signed in since are listed as "needs to
+  sign in once, or an Admin resets their password".
+- *Nothing machine-bound*: stored AI provider keys are sealed with a vault secret inside the file
+  (`lib/ai/keyVault.ts`); only the session-signing key (`.auth-secret`) is per computer.
+
 **Older company folders** (`*.ironbooks` folders from earlier versions) still open (File > Open
 Company Folder (Older Format)); File > Save as a Single Company File converts one.
 

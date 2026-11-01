@@ -82,6 +82,9 @@ import {
 import { allowLedgerRewrite } from './posting';
 import { assertWrite } from './rbac';
 import { BACKUP_MANIFEST_ENTRY, FILE_LOCAL_FILES, createBackup, ensurePreOpBackup, restoreBackup } from './backup';
+import format from '@/electron/companyFileFormat';
+import { protectionForDir, type SealProtection } from './fileProtection';
+import type { ArchiveCredentials } from './sealedArchives';
 import { recordBackup } from './backupHistory';
 import { currentFingerprint } from './backupFingerprint';
 import { logTransaction } from './transactionLog';
@@ -758,12 +761,15 @@ async function condensePeriodUnlocked(
   // --- Snapshots FIRST: rotating pre-op backup + permanent archive copy. ---
   // QB Desktop parity: a complete archive copy of the file is written (and verified readable)
   // before a single row is touched. If it cannot be written, nothing is condensed.
-  ensurePreOpBackup(ctx, 'condense', input.dataDir);
+  // A protected company file's safety copy and archive are encrypted like the file (its key and
+  // key slots, lib/services/fileProtection.ts) — the archive sits next to the company file.
+  const protection = await protectionForDir(input.dataDir);
+  ensurePreOpBackup(ctx, 'condense', input.dataDir, protection);
   const [co] = await ctx.db
     .select({ name: companies.name })
     .from(companies)
     .where(eq(companies.id, ctx.companyId));
-  const archivePath = writeCondenseArchive(co?.name, input.dataDir);
+  const archivePath = writeCondenseArchive(co?.name, input.dataDir, protection);
 
   const runId = randomUUID();
 
@@ -1073,10 +1079,10 @@ async function runCondense(
  * Permanent (non-rotating) archive snapshot written into an `archives` folder
  * next to the data dir. This is the ONLY way back after a condense.
  */
-function writeCondenseArchive(companyName: string | undefined, dataDir?: string): string {
+function writeCondenseArchive(companyName: string | undefined, dataDir: string | undefined, protection: SealProtection | null): string {
   const dir = resolveDataDir(dataDir);
   const fingerprint = currentFingerprint(dir);
-  const { buffer, filename } = createBackup(companyName, dir);
+  const { buffer, filename } = createBackup(companyName, dir, { protection });
   const outDir = condenseArchiveDir(dir);
   fs.mkdirSync(outDir, { recursive: true });
   const outPath = path.join(outDir, filename.replace(/^(ironbooks|bookkeeper)-backup/, 'condense-archive'));
@@ -1084,6 +1090,13 @@ function writeCondenseArchive(companyName: string | undefined, dataDir?: string)
 
   // Verify the archive on disk is a complete, readable copy before anything is deleted.
   try {
+    if (protection) {
+      // Encrypted: decrypt every entry from the bytes on disk (each authentication tag verified).
+      const opened = format.unsealArchiveSync(fs.readFileSync(outPath), protection.fileKey) as { entries: Array<{ name: string; dir?: boolean }> };
+      const files = opened.entries.filter((e) => !e.dir);
+      const expected = format.snapshotDir(dir).filter((e: { name: string; dir?: boolean }) => !e.dir && !FILE_LOCAL_FILES.includes(e.name)).length;
+      if (!files.some((e) => e.name === 'PG_VERSION') || files.length < expected) throw new Error('archive is incomplete');
+    } else {
     const zip = new AdmZip(fs.readFileSync(outPath));
     const entries = zip.getEntries();
     const names = new Set(entries.map((e) => e.entryName.replace(/\\/g, '/')));
@@ -1093,6 +1106,7 @@ function writeCondenseArchive(companyName: string | undefined, dataDir?: string)
     }
     // Force a full read of every entry (CRC-checked by adm-zip) so a truncated write fails here.
     for (const e of entries) if (!e.isDirectory) e.getData();
+    }
   } catch (err) {
     fs.rmSync(outPath, { force: true });
     throw new ServiceError(
@@ -1259,6 +1273,8 @@ export async function restoreCondenseArchive(
   ctx: ServiceContext,
   archiveId: string,
   dataDir?: string,
+  /** An archive encrypted with another key (a restore brought one in since): its file's credentials. */
+  credentials?: ArchiveCredentials | null,
 ): Promise<{ restored: true; archive: CondenseArchive; notices?: string[] }> {
   assertWrite(ctx);
   if (ctx.role && ctx.role !== 'owner' && ctx.role !== 'admin') {
@@ -1269,6 +1285,6 @@ export async function restoreCondenseArchive(
   if (!archive.available) {
     throw new ServiceError('NOT_FOUND', `The archive file is missing: ${archive.filename}`);
   }
-  const result = await restoreBackup(fs.readFileSync(archive.path), resolveDataDir(dataDir));
+  const result = await restoreBackup(fs.readFileSync(archive.path), resolveDataDir(dataDir), { credentials });
   return result.notices?.length ? { restored: true, archive, notices: result.notices } : { restored: true, archive };
 }

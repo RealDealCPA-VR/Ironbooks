@@ -42,6 +42,10 @@ import { companies } from '@/lib/db/schema';
 import { ServiceError, inTransaction, writeAudit, type ServiceContext } from './_base';
 import { requireFileAdmin } from './access';
 import { assertExclusiveAccess } from './sessions';
+import format from '@/electron/companyFileFormat';
+import { APP_VERSION } from '@/lib/appVersion';
+import { BACKUP_HISTORY_FILE } from './backupHistory';
+import { isMarkedProtected, protectionForDir, readProtection, shareFileKey, type SealProtection } from './fileProtection';
 import {
   SANDBOX_MARKER_SCHEMA,
   activeSandbox,
@@ -358,6 +362,8 @@ export async function startSandbox(ctx: ServiceContext, opts: { now?: Date } = {
   try {
     await closeDb(realDir);
     makeCopy(realDir, dir, container, sourceName, createdAt);
+    // A company file protected with passwords: the copy has the same file key (filecrypto).
+    shareFileKey(realDir, dir);
     await openAndVerify(dir, realDir, container);
   } finally {
     release();
@@ -518,13 +524,20 @@ export interface KeepSandboxResult {
  */
 export async function keepSandboxAsTraining(ctx: ServiceContext, name: unknown): Promise<KeepSandboxResult> {
   let target: { name: string; dir: string } | null = null;
+  // A sandbox of a company file protected with passwords (filecrypto): the training file is kept
+  // next to the real file as a protected single company file - never as a folder of plain-text
+  // books. Read now, while the copy is still the open database (refused when its key is unknown).
+  const sandboxDir = resolveDataDir();
+  const protection: SealProtection | null =
+    isMarkedProtected(sandboxDir) || (await readProtection(ctx.db)) ? await protectionForDir(sandboxDir) : null;
   const { dir, container, marker, realDb } = await leaveToRealFile(ctx, (m) => {
     target = trainingTarget(m.realDataDir, name);
   });
   if (!target) throw new ServiceError('VALIDATION', 'Give the training file a name.');
   const t: { name: string; dir: string } = target;
   try {
-    sandboxFs.moveDir(dir, t.dir);
+    if (protection) await writeProtectedTrainingFile(dir, t, marker, protection);
+    else sandboxFs.moveDir(dir, t.dir);
   } catch (err) {
     // The server is already on the real file: report a completed leave with a warning (not an
     // error), so the client still hands off to the desktop shell and the shell stops treating
@@ -539,15 +552,17 @@ export async function keepSandboxAsTraining(ctx: ServiceContext, name: unknown):
       warning: `You are back in your real books, but the copy could not be saved as the training file "${t.name}" (${reason}). It is listed under "Copies left over" on the Sandbox page, where you can open it again or delete it.`,
     };
   }
-  writeSandboxMarker(t.dir, {
-    ...marker,
-    kind: 'training',
-    keptAt: new Date().toISOString(),
-    trainingName: t.name,
-  });
-  writeCompanyManifest(t.dir, { name: t.name, sandbox: false, training: true });
-  // A new file id: sessions signed in the training file never open the real file.
-  fs.writeFileSync(path.join(t.dir, '.file-id'), randomUUID(), { mode: 0o600 });
+  if (!protection) {
+    writeSandboxMarker(t.dir, {
+      ...marker,
+      kind: 'training',
+      keptAt: new Date().toISOString(),
+      trainingName: t.name,
+    });
+    writeCompanyManifest(t.dir, { name: t.name, sandbox: false, training: true });
+    // A new file id: sessions signed in the training file never open the real file.
+    fs.writeFileSync(path.join(t.dir, '.file-id'), randomUUID(), { mode: 0o600 });
+  }
   try {
     removeContainer(container);
   } catch {
@@ -555,6 +570,48 @@ export async function keepSandboxAsTraining(ctx: ServiceContext, name: unknown):
   }
   await auditReal(realDb, ctx, 'update', { event: 'sandbox_kept_as_training_file', name: t.name });
   return { realDir: marker.realDataDir, trainingDir: t.dir, name: t.name };
+}
+
+/**
+ * The training file of a protected company file: the sandbox copy (closed) written as ONE
+ * encrypted company file at `t.dir` ("<name>.ironbooks"), with the same file key and key slots as
+ * the real file - the same user names and passwords (and recovery key) open it. Its training
+ * marker travels inside the encrypted details and `training` in the plain listing
+ * (lib/services/fileProtection.ts doUnseal puts the marker back at sign-in). A new file id, so a
+ * session signed in to the training file never opens the real file.
+ */
+async function writeProtectedTrainingFile(
+  dir: string,
+  t: { name: string; dir: string },
+  marker: SandboxMarker,
+  protection: SealProtection,
+): Promise<void> {
+  const now = new Date().toISOString();
+  const fileId = randomUUID();
+  const companyJson = { schema: COMPANY_FILE_SCHEMA, ...(readCompanyManifest(dir) ?? {}), name: t.name, sandbox: false, training: true };
+  const entries: Array<{ name: string; data?: Buffer }> = (format.snapshotDir(dir) as Array<{ name: string; data?: Buffer }>).filter(
+    (e) => e.name !== COMPANY_FILE_MANIFEST && e.name !== '.file-id' && e.name !== BACKUP_HISTORY_FILE,
+  );
+  entries.push(
+    { name: COMPANY_FILE_MANIFEST, data: Buffer.from(JSON.stringify(companyJson, null, 2), 'utf8') },
+    { name: '.file-id', data: Buffer.from(fileId, 'utf8') },
+  );
+  await format.writeCompanyFile(t.dir, {
+    manifest: {
+      formatVersion: format.COMPANY_FILE_FORMAT_VERSION,
+      fileId,
+      companyName: t.name,
+      saveId: randomUUID(),
+      previousSaveId: null,
+      savedAt: now,
+      appVersion: APP_VERSION,
+      training: true,
+      sandboxMarker: { ...marker, kind: 'training', keptAt: now, trainingName: t.name },
+    },
+    backupManifest: { app: 'bookkeeper-ai', formatVersion: format.BACKUP_FORMAT_VERSION, kind: 'full', companyName: t.name, createdAt: now, appVersion: APP_VERSION },
+    entries,
+    protection,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -579,6 +636,7 @@ export async function resumeSandbox(ctx: ServiceContext, id: unknown): Promise<S
   const realDir = path.resolve(resolveDataDir());
   // Held closed until the switch, as in startSandbox.
   const release = holdDbOpen(realDir);
+  shareFileKey(realDir, hit.dir);
   try {
     await closeDb(realDir);
     switchActiveDataDir(hit.dir);

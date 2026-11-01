@@ -44,8 +44,9 @@ export async function fetchAndSave(
   url: string,
   fallbackName: string,
   filter: { name: string; extensions: string[] },
+  init?: { method: 'POST'; body: string },
 ): Promise<string | null> {
-  const res = await fetch(url, { cache: 'no-store' });
+  const res = await fetch(url, init ? { ...init, cache: 'no-store', headers: { 'Content-Type': 'application/json' } } : { cache: 'no-store' });
   if (!res.ok) {
     const data = await res.json().catch(() => null);
     throw new Error(data?.error || 'The file could not be created.');
@@ -65,11 +66,17 @@ export async function fetchAndSave(
   return name;
 }
 
-export function savePortableCompanyFile(): Promise<string | null> {
-  return fetchAndSave('/api/portable', 'Company.bkp', {
-    name: 'Ironbooks Portable Company File',
-    extensions: ['bkp'],
-  });
+/**
+ * Create and save the portable company file. `password` (filecrypto; the screens offer one, on by
+ * default) encrypts the whole file; null saves it without a password.
+ */
+export function savePortableCompanyFile(password: string | null = null): Promise<string | null> {
+  return fetchAndSave(
+    '/api/portable',
+    'Company.bkp',
+    { name: 'Ironbooks Portable Company File', extensions: ['bkp'] },
+    { method: 'POST', body: JSON.stringify(password ? { password } : { protect: false }) },
+  );
 }
 
 export function saveShareableLedger(format: 'xlsx' | 'pdf'): Promise<string | null> {

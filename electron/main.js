@@ -59,6 +59,8 @@ const hostingCore = require('./hostingCore');
 const hosting = require('./hosting');
 const security = require('./security');
 const { promptForHost } = require('./connectPrompt');
+const { promptForFilePassword } = require('./passwordPrompt');
+const fileCrypto = require('./fileCrypto');
 const { pruneLegacyAutoBackups } = require('./legacyBackups');
 
 const isDev = !app.isPackaged;
@@ -520,7 +522,11 @@ function sandboxRoot() {
 function sandboxActive() {
   if (remoteHostOrigin) return null;
   try {
-    return companyFile.readSandboxMarker(activeCompanyDir());
+    const marker = companyFile.readSandboxMarker(activeCompanyDir());
+    // A protected training file (filecrypto) says so in its plain listing; its marker is only in
+    // the working copy once someone has signed in.
+    if (!marker && openFile && openFile.training) return { kind: 'training' };
+    return marker;
   } catch {
     return null;
   }
@@ -582,7 +588,9 @@ ipcMain.handle('sandbox:left', (e, opts) => {
   const trainingDir = opts && typeof opts.trainingDir === 'string' ? opts.trainingDir : null;
   const kept = trainingDir ? companyFile.readSandboxMarker(trainingDir) : null;
   // A kept training file shows up under File > Recent Companies (it opens like any other file).
-  if (kept && kept.kind === 'training') rememberRecentCompany(trainingDir);
+  // A protected one (filecrypto) is a single encrypted company file, its marker inside it.
+  const keptFile = !kept && trainingDir ? companyFileFormat.readCompanyManifest(trainingDir) : null;
+  if ((kept && kept.kind === 'training') || (keptFile && keptFile.training === true)) rememberRecentCompany(trainingDir);
   rememberRecentCompany(sb.realFile || sb.realDir);
   setImmediate(() => {
     relaunchApp();
@@ -672,6 +680,8 @@ function agoText(ms) {
 /** Plain-language reason a company file could not be opened. */
 function openErrorText(err) {
   if (err && err.code === 'NEWER_FORMAT') return err.message;
+  // Protected with passwords (filecrypto): a damaged or altered entry, or no key to open it.
+  if (err && (err.code === 'TAMPERED' || err.code === 'SEALED' || err.code === 'PROTECTED')) return err.message;
   if (err && err.code === 'READ_ONLY_LOCATION') return err.message;
   if (err && err.name === 'NotACompanyFileError') return err.message;
   if (err && (err.code === 'ENOENT' || err.code === 'ENOTDIR')) {
@@ -785,6 +795,14 @@ async function openSingleFileForLaunch(filePath) {
     plan: prep.plan,
     appUser: info.appUser,
     conflictCopy: prep.conflictCopy || null,
+    // A file protected with passwords: the shell never has its key, so the server starts sealed
+    // and the sign-in decrypts it ('extract' / 'conflict' / 'key' — electron/companySession.js).
+    sealed: prep.sealed || null,
+    training: Boolean(prep.manifest && prep.manifest.training),
+    keptOnThisComputer: prep.keptOnThisComputer || null,
+    // Unsaved work made through another path to this same file (mapped drive vs UNC path).
+    otherPathCopies: prep.otherPathCopies || [],
+    otherPathUnsaved: prep.otherPathUnsaved || [],
   };
   try {
     companySession.pruneWorkingCopies(workingRoot(), [prep.workDir]);
@@ -1143,6 +1161,13 @@ async function closeOpenCompanyFile() {
       data = { error: String((err && err.message) || err) };
     }
     if (ok) {
+      if (data.unsavedKept) {
+        // A protected file nobody signed in to this time, with unsaved work from an earlier session
+        // on this computer: it could not be saved (it is never decrypted without a sign-in). Leave
+        // the lock in place as "unsaved" (it goes stale), so whoever opens the file next is warned.
+        companyLock.heartbeat(openFile.lock, { unsavedSince: new Date().toISOString() });
+        return true;
+      }
       companyLock.release(openFile.lock);
       return true;
     }
@@ -1324,6 +1349,9 @@ async function startNextServer() {
       BKA_COMPANY_STATE: openFile ? path.join(openFile.workDir, companySession.STATE_FILE) : '',
       BKA_COMPANY_LOCK: openFile ? openFile.lock.dir : '',
       BKA_COMPANY_LOCK_TOKEN: openFile ? openFile.lock.token : '',
+      // Protected with passwords (lib/db/sealed.ts): what the sign-in must do before the books open.
+      // Never a key or a password — only the open plan.
+      BKA_COMPANY_SEALED: openFile && openFile.sealed ? openFile.sealed : '',
       // Where the real company file lives (training copies are kept next to it), also in the sandbox.
       BKA_REAL_COMPANY_FILE: openFile ? openFile.path : (loadConfig().sandbox && loadConfig().sandbox.realFile) || '',
       // Scheduled report exports of a single company file go next to the company file, as they do
@@ -1518,13 +1546,30 @@ async function restoreBackupAsNewFileFlow(bkaPath) {
   const scratchWork = path.join(workingRoot(), `restore-${crypto.randomBytes(6).toString('hex')}`);
   const scratch = companySession.dataDirOf(scratchWork);
   try {
-    const info = await companyFileFormat.extractBackupArchive(bkaPath, scratch, {
-      knownSchemaAt: companySession.latestMigrationAt(migrationsDir()),
-    });
-    await companySession.writeWorkingCopyAs(scratchWork, target, {
-      companyName: info.companyName || companyFileFormat.companyFileBaseName(target),
-      appVersion: app.getVersion(),
-    });
+    const knownSchemaAt = companySession.latestMigrationAt(migrationsDir());
+    const head = companyFileFormat.readArchiveHead(bkaPath);
+    if (head && head.manifest && companyFileFormat.isSealedManifest(head.manifest)) {
+      // A backup protected with passwords (filecrypto) becomes a protected company file without
+      // ever being decrypted here: opening it asks for a user name + password from the file it was
+      // made from (or its recovery key), like the file itself.
+      await companyFileFormat.sealedBackupAsCompanyFile(bkaPath, target, {
+        knownSchemaAt,
+        manifest: {
+          fileId: crypto.randomUUID(),
+          companyName: head.manifest.companyName || companyFileFormat.companyFileBaseName(target),
+          saveId: crypto.randomUUID(),
+          previousSaveId: null,
+          savedAt: new Date().toISOString(),
+          appVersion: app.getVersion(),
+        },
+      });
+    } else {
+      const info = await companyFileFormat.extractBackupArchive(bkaPath, scratch, { knownSchemaAt });
+      await companySession.writeWorkingCopyAs(scratchWork, target, {
+        companyName: info.companyName || companyFileFormat.companyFileBaseName(target),
+        appVersion: app.getVersion(),
+      });
+    }
     rememberRecentCompany(target);
     const { response } = await dialog.showMessageBox(parentWindow(), {
       noLink: true,
@@ -1627,25 +1672,49 @@ async function openPortableFlow(filePath) {
   }
   // The server restores (and verifies) into a scratch folder on this computer; that folder is then
   // packed into the single company file the person chose.
-  const scratch = path.join(workingRoot(), `restore-${crypto.randomBytes(6).toString('hex')}`);
-  try {
-    const res = await fetch(`${serverUrl}/api/portable/restore?target=${encodeURIComponent(scratch)}`, {
+  const scratch = path.join(workingRoot(), `restore-${crypto.randomBytes(6).toString('hex')}`, 'data');
+  // The server restores (and verifies) into the scratch folder and writes the company file itself
+  // (packAs): the books of a protected file are written encrypted with the key that travelled
+  // inside the password-protected portable file — this shell never has it.
+  const restore = async (password) => {
+    const headers = { 'x-bka-internal': internalToken, 'content-type': 'application/octet-stream' };
+    if (password) headers['x-ironbooks-password'] = Buffer.from(password, 'utf8').toString('base64url');
+    const res = await fetch(`${serverUrl}/api/portable/restore?target=${encodeURIComponent(scratch)}&packAs=${encodeURIComponent(target)}`, {
       method: 'POST',
-      headers: { 'x-bka-internal': internalToken, 'content-type': 'application/octet-stream' },
+      headers,
       body: bytes,
       signal: AbortSignal.timeout(30 * 60 * 1000),
     });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      dialog.showErrorBox('Could not open the portable company file', data.error || `HTTP ${res.status}`);
-      return;
+    return { res, data: await res.json().catch(() => ({})) };
+  };
+  try {
+    let data;
+    if (fileCrypto.isPasswordSealed(bytes)) {
+      // Protected with a password (filecrypto): ask for it; a wrong one asks again.
+      data = await promptForFilePassword(parentWindow(), {
+        title: 'Open Portable Company File',
+        message: `${path.basename(filePath)} is protected with a password. Enter the password it was saved with.`,
+        onSubmit: async (password) => {
+          const r = await restore(password);
+          if (r.res.ok) return { ok: true, value: r.data };
+          if (r.data && r.data.details && r.data.details.passwordRequired) return { ok: false, error: r.data.error };
+          // Anything else (a damaged file, a newer version): stop asking and say why.
+          return { ok: true, value: { __error: r.data.error || `HTTP ${r.res.status}` } };
+        },
+      });
+      if (!data) return;
+      if (data.__error) {
+        dialog.showErrorBox('Could not open the portable company file', data.__error);
+        return;
+      }
+    } else {
+      const r = await restore(null);
+      if (!r.res.ok) {
+        dialog.showErrorBox('Could not open the portable company file', r.data.error || `HTTP ${r.res.status}`);
+        return;
+      }
+      data = r.data;
     }
-    const scratchWork = path.dirname(scratch);
-    await companySession.writeWorkingCopyAs(scratchWork, target, {
-      companyName: data.companyName || base,
-      appVersion: app.getVersion(),
-      dataDir: scratch,
-    });
     rememberRecentCompany(target);
     const choice = await dialog.showMessageBox(mainWindow, {
       noLink: true,
@@ -1665,7 +1734,7 @@ Every table, the trial balance, attachments and the transaction log ` +
   } catch (e) {
     dialog.showErrorBox('Could not open the portable company file', openErrorText(e));
   } finally {
-    fs.rm(scratch, { recursive: true, force: true }, () => {});
+    fs.rm(path.dirname(scratch), { recursive: true, force: true }, () => {});
   }
 }
 
@@ -2011,7 +2080,11 @@ function buildMenu() {
         process.platform === 'darwin' ? { role: 'quit' } : { label: 'Exit', ...shownKey('Alt+F4'), click: () => (mainWindow ? mainWindow.close() : app.quit()) },
       ],
     },
-    // Native menu shortcuts reach the window before the page, so none may take a QuickBooks key:
+    // Native menu shortcuts and the page share the keyboard, so none may take a QuickBooks key. On
+    // Windows and Linux a menu accelerator fires only for a key the page leaves unhandled (the page
+    // sees every keydown first; one it calls preventDefault on never reaches the menu — the F5
+    // guard of a form with unsaved changes relies on this). On macOS the menu's key equivalents are
+    // matched BEFORE the page sees the key, so there a menu shortcut always wins.
     // Redo stays on Ctrl+Shift+Z here (fields still redo with Ctrl+Y; Ctrl+Y is QB's Transaction
     // Journal) and Minimize has no shortcut on Windows / Linux (Ctrl+M is QB's Memorize). On
     // Windows / Linux the edit keys are shown only: the page's fields handle them (Ctrl+Z also
@@ -2176,18 +2249,60 @@ function buildStartMenu() {
 }
 
 /** After opening: say so when unsaved work from last time was recovered or kept as a copy. */
+/**
+ * The same company file was also opened on this computer through another path (a mapped drive vs
+ * its UNC path), and changes made that way never reached the file: they were kept as separate
+ * "unsaved changes" copies next to it (electron/companySession.js keepWorkThroughOtherPaths) — or,
+ * for books protected with passwords, left where they are until the file is opened that way.
+ */
+function noteWorkThroughOtherPaths(name) {
+  const copies = openFile.otherPathCopies || [];
+  const left = openFile.otherPathUnsaved || [];
+  if (!copies.length && !left.length) return;
+  const detail = copies.length
+    ? `They were made when this computer opened the same file through another path (for example a mapped drive letter instead of \\\\SERVER\\share), and never reached the file. They are kept here:\n\n${copies.join('\n')}\n\nOpen that copy to compare it with ${name} and re-enter anything that is missing.`
+    : `They were made when this computer opened the same file as ${left.join(', ')}, and never reached the file. Open the file through that path once and sign in: Ironbooks saves them then.`;
+  dialog
+    .showMessageBox(mainWindow, {
+      noLink: true,
+      type: 'info',
+      message: copies.length ? `Unsaved changes for ${name} were kept as a separate copy.` : `This computer has unsaved changes for ${name}.`,
+      detail,
+      buttons: copies.length ? ['OK', 'Show in Folder'] : ['OK'],
+    })
+    .then(({ response }) => {
+      if (response === 1 && copies[0]) shell.showItemInFolder(copies[0]);
+    });
+}
+
 function noteRecoveredWork() {
   if (!openFile || !mainWindow) return;
   const name = companyFile.locationName(openFile.path);
+  noteWorkThroughOtherPaths(name);
   if (openFile.plan === 'recover') {
     dialog.showMessageBox(mainWindow, {
       noLink: true,
       type: 'info',
       message: `Ironbooks recovered your unsaved work in ${name}.`,
       detail:
-        'The last time this company file was open on this computer, Ironbooks closed before it could save everything into the file (the computer may have restarted or lost its connection to the file server). Nothing was lost: those changes are here and are being saved into the company file now.',
+        'The last time this company file was open on this computer, Ironbooks closed before it could save everything into the file (the computer may have restarted or lost its connection to the file server). Nothing was lost: those changes are here and ' +
+        (openFile.sealed ? 'are saved into the company file as soon as you sign in.' : 'are being saved into the company file now.'),
       buttons: ['OK'],
     });
+  } else if (openFile.keptOnThisComputer) {
+    const kept = openFile.keptOnThisComputer;
+    dialog
+      .showMessageBox(mainWindow, {
+        noLink: true,
+        type: 'info',
+        message: 'Your unsaved changes were kept on this computer.',
+        detail:
+          `${kept}\n\nThey are protected with passwords, so Ironbooks never copies them next to the company file in plain text. Open them with File > Open Company Folder (Older Format) and sign in with your user name and password, then compare them with ${name} and re-enter anything that is missing.`,
+        buttons: ['OK', 'Show in Folder'],
+      })
+      .then(({ response }) => {
+        if (response === 1) shell.showItemInFolder(kept);
+      });
   } else if (openFile.conflictCopy) {
     const copy = openFile.conflictCopy;
     dialog

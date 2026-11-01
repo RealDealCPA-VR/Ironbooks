@@ -8,15 +8,19 @@
  * Steps: user name → challenge question (when the user has one) → new password.
  * A company file with several users and no challenge question: an Admin resets the password in
  * Users & Roles instead (the server says so).
+ *
+ * A company file protected with its own passwords (filecrypto) can also be opened with its
+ * RECOVERY KEY (?recovery=1, or "Use the recovery key"): the key, an Admin's user name and a new
+ * password for that Admin — the way back in when every password is lost (/api/auth/recover).
  */
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { KeyRound } from 'lucide-react';
 import { Button, Card, Input, Label, toast } from '@/components/ui';
 import { api } from '@/lib/client';
 import { PasswordRulesHint, meetsPolicy, usePasswordPolicy } from '@/components/PasswordRules';
 
-type Step = 'user' | 'question' | 'password';
+type Step = 'user' | 'question' | 'password' | 'recovery';
 
 export default function ResetPasswordPage() {
   const [step, setStep] = useState<Step>('user');
@@ -28,7 +32,41 @@ export default function ResetPasswordPage() {
   const [confirm, setConfirm] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [recoveryKey, setRecoveryKey] = useState('');
+  const [clearFilePassword, setClearFilePassword] = useState(false);
   const policy = usePasswordPolicy();
+
+  useEffect(() => {
+    if (new URLSearchParams(window.location.search).get('recovery') === '1') setStep('recovery');
+  }, []);
+
+  async function recover() {
+    if (password !== confirm) {
+      setError('The two passwords are different. Type the same password twice.');
+      return;
+    }
+    setBusy(true);
+    setError('');
+    try {
+      const r = await api.post<{ login: string; twoFactorTurnedOff?: boolean; filePasswordRemoved?: boolean; filePassword?: boolean }>('/api/auth/recover', {
+        recoveryKey,
+        login: userName,
+        password,
+        clearFilePassword,
+      });
+      toast(
+        `New password set for ${r.login}.` +
+          (r.twoFactorTurnedOff ? ' Two-factor sign-in was turned off for this user; turn it on again in Security.' : '') +
+          (r.filePasswordRemoved ? ' The company file password was removed.' : '') +
+          ' Sign in with the new password.',
+        'success',
+      );
+      setTimeout(() => (window.location.href = '/login'), 900);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'The recovery key did not work.');
+      setBusy(false);
+    }
+  }
 
   async function ask(withAnswer: boolean) {
     setBusy(true);
@@ -87,6 +125,8 @@ export default function ResetPasswordPage() {
               {step === 'user' && 'Enter your user name for this company file.'}
               {step === 'question' && 'Answer the challenge question you chose when the password was set.'}
               {step === 'password' && 'Choose a new password.'}
+              {step === 'recovery' &&
+                "Every password lost? The company file's recovery key (printed or saved when the file was protected) sets a new password for one of its Admins."}
             </p>
           </div>
         </div>
@@ -106,6 +146,71 @@ export default function ResetPasswordPage() {
             <Button type="submit" className="w-full" loading={busy} disabled={!userName.trim()}>
               Next
             </Button>
+            <button
+              type="button"
+              className="block w-full text-center text-sm text-navy/50 hover:text-electric hover:underline"
+              onClick={() => {
+                setError('');
+                setStep('recovery');
+              }}
+            >
+              Use the company file&apos;s recovery key instead
+            </button>
+          </form>
+        )}
+
+        {step === 'recovery' && (
+          <form
+            className="space-y-4"
+            onSubmit={(e) => {
+              e.preventDefault();
+              recover();
+            }}
+          >
+            <div>
+              <Label htmlFor="rp-key">Recovery key</Label>
+              <Input
+                id="rp-key"
+                autoFocus
+                value={recoveryKey}
+                onChange={(e) => setRecoveryKey(e.target.value)}
+                placeholder="XXXX-XXXX-XXXX-XXXX-XXXX-XXXX"
+                className="font-mono"
+                spellCheck={false}
+                autoComplete="off"
+              />
+              <p className="mt-1 text-xs text-navy/50">24 letters and digits. Dashes, spaces and capitals don&apos;t matter.</p>
+            </div>
+            <div>
+              <Label htmlFor="rp-admin">Admin user name</Label>
+              <Input id="rp-admin" value={userName} onChange={(e) => setUserName(e.target.value)} spellCheck={false} autoComplete="username" />
+            </div>
+            <div>
+              <Label htmlFor="rp-rnew">New password for that Admin</Label>
+              <Input id="rp-rnew" type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="new-password" aria-describedby="rp-rnew-rules" />
+              <PasswordRulesHint id="rp-rnew-rules" password={password} policy={policy} />
+            </div>
+            <div>
+              <Label htmlFor="rp-rconfirm">Confirm new password</Label>
+              <Input id="rp-rconfirm" type="password" value={confirm} onChange={(e) => setConfirm(e.target.value)} autoComplete="new-password" />
+            </div>
+            <label className="flex items-start gap-2 text-sm text-navy">
+              <input type="checkbox" className="mt-1" checked={clearFilePassword} onChange={(e) => setClearFilePassword(e.target.checked)} />
+              Also remove the company file password (if the file has one and nobody remembers it)
+            </label>
+            <Button type="submit" className="w-full" loading={busy} disabled={!recoveryKey.trim() || !userName.trim() || !meetsPolicy(password, policy) || !confirm}>
+              Set the new password
+            </Button>
+            <button
+              type="button"
+              className="block w-full text-center text-sm text-navy/50 hover:text-electric hover:underline"
+              onClick={() => {
+                setError('');
+                setStep('user');
+              }}
+            >
+              Answer my challenge question instead
+            </button>
           </form>
         )}
 

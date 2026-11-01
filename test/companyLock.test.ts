@@ -92,6 +92,30 @@ describe('company file lock', () => {
     expect(lock.checkHeld(a.lock).held).toBe(true);
   });
 
+  it('two computers taking over the same stale lock at the same instant: only one gets it', () => {
+    // Review round 5 leftover: both judged the lock stale within milliseconds. Computer A takes
+    // it over right after B has checked it (B's afterCheck hook) — B must not then remove A's
+    // fresh lock and take it too.
+    const file = companyFile('Race');
+    lock.acquire(file, { computer: 'GONE-PC' });
+    age(file, lock.STALE_MS + 5_000);
+    const judged = lock.acquire(file).holder;
+    expect(judged.stale).toBe(true);
+    let a: { ok: boolean; lock?: { token: string } } | null = null;
+    const b = lock.takeOver(file, judged, { appUser: 'B' }, {
+      afterCheck: () => {
+        a = lock.takeOver(file, judged, { appUser: 'A' });
+      },
+    });
+    expect(a).not.toBeNull();
+    expect(a!.ok).toBe(true);
+    expect(b.ok).toBe(false);
+    expect(lock.checkHeld(a!.lock).held).toBe(true);
+    expect(lock.readHolder(file).owner.appUser).toBe('A');
+    // Nothing left lying around next to the company file.
+    expect(fs.readdirSync(root).filter((n) => n.includes('Race') && n.includes('takeover'))).toEqual([]);
+  });
+
   it('heartbeats keep owner details and recreate a deleted lock folder', () => {
     const file = companyFile('Beat');
     const a = lock.acquire(file);
@@ -204,6 +228,41 @@ describe('working copy decisions', () => {
     await format.extractCompanyFile(conf.conflictCopy, kept);
     expect(fs.readFileSync(path.join(kept, 'base', 'rows'), 'utf8')).toBe('v1+local');
     expect(session.readState(conf.workDir)).toMatchObject({ unsavedSince: null, base: { saveId: 's2' } });
+  });
+
+  it('unsaved work left in the working copy of ANOTHER path to the same file (mapped drive vs UNC) is kept as a copy at open', async () => {
+    // Review round 5 leftover: working copies are keyed by path, so unsaved work made through
+    // S:\Books\X.ironbooks stayed invisible when the file was opened as \\SERVER\Books\X.ironbooks.
+    const src = path.join(root, 'two-src');
+    fs.mkdirSync(path.join(src, 'base'), { recursive: true });
+    fs.writeFileSync(path.join(src, 'PG_VERSION'), '17\n');
+    fs.writeFileSync(path.join(src, 'base', 'rows'), 'v1');
+    const share = path.join(root, 'two-share');
+    fs.mkdirSync(share, { recursive: true });
+    const viaUnc = path.join(share, 'Two Paths.ironbooks');
+    await format.writeCompanyFile(viaUnc, {
+      manifest: { formatVersion: 1, fileId: 'fid-two', companyName: 'Two Paths', saveId: 's1', savedAt: 'x' },
+      entries: format.snapshotDir(src),
+    });
+    // A second path to the very same file (a hard link stands in for the mapped drive letter).
+    const mapped = path.join(root, 'two-mapped', 'Two Paths.ironbooks');
+    fs.mkdirSync(path.dirname(mapped), { recursive: true });
+    fs.linkSync(viaUnc, mapped);
+    const wr = path.join(root, 'TwoWorking');
+    const viaMapped = await session.prepareWorkingCopy(mapped, { root: wr });
+    fs.writeFileSync(path.join(viaMapped.dataDir, 'base', 'rows'), 'v1+unsaved via S:');
+    session.writeState(viaMapped.workDir, { unsavedSince: '2026-10-24T10:00:00Z', closedCleanly: false });
+
+    const opened = await session.prepareWorkingCopy(viaUnc, { root: wr });
+    expect(opened.plan).toBe('extract');
+    expect(opened.otherPathCopies).toHaveLength(1);
+    const kept = path.join(root, 'two-kept');
+    await format.extractCompanyFile(opened.otherPathCopies[0], kept);
+    expect(fs.readFileSync(path.join(kept, 'base', 'rows'), 'utf8')).toBe('v1+unsaved via S:');
+    expect(path.dirname(opened.otherPathCopies[0])).toBe(share);
+    // Kept once: the other working copy no longer counts as unsaved (and is refreshed when used).
+    expect(session.readState(viaMapped.workDir)).toMatchObject({ unsavedSince: null, base: null });
+    expect((await session.prepareWorkingCopy(viaUnc, { root: wr })).otherPathCopies ?? []).toHaveLength(0);
   });
 
   it('never prunes a working copy that holds unsaved changes', () => {

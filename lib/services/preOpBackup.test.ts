@@ -36,7 +36,8 @@ describe('ensurePreOpBackup', () => {
   it('writes a .bka into the sibling pre-op-backups dir', () => {
     const result = ensurePreOpBackup(null, 'unit test', DATA_DIR);
     expect(result).not.toBeNull();
-    expect(result!.filename).toMatch(/^preop-unit-test-\d{13}-\d+\.bka$/);
+    // The folder tag (8 hex) keeps each company folder's rotation to its own copies.
+    expect(result!.filename).toMatch(/^preop-unit-test-[0-9a-f]{8}-\d{13}-\d+\.bka$/);
     expect(fs.existsSync(result!.path)).toBe(true);
     // Sibling of the data dir, never inside it (no recursive backup-of-backups).
     expect(path.dirname(result!.path)).toBe(preOpBackupDir(DATA_DIR));

@@ -18,6 +18,7 @@ import { companies, companyRoles, userCompanies, userRoleAssignments, users } fr
 import { hashPassword } from '@/lib/auth';
 import { assertPasswordAllowed, storeUserPassword } from './passwordPolicy';
 import { endUserSessions } from './sessions';
+import { syncPasswordSlot } from './fileProtection';
 import {
   ADMIN_ROLE_KEY,
   BUILTIN_ROLES,
@@ -339,6 +340,8 @@ export async function addUser(
         })
         .returning({ id: users.id });
       id = created.id;
+      // A protected company file: the new user's password opens it from its next save.
+      await syncPasswordSlot(tx.db, id, input.password);
     }
     await tx.db
       .insert(userCompanies)
