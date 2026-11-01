@@ -74,8 +74,12 @@ describe('Recurring templates service', () => {
   });
 
   it('creates a recurring template', async () => {
+    // UTC midnight: the schedule column is a plain timestamp and the schedule math in
+    // recurring.ts uses UTC calendar fields, so a local-midnight Date here would shift by the
+    // UTC offset when stored and read back (it failed this test across the US DST change on
+    // 2026-11-01). Seeding and asserting in UTC keeps the test independent of the local clock.
     const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    today.setUTCHours(0, 0, 0, 0);
 
     const tpl = await createTemplate(ctx, {
       name: 'Monthly Retainer',
@@ -131,13 +135,14 @@ describe('Recurring templates service', () => {
       .where(eq(recurringTemplates.companyId, ctx.companyId));
 
     const nextRun = tpl.nextRunDate!;
-    // One month on, kept inside next month: Oct 31 -> Nov 30, not Dec 1 (Date.setMonth overflows
-    // on the 29th-31st, which failed this test on month-end days).
-    const expectedNext = new Date(today.getFullYear(), today.getMonth() + 1, 1);
+    // One month on, kept inside next month: Oct 31 -> Nov 30, not Dec 1 (setMonth overflows on
+    // the 29th-31st; addMonthsClamped in recurring.ts clamps to the month's last day). Compared
+    // in UTC — the same fields the schedule math and the timestamp column use.
+    const expectedNext = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth() + 1, 1));
 
     // Allow same day (month boundary)
-    expect(nextRun.getMonth()).toBe(expectedNext.getMonth());
-    expect(nextRun.getFullYear()).toBe(expectedNext.getFullYear());
+    expect(nextRun.getUTCMonth()).toBe(expectedNext.getUTCMonth());
+    expect(nextRun.getUTCFullYear()).toBe(expectedNext.getUTCFullYear());
   });
 
   it('trial balance remains balanced after generating recurring invoice', async () => {
