@@ -1,16 +1,17 @@
 ﻿# icon-from-image.ps1
-# Takes a source image, detects background / crops square, applies rounded-corner
-# transparency with anti-aliased mask and padding, outputs 1024x1024 PNG and a
-# multi-size PNG-in-ICO file.
+# Takes a source image (default build/icon-source.png), detects the background /
+# crops square (crop-to-artwork is ON by default; pass -NoCrop to disable),
+# applies rounded-corner transparency with anti-aliased mask and padding, and
+# outputs 1024x1024 PNG and a multi-size PNG-in-ICO file.
 
 param(
-    [Parameter(Mandatory = $true)][string]$SourceImage,
+    [string]$SourceImage = "build/icon-source.png",
     [string]$PngOutput = "build/icon.png",
     [string]$IcoOutput = "build/icon.ico",
     [int]$Size = 1024,
     [int]$CornerRadiusPercent = 18,   # corner radius as % of final size
     [int]$PaddingPercent = 8,         # padding around artwork, % of final size
-    [switch]$AutoCrop                 # trim uniform background border before squaring
+    [switch]$NoCrop                   # disable the default uniform-background trim
 )
 
 $ErrorActionPreference = 'Stop'
@@ -25,7 +26,7 @@ try {
     #    the corner pixels and crop the largest differing region.
     # ---------------------------------------------------------------
     $cropX = 0; $cropY = 0; $cropW = $src.Width; $cropH = $src.Height
-    if ($AutoCrop) {
+    if (-not $NoCrop) {
         $bmp = New-Object System.Drawing.Bitmap($src)
         try {
             $corners = @(
