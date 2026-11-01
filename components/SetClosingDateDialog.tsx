@@ -38,7 +38,7 @@ export function SetClosingDateHost() {
   return open ? <SetClosingDateDialog onClose={() => setOpen(false)} /> : null;
 }
 
-export function SetClosingDateDialog({ onClose }: { onClose: () => void }) {
+export function SetClosingDateDialog({ onClose, suggestedDate = null }: { onClose: () => void; /** Prefilled when later than the current closing date (Client Data Review: the reviewed period's end). */ suggestedDate?: string | null }) {
   const [loaded, setLoaded] = useState<ClosingDateSettings | null>(null);
   const [date, setDate] = useState('');
   const [password, setPassword] = useState('');
@@ -54,12 +54,13 @@ export function SetClosingDateDialog({ onClose }: { onClose: () => void }) {
       .get<ClosingDateSettings>('/api/company/closing-date')
       .then((s) => {
         setLoaded(s);
-        setDate(s.closingDate ?? '');
+        setDate(suggestedDate && (!s.closingDate || s.closingDate < suggestedDate) ? suggestedDate : s.closingDate ?? '');
       })
       .catch((err) => {
         toastError(err, 'Could not read the closing date.');
         onCloseRef.current();
       });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function save(clear = false) {

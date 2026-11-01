@@ -111,5 +111,12 @@ export const clientReviewActionSchema = z.discriminatedUnion('action', [
   }),
   z.object({ action: z.literal('apply_customer_credit'), refType: z.enum(['payment', 'credit_memo']), refId: zUuid }),
   z.object({ action: z.literal('apply_vendor_credit'), refId: zUuid }),
+  // Clear Up Undeposited Funds (feature round, I13): the deposit takes these payments in place of its line.
+  z.object({
+    action: z.literal('clear_undeposited'),
+    depositId: zUuid,
+    lineId: zUuid,
+    items: z.array(z.object({ kind: z.enum(['payment', 'sales_receipt', 'invoice_payment']), id: zUuid })).min(1).max(200),
+  }),
 ]);
 

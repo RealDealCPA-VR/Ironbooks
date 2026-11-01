@@ -2,7 +2,7 @@
  * Client Data Review.
  * GET  /api/accountant/client-data-review?undepositedDays=30 → tasks with issues + fix actions
  * POST /api/accountant/client-data-review { action: 'task_status' | 'snapshot' |
- *      'apply_customer_credit' | 'apply_vendor_credit', ... }
+ *      'apply_customer_credit' | 'apply_vendor_credit' | 'clear_undeposited', ... }
  */
 import { type NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
@@ -14,6 +14,7 @@ import {
   setReviewTaskStatus,
   takeReviewSnapshot,
 } from '@/lib/services/accountant/clientDataReview';
+import { clearUpUndepositedFunds } from '@/lib/services/accountant/clientDataReviewTasks';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { clientReviewActionSchema } from '@/lib/validation/accountant';
 
@@ -45,6 +46,8 @@ export async function POST(req: NextRequest) {
         return NextResponse.json(await autoApplyCustomerCredit(ctx, { refType: b.refType, refId: b.refId }));
       case 'apply_vendor_credit':
         return NextResponse.json(await autoApplyVendorCredit(ctx, { refId: b.refId }));
+      case 'clear_undeposited':
+        return NextResponse.json(await clearUpUndepositedFunds(ctx, { depositId: b.depositId, lineId: b.lineId, items: b.items }));
     }
   } catch (err) {
     return routeError(err, '/api/accountant/client-data-review');
