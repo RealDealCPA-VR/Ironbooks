@@ -37,6 +37,7 @@ import {
   UNLOCK_COOKIE,
 } from '@/lib/auth';
 import { verifyTotp } from '@/lib/totp';
+import { consumeRecoveryCode, looksLikeRecoveryCode, recoveryCodesLeft } from '@/lib/services/recoveryCodes';
 import { ARCHIVED_ONLY_MESSAGE, COMPANY_COOKIE, DEACTIVATED_MESSAGE, isArchivedCompany } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
 import { getFileLockStatus, verifyFilePassword } from '@/lib/services/fileLock';
@@ -199,13 +200,20 @@ async function handlePost(req: NextRequest) {
       return fail('Invalid email or password.');
     }
 
-    // Second factor (TOTP) when enabled.
+    // Second factor (TOTP) when enabled. prefsperms: one of the user's one-time RECOVERY codes
+    // (lib/services/recoveryCodes.ts) works instead of the 6-digit code — the way back in for
+    // someone (a sole Admin too) who lost their phone or authenticator app.
+    let recoveryCodeUsed = false;
     if (user.totpEnabled && user.totpSecret) {
       if (!totp) {
         return NextResponse.json({ requires2fa: true });
       }
-      if (!verifyTotp(user.totpSecret, String(totp), Date.now())) {
-        return fail('Invalid authentication code.');
+      const typed = String(totp);
+      if (!verifyTotp(user.totpSecret, typed, Date.now())) {
+        if (!looksLikeRecoveryCode(typed) || !(await consumeRecoveryCode(db, user.id, typed))) {
+          return fail('Invalid authentication code.');
+        }
+        recoveryCodeUsed = true;
       }
     }
 
@@ -296,6 +304,9 @@ async function handlePost(req: NextRequest) {
       ...(challengeSlotMissing ? { challengeSlotMissing: true } : {}),
       ...(offerProtection ? { offerProtection: true } : {}),
       ...(conflictCopy ? { conflictCopy } : {}),
+      // A recovery code was used: the sign-in screen sends the person to Security (2FA) to set
+      // up their new authenticator and get new codes.
+      ...(recoveryCodeUsed ? { recoveryCodeUsed: true, recoveryCodesLeft: await recoveryCodesLeft(db, user.id) } : {}),
     });
     const opts = { httpOnly: true, secure: cookieSecure(origin), sameSite: 'lax' as const, path: '/', maxAge: 60 * 60 * 24 * 30 };
     res.cookies.set(SESSION_COOKIE, createSessionToken(user.id, 'user', session.id), opts);

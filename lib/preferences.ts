@@ -115,8 +115,39 @@ export interface SendFormDefaults {
   body: string;
 }
 
-/** Default email wording per form (Send Forms preferences). Merge fields: see lib/services/letters.ts. */
-export const DEFAULT_SEND_FORMS: Record<FormType, SendFormDefaults> = {
+/**
+ * Send Forms email templates (QB Preferences > Send Forms > Company Preferences: "Change default
+ * for ..."): every printed form plus the overdue-invoice payment reminder. Kept apart from
+ * FORM_TYPES, which are the PRINT layouts (form templates).
+ */
+export const EMAIL_TEMPLATE_TYPES = [...FORM_TYPES, 'payment_reminder'] as const;
+export type EmailTemplateType = (typeof EMAIL_TEMPLATE_TYPES)[number];
+
+export const EMAIL_TEMPLATE_LABELS: Record<EmailTemplateType, string> = {
+  ...FORM_TYPE_LABELS,
+  payment_reminder: 'Overdue Invoice Reminder',
+};
+
+/**
+ * The merge fields each email template understands ({{field}}; unknown ones print blank). Every
+ * template also has {{company.name}}, {{sender.name}} and {{sender.email}} (who is sending).
+ * Amounts ({{total}}, {{balance}}) are in the form's currency; {{overdue}} reads "was due on
+ * May 1, 2026 (45 days ago)".
+ */
+export const EMAIL_MERGE_FIELDS: Record<EmailTemplateType, string[]> = {
+  invoice: ['number', 'customer.name', 'date', 'total', 'balance', 'dueDate'],
+  estimate: ['number', 'customer.name', 'total', 'date'],
+  sales_receipt: ['number', 'customer.name', 'total', 'date'],
+  credit_memo: ['number', 'customer.name', 'total', 'balance', 'date'],
+  sales_order: ['number', 'customer.name', 'total', 'date'],
+  purchase_order: ['number', 'vendor.name', 'total', 'date', 'expectedDate'],
+  statement: ['customer.name', 'balance', 'date'],
+  payment_reminder: ['number', 'customer.name', 'balance', 'dueDate', 'daysOverdue', 'overdue'],
+};
+export const COMMON_MERGE_FIELDS = ['company.name', 'sender.name', 'sender.email'] as const;
+
+/** Default email wording per form (Send Forms preferences). Merge fields: EMAIL_MERGE_FIELDS. */
+export const DEFAULT_SEND_FORMS: Record<EmailTemplateType, SendFormDefaults> = {
   invoice: {
     subject: 'Invoice {{number}} from {{company.name}}',
     body:
@@ -146,6 +177,11 @@ export const DEFAULT_SEND_FORMS: Record<FormType, SendFormDefaults> = {
   statement: {
     subject: 'Statement from {{company.name}}',
     body: 'Dear {{customer.name}},\n\nYour statement is attached. Please remit payment for any balance due.\n\nSincerely,\n{{company.name}}',
+  },
+  payment_reminder: {
+    subject: 'Payment reminder: invoice {{number}} from {{company.name}}',
+    body:
+      'Dear {{customer.name}},\n\nThis is a friendly reminder that invoice {{number}} for {{balance}} {{overdue}}.\nIf you have already sent your payment, thank you, and please ignore this message.\nOtherwise, we would appreciate payment at your earliest convenience. A copy of the invoice is attached.\n\nThank you for your business.\n{{company.name}}',
   },
 };
 
@@ -213,7 +249,7 @@ export interface CompanyPreferences {
   salesTaxBasis: 'accrual' | 'cash';
   salesTaxFrequency: 'monthly' | 'quarterly' | 'annually';
   // Send Forms
-  sendForms: Record<FormType, SendFormDefaults>;
+  sendForms: Record<EmailTemplateType, SendFormDefaults>;
   // Time & Expenses
   timeTrackingEnabled: boolean;
   firstDayOfWeek: 'sunday' | 'monday';
@@ -228,6 +264,20 @@ export interface CompanyPreferences {
   payrollStandardHours: number;
   payrollExpenseAccountId: string | null;
   payrollLiabilityAccountId: string | null;
+  // Desktop View (prefsperms A2): QB "Show icons on the Home page" (Company Preferences).
+  /** Sales Receipts on the Home page workflow. */
+  homeShowSalesReceipts: boolean;
+  /** Statements and Statement Charges on the Home page workflow. */
+  homeShowStatements: boolean;
+  /** Enter Bills and Pay Bills on the Home page workflow. */
+  homeShowBills: boolean;
+  // Integrated Applications (prefsperms A2): what may reach the company file besides the app.
+  /** QB "Don't allow any applications to access this company file". */
+  integratedAppsBlocked: boolean;
+  /** The employee self-service portal (pay stubs) may sign employees in. */
+  allowEmployeePortal: boolean;
+  /** Phone receipt-capture links may upload into this company file. */
+  allowPhoneReceipts: boolean;
 }
 
 // Feature switches default to ON (class tracking, progress invoicing and units of measure too) so
@@ -294,6 +344,12 @@ export const DEFAULT_COMPANY_PREFERENCES: CompanyPreferences = {
   payrollStandardHours: 40,
   payrollExpenseAccountId: null,
   payrollLiabilityAccountId: null,
+  homeShowSalesReceipts: true,
+  homeShowStatements: true,
+  homeShowBills: true,
+  integratedAppsBlocked: false,
+  allowEmployeePortal: true,
+  allowPhoneReceipts: true,
 };
 
 /** Per-user ("My Preferences") settings. */
@@ -323,6 +379,13 @@ export interface MyPreferences {
   spellIgnoreInternetAddresses: boolean;
   // Checking
   startWithPayee: boolean;
+  // Send Forms (prefsperms): who this person's emails come from (QB My Preferences > Send Forms).
+  /** Name shown as the sender of the forms I email ('' = the company's sender name). */
+  sendFromName: string;
+  /** Address my forms are sent from ('' = the company's address); replies come back here. */
+  sendFromEmail: string;
+  /** Send me a blind copy of every form I email. */
+  bccMe: boolean;
   // Desktop
   showHomeWorkflow: boolean;
   /**
@@ -340,6 +403,29 @@ export interface MyPreferences {
    * (Favorites > Customize Favorites, components/FavoritesMenu.tsx).
    */
   favorites: string[];
+  /**
+   * Desktop View (prefsperms A2): QB "Show Home page when opening a company file" / "Save the
+   * desktop": 'home' opens Home, 'last' goes back to the page I was on when I left.
+   */
+  startPage: 'home' | 'last';
+  // Search (prefsperms A2): QB My Preferences > Search.
+  /** Show the search box in the menu (QB "Show Search field in the Icon Bar"). */
+  showSearchBox: boolean;
+  /** What Enter searches: pages only, or everything in the company file (names, transactions). */
+  searchDefault: 'pages' | 'everything';
+  // Calendar (prefsperms A2): QB My Preferences > Calendar.
+  /** The view the calendar opens in ('last' = the one I used last). */
+  calendarView: 'day' | 'week' | 'month' | 'last';
+  /** Weekly view: which days ('company' = the first day of the week from Time & Expenses). */
+  calendarWeek: 'company' | 'sun_sat' | 'mon_sun' | 'mon_fri';
+  /** Show transactions entered on each day. */
+  calendarShowEntered: boolean;
+  /** Show transactions due on each day. */
+  calendarShowDue: boolean;
+  /** Upcoming & Past Due list: past-due items from this many days back. */
+  calendarPastDueDays: number;
+  /** Upcoming & Past Due list: items due within this many days. */
+  calendarUpcomingDays: number;
 }
 
 /** Most pages on the Favorites menu (QuickBooks allows 30). */
@@ -366,10 +452,22 @@ export const DEFAULT_MY_PREFERENCES: MyPreferences = {
   spellIgnoreWithNumbers: true,
   spellIgnoreInternetAddresses: true,
   startWithPayee: true,
+  sendFromName: '',
+  sendFromEmail: '',
+  bccMe: false,
   showHomeWorkflow: true,
   navMode: 'advanced',
   density: 'comfortable',
   favorites: [],
+  startPage: 'home',
+  showSearchBox: true,
+  searchDefault: 'pages',
+  calendarView: 'month',
+  calendarWeek: 'company',
+  calendarShowEntered: true,
+  calendarShowDue: true,
+  calendarPastDueDays: 30,
+  calendarUpcomingDays: 7,
 };
 
 export const MY_PREFERENCE_KEYS = Object.keys(DEFAULT_MY_PREFERENCES) as (keyof MyPreferences)[];
@@ -385,6 +483,11 @@ export const PREFERENCE_CATEGORIES: Array<{
   label: string;
   company: (keyof CompanyPreferences)[];
   my: (keyof MyPreferences)[];
+  /**
+   * prefsperms A2: a plain explanation shown on a tab, for QB settings Ironbooks fixes on
+   * (Search's "Update automatically": search always reads the live file).
+   */
+  notes?: { company?: string; my?: string };
 }> = [
   {
     id: 'accounting',
@@ -428,7 +531,6 @@ export const PREFERENCE_CATEGORIES: Array<{
       'warnWhenDeleting',
       'defaultDate',
       'autoRecallLastTransaction',
-      'showHomeWorkflow',
       'navMode',
       'density',
     ],
@@ -500,7 +602,7 @@ export const PREFERENCE_CATEGORIES: Array<{
     company: ['salesTaxEnabled', 'salesTaxBasis', 'salesTaxFrequency'],
     my: [],
   },
-  { id: 'sendForms', label: 'Send Forms', company: ['sendForms'], my: [] },
+  { id: 'sendForms', label: 'Send Forms', company: ['sendForms'], my: ['sendFromName', 'sendFromEmail', 'bccMe'] },
   {
     id: 'spelling',
     label: 'Spelling',
@@ -524,6 +626,46 @@ export const PREFERENCE_CATEGORIES: Array<{
     my: [],
   },
   { id: 'currencies', label: 'Multiple Currencies', company: ['multiCurrencyEnabled'], my: [] },
+  // prefsperms A2: the QB categories that were missing.
+  {
+    id: 'calendar',
+    label: 'Calendar',
+    company: [],
+    my: ['calendarView', 'calendarWeek', 'calendarShowEntered', 'calendarShowDue', 'calendarPastDueDays', 'calendarUpcomingDays'],
+  },
+  {
+    id: 'desktop',
+    label: 'Desktop View',
+    company: ['homeShowSalesReceipts', 'homeShowStatements', 'homeShowBills'],
+    my: ['showHomeWorkflow', 'startPage'],
+    notes: {
+      my: 'Ironbooks always works in one window, so QuickBooks\' "One window / Multiple windows" choice does not apply. Colors and light or dark mode are under Appearance.',
+      company: 'Estimates, sales orders, sales tax, inventory, payroll and time tracking show on the Home page when they are turned on in their own preferences.',
+    },
+  },
+  // Finance Charge: edited by its own pane (app/settings/FinanceChargePreference.tsx); the
+  // settings live in companies.settings.financeCharges (lib/services/financeCharges.ts).
+  { id: 'financeCharge', label: 'Finance Charge', company: [], my: [] },
+  {
+    id: 'integratedApps',
+    label: 'Integrated Applications',
+    company: ['integratedAppsBlocked', 'allowEmployeePortal', 'allowPhoneReceipts'],
+    my: [],
+    notes: {
+      company:
+        'Ironbooks has no add-on programs that connect to the company file the way QuickBooks SDK applications do, so there is no certificate list. These are the ways something other than Ironbooks\' own screens can reach this file. Cloud AI and email are controlled under Privacy & Network; other computers on your network under Multi-user.',
+    },
+  },
+  {
+    id: 'search',
+    label: 'Search',
+    company: [],
+    my: ['showSearchBox', 'searchDefault'],
+    notes: {
+      company:
+        'Search always looks at the company file as it is right now, so there is no search index to update (QuickBooks\' "Update automatically" setting is not needed).',
+    },
+  },
   {
     id: 'payroll',
     label: 'Payroll & Employees',
@@ -581,7 +723,7 @@ export function resolveCompanyPreferences(settings: unknown): CompanyPreferences
   prefs.reminders = reminders;
   const sendForms = { ...DEFAULT_SEND_FORMS };
   if (isPlainObject(s.sendForms)) {
-    for (const k of FORM_TYPES) {
+    for (const k of EMAIL_TEMPLATE_TYPES) {
       const f = s.sendForms[k];
       if (isPlainObject(f)) {
         sendForms[k] = {
@@ -607,6 +749,13 @@ export function resolveMyPreferences(stored: unknown): MyPreferences {
   if (my.density !== 'compact') my.density = 'comfortable';
   const favorites = Array.isArray(my.favorites) ? my.favorites.filter(isFavoritePath) : [];
   my.favorites = [...new Set(favorites)].slice(0, MAX_FAVORITES);
+  if (my.startPage !== 'last') my.startPage = 'home';
+  if (my.searchDefault !== 'everything') my.searchDefault = 'pages';
+  if (!['day', 'week', 'month', 'last'].includes(my.calendarView)) my.calendarView = 'month';
+  if (!['company', 'sun_sat', 'mon_sun', 'mon_fri'].includes(my.calendarWeek)) my.calendarWeek = 'company';
+  const days = (v: unknown, def: number) => (Number.isInteger(v) && (v as number) >= 0 && (v as number) <= 365 ? (v as number) : def);
+  my.calendarPastDueDays = days(my.calendarPastDueDays, DEFAULT_MY_PREFERENCES.calendarPastDueDays);
+  my.calendarUpcomingDays = days(my.calendarUpcomingDays, DEFAULT_MY_PREFERENCES.calendarUpcomingDays);
   return my;
 }
 
@@ -680,6 +829,47 @@ export function addDaysIso(iso: string, days: number): string {
 export function dueDateForTerms(dateIso: string, terms: string | null | undefined): string {
   if (!dateIso || !terms || !(terms in TERMS_DAYS)) return '';
   return addDaysIso(dateIso, TERMS_DAYS[terms as TermsValue]);
+}
+
+/** Preferences > Integrated Applications (prefsperms A2): what may reach the company file. */
+export type IntegratedApp = 'employeePortal' | 'phoneReceipts';
+
+export const INTEGRATED_APP_LABELS: Record<IntegratedApp, string> = {
+  employeePortal: 'The employee portal',
+  phoneReceipts: 'Phone receipt capture',
+};
+
+/**
+ * May this application reach the company file? `settings` is companies.settings (raw): the
+ * master switch "Don't allow any applications to access this company file" wins, then each
+ * application's own switch (both default to allowed, so existing files keep working).
+ */
+export function integratedAppAllowed(settings: unknown, app: IntegratedApp): boolean {
+  const s = settings && typeof settings === 'object' ? (settings as Record<string, unknown>) : {};
+  if (s.integratedAppsBlocked === true) return false;
+  return app === 'employeePortal' ? s.allowEmployeePortal !== false : s.allowPhoneReceipts !== false;
+}
+
+/** The plain refusal for an application the company turned off. */
+export function integratedAppOffMessage(app: IntegratedApp): string {
+  return `${INTEGRATED_APP_LABELS[app]} is turned off for this company file (Preferences > Integrated Applications).`;
+}
+
+/**
+ * Desktop View > "Show icons on the Home page" (prefsperms A2): the Home workflow steps the company
+ * turned off. Only the Home icons: the pages stay in the menus (QB hides just the icons).
+ */
+export function homeIconHiddenHrefs(
+  prefs: Pick<CompanyPreferences, 'homeShowSalesReceipts' | 'homeShowStatements' | 'homeShowBills'>,
+): Set<string> {
+  const out = new Set<string>();
+  if (prefs.homeShowSalesReceipts === false) out.add('/sales-receipts');
+  if (prefs.homeShowStatements === false) out.add('/reports/statements');
+  if (prefs.homeShowBills === false) {
+    out.add('/bills');
+    out.add('/pay-bills');
+  }
+  return out;
 }
 
 /** Account label honoring "Show account numbers" and the Reports account-display preference. */

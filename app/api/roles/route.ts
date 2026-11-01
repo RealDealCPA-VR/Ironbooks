@@ -1,6 +1,6 @@
 /**
  * GET  /api/roles — built-in + custom roles (with user counts) and the permission catalog
- *                   (areas, actions, flags) for the role editor's matrix.
+ *                   (areas, their activities, actions, flags) for the role editor.
  * POST /api/roles — create a custom role { name, description?, permissions, flags } or clone
  *                   one { cloneFrom: roleKey, name, description? }.
  */
@@ -15,6 +15,7 @@ import {
   type PermissionGrant,
   type RoleFlags,
 } from '@/lib/permissions/model';
+import { ACTIVITIES, supportedActions } from '@/lib/permissions/activities';
 import { ServiceError } from '@/lib/services/_base';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { createRoleSchema } from '@/lib/validation/users';
@@ -38,6 +39,14 @@ export async function GET() {
         areas: AREAS.map((a) => ({ ...a, description: AREA_DESCRIPTIONS[a.key] })),
         actions: ACTIONS,
         flags: FLAGS,
+        // prefsperms: QB Enterprise activities of each area, with the rights each one has.
+        activities: ACTIVITIES.map((a) => ({
+          key: a.key,
+          area: a.area,
+          label: a.label,
+          description: a.description,
+          actions: supportedActions(a),
+        })),
       },
     });
   } catch (err) {

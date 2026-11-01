@@ -26,6 +26,7 @@ import {
 } from '@/components/ui';
 import { api } from '@/lib/client';
 import { saveWithReconciledCheck } from '@/lib/purchasesClient';
+import { usePreferences } from '@/lib/usePreferences';
 import { todayISO } from '@/lib/dates';
 import { Money, formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
@@ -205,6 +206,9 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId, n
   const [unapplying, setUnapplying] = useState<string | null>(null);
   const [itemList, setItemList] = useState<Named[]>([]);
   const [classList, setClassList] = useState<Named[]>([]);
+  // A1: Preferences > Accounting "Use class tracking" off hides the Class column (a class already
+  // on a line still shows, so editing an old credit never drops it).
+  const classOn = usePreferences().company.classTrackingEnabled;
   const [customerList, setCustomerList] = useState<Named[]>([]);
   const [jobList, setJobList] = useState<Named[]>([]);
   // Advanced Inventory: sites / bins for the Items tab (serial / lot / site of returned units).
@@ -440,12 +444,16 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId, n
     const jobs = l.customerId ? jobList.filter((j) => !j.customerId || j.customerId === l.customerId) : [];
     return (
       <>
-        <Select aria-label="Class" value={l.classId} onChange={(e) => set('classId', e.target.value)}>
-          <option value="">Class</option>
-          {classList.map((c) => (
-            <option key={c.id} value={c.id}>{c.name}</option>
-          ))}
-        </Select>
+        {classOn || l.classId ? (
+          <Select aria-label="Class" value={l.classId} onChange={(e) => set('classId', e.target.value)}>
+            <option value="">Class</option>
+            {classList.map((c) => (
+              <option key={c.id} value={c.id}>{c.name}</option>
+            ))}
+          </Select>
+        ) : (
+          <span />
+        )}
         <div className="flex gap-1">
           <Select aria-label="Customer:Job" value={l.customerId} onChange={(e) => set('customerId', e.target.value)}>
             <option value="">Customer:Job</option>
@@ -582,7 +590,7 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId, n
                 <span>Account</span>
                 <span>Memo</span>
                 <span>Amount</span>
-                <span>Class</span>
+                <span>{classOn ? 'Class' : ''}</span>
                 <span>Customer:Job</span>
                 <span />
               </div>
@@ -622,7 +630,7 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId, n
                 <span>Qty</span>
                 <span>Cost</span>
                 <span>Amount</span>
-                <span>Class</span>
+                <span>{classOn ? 'Class' : ''}</span>
                 <span>Customer:Job</span>
                 <span />
               </div>

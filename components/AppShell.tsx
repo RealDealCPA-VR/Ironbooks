@@ -2,7 +2,7 @@
 import * as React from 'react';
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
-import CommandPalette, { CommandBarButton } from './CommandPalette';
+import CommandPalette, { CommandBarButton, openCommandBar } from './CommandPalette';
 import { AppearanceButton } from './AppearancePicker';
 import AssistantPanel from './AssistantPanel';
 import {
@@ -22,6 +22,7 @@ import { pageHelpFor } from '@/lib/pageHelp';
 import type { Area } from '@/lib/permissions/model';
 import { blockingFeatureGate, featureHiddenPaths, multiCurrencyHiddenPaths } from '@/lib/preferences';
 import FeatureOff from './FeatureOff';
+import { NoAccess, pageBlocked, useActivityButtons } from './ActivityGuard';
 import AccountantCopyBanner from './AccountantCopyBanner';
 import PreferenceBehaviors from './PreferenceBehaviors';
 import AttentionBadge from './AttentionBadge'; // team home: count on the "Needs attention" link
@@ -436,12 +437,18 @@ function SidebarSearch({
   hiddenPaths,
   idPrefix = 'ss',
   className = 'relative mx-1 mb-3 hidden lg:block',
+  everything = false,
 }: {
   permissions: Partial<Record<Area, readonly string[]>> | null | undefined;
   hiddenPaths: ReadonlySet<string>;
   /** Keeps element ids unique when a second (narrow-window) copy is on the page. */
   idPrefix?: string;
   className?: string;
+  /**
+   * prefsperms A2 (My Preferences > Search "Pressing Enter searches my company file"): Enter
+   * searches names, transactions and pages in the command bar instead of opening the top page.
+   */
+  everything?: boolean;
 }) {
   const router = useRouter();
   const [q, setQ] = React.useState('');
@@ -495,6 +502,12 @@ function SidebarSearch({
           } else if (e.key === 'ArrowUp') {
             e.preventDefault();
             setActive((a) => Math.max(a - 1, 0));
+          } else if (e.key === 'Enter' && everything && q.trim()) {
+            e.preventDefault();
+            const text = q.trim();
+            setOpen(false);
+            setQ('');
+            openCommandBar(text);
           } else if (e.key === 'Enter' && results[active]) {
             e.preventDefault();
             go(results[active].href);
@@ -510,6 +523,9 @@ function SidebarSearch({
           role="listbox"
           className="absolute left-0 z-50 mt-2 w-80 max-w-[80vw] rounded-xl border border-slate-200/70 bg-white/95 p-1 shadow-2xl backdrop-blur-xl"
         >
+          {everything && (
+            <div className="px-3 pt-2 pb-1 text-xs text-navy/50">Press Enter to search customers, vendors, items and transactions too.</div>
+          )}
           {results.length === 0 ? (
             <div className="px-3 py-3 text-sm text-navy/50">
               No page found. Try other words, like &ldquo;pay a bill&rdquo; or &ldquo;record a sale&rdquo;.
@@ -693,6 +709,9 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   const blockedGate = prefs.loaded ? blockingFeatureGate(pathname, prefs.company) : null;
   const [assistantOpen, setAssistantOpen] = React.useState(false);
   const closeAssistant = React.useCallback(() => setAssistantOpen(false), []);
+  // prefsperms K: QB Enterprise activities in the screens (components/ActivityGuard.tsx).
+  useActivityButtons(pathname, me?.permissions);
+  const noAccess = !blockedGate && pageBlocked(pathname, me?.permissions);
 
   if (bare) return <>{children}</>;
 
@@ -719,7 +738,10 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
           </h1>
         </div>
         <MenuModeToggle mode={navMode} onChange={changeMode} />
-        <SidebarSearch permissions={me?.permissions} hiddenPaths={hiddenPaths} />
+        {/* prefsperms A2: My Preferences > Search "Show the search box in the menu". */}
+        {prefs.my.showSearchBox && (
+          <SidebarSearch permissions={me?.permissions} hiddenPaths={hiddenPaths} everything={prefs.my.searchDefault === 'everything'} />
+        )}
         <nav
           aria-label={navMode === 'simple' ? 'Everyday tasks' : 'All menus'}
           className="flex flex-col gap-0.5 w-full flex-1 min-h-0 overflow-y-auto overscroll-contain pr-1 -mr-1"
@@ -768,12 +790,15 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             <span className="mr-auto" />
           )}
           {/* Narrow windows: the sidebar shows icons only, so page search and the menu switch live here. */}
-          <SidebarSearch
-            permissions={me?.permissions}
-            hiddenPaths={hiddenPaths}
-            idPrefix="ts"
-            className="relative w-48 sm:w-64 lg:hidden"
-          />
+          {prefs.my.showSearchBox && (
+            <SidebarSearch
+              permissions={me?.permissions}
+              hiddenPaths={hiddenPaths}
+              idPrefix="ts"
+              className="relative w-48 sm:w-64 lg:hidden"
+              everything={prefs.my.searchDefault === 'everything'}
+            />
+          )}
           <MenuModeToggle mode={navMode} onChange={changeMode} className="flex lg:hidden w-40" />
           <CommandBarButton />
           <button
@@ -791,7 +816,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         <BackupWarningBanner />
         <AccountantCopyBanner pathname={pathname} />
         {/* F5 (QuickBooks' Refresh) starts the page area over in place: components/PageRefresh.tsx. */}
-        <PageRefresh>{blockedGate ? <FeatureOff gate={blockedGate} /> : children}</PageRefresh>
+        <PageRefresh>{blockedGate ? <FeatureOff gate={blockedGate} /> : noAccess ? <NoAccess pathname={pathname} /> : children}</PageRefresh>
       </main>
       <CommandPalette permissions={me?.permissions} hiddenPaths={hiddenPaths} />
       <AssistantPanel open={assistantOpen} onClose={closeAssistant} />

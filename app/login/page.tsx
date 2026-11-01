@@ -22,6 +22,8 @@ import { Button, Card, Input, Label, toast } from '@/components/ui';
 import { AccessKeyText } from '@/components/AccessKey';
 import { ApiError, api } from '@/lib/client';
 import { safeNext } from '@/lib/safeNext';
+import { afterFailedSignIn } from '@/lib/loginForm';
+import { clearStartedFlags } from '@/lib/startPage';
 
 interface FileInfo {
   companyName: string | null;
@@ -67,6 +69,7 @@ export default function LoginPage() {
   const userRef = useRef<HTMLInputElement>(null);
   const passRef = useRef<HTMLInputElement>(null);
   const filePassRef = useRef<HTMLInputElement>(null);
+  const codeRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     let alive = true;
@@ -120,6 +123,8 @@ export default function LoginPage() {
         challengeMissing?: boolean;
         offerProtection?: boolean;
         conflictCopy?: string;
+        recoveryCodeUsed?: boolean;
+        recoveryCodesLeft?: number;
       }>('/api/auth/login', {
         email: userName,
         password,
@@ -142,12 +147,21 @@ export default function LoginPage() {
       } catch {
         /* the shell is optional */
       }
+      // prefsperms A2 (Desktop View): this sign-in opens the company file again, so "where I left
+      // off" may apply once more (lib/startPage.ts).
+      clearStartedFlags();
       // Only a page of this app (never another site or a javascript: URL — lib/safeNext.ts).
       const next = safeNext(new URLSearchParams(window.location.search).get('next'), '/dashboard', ['/login']);
       // gapsb K: an expired password (or one an Admin asked to change) must be replaced first.
       if (res?.mustChangePassword) {
         window.location.href =
           '/change-password?next=' + encodeURIComponent(next) + '&reason=' + encodeURIComponent(res.passwordChangeReason ?? 'required');
+        return;
+      }
+      // A one-time recovery code got them in: set up the new authenticator and new codes first.
+      if (res?.recoveryCodeUsed) {
+        window.location.href =
+          '/security?recovered=' + encodeURIComponent(String(res.recoveryCodesLeft ?? 0)) + '&next=' + encodeURIComponent(next);
         return;
       }
       // No challenge question yet: offer to set one (once per computer and file), then continue.
@@ -196,10 +210,14 @@ export default function LoginPage() {
         setTimeout(() => filePassRef.current?.focus(), 0);
         return;
       }
-      setError(/invalid email or password/i.test(msg) ? 'The user name or password is not correct. Passwords are case-sensitive.' : msg);
-      setPassword('');
+      // A wrong authenticator code keeps the (right) password (lib/loginForm.ts).
+      const next = afterFailedSignIn(msg, needs2fa);
+      setError(next.error);
+      if (next.clearPassword) setPassword('');
+      if (next.clearCode) setTotp('');
+      setNeeds2fa(next.keepCodeStep);
       setBusy(false);
-      setTimeout(() => passRef.current?.focus(), 0);
+      setTimeout(() => (next.focus === 'code' ? codeRef.current : passRef.current)?.focus(), 0);
     }
   }
 
@@ -310,13 +328,19 @@ export default function LoginPage() {
               <Label htmlFor="login-totp">Authentication code</Label>
               <Input
                 id="login-totp"
+                ref={codeRef}
                 value={totp}
                 onChange={(e) => setTotp(e.target.value)}
                 placeholder="6-digit code"
-                inputMode="numeric"
+                autoComplete="one-time-code"
+                spellCheck={false}
+                aria-describedby="login-totp-hint"
                 autoFocus
                 required
               />
+              <p id="login-totp-hint" className="mt-1 text-xs text-navy/50">
+                Lost your phone? Type one of your recovery codes (like ABCDE-12345) instead.
+              </p>
             </div>
           )}
           {error && (

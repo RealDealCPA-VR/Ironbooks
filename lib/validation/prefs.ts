@@ -49,6 +49,10 @@ export const myPreferencesSchema = z
     spellIgnoreWithNumbers: z.boolean(),
     spellIgnoreInternetAddresses: z.boolean(),
     startWithPayee: z.boolean(),
+    // prefsperms: Send Forms - who my emails come from.
+    sendFromName: z.string().trim().max(100),
+    sendFromEmail: z.union([z.literal(''), z.string().trim().max(255).email('must be an email address')]),
+    bccMe: z.boolean(),
     showHomeWorkflow: z.boolean(),
     navMode: z.enum(['simple', 'advanced']),
     density: z.enum(['comfortable', 'compact']),
@@ -56,6 +60,16 @@ export const myPreferencesSchema = z
     favorites: z
       .array(z.string().refine(isFavoritePath, 'must be a page of the app, like /invoices'))
       .max(MAX_FAVORITES, `can hold at most ${MAX_FAVORITES} pages`),
+    // prefsperms A2: Desktop View, Search and Calendar.
+    startPage: z.enum(['home', 'last']),
+    showSearchBox: z.boolean(),
+    searchDefault: z.enum(['pages', 'everything']),
+    calendarView: z.enum(['day', 'week', 'month', 'last']),
+    calendarWeek: z.enum(['company', 'sun_sat', 'mon_sun', 'mon_fri']),
+    calendarShowEntered: z.boolean(),
+    calendarShowDue: z.boolean(),
+    calendarPastDueDays: z.number().int('must be a whole number of days').min(0).max(365),
+    calendarUpcomingDays: z.number().int('must be a whole number of days').min(0).max(365),
   })
   .partial()
   .strict();
@@ -177,3 +191,31 @@ export const updateAttachmentSchema = z.object({
 
 // ---- Calendar ----
 export const calendarQuerySchema = z.object({ from: zIsoDay, to: zIsoDay });
+
+// ---------------------------------------------------------------------------
+// prefsperms: Preferences > Send Forms mail server (lib/services/emailSettings.ts)
+// ---------------------------------------------------------------------------
+
+/** The mail server form. `password`: a string sets it, null / '' removes it, absent keeps it. */
+export const emailSetupSchema = z
+  .object({
+    host: z.string().trim().min(1, 'enter the mail server name').max(255),
+    port: z.coerce.number().int('must be a whole number').min(1).max(65535),
+    security: z.enum(['ssl', 'starttls', 'none']),
+    username: z.string().max(255).nullish(),
+    password: z.string().max(500).nullish(),
+    fromName: z.string().max(255).nullish(),
+    fromEmail: z.string().trim().min(1, 'enter the address forms are sent from').max(255),
+    replyTo: z.string().max(255).nullish(),
+    bcc: z.string().max(500).nullish(),
+    useSenderAddress: z.boolean().optional(),
+  })
+  .strict();
+
+/** Test: the saved settings (no draft) or the typed, not yet saved ones; `to` = where to send it. */
+export const emailTestSchema = z
+  .object({
+    to: z.string().max(255).nullish(),
+    draft: emailSetupSchema.nullish(),
+  })
+  .strict();

@@ -5,6 +5,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
+import { balancesForContext } from '@/lib/services/access';
 import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
 import { getAccount, updateAccount, deactivateAccount } from '@/lib/services/accounts';
 import { ServiceError } from '@/lib/services/_base';
@@ -29,7 +30,7 @@ export async function GET(_req: NextRequest, { params }: RouteParams) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
-    return NextResponse.json(await getAccount(ctx, id));
+    return NextResponse.json(balancesForContext(ctx, 'lists.chart_of_accounts', await getAccount(ctx, id))); // QB View Balance
   } catch (err) {
     return errorResponse(err);
   }

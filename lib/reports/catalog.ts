@@ -5,6 +5,7 @@
  * lib/services/reportRegistry.ts and must cover exactly these keys (reportRegistry.test.ts).
  */
 import type { Area } from '@/lib/permissions/model';
+import type { ActivityKey } from '@/lib/permissions/activities';
 
 export type ReportControl =
   /** From / To dates (defaults to fiscal year to date). */
@@ -182,6 +183,35 @@ export const REPORT_GROUPS: ReportGroup[] = [
   'Lists',
   'Multiple Companies',
 ];
+
+/**
+ * prefsperms (PARITY K): the QuickBooks Enterprise report ACTIVITY a standard report belongs to,
+ * so a role can allow Company & Financial reports without Accountant & Taxes ones, or A/R reports
+ * without Sales reports. Every activity here is in the entry's own area, so a role stored the old
+ * way (one grant for the whole area) keeps exactly the reports it had.
+ */
+export function reportActivity(entry: Pick<CatalogEntry, 'key' | 'area' | 'group'>): ActivityKey {
+  switch (entry.area) {
+    case 'reports_financial':
+      return entry.group === 'Accountant & Taxes' ? 'reports_financial.accountant' : 'reports_financial.company';
+    case 'reports_sales':
+      return entry.group === 'Customers & Receivables' || entry.group === 'Multiple Companies'
+        ? 'reports_sales.receivables'
+        : 'reports_sales.sales';
+    case 'reports_purchases':
+      return entry.group === 'Purchases' ? 'reports_purchases.purchases' : 'reports_purchases.payables';
+    case 'reports_payroll':
+      return 'reports_payroll.payroll';
+    case 'reports_inventory':
+      return 'reports_inventory.valuation';
+    case 'sales_tax':
+      return 'sales_tax.reports';
+    case 'time':
+      return entry.key.startsWith('mileage') ? 'time.mileage' : 'time.timesheets';
+    default:
+      throw new Error(`No report activity for area ${entry.area}`);
+  }
+}
 
 /** Href of a standard report with optional parameters. */
 export function stdReportHref(key: string, params: Record<string, string | undefined | null> = {}): string {

@@ -1,0 +1,313 @@
+/**
+ * prefsperms (PARITY A1 / A2): preferences that must take effect.
+ *
+ *  - Reports & Graphs > "Reports show accounts by" (accountDisplay): every report names accounts
+ *    by name, description, or both (QB "Show accounts by"). It only reached the journal page's
+ *    account picker before; reports always used the name.
+ *  - Finance Charge (A2, a QB category that was missing): the finance charge account, "Assess
+ *    finance charges on overdue finance charges", "Calculate charges from due date / invoice
+ *    date" and "Mark finance charge invoices To be printed" take effect in the assessment.
+ *  - Desktop View, Search, Calendar, Integrated Applications: the settings resolve safely and
+ *    take effect (Home icons, start page, portal / phone-receipt access).
+ */
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
+import { eq } from 'drizzle-orm';
+
+const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-prefsperms-prefs');
+process.env.BKA_DATA_DIR = TEST_DIR;
+process.env.BKA_AUTH_SECRET = 'prefsperms-prefs-secret';
+
+const h = vi.hoisted(() => ({ cookies: new Map<string, string>() }));
+vi.mock('next/headers', () => ({
+  cookies: async () => ({
+    get: (n: string) => (h.cookies.has(n) ? { name: n, value: h.cookies.get(n)! } : undefined),
+    set: () => undefined,
+    delete: () => undefined,
+  }),
+  headers: async () => new Headers(),
+}));
+
+import { closeDb, getDb, type DB } from '@/lib/db';
+import { NextRequest } from 'next/server';
+import { accounts, employees, invoices, users } from '@/lib/db/schema';
+import { PORTAL_COOKIE, getPortalEmployeeId, hashPassword } from '@/lib/auth';
+import {
+  DEFAULT_MY_PREFERENCES,
+  homeIconHiddenHrefs,
+  integratedAppAllowed,
+  resolveCompanyPreferences,
+  resolveMyPreferences,
+} from '@/lib/preferences';
+import { isRestorablePath, startPageTarget } from '@/lib/startPage';
+import { calendarLayout, initialCalendarView, shiftAnchor, splitUpcomingPastDue, upcomingPastDueRange } from '@/lib/calendarView';
+import { myPreferencesSchema } from '@/lib/validation/prefs';
+import { POST as portalLogin } from '@/app/api/portal/login/route';
+import { UploadTokenError, createUploadToken, uploadLinkStatus } from './receipts';
+import type { ServiceContext } from './_base';
+import { createCompany, updateCompany } from './company';
+import { createManualEntry } from './journal';
+import { runStandardReport } from './reportRegistry';
+import { loadAccountMeta } from './reportEngine';
+import { createCustomer } from './customers';
+import { createInvoice } from './invoices';
+import { assessFinanceCharges, getFinanceChargeSettings, previewFinanceCharges, updateFinanceChargeSettings } from './financeCharges';
+
+let db: DB;
+let ctx: ServiceContext;
+const acct: Record<string, string> = {};
+
+beforeAll(async () => {
+  fs.rmSync(TEST_DIR, { recursive: true, force: true });
+  db = await getDb(TEST_DIR);
+  const [u] = await db.insert(users).values({ email: 'prefs@acme.test', name: 'Pat Prefs', passwordHash: 'x' }).returning();
+  const company = await createCompany(db, { name: 'Prefs Co', ownerId: u.id });
+  ctx = { db, companyId: company.id, userId: u.id };
+  for (const a of await db.select().from(accounts).where(eq(accounts.companyId, company.id))) acct[a.code] = a.id;
+  await db.update(accounts).set({ description: 'Consulting revenue' }).where(eq(accounts.id, acct['4000']));
+  await createManualEntry(ctx, {
+    date: new Date('2026-03-10T00:00:00Z'),
+    description: 'Fee',
+    lines: [
+      { accountId: acct['1000'], debit: '500.00' },
+      { accountId: acct['4000'], credit: '500.00' },
+    ],
+  } as never);
+}, 180_000);
+
+afterAll(async () => {
+  await closeDb(TEST_DIR).catch(() => undefined);
+  try {
+    fs.rmSync(TEST_DIR, { recursive: true, force: true });
+  } catch {
+    /* Windows */
+  }
+});
+
+async function plLabels(): Promise<string[]> {
+  const r = await runStandardReport(ctx, 'profit-loss', { from: '2026-01-01', to: '2026-12-31' });
+  return r.rows.map((x) => String(x.cells.label ?? ''));
+}
+
+describe('A1: Reports show accounts by (accountDisplay)', () => {
+  it('name (the default): the account name', async () => {
+    const [a] = await db.select().from(accounts).where(eq(accounts.id, acct['4000']));
+    const labels = await plLabels();
+    expect(labels).toContain(a.name);
+    expect(labels.some((l) => l.includes('Consulting revenue'))).toBe(false);
+  });
+
+  it('description only: the description (the name when an account has none)', async () => {
+    await updateCompany(ctx, { settings: { accountDisplay: 'description' } } as never);
+    const labels = await plLabels();
+    expect(labels).toContain('Consulting revenue');
+    expect(labels).toContain('Total Income');
+    // Detail reports name accounts the same way.
+    const detail = await runStandardReport(ctx, 'transaction-detail-by-account', { from: '2026-01-01', to: '2026-12-31' });
+    expect(JSON.stringify(detail.rows)).toContain('Consulting revenue');
+  });
+
+  it('name and description', async () => {
+    await updateCompany(ctx, { settings: { accountDisplay: 'both' } } as never);
+    const [a] = await db.select().from(accounts).where(eq(accounts.id, acct['4000']));
+    expect(await plLabels()).toContain(`${a.name} (Consulting revenue)`);
+  });
+
+  it('raw metadata (cross-company matching) keeps the real names', async () => {
+    const meta = await loadAccountMeta(ctx, { raw: true });
+    const [a] = await db.select().from(accounts).where(eq(accounts.id, acct['4000']));
+    expect(meta.get(acct['4000'])!.name).toBe(a.name);
+    await updateCompany(ctx, { settings: { accountDisplay: 'name' } } as never);
+  });
+});
+
+describe('A2: Finance Charge preferences take effect', () => {
+  let customerId: string;
+  let invoiceId: string;
+  beforeAll(async () => {
+    const c = await createCustomer(ctx, { displayName: 'Slow Payer Inc' } as never);
+    customerId = c.id;
+    const inv = await createInvoice(ctx, {
+      customerId,
+      date: new Date('2026-01-01T00:00:00Z'),
+      dueDate: new Date('2026-01-31T00:00:00Z'),
+      lines: [{ accountId: acct['4000'], description: 'Work', quantity: 1, rate: '1000.00' }],
+    } as never);
+    invoiceId = inv.id;
+  });
+
+  it('defaults keep the old behaviour', async () => {
+    expect(await getFinanceChargeSettings(ctx)).toMatchObject({
+      annualRate: '18',
+      accountId: null,
+      assessOnFinanceCharges: false,
+      calculateFrom: 'due_date',
+      markToBePrinted: false,
+    });
+  });
+
+  it('refuses a finance charge account that is not an income account of this company', async () => {
+    await expect(updateFinanceChargeSettings(ctx, { accountId: acct['1000'] })).rejects.toMatchObject({ code: 'VALIDATION' });
+    await expect(updateFinanceChargeSettings(ctx, { accountId: '00000000-0000-0000-0000-000000000000' })).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  });
+
+  it('"Calculate charges from" the invoice date counts the days from the invoice date', async () => {
+    const asOf = new Date('2026-03-02T00:00:00Z');
+    const byDue = await previewFinanceCharges(ctx, { asOf });
+    const fromDue = byDue.customers.find((c) => c.customerId === customerId)!.overdueInvoices[0];
+    expect(fromDue.daysCharged).toBe(30); // Jan 31 -> Mar 2
+    await updateFinanceChargeSettings(ctx, { calculateFrom: 'invoice_date' });
+    const byInvoice = await previewFinanceCharges(ctx, { asOf });
+    const fromInv = byInvoice.customers.find((c) => c.customerId === customerId)!.overdueInvoices[0];
+    expect(fromInv.daysCharged).toBe(60); // Jan 1 -> Mar 2
+    await updateFinanceChargeSettings(ctx, { calculateFrom: 'due_date' });
+  });
+
+  it('posts to the chosen account and marks the invoice To be printed', async () => {
+    await updateFinanceChargeSettings(ctx, { accountId: acct['4000'], markToBePrinted: true });
+    const r = await assessFinanceCharges(ctx, { asOf: new Date('2026-03-02T00:00:00Z'), customerIds: [customerId] });
+    expect(r.assessed).toHaveLength(1);
+    const [fc] = await db.select().from(invoices).where(eq(invoices.id, r.assessed[0].invoiceId));
+    expect(fc.toBePrinted).toBe(true);
+    const lines = await db.query.invoiceLines.findMany({ where: (l, { eq: e }) => e(l.invoiceId, fc.id) });
+    expect(lines[0].accountId).toBe(acct['4000']);
+  });
+
+  it('"Assess finance charges on overdue finance charges" adds unpaid finance charges to the base', async () => {
+    const asOf = new Date('2026-05-15T00:00:00Z');
+    const off = await previewFinanceCharges(ctx, { asOf });
+    const offRows = off.customers.find((c) => c.customerId === customerId)!.overdueInvoices;
+    expect(offRows.map((r) => r.invoiceId)).toEqual([invoiceId]);
+    await updateFinanceChargeSettings(ctx, { assessOnFinanceCharges: true });
+    const on = await previewFinanceCharges(ctx, { asOf });
+    const onRows = on.customers.find((c) => c.customerId === customerId)!.overdueInvoices;
+    expect(onRows.length).toBe(2);
+    await updateFinanceChargeSettings(ctx, { assessOnFinanceCharges: false });
+  });
+});
+
+describe('A2: Integrated Applications decide what may reach the company file', () => {
+  it('the master switch overrides each application', () => {
+    expect(integratedAppAllowed({}, 'employeePortal')).toBe(true);
+    expect(integratedAppAllowed({ allowEmployeePortal: false }, 'employeePortal')).toBe(false);
+    expect(integratedAppAllowed({ allowPhoneReceipts: false }, 'employeePortal')).toBe(true);
+    expect(integratedAppAllowed({ integratedAppsBlocked: true }, 'phoneReceipts')).toBe(false);
+    expect(integratedAppAllowed(null, 'phoneReceipts')).toBe(true);
+  });
+
+  it('employee portal: no sign-in, and signed-in employees are signed out', async () => {
+    const pw = 'Portal-Pass-2026';
+    const [emp] = await db
+      .insert(employees)
+      .values({ companyId: ctx.companyId, firstName: 'Eve', lastName: 'Employee', email: 'eve@acme.test', portalPasswordHash: await hashPassword(pw) } as never)
+      .returning();
+    const login = () =>
+      portalLogin(new NextRequest('http://localhost/api/portal/login', { method: 'POST', body: JSON.stringify({ email: 'eve@acme.test', password: pw }) }));
+    const ok = await login();
+    expect(ok.status).toBe(200);
+    const cookie = /bka_portal=([^;]+)/.exec(ok.headers.get('set-cookie') ?? '')![1];
+    h.cookies.set(PORTAL_COOKIE, cookie);
+    expect(await getPortalEmployeeId()).toBe(emp.id);
+
+    await updateCompany(ctx, { settings: { allowEmployeePortal: false } } as never);
+    expect(await getPortalEmployeeId()).toBeNull();
+    const refused = await login();
+    expect(refused.status).toBe(403);
+    expect((await refused.json()).error).toMatch(/Integrated Applications/);
+
+    await updateCompany(ctx, { settings: { allowEmployeePortal: true, integratedAppsBlocked: true } } as never);
+    expect(await getPortalEmployeeId()).toBeNull();
+    await updateCompany(ctx, { settings: { integratedAppsBlocked: false } } as never);
+    expect(await getPortalEmployeeId()).toBe(emp.id);
+    h.cookies.clear();
+  });
+
+  it('phone receipt links: no new links, and existing ones stop working', async () => {
+    const link = await createUploadToken(ctx);
+    expect((await uploadLinkStatus(db, link.token)).remaining).toBeGreaterThan(0);
+    await updateCompany(ctx, { settings: { allowPhoneReceipts: false } } as never);
+    await expect(uploadLinkStatus(db, link.token)).rejects.toBeInstanceOf(UploadTokenError);
+    await expect(uploadLinkStatus(db, link.token)).rejects.toMatchObject({ problem: 'apps_off' });
+    await expect(createUploadToken(ctx)).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    await updateCompany(ctx, { settings: { allowPhoneReceipts: true } } as never);
+    expect((await uploadLinkStatus(db, link.token)).remaining).toBeGreaterThan(0);
+  });
+});
+
+describe('A2: Desktop View, Search and Calendar settings', () => {
+  it('Home page icons the company turned off', () => {
+    const prefs = resolveCompanyPreferences({ homeShowBills: false, homeShowStatements: false });
+    expect([...homeIconHiddenHrefs(prefs)].sort()).toEqual(['/bills', '/pay-bills', '/reports/statements']);
+    expect(homeIconHiddenHrefs(resolveCompanyPreferences({})).size).toBe(0);
+  });
+
+  it('"Go back to where I left off" only redirects the opening Home page to a real app page', () => {
+    expect(startPageTarget('last', '/dashboard', '/invoices?id=1')).toBe('/invoices?id=1');
+    expect(startPageTarget('home', '/dashboard', '/invoices')).toBeNull();
+    expect(startPageTarget('last', '/bills', '/invoices')).toBeNull();
+    expect(startPageTarget('last', '/dashboard', '/login')).toBeNull();
+    expect(startPageTarget('last', '/dashboard', '//evil.example')).toBeNull();
+    expect(startPageTarget('last', '/dashboard', '/api/users')).toBeNull();
+    expect(isRestorablePath('/reports/profit-loss?from=2026-01-01')).toBe(true);
+  });
+
+  it('My Preferences resolve and validate the new keys', () => {
+    const m = resolveMyPreferences({ startPage: 'x', calendarView: 'year', calendarWeek: 'tue', calendarPastDueDays: -3, searchDefault: 'web' });
+    expect(m).toMatchObject({ startPage: 'home', calendarView: 'month', calendarWeek: 'company', calendarPastDueDays: 30, searchDefault: 'pages' });
+    expect(resolveMyPreferences({ calendarView: 'week', calendarUpcomingDays: 14, showSearchBox: false })).toMatchObject({
+      calendarView: 'week',
+      calendarUpcomingDays: 14,
+      showSearchBox: false,
+    });
+    expect(DEFAULT_MY_PREFERENCES.showSearchBox).toBe(true);
+    expect(myPreferencesSchema.safeParse({ calendarView: 'week', calendarWeek: 'mon_fri', calendarPastDueDays: 10 }).success).toBe(true);
+    expect(myPreferencesSchema.safeParse({ calendarPastDueDays: 1.5 }).success).toBe(false);
+    expect(myPreferencesSchema.safeParse({ searchDefault: 'web' }).success).toBe(false);
+  });
+});
+
+describe('A2: Calendar preferences shape the calendar', () => {
+  it('opens in the chosen view, or the one used last', () => {
+    expect(initialCalendarView('week', 'day')).toBe('week');
+    expect(initialCalendarView('last', 'day')).toBe('day');
+    expect(initialCalendarView('last', null)).toBe('month');
+  });
+
+  it('weekly view: Sunday-Saturday, Monday-Sunday, Monday-Friday or the work week', () => {
+    // 2026-10-29 is a Thursday.
+    expect(calendarLayout('week', '2026-10-29', 'sun_sat', 'monday').days).toEqual([
+      '2026-10-25', '2026-10-26', '2026-10-27', '2026-10-28', '2026-10-29', '2026-10-30', '2026-10-31',
+    ]);
+    const monFri = calendarLayout('week', '2026-10-29', 'mon_fri', 'sunday');
+    expect(monFri.days).toEqual(['2026-10-26', '2026-10-27', '2026-10-28', '2026-10-29', '2026-10-30']);
+    expect(monFri.headings).toEqual(['Mon', 'Tue', 'Wed', 'Thu', 'Fri']);
+    expect(calendarLayout('week', '2026-10-29', 'company', 'sunday').days[0]).toBe('2026-10-25');
+    expect(calendarLayout('week', '2026-10-29', 'company', 'monday').days[0]).toBe('2026-10-26');
+  });
+
+  it('month grid starts on the chosen weekday; day view is one day; arrows move by the view', () => {
+    const m = calendarLayout('month', '2026-10-15', 'sun_sat', 'monday');
+    expect(m.days).toHaveLength(42);
+    expect(m.days[0]).toBe('2026-09-27'); // the Sunday before Oct 1 (a Thursday)
+    expect(m.headings[0]).toBe('Sun');
+    expect(calendarLayout('month', '2026-10-15', 'mon_sun', 'sunday').days[0]).toBe('2026-09-28');
+    expect(calendarLayout('day', '2026-10-15', 'company', 'monday').days).toEqual(['2026-10-15']);
+    expect(shiftAnchor('month', '2026-01-31', 1)).toBe('2026-02-01');
+    expect(shiftAnchor('week', '2026-10-29', -1)).toBe('2026-10-22');
+    expect(shiftAnchor('day', '2026-12-31', 1)).toBe('2027-01-01');
+  });
+
+  it('Upcoming & Past Due covers the chosen window, past due first, open items only', () => {
+    expect(upcomingPastDueRange('2026-10-29', 30, 7)).toEqual({ from: '2026-09-29', to: '2026-11-05' });
+    const split = splitUpcomingPastDue(
+      [
+        { date: '2026-11-01', events: [{ type: 'due', id: 'b' }, { type: 'entered', id: 'x' }] },
+        { date: '2026-10-01', events: [{ type: 'due', id: 'a' }, { type: 'due', id: 'paid', done: true }] },
+      ],
+      '2026-10-29',
+    );
+    expect(split.pastDue.map((e) => e.id)).toEqual(['a']);
+    expect(split.upcoming.map((e) => e.id)).toEqual(['b']);
+  });
+});

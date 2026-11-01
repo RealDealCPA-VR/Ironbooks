@@ -66,7 +66,7 @@ export const PURPOSE_INFO: Record<
   email: {
     label: 'Email (invoices, statements)',
     sends: 'The message and PDF attachment you choose to send, to the recipient you enter.',
-    destinations: 'Your configured SMTP server (SMTP_HOST). A relay on your LAN/tailnet works without cloud opt-in.',
+    destinations: 'The mail server set up under Preferences > Send Forms (or SMTP_HOST on a server). A relay on your LAN/tailnet works without cloud opt-in.',
   },
   'vendor-lookup': {
     label: 'Vendor lookup (your SearXNG)',

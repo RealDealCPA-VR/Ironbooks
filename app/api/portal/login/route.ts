@@ -7,6 +7,7 @@ import { verifyPassword, createPortalToken, isArchivedSettings, PORTAL_COOKIE } 
 import { cookieSecure, originFromHeaders } from '@/lib/net/requestInfo';
 import { GLOBAL_KEY_WEIGHT, attemptKeys, loginLimiter, tooManyAttempts } from '@/lib/net/rateLimit';
 import { readJsonObject } from '@/lib/routeErrors';
+import { integratedAppAllowed, integratedAppOffMessage } from '@/lib/preferences';
 
 export async function POST(req: NextRequest) {
   // Malformed JSON, `null` or a non-object body reads as {} (→ 400 below), never a TypeError → 500.
@@ -40,6 +41,12 @@ export async function POST(req: NextRequest) {
     for (const emp of matches) {
       if (emp.portalPasswordHash && emp.isActive && (await verifyPassword(password, emp.portalPasswordHash))) {
         limiter.recordSuccess(keys.slice(0, -1));
+        // prefsperms A2: the company turned the employee portal off (Integrated Applications). Only
+        // said after the right password, so it reveals nothing to a guesser.
+        const settings = rows.find((r) => r.emp.id === emp.id)?.companySettings;
+        if (!integratedAppAllowed(settings, 'employeePortal')) {
+          return NextResponse.json({ error: integratedAppOffMessage('employeePortal'), code: 'FORBIDDEN' }, { status: 403 });
+        }
         const res = NextResponse.json({ id: emp.id, name: `${emp.firstName} ${emp.lastName}` });
         res.cookies.set(PORTAL_COOKIE, createPortalToken(emp.id, emp.portalPasswordHash), {
           httpOnly: true,

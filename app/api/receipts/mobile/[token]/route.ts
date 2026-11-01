@@ -51,9 +51,9 @@ async function guard(): Promise<{ keys: string[]; blocked: NextResponse | null }
 function answerError(err: unknown, keys: string[], tag: string): NextResponse {
   if (err instanceof UploadTokenError) {
     // 'locked' means a real link for a company file that was closed since: not a guess.
-    if (err.problem !== 'locked') limiter().recordFailure(keys);
+    if (err.problem !== 'locked' && err.problem !== 'apps_off') limiter().recordFailure(keys);
     const status =
-      err.problem === 'invalid' ? 404 : err.problem === 'not_allowed' ? 403 : err.problem === 'locked' ? 423 : 410;
+      err.problem === 'invalid' ? 404 : err.problem === 'not_allowed' || err.problem === 'apps_off' ? 403 : err.problem === 'locked' ? 423 : 410;
     return NextResponse.json({ error: err.message, code: err.problem }, { status, headers: HEADERS });
   }
   const res = routeError(err, tag);

@@ -6,7 +6,9 @@
  *    Every form prints with its form template (B11): the explicit `templateId` when given, else
  *    the form's default template, else the built-in layout (resolveFormTemplate).
  *  - `emailSalesForm` sends it as a PDF attachment through `sendMail` (lib/services/email.ts),
- *    which enforces SMTP configuration and the company network policy (lib/net/guard.ts). A
+ *    which uses the company's mail server (Preferences > Send Forms) and enforces the company
+ *    network policy (lib/net/guard.ts). The subject and message are the form's Send Forms
+ *    template (Preferences > Send Forms > Company Preferences) with its merge fields filled. A
  *    successful send clears the form's "to be emailed" flag and stamps `lastEmailedAt`.
  *  - `setSendFlags` / `listSendQueue` / `markPrinted` / `sendQueuedEmails` implement QB's
  *    "To be printed" / "To be e-mailed" checkboxes and the batch Print Forms / Send Forms queues.
@@ -29,10 +31,14 @@ import { getSalesReceipt } from './salesReceipts';
 import { getCreditMemo } from './creditMemos';
 import { getSalesOrder } from './salesOrders';
 import { customerStatement } from './statements';
-import { getCompany } from './company';
-import { Money } from '@/lib/money';
+import { getCompany, getPreferences } from './company';
+import { Money, formatCurrency } from '@/lib/money';
 import { docRef } from './docNumbers';
-import { isConfigured, sendMail } from './email';
+import { emailNotSetUpError, isConfigured, sendMail } from './email';
+import { senderMergeFields } from './emailSettings';
+import { getHomeCurrencyCode } from './currencies';
+import { companyTodayIso } from './preferences';
+import { fillMergeFields, type EmailTemplateType } from '@/lib/preferences';
 import { renderEstimatePdf } from '@/lib/pdf/estimate';
 import { renderSalesReceiptPdf } from '@/lib/pdf/salesReceipt';
 import { renderCreditMemoPdf } from '@/lib/pdf/creditMemo';
@@ -104,6 +110,18 @@ export interface RenderedForm {
   customerEmail: string | null;
   /** Plain-text summary for the email body. */
   summary: string[];
+  /** Which Send Forms email template (Preferences > Send Forms) this form is emailed with. */
+  templateType: EmailTemplateType;
+  /** The form's merge fields for that template ({{number}}, {{total}}, ...; amounts unformatted). */
+  merge: Record<string, string>;
+  /** The form's currency (null = the home currency), for the money merge fields. */
+  currency?: string | null;
+}
+
+/** A form's own currency code when it has one (null = the home currency). */
+function currencyOf(doc: object): string | null {
+  const c = (doc as { currency?: unknown }).currency;
+  return typeof c === 'string' && c.trim() ? c.trim() : null;
 }
 
 /** A document number made safe for a download filename (alphanumeric numbers may contain / etc.). */
@@ -153,6 +171,15 @@ export async function renderSalesForm(
         customerName: cust.name,
         customerEmail: cust.email,
         summary: [`Total: ${inv.total}`, `Balance due: ${inv.balanceDue}`, ...(inv.dueDate ? [`Due: ${iso(inv.dueDate)}`] : [])],
+        templateType: 'invoice',
+        merge: {
+          number: docRef(inv.refNumber, inv.invoiceNumber),
+          date: iso(inv.date),
+          total: inv.total,
+          balance: inv.balanceDue,
+          dueDate: iso(inv.dueDate),
+        },
+        currency: inv.currency ?? null,
       };
     }
     case 'estimate': {
@@ -183,6 +210,9 @@ export async function renderSalesForm(
         customerName: cust.name,
         customerEmail: cust.email,
         summary: [`Total: ${est.total}`, ...(est.expirationDate ? [`Valid until: ${iso(est.expirationDate)}`] : [])],
+        templateType: 'estimate',
+        merge: { number: docRef(est.refNumber, est.estimateNumber), date: iso(est.date), total: est.total },
+        currency: currencyOf(est),
       };
     }
     case 'sales_receipt': {
@@ -214,6 +244,9 @@ export async function renderSalesForm(
         customerName: cust.name,
         customerEmail: cust.email,
         summary: [`Total paid: ${r.total}`],
+        templateType: 'sales_receipt',
+        merge: { number: docRef(r.refNumber, r.receiptNumber), date: iso(r.date), total: r.total },
+        currency: currencyOf(r),
       };
     }
     case 'credit_memo': {
@@ -244,6 +277,9 @@ export async function renderSalesForm(
         customerName: cust.name,
         customerEmail: cust.email,
         summary: [`Credit total: ${m.total}`, `Credit remaining: ${m.unapplied}`],
+        templateType: 'credit_memo',
+        merge: { number: docRef(m.refNumber, m.memoNumber), date: iso(m.date), total: m.total, balance: m.unapplied },
+        currency: currencyOf(m),
       };
     }
     case 'sales_order': {
@@ -273,6 +309,9 @@ export async function renderSalesForm(
         customerName: cust.name,
         customerEmail: cust.email,
         summary: [`Order total: ${o.total}`],
+        templateType: 'sales_order',
+        merge: { number: docRef(o.refNumber, o.orderNumber), date: iso(o.date), total: o.total },
+        currency: currencyOf(o),
       };
     }
   }
@@ -296,34 +335,62 @@ export async function renderCustomerStatement(
     customerName: stmt.customer.displayName,
     customerEmail: stmt.customer.email,
     summary: [`Balance due: ${stmt.closingBalance}`],
+    templateType: 'statement',
+    // The statement date: the end of its period, else the company's today (never the UTC day).
+    merge: { date: stmt.to ?? (await companyTodayIso(ctx)), balance: stmt.closingBalance },
+    currency: null,
   };
 }
 
-const NOT_CONFIGURED =
-  'Email is not set up yet. Ask your administrator to add the SMTP settings, then try again.';
+const MONEY_FIELDS = ['total', 'balance'] as const;
+
+/**
+ * The subject and message for emailing a form: its Send Forms template (Preferences > Send Forms)
+ * with the merge fields filled - amounts in the form's currency (else the home currency), the
+ * customer, the company and the sender.
+ */
+export async function salesFormEmailText(ctx: ServiceContext, form: RenderedForm): Promise<{ subject: string; text: string }> {
+  const [prefs, company, sender] = await Promise.all([getPreferences(ctx), getCompany(ctx), senderMergeFields(ctx)]);
+  let code = typeof form.currency === 'string' && /^[A-Za-z]{3}$/.test(form.currency) ? form.currency.toUpperCase() : null;
+  if (!code) {
+    try {
+      code = await getHomeCurrencyCode(ctx);
+    } catch {
+      code = null;
+    }
+  }
+  if (!code) code = /^[A-Za-z]{3}$/.test(String(prefs.currency ?? '')) ? String(prefs.currency).toUpperCase() : 'USD';
+  const merge: Record<string, string> = {
+    ...form.merge,
+    'customer.name': form.customerName,
+    'company.name': company?.name ?? 'Your Company',
+    ...sender,
+  };
+  for (const k of MONEY_FIELDS) {
+    if (merge[k] === undefined || merge[k] === '') continue;
+    try {
+      merge[k] = formatCurrency(merge[k], code);
+    } catch {
+      merge[k] = formatCurrency(merge[k]);
+    }
+  }
+  const template = prefs.sendForms[form.templateType];
+  return { subject: fillMergeFields(template.subject, merge).trim() || form.title, text: fillMergeFields(template.body, merge) };
+}
 
 async function deliver(ctx: ServiceContext, form: RenderedForm, to?: string | null) {
-  const company = await getCompany(ctx);
-  const companyName = company?.name ?? 'Your Company';
   const recipient = (to && to.trim()) || form.customerEmail;
   if (!recipient) {
     throw validation(
       `There is no email address for ${form.customerName}. Type one in, or add it to the customer record.`,
     );
   }
+  const { subject, text } = await salesFormEmailText(ctx, form);
   await sendMail(
     {
       to: recipient,
-      subject: `${form.title} from ${companyName}`,
-      text: [
-        `Dear ${form.customerName},`,
-        '',
-        `Please find attached ${form.title} from ${companyName}.`,
-        ...form.summary,
-        '',
-        'Thank you for your business.',
-        companyName,
-      ].join('\n'),
+      subject,
+      text,
       attachments: [{ filename: form.filename, content: Buffer.from(form.bytes), contentType: 'application/pdf' }],
     },
     ctx,
@@ -350,7 +417,7 @@ export async function emailSalesForm(
   to?: string | null,
   templateId?: string | null,
 ): Promise<{ ok: true; to: string }> {
-  if (!isConfigured()) throw new ServiceError('VALIDATION', NOT_CONFIGURED);
+  if (!(await isConfigured(ctx))) throw emailNotSetUpError();
   const form = await renderSalesForm(ctx, kind, id, templateId);
   const recipient = await deliver(ctx, form, to);
   const t = TABLE[kind];
@@ -375,7 +442,7 @@ export async function emailCustomerStatement(
   customerId: string,
   opts?: { from?: Date; to?: Date; email?: string | null },
 ): Promise<{ ok: true; to: string }> {
-  if (!isConfigured()) throw new ServiceError('VALIDATION', NOT_CONFIGURED);
+  if (!(await isConfigured(ctx))) throw emailNotSetUpError();
   const form = await renderCustomerStatement(ctx, customerId, { from: opts?.from, to: opts?.to });
   const recipient = await deliver(ctx, form, opts?.email);
   await writeAudit(ctx, {
@@ -516,7 +583,7 @@ export async function sendQueuedEmails(
   ctx: ServiceContext,
   items: Array<{ kind: SalesFormKind; id: string; to?: string | null }>,
 ) {
-  if (!isConfigured()) throw new ServiceError('VALIDATION', NOT_CONFIGURED);
+  if (!(await isConfigured(ctx))) throw emailNotSetUpError();
   const sent: Array<{ kind: SalesFormKind; id: string; to: string }> = [];
   const failed: Array<{ kind: SalesFormKind; id: string; error: string }> = [];
   for (const it of items) {

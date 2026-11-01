@@ -244,7 +244,8 @@ async function buildTransferFile(
   password: string | null = null,
 ): Promise<TransferFileResult> {
   if (password != null) assertFilePassword(password); // before any work
-  const portable = await createPortableCompanyFile(ctx, { dataDir, carryFileKey: Boolean(password) });
+  // prefsperms: the file's own secrets (vault for AI keys / mail password) stay with the client.
+  const portable = await createPortableCompanyFile(ctx, { dataDir, omitFileSecrets: true, carryFileKey: Boolean(password) });
   const zip = new AdmZip(portable.buffer);
   const manifest: TransferManifest = {
     app: 'ironbooks',

@@ -17,8 +17,11 @@ import {
   areaLabel,
   builtinRole,
   can,
+  canActivity,
   unionRoles,
   type Action,
+  type ActivityAction,
+  type ActivityKey,
   type Area,
   type EffectiveAccess,
   type PermissionGrant,
@@ -26,6 +29,8 @@ import {
   type RoleFlags,
 } from '@/lib/permissions/model';
 import { maskAccountNumber, maskSensitive, maskSsn, stripSecrets } from '@/lib/permissions/mask';
+import { activityDef, activityLabel } from '@/lib/permissions/activities';
+import { hideBalances } from '@/lib/permissions/balances';
 import { ServiceError, type ServiceContext } from './_base';
 
 export interface ResolvedAccess {
@@ -140,13 +145,43 @@ export async function resolveAccess(
 /** Message prefix shared with getPageContext (lib/context.ts) — keep in sync. */
 export const PERMISSION_DENIED_PREFIX = 'You do not have permission';
 
-export function permissionDenied(area: Area, action: Action): ServiceError {
-  const verb = action === 'view' ? 'view' : action === 'print' ? 'print or export' : action;
+export function permissionDenied(area: Area, action: Action | 'view_balance', activity?: string): ServiceError {
+  const verb =
+    action === 'view' ? 'view' : action === 'print' ? 'print or export' : action === 'view_balance' ? 'see balances in' : action;
+  // prefsperms: name the activity too ("create Invoices (Customers & Receivables)").
+  const what = activity && activityDef(activity) ? `${activityLabel(activity)} (${areaLabel(area)})` : areaLabel(area);
   return new ServiceError(
     'FORBIDDEN',
-    `${PERMISSION_DENIED_PREFIX} to ${verb} ${areaLabel(area)}. Ask your administrator for access.`,
-    { area, action },
+    `${PERMISSION_DENIED_PREFIX} to ${verb} ${what}. Ask your administrator for access.`,
+    { area, action, ...(activity ? { activity } : {}) },
   );
+}
+
+/**
+ * Service-level activity guard (prefsperms). Contexts without `access` are trusted and pass, as
+ * with requirePermission.
+ */
+export function requireActivity(ctx: ServiceContext, activity: ActivityKey, action: ActivityAction): void {
+  if (!ctx.access) return;
+  if (!canActivity(ctx.access, activity, action)) {
+    const def = activityDef(activity)!;
+    throw permissionDenied(def.area, action, activity);
+  }
+}
+
+/** True when the context may see balances of this activity (trusted contexts: yes). */
+export function canSeeBalances(ctx: Pick<ServiceContext, 'access'>, activity: ActivityKey): boolean {
+  if (!ctx.access) return true;
+  return canActivity(ctx.access, activity, 'view_balance');
+}
+
+/**
+ * QB "View Balance": an API answer for a screen of `activity` (registers, chart of accounts,
+ * customer / vendor centers) with every balance blanked unless the caller has View Balance there
+ * (lib/permissions/balances.ts). Trusted contexts see everything.
+ */
+export function balancesForContext<T>(ctx: Pick<ServiceContext, 'access'>, activity: ActivityKey, data: T): T {
+  return canSeeBalances(ctx, activity) ? data : hideBalances(data);
 }
 
 /**

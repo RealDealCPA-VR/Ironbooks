@@ -11,7 +11,7 @@
  * file has no user accounts) plus a middleware redirect to `/unlock` for page navigation. The
  * unlock token itself (lib/auth) is bound to the data dir + per-launch nonce.
  */
-import { asc, eq } from 'drizzle-orm';
+import { asc, eq, sql } from 'drizzle-orm';
 import { companies } from '@/lib/db/schema';
 import { hashPassword, verifyPassword } from '@/lib/auth';
 import type { DB } from '@/lib/db';
@@ -62,9 +62,11 @@ export async function verifyFilePassword(db: DB, password: string): Promise<bool
 async function writeLock(db: DB, next: FileLock | null): Promise<void> {
   const c = await primaryCompany(db);
   if (!c) throw new ServiceError('NOT_FOUND', 'No company exists in this file yet.');
-  const settings = { ...((c.settings ?? {}) as Record<string, unknown>) };
-  if (next) settings.fileLock = next;
-  else delete settings.fileLock;
+  // Only the fileLock key changes, merged in SQL (prefsperms, review 5 leftover): writing back the
+  // whole settings object read above undid a Preferences save or a policy change made meanwhile.
+  const settings = next
+    ? sql`coalesce(${companies.settings}, '{}'::jsonb) || jsonb_build_object('fileLock', ${JSON.stringify(next)}::jsonb)`
+    : sql`coalesce(${companies.settings}, '{}'::jsonb) - 'fileLock'`;
   await db.update(companies).set({ settings, updatedAt: new Date() }).where(eq(companies.id, c.id));
 }
 

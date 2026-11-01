@@ -36,6 +36,7 @@ import {
 import { Typeahead } from '@/components/Typeahead';
 import { AccessKeyText } from '@/components/AccessKey';
 import { api } from '@/lib/client';
+import { usePreferences } from '@/lib/usePreferences';
 import { Money, formatCurrency } from '@/lib/money';
 import { isBankAccount, isCreditCardAccount } from '@/lib/accountTypes';
 import { dateKeyForTextField } from '@/lib/shortcuts';
@@ -127,6 +128,9 @@ const EMPTY_LOOKUPS: Lookups = {
 
 export default function BatchEnterPage() {
   const [lookups, setLookups] = useState<Lookups>(EMPTY_LOOKUPS);
+  // A1: "Use class tracking" off: the Class column stays in place (pasted spreadsheets keep their
+  // column order) but is not offered; a class that arrives with a paste still shows.
+  const classOn = usePreferences().company.classTrackingEnabled;
   const [type, setType] = useState<BatchEnterType>('check');
   const [bankAccountId, setBankAccountId] = useState('');
   const [rows, setRows] = useState<KeyedBatchRow[]>(() => Array.from({ length: START_ROWS }, blank));
@@ -442,7 +446,7 @@ export default function BatchEnterPage() {
                 <Th className="w-10 px-2">#</Th>
                 {cols.map((c) => (
                   <Th key={c} numeric={MONEY_COLS.includes(c)} className="px-1">
-                    {columnLabel(c, type)}
+                    {c === 'className' && !classOn ? <span className="sr-only">Class (class tracking is off)</span> : columnLabel(c, type)}
                   </Th>
                 ))}
                 <Th className="w-10 px-2">
@@ -473,7 +477,9 @@ export default function BatchEnterPage() {
                         className: 'px-2 py-1.5',
                       };
                       let cell: React.ReactNode;
-                      if (c === 'account' || c === 'name' || c === 'className') {
+                      if (c === 'className' && !classOn && !v) {
+                        cell = <span className="block px-2 py-1.5" aria-hidden="true" />;
+                      } else if (c === 'account' || c === 'name' || c === 'className') {
                         cell = (
                           <Typeahead
                             {...common}

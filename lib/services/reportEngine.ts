@@ -215,7 +215,16 @@ export interface AccountMeta {
   fullName: string;
 }
 
-export async function loadAccountMeta(ctx: ServiceContext): Promise<Map<string, AccountMeta>> {
+/**
+ * Every account of the company with its report section and "Parent:Child" full name.
+ *
+ * prefsperms (A1): `name` / `fullName` follow Preferences > Reports & Graphs "Reports show
+ * accounts by" (QB "Show accounts by: Name only / Description only / Name and Description"), so
+ * every report built on this metadata names accounts the way the company chose. `raw: true` keeps
+ * the real names (matching accounts across company files, budgets keyed by name).
+ */
+export async function loadAccountMeta(ctx: ServiceContext, opts: { raw?: boolean } = {}): Promise<Map<string, AccountMeta>> {
+  const display = opts.raw ? 'name' : await accountDisplayOf(ctx);
   const rows = await ctx.db
     .select({
       id: accounts.id,
@@ -225,17 +234,21 @@ export async function loadAccountMeta(ctx: ServiceContext): Promise<Map<string, 
       subtype: accounts.subtype,
       parentId: accounts.parentId,
       isActive: accounts.isActive,
+      description: accounts.description,
     })
     .from(accounts)
     .where(eq(accounts.companyId, ctx.companyId));
   const map = new Map<string, AccountMeta>();
-  for (const r of rows) {
+  for (const { description, ...r } of rows) {
+    const desc = description?.trim();
+    const name = display === 'description' && desc ? desc : display === 'both' && desc ? `${r.name} (${desc})` : r.name;
     map.set(r.id, {
       ...r,
+      name,
       type: String(r.type),
       subtype: String(r.subtype),
       section: sectionForAccount(String(r.type), String(r.subtype)),
-      fullName: r.name,
+      fullName: name,
     });
   }
   for (const a of map.values()) {
@@ -250,6 +263,13 @@ export async function loadAccountMeta(ctx: ServiceContext): Promise<Map<string, 
     a.fullName = names.join(':');
   }
   return map;
+}
+
+/** Preferences > Reports & Graphs "Reports show accounts by" for this company. */
+async function accountDisplayOf(ctx: ServiceContext): Promise<'name' | 'description' | 'both'> {
+  const [row] = await ctx.db.select({ settings: companies.settings }).from(companies).where(eq(companies.id, ctx.companyId));
+  const v = (row?.settings as { accountDisplay?: unknown } | null)?.accountDisplay;
+  return v === 'description' || v === 'both' ? v : 'name';
 }
 
 /** The account and all of its descendants (for "include sub-accounts" filters). */

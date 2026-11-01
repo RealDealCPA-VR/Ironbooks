@@ -288,8 +288,20 @@ export function portableFilename(companyName: string): string {
 }
 
 /**
+ * Tables of the company FILE's own secrets (lib/ai/keyVault.ts: the vault secret that seals the AI
+ * provider keys and the Send Forms mail password). A file handed to someone outside the company
+ * leaves them out (`omitFileSecrets`), so the sealed values in it can't be opened anywhere.
+ */
+export const FILE_SECRET_TABLES = ['file_secrets'] as const;
+
+/**
  * Build `<Company>.bkp` for the company file (data directory) behind `ctx`.
  * Includes users with password hashes, so it requires the owner or an admin.
+ *
+ * `omitFileSecrets` (prefsperms, review 5 leftover): for the Accountant's Copy and the Period Copy,
+ * which go to an outside accountant, auditor or lender — the file's vault secret stays home, so the
+ * client's AI provider keys and mail server password can't be recovered from the transfer file.
+ * The owner's own portable file keeps it (a restore on a new computer keeps those working).
  */
 export async function createPortableCompanyFile(
   ctx: ServiceContext,
@@ -299,6 +311,8 @@ export async function createPortableCompanyFile(
     password?: string | null;
     /** Carry a protected file's key without sealing here (the caller seals the final file). */
     carryFileKey?: boolean;
+    /** Leave the file's own secret tables out (Accountant's Copy / Period Copy). */
+    omitFileSecrets?: boolean;
   } = {},
 ): Promise<PortableFileResult> {
   if (opts.password != null) assertFilePassword(opts.password);
@@ -326,7 +340,8 @@ export async function createPortableCompanyFile(
   const snapshot = await client.transaction(async (tx) => {
     const tables: PortableManifest['tables'] = {};
     for (const t of await listTables(tx)) {
-      const lines = await dumpTable(tx, t);
+      const omit = opts.omitFileSecrets === true && (FILE_SECRET_TABLES as readonly string[]).includes(t.name);
+      const lines = omit ? [] : await dumpTable(tx, t);
       const text = lines.join('\n');
       tables[t.name] = { rows: lines.length, columns: t.columns.map((c) => c.name), sha256: sha256(text) };
       add(`data/${t.name}.jsonl`, Buffer.from(text, 'utf8'));

@@ -21,8 +21,8 @@ import { listAccounts } from '@/lib/services/accounts';
 import { trialBalance } from '@/lib/services/reports';
 import { allWorkflowHrefs, buildAccountBalances } from '@/lib/homeWorkflow';
 import { getPreferences } from '@/lib/services/company';
-import { featureHiddenPaths } from '@/lib/preferences';
-import { pageAreasFor } from '@/lib/permissions/routes';
+import { featureHiddenPaths, homeIconHiddenHrefs } from '@/lib/preferences';
+import { pageAccessFor } from '@/lib/permissions/routes';
 import type { ServiceContext } from '@/lib/services/_base';
 import HomeWorkflow from '@/components/HomeWorkflow';
 import RemindersList from '@/components/RemindersList';
@@ -31,7 +31,7 @@ import { Help } from '@/components/Help';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
 import { Card, PageHeader } from '@/components/ui';
-import { can } from '@/lib/permissions/model';
+import { can, canActivity } from '@/lib/permissions/model';
 // team home: "Needs attention" is Home's first tab (Simple mode lands on it).
 import HomeTabs from '@/components/HomeTabs';
 import AttentionInbox from '@/components/AttentionInbox';
@@ -57,13 +57,19 @@ const CHART = {
  * feature is on (Preferences). The Home diagram shows only these, like QB hides icons.
  */
 async function allowedWorkflowHrefs(ctx: ServiceContext): Promise<string[]> {
-  const hidden = featureHiddenPaths(await getPreferences(ctx));
+  const prefs = await getPreferences(ctx);
+  const hidden = featureHiddenPaths(prefs);
+  // prefsperms A2: Preferences > Desktop View "Show icons on the Home page".
+  const iconsOff = homeIconHiddenHrefs(prefs);
   return allWorkflowHrefs().filter((href) => {
     if (href.startsWith('#')) return true;
     const path = href.split('?')[0];
-    if (hidden.has(path)) return false;
-    const areas = pageAreasFor(path);
-    return !ctx.access || !areas || areas.some((a) => can(ctx.access!, a, 'view'));
+    if (hidden.has(path) || iconsOff.has(path)) return false;
+    // prefsperms: the step's activity (Invoices, Pay Bills, …), else its area.
+    const need = pageAccessFor(path);
+    if (!ctx.access || !need) return true;
+    if (need.activities) return need.activities.some((k) => canActivity(ctx.access!, k, 'view'));
+    return need.areas.some((a) => can(ctx.access!, a, 'view'));
   });
 }
 
@@ -87,7 +93,8 @@ export default async function DashboardPage({ searchParams }: { searchParams: Pr
     trialBalance(ctx),
     getMyPreferences(ctx),
   ]);
-  const showBalances = !ctx.access || can(ctx.access, 'banking', 'view');
+  // prefsperms: QB "View Balance" on Bank Accounts decides whether the balances show.
+  const showBalances = !ctx.access || canActivity(ctx.access, 'banking.bank_accounts', 'view_balance');
   // QB "Account Balances" panel: bank + credit card balances straight from the ledger.
   const balances = buildAccountBalances(accountRows, tb.rows);
 
@@ -105,7 +112,7 @@ export default async function DashboardPage({ searchParams }: { searchParams: Pr
       <HomeTabs active="overview" />
 
       {/* QuickBooks-style workflow diagram: click any step to start that task
-          (My Preferences > General can hide it). */}
+          (My Preferences > Desktop View can hide it). */}
       {myPrefs.showHomeWorkflow && (
         <HomeWorkflow balances={balances} allowedHrefs={allowedHrefs} showBalances={showBalances} />
       )}

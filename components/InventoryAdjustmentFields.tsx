@@ -7,6 +7,7 @@
 import { useEffect, useState } from 'react';
 import { Label, Select } from '@/components/ui';
 import { api } from '@/lib/client';
+import { usePreferences } from '@/lib/usePreferences';
 
 export interface AdjustmentFieldValues {
   adjustmentAccountId: string;
@@ -55,6 +56,8 @@ export function InventoryAdjustmentFields({
   const [classes, setClasses] = useState<Named[]>([]);
   const [customers, setCustomers] = useState<Named[]>([]);
   const [jobs, setJobs] = useState<Named[]>([]);
+  // A1: "Use class tracking" off hides Class (a class already chosen still shows).
+  const classOn = usePreferences().company.classTrackingEnabled || Boolean(value.classId);
 
   useEffect(() => {
     const soft = <T,>(p: Promise<T>, fallback: T) => p.catch(() => fallback);
@@ -99,17 +102,19 @@ export function InventoryAdjustmentFields({
           ))}
         </Select>
       </div>
-      <div>
-        <Label htmlFor={`${idPrefix}-class`}>Class</Label>
-        <Select id={`${idPrefix}-class`} value={value.classId} onChange={(e) => set({ classId: e.target.value })}>
-          <option value="">None</option>
-          {classes.map((c) => (
-            <option key={c.id} value={c.id}>
-              {c.name}
-            </option>
-          ))}
-        </Select>
-      </div>
+      {classOn && (
+        <div>
+          <Label htmlFor={`${idPrefix}-class`}>Class</Label>
+          <Select id={`${idPrefix}-class`} value={value.classId} onChange={(e) => set({ classId: e.target.value })}>
+            <option value="">None</option>
+            {classes.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.name}
+              </option>
+            ))}
+          </Select>
+        </div>
+      )}
       <div>
         <Label htmlFor={`${idPrefix}-customer`}>Customer:Job</Label>
         <div className="flex gap-2">

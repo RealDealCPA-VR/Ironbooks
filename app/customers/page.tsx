@@ -29,6 +29,7 @@ import { api, ApiError } from '@/lib/client';
 import { usePreferences } from '@/lib/usePreferences';
 import AttachmentPanel from '@/components/AttachmentPanel';
 import { formatCurrency } from '@/lib/money';
+import { HIDDEN_BALANCE_TITLE } from '@/lib/permissions/balances';
 import { useFocusParam } from '@/lib/useFocusParam';
 import { EntityNotes } from '@/components/lists/EntityNotes';
 import { Help } from '@/components/Help';
@@ -979,7 +980,12 @@ function CustomersPageContent() {
                   </>
                   )}
                   <Td numeric className="font-semibold text-navy">
-                    {formatCurrency(c.balanceTotal ?? c.balance)}
+                    {/* QB View Balance: the server blanks balances the role may not see. */}
+                    {(c as { balanceHidden?: boolean }).balanceHidden ? (
+                      <span className="font-normal text-navy/40" title={HIDDEN_BALANCE_TITLE}>Hidden</span>
+                    ) : (
+                      formatCurrency(c.balanceTotal ?? c.balance)
+                    )}
                   </Td>
                   {wide && (
                   <Td>

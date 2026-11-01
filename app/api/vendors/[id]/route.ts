@@ -5,6 +5,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
+import { balancesForContext } from '@/lib/services/access';
 import { getVendor, updateVendor, deactivateVendor } from '@/lib/services/vendors';
 import { ServiceError } from '@/lib/services/_base';
 import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
@@ -28,7 +29,7 @@ export async function GET(_req: NextRequest, { params }: RouteContext) {
     const { id } = await params;
     const ctx = await getServerContext();
     const vendor = await getVendor(ctx, id);
-    return NextResponse.json(vendor);
+    return NextResponse.json(balancesForContext(ctx, 'vendors.center', vendor)); // QB View Balance
   } catch (err) {
     return errorResponse(err);
   }

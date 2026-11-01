@@ -18,10 +18,11 @@ import { reportToCsv, reportToTable, type StdReport } from '@/lib/reports/types'
 import { type ServiceContext, notFound, validation, writeAudit, inTransaction } from './_base';
 import { runStandardReport, standardReportEntry } from './reportRegistry';
 import { runReport, type ReportConfig } from './reportBuilder';
-import { requirePermission, resolveAccess } from './access';
+import { requireActivity, requirePermission, resolveAccess } from './access';
+import { reportActivity } from '@/lib/reports/catalog';
 import { requireAnyReportAccess } from './reportsAccess';
 import { assertNotSandbox } from './sandboxState';
-import { can, type Area, type EffectiveAccess } from '@/lib/permissions/model';
+import { can, canActivity, type Area, type EffectiveAccess } from '@/lib/permissions/model';
 
 /**
  * Permission area a memorized report's data belongs to. Report builder ("custom") reports read
@@ -36,7 +37,15 @@ function areaForReportType(reportType: string): Area | undefined {
 function requireReportTypeAccess(ctx: ServiceContext, reportType: string): void {
   const area = areaForReportType(reportType);
   if (!area) throw validation(`Unknown report type "${reportType}".`);
-  requirePermission(ctx, area, 'view');
+  requireReportView(ctx, reportType, area);
+}
+
+/** View of the report's own activity (prefsperms), or of Custom Reports for the report builder. */
+function requireReportView(ctx: ServiceContext, reportType: string, area: Area): void {
+  const entry = standardReportEntry(reportType);
+  if (entry) requireActivity(ctx, reportActivity(entry), 'view');
+  else if (reportType === 'custom') requireActivity(ctx, 'reports_financial.custom', 'view');
+  else requirePermission(ctx, area, 'view');
 }
 
 /**
@@ -50,7 +59,7 @@ function requireExistingRowAccess(ctx: ServiceContext, reportType: string): void
     requireAnyReportAccess(ctx);
     return;
   }
-  requirePermission(ctx, area, 'view');
+  requireReportView(ctx, reportType, area);
 }
 
 // ---------------------------------------------------------------------------
@@ -273,7 +282,12 @@ function canRunReportTypes(access: EffectiveAccess | undefined, types: string[])
   if (!access) return true;
   return types.every((t) => {
     const area = typeof t === 'string' ? areaForReportType(t) : undefined;
-    return !area || can(access, area, 'view');
+    if (!area) return true;
+    // prefsperms: the report's own activity, as runStandardReport checks it.
+    const entry = standardReportEntry(t);
+    if (entry) return canActivity(access, reportActivity(entry), 'view');
+    if (t === 'custom') return canActivity(access, 'reports_financial.custom', 'view');
+    return can(access, area, 'view');
   });
 }
 
@@ -460,7 +474,7 @@ export async function createReportSchedule(
     requireAnyReportAccess(ctx);
     for (const t of await scheduleReportTypes(ctx, { groupId: input.groupId })) {
       const area = typeof t === 'string' ? areaForReportType(t) : undefined;
-      if (area) requirePermission(ctx, area, 'view');
+      if (area) requireReportView(ctx, t, area);
     }
   }
   // The first run is at the start (local midnight) of the start date on this computer's calendar:

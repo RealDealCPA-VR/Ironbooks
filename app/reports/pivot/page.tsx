@@ -9,6 +9,7 @@ import { useState } from 'react';
 import { Grid3x3 } from 'lucide-react';
 import { Button, Card, Input, Label, PageHeader, Select, Spinner, toast } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { usePreferences } from '@/lib/usePreferences';
 import { todayISO } from '@/lib/dates';
 import type { StdReport } from '@/lib/reports/types';
 import ReportToolbar from '../_components/ReportToolbar';
@@ -51,6 +52,8 @@ const SECTIONS: [string, string][] = [
 export default function PivotPage() {
   const year = new Date().getFullYear();
   const [source, setSource] = useState<'gl' | 'sales'>('gl');
+  // A1 (prefsperms): no Class dimension while "Use class tracking" is off.
+  const classOn = usePreferences().company.classTrackingEnabled;
   const [rows, setRows] = useState('account');
   const [cols, setCols] = useState('month');
   const [measure, setMeasure] = useState('amount');
@@ -109,7 +112,7 @@ export default function PivotPage() {
           <div>
             <Label htmlFor="pv-rows">Rows</Label>
             <Select id="pv-rows" value={rows} onChange={(e) => setRows(e.target.value)}>
-              {DIMS[source].map(([k, l]) => (
+              {DIMS[source].filter(([k]) => classOn || k !== 'class' || rows === 'class' || cols === 'class').map(([k, l]) => (
                 <option key={k} value={k}>
                   {l}
                 </option>
@@ -120,7 +123,7 @@ export default function PivotPage() {
             <Label htmlFor="pv-cols">Columns</Label>
             <Select id="pv-cols" value={cols} onChange={(e) => setCols(e.target.value)}>
               <option value="">Total only</option>
-              {DIMS[source]
+              {DIMS[source].filter(([k]) => classOn || k !== 'class' || rows === 'class' || cols === 'class')
                 .filter(([k]) => k !== rows)
                 .map(([k, l]) => (
                   <option key={k} value={k}>

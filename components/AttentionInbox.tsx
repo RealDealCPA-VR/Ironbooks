@@ -638,14 +638,16 @@ function ReminderPanel({
     <div className="space-y-3">
       {!emailConfigured && (
         <div className="rounded-lg border border-gold/40 bg-gold/10 p-3 text-sm text-navy/80" role="note">
-          <strong className="font-semibold">Email isn&apos;t set up on this computer yet.</strong> You can still send
-          this reminder from your own email program, or copy it. To send straight from Ironbooks, whoever
-          installed it adds the outgoing mail (SMTP) settings: SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS and
-          SMTP_FROM. See{' '}
+          <strong className="font-semibold">Email isn&apos;t set up yet.</strong> You can still send this reminder
+          from your own email program, or copy it. To send straight from Ironbooks, add your mail server under{' '}
+          <Link href="/settings?tab=sendForms" className="font-semibold text-electric hover:underline">
+            Preferences &gt; Send Forms
+          </Link>
+          . See{' '}
           <Link href="/privacy" className="font-semibold text-electric hover:underline">
             Privacy &amp; Network
           </Link>{' '}
-          for which internet services Ironbooks may use.
+          for which internet services Ironbooks may use. The wording is the Overdue Invoice Reminder template there.
         </div>
       )}
       <div className="max-w-sm">

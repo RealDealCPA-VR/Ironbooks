@@ -451,6 +451,13 @@
       "breakpoints": true
     },
     {
+      "idx": 79,
+      "version": "7",
+      "when": 1781400079000,
+      "tag": "0079_prefsperms",
+      "breakpoints": true
+    },
+    {
       "idx": 81,
       "version": "7",
       "when": 1781400081000,

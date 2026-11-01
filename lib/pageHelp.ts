@@ -40,8 +40,8 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
   },
   '/calendar': {
     title: 'Calendar',
-    what: 'A month view of what you entered each day, what is due (invoices, bills) and your to-dos.',
-    first: 'Click a day to see everything on it or to add a to-do.',
+    what: 'A day, week or month view of what you entered each day, what is due (invoices, bills) and your to-dos, with an Upcoming & Past Due list.',
+    first: 'Click a day to see everything on it or to add a to-do. Preferences > Calendar sets the view you start in and how far the Upcoming & Past Due list looks.',
   },
   '/reminders': {
     title: 'Reminders',
@@ -363,10 +363,23 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
     first: 'Click "Try it on a copy". When done, discard the copy or keep it as a training file.',
     qb: 'Sample / practice company file',
   },
+  // prefsperms K: Users & Roles and its reports
+  '/users': {
+    title: 'Users & Roles',
+    what: 'Who can sign in to this company file and what each person may do. A role sets access per activity, such as Invoices or Receive Payments.',
+    first: 'Add a user and give them one or more roles, or clone a built-in role to make your own.',
+    qb: 'Set Up Users and Roles',
+  },
+  '/users/permissions': {
+    title: 'View Permissions',
+    what: 'Reports of what each role or user may do in every area and activity, side by side, plus the user and role lists.',
+    first: 'Pick a report, tick the roles or users to compare, then print it or download it as CSV.',
+    qb: 'Users and Roles > View Permissions',
+  },
   '/settings': {
     title: 'Preferences',
-    what: 'Settings for the whole company and just for you, such as features you use and the menu style.',
-    first: 'Open a category on the left, change what you need and save.',
+    what: 'Settings for the whole company and just for you, such as features you use, the menu style and the mail server that sends your forms (Send Forms).',
+    first: 'Open a category on the left, change what you need and save. Each category has a My Preferences and a Company Preferences tab.',
     qb: 'Edit > Preferences',
   },
   // filecrypto: the company file's own passwords

@@ -7,6 +7,7 @@ import {
 } from '@/components/ui';
 import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
+import { usePreferences } from '@/lib/usePreferences';
 import { type AccountOpt, type NamedOpt, BackToCenter, accountLabel, money, monthsAgo, today, useList } from '../_shared';
 
 interface Line {
@@ -36,6 +37,10 @@ export default function ReclassifyPage() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [newAccountId, setNewAccountId] = useState('');
   const [classMode, setClassMode] = useState<'keep' | 'clear' | string>('keep');
+  // A1: "Use class tracking" off: no Class column or new class, unless lines already carry one
+  // (they can still be cleared).
+  const classOn = usePreferences().company.classTrackingEnabled;
+  const showClass = classOn || (lines ?? []).some((l) => !!l.className);
   const [loading, setLoading] = useState(false);
   const [confirm, setConfirm] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -156,7 +161,7 @@ export default function ReclassifyPage() {
                     <Th>Type</Th>
                     <Th>#</Th>
                     <Th>Description / memo</Th>
-                    <Th>Class</Th>
+                    {showClass && <Th>Class</Th>}
                     <Th numeric>Debit</Th>
                     <Th numeric>Credit</Th>
                   </tr>
@@ -184,7 +189,7 @@ export default function ReclassifyPage() {
                         {l.description}
                         {l.memo && l.memo !== l.description ? <span className="block text-xs text-navy/50">{l.memo}</span> : null}
                       </Td>
-                      <Td>{l.className ?? ''}</Td>
+                      {showClass && <Td>{l.className ?? ''}</Td>}
                       <Td numeric>{l.debit ? money(l.debit) : ''}</Td>
                       <Td numeric>{l.credit ? money(l.credit) : ''}</Td>
                     </Tr>
@@ -204,16 +209,19 @@ export default function ReclassifyPage() {
                       ))}
                   </Select>
                 </div>
-                <div className="min-w-[200px]">
-                  <Label htmlFor="rc-class">Change class to</Label>
-                  <Select id="rc-class" value={classMode} onChange={(e) => setClassMode(e.target.value)}>
-                    <option value="keep">Keep the same class</option>
-                    <option value="clear">No class</option>
-                    {classes.map((c) => (
-                      <option key={c.id} value={c.id}>{c.name}</option>
-                    ))}
-                  </Select>
-                </div>
+                {showClass && (
+                  <div className="min-w-[200px]">
+                    <Label htmlFor="rc-class">Change class to</Label>
+                    <Select id="rc-class" value={classMode} onChange={(e) => setClassMode(e.target.value)}>
+                      <option value="keep">Keep the same class</option>
+                      <option value="clear">No class</option>
+                      {classOn &&
+                        classes.map((c) => (
+                          <option key={c.id} value={c.id}>{c.name}</option>
+                        ))}
+                    </Select>
+                  </div>
+                )}
                 <Button disabled={!canApply} onClick={() => setConfirm(true)}>
                   Reclassify {selected.size > 0 ? `${selected.size} line(s)` : ''}
                 </Button>

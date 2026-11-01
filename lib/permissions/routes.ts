@@ -25,6 +25,8 @@
  * Pure module (no Node/DB imports): also used client-side to filter navigation.
  */
 import type { Action, Area } from './model';
+import type { ActivityKey } from './activities';
+import { PAGE_ACTIVITIES as PAGE_ACTIVITY_PREFIXES, activityForRoute, pageActivitiesFor } from './routeActivities';
 
 export const HTTP_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] as const;
 export type HttpMethod = (typeof HTTP_METHODS)[number];
@@ -73,6 +75,7 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/auth/2fa/setup': kind('self', 'POST'),
   '/api/auth/2fa/enable': kind('self', 'POST'),
   '/api/auth/2fa/disable': kind('self', 'POST'),
+  '/api/auth/2fa/recovery-codes': kind('self', 'GET POST'), // prefsperms: own one-time recovery codes
   '/api/auth/change-password': kind('self', 'POST'), // gapsb K: change own password (also when expired)
   '/api/auth/password-policy': kind('public', 'GET'), // gapsb K: the file's password rules for the forms
   '/api/auth/challenge': kind('self', 'GET POST'), // own challenge question for "I forgot my password"
@@ -84,7 +87,13 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/portal/login': kind('public', 'POST'),
   '/api/portal/logout': kind('public', 'POST'),
   '/api/portal/me': kind('self', 'GET'),
-  '/api/email/status': kind('public', 'GET'),
+  // prefsperms: whether this company can send email (file mail server or SMTP env); nothing secret.
+  '/api/email/status': kind('member', 'GET'),
+  // prefsperms: Preferences > Send Forms mail server (Company & Preferences > Send Forms set-up).
+  '/api/email/settings': r('company', 'GET PUT:modify DELETE:modify'),
+  // Test: typed settings need the set-up right (checked in the service); anyone may test the saved
+  // ones to their OWN address (My Preferences > Send Forms).
+  '/api/email/test': kind('member', 'POST'),
 
   // ---- Company files / company settings ----
   '/api/companies': kind('self', 'GET POST'),
@@ -179,6 +188,7 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/users/[id]': r('users', 'GET PATCH'),
   '/api/users/[id]/reset-password': r('users', 'POST:modify'),
   '/api/users/password-policy': r('users', 'GET PUT:modify'), // gapsb K: Admin-only save (requireFileAdmin)
+  '/api/users/permissions-report': r('users', 'GET'), // prefsperms K: View Permissions / user & role lists (CSV needs Print, service)
   '/api/roles': r('users', 'GET POST'),
   '/api/roles/[id]': r('users', 'GET PATCH DELETE'),
   // Multi-user hosting (team hosting): who is logged in / sign-out / single-user mode. Every
@@ -394,6 +404,7 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/purchase-orders': r('vendors', 'GET POST'),
   '/api/purchase-orders/[id]': r('vendors', 'GET POST:modify PATCH DELETE'),
   '/api/purchase-orders/[id]/pdf': r('vendors', 'GET:print'),
+  '/api/purchase-orders/[id]/email': r('vendors', 'POST:print'), // prefsperms: email the P.O. to the vendor
   '/api/expense-reports': r('vendors', 'GET POST'),
   '/api/expense-reports/[id]': r('vendors', 'GET POST:modify'),
   '/api/reports/1099/mapping': r('vendors', 'GET PATCH'),
@@ -917,6 +928,19 @@ export function apiRuleFor(pathname: string, method: string): RouteRule | null {
 }
 
 /**
+ * prefsperms (QB Enterprise activities): the ACTIVITY of the rule's area a concrete API request
+ * needs (lib/permissions/routeActivities.ts), or null for non-area rules and unmapped routes —
+ * enforce.ts then checks the whole area.
+ */
+export function apiActivityFor(pathname: string, method: string): ActivityKey | null {
+  const rule = apiRuleFor(pathname, method);
+  if (!rule || typeof rule !== 'object') return null;
+  const pattern = matchRoutePattern(pathname)!;
+  const m = method.toUpperCase();
+  return activityForRoute(pattern, m === 'HEAD' ? 'GET' : m, rule.area, pathname);
+}
+
+/**
  * The areas a page path needs 'view' of (ANY one suffices), or null when the page is open to
  * every member.
  */
@@ -930,4 +954,31 @@ export function pageAreasFor(pathname: string): Area[] | null {
   if (!best) return null;
   const v = PAGE_AREAS[best];
   return Array.isArray(v) ? v : [v];
+}
+
+/**
+ * What a page needs (prefsperms): View of one of these ACTIVITIES when
+ * lib/permissions/routeActivities.ts maps the page at least as precisely as PAGE_AREAS does,
+ * else View of one of the AREAS; null when the page is open to every member.
+ */
+export function pageAccessFor(
+  pathname: string,
+): { activities: ActivityKey[]; areas: Area[] } | { activities: null; areas: Area[] } | null {
+  const areas = pageAreasFor(pathname);
+  const activities = pageActivitiesFor(pathname);
+  if (!areas && !activities) return null;
+  if (activities && (!areas || prefixLength(pathname, Object.keys(PAGE_AREAS)) <= prefixLengthOfActivities(pathname))) {
+    return { activities, areas: areas ?? [] };
+  }
+  return { activities: null, areas: areas ?? [] };
+}
+
+function prefixLength(pathname: string, prefixes: string[]): number {
+  let best = -1;
+  for (const p of prefixes) if ((pathname === p || pathname.startsWith(p + '/')) && p.length > best) best = p.length;
+  return best;
+}
+
+function prefixLengthOfActivities(pathname: string): number {
+  return prefixLength(pathname, Object.keys(PAGE_ACTIVITY_PREFIXES));
 }

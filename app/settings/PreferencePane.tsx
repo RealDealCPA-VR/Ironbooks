@@ -12,8 +12,10 @@ import { Building2, User } from 'lucide-react';
 import { Button, Card, Input, Label, Select, toast } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import {
-  FORM_TYPES,
-  FORM_TYPE_LABELS,
+  COMMON_MERGE_FIELDS,
+  EMAIL_MERGE_FIELDS,
+  EMAIL_TEMPLATE_LABELS,
+  EMAIL_TEMPLATE_TYPES,
   PREFERENCE_CATEGORIES,
   REMINDER_KEYS,
   REMINDER_LABELS,
@@ -174,15 +176,15 @@ function SendFormsEditor({
   onChange: (v: CompanyPreferences['sendForms']) => void;
   disabled?: boolean;
 }) {
-  const [form, setForm] = React.useState<(typeof FORM_TYPES)[number]>('invoice');
+  const [form, setForm] = React.useState<(typeof EMAIL_TEMPLATE_TYPES)[number]>('invoice');
   return (
     <div className="flex flex-col gap-3">
       <div className="max-w-xs">
         <Label htmlFor="sf-form">Form</Label>
         <Select id="sf-form" value={form} onChange={(e) => setForm(e.target.value as typeof form)}>
-          {FORM_TYPES.map((f) => (
+          {EMAIL_TEMPLATE_TYPES.map((f) => (
             <option key={f} value={f}>
-              {FORM_TYPE_LABELS[f]}
+              {EMAIL_TEMPLATE_LABELS[f]}
             </option>
           ))}
         </Select>
@@ -208,8 +210,8 @@ function SendFormsEditor({
           className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-navy focus:outline-none focus:ring-2 focus:ring-electric/40"
         />
         <p className="mt-1 text-xs text-navy/50">
-          Fill-in fields: {'{{number}}'}, {'{{customer.name}}'}, {'{{company.name}}'}, {'{{total}}'}, {'{{balance}}'},{' '}
-          {'{{dueDate}}'}.
+          Fill-in fields for this form:{' '}
+          {[...EMAIL_MERGE_FIELDS[form], ...COMMON_MERGE_FIELDS].map((f) => `{{${f}}}`).join(', ')}.
         </p>
       </div>
     </div>
@@ -237,6 +239,10 @@ export default function PreferencePane({
 
   const companyKeys = (category?.company ?? []).filter((k) => !exclude.includes(k));
   const myKeys = category?.my ?? [];
+  // prefsperms A2: a tab may carry only a plain note (a QB setting Ironbooks fixes on).
+  const notes = category?.notes ?? {};
+  const companyCount = companyKeys.length + (notes.company ? 1 : 0);
+  const myCount = myKeys.length + (notes.my ? 1 : 0);
 
   React.useEffect(() => {
     if (!prefs.loaded) return;
@@ -246,8 +252,9 @@ export default function PreferencePane({
   }, [prefs.loaded, categoryId]);
 
   React.useEffect(() => {
-    if (companyKeys.length === 0 && myKeys.length > 0) setScope('my');
-    else if (myKeys.length === 0) setScope('company');
+    if (companyCount === 0 && myCount > 0) setScope('my');
+    else if (myCount === 0) setScope('company');
+    else if (companyKeys.length === 0 && myKeys.length > 0) setScope('my');
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [categoryId]);
 
@@ -255,7 +262,7 @@ export default function PreferencePane({
   if (categoryId === 'currencies' && companyKeys.includes('multiCurrencyEnabled')) {
     return <MultiCurrencyPreference canEdit={canEditCompany} />;
   }
-  if (!category || (companyKeys.length === 0 && myKeys.length === 0)) return null;
+  if (!category || (companyCount === 0 && myCount === 0)) return null;
 
   const keys = scope === 'company' ? companyKeys : myKeys;
   const values = scope === 'company' ? draft : myDraft;
@@ -290,8 +297,8 @@ export default function PreferencePane({
         <div className="flex rounded-lg border border-slate-200 overflow-hidden" role="tablist" aria-label="Preference scope">
           {(
             [
-              ['my', 'My Preferences', User, myKeys.length],
-              ['company', 'Company Preferences', Building2, companyKeys.length],
+              ['my', 'My Preferences', User, myCount],
+              ['company', 'Company Preferences', Building2, companyCount],
             ] as const
           ).map(([id, label, Icon, n]) => (
             <button
@@ -316,6 +323,11 @@ export default function PreferencePane({
           : 'These settings only change how the app works for you.'}
         {readOnly && ' Only an administrator can change them.'}
       </p>
+      {(scope === 'company' ? notes.company : notes.my) && (
+        <p className="mb-5 rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-navy/70" role="note">
+          {scope === 'company' ? notes.company : notes.my}
+        </p>
+      )}
       <div className="flex flex-col gap-5">
         {keys.map((k) => {
           const meta = FIELD_META[k];
@@ -355,11 +367,13 @@ export default function PreferencePane({
           );
         })}
       </div>
-      <div className="mt-6">
-        <Button onClick={() => void save()} loading={saving} disabled={readOnly}>
-          Save {scope === 'company' ? 'company' : 'my'} preferences
-        </Button>
-      </div>
+      {keys.length > 0 && (
+        <div className="mt-6">
+          <Button onClick={() => void save()} loading={saving} disabled={readOnly}>
+            Save {scope === 'company' ? 'company' : 'my'} preferences
+          </Button>
+        </div>
+      )}
     </Card>
   );
 }

@@ -77,6 +77,7 @@ import { createVendor } from './vendors';
 import { vendorPrefill } from './aiCategorizer';
 import { buildProviders, loadSettings } from './aiSettings';
 import { getFileLockStatus } from './fileLock';
+import { integratedAppAllowed, integratedAppOffMessage } from '@/lib/preferences';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -887,6 +888,10 @@ export async function createUploadToken(
 ): Promise<UploadTokenView & { token: string }> {
   assertWrite(ctx);
   requirePermission(ctx, 'lists', 'create');
+  const [co] = await ctx.db.select({ settings: companies.settings }).from(companies).where(eq(companies.id, ctx.companyId));
+  if (!integratedAppAllowed(co?.settings, 'phoneReceipts')) {
+    throw new ServiceError('FORBIDDEN', integratedAppOffMessage('phoneReceipts'));
+  }
   const minutes = Math.min(Math.max(Math.trunc(opts.minutes ?? UPLOAD_TOKEN_MINUTES), 1), 60);
   const maxUploads = Math.min(Math.max(Math.trunc(opts.maxUploads ?? UPLOAD_TOKEN_MAX_UPLOADS), 1), 50);
   const token = randomBytes(32).toString('base64url');
@@ -947,7 +952,7 @@ export async function revokeUploadToken(ctx: ServiceContext, id: string): Promis
   });
 }
 
-export type TokenProblem = 'invalid' | 'expired' | 'used_up' | 'revoked' | 'not_allowed' | 'locked';
+export type TokenProblem = 'invalid' | 'expired' | 'used_up' | 'revoked' | 'not_allowed' | 'locked' | 'apps_off';
 
 export class UploadTokenError extends ServiceError {
   constructor(public readonly problem: TokenProblem) {
@@ -962,7 +967,14 @@ const TOKEN_MESSAGES: Record<TokenProblem, string> = {
   revoked: 'This upload link was turned off. Make a new one on the Receipts page.',
   not_allowed: 'The person who made this link can no longer add receipts to this company.',
   locked: 'Open the company on your computer first, then make a new upload link on the Receipts page.',
+  apps_off: 'Phone receipt capture is turned off for this company file (Preferences > Integrated Applications).',
 };
+
+/** prefsperms A2: Preferences > Integrated Applications turned phone receipt capture off. */
+async function appsProblem(db: DB, row: TokenRow): Promise<TokenProblem | null> {
+  const [c] = await db.select({ settings: companies.settings }).from(companies).where(eq(companies.id, row.companyId));
+  return integratedAppAllowed(c?.settings, 'phoneReceipts') ? null : 'apps_off';
+}
 
 /**
  * When this server process started. The company-file password (lib/services/fileLock.ts) has to
@@ -1026,7 +1038,7 @@ export interface UploadLinkStatus {
 /** What the phone page shows: which company, how long, how many uploads are left. */
 export async function uploadLinkStatus(db: DB, token: string, now: Date = new Date()): Promise<UploadLinkStatus> {
   const row = await findToken(db, token);
-  const problem = problemOf(row, now) ?? (await lockProblem(db, row!));
+  const problem = problemOf(row, now) ?? (await lockProblem(db, row!)) ?? (await appsProblem(db, row!));
   if (problem) throw new UploadTokenError(problem);
   await tokenContext(db, row!);
   const [company] = await db.select({ name: companies.name }).from(companies).where(eq(companies.id, row!.companyId));
@@ -1051,7 +1063,7 @@ export async function uploadWithToken(
   now: Date = new Date(),
 ): Promise<{ receipt: ReceiptView; remaining: number; ctx: ServiceContext }> {
   const row = await findToken(db, token);
-  const problem = problemOf(row, now) ?? (await lockProblem(db, row!));
+  const problem = problemOf(row, now) ?? (await lockProblem(db, row!)) ?? (await appsProblem(db, row!));
   if (problem) throw new UploadTokenError(problem);
   try {
     checkReceiptFile(file, { maxBytes: MOBILE_MAX_BYTES });

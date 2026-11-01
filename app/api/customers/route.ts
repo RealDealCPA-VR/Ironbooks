@@ -9,6 +9,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
+import { balancesForContext } from '@/lib/services/access';
 import {
   listCustomers,
   listCustomersWithBalances,
@@ -36,7 +37,7 @@ export async function GET(req: NextRequest) {
 
     if (searchParams.get('balanceSummary') === 'true') {
       const summary = await customerBalanceSummary(ctx);
-      return NextResponse.json(summary);
+      return NextResponse.json(balancesForContext(ctx, 'customers.center', summary)); // QB View Balance
     }
 
     const includeInactive = searchParams.get('includeInactive') === 'true';
@@ -44,7 +45,7 @@ export async function GET(req: NextRequest) {
       searchParams.get('withBalances') === 'true'
         ? await listCustomersWithBalances(ctx, { includeInactive })
         : await listCustomers(ctx, { includeInactive });
-    return NextResponse.json(list);
+    return NextResponse.json(balancesForContext(ctx, 'customers.center', list)); // QB View Balance
   } catch (err) {
     return errorResponse(err);
   }

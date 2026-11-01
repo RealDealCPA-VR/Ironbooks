@@ -224,7 +224,7 @@ async function mergedMeta(ctx: ServiceContext, companyIds: string[]) {
   const meta = new Map<string, AccountMeta>();
   const keyOfAccount = new Map<string, string>();
   const perCompany: Map<string, AccountMeta>[] = [];
-  for (const id of companyIds) perCompany.push(await loadAccountMeta(companyCtx(ctx, id)));
+  for (const id of companyIds) perCompany.push(await loadAccountMeta(companyCtx(ctx, id), { raw: true }));
   for (const m of perCompany) {
     for (const a of m.values()) {
       const key = `${a.section}|${a.code}|${a.name.toLowerCase()}`;
@@ -260,7 +260,7 @@ export async function combinedTrialBalance(ctx: ServiceContext, p: ReportParams)
     // Each company's trial balance as QuickBooks shows it (trialBalanceAmounts): income and
     // expense accounts for its fiscal year to date, earlier years' income in Retained Earnings.
     const cctx = companyCtx(ctx, cos[i].id);
-    const tb = await trialBalanceAmounts(cctx, await loadAccountMeta(cctx), asOf, undefined);
+    const tb = await trialBalanceAmounts(cctx, await loadAccountMeta(cctx, { raw: true }), asOf, undefined);
     balanced = balanced && tb.ledgerBalanced;
     const put = (k: string, net: Decimal) => {
       if (net.isZero()) return;
@@ -334,7 +334,7 @@ export async function combinedProfitAndLossByMonth(ctx: ServiceContext, p: Repor
   const amountKeys = [...periods.map((x) => x.key), 'total'];
   const amounts = new Map<string, Amounts>();
   for (const c of cos) {
-    const cmeta = await loadAccountMeta(companyCtx(ctx, c.id));
+    const cmeta = await loadAccountMeta(companyCtx(ctx, c.id), { raw: true });
     const act = await activityByAccount(
       companyCtx(ctx, c.id),
       { from, to, excludeClose: true, basis: p.basis === 'cash' ? 'cash' : undefined },

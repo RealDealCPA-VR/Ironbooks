@@ -4,14 +4,17 @@
  *
  * Users tab: add a user (name, login, password, roles), edit, change roles, deactivate /
  * reactivate, reset password, and show a user's effective permissions (union of their roles).
- * Roles tab: built-in roles (read-only) and custom roles — create, clone, edit with a permission
- * matrix (area × view/create/modify/delete/print + Full) and the sensitive-data flags, delete.
+ * Roles tab: built-in roles (read-only) and custom roles — create, clone, edit with QuickBooks
+ * Enterprise's Area and Activity tree (each activity None / Full / Partial: View, Create, Modify,
+ * Delete, Print, View Balance; app/users/ActivityMatrix.tsx) and the sensitive-data flags, delete.
+ * View Permissions (/users/permissions) prints the role and user permission reports.
  *
  * All rules (last active Admin, no privilege escalation, audit) are enforced server-side in
  * lib/services/users.ts; this page only presents them.
  */
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Copy, KeyRound, Pencil, Plus, ShieldCheck, Trash2, UserCheck, UserX, Users } from 'lucide-react';
+import { useCallback, useEffect, useState } from 'react';
+import Link from 'next/link';
+import { Copy, FileText, KeyRound, Pencil, Plus, ShieldCheck, Trash2, UserCheck, UserX, Users } from 'lucide-react';
 import {
   Badge,
   Button,
@@ -30,6 +33,7 @@ import {
 } from '@/components/ui';
 import { api } from '@/lib/client';
 import type { Action, Area, Flag, PermissionGrant, PermissionSet, RoleFlags } from '@/lib/permissions/model';
+import ActivityMatrix, { type ActivityGrant, type CatalogActivity } from './ActivityMatrix';
 import { PasswordRulesHint, meetsPolicy, usePasswordPolicy } from '@/components/PasswordRules';
 import PasswordPolicyEditor from './PasswordPolicyEditor';
 import { NEEDS_SLOT_TEXT, ProtectionUsersNotice, useProtectionStatus } from '@/components/FileProtectionCard';
@@ -47,7 +51,7 @@ interface CompanyUser {
   isAdmin: boolean;
 }
 interface UserDetail extends CompanyUser {
-  access: { permissions: PermissionSet; flags: Record<Flag, boolean>; isAdmin: boolean };
+  access: { permissions: PermissionSet; activities?: ActivityGrant; flags: Record<Flag, boolean>; isAdmin: boolean };
 }
 interface Role {
   key: string;
@@ -57,48 +61,33 @@ interface Role {
   permissions: PermissionGrant;
   flags: RoleFlags;
   userCount: number;
+  /** prefsperms: rights per QB Enterprise activity (area grants expanded). */
+  activities?: ActivityGrant;
 }
 interface Catalog {
   areas: { key: Area; label: string; group: string; description: string }[];
   actions: Action[];
   flags: { key: Flag; label: string }[];
+  /** prefsperms: the activities of every area. */
+  activities: CatalogActivity[];
 }
-
-const ACTION_LABEL: Record<Action, string> = {
-  view: 'View',
-  create: 'Create',
-  modify: 'Modify',
-  delete: 'Delete',
-  print: 'Print',
-};
 
 function errMsg(e: unknown) {
   return e instanceof Error ? e.message : 'Something went wrong';
-}
-
-/** Expand a stored grant ('full', implied view) into concrete actions per area. */
-function expand(grant: PermissionGrant, actions: Action[]): Record<string, Set<Action>> {
-  const out: Record<string, Set<Action>> = {};
-  for (const [area, list] of Object.entries(grant ?? {})) {
-    const set = new Set<Action>();
-    for (const a of list ?? []) {
-      if (a === 'full') actions.forEach((x) => set.add(x));
-      else set.add(a as Action);
-    }
-    if (set.size) set.add('view');
-    out[area] = set;
-  }
-  return out;
 }
 
 export default function UsersAndRolesPage() {
   const [tab, setTab] = useState<'users' | 'roles' | 'passwords'>('users');
   // gapsb K: the password-rules editor is for Admins only (the server checks too).
   const [isAdmin, setIsAdmin] = useState(false);
+  const [meId, setMeId] = useState<string | null>(null);
   useEffect(() => {
     api
-      .get<{ isAdmin?: boolean } | null>('/api/auth/me')
-      .then((m) => setIsAdmin(Boolean(m?.isAdmin)))
+      .get<{ id?: string; isAdmin?: boolean } | null>('/api/auth/me')
+      .then((m) => {
+        setIsAdmin(Boolean(m?.isAdmin));
+        setMeId(m?.id ?? null);
+      })
       .catch(() => setIsAdmin(false));
   }, []);
   const [users, setUsers] = useState<CompanyUser[] | null>(null);
@@ -131,7 +120,7 @@ export default function UsersAndRolesPage() {
       <PageHeader title="Users & Roles" icon={Users} />
       {/* filecrypto: users whose password does not open the protected company file yet. */}
       <ProtectionUsersNotice />
-      <div className="mb-4 flex gap-2" role="tablist">
+      <div className="mb-4 flex flex-wrap items-center gap-2" role="tablist">
         {(isAdmin ? (['users', 'roles', 'passwords'] as const) : (['users', 'roles'] as const)).map((t) => (
           <button
             key={t}
@@ -145,6 +134,13 @@ export default function UsersAndRolesPage() {
             {t === 'users' ? 'Users' : t === 'roles' ? 'Roles' : 'Password rules'}
           </button>
         ))}
+        {/* QB Enterprise Users and Roles > View Permissions (role / user permission reports). */}
+        <Link
+          href="/users/permissions"
+          className="ml-auto inline-flex items-center gap-1.5 rounded-lg bg-white px-4 py-2 text-sm font-semibold text-electric hover:bg-electric/5"
+        >
+          <FileText className="h-4 w-4" /> View permissions
+        </Link>
       </div>
       {error && (
         <Card className="mb-4 p-4 text-sm text-red-600">
@@ -156,7 +152,7 @@ export default function UsersAndRolesPage() {
       ) : users === null || !catalog ? (
         error ? null : <PageSkeleton />
       ) : tab === 'users' ? (
-        <UsersTab users={users} roles={roles} catalog={catalog} reload={load} />
+        <UsersTab users={users} roles={roles} catalog={catalog} reload={load} isAdmin={isAdmin} meId={meId} />
       ) : (
         <RolesTab roles={roles} catalog={catalog} reload={load} />
       )}
@@ -173,11 +169,15 @@ function UsersTab({
   roles,
   catalog,
   reload,
+  isAdmin,
+  meId,
 }: {
   users: CompanyUser[];
   roles: Role[];
   catalog: Catalog;
   reload: () => Promise<void>;
+  isAdmin: boolean;
+  meId: string | null;
 }) {
   const [editing, setEditing] = useState<CompanyUser | 'new' | null>(null);
   const [resetting, setResetting] = useState<CompanyUser | null>(null);
@@ -187,6 +187,7 @@ function UsersTab({
   // filecrypto: who can open the protected company file (Admins see every user).
   const [protection, reloadProtection] = useProtectionStatus();
   const cannotOpen = new Set((protection?.protected ? protection.users ?? [] : []).filter((p) => !p.canOpen).map((p) => p.userId));
+  const [notice, setNotice] = useState<string | null>(null);
 
   async function toggleActive() {
     if (!toggling) return;
@@ -213,6 +214,14 @@ function UsersTab({
 
   return (
     <Card className="p-0">
+      {notice && (
+        <div role="status" className="m-4 mb-0 flex items-start justify-between gap-3 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-navy">
+          <span>{notice}</span>
+          <button type="button" className="text-xs font-semibold text-electric hover:underline" onClick={() => setNotice(null)}>
+            OK
+          </button>
+        </div>
+      )}
       <div className="flex items-center justify-between p-4">
         <p className="text-sm text-navy/60">
           People who can sign in to this company file. A user can hold several roles — they get
@@ -287,8 +296,10 @@ function UsersTab({
           user={editing === 'new' ? null : editing}
           roles={roles}
           onClose={() => setEditing(null)}
-          onSaved={async () => {
+          onSaved={async (n) => {
             setEditing(null);
+            // prefsperms: an existing login of another company was attached (keeps its password).
+            setNotice(n ?? null);
             await reload();
           }}
         />
@@ -300,6 +311,8 @@ function UsersTab({
             setResetting(null);
             void reloadProtection();
           }}
+          // Only an Admin may turn off SOMEONE ELSE's two-factor sign-in (lib/services/users.ts).
+          canTurnOffTwoFactor={isAdmin && resetting.userId !== meId}
         />
       )}
       <ConfirmDialog
@@ -321,10 +334,12 @@ function UsersTab({
           <p className="mb-3 text-sm text-navy/60">
             Combined from: {viewing.roles.map((r) => r.name).join(', ') || 'no roles'}.
           </p>
-          <PermissionMatrix
-            catalog={catalog}
-            value={viewing.access.permissions as PermissionGrant}
-            flags={viewing.access.flags}
+          <ActivityMatrix
+            areas={catalog.areas}
+            activities={catalog.activities ?? []}
+            flags={catalog.flags}
+            value={viewing.access.activities ?? {}}
+            flagValues={viewing.access.flags}
             readOnly
           />
         </Modal>
@@ -374,7 +389,8 @@ function UserEditor({
   user: CompanyUser | null;
   roles: Role[];
   onClose: () => void;
-  onSaved: () => Promise<void>;
+  /** `notice`: a plain message to keep on screen (an existing login was attached). */
+  onSaved: (notice?: string) => Promise<void>;
 }) {
   const [name, setName] = useState(user?.name ?? '');
   const [login, setLogin] = useState(user?.login ?? '');
@@ -392,20 +408,22 @@ function UserEditor({
     }
     setBusy(true);
     try {
+      let notice: string | undefined;
       if (user) {
         await api.patch(`/api/users/${user.userId}`, { name, login, roleKeys });
         toast('User updated.', 'success');
       } else {
-        await api.post('/api/users', {
+        const added = await api.post<{ notice?: string }>('/api/users', {
           name,
           login,
           password: password || undefined,
           roleKeys,
           ...(password ? { requireChange } : {}),
         });
+        notice = added?.notice;
         toast('User added.', 'success');
       }
-      await onSaved();
+      await onSaved(notice);
     } catch (e) {
       toast(errMsg(e), 'danger');
     } finally {
@@ -454,6 +472,10 @@ function UserEditor({
                 aria-describedby="u-pw-rules"
               />
               <PasswordRulesHint id="u-pw-rules" password={password} policy={policy} />
+              <p className="mt-1 text-xs text-navy/50">
+                Someone who already signs in to another company in this file keeps their own password; leave this blank for
+                them.
+              </p>
             </div>
             <div>
               <Label htmlFor="u-pw2">Confirm password</Label>
@@ -480,7 +502,15 @@ function UserEditor({
   );
 }
 
-function ResetPassword({ user, onClose }: { user: CompanyUser; onClose: () => void }) {
+function ResetPassword({
+  user,
+  onClose,
+  canTurnOffTwoFactor,
+}: {
+  user: CompanyUser;
+  onClose: () => void;
+  canTurnOffTwoFactor: boolean;
+}) {
   const [password, setPassword] = useState('');
   const [confirm, setConfirm] = useState('');
   const [requireChange, setRequireChange] = useState(true);
@@ -497,7 +527,7 @@ function ResetPassword({ user, onClose }: { user: CompanyUser; onClose: () => vo
       await api.post(`/api/users/${user.userId}/reset-password`, {
         password,
         requireChange,
-        ...(user.twoFactor && turnOffTwoFactor ? { turnOffTwoFactor: true } : {}),
+        ...(user.twoFactor && canTurnOffTwoFactor && turnOffTwoFactor ? { turnOffTwoFactor: true } : {}),
       });
       toast(`Password reset for ${user.name}.`, 'success');
       onClose();
@@ -545,11 +575,17 @@ function ResetPassword({ user, onClose }: { user: CompanyUser; onClose: () => vo
           <input type="checkbox" checked={requireChange} onChange={(e) => setRequireChange(e.target.checked)} />
           Ask {user.name} to choose a new password at their next sign-in
         </label>
-        {user.twoFactor && (
+        {user.twoFactor && canTurnOffTwoFactor && (
           <label className="flex items-center gap-2 text-sm text-navy">
             <input type="checkbox" checked={turnOffTwoFactor} onChange={(e) => setTurnOffTwoFactor(e.target.checked)} />
             Also turn off two-factor sign-in (they lost their phone or authenticator app)
           </label>
+        )}
+        {user.twoFactor && !canTurnOffTwoFactor && (
+          <p className="text-xs text-navy/60">
+            {user.name} keeps two-factor sign-in. Only an Admin can turn off another person&apos;s; your own is turned off
+            under Security (2FA) with a code from your authenticator app, or by signing in with a recovery code.
+          </p>
         )}
       </div>
     </Modal>
@@ -729,7 +765,8 @@ function RoleEditor({
   const readOnly = role?.builtin ?? false;
   const [name, setName] = useState(role?.name ?? '');
   const [description, setDescription] = useState(role?.description ?? '');
-  const [grant, setGrant] = useState<PermissionGrant>(role?.permissions ?? {});
+  // prefsperms: edit per activity (an old-style area grant arrives expanded to its activities).
+  const [grant, setGrant] = useState<ActivityGrant>(role?.activities ?? {});
   const [flags, setFlags] = useState<RoleFlags>(role?.flags ?? {});
   const [busy, setBusy] = useState(false);
 
@@ -788,132 +825,17 @@ function RoleEditor({
           </div>
         )}
         {readOnly && <p className="text-sm text-navy/60">{role?.description}</p>}
-        <PermissionMatrix
-          catalog={catalog}
+        <ActivityMatrix
+          areas={catalog.areas}
+          activities={catalog.activities ?? []}
+          flags={catalog.flags}
           value={grant}
-          flags={flags}
+          flagValues={flags as Record<string, boolean | undefined>}
           readOnly={readOnly}
           onChange={setGrant}
-          onFlagsChange={setFlags}
+          onFlagsChange={(f) => setFlags(f as RoleFlags)}
         />
       </div>
     </Modal>
-  );
-}
-
-/** Area × action checkbox grid (+ Full column) and the sensitive-data flags. */
-function PermissionMatrix({
-  catalog,
-  value,
-  flags,
-  readOnly,
-  onChange,
-  onFlagsChange,
-}: {
-  catalog: Catalog;
-  value: PermissionGrant;
-  flags: RoleFlags;
-  readOnly?: boolean;
-  onChange?: (g: PermissionGrant) => void;
-  onFlagsChange?: (f: RoleFlags) => void;
-}) {
-  const expanded = useMemo(() => expand(value, catalog.actions), [value, catalog.actions]);
-
-  function setArea(area: Area, set: Set<Action>) {
-    const next: PermissionGrant = { ...value };
-    // Granting anything implies View; clearing View clears the area.
-    if (set.size && !set.has('view')) set.add('view');
-    if (set.size) next[area] = catalog.actions.filter((a) => set.has(a));
-    else delete next[area];
-    onChange?.(next);
-  }
-  function toggle(area: Area, action: Action, on: boolean) {
-    const set = new Set(expanded[area] ?? []);
-    if (on) set.add(action);
-    else if (action === 'view') set.clear();
-    else set.delete(action);
-    setArea(area, set);
-  }
-  function toggleFull(area: Area, on: boolean) {
-    setArea(area, on ? new Set(catalog.actions) : new Set());
-  }
-
-  let lastGroup = '';
-  return (
-    <div>
-      <Table>
-        <thead>
-          <tr>
-            <Th>Area</Th>
-            {catalog.actions.map((a) => (
-              <Th key={a} className="text-center">
-                {ACTION_LABEL[a]}
-              </Th>
-            ))}
-            <Th className="text-center">Full</Th>
-          </tr>
-        </thead>
-        <tbody>
-          {catalog.areas.flatMap((area) => {
-            const rows = [];
-            if (area.group !== lastGroup) {
-              lastGroup = area.group;
-              rows.push(
-                <tr key={`g-${area.group}`}>
-                  <td colSpan={catalog.actions.length + 2} className="px-4 pt-4 pb-1 text-[11px] font-bold uppercase tracking-wider text-navy/40">
-                    {area.group}
-                  </td>
-                </tr>,
-              );
-            }
-            const set = expanded[area.key] ?? new Set<Action>();
-            const full = catalog.actions.every((a) => set.has(a));
-            rows.push(
-              <Tr key={area.key}>
-                <Td>
-                  <span className="text-sm font-semibold">{area.label}</span>
-                  <span className="block text-xs text-navy/40">{area.description}</span>
-                </Td>
-                {catalog.actions.map((a) => (
-                  <Td key={a} className="text-center">
-                    <input
-                      type="checkbox"
-                      aria-label={`${area.label}: ${ACTION_LABEL[a]}`}
-                      checked={set.has(a)}
-                      disabled={readOnly}
-                      onChange={(e) => toggle(area.key, a, e.target.checked)}
-                    />
-                  </Td>
-                ))}
-                <Td className="text-center">
-                  <input
-                    type="checkbox"
-                    aria-label={`${area.label}: full access`}
-                    checked={full}
-                    disabled={readOnly}
-                    onChange={(e) => toggleFull(area.key, e.target.checked)}
-                  />
-                </Td>
-              </Tr>,
-            );
-            return rows;
-          })}
-        </tbody>
-      </Table>
-      <div className="mt-4 space-y-2 rounded-lg border border-slate-200 p-3">
-        <div className="text-[11px] font-bold uppercase tracking-wider text-navy/40">Sensitive data</div>
-        {catalog.flags.map((f) => (
-          <label key={f.key} className="flex items-center gap-2 text-sm text-navy">
-            <input
-              type="checkbox"
-              checked={Boolean(flags?.[f.key])}
-              disabled={readOnly}
-              onChange={(e) => onFlagsChange?.({ ...flags, [f.key]: e.target.checked })}
-            />
-            {f.label}
-          </label>
-        ))}
-      </div>
-    </div>
   );
 }

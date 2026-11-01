@@ -157,7 +157,11 @@ export default function SendFormsPage() {
       />
       {!emailConfigured && mode === 'email' && (
         <div className="mb-4 rounded-lg bg-amber-50 border border-amber-200 px-3 py-2 text-sm text-amber-800">
-          Email is not set up yet, so forms can&apos;t be sent. You can still print them.
+          Email is not set up yet, so forms can&apos;t be sent. You can still print them. Add the mail server under{' '}
+          <Link href="/settings?tab=sendForms" className="font-semibold underline">
+            Preferences &gt; Send Forms
+          </Link>
+          .
         </div>
       )}
       <div className="mb-3 flex flex-wrap items-center gap-2">

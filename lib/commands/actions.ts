@@ -6,7 +6,8 @@
  * creates something also needs 'create'. COSMETIC like the sidebar — every API route is still
  * enforced server-side. PURE (client + server).
  */
-import { pageAreasFor } from '@/lib/permissions/routes';
+import { canSeePage, hasActivityRights } from '@/lib/permissions/pageAccess';
+import { pageAccessFor } from '@/lib/permissions/routes';
 import type { Action, Area } from '@/lib/permissions/model';
 import type { ActionKey } from './intent';
 import type { PrefillKind } from './prefill';
@@ -75,19 +76,27 @@ function basePath(href: string): string {
 /** May this person open the page behind `href`? (null permissions = not loaded → allowed). */
 export function canOpenHref(href: string, permissions: PermissionMap): boolean {
   if (!permissions) return true;
-  const areas = pageAreasFor(basePath(href));
-  return !areas || areas.some((a) => permissions[a]?.includes('view') ?? false);
+  // prefsperms: the page's activity when the map carries activities, else its area.
+  return canSeePage(basePath(href), permissions as Partial<Record<string, readonly string[]>>);
 }
 
-export function canDoAction(needs: { area: Area; action: Action } | undefined, permissions: PermissionMap): boolean {
+export function canDoAction(
+  needs: { area: Area; action: Action } | undefined,
+  permissions: PermissionMap,
+  href?: string,
+): boolean {
   if (!needs || !permissions) return true;
+  // prefsperms: "New invoice" needs Create on Invoices itself, not on any Customers activity.
+  const map = permissions as Partial<Record<string, readonly string[]>>;
+  const activities = href && hasActivityRights(map) ? pageAccessFor(basePath(href))?.activities : null;
+  if (activities?.length) return activities.some((k) => map[k]?.includes(needs.action) ?? false);
   return permissions[needs.area]?.includes(needs.action) ?? false;
 }
 
 /** Actions this person may use, minus pages switched off in Preferences. */
 export function visibleActions(permissions: PermissionMap, hiddenPaths?: ReadonlySet<string>): CommandAction[] {
   return COMMAND_ACTIONS.filter(
-    (a) => !hiddenPaths?.has(basePath(a.href)) && canOpenHref(a.href, permissions) && canDoAction(a.needs, permissions),
+    (a) => !hiddenPaths?.has(basePath(a.href)) && canOpenHref(a.href, permissions) && canDoAction(a.needs, permissions, a.href),
   );
 }
 

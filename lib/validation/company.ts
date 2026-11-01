@@ -5,7 +5,7 @@
  */
 import { z } from 'zod';
 import { zUuid } from './helpers';
-import { FORM_TYPES, REMINDER_KEYS } from '@/lib/preferences';
+import { EMAIL_TEMPLATE_TYPES, REMINDER_KEYS } from '@/lib/preferences';
 
 /** Day counts for warnings / reminder windows. */
 const zDays = z.number().int('must be a whole number of days').min(0).max(3650);
@@ -143,7 +143,7 @@ export const companySettingsSchema = z.object({
   // Send Forms
   sendForms: z
     .record(
-      z.enum(FORM_TYPES),
+      z.enum(EMAIL_TEMPLATE_TYPES),
       z.object({ subject: z.string().max(255), body: z.string().max(5000) }),
     )
     .optional(),
@@ -154,6 +154,13 @@ export const companySettingsSchema = z.object({
   defaultMarkupPercent: z.number().min(0).max(1000).optional(),
   // Multiple Currencies
   multiCurrencyEnabled: z.boolean().optional(),
+  // prefsperms A2: Desktop View (Home page icons) and Integrated Applications.
+  homeShowSalesReceipts: z.boolean().optional(),
+  homeShowStatements: z.boolean().optional(),
+  homeShowBills: z.boolean().optional(),
+  integratedAppsBlocked: z.boolean().optional(),
+  allowEmployeePortal: z.boolean().optional(),
+  allowPhoneReceipts: z.boolean().optional(),
 });
 export type CompanySettingsBody = z.infer<typeof companySettingsSchema>;
 

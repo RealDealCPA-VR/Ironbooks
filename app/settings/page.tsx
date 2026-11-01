@@ -20,11 +20,13 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import {
+  BadgePercent,
   Bell,
   BookOpen,
   Briefcase,
   Building2,
   Calculator,
+  CalendarDays,
   Clock,
   Coins,
   CreditCard,
@@ -34,10 +36,13 @@ import {
   HandCoins,
   Lock,
   Mail,
+  Monitor,
   Package,
   Palette,
   Percent,
   PieChart,
+  Plug,
+  Search,
   Settings,
   ShoppingCart,
   SpellCheck,
@@ -48,6 +53,9 @@ import {
   Wallet,
 } from 'lucide-react';
 import PreferencePane from './PreferencePane';
+import EmailServerSetup from './EmailServerSetup';
+import FinanceChargePreference from './FinanceChargePreference';
+import { canDoActivity, useMe } from '@/lib/usePermissions';
 import { AppearanceControls } from '@/components/AppearancePicker';
 import {
   Badge,
@@ -191,8 +199,12 @@ const TABS = [
   { id: 'accounting', label: 'Accounting', icon: Calculator },
   { id: 'appearance', label: 'Appearance', icon: Palette },
   { id: 'purchases', label: 'Bills', icon: Truck },
+  { id: 'calendar', label: 'Calendar', icon: CalendarDays },
   { id: 'checking', label: 'Checking', icon: CreditCard },
+  { id: 'desktop', label: 'Desktop View', icon: Monitor },
+  { id: 'financeCharge', label: 'Finance Charge', icon: BadgePercent },
   { id: 'general', label: 'General', icon: Settings },
+  { id: 'integratedApps', label: 'Integrated Applications', icon: Plug },
   { id: 'inventory', label: 'Items & Inventory', icon: Package },
   { id: 'jobs', label: 'Jobs & Estimates', icon: Briefcase },
   { id: 'currencies', label: 'Multiple Currencies', icon: Coins },
@@ -202,6 +214,7 @@ const TABS = [
   { id: 'reports', label: 'Reports & Graphs', icon: PieChart },
   { id: 'sales', label: 'Sales & Customers', icon: ShoppingCart },
   { id: 'salesTax', label: 'Sales Tax', icon: Percent },
+  { id: 'search', label: 'Search', icon: Search },
   { id: 'sendForms', label: 'Send Forms', icon: Mail },
   { id: 'spelling', label: 'Spelling', icon: SpellCheck },
   { id: 'time', label: 'Time & Expenses', icon: Clock },
@@ -216,6 +229,10 @@ type TabId = (typeof TABS)[number]['id'];
 const PANE_FOR_TAB: Partial<Record<TabId, string>> = {
   accounting: 'accounting',
   purchases: 'bills',
+  calendar: 'calendar',
+  desktop: 'desktop',
+  integratedApps: 'integratedApps',
+  search: 'search',
   checking: 'checking',
   general: 'general',
   inventory: 'items',
@@ -338,7 +355,14 @@ function AccountSelect({
 
 export default function SettingsPage() {
   const [tab, setTab] = useState<TabId>('company');
+  const { me } = useMe();
   const [loading, setLoading] = useState(true);
+
+  // Deep links: /settings?tab=sendForms opens that category (the "Set up email" fixes use it).
+  useEffect(() => {
+    const want = new URLSearchParams(window.location.search).get('tab');
+    if (want && TABS.some((t) => t.id === want)) setTab(want as TabId);
+  }, []);
   const [saving, setSaving] = useState(false);
 
   const [companyName, setCompanyName] = useState('');
@@ -1122,6 +1146,14 @@ export default function SettingsPage() {
                   </Link>
                 </div>
               </Card>
+            )}
+
+            {/* ── Send Forms: the mail server stored in the company file (prefsperms) ── */}
+            {tab === 'sendForms' && <EmailServerSetup canEdit={canDoActivity(me, 'company.send_forms', 'modify')} />}
+
+            {/* ── Finance Charge (prefsperms A2): QB Preferences > Finance Charge ── */}
+            {tab === 'financeCharge' && (
+              <FinanceChargePreference canEdit={canDoActivity(me, 'company.preferences', 'modify')} accounts={accounts} />
             )}
 
             {/* ── Categorized QB preferences (Company + My Preferences) ───────── */}

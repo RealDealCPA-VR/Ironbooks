@@ -28,6 +28,7 @@ import { Help } from '@/components/Help';
 import WhyChanged from '@/components/WhyChanged';
 import { api, ApiError } from '@/lib/client';
 import { Money, formatCurrency } from '@/lib/money';
+import { HIDDEN_BALANCE_TITLE } from '@/lib/permissions/balances';
 import {
   QB_ACCOUNT_TYPES,
   SUBTYPE_LABELS,
@@ -45,6 +46,9 @@ import {
   qbTypeOfAccount,
   useIncomeTaxForm,
 } from '@/components/accounts/AccountForm';
+
+/** QB View Balance: the server blanked this account's balance for the signed-in role. */
+const balanceHidden = (a: unknown) => Boolean((a as { balanceHidden?: boolean }).balanceHidden);
 
 // ---- Types ----------------------------------------------------------------
 
@@ -302,6 +306,9 @@ function AccountRow({ node, depth, onDeactivate, onReactivate, onEdit }: Account
           )}
         </Td>
         <Td numeric className="font-semibold text-navy">
+          {balanceHidden(node) ? (
+            <span className="font-normal text-navy/40" title={HIDDEN_BALANCE_TITLE}>Hidden</span>
+          ) : (
           <div className="inline-flex items-center gap-1">
             {formatCurrency(node.balance)}
             <WhyChanged
@@ -311,7 +318,8 @@ function AccountRow({ node, depth, onDeactivate, onReactivate, onEdit }: Account
               storageKey={`account:${node.id}`}
             />
           </div>
-          {hasChildren && (
+          )}
+          {hasChildren && !balanceHidden(node) && (
             <div className="text-xs font-normal text-navy/50">
               Total {formatCurrency(rolledUp)}
             </div>
@@ -389,7 +397,7 @@ function AccountGroup({ type, roots, onDeactivate, onReactivate, onEdit }: Accou
           )}
         </span>
         <span className="text-sm font-semibold text-navy/60 tabular-nums">
-          {formatCurrency(total)}
+          {all.some(balanceHidden) ? 'Hidden' : formatCurrency(total)}
         </span>
         <Badge tone="info">{all.length}</Badge>
       </button>

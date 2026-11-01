@@ -5,11 +5,11 @@
  * safely), validates the parameters and runs the report.
  */
 import type { StdReport } from '@/lib/reports/types';
-import { CATALOG_BY_KEY, REPORT_CATALOG } from '@/lib/reports/catalog';
+import { CATALOG_BY_KEY, REPORT_CATALOG, reportActivity } from '@/lib/reports/catalog';
 import { parseReportParams, type ReportParams } from '@/lib/validation/reports';
 import type { ServiceContext } from './_base';
 import { notFound, validation } from './_base';
-import { requirePermission } from './access';
+import { requireActivity } from './access';
 import {
   DATE_MACROS,
   companyFiscalYearEnd,
@@ -201,7 +201,8 @@ export async function prepareStandardReport(
   if (!isStandardReport(key)) throw notFound('Report');
   const entry = CATALOG_BY_KEY[key];
   const runner = REPORT_RUNNERS[key];
-  requirePermission(ctx, entry.area, 'view');
+  // prefsperms: the report's own QB activity (Company & Financial, Accountant & Taxes, …).
+  requireActivity(ctx, reportActivity(entry), 'view');
   const merged: Record<string, unknown> = { ...(entry.defaults ?? {}) };
   const entries = rawParams instanceof URLSearchParams ? [...rawParams.entries()] : Object.entries(rawParams ?? {});
   for (const [k, v] of entries) if (v !== undefined && v !== null && String(v) !== '') merged[k] = v;

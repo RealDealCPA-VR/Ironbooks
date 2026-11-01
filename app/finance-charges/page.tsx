@@ -259,8 +259,13 @@ export default function FinanceChargesPage() {
         <p className="mt-3 text-xs text-navy/40">
           Charges = open balance × annual rate ÷ 365 × days overdue, per invoice. Invoices become
           chargeable once past the grace period. One finance-charge invoice is created per customer
-          per month (re-running the same month is skipped). Finance charges never compound on prior
-          finance charges.
+          per month (re-running the same month is skipped). Unpaid finance charges are charged again
+          only when Preferences &gt; Finance Charge says so; the account, &quot;calculate from&quot; and
+          &quot;To be printed&quot; are set there too:{' '}
+          <a href="/settings?tab=financeCharge" className="font-semibold text-electric hover:underline">
+            Finance Charge preferences
+          </a>
+          .
         </p>
       </Card>
 

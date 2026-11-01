@@ -5,6 +5,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
+import { balancesForContext } from '@/lib/services/access';
 import {
   getCustomer,
   updateCustomer,
@@ -34,7 +35,7 @@ export async function GET(_req: NextRequest, { params }: RouteParams) {
     const { id } = await params;
     const ctx = await getServerContext();
     const customer = await getCustomer(ctx, id);
-    return NextResponse.json(customer);
+    return NextResponse.json(balancesForContext(ctx, 'customers.center', customer)); // QB View Balance
   } catch (err) {
     return errorResponse(err);
   }

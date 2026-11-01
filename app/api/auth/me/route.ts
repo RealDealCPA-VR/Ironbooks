@@ -29,6 +29,8 @@ export async function GET() {
     companyId,
     roleKeys: access?.roleKeys ?? null,
     permissions: access?.permissions ?? null,
+    // prefsperms: QB Enterprise per-activity rights (Invoices, Receive Payments, View Balance…).
+    activities: access?.activities ?? null,
     flags: access?.flags ?? null,
     isAdmin: access?.isAdmin ?? false,
   });

@@ -15,6 +15,7 @@ import { BookOpen, ChevronRight } from 'lucide-react';
 import { Card, EmptyState, PageHeader, Spinner, Table, Th, Td, Tr, toast } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import { HIDDEN_BALANCE_TITLE } from '@/lib/permissions/balances';
 
 interface RegisterAccount {
   id: string;
@@ -134,7 +135,12 @@ export default function RegistersIndexPage() {
                             Number(a.balance) < 0 ? 'text-red-600' : 'text-navy'
                           }`}
                         >
-                          {formatCurrency(a.balance)}
+                          {/* QB View Balance: the server blanks balances the role may not see. */}
+                          {(a as { balanceHidden?: boolean }).balanceHidden ? (
+                            <span className="font-normal text-navy/40" title={HIDDEN_BALANCE_TITLE}>Hidden</span>
+                          ) : (
+                            formatCurrency(a.balance)
+                          )}
                         </Td>
                         <Td>
                           <ChevronRight className="h-4 w-4 text-navy/30 group-hover:text-electric" />

@@ -34,6 +34,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { usePreferences } from '@/lib/usePreferences';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/dates';
 
@@ -631,6 +632,8 @@ function RuleEditor({
   onClose: () => void;
 }) {
   const set = <K extends keyof Draft>(k: K, v: Draft[K]) => setDraft({ ...draft, [k]: v });
+  // A1: "Use class tracking" off hides the Class pickers (a class already on the rule still shows).
+  const classOn = usePreferences().company.classTrackingEnabled;
   const splitTotal = draft.splits.reduce((sum, s) => sum + (Number.isFinite(Number(s.percent)) ? Math.round(Number(s.percent) * 10000) : 0), 0) / 10000;
   const setSplit = (i: number, patch: Partial<Split>) =>
     set('splits', draft.splits.map((s, j) => (j === i ? { ...s, ...patch } : s)));
@@ -781,17 +784,21 @@ function RuleEditor({
                       {accountOptions}
                     </Select>
                   </div>
-                  <div>
-                    <Label htmlFor={`split-class-${i}`}>Class</Label>
-                    <Select id={`split-class-${i}`} value={s.classId ?? ''} onChange={(e) => setSplit(i, { classId: e.target.value })}>
-                      <option value="">No class</option>
-                      {classList.map((c) => (
-                        <option key={c.id} value={c.id}>
-                          {c.name}
-                        </option>
-                      ))}
-                    </Select>
-                  </div>
+                  {classOn || s.classId ? (
+                    <div>
+                      <Label htmlFor={`split-class-${i}`}>Class</Label>
+                      <Select id={`split-class-${i}`} value={s.classId ?? ''} onChange={(e) => setSplit(i, { classId: e.target.value })}>
+                        <option value="">No class</option>
+                        {classList.map((c) => (
+                          <option key={c.id} value={c.id}>
+                            {c.name}
+                          </option>
+                        ))}
+                      </Select>
+                    </div>
+                  ) : (
+                    <div />
+                  )}
                   <div>
                     <Label htmlFor={`split-pct-${i}`}>Percent</Label>
                     <Input id={`split-pct-${i}`} inputMode="decimal" value={s.percent} onChange={(e) => setSplit(i, { percent: e.target.value })} />
@@ -822,7 +829,7 @@ function RuleEditor({
             </div>
           )}
           <div className="grid gap-3 sm:grid-cols-3 mt-3">
-            {!draft.useSplit && (
+            {!draft.useSplit && (classOn || !!draft.setClassId) && (
               <div>
                 <Label htmlFor="rule-class">Class</Label>
                 <Select id="rule-class" value={draft.setClassId} onChange={(e) => set('setClassId', e.target.value)}>

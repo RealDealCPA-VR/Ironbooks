@@ -24,6 +24,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { and, eq } from 'drizzle-orm';
 import { getServerContext } from '@/lib/context';
+import { balancesForContext } from '@/lib/services/access';
 import { accounts } from '@/lib/db/schema';
 import { ServiceError, type ServiceContext } from '@/lib/services/_base';
 import { permissionDenied } from '@/lib/services/access';
@@ -88,7 +89,7 @@ export async function GET(req: NextRequest, { params }: Params) {
       register.rows = register.rows.slice(dropped);
       register.offset = register.offset + dropped;
     }
-    return NextResponse.json({ register });
+    return NextResponse.json(balancesForContext(ctx, 'banking.registers', { register })); // QB View Balance
   } catch (err) {
     return mapError(err);
   }

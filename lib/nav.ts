@@ -20,7 +20,7 @@ import {
   ScrollText,
   Warehouse, Ship, MapPin,
 } from 'lucide-react';
-import { pageAreasFor } from '@/lib/permissions/routes';
+import { canSeePage } from '@/lib/permissions/pageAccess';
 import type { Area } from '@/lib/permissions/model';
 import { matchIntentsScored } from '@/lib/nav-actions';
 import { Sparkles } from 'lucide-react'; // team ai: AI & Automation
@@ -216,6 +216,7 @@ export const navGroups: NavGroup[] = [
       { icon: FlaskConical, label: 'Try it on a copy', path: '/sandbox', qb: 'Sandbox / practice file', keywords: 'sandbox practice training test copy experiment safe' },
       { icon: CalendarRange, label: 'Period Copy', path: '/accountant/period-copy', qb: 'Period Copy', keywords: 'audit copy date range auditor' }, // I7
       { icon: Users, label: 'Users & Roles', path: '/users', qb: 'Set Up Users and Roles', keywords: 'permissions access' },
+      { icon: FileText, label: 'View Permissions', path: '/users/permissions', qb: 'Users and Roles > View Permissions', keywords: 'permissions report roles users access who can user list role list' }, // prefsperms K
       { icon: FileSpreadsheet, label: 'Migrate from QuickBooks', path: '/qb-import', qb: 'Import IIF / Convert', keywords: 'import iif convert' },
       { icon: ShieldCheck, label: 'Security (2FA)', path: '/security', qb: 'Security', keywords: 'two factor password protect encrypt recovery key file passwords' },
       { icon: KeyRound, label: 'Change My Password', path: '/change-password', qb: 'Change Your Password', keywords: 'new password expired' }, // gapsb K
@@ -322,9 +323,8 @@ export function filterNavGroups(
 }
 
 function canSeePath(path: string, permissions: Partial<Record<Area, readonly string[]>> | null | undefined): boolean {
-  if (!permissions) return true;
-  const areas = pageAreasFor(path.split('?')[0].split('#')[0]);
-  return !areas || areas.some((a) => permissions[a]?.includes('view') ?? false);
+  // prefsperms: the page's ACTIVITY (Invoices, Receive Payments, …) when the map carries them.
+  return canSeePage(path, permissions);
 }
 
 /**

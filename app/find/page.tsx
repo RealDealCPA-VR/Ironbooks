@@ -9,6 +9,7 @@ import { useEffect, useState } from 'react';
 import { Search } from 'lucide-react';
 import { Button, Card, Input, Label, PageHeader, Select, Spinner, toast } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { usePreferences } from '@/lib/usePreferences';
 import type { StdReport } from '@/lib/reports/types';
 import { reportToTable } from '@/lib/reports/types';
 import ReportToolbar from '../reports/_components/ReportToolbar';
@@ -20,6 +21,8 @@ type Q = Record<string, string>;
 
 export default function FindPage() {
   const [q, setQ] = useState<Q>({});
+  // A1: "Use class tracking" off hides the Class filter (QB Find has none then).
+  const classOn = usePreferences().company.classTrackingEnabled;
   const [opts, setOpts] = useState<FilterOptions | null>(null);
   const [report, setReport] = useState<StdReport | null>(null);
   const [loading, setLoading] = useState(false);
@@ -129,17 +132,19 @@ export default function FindPage() {
               ))}
             </Select>
           </div>
-          <div>
-            <Label htmlFor="f-class">Class</Label>
-            <Select id="f-class" value={q.classId ?? ''} onChange={(e) => set('classId', e.target.value)}>
-              <option value="">Any</option>
-              {opts?.classes.map((a) => (
-                <option key={a.id} value={a.id}>
-                  {a.name}
-                </option>
-              ))}
-            </Select>
-          </div>
+          {(classOn || !!q.classId) && (
+            <div>
+              <Label htmlFor="f-class">Class</Label>
+              <Select id="f-class" value={q.classId ?? ''} onChange={(e) => set('classId', e.target.value)}>
+                <option value="">Any</option>
+                {opts?.classes.map((a) => (
+                  <option key={a.id} value={a.id}>
+                    {a.name}
+                  </option>
+                ))}
+              </Select>
+            </div>
+          )}
           <div>
             <Label htmlFor="f-from">Date from</Label>
             <Input id="f-from" type="date" value={q.from ?? ''} onChange={(e) => set('from', e.target.value)} />

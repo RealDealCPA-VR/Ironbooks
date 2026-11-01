@@ -8,6 +8,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
+import { balancesForContext } from '@/lib/services/access';
 import { getJob, updateJob, deactivateJob, jobProfitability } from '@/lib/services/jobs';
 import { ServiceError } from '@/lib/services/_base';
 import { zodErrorBody } from '@/lib/validation/helpers';
@@ -37,10 +38,10 @@ export async function GET(req: NextRequest, { params }: RouteParams) {
 
     if (searchParams.get('profitability') === 'true') {
       const profitability = await jobProfitability(ctx, id);
-      return NextResponse.json({ ...job, profitability });
+      return NextResponse.json(balancesForContext(ctx, 'customers.center', { ...job, profitability })); // QB View Balance
     }
 
-    return NextResponse.json(job);
+    return NextResponse.json(balancesForContext(ctx, 'customers.center', job)); // QB View Balance
   } catch (err) {
     return errorResponse(err);
   }

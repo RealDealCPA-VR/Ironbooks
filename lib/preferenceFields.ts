@@ -77,7 +77,7 @@ export const FIELD_META: Record<string, FieldMeta> = {
   warnWhenDeleting: { label: 'Warn when deleting a transaction or unused list item', type: 'bool', fixed: 'Always on: Ironbooks always asks before deleting or voiding, because it cannot be undone.' },
   defaultDate: { label: 'Default date for new transactions', help: '"The last date I entered" uses the date you last saved on the same kind of form (a check, an invoice, ...) since you opened the app.', type: 'select', options: [['today', "Today's date"], ['last', 'The last date I entered']] },
   autoRecallLastTransaction: { label: 'Recall the last transaction for a name', help: 'When you pick a name on a new bill, check, expense, card charge, invoice, sales receipt, estimate or sales order, the lines, terms, class, sales rep, tax and memo from the last one for that name are filled in.', type: 'bool' },
-  showHomeWorkflow: { label: 'Show the home workflow on the dashboard', type: 'bool' },
+  showHomeWorkflow: { label: 'Show the Home page workflow (the task diagram)', help: 'The clickable diagram of everyday tasks on the Home page.', type: 'bool' },
   navMode: { label: 'Menu style', help: 'Advanced shows every screen, as QuickBooks does. Simple shows only everyday tasks. You can also switch at the top of the menu.', type: 'select', options: [['advanced', 'Advanced (every screen)'], ['simple', 'Simple (everyday tasks)']] },
   density: { label: 'Screen density', help: 'Compact fits more rows in lists, registers and forms, closer to QuickBooks Desktop.', type: 'select', options: [['comfortable', 'Comfortable'], ['compact', 'Compact']] },
   // Jobs & Estimates
@@ -106,7 +106,7 @@ export const FIELD_META: Record<string, FieldMeta> = {
   // Reports
   reportBasis: { label: 'Default report basis', help: 'Accrual counts income when invoiced; cash counts it when paid. Any report can still switch.', type: 'select', options: [['accrual', 'Accrual'], ['cash', 'Cash']] },
   agingFrom: { label: 'Aging reports age from', type: 'select', options: [['due_date', 'The due date'], ['transaction_date', 'The transaction date']] },
-  accountDisplay: { label: 'Reports show accounts by', type: 'select', options: [['name', 'Name only'], ['description', 'Description only'], ['both', 'Name and description']] },
+  accountDisplay: { label: 'Reports show accounts by', help: 'How every report names accounts. An account with no description shows its name.', type: 'select', options: [['name', 'Name only'], ['description', 'Description only'], ['both', 'Name and description']] },
   reportsRefresh: { label: 'When report data changes', type: 'select', options: [['auto', 'Refresh automatically'], ['prompt', 'Ask me to refresh'], ['never', "Don't refresh"]] },
   // Sales & Customers
   defaultCustomerTerms: { label: 'Default terms for new customers', type: 'select', options: TERMS },
@@ -122,6 +122,9 @@ export const FIELD_META: Record<string, FieldMeta> = {
   salesTaxFrequency: { label: 'How often you pay sales tax', type: 'select', options: [['monthly', 'Monthly'], ['quarterly', 'Quarterly'], ['annually', 'Annually']], dependsOn: 'salesTaxEnabled' },
   // Send Forms
   sendForms: { label: 'Email wording for each form', type: 'sendForms' },
+  sendFromName: { label: 'Send my emails with this name', help: "Leave blank to use the company's sender name.", type: 'text' },
+  sendFromEmail: { label: 'Send my emails from this address', help: "Replies come back to you. Leave blank to use the company's address. Your mail server must allow sending from it: use Test on the Send Forms page.", type: 'text' },
+  bccMe: { label: 'Send me a copy (Bcc) of every form I email', type: 'bool' },
   // Spelling
   spellCheckEnabled: { label: 'Check spelling as I type (memos and descriptions)', help: 'Uses the spell checker built into your computer. Right-click a word for suggestions.', type: 'bool' },
   spellIgnoreUppercase: { label: 'Ignore words in UPPERCASE', type: 'bool', dependsOn: 'spellCheckEnabled', help: "Note: the spell checker built into your computer decides this; Ironbooks cannot change it." },
@@ -140,4 +143,23 @@ export const FIELD_META: Record<string, FieldMeta> = {
   payrollStandardHours: { label: 'Standard hours per week', type: 'number' },
   payrollExpenseAccountId: { label: 'Wages expense account', type: 'account', accounts: expense },
   payrollLiabilityAccountId: { label: 'Payroll liabilities account', type: 'account', accounts: liability },
+  // Desktop View (prefsperms A2)
+  startPage: { label: 'When I open a company file', help: '"Where I left off" opens the page you were on when you last closed the file or signed out.', type: 'select', options: [['home', 'Show the Home page'], ['last', 'Go back to where I left off']] },
+  homeShowSalesReceipts: { label: 'Show Sales Receipts on the Home page', help: 'Only the Home page icon: Sales Receipts stay in the menus.', type: 'bool' },
+  homeShowStatements: { label: 'Show Statements and Statement Charges on the Home page', help: 'Only the Home page icons: statements stay in the menus.', type: 'bool' },
+  homeShowBills: { label: 'Show Enter Bills and Pay Bills on the Home page', help: 'Turn off if you pay as you go with checks and never enter bills. Bills stay in the menus.', type: 'bool' },
+  // Integrated Applications (prefsperms A2)
+  integratedAppsBlocked: { label: "Don't allow any applications to access this company file", help: 'Turns off everything below at once: only people signed in to Ironbooks can reach the file.', type: 'bool' },
+  allowEmployeePortal: { label: 'Employee portal: employees may sign in to see their pay stubs', help: 'Off: employees cannot sign in to the portal (signed-in employees are signed out).', type: 'bool' },
+  allowPhoneReceipts: { label: 'Phone receipt capture: phone links may upload receipts', help: 'Off: no new phone links can be made and existing links stop accepting receipts.', type: 'bool' },
+  // Search (prefsperms A2)
+  showSearchBox: { label: 'Show the search box in the menu', help: 'Ctrl+K (the command bar) searches everything either way.', type: 'bool' },
+  searchDefault: { label: 'Pressing Enter in the search box searches', type: 'select', options: [['pages', 'Pages (the best matching screen opens)'], ['everything', 'My company file: names, transactions and pages']] },
+  // Calendar (prefsperms A2)
+  calendarView: { label: 'Calendar view', type: 'select', options: [['day', 'Day'], ['week', 'Week'], ['month', 'Month'], ['last', 'Remember the last view I used']] },
+  calendarWeek: { label: 'Weekly view shows', type: 'select', options: [['company', 'The work week from Time & Expenses'], ['sun_sat', 'Sunday to Saturday'], ['mon_sun', 'Monday to Sunday'], ['mon_fri', 'Monday to Friday']] },
+  calendarShowEntered: { label: 'Show transactions entered on each day', type: 'bool' },
+  calendarShowDue: { label: 'Show transactions due on each day', type: 'bool' },
+  calendarPastDueDays: { label: 'Upcoming & Past Due: show past-due items from this many days back', type: 'number' },
+  calendarUpcomingDays: { label: 'Upcoming & Past Due: show items due in the next this many days', type: 'number' },
 };

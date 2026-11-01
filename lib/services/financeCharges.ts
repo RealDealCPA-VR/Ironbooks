@@ -1,8 +1,10 @@
 /**
  * Finance charges — QB Desktop "Assess Finance Charges" parity.
  *
- * Settings (annual interest rate %, minimum charge, grace days) live in
- * companies.settings.financeCharges (jsonb). Assessment walks every overdue
+ * Settings (annual interest rate %, minimum charge, grace days, and — prefsperms A2, QB Preferences >
+ * Finance Charge — the finance charge account, "Assess finance charges on overdue finance
+ * charges", "Calculate charges from due date / invoice date" and "Mark finance charge invoices To
+ * be printed") live in companies.settings.financeCharges (jsonb). Assessment walks every overdue
  * open invoice as of a date, computes simple interest per invoice
  * (balanceDue × annualRate/100 × days/365, the days counted from the due date or from the
  * customer's last finance charge, whichever is later — as QB does), applies the minimum charge
@@ -53,13 +55,67 @@ export interface FinanceChargeSettings {
   minCharge: string;
   /** Days past the due date before an invoice becomes chargeable. */
   graceDays: number;
+  /** Income account the charges post to (null = "Finance Charge Income", 4400, created on use). */
+  accountId: string | null;
+  /** QB "Assess finance charges on overdue finance charges": unpaid finance charges are charged too. */
+  assessOnFinanceCharges: boolean;
+  /** QB "Calculate charges from": the due date, or the invoice (billed) date. */
+  calculateFrom: 'due_date' | 'invoice_date';
+  /** QB "Mark finance charge invoices 'To be printed'". */
+  markToBePrinted: boolean;
 }
 
 export const DEFAULT_FINANCE_CHARGE_SETTINGS: FinanceChargeSettings = {
   annualRate: '18',
   minCharge: '0',
   graceDays: 0,
+  accountId: null,
+  assessOnFinanceCharges: false,
+  calculateFrom: 'due_date',
+  markToBePrinted: false,
 };
+
+/** Stored settings over the defaults, keeping only well-formed values. */
+function resolveSettings(stored: unknown): FinanceChargeSettings {
+  const s = (stored && typeof stored === 'object' ? stored : {}) as Record<string, unknown>;
+  const d = DEFAULT_FINANCE_CHARGE_SETTINGS;
+  return {
+    annualRate: s.annualRate !== undefined && s.annualRate !== null ? String(s.annualRate) : d.annualRate,
+    minCharge: s.minCharge !== undefined && s.minCharge !== null ? String(s.minCharge) : d.minCharge,
+    graceDays: Number.isInteger(s.graceDays) ? (s.graceDays as number) : d.graceDays,
+    accountId: typeof s.accountId === 'string' && s.accountId ? s.accountId : null,
+    assessOnFinanceCharges: s.assessOnFinanceCharges === true,
+    calculateFrom: s.calculateFrom === 'invoice_date' ? 'invoice_date' : 'due_date',
+    markToBePrinted: s.markToBePrinted === true,
+  };
+}
+
+/** Per-run overrides over the stored settings. */
+function withOverrides(base: FinanceChargeSettings, o: Partial<FinanceChargeSettings> | undefined): FinanceChargeSettings {
+  if (!o) return base;
+  return {
+    annualRate: o.annualRate !== undefined ? String(o.annualRate) : base.annualRate,
+    minCharge: o.minCharge !== undefined ? String(o.minCharge) : base.minCharge,
+    graceDays: o.graceDays !== undefined ? Number(o.graceDays) : base.graceDays,
+    accountId: o.accountId !== undefined ? o.accountId || null : base.accountId,
+    assessOnFinanceCharges: o.assessOnFinanceCharges !== undefined ? o.assessOnFinanceCharges === true : base.assessOnFinanceCharges,
+    calculateFrom: o.calculateFrom !== undefined ? (o.calculateFrom === 'invoice_date' ? 'invoice_date' : 'due_date') : base.calculateFrom,
+    markToBePrinted: o.markToBePrinted !== undefined ? o.markToBePrinted === true : base.markToBePrinted,
+  };
+}
+
+/** The finance charge account must be an income account of this company (QB lists income accounts). */
+async function assertFinanceChargeAccount(ctx: ServiceContext, accountId: string | null): Promise<void> {
+  if (!accountId) return;
+  if (!/^[0-9a-f-]{36}$/i.test(accountId)) throw notFound('Account');
+  const [a] = await ctx.db
+    .select({ type: accounts.type, isActive: accounts.isActive })
+    .from(accounts)
+    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, accountId)));
+  if (!a) throw notFound('Account');
+  if (String(a.type) !== 'revenue') throw validation('The finance charge account must be an income account.');
+  if (a.isActive === false) throw validation('The finance charge account is inactive. Pick an active income account.');
+}
 
 export async function getFinanceChargeSettings(
   ctx: ServiceContext,
@@ -69,8 +125,7 @@ export async function getFinanceChargeSettings(
     .from(companies)
     .where(eq(companies.id, ctx.companyId));
   if (!row) throw notFound('Company');
-  const stored = (row.settings?.financeCharges ?? {}) as Partial<FinanceChargeSettings>;
-  return { ...DEFAULT_FINANCE_CHARGE_SETTINGS, ...stored };
+  return resolveSettings(row.settings?.financeCharges);
 }
 
 function validateSettings(s: FinanceChargeSettings): void {
@@ -84,6 +139,9 @@ function validateSettings(s: FinanceChargeSettings): void {
   if (!Number.isInteger(s.graceDays) || s.graceDays < 0 || s.graceDays > 365) {
     throw validation('Grace days must be a whole number between 0 and 365.');
   }
+  if (s.calculateFrom !== 'due_date' && s.calculateFrom !== 'invoice_date') {
+    throw validation('Calculate charges from the due date or the invoice date.');
+  }
 }
 
 /** Merge-update the finance-charge settings stored on companies.settings. */
@@ -92,14 +150,13 @@ export async function updateFinanceChargeSettings(
   input: Partial<FinanceChargeSettings>,
 ): Promise<FinanceChargeSettings> {
   const current = await getFinanceChargeSettings(ctx);
-  const next: FinanceChargeSettings = {
-    annualRate:
-      input.annualRate !== undefined ? toAmountString(input.annualRate) : current.annualRate,
-    minCharge:
-      input.minCharge !== undefined ? toAmountString(input.minCharge) : current.minCharge,
-    graceDays: input.graceDays !== undefined ? Number(input.graceDays) : current.graceDays,
-  };
+  const next: FinanceChargeSettings = withOverrides(current, {
+    ...input,
+    ...(input.annualRate !== undefined ? { annualRate: toAmountString(input.annualRate) } : {}),
+    ...(input.minCharge !== undefined ? { minCharge: toAmountString(input.minCharge) } : {}),
+  });
   validateSettings(next);
+  await assertFinanceChargeAccount(ctx, next.accountId);
 
   return inTransaction(ctx, async (tx) => {
     const [row] = await tx.db
@@ -108,10 +165,12 @@ export async function updateFinanceChargeSettings(
       .where(eq(companies.id, tx.companyId));
     if (!row) throw notFound('Company');
 
+    // Only the financeCharges key changes, merged in SQL: never writes back a stale copy of the
+    // other settings (the companies.settings lost-update rule, prefsperms review 5 leftover).
     await tx.db
       .update(companies)
       .set({
-        settings: { ...(row.settings ?? {}), financeCharges: next },
+        settings: sql`coalesce(${companies.settings}, '{}'::jsonb) || jsonb_build_object('financeCharges', ${JSON.stringify(next)}::jsonb)`,
         updatedAt: new Date(),
       })
       .where(eq(companies.id, tx.companyId));
@@ -185,15 +244,7 @@ export async function previewFinanceCharges(
   opts: { asOf: Date; settings?: Partial<FinanceChargeSettings> },
 ): Promise<FinanceChargePreview> {
   const stored = await getFinanceChargeSettings(ctx);
-  const settings: FinanceChargeSettings = {
-    annualRate:
-      opts.settings?.annualRate !== undefined
-        ? String(opts.settings.annualRate)
-        : stored.annualRate,
-    minCharge:
-      opts.settings?.minCharge !== undefined ? String(opts.settings.minCharge) : stored.minCharge,
-    graceDays: opts.settings?.graceDays !== undefined ? Number(opts.settings.graceDays) : stored.graceDays,
-  };
+  const settings: FinanceChargeSettings = withOverrides(stored, opts.settings);
   validateSettings(settings);
 
   const asOf = opts.asOf;
@@ -201,7 +252,8 @@ export async function previewFinanceCharges(
   const periodKey = periodKeyFor(asOf);
 
   // All open invoices with a balance, dated on/before asOf, excluding prior
-  // finance-charge invoices (memo marker) so charges never compound.
+  // finance-charge invoices (memo marker) so charges never compound — unless the company chose
+  // "Assess finance charges on overdue finance charges" (Preferences > Finance Charge).
   const rows = await ctx.db
     .select({
       id: invoices.id,
@@ -222,7 +274,7 @@ export async function previewFinanceCharges(
         inArray(invoices.status, ['open', 'partial', 'overdue']),
         gt(sql`CAST(${invoices.balanceDue} AS NUMERIC)`, 0),
         lt(invoices.date, new Date(asOf.getTime() + DAY_MS)),
-        or(isNull(invoices.memo), sql`${invoices.memo} NOT LIKE '%[FC:%'`),
+        settings.assessOnFinanceCharges ? sql`true` : or(isNull(invoices.memo), sql`${invoices.memo} NOT LIKE '%[FC:%'`),
       ),
     )
     .orderBy(asc(customers.displayName), asc(invoices.dueDate));
@@ -267,9 +319,11 @@ export async function previewFinanceCharges(
     // Chargeable only once past the grace period; interest accrues from the due date.
     if (daysOverdue <= settings.graceDays) continue;
 
-    // Interest runs from the due date, or from the last finance charge when that is later.
+    // Interest runs from the due date (or the invoice date: Preferences > Finance Charge
+    // "Calculate charges from"), or from the last finance charge when that is later.
     const lastCharge = lastChargeBy.get(r.customerId);
-    const from = lastCharge && lastCharge.getTime() > effDue.getTime() ? lastCharge : effDue;
+    const start = settings.calculateFrom === 'invoice_date' ? r.date : effDue;
+    const from = lastCharge && lastCharge.getTime() > start.getTime() ? lastCharge : start;
     const daysCharged = Math.max(0, Math.floor((asOf.getTime() - from.getTime()) / DAY_MS));
     // A customer already assessed for this period stays listed (as "already assessed").
     const assessedThisPeriod = assessedSet.has(r.customerId);
@@ -396,11 +450,14 @@ export async function assessFinanceCharges(
       type: 'asset',
       subtype: 'accounts_receivable',
     }),
-    fcIncomeId: await getOrCreateAccountByCode(tx, FC_INCOME_CODE, {
-      name: FC_INCOME_NAME,
-      type: 'revenue',
-      subtype: 'other_income',
-    }),
+    // Preferences > Finance Charge "Finance charge account", else Finance Charge Income (4400).
+    fcIncomeId: preview.settings.accountId
+      ? (await assertFinanceChargeAccount(tx, preview.settings.accountId), preview.settings.accountId)
+      : await getOrCreateAccountByCode(tx, FC_INCOME_CODE, {
+          name: FC_INCOME_NAME,
+          type: 'revenue',
+          subtype: 'other_income',
+        }),
   }));
 
   const assessed: AssessedFinanceCharge[] = [];
@@ -461,6 +518,8 @@ export async function assessFinanceCharges(
             amountPaid: '0.00',
             balanceDue: toAmountString(charge),
             memo: `Finance charge assessed ${asOfIso} ${fcMarker(preview.periodKey)}`,
+            // Preferences > Finance Charge "Mark finance charge invoices To be printed".
+            toBePrinted: preview.settings.markToBePrinted,
           })
           .returning();
 

@@ -5,6 +5,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
+import { balancesForContext } from '@/lib/services/access';
 import { createVendor, listVendors, listVendorsWithBalances } from '@/lib/services/vendors';
 import { ServiceError } from '@/lib/services/_base';
 import { zodErrorBody } from '@/lib/validation/helpers';
@@ -28,7 +29,7 @@ export async function GET(req: NextRequest) {
       req.nextUrl.searchParams.get('withBalances') === 'true'
         ? await listVendorsWithBalances(ctx, { includeInactive })
         : await listVendors(ctx, { includeInactive });
-    return NextResponse.json(rows);
+    return NextResponse.json(balancesForContext(ctx, 'vendors.center', rows)); // QB View Balance
   } catch (err) {
     return errorResponse(err);
   }

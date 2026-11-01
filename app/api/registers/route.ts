@@ -9,6 +9,7 @@
  */
 import { NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
+import { balancesForContext } from '@/lib/services/access';
 import { ServiceError } from '@/lib/services/_base';
 import { listRegisterAccounts } from '@/lib/services/journal';
 import { canViewRegister } from '@/lib/permissions/registers';
@@ -18,7 +19,7 @@ export async function GET() {
   try {
     const ctx = await getServerContext();
     const accounts = (await listRegisterAccounts(ctx)).filter((a) => canViewRegister(ctx.access, a));
-    return NextResponse.json({ accounts });
+    return NextResponse.json(balancesForContext(ctx, 'banking.registers', { accounts })); // QB View Balance
   } catch (err) {
     return mapError(err);
   }
