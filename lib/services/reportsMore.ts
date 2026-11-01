@@ -1147,7 +1147,7 @@ export async function closingDateExceptionsStd(ctx: ServiceContext, p: ReportPar
       depth: 0,
       kind: 'section',
       cells: {
-        state: `${g.typeLabel} dated ${g.transactionDate}: ${changes}${g.closingDate ? ` (closed through ${g.closingDate})` : ''}`,
+        state: `${g.typeLabel} dated ${fmtDay(parseDay(g.transactionDate.slice(0, 10))!)}: ${changes}${g.closingDate ? ` (closed through ${fmtDay(parseDay(g.closingDate.slice(0, 10))!)})` : ''}`,
       },
     });
     const versions = [...(g.latest ? [g.latest] : []), ...g.prior];
@@ -1171,11 +1171,11 @@ export async function closingDateExceptionsStd(ctx: ServiceContext, p: ReportPar
         },
       });
     }
-    for (const v of versions) {
+    for (const [vi, v] of versions.entries()) {
       v.lines.forEach((l, i) => {
         const first = i === 0;
         rows.push({
-          id: `${headingId}:${v.state}:${v.entryId}:${i}`,
+          id: `${headingId}:${v.state}:${vi}:${v.entryId}:${i}`,
           parentId: headingId,
           depth: 1,
           kind: 'data' as const,
