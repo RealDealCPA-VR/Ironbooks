@@ -260,6 +260,8 @@ export function reportActivity(entry: Pick<CatalogEntry, 'key' | 'area' | 'group
       return 'reports_inventory.valuation';
     case 'sales_tax':
       return 'sales_tax.reports';
+    case 'closing':
+      return 'closing.closing_date';
     case 'time':
       return entry.key.startsWith('mileage') ? 'time.mileage' : 'time.timesheets';
     default:

@@ -46,6 +46,6 @@ describe('Report Center', () => {
       expect(e.hidden, e.key).toBeFalsy();
     }
     const src = fs.readFileSync(path.join(REPORTS, 'page.tsx'), 'utf8');
-    expect(src).toMatch(/REPORT_CATALOG\.filter\(\(r\) => !r\.hidden && canDo\(me, r\.area, 'view'\) && !hidden\(r\.key\)\)/);
+    expect(src).toMatch(/REPORT_CATALOG\.filter\(\(r\) => !r\.hidden && canDoActivity\(me, reportActivity\(r\), 'view'\) && !hidden\(r\.key\)\)/);
   });
 });
