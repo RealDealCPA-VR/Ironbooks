@@ -151,8 +151,8 @@ export const ROUTE_ACTIVITIES: Record<string, ActivityRef> = {
   // salesar (C6/C9): Collections Center email/letter send (routes need the 'print' right).
   '/api/collections/email': 'customers.send_forms',
   '/api/collections/letter': 'customers.send_forms',
-  // salesar: Billing Groups for Batch Invoicing (group CRUD is Customer Center; creating a batch run is Batch Invoicing).
-  '/api/billing-groups': 'customers.batch_invoicing',
+  // salesar: Billing Groups for Batch Invoicing (creating the group is Customer Center; creating a batch run is Batch Invoicing).
+  '/api/billing-groups': { GET: 'customers.center', POST: 'customers.center' },
   '/api/billing-groups/[id]': 'customers.center',
   '/api/accountant/write-off': 'customers.write_off',
   '/api/attention/invoice-reminder': 'customers.invoices',

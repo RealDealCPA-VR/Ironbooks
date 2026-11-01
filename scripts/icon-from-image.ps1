@@ -5,7 +5,7 @@
 
 param(
     [Parameter(Mandatory = $true)][string]$SourceImage,
-    [string]$PngOutput = "build/icon-1024.png",
+    [string]$PngOutput = "build/icon.png",
     [string]$IcoOutput = "build/icon.ico",
     [int]$Size = 1024,
     [int]$CornerRadiusPercent = 18,   # corner radius as % of final size
@@ -106,7 +106,7 @@ try {
 
         # -----------------------------------------------------------
         # 4. Rounded-corner transparency via anti-aliased GraphicsPath mask.
-        #    Draw the mask at 4x then downsample for soft edges.
+        #    Draw the mask at full size, anti-aliased, for soft edges.
         # -----------------------------------------------------------
         $radius = [int]($Size * $CornerRadiusPercent / 100)
         $mask = New-Object System.Drawing.Bitmap($Size, $Size, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
@@ -130,7 +130,7 @@ try {
             # Apply mask to alpha channel.
             $mb = $mask
             $wd = $work.Width; $ht = $work.Height
-            $wData = $work.LockBits((New-Object System.Drawing.Rectangle(0, 0, $wd, $ht)), [System.Drawing.Imaging.ImageLockMode]::ReadOnly, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+            $wData = $work.LockBits((New-Object System.Drawing.Rectangle(0, 0, $wd, $ht)), [System.Drawing.Imaging.ImageLockMode]::ReadWrite, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
             $mData = $mb.LockBits((New-Object System.Drawing.Rectangle(0, 0, $wd, $ht)), [System.Drawing.Imaging.ImageLockMode]::ReadOnly, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
             try {
                 $wPtr = $wData.Scan0; $mPtr = $mData.Scan0
@@ -156,7 +156,6 @@ try {
             if (-not [System.IO.Path]::IsPathRooted($p)) { $full = Join-Path (Get-Location) $p }
             return $full
         }
-        $outDir = Split-Path -Parent (Resolve-PathRel $PngOutput)
         $pngFull = Resolve-PathRel $PngOutput
         $icoFull = Resolve-PathRel $IcoOutput
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $pngFull) | Out-Null

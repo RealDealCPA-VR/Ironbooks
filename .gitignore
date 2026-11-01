@@ -21,6 +21,9 @@
 .DS_Store
 *.pem
 
+# session scratch
+/_vr_tmp/
+
 # debug
 npm-debug.log*
 yarn-debug.log*
