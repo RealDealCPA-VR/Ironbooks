@@ -7,15 +7,17 @@
  *    and the browser Back button returns to the previous QuickZoom level,
  *  - Collapse / Expand rows, Fonts & Numbers (number formats), column show/hide,
  *  - Memorize (save with its settings, into a group; or replace an existing memorized report),
- *  - the shared export toolbar (CSV / Excel / PDF / Print / Email).
+ *  - the shared export toolbar (CSV / Excel / PDF / Print / Email),
+ *  - Comment on Report (QB): click amounts to comment on them, then save the report with its
+ *    comments as a Commented Report (app/reports/commented; lib/services/commentedReports.ts).
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
-import { BarChart2, Bookmark, ChevronsDownUp, ChevronsUpDown, Filter, Type } from 'lucide-react';
+import { BarChart2, Bookmark, ChevronsDownUp, ChevronsUpDown, Filter, MessageSquare, Type } from 'lucide-react';
 import { Button, Card, Input, Label, Modal, PageHeader, Select, Spinner, toast } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
-import { CATALOG_BY_KEY } from '@/lib/reports/catalog';
+import { CATALOG_BY_KEY, REPORT_ACTIONS, relatedReports } from '@/lib/reports/catalog';
 import { reportToTable, type StdReport } from '@/lib/reports/types';
 import ReportToolbar, { type ExportTable } from './ReportToolbar';
 import StdReportTable, { useCollapse } from './StdReportTable';
@@ -26,6 +28,8 @@ import { ReportWhyChanged } from '@/components/WhyChanged';
 import ReportSummaryBar from './ReportSummaryBar';
 import { clearExplainCache } from './AmountExplain';
 import { isSummaryReport } from '@/lib/reports/drilldown';
+import { commentMarks, type ReportComment } from '@/lib/reports/comments';
+import { CommentDialog, CommentList, commentLabel, useCommentEditing } from './ReportComments';
 
 interface MemorizedRow {
   id: string;
@@ -41,12 +45,14 @@ interface Group {
 }
 
 const PARAM_KEYS = [
-  'from', 'to', 'asOf', 'priorAsOf', 'accountId', 'section', 'nameId', 'customerId', 'vendorId', 'employeeId', 'itemId', 'jobId',
+  'from', 'to', 'asOf', 'priorAsOf', 'accountId', 'accountIds', 'section', 'nameId', 'customerId', 'vendorId', 'employeeId', 'itemId', 'jobId',
   // Profit & Loss by Job cell QuickZoom: that Customer:Job column's lines (named or job-costed).
   'customerJobId',
   'classId', 'budgetId', 'txnType', 'amountMin', 'amountMax', 'cleared', 'memo', 'number', 'sortBy', 'sortDir',
   'subtotalBy', 'columns', 'compare', 'basis', 'view', 'vehicle', 'dates', 'interval', 'through', 'agingFrom',
   'overDays',
+  // Report gaps round: Sales by Rep, inventory sites, Cash Flow Forecast periods.
+  'repId', 'siteId', 'period',
 ];
 
 function paramsFromSearch(sp: URLSearchParams | null): Params {
@@ -87,6 +93,12 @@ export default function StdReportView({
   const [memorized, setMemorized] = useState<MemorizedRow | null>(null);
   const [format, setFormat] = useNumberFormat(memorized?.config.display?.numberFormat);
   const [memoOpen, setMemoOpen] = useState(false);
+  // Comment on Report: draft comments on the report on screen (saved as a Commented Report).
+  const [commenting, setCommenting] = useState(false);
+  const [comments, setComments] = useState<ReportComment[]>([]);
+  const [saveCommentsOpen, setSaveCommentsOpen] = useState(false);
+  const commentEdit = useCommentEditing(comments, setComments);
+  const marks = useMemo(() => commentMarks(comments), [comments]);
   const { collapsed, setCollapsed, toggle, collapsible, allCollapsed, collapseAll, expandAll } = useCollapse(report);
 
   // Re-read params when the URL changes (QuickZoom Back / Forward).
@@ -160,6 +172,9 @@ export default function StdReportView({
   }, [reportKey, fixedBasis]);
 
   useEffect(() => {
+    // Comments point at amounts of the report on screen: other options = another report.
+    setComments([]);
+    setCommenting(false);
     run({ ...(entry?.defaults ?? {}), ...paramsFromSearch(search) });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [optionsKey, reportKey]);
@@ -215,6 +230,22 @@ export default function StdReportView({
         action={report?.subtitle ? <span className="text-sm text-navy/60">{report.subtitle}</span> : undefined}
       />
       <p className="text-sm text-navy/60 -mt-4 mb-4 print-hidden">{entry.description}</p>
+      {(relatedReports(reportKey).length > 0 || (REPORT_ACTIONS[reportKey] ?? []).length > 0) && (
+        <nav aria-label="Related reports" className="-mt-2 mb-4 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm print-hidden">
+          {relatedReports(reportKey).length > 0 && <span className="text-navy/50">Related:</span>}
+          {relatedReports(reportKey).map((r) => (
+            <Link key={r.key} href={`/reports/std/${r.key}`} className="text-electric hover:underline">
+              {r.title}
+            </Link>
+          ))}
+          {(REPORT_ACTIONS[reportKey] ?? []).length > 0 && <span className="text-navy/50 ml-2">Next steps:</span>}
+          {(REPORT_ACTIONS[reportKey] ?? []).map((a) => (
+            <Link key={a.href} href={a.href} className="text-electric hover:underline">
+              {a.label}
+            </Link>
+          ))}
+        </nav>
+      )}
 
       <ReportToolbar
         table={table}
@@ -277,8 +308,22 @@ export default function StdReportView({
               <Bookmark className="h-4 w-4" />
               Memorize
             </Button>
+            <Button
+              type="button"
+              variant={commenting ? 'primary' : 'secondary'}
+              size="sm"
+              onClick={() => setCommenting(!commenting)}
+              disabled={!report}
+              aria-pressed={commenting}
+            >
+              <MessageSquare className="h-4 w-4" />
+              {commenting ? 'Done commenting' : 'Comment on report'}
+            </Button>
             <Link href="/reports/memorized" className="text-sm text-electric hover:underline ml-1">
               Memorized reports
+            </Link>
+            <Link href="/reports/commented" className="text-sm text-electric hover:underline ml-1">
+              Commented reports
             </Link>
           </div>
         </form>
@@ -303,6 +348,29 @@ export default function StdReportView({
             router.replace(`${pathname}${s ? `?${s}` : ''}`, { scroll: false });
           }}
         />
+      )}
+
+      {(commenting || comments.length > 0) && report && (
+        <div role="status" className="mb-4 flex flex-wrap items-center gap-3 rounded-lg border border-electric/30 bg-electric/5 p-3 text-sm text-navy print-hidden">
+          <span className="flex-1 min-w-[16rem]">
+            {commenting
+              ? 'Click (or tab to and press Enter on) an amount to comment on it. Save the report with its comments to print, export or share it later exactly as it is now.'
+              : `${comments.length} comment${comments.length === 1 ? '' : 's'} not saved yet.`}
+          </span>
+          <Button size="sm" onClick={() => setSaveCommentsOpen(true)} disabled={!comments.length}>
+            Save commented report
+          </Button>
+          <Button
+            size="sm"
+            variant="secondary"
+            onClick={() => {
+              setComments([]);
+              setCommenting(false);
+            }}
+          >
+            Discard comments
+          </Button>
+        </div>
       )}
 
       {report?.balanced === false && (
@@ -334,9 +402,14 @@ export default function StdReportView({
             onToggle={toggle}
             hiddenColumns={hidden}
             explain={{ reportKey, params: ranParams, backHref, onNavigate: saveViewState }}
+            marks={marks}
+            onComment={commenting ? commentEdit.startAdd : undefined}
           />
         )}
       </Card>
+      {report && (
+        <CommentList report={report} comments={comments} onEdit={commentEdit.startEdit} onDelete={commentEdit.remove} />
+      )}
       {report?.notes?.map((n) => (
         <p key={n} className="text-xs text-navy/50 mt-2">
           {n}
@@ -345,6 +418,35 @@ export default function StdReportView({
       <p className="text-xs text-navy/40 mt-2 print-hidden">
         Tip: point at (or tab to) an amount to see what it is made of; click it or press Enter to see the transactions behind it (QuickZoom). Double-click a transaction row to open it.
       </p>
+
+      {report && (
+        <CommentDialog
+          open={!!commentEdit.adding || commentEdit.editing !== null}
+          target={
+            commentEdit.adding
+              ? commentLabel(report, { rowId: commentEdit.adding.row.id, columnKey: commentEdit.adding.column.key })
+              : commentEdit.editing !== null && comments[commentEdit.editing]
+                ? commentLabel(report, comments[commentEdit.editing])
+                : ''
+          }
+          initialText={commentEdit.editing !== null ? comments[commentEdit.editing]?.text : ''}
+          onClose={commentEdit.close}
+          onSave={commentEdit.save}
+        />
+      )}
+      <SaveCommentedDialog
+        open={saveCommentsOpen}
+        onClose={() => setSaveCommentsOpen(false)}
+        reportKey={reportKey}
+        defaultName={title}
+        params={entry.basis && !ranParams.basis && report?.basis ? { ...ranParams, basis: report.basis } : ranParams}
+        comments={comments}
+        onSaved={(id) => {
+          setComments([]);
+          setCommenting(false);
+          router.push(`/reports/commented?id=${id}`);
+        }}
+      />
 
       <MemorizeDialog
         open={memoOpen}
@@ -470,6 +572,68 @@ function MemorizeDialog({
           </div>
         )}
       </div>
+    </Modal>
+  );
+}
+
+/** Save the report on screen with its comments as a Commented Report. */
+function SaveCommentedDialog({
+  open,
+  onClose,
+  reportKey,
+  defaultName,
+  params,
+  comments,
+  onSaved,
+}: {
+  open: boolean;
+  onClose: () => void;
+  reportKey: string;
+  defaultName: string;
+  params: Params;
+  comments: ReportComment[];
+  onSaved: (id: string) => void;
+}) {
+  const [name, setName] = useState(defaultName);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    if (open) setName(defaultName);
+  }, [open, defaultName]);
+  const save = async () => {
+    setBusy(true);
+    try {
+      const row = await api.post<{ id: string }>('/api/commented-reports', { name: name.trim(), reportType: reportKey, params, comments });
+      toast('Commented report saved.', 'success');
+      onClose();
+      onSaved(row.id);
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Could not save the commented report.', 'danger');
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="Save commented report"
+      footer={
+        <>
+          <Button variant="secondary" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button loading={busy} onClick={save} disabled={!name.trim()}>
+            Save
+          </Button>
+        </>
+      }
+    >
+      <p className="text-sm text-navy/60 mb-3">
+        Keeps this report exactly as it is now, with your {comments.length} comment{comments.length === 1 ? '' : 's'}. It will not change when
+        the books do — run the report again for up-to-date numbers.
+      </p>
+      <Label htmlFor="commented-name">Name</Label>
+      <Input id="commented-name" value={name} onChange={(e) => setName(e.target.value)} autoFocus maxLength={255} />
     </Modal>
   );
 }

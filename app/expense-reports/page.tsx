@@ -23,6 +23,7 @@ import {
   useGridKeys,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { useOpenParam } from '@/lib/useOpenParam';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
 
@@ -482,6 +483,9 @@ export default function ExpenseReportsPage() {
   // ---------------------------------------------------------------------------
   // View detail
   // ---------------------------------------------------------------------------
+
+  // QuickZoom from a report line (/reports/open → ?open=<id>): open that expense report.
+  useOpenParam((id) => void openDetail({ id } as ExpenseReport), !loading);
 
   async function openDetail(report: ExpenseReport) {
     setDetailLoading(true);

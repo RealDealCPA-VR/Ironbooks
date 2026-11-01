@@ -121,7 +121,10 @@ describe('date helpers', () => {
     const instant = new Date('2026-03-01T03:00:00Z'); // still Feb 28 in New York
     expect(todayInTimeZone('America/New_York', instant)).toBe('2026-02-28');
     expect(todayInTimeZone('Asia/Tokyo', instant)).toBe('2026-03-01');
-    expect(todayInTimeZone('Not/AZone', instant)).toBe('2026-03-01');
+    // A zone the runtime does not know: this computer's calendar day (the reports' "today"), not
+    // the UTC day.
+    const local = `${instant.getFullYear()}-${String(instant.getMonth() + 1).padStart(2, '0')}-${String(instant.getDate()).padStart(2, '0')}`;
+    expect(todayInTimeZone('Not/AZone', instant)).toBe(local);
   });
 
   it('addDaysIso and dueDateForTerms', () => {

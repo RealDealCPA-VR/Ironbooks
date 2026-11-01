@@ -26,6 +26,7 @@ import {
 } from '@/components/ui';
 import { api } from '@/lib/client';
 import { useFocusId, useNewParam } from '@/lib/useFocusParam';
+import { useOpenParam } from '@/lib/useOpenParam';
 import { todayISO } from '@/lib/dates';
 // wave2 prefs: Memorize (Ctrl+M)
 import MemorizeButton from '@/components/MemorizeButton';
@@ -999,6 +1000,9 @@ function CreditMemosPageContent() {
   const [editTarget, setEditTarget] = useState<CreditMemoDetail | null>(null);
   /** Remounts the form: Revert / Clear, and moving to another credit memo (Previous / Next). */
   const [formKey, setFormKey] = useState(0);
+
+  // QuickZoom from a report line (/reports/open → ?open=<id>): open that credit memo.
+  useOpenParam((id) => void openEdit({ id } as CreditMemo), !loading);
 
   async function openEdit(m: CreditMemo) {
     try {

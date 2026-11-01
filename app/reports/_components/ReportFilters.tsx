@@ -34,9 +34,11 @@ export interface FilterOptions {
   customerTypes?: Option[];
   vendorTypes?: Option[];
   jobTypes?: Option[];
+  reps?: Option[];
+  sites?: Option[];
 }
 
-const NEEDS_OPTIONS: ReportControl[] = ['account', 'customer', 'vendor', 'class', 'item', 'employee', 'job', 'budget', 'vehicle', 'customerType', 'vendorType', 'jobType'];
+const NEEDS_OPTIONS: ReportControl[] = ['account', 'customer', 'vendor', 'class', 'item', 'employee', 'job', 'budget', 'vehicle', 'rep', 'site', 'customerType', 'vendorType', 'jobType'];
 
 /**
  * How long one load of the filter lists is shared. Long enough for the several filter rows of one
@@ -73,6 +75,7 @@ export const TXN_TYPES: [string, string][] = [
   ['journal', 'General Journal'],
   ['inventory', 'Inventory Adjustment'],
   ['item_receipt', 'Item Receipt'],
+  ['build_assembly', 'Build Assembly'],
   ['depreciation', 'Depreciation'],
   ['sales_tax_payment', 'Sales Tax Payment'],
   ['cc_payment', 'Credit Card Payment'],
@@ -268,6 +271,28 @@ export default function ReportFilters({
           <Input id="rf-overdays" inputMode="numeric" placeholder="Any" value={params.overDays ?? ''} onChange={(e) => set('overDays', e.target.value.replace(/[^0-9]/g, ''))} />
         </Field>
       )}
+      {has('period') && (
+        <Field id="rf-period" label="Periods">
+          <Select id="rf-period" value={params.period ?? ''} onChange={(e) => set('period', e.target.value)}>
+            <option value="">Weeks</option>
+            <option value="month">Months</option>
+          </Select>
+        </Field>
+      )}
+      {has('rep') && opts?.reps && (
+        <Field id="rf-rep" label="Sales rep">
+          <Select id="rf-rep" value={params.repId ?? ''} onChange={(e) => set('repId', e.target.value)}>
+            <option value="">All</option>
+            {opts.reps.map((o) => (
+              <option key={o.id} value={o.id}>
+                {o.name}
+              </option>
+            ))}
+            <option value="none">No sales rep</option>
+          </Select>
+        </Field>
+      )}
+      {has('site') && pick('siteId', 'Inventory site', opts?.sites)}
       {has('class') && (classOn || !!params.classId) && pick('classId', 'Class', opts?.classes, <Help term="class" />)}
       {has('customer') && pick('customerId', 'Customer:Job', opts?.customers)}
       {has('customerType') && pick('customerTypeId', 'Customer type', opts?.customerTypes ?? (opts ? [] : undefined))}

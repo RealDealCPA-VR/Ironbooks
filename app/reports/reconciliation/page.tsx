@@ -25,7 +25,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
-import { formatCurrency } from '@/lib/money';
+import { useReportNumbers } from '@/app/reports/_components/NumberFormatPanel';
 import { formatShortDate } from '@/lib/format';
 import { csvMinimal, withCsvBom } from '@/lib/csv';
 
@@ -120,6 +120,8 @@ function downloadCsv(csv: string, filename: string) {
 // ---------------------------------------------------------------------------
 
 export default function ReconciliationReportsPage() {
+  // Fonts & Numbers (the same remembered format as the standard reports).
+  const nums = useReportNumbers();
   const [sessions, setSessions] = useState<Reconciliation[]>([]);
   const [discrepancies, setDiscrepancies] = useState<DiscrepancyRow[]>([]);
   const [loading, setLoading] = useState(true);
@@ -194,8 +196,10 @@ export default function ReconciliationReportsPage() {
   }
 
   return (
-    <main className="min-h-screen bg-offwhite p-8 font-sans">
+    <main className={`min-h-screen bg-offwhite p-8 ${nums.tableClass}`}>
       <PageHeader title="Reconciliation Reports" icon={CheckSquare} />
+      <div className="-mt-3 mb-4 flex justify-end print-hidden">{nums.button}</div>
+      {nums.panel}
 
       {loading ? (
         <Card className="p-12">
@@ -246,9 +250,9 @@ export default function ReconciliationReportsPage() {
                         </span>
                       </Td>
                       <Td>{fmtDate(r.statementDate)}</Td>
-                      <Td numeric>{formatCurrency(r.statementBalance)}</Td>
+                      <Td numeric>{nums.money(r.statementBalance)}</Td>
                       <Td numeric>
-                        {r.reconciledBalance ? formatCurrency(r.reconciledBalance) : '—'}
+                        {r.reconciledBalance ? nums.money(r.reconciledBalance) : '—'}
                       </Td>
                       <Td>
                         <Badge tone={statusTone(r.status)}>{statusLabel(r.status)}</Badge>
@@ -314,10 +318,10 @@ export default function ReconciliationReportsPage() {
                       <Td className="tabular-nums text-navy/60">#{d.entryNumber}</Td>
                       <Td>{fmtDate(d.date)}</Td>
                       <Td className="max-w-xs truncate">{d.description}</Td>
-                      <Td numeric>{d.reconciledAmount != null ? formatCurrency(d.reconciledAmount) : ''}</Td>
+                      <Td numeric>{d.reconciledAmount != null ? nums.money(d.reconciledAmount) : ''}</Td>
                       <Td>{changeLabel(d.changeType)}</Td>
                       <Td numeric className="text-red-600">
-                        {formatCurrency(d.amount)}
+                        {nums.money(d.amount)}
                       </Td>
                       <Td>{fmtDate(d.changedAt ?? d.voidedAt)}</Td>
                     </Tr>

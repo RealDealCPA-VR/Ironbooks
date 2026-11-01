@@ -8,7 +8,7 @@
  */
 import type Decimal from 'decimal.js';
 import { eq } from 'drizzle-orm';
-import { budgets, classes, employees, items, jobs, mileageLogs, vehicles, vendors } from '@/lib/db/schema';
+import { budgets, classes, employees, inventorySites, items, jobs, mileageLogs, salesReps, vehicles, vendors } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import type { CellValue, StdColumn, StdReport, StdRow } from '@/lib/reports/types';
 import type { ReportParams } from '@/lib/validation/reports';
@@ -492,6 +492,10 @@ export interface ReportFilterOptions {
   customerTypes: FilterOption[];
   vendorTypes: FilterOption[];
   jobTypes: FilterOption[];
+  /** Sales reps (Sales by Rep). */
+  reps: FilterOption[];
+  /** Inventory sites (site reports). */
+  sites: FilterOption[];
 }
 
 /**
@@ -502,7 +506,7 @@ export async function reportFilterOptions(ctx: ServiceContext): Promise<ReportFi
   requireAnyReportAccess(ctx);
   const c = ctx.companyId;
   const typeLists = await typeListOptions(ctx);
-  const [meta, custs, vends, cls, its, emps, jbs, bdg, veh] = await Promise.all([
+  const [meta, custs, vends, cls, its, emps, jbs, bdg, veh, reps, sites] = await Promise.all([
     loadAccountMeta(ctx),
     customerNames(ctx),
     ctx.db.select({ id: vendors.id, name: vendors.displayName }).from(vendors).where(eq(vendors.companyId, c)),
@@ -520,6 +524,8 @@ export async function reportFilterOptions(ctx: ServiceContext): Promise<ReportFi
         ...rows,
         ...(await ctx.db.select({ v: vehicles.name }).from(vehicles).where(eq(vehicles.companyId, c))),
       ]),
+    ctx.db.select({ id: salesReps.id, name: salesReps.name }).from(salesReps).where(eq(salesReps.companyId, c)),
+    ctx.db.select({ id: inventorySites.id, name: inventorySites.name }).from(inventorySites).where(eq(inventorySites.companyId, c)),
   ]);
   const byName = <T extends { name: string }>(a: T, b: T) => a.name.localeCompare(b.name);
   return {
@@ -539,5 +545,7 @@ export async function reportFilterOptions(ctx: ServiceContext): Promise<ReportFi
       .sort((a, b) => b.fiscalYear - a.fiscalYear || a.name.localeCompare(b.name)),
     vehicles: [...new Set(veh.map((v) => v.v).filter((v): v is string => !!v))].sort(),
     ...typeLists,
+    reps: reps.sort(byName),
+    sites: sites.sort(byName),
   };
 }

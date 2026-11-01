@@ -5,7 +5,8 @@ import Link from 'next/link';
 import { Building2 } from 'lucide-react';
 import { Button, Card, PageHeader, Table, Th, Td, Tr, Badge, toast } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
-import { formatCurrency, Money, toAmountString } from '@/lib/money';
+import { Money, toAmountString } from '@/lib/money';
+import { MoneyProvider, useMoney, useReportNumbers } from '@/app/reports/_components/NumberFormatPanel';
 import type { ConsolidatedPL, ConsolidatedBS } from '@/lib/services/consolidation';
 import { AsOfControl, RangeControls } from '../_components/shared';
 
@@ -41,12 +42,13 @@ function TotalRow({
   values: string[];
   className?: string;
 }) {
+  const money = useMoney();
   return (
     <tr className={`border-t border-navy/20 font-semibold text-navy/80 ${className}`}>
       <td className="py-2 px-3">{label}</td>
       {values.map((v, i) => (
         <td key={i} className="py-2 px-3 text-right tabular-nums">
-          {formatCurrency(v)}
+          {money(v)}
         </td>
       ))}
     </tr>
@@ -58,6 +60,7 @@ function TotalRow({
 // ---------------------------------------------------------------------------
 
 function PLTable({ data }: { data: ConsolidatedPL }) {
+  const money = useMoney();
   const { companies, consolidated } = data;
   const colSpan = companies.length + 2; // label + one per company + consolidated
 
@@ -96,12 +99,12 @@ function PLTable({ data }: { data: ConsolidatedPL }) {
                     const line = c.report.income.find((l) => l.code === code);
                     return (
                       <Td key={c.companyId} className="text-right tabular-nums text-navy">
-                        {line ? formatCurrency(line.amount) : '-'}
+                        {line ? money(line.amount) : '-'}
                       </Td>
                     );
                   })}
                   <Td className="text-right tabular-nums text-navy bg-navy/5">
-                    {formatCurrency(
+                    {money(
                       Money.add(
                         ...companies.map((c) => c.report.income.find((l) => l.code === code)?.amount),
                       ),
@@ -145,12 +148,12 @@ function PLTable({ data }: { data: ConsolidatedPL }) {
                     const line = c.report.expenses.find((l) => l.code === code);
                     return (
                       <Td key={c.companyId} className="text-right tabular-nums text-navy">
-                        {line ? formatCurrency(line.amount) : '-'}
+                        {line ? money(line.amount) : '-'}
                       </Td>
                     );
                   })}
                   <Td className="text-right tabular-nums text-navy bg-navy/5">
-                    {formatCurrency(
+                    {money(
                       Money.add(
                         ...companies.map((c) => c.report.expenses.find((l) => l.code === code)?.amount),
                       ),
@@ -182,7 +185,7 @@ function PLTable({ data }: { data: ConsolidatedPL }) {
                     net >= 0 ? 'text-emerald' : 'text-red-600'
                   }`}
                 >
-                  {formatCurrency(c.report.netIncome)}
+                  {money(c.report.netIncome)}
                 </td>
               );
             })}
@@ -191,7 +194,7 @@ function PLTable({ data }: { data: ConsolidatedPL }) {
                 parseFloat(consolidated.netIncome) >= 0 ? 'text-emerald' : 'text-red-600'
               }`}
             >
-              {formatCurrency(consolidated.netIncome)}
+              {money(consolidated.netIncome)}
             </td>
           </tr>
         </tfoot>
@@ -219,6 +222,7 @@ function BSSection({
   getTotal: (r: ConsolidatedBS['consolidated']) => string;
   colSpan: number;
 }) {
+  const money = useMoney();
   const allCodes = Array.from(
     new Map(
       companies.flatMap((c) => getLines(c.report).map((l) => [l.code, l.name])),
@@ -245,12 +249,12 @@ function BSSection({
               const line = getLines(c.report).find((l) => l.code === code);
               return (
                 <Td key={c.companyId} className="text-right tabular-nums text-navy">
-                  {line ? formatCurrency(line.amount) : '-'}
+                  {line ? money(line.amount) : '-'}
                 </Td>
               );
             })}
             <Td className="text-right tabular-nums text-navy bg-navy/5">
-              {formatCurrency(
+              {money(
                 Money.add(
                   ...companies.map((c) => getLines(c.report).find((l) => l.code === code)?.amount),
                 ),
@@ -273,6 +277,7 @@ function BSSection({
 }
 
 function BSTable({ data }: { data: ConsolidatedBS }) {
+  const money = useMoney();
   const { companies, consolidated } = data;
   const colSpan = companies.length + 2;
 
@@ -327,22 +332,22 @@ function BSTable({ data }: { data: ConsolidatedBS }) {
             <td className="py-2 px-3">Retained Earnings (net income)</td>
             {companies.map((c) => (
               <td key={c.companyId} className="py-2 px-3 text-right tabular-nums">
-                {formatCurrency(c.report.retainedEarnings)}
+                {money(c.report.retainedEarnings)}
               </td>
             ))}
             <td className="py-2 px-3 text-right tabular-nums bg-navy/5">
-              {formatCurrency(consolidated.retainedEarnings)}
+              {money(consolidated.retainedEarnings)}
             </td>
           </tr>
           <tr className="border-t-2 border-navy/30 text-base font-bold">
             <td className="py-3 px-3 text-navy">Total Equity (incl. retained earnings)</td>
             {companies.map((c) => (
               <td key={c.companyId} className="py-3 px-3 text-right tabular-nums text-navy">
-                {formatCurrency(c.report.totalEquity)}
+                {money(c.report.totalEquity)}
               </td>
             ))}
             <td className="py-3 px-3 text-right tabular-nums text-navy bg-navy/5">
-              {formatCurrency(consolidated.totalEquity)}
+              {money(consolidated.totalEquity)}
             </td>
           </tr>
           <tr className="border-t border-navy/20 font-semibold text-navy/80">
@@ -375,6 +380,8 @@ function BSTable({ data }: { data: ConsolidatedBS }) {
 // ---------------------------------------------------------------------------
 
 export default function ConsolidatedReportPage() {
+  // Fonts & Numbers (the same remembered format as the standard reports).
+  const nums = useReportNumbers();
   const [reportType, setReportType] = useState<ReportType>('pl');
   const [plData, setPlData] = useState<ConsolidatedPL | null>(null);
   const [bsData, setBsData] = useState<ConsolidatedBS | null>(null);
@@ -427,7 +434,8 @@ export default function ConsolidatedReportPage() {
     reportType === 'pl' ? (plData?.companies.length ?? 0) : (bsData?.companies.length ?? 0);
 
   return (
-    <main className="min-h-screen bg-offwhite p-8 font-sans">
+    <MoneyProvider value={nums.money}>
+    <main className={`min-h-screen bg-offwhite p-8 ${nums.tableClass}`}>
       <nav aria-label="More combined reports" className="mb-3 flex flex-wrap gap-x-4 gap-y-1 text-sm print-hidden">
         <span className="text-navy/50">More combined reports:</span>
         <Link className="text-electric hover:underline" href="/reports/std/combined-trial-balance">Trial Balance</Link>
@@ -458,6 +466,8 @@ export default function ConsolidatedReportPage() {
           </div>
         }
       />
+      <div className="-mt-3 mb-4 flex justify-end print-hidden">{nums.button}</div>
+      {nums.panel}
 
       <Card className="p-4 mb-4 print-hidden">
         {reportType === 'pl' ? (
@@ -500,5 +510,6 @@ export default function ConsolidatedReportPage() {
         ) : null}
       </Card>
     </main>
+    </MoneyProvider>
   );
 }

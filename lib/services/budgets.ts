@@ -268,8 +268,22 @@ async function setBudgetLineInTx(
       .where(and(eq(classes.id, classId), eq(classes.companyId, ctx.companyId)));
     if (!cls) throw notFound('Class');
   }
-  // A budget is either company-wide or by Customer:Job (QB picks the criteria per budget) —
-  // mixing would double count in budget-vs-actual totals.
+  // A budget is company-wide, by Class or by Customer:Job (QB picks the criteria per budget) —
+  // mixing double counted: Budget vs. Actual for the whole company added the class lines to the
+  // company-wide ones.
+  if (customerId && classId) throw validation('A budget amount is for a class or a Customer:Job, not both.');
+  const [classMix] = await ctx.db
+    .select({ id: budgetLines.id })
+    .from(budgetLines)
+    .where(and(eq(budgetLines.budgetId, budgetId), classId ? isNull(budgetLines.classId) : isNotNull(budgetLines.classId)))
+    .limit(1);
+  if (classMix) {
+    throw validation(
+      classId
+        ? 'This budget is not by class; create a separate budget by class.'
+        : 'This budget is by class; choose a class for every amount.',
+    );
+  }
   const [mix] = await ctx.db
     .select({ id: budgetLines.id })
     .from(budgetLines)
@@ -371,7 +385,7 @@ interface FiscalMonth {
  * keep their CALENDAR month (1 = January, as the budget grid enters them); each calendar month
  * is the one month of that name inside the fiscal year, so a calendar-year company is unchanged.
  */
-async function budgetFiscalYear(ctx: ServiceContext, fiscalYear: number) {
+export async function budgetFiscalYear(ctx: ServiceContext, fiscalYear: number) {
   const w = fiscalYearWindow(fiscalYear, await companyFiscalYearEnd(ctx));
   const from = w.yearStart;
   const to = new Date(w.yearEnd.getTime() - 1);

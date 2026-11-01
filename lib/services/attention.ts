@@ -170,10 +170,26 @@ async function resolveHomeCurrency(ctx: ServiceContext, settingsCurrency: unknow
   return (pick as string | undefined) ?? 'USD';
 }
 
+/**
+ * The calendar day of a stored calendar date (UTC midnight, or a raw 'YYYY-MM-DD …' string from
+ * SQL). A raw string is read by its own digits: new Date('2026-07-01 00:00:00') is LOCAL midnight,
+ * the day before in UTC east of Greenwich.
+ */
 function isoDay(d: Date | string | null | undefined): string | null {
   if (!d) return null;
+  if (typeof d === 'string' && /^\d{4}-\d{2}-\d{2}/.test(d)) return d.slice(0, 10);
   const x = d instanceof Date ? d : new Date(d);
   return isNaN(x.getTime()) ? null : x.toISOString().slice(0, 10);
+}
+
+/**
+ * The company-calendar day of a real moment (when a reminder was sent, a backup made, a problem
+ * found): its UTC day was tomorrow in a US evening.
+ */
+function instantDay(d: Date | string | null | undefined, timeZone: string): string | null {
+  if (!d) return null;
+  const x = d instanceof Date ? d : new Date(d);
+  return isNaN(x.getTime()) ? null : todayInTimeZone(timeZone, x);
 }
 
 /** Whole days from a to b ('YYYY-MM-DD'): positive when b is later. */
@@ -301,6 +317,8 @@ interface SourceEnv {
   payrollLiabilityAccountId: string | null;
   /** Company file data folder (backup history lives there); default = the open file. */
   dataDir?: string;
+  /** The company's time zone (Preferences): real timestamps are shown on its calendar. */
+  timeZone: string;
 }
 
 interface SourceResult {
@@ -422,7 +440,7 @@ const bankTxnSource: Source = async ({ ctx, today, countOnly, hiddenKeys }) => {
 };
 
 /** Invoices past due with money still owed. */
-const overdueInvoiceSource: Source = async ({ ctx, today, countOnly, companyName, homeCurrency, reminderTemplate, sender }) => {
+const overdueInvoiceSource: Source = async ({ ctx, today, countOnly, companyName, homeCurrency, reminderTemplate, sender, timeZone }) => {
   const rows = await ctx.db
     .select({
       id: invoices.id,
@@ -452,7 +470,8 @@ const overdueInvoiceSource: Source = async ({ ctx, today, countOnly, companyName
   const lastSent = new Map<string, string>();
   if (!countOnly && rows.length) {
     const sent = await ctx.db
-      .select({ id: auditLogs.entityId, at: sql<string>`MAX(${auditLogs.createdAt})` })
+      // Typed like the column (stored as UTC wall time), so the moment is read correctly.
+      .select({ id: auditLogs.entityId, at: sql<Date>`MAX(${auditLogs.createdAt})`.mapWith(auditLogs.createdAt) })
       .from(auditLogs)
       .where(
         and(
@@ -462,7 +481,7 @@ const overdueInvoiceSource: Source = async ({ ctx, today, countOnly, companyName
         ),
       )
       .groupBy(auditLogs.entityId);
-    for (const s of sent) lastSent.set(s.id, isoDay(s.at) ?? '');
+    for (const s of sent) lastSent.set(s.id, instantDay(s.at, timeZone) ?? '');
   }
 
   const canEmail = allowed(ctx, 'customers', 'print');
@@ -570,7 +589,7 @@ const ERROR_TITLES: Record<string, string> = {
 const SEVERITY_URGENCY: Record<string, number> = { critical: 60, high: 30, medium: 5, low: -10 };
 
 /** Open findings of the error scan (AI Review), worst first. */
-const aiErrorSource: Source = async ({ ctx, today }) => {
+const aiErrorSource: Source = async ({ ctx, today, timeZone }) => {
   const rows = await ctx.db
     .select({
       id: errorDetections.id,
@@ -584,7 +603,7 @@ const aiErrorSource: Source = async ({ ctx, today }) => {
     .where(and(eq(errorDetections.companyId, ctx.companyId), isNull(errorDetections.resolvedAt)))
     .orderBy(asc(errorDetections.detectedAt));
   const items = rows.map((r) => {
-    const found = isoDay(r.detectedAt) ?? today;
+    const found = instantDay(r.detectedAt, timeZone) ?? today;
     const href = `/errors?focus=${r.id}`;
     return item({
       key: `ai_error:${r.id}`,
@@ -772,7 +791,7 @@ const todoSource: Source = async ({ ctx, today }) => {
 };
 
 /** No backup of the company file for more than a week. */
-const backupSource: Source = async ({ ctx, today, companyCreatedAt, dataDir }) => {
+const backupSource: Source = async ({ ctx, today, companyCreatedAt, dataDir, timeZone }) => {
   if (ctx.access) {
     try {
       await requireFileAdmin(ctx);
@@ -783,8 +802,8 @@ const backupSource: Source = async ({ ctx, today, companyCreatedAt, dataDir }) =
   // Backup history is kept by lib/services/backupHistory.ts (every manual, scheduled, quit-time
   // and Back up now copy of the whole file).
   const newestFull = lastFullBackup(readBackupHistory(dataDir));
-  const last = isoDay(newestFull?.at ?? null);
-  const since = last ?? isoDay(companyCreatedAt) ?? today;
+  const last = instantDay(newestFull?.at ?? null, timeZone);
+  const since = last ?? instantDay(companyCreatedAt, timeZone) ?? today;
   const age = daysBetween(since, today);
   if (age <= BACKUP_STALE_DAYS) return { items: [] };
   return {
@@ -912,6 +931,7 @@ export async function getAttention(ctx: ServiceContext, opts: AttentionOptions =
     companyCreatedAt: company?.createdAt ?? null,
     payrollLiabilityAccountId: prefs.payrollLiabilityAccountId ?? null,
     dataDir: opts.dataDir,
+    timeZone: prefs.timezone,
   };
 
   const kinds = new Set(attentionKindsFor(ctx));

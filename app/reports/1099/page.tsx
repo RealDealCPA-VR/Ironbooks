@@ -18,6 +18,7 @@ import {
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency, Money, toAmountString } from '@/lib/money';
+import { MoneyProvider, useMoney, useReportNumbers } from '@/app/reports/_components/NumberFormatPanel';
 import { csvQuoted, withCsvBom } from '@/lib/csv';
 import { lastCompletedYear } from '@/lib/formPeriods';
 
@@ -264,6 +265,7 @@ function MappingEditor({
 // ---------------------------------------------------------------------------
 
 function NecTable({ rows, threshold }: { rows: WorksheetRow[]; threshold?: string }) {
+  const money = useMoney();
   const visible = rows.filter((r) => Number(r.nec1) > 0);
   const total = toAmountString(Money.add(...visible.map((r) => r.nec1), 0));
   return (
@@ -295,7 +297,7 @@ function NecTable({ rows, threshold }: { rows: WorksheetRow[]; threshold?: strin
                 <Td className="tabular-nums text-navy/70">
                   {row.taxId ?? <span className="italic text-gold text-xs">Not on file</span>}
                 </Td>
-                <Td numeric className="font-semibold">{formatCurrency(row.nec1)}</Td>
+                <Td numeric className="font-semibold">{money(row.nec1)}</Td>
                 <Td>
                   {row.necEligible ? (
                     <Badge tone="success">Required</Badge>
@@ -313,7 +315,7 @@ function NecTable({ rows, threshold }: { rows: WorksheetRow[]; threshold?: strin
               <td colSpan={2} className="py-3 px-4">
                 Total — {visible.length} vendor{visible.length !== 1 ? 's' : ''}
               </td>
-              <td className="py-3 px-4 text-right tabular-nums">{formatCurrency(total)}</td>
+              <td className="py-3 px-4 text-right tabular-nums">{money(total)}</td>
               <td />
             </tr>
           </tfoot>
@@ -324,6 +326,7 @@ function NecTable({ rows, threshold }: { rows: WorksheetRow[]; threshold?: strin
 }
 
 function MiscTable({ rows, threshold }: { rows: WorksheetRow[]; threshold?: string }) {
+  const money = useMoney();
   const visible = rows.filter((r) => Number(r.misc1) > 0 || Number(r.misc3) > 0);
   const totalRents = toAmountString(Money.add(...visible.map((r) => r.misc1), 0));
   const totalOther = toAmountString(Money.add(...visible.map((r) => r.misc3), 0));
@@ -360,8 +363,8 @@ function MiscTable({ rows, threshold }: { rows: WorksheetRow[]; threshold?: stri
                 <Td className="tabular-nums text-navy/70">
                   {row.taxId ?? <span className="italic text-gold text-xs">Not on file</span>}
                 </Td>
-                <Td numeric className="font-semibold">{formatCurrency(row.misc1)}</Td>
-                <Td numeric className="font-semibold">{formatCurrency(row.misc3)}</Td>
+                <Td numeric className="font-semibold">{money(row.misc1)}</Td>
+                <Td numeric className="font-semibold">{money(row.misc3)}</Td>
                 <Td>
                   {row.miscEligible ? (
                     <Badge tone="success">Required</Badge>
@@ -379,8 +382,8 @@ function MiscTable({ rows, threshold }: { rows: WorksheetRow[]; threshold?: stri
               <td colSpan={2} className="py-3 px-4">
                 Total — {visible.length} vendor{visible.length !== 1 ? 's' : ''}
               </td>
-              <td className="py-3 px-4 text-right tabular-nums">{formatCurrency(totalRents)}</td>
-              <td className="py-3 px-4 text-right tabular-nums">{formatCurrency(totalOther)}</td>
+              <td className="py-3 px-4 text-right tabular-nums">{money(totalRents)}</td>
+              <td className="py-3 px-4 text-right tabular-nums">{money(totalOther)}</td>
               <td />
             </tr>
           </tfoot>
@@ -395,6 +398,8 @@ function MiscTable({ rows, threshold }: { rows: WorksheetRow[]; threshold?: stri
 // ---------------------------------------------------------------------------
 
 export default function Report1099Page() {
+  // Fonts & Numbers (the same remembered format as the standard reports).
+  const nums = useReportNumbers();
   const yearOptions = buildYearOptions();
 
   // 1099s are prepared for the last finished calendar year (QB: "Last Calendar Year").
@@ -452,7 +457,8 @@ export default function Report1099Page() {
   }
 
   return (
-    <main className="min-h-screen bg-offwhite p-8 font-sans">
+    <MoneyProvider value={nums.money}>
+    <main className={`min-h-screen bg-offwhite p-8 ${nums.tableClass}`}>
       <PageHeader
         title="1099 Worksheets (NEC + MISC)"
         icon={Receipt}
@@ -468,6 +474,8 @@ export default function Report1099Page() {
           </Button>
         }
       />
+      <div className="-mt-3 mb-4 flex justify-end print-hidden">{nums.button}</div>
+      {nums.panel}
 
       {/* ---- Year picker ---- */}
       <Card className="p-4 mb-6">
@@ -540,5 +548,6 @@ export default function Report1099Page() {
         </>
       )}
     </main>
+    </MoneyProvider>
   );
 }

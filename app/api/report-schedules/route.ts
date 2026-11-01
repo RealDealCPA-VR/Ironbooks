@@ -1,7 +1,8 @@
 /**
  * GET  /api/report-schedules — list scheduled reports (+ the export folder they write to)
  * POST /api/report-schedules — schedule a memorized report or group
- *   ({ name, memorizedReportId | groupId, frequency: daily|weekly|monthly, startDate?, format?, folder? })
+ *   ({ name, memorizedReportId | groupId, frequency: daily|weekly|monthly, startDate?, format?, folder?,
+ *    emailTo? — also email the files to these addresses })
  * Schedules write export files to the local disk, so they need the file-utilities permission.
  */
 import { NextRequest, NextResponse } from 'next/server';

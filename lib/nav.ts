@@ -31,6 +31,7 @@ import { ClipboardCheck, Table2, Eraser } from 'lucide-react';
 // wave2 sales: Income Tracker, Collections Center, Batch Invoicing
 import { TrendingUp, PhoneCall } from 'lucide-react';
 import { Bookmark, LineChart, Grid3x3, Search } from 'lucide-react'; // wave2 reports
+import { MessageSquare } from 'lucide-react'; // reports: Commented Reports
 // wave2 prefs: calendar, reminders, lead center, letters, form templates
 import { Bell, CalendarDays, Contact, Mail, LayoutTemplate } from 'lucide-react';
 // p1 ux: Simple mode
@@ -162,6 +163,7 @@ export const navGroups: NavGroup[] = [
       { icon: Percent, label: 'Sales Tax Liability', path: '/reports/sales-tax', qb: 'Sales Tax Liability', keywords: 'sales tax owed' }, // wave2 accountant
       { icon: Network, label: 'Combined company reports', path: '/reports/consolidated', qb: 'Combine Reports from Multiple Companies', keywords: 'consolidated' },
       { icon: Bookmark, label: 'Saved reports', path: '/reports/memorized', qb: 'Memorized Reports', keywords: 'memorized' },
+      { icon: MessageSquare, label: 'Commented reports', path: '/reports/commented', qb: 'Commented Reports', keywords: 'comment notes report' }, // reports
       { icon: LineChart, label: 'Graphs', path: '/reports/graphs', qb: 'Graphs', keywords: 'chart' },
       { icon: Grid3x3, label: 'Advanced Reporting', path: '/reports/pivot', qb: 'Advanced Reporting', keywords: 'pivot' },
       { icon: Search, label: 'Find Transactions', path: '/find', qb: 'Find', keywords: 'search lookup' },

@@ -234,241 +234,248 @@
       "breakpoints": true
     },
     {
-      "idx": 35,
+      "idx": 33,
       "version": "7",
       "when": 1781300035000,
       "tag": "0035_fix_payroll",
       "breakpoints": true
     },
     {
-      "idx": 36,
+      "idx": 34,
       "version": "7",
       "when": 1781300036000,
       "tag": "0036_fix_sales",
       "breakpoints": true
     },
     {
-      "idx": 37,
+      "idx": 35,
       "version": "7",
       "when": 1781300037000,
       "tag": "0037_fix_ledger",
       "breakpoints": true
     },
     {
-      "idx": 39,
+      "idx": 36,
       "version": "7",
       "when": 1781400039000,
       "tag": "0039_p1_ux",
       "breakpoints": true
     },
     {
-      "idx": 40,
+      "idx": 37,
       "version": "7",
       "when": 1781400040000,
       "tag": "0040_p1_salesforms",
       "breakpoints": true
     },
     {
-      "idx": 41,
+      "idx": 38,
       "version": "7",
       "when": 1781400041000,
       "tag": "0041_p1_payments",
       "breakpoints": true
     },
     {
-      "idx": 42,
+      "idx": 39,
       "version": "7",
       "when": 1781400042000,
       "tag": "0042_p1_purchases",
       "breakpoints": true
     },
     {
-      "idx": 43,
+      "idx": 40,
       "version": "7",
       "when": 1781400043000,
       "tag": "0043_p1_fx",
       "breakpoints": true
     },
     {
-      "idx": 46,
+      "idx": 41,
       "version": "7",
       "when": 1781400046000,
       "tag": "0046_p1_controls",
       "breakpoints": true
     },
     {
-      "idx": 47,
+      "idx": 42,
       "version": "7",
       "when": 1781400047000,
       "tag": "0047_check_layouts",
       "breakpoints": true
     },
     {
-      "idx": 48,
+      "idx": 43,
       "version": "7",
       "when": 1781400048000,
       "tag": "0048_bankrules",
       "breakpoints": true
     },
     {
-      "idx": 50,
+      "idx": 44,
       "version": "7",
       "when": 1781400050000,
       "tag": "0050_receipts",
       "breakpoints": true
     },
     {
-      "idx": 51,
+      "idx": 45,
       "version": "7",
       "when": 1781400051000,
       "tag": "0051_monthend",
       "breakpoints": true
     },
     {
-      "idx": 53,
+      "idx": 46,
       "version": "7",
       "when": 1781400053000,
       "tag": "0053_acctcopy",
       "breakpoints": true
     },
     {
-      "idx": 54,
+      "idx": 47,
       "version": "7",
       "when": 1781400054000,
       "tag": "0054_home",
       "breakpoints": true
     },
     {
-      "idx": 55,
+      "idx": 48,
       "version": "7",
       "when": 1781400055000,
       "tag": "0055_gapsa",
       "breakpoints": true
     },
     {
-      "idx": 56,
+      "idx": 49,
       "version": "7",
       "when": 1781400056000,
       "tag": "0056_gapsb",
       "breakpoints": true
     },
     {
-      "idx": 57,
+      "idx": 50,
       "version": "7",
       "when": 1781400057000,
       "tag": "0057_undo",
       "breakpoints": true
     },
     {
-      "idx": 58,
+      "idx": 51,
       "version": "7",
       "when": 1781400058000,
       "tag": "0058_acctcopy2",
       "breakpoints": true
     },
     {
-      "idx": 59,
+      "idx": 52,
       "version": "7",
       "when": 1781400059000,
       "tag": "0059_deposit_line_accounts",
       "breakpoints": true
     },
     {
-      "idx": 61,
+      "idx": 53,
       "version": "7",
       "when": 1781400061000,
       "tag": "0061_item_value_remainder",
       "breakpoints": true
     },
     {
-      "idx": 62,
+      "idx": 54,
       "version": "7",
       "when": 1781400062000,
       "tag": "0062_user_challenge",
       "breakpoints": true
     },
     {
-      "idx": 63,
+      "idx": 55,
       "version": "7",
       "when": 1781400063000,
       "tag": "0063_r5_ledger",
       "breakpoints": true
     },
     {
-      "idx": 64,
+      "idx": 56,
       "version": "7",
       "when": 1781400064000,
       "tag": "0064_r5_sales",
       "breakpoints": true
     },
     {
-      "idx": 65,
+      "idx": 57,
       "version": "7",
       "when": 1781400065000,
       "tag": "0065_r5_purchases",
       "breakpoints": true
     },
     {
-      "idx": 66,
+      "idx": 58,
       "version": "7",
       "when": 1781400066000,
       "tag": "0066_r5_banking",
       "breakpoints": true
     },
     {
-      "idx": 67,
+      "idx": 59,
       "version": "7",
       "when": 1781400067000,
       "tag": "0067_r5_inventory",
       "breakpoints": true
     },
     {
-      "idx": 68,
+      "idx": 60,
       "version": "7",
       "when": 1781400068000,
       "tag": "0068_r5_payroll",
       "breakpoints": true
     },
     {
-      "idx": 70,
+      "idx": 61,
       "version": "7",
       "when": 1781400070000,
       "tag": "0070_r5_fx",
       "breakpoints": true
     },
     {
-      "idx": 72,
+      "idx": 62,
       "version": "7",
       "when": 1781400072000,
       "tag": "0072_r5_security",
       "breakpoints": true
     },
     {
-      "idx": 77,
+      "idx": 63,
       "version": "7",
       "when": 1781400077000,
       "tag": "0077_filecrypto",
       "breakpoints": true
     },
     {
-      "idx": 79,
+      "idx": 64,
       "version": "7",
       "when": 1781400079000,
       "tag": "0079_prefsperms",
       "breakpoints": true
     },
     {
-      "idx": 81,
+      "idx": 65,
       "version": "7",
       "when": 1781400081000,
       "tag": "0081_purchbank",
       "breakpoints": true
     },
     {
-      "idx": 82,
+      "idx": 66,
       "version": "7",
       "when": 1781400082000,
       "tag": "0082_salesar",
+      "breakpoints": true
+    },
+    {
+      "idx": 67,
+      "version": "7",
+      "when": 1781400083000,
+      "tag": "0083_reports",
       "breakpoints": true
     }
   ]

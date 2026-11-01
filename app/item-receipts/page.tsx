@@ -38,6 +38,7 @@ import {
 import { api } from '@/lib/client';
 import { saveWithDuplicateCheck } from '@/lib/purchasesClient';
 import { useFocusParam } from '@/lib/useFocusParam';
+import { useOpenParam } from '@/lib/useOpenParam';
 import { todayISO } from '@/lib/dates';
 import {
   BarcodeScanInput,
@@ -781,6 +782,18 @@ function ItemReceiptsPageContent() {
       setShowNew(true);
     }
   });
+
+  // QuickZoom from a report line (/reports/open → ?open=<id>): open that item receipt. A receipt
+  // whose bill has been entered is changed on the bill (QB), so it is pointed out instead.
+  useOpenParam((id) => {
+    const r = receipts.find((x) => x.id === id);
+    if (r && r.status !== 'open') {
+      toast('The bill for this receipt has been entered — change it on the bill.', 'info');
+      return;
+    }
+    setEditId(id);
+    setShowNew(true);
+  }, !loading);
 
   async function handleVoid() {
     if (!voidTarget) return;

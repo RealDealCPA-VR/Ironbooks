@@ -5,9 +5,10 @@
  * The choice is remembered per person in this browser (localStorage, best effort) and saved
  * with a memorized report.
  */
-import { useEffect, useState } from 'react';
+import { createContext, useContext, useEffect, useState } from 'react';
 import { Label, Select } from '@/components/ui';
-import { DEFAULT_NUMBER_FORMAT, formatAmount, normalizeNumberFormat, type NumberFormat } from '@/lib/reports/format';
+import { Type } from 'lucide-react';
+import { DEFAULT_NUMBER_FORMAT, FONT_CLASS, FONT_SIZE_CLASS, formatAmount, normalizeNumberFormat, type NumberFormat } from '@/lib/reports/format';
 
 const STORAGE_KEY = 'bk.reports.numberFormat';
 
@@ -97,4 +98,49 @@ export default function NumberFormatPanel({ format, onChange }: { format: Number
       </div>
     </div>
   );
+}
+
+/** An amount as the pages hold it: a decimal string, a number or a Decimal. */
+type AmountValue = string | number | { toFixed(dp: number): string } | null | undefined;
+const amountText = (v: NonNullable<AmountValue>): string => (typeof v === 'string' ? v : v.toFixed(2));
+
+/**
+ * Fonts & Numbers on a report page that is not on the standard engine (1099 summary, combined
+ * company reports, reconciliation reports, Report Builder, Find): the same remembered format as
+ * every standard report. `money(v)` renders one amount with it; `tableClass` is the font.
+ */
+export function useReportNumbers() {
+  const [format, setFormat] = useNumberFormat();
+  const [open, setOpen] = useState(false);
+  const money = (v: AmountValue): React.ReactNode => {
+    if (v === null || v === undefined || v === '') return '';
+    const f = formatAmount(amountText(v), format);
+    return f.negative && format.redNegatives ? <span className="text-red-600">{f.text}</span> : f.text;
+  };
+  const tableClass = `${FONT_CLASS[format.font]} ${FONT_SIZE_CLASS[format.fontSize]}`;
+  const button = (
+    <button
+      type="button"
+      onClick={() => setOpen(!open)}
+      aria-expanded={open}
+      className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium text-navy hover:bg-electric/5 print-hidden"
+    >
+      <Type className="h-4 w-4" aria-hidden="true" /> Fonts &amp; numbers
+    </button>
+  );
+  const panel = open ? (
+    <div className="mb-4 print-hidden">
+      <NumberFormatPanel format={format} onChange={setFormat} />
+    </div>
+  ) : null;
+  return { format, money, tableClass, button, panel };
+}
+
+/** The page's amount formatter for its sub-components (MoneyProvider value = useReportNumbers().money). */
+const MoneyContext = createContext<(v: AmountValue) => React.ReactNode>((v) =>
+  v === null || v === undefined || v === '' ? '' : formatAmount(amountText(v), DEFAULT_NUMBER_FORMAT).text,
+);
+export const MoneyProvider = MoneyContext.Provider;
+export function useMoney() {
+  return useContext(MoneyContext);
 }

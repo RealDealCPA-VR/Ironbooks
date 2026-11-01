@@ -38,6 +38,8 @@ export const TXN_TYPE_KEYS = [
   'journal',
   'inventory',
   'item_receipt',
+  /** Build / unbuild assembly value moves (QB "Build Assembly"). */
+  'build_assembly',
   'depreciation',
   'sales_tax_payment',
   'cc_payment',
@@ -59,6 +61,16 @@ export const reportParamsSchema = z
     /** Balance sheet comparison: the earlier as-of date (defaults to one year / one month earlier). */
     priorAsOf: zDateStr.optional(),
     accountId: zId.optional(),
+    /**
+     * Several accounts (QB "Account: Selected accounts"), comma-separated ids — each with its
+     * sub-accounts. QuickZoom of a line that adds up several accounts (Statement of Cash Flows
+     * Inventory / Net cash) lists exactly those accounts.
+     */
+    accountIds: z
+      .string()
+      .max(37 * 500, 'too many accounts')
+      .refine((s) => s.split(',').every((x) => UUID_RE.test(x.trim())), 'must be a list of account ids')
+      .optional(),
     /** Restrict detail to accounts of one P&L / balance-sheet section (sectionForAccount key). */
     section: z.string().max(40).optional(),
     nameId: zId.optional(),
@@ -78,6 +90,12 @@ export const reportParamsSchema = z
     vendorTypeId: zId.optional(),
     jobTypeId: zId.optional(),
     budgetId: zId.optional(),
+    /** Sales by Rep: one sales rep ('none' = sales without a rep). */
+    repId: z.union([zId, z.literal('none')]).optional(),
+    /** Inventory site reports: one site. */
+    siteId: zId.optional(),
+    /** Cash Flow Forecast: periods of a week (QB default) or a month. */
+    period: z.enum(['week', 'month']).optional(),
     txnType: z.enum(TXN_TYPE_KEYS).optional(),
     amountMin: zAmount.optional(),
     amountMax: zAmount.optional(),
@@ -187,6 +205,8 @@ export const reportScheduleSchema = z
       .refine((s) => !s.includes('..'), 'Folder name may not contain ".."')
       .optional(),
     isActive: z.boolean().optional(),
+    /** Also email the export to these addresses (comma separated; checked by the service). */
+    emailTo: z.string().max(5000).nullable().optional(),
   })
   .refine((s) => !!s.memorizedReportId !== !!s.groupId, {
     message: 'Choose either one memorized report or one report group.',
@@ -198,6 +218,8 @@ export const updateReportScheduleSchema = z.object({
   frequency: z.enum(SCHEDULE_FREQUENCIES).optional(),
   isActive: z.boolean().optional(),
   format: z.enum(['csv', 'xlsx']).optional(),
+  /** Recipients of the emailed export; '' or null = files only. */
+  emailTo: z.string().max(5000).nullable().optional(),
 });
 
 export const PIVOT_DIMENSIONS = ['account', 'accountType', 'class', 'customer', 'vendor', 'name', 'item', 'month', 'quarter', 'year', 'txnType'] as const;
@@ -211,4 +233,24 @@ export const pivotSchema = z.object({
   from: zDateStr.optional(),
   to: zDateStr.optional(),
   section: z.string().max(40).optional(),
+});
+
+/** Commented Reports (QB "Comment on Report"). */
+const commentSchema = z.object({
+  id: z.string().max(64).optional(),
+  rowId: z.string().min(1).max(300),
+  columnKey: z.string().min(1).max(60),
+  text: z.string().trim().min(1, 'A comment cannot be empty').max(2000),
+});
+
+export const commentedReportSchema = z.object({
+  name: z.string().trim().min(1, 'Give the commented report a name').max(255),
+  reportType: z.string().trim().min(1, 'Report type is required').max(100),
+  params: z.record(z.unknown()).default({}),
+  comments: z.array(commentSchema).max(200).optional(),
+});
+
+export const updateCommentedReportSchema = z.object({
+  name: z.string().trim().min(1, 'Give the commented report a name').max(255).optional(),
+  comments: z.array(commentSchema).max(200).optional(),
 });

@@ -84,6 +84,35 @@ import {
 } from './reportsAging';
 import { salesTaxLiabilityStd } from './reportsSalesTax';
 import { typeFilterLabel } from './reportTypeFilters';
+import {
+  cashFlowForecast,
+  checkDetailStd,
+  closingDateExceptionsStd,
+  depositDetailStd,
+  employeeContactList,
+  employeeEarningsSummaryStd,
+  inventoryReorderBySite,
+  inventoryStockStatusByItem,
+  inventoryStockStatusBySite,
+  inventoryStockStatusByVendor,
+  inventoryValuationDetailStd,
+  inventoryValuationSummaryStd,
+  missingChecksStd,
+  payrollDetailStd,
+  payrollItemDetailStd,
+  payrollLiabilityBalancesStd,
+  payrollSummaryStd,
+  physicalInventoryWorksheet,
+  quantityOnHandBySiteStd,
+  salesByRepDetail,
+  salesByRepSummary,
+  salesTaxRevenueSummaryStd,
+  serialLotInStockStd,
+  transactionsBySerialLotStd,
+  voidedDeletedDetailStd,
+  voidedDeletedSummaryStd,
+} from './reportsMore';
+import { getPreferences } from './company';
 import { companies } from '@/lib/db/schema';
 import { eq } from 'drizzle-orm';
 
@@ -174,6 +203,33 @@ export const REPORT_RUNNERS: Record<string, Runner> = {
   'combined-pl-by-month': combinedProfitAndLossByMonth,
   'combined-ar-aging': (c, p) => combinedAging(c, p, 'ar'),
   'combined-ap-aging': (c, p) => combinedAging(c, p, 'ap'),
+  // Report gaps round (reportsMore.ts): the legacy-page reports and the missing QB reports.
+  'cash-flow-forecast': cashFlowForecast,
+  'sales-by-rep-summary': salesByRepSummary,
+  'sales-by-rep-detail': salesByRepDetail,
+  'sales-tax-revenue-summary': salesTaxRevenueSummaryStd,
+  'inventory-valuation-summary': inventoryValuationSummaryStd,
+  'inventory-valuation-detail': inventoryValuationDetailStd,
+  'inventory-stock-status-by-item': inventoryStockStatusByItem,
+  'inventory-stock-status-by-vendor': inventoryStockStatusByVendor,
+  'physical-inventory-worksheet': physicalInventoryWorksheet,
+  'quantity-on-hand-by-site': quantityOnHandBySiteStd,
+  'inventory-stock-status-by-site': inventoryStockStatusBySite,
+  'inventory-reorder-by-site': inventoryReorderBySite,
+  'serial-lot-in-stock': serialLotInStockStd,
+  'transactions-by-serial-lot': transactionsBySerialLotStd,
+  'payroll-summary': payrollSummaryStd,
+  'employee-earnings-summary': employeeEarningsSummaryStd,
+  'payroll-detail': payrollDetailStd,
+  'payroll-item-detail': payrollItemDetailStd,
+  'payroll-liability-balances': payrollLiabilityBalancesStd,
+  'employee-contact-list': employeeContactList,
+  'check-detail': checkDetailStd,
+  'deposit-detail': depositDetailStd,
+  'missing-checks': missingChecksStd,
+  'voided-deleted-summary': voidedDeletedSummaryStd,
+  'voided-deleted-detail': voidedDeletedDetailStd,
+  'closing-date-exceptions': closingDateExceptionsStd,
 };
 
 /** True when `key` is a runnable standard report. */
@@ -203,6 +259,11 @@ export async function prepareStandardReport(
   const runner = REPORT_RUNNERS[key];
   // prefsperms: the report's own QB activity (Company & Financial, Accountant & Taxes, …).
   requireActivity(ctx, reportActivity(entry), 'view');
+  // Preferences feature switches (inventory, payroll, sales tax): a report of a feature that is
+  // turned off is not run, exactly like the feature's own pages.
+  if (entry.feature && (await getPreferences(ctx))[entry.feature] === false) {
+    throw validation(`${entry.title} is not available because this feature is turned off in Preferences.`);
+  }
   const merged: Record<string, unknown> = { ...(entry.defaults ?? {}) };
   const entries = rawParams instanceof URLSearchParams ? [...rawParams.entries()] : Object.entries(rawParams ?? {});
   for (const [k, v] of entries) if (v !== undefined && v !== null && String(v) !== '') merged[k] = v;
@@ -264,7 +325,8 @@ export async function executePreparedReport(
   // B4: say which Customer / Vendor / Job Type the report is filtered to.
   const typeLabel = await typeFilterLabel(ctx, params);
   if (typeLabel) report.subtitle = report.subtitle ? `${report.subtitle} · ${typeLabel}` : typeLabel;
-  report.range = await resolvedRange(ctx, params);
+  // A runner with its own default dates (Cash Flow Forecast: the next six weeks) says what it ran.
+  report.range ??= await resolvedRange(ctx, params);
   rememberReportRun(ctx, key, params, report);
   return report;
 }

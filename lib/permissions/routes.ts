@@ -116,6 +116,10 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/budgets': r('company', 'GET POST'),
   '/api/budgets/[id]': r('company', 'GET PATCH'),
   '/api/budgets/[id]/vs-actual': r('reports_financial', 'GET'),
+  // reports (H17): budget tools — create from actuals, copy & adjust, adjust row amounts.
+  '/api/budgets/[id]/fill-from-actuals': r('company', 'POST:modify'),
+  '/api/budgets/[id]/copy': r('company', 'POST:create'),
+  '/api/budgets/[id]/adjust': r('company', 'POST:modify'),
   '/api/fiscal-periods': r('closing', 'GET POST:modify'),
   '/api/fiscal-periods/[id]': r('closing', 'PATCH'),
   '/api/year-end-close': r('closing', 'POST:modify'),
@@ -136,6 +140,10 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/memorized-reports/groups': kind('member', 'GET POST'),
   '/api/memorized-reports/groups/[id]': kind('member', 'PATCH DELETE'),
   '/api/memorized-reports/process': kind('member', 'POST'),
+  // reports: Commented Reports — the service runs / shows each report only to someone who may view
+  // that report's own area (commentedReports.ts), so these are member routes like the above.
+  '/api/commented-reports': kind('member', 'GET POST'),
+  '/api/commented-reports/[id]': kind('member', 'GET PATCH DELETE'),
   // Scheduled reports write export files to the local disk (a file utility).
   '/api/report-schedules': r('file_utilities', 'GET POST'),
   '/api/report-schedules/[id]': r('file_utilities', 'PATCH:modify DELETE'),
@@ -230,6 +238,10 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/product-info': kind('member', 'GET'),
   '/api/transaction-log': r('reports_financial', 'GET'),
   '/api/transaction-log/verify': r('reports_financial', 'GET'),
+  // reports: the filtered log as CSV, every record (streamed); the raw .bktlg + its verification
+  // report is a copy of part of the company file (file utility, like /api/portable).
+  '/api/transaction-log/export': r('reports_financial', 'GET'),
+  '/api/transaction-log/download': r('file_utilities', 'GET:create'),
   '/api/qb-import/gl': r('file_utilities', 'GET POST'),
   '/api/qb-import/open-items': r('file_utilities', 'GET POST'),
   '/api/integrity': r('file_utilities', 'GET'),
@@ -838,7 +850,11 @@ export const PAGE_AREAS: Record<string, Area | Area[]> = {
   '/reports/reconciliation': 'accounting',
   // wave2 reports. The standard report viewer, memorized reports and graphs host reports from
   // several areas; their APIs check each report's own area (runStandardReport / graph kind).
-  '/reports/std': [...ANY_REPORT, 'time'],
+  // reports: the std viewer also hosts the Sales Tax and Closing Date Exception reports.
+  '/reports/std': [...ANY_REPORT, 'time', 'sales_tax', 'closing'],
+  '/reports/commented': [...ANY_REPORT, 'time', 'sales_tax', 'closing'],
+  // QuickZoom to the source form: the form page then checks its own area.
+  '/reports/open': [...ANY_REPORT, 'time', 'sales_tax', 'closing'],
   '/reports/drilldown': ANY_REPORT, // reportexplain: QuickZoom list; the API checks the report's area
   '/reports/memorized': ANY_REPORT,
   '/reports/graphs': ['reports_financial', 'reports_sales', 'reports_purchases'],

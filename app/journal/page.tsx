@@ -39,6 +39,7 @@ import { TypeaheadSelect } from '@/components/TypeaheadSelect';
 import type { TypeaheadChoice } from '@/lib/typeahead';
 import { computeJournalBalance, journalPayloadLines } from '@/lib/journalBalance';
 import { api } from '@/lib/client';
+import { useOpenParam } from '@/lib/useOpenParam';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
 import { firstOfNextMonthISO, todayISO } from '@/lib/dates';
@@ -852,6 +853,9 @@ function JournalPageContent() {
     await openEdit(e);
     setFormKey((k) => k + 1);
   };
+
+  // QuickZoom from a report line (/reports/open → ?open=<id>): open that journal entry.
+  useOpenParam((id) => void openEdit({ id } as JournalEntry), !loading);
 
   const openEdit = async (entry: JournalEntry) => {
     try {

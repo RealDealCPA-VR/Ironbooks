@@ -18,7 +18,7 @@ import { ArrowLeft, ExternalLink, ListTree } from 'lucide-react';
 import { Badge, Button, Card, EmptyState, PageHeader, Spinner, useListKeys } from '@/components/ui';
 import EntryDetailModal, { sourceRefLink } from '@/components/EntryDetailModal';
 import { api, ApiError } from '@/lib/client';
-import { formatCurrency } from '@/lib/money';
+import { useReportNumbers } from './NumberFormatPanel';
 import { CATALOG_BY_KEY, stdReportHref } from '@/lib/reports/catalog';
 import { drilldownApiUrl, drilldownListNotes, reportOptions, safeBackHref, type CellDrilldown } from '@/lib/reports/drilldown';
 
@@ -40,6 +40,8 @@ export function DrilldownListNotes({ data }: { data: Pick<CellDrilldown, 'listTr
 }
 
 export default function DrilldownView() {
+  // Fonts & Numbers (the same remembered format as the standard reports).
+  const nums = useReportNumbers();
   const router = useRouter();
   const search = useSearchParams();
   const report = search?.get('report') ?? '';
@@ -86,7 +88,7 @@ export default function DrilldownView() {
   };
 
   return (
-    <main className="min-h-screen bg-offwhite p-8 font-sans">
+    <main className={`min-h-screen bg-offwhite p-8 ${nums.tableClass}`}>
       <PageHeader
         title="What's behind this number"
         icon={ListTree}
@@ -97,6 +99,8 @@ export default function DrilldownView() {
           </Button>
         }
       />
+      <div className="-mt-3 mb-4 flex justify-end print-hidden">{nums.button}</div>
+      {nums.panel}
 
       {loading && (
         <div className="flex items-center justify-center gap-2 py-16 text-navy/50 text-sm" role="status">
@@ -130,7 +134,7 @@ export default function DrilldownView() {
               <div className="text-right">
                 <p className="text-xs text-navy/50">{data.kind === 'formula' ? 'Calculated amount' : 'Amount on the report'}</p>
                 <p className="text-2xl font-bold text-navy tabular-nums">
-                  {data.cell === null ? '—' : data.kind === 'formula' && /%|pct/i.test(data.column) ? `${data.cell}%` : formatCurrency(data.cell)}
+                  {data.cell === null ? '—' : data.kind === 'formula' && /%|pct/i.test(data.column) ? `${data.cell}%` : nums.money(data.cell)}
                 </p>
                 {data.incomplete ? (
                   <Badge tone="warning">Too many transactions to add up</Badge>
@@ -138,7 +142,7 @@ export default function DrilldownView() {
                   data.ties ? (
                     <Badge tone="success">Adds up to the report</Badge>
                   ) : (
-                    <Badge tone="warning">Adds up to {formatCurrency(data.total)} — run the report again</Badge>
+                    <Badge tone="warning">Adds up to {nums.money(data.total)} — run the report again</Badge>
                   )
                 ) : (
                   <Badge tone="info">Calculated</Badge>
@@ -148,7 +152,7 @@ export default function DrilldownView() {
             <p className="mt-3 text-sm text-navy">{data.explanation}</p>
             {data.kind === 'formula' && (
               <p className="mt-1 text-xs text-navy/60">
-                The list below shows the transactions the calculation is based on ({formatCurrency(data.total)} in total).
+                The list below shows the transactions the calculation is based on ({nums.money(data.total)} in total).
               </p>
             )}
             {data.basis && (
@@ -213,7 +217,7 @@ export default function DrilldownView() {
                           <td className="py-1.5 px-3 text-navy/70">{t.memo}</td>
                           <td className="py-1.5 px-3 text-navy/70">{t.account}</td>
                           <td className={`py-1.5 px-3 text-right tabular-nums whitespace-nowrap ${t.amount.startsWith('-') ? 'text-red-600' : ''}`}>
-                            {formatCurrency(t.amount)}
+                            {nums.money(t.amount)}
                           </td>
                           <td className="py-1.5 px-3 whitespace-nowrap">
                             {doc && (
@@ -232,7 +236,7 @@ export default function DrilldownView() {
                       <td className="py-2 px-3" colSpan={6}>
                         Total of {data.count.toLocaleString('en-US')} transaction{data.count === 1 ? '' : 's'}
                       </td>
-                      <td className="py-2 px-3 text-right tabular-nums">{formatCurrency(data.total)}</td>
+                      <td className="py-2 px-3 text-right tabular-nums">{nums.money(data.total)}</td>
                       <td />
                     </tr>
                   </tfoot>

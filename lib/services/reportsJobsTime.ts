@@ -392,6 +392,10 @@ export async function itemEstimatesVsActuals(ctx: ServiceContext, p: ReportParam
     s.act = s.act.plus(f.amount);
     sums.set(k, s);
   }
+  // QuickZoom: an item's line opens Sales by Item Detail for that item and the same dates.
+  const itemIds = new Map(
+    (await ctx.db.select({ id: items.id, name: items.name }).from(items).where(eq(items.companyId, ctx.companyId))).map((i) => [i.name, i.id] as const),
+  );
   const rows: StdRow[] = [...sums.entries()]
     .sort((a, b) => a[0].localeCompare(b[0]))
     .map(([k, s]) => ({
@@ -399,6 +403,7 @@ export async function itemEstimatesVsActuals(ctx: ServiceContext, p: ReportParam
       depth: 0,
       kind: 'data' as const,
       cells: { label: k, estQty: s.estQty.toFixed(4), actQty: s.actQty.toFixed(4), est: amt(s.est), act: amt(s.act), diff: amt(s.act.minus(s.est)) },
+      href: stdHref('sales-by-item-detail', { itemId: itemIds.get(k), from: p.from ?? '1900-01-01', to: p.to }),
     }));
   const t = [...sums.values()].reduce((a, s) => ({ est: a.est.plus(s.est), act: a.act.plus(s.act) }), { est: Money.zero(), act: Money.zero() });
   rows.push({ id: 'ieva:grand', depth: 0, kind: 'grand', cells: { label: 'TOTAL', est: amt(t.est), act: amt(t.act), diff: amt(t.act.minus(t.est)) } });

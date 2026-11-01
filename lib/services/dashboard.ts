@@ -32,6 +32,7 @@ import { getCompany } from '@/lib/services/company';
 import { notFiscalCloseEntry, profitAndLoss } from '@/lib/services/reports';
 import { arAging } from '@/lib/services/reportsExtra';
 import { ytdRange } from '@/lib/ytd';
+import { activityByAccount, naturalAmount, sectionForAccount } from './reportEngine';
 import type { ServiceContext } from './_base';
 
 // ---------------------------------------------------------------------------
@@ -150,7 +151,7 @@ export async function getDashboardInsights(
 
   const [kpis, aging, plTrend, overdue, dueThisWeek, lowStockCount, lastReconciliation] =
     await Promise.all([
-      kpiCards(ctx, now),
+      kpiCards(ctx, now, endOfToday),
       arAging(ctx, endOfToday),
       profitLossTrend(ctx, now),
       overdueInvoices(ctx, today),
@@ -202,13 +203,21 @@ export async function getDashboardInsights(
  * The original five KPI tiles. Preserves the fiscal-YTD scoping from lib/ytd.ts
  * (settings.fiscalYearEnd "MM-DD"; defaults to Jan 1).
  */
-async function kpiCards(ctx: ServiceContext, now: Date): Promise<DashboardKpis> {
+async function kpiCards(ctx: ServiceContext, now: Date, endOfToday: Date): Promise<DashboardKpis> {
   const company = await getCompany(ctx);
   const ytd = ytdRange(company?.settings?.fiscalYearEnd, now);
-  const [pl, accts] = await Promise.all([profitAndLoss(ctx, ytd), listAccounts(ctx)]);
+  const [pl, accts, act] = await Promise.all([profitAndLoss(ctx, ytd), listAccounts(ctx), activityByAccount(ctx, { to: endOfToday })]);
 
+  // Balances AS OF TODAY (like the A/R aging tile and the year-to-date figures): the cached
+  // account balances include post-dated transactions, so Cash and A/R disagreed with the aging
+  // tile beside them whenever something was dated in the future.
+  const byId = new Map(act.map((r) => [r.accountId, r] as const));
+  const balanceToday = (a: (typeof accts)[number]) => {
+    const r = byId.get(a.id);
+    return r ? naturalAmount(sectionForAccount(a.type, a.subtype), r.debit, r.credit) : Money.zero();
+  };
   const sumWhere = (pred: (a: (typeof accts)[number]) => boolean) =>
-    toAmountString(Money.add(...accts.filter(pred).map((a) => a.balance)));
+    toAmountString(Money.add(...accts.filter(pred).map(balanceToday)));
 
   return {
     ytdFrom: ytd.from.toISOString(),

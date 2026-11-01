@@ -734,6 +734,10 @@ export function resolveCompanyPreferences(settings: unknown): CompanyPreferences
     }
   }
   prefs.sendForms = sendForms;
+  // No time zone chosen: this computer's (the reports' "today" is this computer's day too). The
+  // fixed America/New_York default made Needs attention, reminders and letters flip to tomorrow at
+  // 9 pm Pacific while every report still showed today.
+  if (typeof s.timezone !== 'string' || !s.timezone.trim()) prefs.timezone = localTimeZone();
   if (!TERMS_VALUES.includes(prefs.defaultCustomerTerms)) prefs.defaultCustomerTerms = 'net_30';
   if (!TERMS_VALUES.includes(prefs.defaultVendorTerms)) prefs.defaultVendorTerms = 'net_30';
   if (prefs.reportBasis !== 'cash') prefs.reportBasis = 'accrual';
@@ -763,11 +767,30 @@ export function resolveMyPreferences(stored: unknown): MyPreferences {
 // Helpers used by forms, reports and services
 // ---------------------------------------------------------------------------
 
-/** 'YYYY-MM-DD' for "today" in the company's time zone (falls back to UTC on a bad zone). */
+/** This computer's IANA time zone (UTC when the runtime cannot tell). */
+export function localTimeZone(): string {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  } catch {
+    return 'UTC';
+  }
+}
+
+/** This computer's calendar day of an instant (no import: this module stays dependency-free). */
+function localDay(d: Date): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+/**
+ * 'YYYY-MM-DD' for "today" (or the day of any instant) in the company's time zone. No zone, or
+ * one the runtime does not know: this computer's calendar day — the day the reports use — not
+ * the UTC day (tomorrow in a US evening).
+ */
 export function todayInTimeZone(timeZone: string | null | undefined, now: Date = new Date()): string {
+  if (!timeZone) return localDay(now);
   try {
     const parts = new Intl.DateTimeFormat('en-CA', {
-      timeZone: timeZone || 'UTC',
+      timeZone,
       year: 'numeric',
       month: '2-digit',
       day: '2-digit',
@@ -775,7 +798,7 @@ export function todayInTimeZone(timeZone: string | null | undefined, now: Date =
     const get = (t: string) => parts.find((p) => p.type === t)?.value ?? '';
     return `${get('year')}-${get('month')}-${get('day')}`;
   } catch {
-    return now.toISOString().slice(0, 10);
+    return localDay(now);
   }
 }
 
