@@ -19,7 +19,7 @@
  */
 
 import { and, eq, lte } from 'drizzle-orm';
-import { recurringTemplates } from '@/lib/db/schema';
+import { recurringTemplates, customers, vendors } from '@/lib/db/schema';
 import {
   type ServiceContext,
   ServiceError,
@@ -42,6 +42,9 @@ import { createTransfer, type CreateTransferInput } from './transfers';
 import { accountCurrencyOf, currencyRate } from './exchangeRates';
 import { Money } from '@/lib/money';
 import { createPurchaseOrder, type CreatePurchaseOrderInput } from './purchaseOrders';
+import { createEstimate, type CreateEstimateInput } from './estimates';
+import { createSalesOrder, type CreateSalesOrderInput } from './salesOrders';
+import { createVendorCredit, type CreateVendorCreditInput } from './vendorCredits';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -49,6 +52,8 @@ import { createPurchaseOrder, type CreatePurchaseOrderInput } from './purchaseOr
 
 export const DOC_TYPES = [
   'invoice',
+  'estimate',
+  'sales_order',
   'bill',
   'journal_entry',
   'expense',
@@ -58,6 +63,7 @@ export const DOC_TYPES = [
   'deposit',
   'transfer',
   'purchase_order',
+  'vendor_credit',
 ] as const;
 export type DocType = (typeof DOC_TYPES)[number];
 
@@ -68,10 +74,13 @@ export type DocType = (typeof DOC_TYPES)[number];
  */
 const DOC_AREA: Record<DocType, Area> = {
   invoice: 'customers',
+  estimate: 'customers',
+  sales_order: 'customers',
   sales_receipt: 'customers',
   credit_memo: 'customers',
   bill: 'vendors',
   purchase_order: 'vendors',
+  vendor_credit: 'vendors',
   expense: 'banking',
   check: 'banking',
   deposit: 'banking',
@@ -81,10 +90,13 @@ const DOC_AREA: Record<DocType, Area> = {
 
 const DOC_LABEL_PLURAL: Record<DocType, string> = {
   invoice: 'invoices',
+  estimate: 'estimates',
+  sales_order: 'sales orders',
   sales_receipt: 'sales receipts',
   credit_memo: 'credit memos',
   bill: 'bills',
   purchase_order: 'purchase orders',
+  vendor_credit: 'vendor credits',
   expense: 'expenses',
   check: 'checks',
   deposit: 'deposits',
@@ -426,6 +438,40 @@ async function assertMayAutomate(ctx: ServiceContext, docType: string): Promise<
   if (area) await requireEffectivePermission(ctx, area, 'create');
 }
 
+/**
+ * Memorizing a document runs the payload through the same checks the document's own create
+ * service applies to its identity fields (the name must exist in this company) and its lines,
+ * so a typo is refused when it is memorized — not months later when the recurrence fires.
+ */
+async function validateDocPayload(
+  tx: ServiceContext,
+  docType: string,
+  payload: Record<string, unknown>,
+): Promise<void> {
+  if (docType === 'estimate' || docType === 'sales_order' || docType === 'vendor_credit') {
+    const nameTable = docType === 'vendor_credit' ? vendors : customers;
+    const nameField = docType === 'vendor_credit' ? 'vendorId' : 'customerId';
+    const nameId = payload[nameField];
+    if (typeof nameId !== 'string' || nameId.length === 0) {
+      throw validation(`${docType === 'vendor_credit' ? 'Vendor' : 'Customer'} is required.`);
+    }
+    const [name] = await tx.db
+      .select({ id: nameTable.id })
+      .from(nameTable)
+      .where(and(eq(nameTable.id, nameId), eq(nameTable.companyId, tx.companyId)));
+    if (!name) throw notFound(`${docType === 'vendor_credit' ? 'Vendor' : 'Customer'} not found.`);
+    const lines = payload.lines;
+    if (!Array.isArray(lines) || lines.length === 0) {
+      throw validation('At least one line is required.');
+    }
+    for (const line of lines) {
+      if (!line || typeof line !== 'object' || Array.isArray(line)) {
+        throw validation('Each line must be an object.');
+      }
+    }
+  }
+}
+
 export async function createTemplate(ctx: ServiceContext, input: CreateTemplateInput) {
   if (!input.name?.trim()) {
     throw validation('Template name is required.');
@@ -449,6 +495,7 @@ export async function createTemplate(ctx: ServiceContext, input: CreateTemplateI
   // The view-only check, the insert and its audit entry commit together: a refused call leaves
   // nothing behind.
   return inTransaction(ctx, async (tx) => {
+    await validateDocPayload(tx, input.docType, payloadOf(input.template));
     if (mode === 'automatic') await assertMayAutomate(tx, input.docType);
     const [row] = await tx.db
       .insert(recurringTemplates)
@@ -518,6 +565,7 @@ export async function updateTemplate(ctx: ServiceContext, id: string, input: Upd
         throw validation('template payload must be an object.');
       }
       patch.template = { ...payloadOf(input.template), [OPTIONS_KEY]: { autoEnter: mode === 'automatic' } };
+      await validateDocPayload(tx, before.docType, payloadOf(input.template));
     } else if (input.mode !== undefined) {
       patch.template = {
         ...payloadOf(before.template as Record<string, unknown>),
@@ -703,6 +751,33 @@ async function generateFromTemplate(
       }
       const input = { ...memorized, ...rate, homeAmount: undefined, date: runDate };
       docId = (await createTransfer(ctx, input)).id;
+      break;
+    }
+    case 'estimate': {
+      // The memorized ref number is never reused — a fresh number comes from the sequence.
+      const { refNumber: _drop, ...rest } = payload as unknown as CreateEstimateInput;
+      const input = {
+        ...rest,
+        date: runDate,
+        expirationDate: shiftedDate(payload, 'expirationDate', runDate),
+      };
+      docId = (await createEstimate(ctx, input)).id;
+      break;
+    }
+    case 'sales_order': {
+      const { refNumber: _drop, trackingNumber: _dropTracking, ...rest } = payload as unknown as CreateSalesOrderInput;
+      const input = {
+        ...rest,
+        date: runDate,
+        shipDate: shiftedDate(payload, 'shipDate', runDate),
+      };
+      docId = (await createSalesOrder(ctx, input)).id;
+      break;
+    }
+    case 'vendor_credit': {
+      const { refNumber: _drop, ...rest } = payload as unknown as CreateVendorCreditInput;
+      const input = { ...rest, ...fresh, date: runDate };
+      docId = (await createVendorCredit(ctx, input)).id;
       break;
     }
     case 'purchase_order': {
