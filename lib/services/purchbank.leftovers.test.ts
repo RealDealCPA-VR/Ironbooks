@@ -129,12 +129,12 @@ describe('purchase account lines refuse Undeposited Funds and Inventory Asset', 
     expect(await gl('1300')).toBe('0.00');
   });
 
-  it('Enter Bills and vendor credits: an account line on 1300 / 1050 is refused', async () => {
+  it('Enter Bills and vendor credits: an account line on 1050 is refused; 1300 posts but is not attributed', async () => {
     const v = await vendor();
     await expectCode(
-      createBill(ctx, { vendorId: v.id, date: d('2026-03-01'), lines: [{ accountId: acct['1300'], amount: '40.00' }] }),
+      createBill(ctx, { vendorId: v.id, date: d('2026-03-01'), lines: [{ accountId: acct['1050'], amount: '40.00' }] }),
       'VALIDATION',
-      /inventory asset/,
+      /Undeposited Funds/,
     );
     await expectCode(
       createVendorCredit(ctx, { vendorId: v.id, date: d('2026-03-01'), lines: [{ accountId: acct['1050'], amount: '40.00' }] } as never),
