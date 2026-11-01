@@ -166,7 +166,6 @@ describe('API permission map coverage', () => {
         '/api/company-file/close',
         '/api/company-file/info',
         '/api/company-file/save-as',
-        '/api/email/status',
         // filecrypto: protect the file / new recovery key (an Admin of every company, checked in the handler)
         '/api/file-protection',
         '/api/file-protection/recovery-key',

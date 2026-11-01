@@ -63,6 +63,8 @@ export const ROUTE_ACTIVITIES: Record<string, ActivityRef> = {
   '/api/form-templates': 'company.templates',
   '/api/letters/templates': 'lists.letters',
   '/api/email': 'company.send_forms',
+  // feature round (accountant): System Accounts by role (choosing one is a company setting).
+  '/api/account-roles': ['accounting.accountant_tools', 'company.preferences'],
 
   // ---- Users & Roles ----
   '/api/users': 'users.users',
@@ -145,6 +147,12 @@ export const ROUTE_ACTIVITIES: Record<string, ActivityRef> = {
   '/api/sales-forms/statement-email': 'customers.statements',
   '/api/income-tracker': 'customers.income_tracker',
   '/api/collections': 'customers.collections',
+  // salesar (C6/C9): Collections Center email/letter send (routes need the 'print' right).
+  '/api/collections/email': 'customers.send_forms',
+  '/api/collections/letter': 'customers.send_forms',
+  // salesar: Billing Groups for Batch Invoicing (group CRUD is Customer Center; creating a batch run is Batch Invoicing).
+  '/api/billing-groups': 'customers.batch_invoicing',
+  '/api/billing-groups/[id]': 'customers.center',
   '/api/accountant/write-off': 'customers.write_off',
   '/api/attention/invoice-reminder': 'customers.invoices',
   '/api/smart-defaults/sales': 'customers.invoices',
