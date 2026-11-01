@@ -63,9 +63,7 @@ function cleanPaymentBody(body: PaymentBody): PaymentBody {
 // cmdbar: "receive payment from Acme" opens Receive Payments with the customer picked.
 import { usePrefill } from '@/lib/commands/usePrefill';
 import { TransactionNav, useAdjacentTransactions } from '@/components/TransactionNav';
-<<<<<<< HEAD
 import AttachmentPanel from '@/components/AttachmentPanel'; // J9 Doc Center
-=======
 // salesar: Payment Method list entry (B7), credits split across invoices (C4), deep link.
 import { PaymentMethodField, usePaymentMethods } from '@/components/sales/FormLists';
 import {
@@ -88,7 +86,6 @@ import {
 } from './creditSplit';
 import { CreditsDialog } from './CreditsDialog';
 import { parseReceivePaymentLink, prefillFromLink } from './deepLink';
->>>>>>> feat/salesar
 
 // ---------------------------------------------------------------------------
 // Types
@@ -1440,9 +1437,7 @@ function ReceivePaymentModal({
           </div>
         )}
       </div>
-<<<<<<< HEAD
       <AttachmentPanel className="mt-4" entityType="payment_received" entityId={editing?.id} />
-=======
       {/* C4: credits used on one invoice / General Journal charge (QB's Discount and Credits). */}
       <CreditsDialog
         open={!!creditsFor}
@@ -1458,7 +1453,6 @@ function ReceivePaymentModal({
         onChange={changeCreditUse}
         fmt={(v) => money(v, currency)}
       />
->>>>>>> feat/salesar
     </Modal>
   );
 }

@@ -52,9 +52,7 @@ import {
   useDuplicateNumberConfirm,
 } from '@/components/sales/DocNumberField';
 import { TransactionNav, useAdjacentTransactions } from '@/components/TransactionNav';
-<<<<<<< HEAD
 import AttachmentPanel from '@/components/AttachmentPanel'; // J9 Doc Center
-=======
 // salesar (B8 / B9): Customer Message picker and the per-line Sales Tax Code column.
 import { CustomerMessageField, customerTaxStatus, useCustomerMessages, useSalesTaxCodes } from '@/components/sales/FormLists';
 import {
@@ -66,7 +64,6 @@ import {
   withShownTaxable,
 } from '@/lib/salesFormListsClient';
 import { usePreferences } from '@/lib/usePreferences';
->>>>>>> feat/salesar
 
 // ---------------------------------------------------------------------------
 // Types

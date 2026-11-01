@@ -67,9 +67,7 @@ import { previewSalesTotals } from '@/lib/salesLineMath';
 import { usePrefill } from '@/lib/commands/usePrefill';
 import type { FormPrefill } from '@/lib/commands/prefill';
 import { TransactionNav, useAdjacentTransactions } from '@/components/TransactionNav';
-<<<<<<< HEAD
 import AttachmentPanel from '@/components/AttachmentPanel'; // J9 Doc Center
-=======
 // salesar (B7 / B8 / B9): Payment Method list, Customer Message and the per-line Sales Tax Code.
 import {
   CustomerMessageField,
@@ -96,7 +94,6 @@ import {
   taxItemLabel,
   withShownTaxable,
 } from '@/lib/salesFormListsClient';
->>>>>>> feat/salesar
 
 // ---------------------------------------------------------------------------
 // Types

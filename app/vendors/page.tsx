@@ -40,11 +40,8 @@ import { formatCurrency } from '@/lib/money';
 import { useFocusParam } from '@/lib/useFocusParam';
 import { EntityNotes } from '@/components/lists/EntityNotes';
 import Link from 'next/link';
-<<<<<<< HEAD
 import CenterDetail, { CENTER_ROW_ATTR, useCenterLayout, useCenterSelection } from '@/components/lists/CenterDetail';
-=======
 import { todayISO } from '@/lib/dates';
->>>>>>> feat/salesar
 
 // ---------------------------------------------------------------------------
 // Types

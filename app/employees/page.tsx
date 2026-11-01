@@ -2323,13 +2323,10 @@ export default function EmployeesPage() {
             </Button>
           </div>
         </div>
-<<<<<<< HEAD
         <AttachmentPanel className="mt-4" entityType="employee" entityId={editId} />
-=======
 
         {/* ---- Dated notes (QB Employee Center "Notes"); each note saves on its own ---- */}
         {editId && <EntityNotes entityType="employee" entityId={editId} />}
->>>>>>> feat/salesar
       </Modal>
 
       {/* ---- Run Payroll Modal ---- */}

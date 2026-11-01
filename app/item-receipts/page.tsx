@@ -36,11 +36,8 @@ import {
   useGridKeys,
 } from '@/components/ui';
 import { api } from '@/lib/client';
-<<<<<<< HEAD
 import { saveWithDuplicateCheck } from '@/lib/purchasesClient';
-=======
 import { useFocusParam } from '@/lib/useFocusParam';
->>>>>>> feat/salesar
 import { todayISO } from '@/lib/dates';
 import {
   BarcodeScanInput,

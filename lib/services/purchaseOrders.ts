@@ -26,17 +26,13 @@
  */
 import { assertAccountantMayConvert, assertDividingDateOpen } from './accountantCopy/guard';
 import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
-<<<<<<< HEAD
-import { accounts, auditLogs, classes, customers, items, jobs, purchaseOrders, purchaseOrderLines, vendors } from '@/lib/db/schema';
-=======
-import { accounts, auditLogs, bills, itemReceipts, items, purchaseOrders, purchaseOrderLines, vendors } from '@/lib/db/schema';
+import { accounts, auditLogs, bills, classes, customers, itemReceipts, items, jobs, purchaseOrders, purchaseOrderLines, vendors } from '@/lib/db/schema';
 import {
   assertMayVoidOrDelete,
   auditSnapshot,
   refuseInAccountantCopy,
   unfileAttachments,
 } from './nonPostingDocs';
->>>>>>> feat/salesar
 import { Money, toAmountString } from '@/lib/money';
 import { createBill } from '@/lib/services/bills';
 import {
