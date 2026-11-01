@@ -9,7 +9,10 @@
  *   open  →  partial  (via convertToBill with per-line quantities — some qty unbilled)
  *   open / partial  →  closed   (via convertToBill once every line is fully billed,
  *                                or manually via updateStatus)
- *   open  →  void     (via updateStatus; blocked once anything has been billed)
+ *   open / closed  →  void     (via voidPurchaseOrder / updateStatus; blocked once anything has
+ *                               been received or billed). deletePurchaseOrder removes a PO nothing
+ *                               was received or billed against. Both are listed on the
+ *                               Voided/Deleted Transactions report.
  *
  * Conversion / partial billing:
  *   convertToBill(ctx, poId, opts?) bills the PO (default: every line's full
@@ -23,7 +26,13 @@
  */
 import { assertAccountantMayConvert, assertDividingDateOpen } from './accountantCopy/guard';
 import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
-import { accounts, auditLogs, items, purchaseOrders, purchaseOrderLines, vendors } from '@/lib/db/schema';
+import { accounts, auditLogs, bills, itemReceipts, items, purchaseOrders, purchaseOrderLines, vendors } from '@/lib/db/schema';
+import {
+  assertMayVoidOrDelete,
+  auditSnapshot,
+  refuseInAccountantCopy,
+  unfileAttachments,
+} from './nonPostingDocs';
 import { Money, toAmountString } from '@/lib/money';
 import { createBill } from '@/lib/services/bills';
 import {
@@ -35,7 +44,7 @@ import {
   writeAudit,
 } from './_base';
 import { getReceivingSettings, poStatusFromLines } from './receivingLinks';
-import { allocateDocNumber, renumberDoc } from './docNumbers';
+import { allocateDocNumber, docRef, renumberDoc } from './docNumbers';
 import { assertFeatureOn } from '@/lib/featureGate';
 
 // ---------------------------------------------------------------------------
@@ -472,6 +481,26 @@ async function updateStatusInTx(ctx: ServiceContext, id: string, status: 'open' 
     }
   }
 
+  if (status === 'void') {
+    // Never void a PO with received or billed quantities (the status can lag the lines: manual
+    // status, receipts) or a standing bill / item receipt made from it. A manually closed PO with
+    // nothing received or billed can be voided.
+    await assertPoUnlinked(ctx, po, 'voided');
+    const [voided] = await ctx.db
+      .update(purchaseOrders)
+      .set({ status: 'void' })
+      .where(and(eq(purchaseOrders.id, id), eq(purchaseOrders.companyId, ctx.companyId)))
+      .returning();
+    await writeAudit(ctx, {
+      action: 'void',
+      entityType: 'purchase_order',
+      entityId: id,
+      oldValues: await poAuditValues(ctx, po),
+      newValues: { status: 'void' },
+    });
+    return voided;
+  }
+
   if (po.status === 'closed' && status !== 'closed') {
     throw new ServiceError(
       'CONFLICT',
@@ -484,28 +513,6 @@ async function updateStatusInTx(ctx: ServiceContext, id: string, status: 'open' 
       'CONFLICT',
       'Cannot mark a partially billed purchase order as open — its billed quantities already track the open balance.',
     );
-  }
-
-  if (po.status === 'partial' && status === 'void') {
-    throw new ServiceError(
-      'CONFLICT',
-      'Cannot void a partially billed purchase order. Close it instead to stop further billing.',
-    );
-  }
-  if (status === 'void' && po.status !== 'void') {
-    // The status can lag the lines (manual status, receipts): never void a PO with billed or
-    // received quantities.
-    const [used] = await ctx.db
-      .select({ id: purchaseOrderLines.id })
-      .from(purchaseOrderLines)
-      .where(and(eq(purchaseOrderLines.purchaseOrderId, id), sql`${purchaseOrderLines.quantityBilled} > 0`))
-      .limit(1);
-    if (used) {
-      throw new ServiceError(
-        'CONFLICT',
-        'Items on this purchase order were already received or billed, so it cannot be voided. Close it instead to stop further billing.',
-      );
-    }
   }
 
   const [updated] = await ctx.db
@@ -523,6 +530,153 @@ async function updateStatusInTx(ctx: ServiceContext, id: string, status: 'open' 
   });
 
   return updated;
+}
+
+// ---------------------------------------------------------------------------
+// voidPurchaseOrder / deletePurchaseOrder (QB Edit > Void / Delete Purchase Order)
+// ---------------------------------------------------------------------------
+
+type PurchaseOrderRow = typeof purchaseOrders.$inferSelect;
+
+/**
+ * Refuse a void / delete while anything was received or billed against the PO: a line with
+ * received / billed quantities, a standing (not void) item receipt received against it, or the
+ * bill that closed it — unless that bill was voided (voiding gave the PO its quantities back).
+ */
+async function assertPoUnlinked(ctx: ServiceContext, po: PurchaseOrderRow, verb: 'voided' | 'deleted') {
+  const action = verb === 'voided' ? 'void' : 'delete';
+  const [used] = await ctx.db
+    .select({ id: purchaseOrderLines.id })
+    .from(purchaseOrderLines)
+    .where(
+      and(
+        eq(purchaseOrderLines.purchaseOrderId, po.id),
+        sql`(${purchaseOrderLines.quantityBilled} > 0 OR ${purchaseOrderLines.quantityReceivedUnbilled} > 0)`,
+      ),
+    )
+    .limit(1);
+  if (used || po.status === 'partial') {
+    throw new ServiceError(
+      'CONFLICT',
+      `Items on this purchase order were already received or billed, so it cannot be ${verb}. Close it instead to stop further billing, or void the bills and item receipts made from it first.`,
+    );
+  }
+  const receipts = await ctx.db
+    .select({ ref: itemReceipts.reference, id: itemReceipts.id })
+    .from(itemReceipts)
+    .where(
+      and(
+        eq(itemReceipts.companyId, ctx.companyId),
+        eq(itemReceipts.purchaseOrderId, po.id),
+        sql`${itemReceipts.status} <> 'void'`,
+      ),
+    );
+  if (receipts.length > 0) {
+    throw new ServiceError(
+      'CONFLICT',
+      `Items were received against this purchase order (item receipt${receipts.length === 1 ? '' : 's'} ${receipts
+        .map((r) => r.ref || 'without a number')
+        .join(', ')}), so it can't be ${verb}. Void ${receipts.length === 1 ? 'that item receipt' : 'those item receipts'} first, then ${action} the purchase order.`,
+    );
+  }
+  if (po.convertedBillId) {
+    const [bill] = await ctx.db
+      .select({ n: bills.billNumber, status: bills.status })
+      .from(bills)
+      .where(and(eq(bills.companyId, ctx.companyId), eq(bills.id, po.convertedBillId)));
+    if (bill && bill.status !== 'void') {
+      throw new ServiceError(
+        'CONFLICT',
+        `A bill${bill.n ? ` (Ref. No. ${bill.n})` : ''} was made from this purchase order, so it can't be ${verb}. Void that bill first, then ${action} the purchase order.`,
+      );
+    }
+  }
+}
+
+/** Number, date, vendor and amount of the PO, kept in the audit trail of a void / delete. */
+async function poAuditValues(ctx: ServiceContext, po: PurchaseOrderRow) {
+  const [v] = await ctx.db
+    .select({ name: vendors.displayName })
+    .from(vendors)
+    .where(and(eq(vendors.companyId, ctx.companyId), eq(vendors.id, po.vendorId)));
+  return {
+    ...auditSnapshot({
+      number: docRef(po.refNumber, po.poNumber),
+      date: po.date,
+      name: v?.name ?? null,
+      partyKey: 'vendorName',
+      total: po.total,
+      status: po.status,
+      memo: po.memo,
+    }),
+    poNumber: po.poNumber,
+    refNumber: po.refNumber,
+    vendorId: po.vendorId,
+  };
+}
+
+/**
+ * Void a purchase order (QB Edit > Void Purchase Order): it stays on file marked VOID with its
+ * amounts, can no longer be edited, received or billed, and leaves the open-PO lists and reports.
+ * Refused once anything was received or billed. Needs the Delete right (Vendors).
+ */
+export async function voidPurchaseOrder(ctx: ServiceContext, id: string) {
+  assertMayVoidOrDelete(ctx, 'purchase_order');
+  return updateStatus(ctx, id, 'void');
+}
+
+/**
+ * Delete a purchase order (QB Edit > Delete Purchase Order, Ctrl+D): its lines go with it,
+ * documents filed to it go back to the Doc Center inbox and voided item receipts received against
+ * it lose the link. The audit trail keeps its number, date, vendor, amount and lines (Voided/Deleted
+ * report). Refused once anything was received or billed; a void PO can be deleted. Not available
+ * on the accountant's side of an Accountant's Copy.
+ */
+export async function deletePurchaseOrder(ctx: ServiceContext, id: string): Promise<{ id: string; deleted: true }> {
+  assertMayVoidOrDelete(ctx, 'purchase_order');
+  return inTransaction(ctx, async (tx) => {
+    const [po] = await tx.db
+      .select()
+      .from(purchaseOrders)
+      .where(and(eq(purchaseOrders.id, id), eq(purchaseOrders.companyId, tx.companyId)));
+    if (!po) throw notFound('Purchase order');
+    await assertDividingDateOpen(tx, po.date); // Accountant's Copy (I1)
+    await refuseInAccountantCopy(tx, 'Deleting a purchase order', 'Void it instead (that is sent back).');
+    await assertPoUnlinked(tx, po, 'deleted');
+    const lines = await tx.db
+      .select()
+      .from(purchaseOrderLines)
+      .where(eq(purchaseOrderLines.purchaseOrderId, id))
+      .orderBy(asc(purchaseOrderLines.lineOrder));
+    // Only voided item receipts can still name it (standing ones were refused above).
+    await tx.db
+      .update(itemReceipts)
+      .set({ purchaseOrderId: null })
+      .where(and(eq(itemReceipts.companyId, tx.companyId), eq(itemReceipts.purchaseOrderId, id)));
+    const unfiled = await unfileAttachments(tx, 'purchase_order', id);
+    const before = await poAuditValues(tx, po);
+    await tx.db.delete(purchaseOrderLines).where(eq(purchaseOrderLines.purchaseOrderId, id));
+    await tx.db.delete(purchaseOrders).where(and(eq(purchaseOrders.id, id), eq(purchaseOrders.companyId, tx.companyId)));
+    await writeAudit(tx, {
+      action: 'delete',
+      entityType: 'purchase_order',
+      entityId: id,
+      oldValues: {
+        ...before,
+        expectedDate: po.expectedDate,
+        lines: lines.map((l) => ({
+          itemId: l.itemId,
+          accountId: l.accountId,
+          description: l.description,
+          quantity: l.quantity,
+          rate: l.rate,
+          amount: l.amount,
+        })),
+      },
+      newValues: unfiled > 0 ? { attachmentsUnfiled: unfiled } : null,
+    });
+    return { id, deleted: true as const };
+  });
 }
 
 // ---------------------------------------------------------------------------

@@ -324,6 +324,11 @@ export async function voidedDeletedTransactions(
     vendor_credit: { table: 'vendor_credits', num: 't.ref_number', total: 'total', party: 'vendor_id', partyTable: 'vendors' },
     expense: { table: 'expenses', num: 't.reference', total: 'total', party: 'vendor_id', partyTable: 'vendors', fallbackName: 't.payee_name' },
     deposit: { table: 'deposits', num: 't.memo', total: 'total' },
+    // Non-posting forms (salesar): voided ones are still on file; deleted ones fall back to the
+    // number / date / name / amount their delete audit row keeps (lib/services/nonPostingDocs.ts).
+    estimate: { table: 'estimates', num: "COALESCE(NULLIF(t.ref_number, ''), t.estimate_number::text)", total: 'total', party: 'customer_id', partyTable: 'customers' },
+    sales_order: { table: 'sales_orders', num: "COALESCE(NULLIF(t.ref_number, ''), t.order_number::text)", total: 'total', party: 'customer_id', partyTable: 'customers' },
+    purchase_order: { table: 'purchase_orders', num: "COALESCE(NULLIF(t.ref_number, ''), t.po_number::text)", total: 'total', party: 'vendor_id', partyTable: 'vendors' },
   };
   for (const [type, ids] of byType) {
     const spec = docTables[type];
@@ -391,7 +396,9 @@ export async function voidedDeletedTransactions(
       typeLabel: TRANSACTION_ENTITY_LABELS[l.entityType] ?? l.entityType,
       entityId: l.entityId,
       action: l.action as 'void' | 'delete',
-      number: i?.number ?? pickStr(snap, ['invoiceNumber', 'receiptNumber', 'memoNumber', 'entryNumber', 'billNumber', 'reference', 'number']),
+      number:
+        i?.number ??
+        pickStr(snap, ['invoiceNumber', 'receiptNumber', 'memoNumber', 'entryNumber', 'billNumber', 'reference', 'number', 'estimateNumber', 'orderNumber', 'poNumber']),
       transactionDate: i?.date ?? pickStr(snap, ['date']),
       name: i?.name ?? pickStr(snap, ['customerName', 'vendorName', 'payeeName', 'description']),
       amount,

@@ -9,7 +9,9 @@
  *   open  →  partial  (via convertToInvoice with per-line quantities — some qty backordered)
  *   open / partial  →  closed  (via convertToInvoice once every line is fully invoiced,
  *                               or manually via updateStatus to cancel the backorder)
- *   open  →  void    (via updateStatus; blocked once anything has been invoiced)
+ *   open / closed  →  void    (via voidSalesOrder / updateStatus; blocked once anything has been
+ *                              invoiced). deleteSalesOrder removes an order nothing was invoiced
+ *                              from. Both are listed on the Voided/Deleted Transactions report.
  *
  * Partial invoicing / backorders (mirrors purchaseOrders partial billing):
  *   convertToInvoice(ctx, soId, opts?) invoices the order (default: every line's
@@ -24,7 +26,14 @@
 import { assertAccountantMayConvert, assertDividingDateOpen } from './accountantCopy/guard';
 import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import { Money, toAmountString } from '@/lib/money';
-import { auditLogs, customers, items, salesOrders, salesOrderLines, taxRates } from '@/lib/db/schema';
+import { auditLogs, customers, invoices, items, salesOrders, salesOrderLines, taxRates } from '@/lib/db/schema';
+import {
+  assertMayVoidOrDelete,
+  auditSnapshot,
+  listRefs,
+  refuseInAccountantCopy,
+  unfileAttachments,
+} from './nonPostingDocs';
 import {
   type ServiceContext,
   ServiceError,
@@ -319,6 +328,26 @@ async function updateStatusInTx(
   if (!order) throw notFound('Sales order');
   await assertDividingDateOpen(ctx, order.date); // Accountant's Copy (I1)
 
+  if (status === 'void') {
+    if (order.status === 'void') return order; // already void (a double click)
+    // Whatever the header says, an order with a standing invoice made from it is not voided. A
+    // manually closed order (backorder cancelled) with nothing invoiced can be voided.
+    await assertOrderUnlinked(ctx, order, 'voided');
+    const [voided] = await ctx.db
+      .update(salesOrders)
+      .set({ status: 'void' })
+      .where(and(eq(salesOrders.id, id), eq(salesOrders.companyId, ctx.companyId)))
+      .returning();
+    await writeAudit(ctx, {
+      action: 'void',
+      entityType: 'sales_order',
+      entityId: id,
+      oldValues: await orderAuditValues(ctx, order),
+      newValues: { status: 'void' },
+    });
+    return voided;
+  }
+
   if (order.status === 'closed' && status !== 'closed') {
     throw new ServiceError('CONFLICT', 'Cannot reopen a closed (converted) sales order.');
   }
@@ -328,26 +357,6 @@ async function updateStatusInTx(
       'CONFLICT',
       'Cannot mark a partially invoiced sales order as open — its invoiced quantities already track the open balance.',
     );
-  }
-
-  if (order.status === 'partial' && status === 'void') {
-    throw new ServiceError(
-      'CONFLICT',
-      'Cannot void a partially invoiced sales order. Close it instead to cancel the backorder.',
-    );
-  }
-  if (status === 'void') {
-    // Whatever the header says, an order with invoiced quantities is not voided.
-    const lines = await ctx.db
-      .select({ invoiced: salesOrderLines.quantityInvoiced })
-      .from(salesOrderLines)
-      .where(eq(salesOrderLines.salesOrderId, id));
-    if (lines.some((l) => Money.gt(l.invoiced ?? '0', 0))) {
-      throw new ServiceError(
-        'CONFLICT',
-        'Part of this sales order has been invoiced, so it cannot be voided. Close it instead to cancel the backorder.',
-      );
-    }
   }
 
   const [updated] = await ctx.db
@@ -365,6 +374,127 @@ async function updateStatusInTx(
   });
 
   return updated;
+}
+
+// ---------------------------------------------------------------------------
+// voidSalesOrder / deleteSalesOrder (QB Edit > Void / Delete Sales Order)
+// ---------------------------------------------------------------------------
+
+type SalesOrderRow = typeof salesOrders.$inferSelect;
+
+/**
+ * Refuse a void / delete while anything was invoiced from the order: a line with invoiced
+ * quantities (partial invoicing) or the invoice that closed it, unless that invoice was voided
+ * (voiding it gave the order its quantities back).
+ */
+async function assertOrderUnlinked(ctx: ServiceContext, order: SalesOrderRow, verb: 'voided' | 'deleted') {
+  const action = verb === 'voided' ? 'void' : 'delete';
+  if (order.convertedInvoiceId) {
+    const [inv] = await ctx.db
+      .select({ ref: invoices.refNumber, n: invoices.invoiceNumber, status: invoices.status })
+      .from(invoices)
+      .where(and(eq(invoices.companyId, ctx.companyId), eq(invoices.id, order.convertedInvoiceId)));
+    if (inv && inv.status !== 'void') {
+      throw new ServiceError(
+        'CONFLICT',
+        `Invoice ${listRefs([docRef(inv.ref, inv.n)])} was made from this sales order, so it can't be ${verb}. Void that invoice first, then ${action} the sales order.`,
+        { linkedInvoices: [docRef(inv.ref, inv.n)] },
+      );
+    }
+  }
+  const lines = await ctx.db
+    .select({ invoiced: salesOrderLines.quantityInvoiced })
+    .from(salesOrderLines)
+    .where(eq(salesOrderLines.salesOrderId, order.id));
+  if (order.status === 'partial' || lines.some((l) => Money.gt(l.invoiced ?? '0', 0))) {
+    throw new ServiceError(
+      'CONFLICT',
+      `Part of this sales order has been invoiced, so it cannot be ${verb}. Close it instead to cancel the backorder, or void the invoices made from it first.`,
+    );
+  }
+}
+
+/** Number, date, customer and amount of the order, kept in the audit trail of a void / delete. */
+async function orderAuditValues(ctx: ServiceContext, order: SalesOrderRow) {
+  const [c] = await ctx.db
+    .select({ name: customers.displayName })
+    .from(customers)
+    .where(and(eq(customers.companyId, ctx.companyId), eq(customers.id, order.customerId)));
+  return {
+    ...auditSnapshot({
+      number: docRef(order.refNumber, order.orderNumber),
+      date: order.date,
+      name: c?.name ?? null,
+      partyKey: 'customerName',
+      total: order.total,
+      status: order.status,
+      memo: order.memo,
+    }),
+    orderNumber: order.orderNumber,
+    refNumber: order.refNumber,
+    customerId: order.customerId,
+  };
+}
+
+/**
+ * Void a sales order (QB Edit > Void Sales Order): it stays on file marked VOID with its amounts,
+ * can no longer be edited or invoiced, and leaves the open-order lists and reports. Refused while
+ * anything was invoiced from it. Needs the Delete right (Customers).
+ */
+export async function voidSalesOrder(ctx: ServiceContext, id: string) {
+  assertMayVoidOrDelete(ctx, 'sales_order');
+  return updateStatus(ctx, id, 'void');
+}
+
+/**
+ * Delete a sales order (QB Edit > Delete Sales Order, Ctrl+D): its lines go with it and documents
+ * filed to it go back to the Doc Center inbox. The audit trail keeps its number, date, customer,
+ * amount and lines (Voided/Deleted report). Refused while anything was invoiced from it; a void
+ * order can be deleted. Not available on the accountant's side of an Accountant's Copy.
+ */
+export async function deleteSalesOrder(ctx: ServiceContext, id: string): Promise<{ id: string; deleted: true }> {
+  assertMayVoidOrDelete(ctx, 'sales_order');
+  return inTransaction(ctx, async (tx) => {
+    const [order] = await tx.db
+      .select()
+      .from(salesOrders)
+      .where(and(eq(salesOrders.companyId, tx.companyId), eq(salesOrders.id, id)));
+    if (!order) throw notFound('Sales order');
+    await assertDividingDateOpen(tx, order.date); // Accountant's Copy (I1)
+    await refuseInAccountantCopy(tx, 'Deleting a sales order', 'Void it instead (that is sent back).');
+    await assertOrderUnlinked(tx, order, 'deleted');
+    const lines = await tx.db
+      .select()
+      .from(salesOrderLines)
+      .where(eq(salesOrderLines.salesOrderId, id))
+      .orderBy(asc(salesOrderLines.lineOrder));
+    const unfiled = await unfileAttachments(tx, 'sales_order', id);
+    const before = await orderAuditValues(tx, order);
+    await tx.db.delete(salesOrderLines).where(eq(salesOrderLines.salesOrderId, id));
+    await tx.db.delete(salesOrders).where(and(eq(salesOrders.id, id), eq(salesOrders.companyId, tx.companyId)));
+    await writeAudit(tx, {
+      action: 'delete',
+      entityType: 'sales_order',
+      entityId: id,
+      oldValues: {
+        ...before,
+        subtotal: order.subtotal,
+        taxAmount: order.taxAmount,
+        poNumber: order.poNumber,
+        lines: lines.map((l) => ({
+          itemId: l.itemId,
+          description: l.description,
+          quantity: l.quantity,
+          rate: l.rate,
+          amount: l.amount,
+          taxable: l.taxable,
+          salesTaxCodeId: l.salesTaxCodeId,
+        })),
+      },
+      newValues: unfiled > 0 ? { attachmentsUnfiled: unfiled } : null,
+    });
+    return { id, deleted: true as const };
+  });
 }
 
 // ---------------------------------------------------------------------------

@@ -25,7 +25,10 @@ export type MemorizableDocType =
   | 'credit_memo'
   | 'deposit'
   | 'transfer'
-  | 'purchase_order';
+  | 'purchase_order'
+  | 'estimate'
+  | 'sales_order'
+  | 'vendor_credit';
 
 const FREQUENCIES: Array<[string, string]> = [
   ['daily', 'Daily'],

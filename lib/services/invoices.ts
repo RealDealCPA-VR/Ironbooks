@@ -833,6 +833,12 @@ async function prepareInvoice(
           `Line ${i + 1} bills estimate ${el.estimateRef || el.estimateNumber}, which the customer rejected. Mark the estimate accepted before invoicing it.`,
         );
       }
+      if (el.estimateStatus === 'void') {
+        throw new ServiceError(
+          'CONFLICT',
+          `Line ${i + 1} bills estimate ${el.estimateRef || el.estimateNumber}, which is void. A void estimate can't be invoiced.`,
+        );
+      }
       if ((el.itemId ?? null) !== (l.itemId ?? null)) {
         throw validation(`Line ${i + 1}: the item does not match the estimate line it bills.`);
       }

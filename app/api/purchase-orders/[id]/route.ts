@@ -9,8 +9,9 @@
  *       date:       bill date (defaults to the PO date)
  *       billNumber: vendor bill / reference number
  *     PO status moves open → partial → closed as quantities are billed.
- *   action = 'void'     → updateStatus to 'void'
+ *   action = 'void'     → voidPurchaseOrder (refused once anything was received or billed)
  *   action = 'close'    → updateStatus to 'closed' (stop further billing)
+ * DELETE /api/purchase-orders/:id             — delete the PO (same refusal as void)
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
@@ -20,6 +21,8 @@ import {
   updateStatus,
   convertToBill,
   updatePurchaseOrder,
+  voidPurchaseOrder,
+  deletePurchaseOrder,
 } from '@/lib/services/purchaseOrders';
 import { routeError, serviceErrorStatus } from '@/lib/routeErrors';
 import { updatePurchaseOrderSchema } from '@/lib/validation/purchaseOrders';
@@ -72,7 +75,7 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
     }
 
     if (parsed.data.action === 'void') {
-      const po = await withVersionCheck(ctx, 'purchase_order', id, expectedVersion(req), (c) => updateStatus(c, id, 'void'));
+      const po = await withVersionCheck(ctx, 'purchase_order', id, expectedVersion(req), (c) => voidPurchaseOrder(c, id));
       return NextResponse.json(po);
     }
 
@@ -96,5 +99,18 @@ export async function PATCH(req: NextRequest, { params }: RouteContext) {
     return NextResponse.json(po);
   } catch (err) {
     return routeError(err, 'PATCH /api/purchase-orders/[id]');
+  }
+}
+
+/** DELETE /api/purchase-orders/:id — QB Edit > Delete Purchase Order (Ctrl+D). */
+export async function DELETE(req: NextRequest, { params }: RouteContext) {
+  try {
+    const { id } = await params;
+    const ctx = await getServerContext();
+    return NextResponse.json(
+      await withVersionCheck(ctx, 'purchase_order', id, expectedVersion(req), (c) => deletePurchaseOrder(c, id)),
+    );
+  } catch (err) {
+    return errorResponse(err);
   }
 }
