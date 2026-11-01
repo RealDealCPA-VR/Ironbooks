@@ -27,7 +27,8 @@ import {
 } from './memorizedReports';
 import { parseReportParams } from '@/lib/validation/reports';
 import type { StdReport } from '@/lib/reports/types';
-import { fullAccess } from '@/lib/permissions/model';
+import { fullAccess, withoutAreas } from '@/lib/permissions/model';
+import type { Area } from '@/lib/permissions/model';
 import { Money } from '@/lib/money';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-reports-wave2-qa4');
@@ -39,11 +40,7 @@ const run = (key: string, p: Record<string, string> = {}, c: ServiceContext = ct
 const prevHeader = (r: StdReport) => r.columns.find((c) => c.key === 'prev')?.header;
 const num = (v: unknown) => Money.of(v === null || v === undefined || v === '' ? '0' : String(v));
 
-const salesOnly = () => {
-  const a = fullAccess();
-  a.permissions.reports_financial = [];
-  return a;
-};
+const salesOnly = () => withoutAreas(fullAccess(), ['reports_financial']);
 
 beforeAll(async () => {
   fs.rmSync(TEST_DIR, { recursive: true, force: true });

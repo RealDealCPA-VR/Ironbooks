@@ -28,7 +28,8 @@ import {
   saveMemorizedReport,
 } from './memorizedReports';
 import { parseReportParams } from '@/lib/validation/reports';
-import { fullAccess } from '@/lib/permissions/model';
+import { fullAccess, withoutAreas } from '@/lib/permissions/model';
+import type { Area } from '@/lib/permissions/model';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-reports-wave2-fixes');
 let db: DB;
@@ -122,10 +123,10 @@ describe('schedule anchor on frequency change', () => {
 describe('legacy memorized rows (unknown report type)', () => {
   it('owner can rename and delete; a no-report user still cannot', async () => {
     const [legacy] = await db.insert(memorizedReports).values({ companyId: ctx.companyId, name: 'Old', reportType: 'pl_v1', config: {} }).returning();
-    const none = fullAccess();
-    for (const k of Object.keys(none.permissions) as (keyof typeof none.permissions)[]) {
-      if (String(k).startsWith('reports_') || k === 'time') none.permissions[k] = [];
-    }
+    const none = withoutAreas(
+      fullAccess(),
+      (Object.keys(fullAccess().permissions) as Area[]).filter((k) => String(k).startsWith('reports_') || k === 'time'),
+    );
     await expect(deleteMemorizedReport({ ...ctx, access: none }, legacy.id)).rejects.toMatchObject({ code: 'FORBIDDEN' });
     await expect(updateMemorizedReport(ctx, legacy.id, { name: 'Old (renamed)' })).resolves.toMatchObject({ name: 'Old (renamed)' });
     await expect(deleteMemorizedReport(ctx, legacy.id)).resolves.toMatchObject({ deleted: true });
@@ -133,18 +134,12 @@ describe('legacy memorized rows (unknown report type)', () => {
 });
 
 describe('memorized report permissions', () => {
-  const salesOnly = () => {
-    const a = fullAccess();
-    a.permissions.reports_financial = [];
-    return a;
-  };
-  const noReports = () => {
-    const a = fullAccess();
-    for (const k of Object.keys(a.permissions) as (keyof typeof a.permissions)[]) {
-      if (String(k).startsWith('reports_') || k === 'time') a.permissions[k] = [];
-    }
-    return a;
-  };
+  const salesOnly = () => withoutAreas(fullAccess(), ['reports_financial']);
+  const noReports = () =>
+    withoutAreas(
+      fullAccess(),
+      (Object.keys(fullAccess().permissions) as Area[]).filter((k) => String(k).startsWith('reports_') || k === 'time'),
+    );
 
   it('a sales-only user cannot delete a financial memorized report', async () => {
     const m = await saveMemorizedReport(ctx, { name: 'Owner TB', reportType: 'trial-balance', config: {} });
@@ -172,8 +167,7 @@ describe('report schedule services enforce file_utilities in the service', () =>
   it('a user without file_utilities cannot list, create, change, delete or run schedules', async () => {
     const m = await saveMemorizedReport(ctx, { name: 'Perm TB', reportType: 'trial-balance', config: {} });
     const s = await createReportSchedule(ctx, { name: 'Perm sched', memorizedReportId: m.id, frequency: 'daily', startDate: '2026-01-05' });
-    const noFile = fullAccess();
-    noFile.permissions.file_utilities = [];
+    const noFile = withoutAreas(fullAccess(), ['file_utilities']);
     const c = { ...ctx, access: noFile };
     await expect(listReportSchedules(c)).rejects.toMatchObject({ code: 'FORBIDDEN' });
     await expect(createReportSchedule(c, { name: 'x', memorizedReportId: m.id, frequency: 'daily' })).rejects.toMatchObject({ code: 'FORBIDDEN' });

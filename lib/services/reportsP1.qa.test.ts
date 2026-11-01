@@ -23,7 +23,8 @@ import { Money } from '@/lib/money';
 import type { StdReport } from '@/lib/reports/types';
 import type { ServiceContext } from './_base';
 import { createCompany, updateCompany } from './company';
-import { fullAccess } from '@/lib/permissions/model';
+import { fullAccess, withoutAreas } from '@/lib/permissions/model';
+import type { Area } from '@/lib/permissions/model';
 import { createCustomer } from './customers';
 import { createVendor } from './vendors';
 import { createInvoice, updateInvoice, voidInvoice } from './invoices';
@@ -525,8 +526,7 @@ describe('area permissions on the migrated std reports', () => {
   it('each aging / financial / sales tax report needs its own area', async () => {
     const co = await newCompany();
     const without = (area: string) => {
-      const a = fullAccess();
-      (a.permissions as Record<string, string[]>)[area] = [];
+      const a = withoutAreas(fullAccess(), [area as Area]);
       return { ...co.ctx, access: a } as ServiceContext;
     };
     const cases: [string, string, Record<string, string>][] = [

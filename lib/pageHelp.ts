@@ -40,8 +40,8 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
   },
   '/calendar': {
     title: 'Calendar',
-    what: 'A day, week or month view of what you entered each day, what is due (invoices, bills) and your to-dos, with an Upcoming & Past Due list.',
-    first: 'Click a day to see everything on it or to add a to-do. Preferences > Calendar sets the view you start in and how far the Upcoming & Past Due list looks.',
+    what: 'A day, week or month view of entries, due dates (invoices, bills) and to-dos, with an Upcoming & Past Due list.',
+    first: 'Click a day to see or add what is on it. Preferences > Calendar sets the starting view and how far the list looks.',
   },
   '/reminders': {
     title: 'Reminders',
@@ -201,7 +201,7 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
   '/print-checks': {
     title: 'Print Checks',
     what: 'Print the checks you marked "to be printed" on your check stock.',
-    first: 'Pick the bank account, check the starting check number, then print. Answer "Did checks print OK?" to record the numbers; tick any check that printed wrong to reprint it.',
+    first: 'Pick the bank account and starting check number, then print. Answer "Did checks print OK?" to record check numbers.',
   },
   '/sales-tax': {
     title: 'Pay Sales Tax',
@@ -279,7 +279,7 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
   '/loans': {
     title: 'Loans',
     what: 'Track loans you owe, their payments and how much is interest. The balance owed is read from the loan account; "What if" compares another rate, payment or term, a lump sum or extra principal.',
-    first: 'Add a loan with its amount, rate and term (tick "already being paid" for a loan you have been paying). Then set up each payment as a check or a bill.',
+    first: 'Add a loan with its amount, rate and term (tick "already being paid" if you have been paying it). Then set up each payment.',
     qb: 'Loan Manager',
   },
   '/accountant/batch-enter': {

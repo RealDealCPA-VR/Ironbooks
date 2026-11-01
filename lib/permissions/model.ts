@@ -528,6 +528,21 @@ export function fullAccess(): EffectiveAccess {
   return unionRoles([builtinRole(ADMIN_ROLE_KEY)!]);
 }
 
+/** Test / tooling helper: an access with these areas taken away entirely (area grants and every activity of the area), like a role that never had them. */
+export function withoutAreas(
+  access: EffectiveAccess,
+  areas: readonly Area[],
+): EffectiveAccess {
+  const permissions = { ...access.permissions };
+  const activities = access.activities ? { ...access.activities } : undefined;
+  for (const area of areas) {
+    permissions[area] = [];
+    if (!activities) continue;
+    for (const def of activitiesOf(area)) activities[def.key as ActivityKey] = [];
+  }
+  return { ...access, permissions, activities };
+}
+
 export function can(
   access: Pick<EffectiveAccess, 'permissions'> | null | undefined,
   area: Area,

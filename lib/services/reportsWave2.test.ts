@@ -57,7 +57,8 @@ import {
 import { findTransactions, graphData, pivotReport } from './reportsAnalysis';
 import { reportableCompanies } from './consolidation';
 import type { StdReport } from '@/lib/reports/types';
-import { fullAccess } from '@/lib/permissions/model';
+import { fullAccess, withoutAreas } from '@/lib/permissions/model';
+import type { Area } from '@/lib/permissions/model';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-reports-wave2');
 const OUT_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-reports-wave2-exports');
@@ -184,8 +185,7 @@ describe('catalog / registry', () => {
     await expect(run('nope')).rejects.toMatchObject({ code: 'NOT_FOUND' });
     await expect(run('profit-loss', { from: '2026-13-01' })).rejects.toMatchObject({ code: 'VALIDATION' });
     await expect(run('profit-loss', { from: '2026-05-01', to: '2026-01-01' })).rejects.toMatchObject({ code: 'VALIDATION' });
-    const noSales = fullAccess();
-    noSales.permissions.reports_sales = [];
+    const noSales = withoutAreas(fullAccess(), ['reports_sales']);
     await expect(runStandardReport({ ...ctx, access: noSales }, 'customer-balance-summary', {})).rejects.toMatchObject({ code: 'FORBIDDEN' });
     await expect(runStandardReport({ ...ctx, access: noSales }, 'profit-loss', {})).resolves.toBeTruthy();
   });
@@ -374,8 +374,7 @@ describe('memorized reports, groups, Process Multiple Reports, schedules', () =>
     expect(processed.map((x) => x.name)).toEqual(['BS', 'Feb P&L']);
     expect(processed.every((x) => x.report && !x.error)).toBe(true);
     // A report the caller cannot run is reported, not fatal.
-    const noFin = fullAccess();
-    noFin.permissions.reports_financial = [];
+    const noFin = withoutAreas(fullAccess(), ['reports_financial']);
     const limited = await processMultipleReports({ ...ctx, access: noFin }, { ids: [pl.id, bs.id] });
     expect(limited.every((x) => x.error)).toBe(true);
     // Deleting the group keeps its reports.
@@ -467,8 +466,7 @@ describe('relative dates, purchases detail, filter options', () => {
     const o = await reportFilterOptions(ctx);
     expect(o.customers.map((c) => c.name)).toContain('Acme:Kitchen');
     expect(o.vehicles).toEqual(['Truck', 'Van']);
-    const none = fullAccess();
-    for (const k of Object.keys(none.permissions) as (keyof typeof none.permissions)[]) none.permissions[k] = [];
+    const none = withoutAreas(fullAccess(), Object.keys(fullAccess().permissions) as Area[]);
     await expect(reportFilterOptions({ ...ctx, access: none })).rejects.toMatchObject({ code: 'FORBIDDEN' });
   });
 });

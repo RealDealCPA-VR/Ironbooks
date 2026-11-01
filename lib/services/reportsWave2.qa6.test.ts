@@ -26,7 +26,7 @@ import { createAccount } from './accounts';
 import { postJournalEntry } from './posting';
 import { createReportSchedule, nextRunAfter, saveMemorizedReport } from './memorizedReports';
 import { runStandardReport } from './reportRegistry';
-import { fullAccess } from '@/lib/permissions/model';
+import { fullAccess, withoutAreas } from '@/lib/permissions/model';
 import { API_ROUTE_PERMISSIONS } from '@/lib/permissions/routes';
 
 const ROOT = process.cwd();
@@ -141,8 +141,7 @@ describe('H5: the run-due endpoint the Electron timer calls', () => {
 describe('scheduling a report needs access to that report', () => {
   it('a file_utilities user without reports_financial cannot schedule a financial memorized report', async () => {
     const m = await saveMemorizedReport(ctx, { name: 'Owner P&L', reportType: 'profit-loss', config: {} });
-    const a = fullAccess();
-    a.permissions.reports_financial = [];
+    const a = withoutAreas(fullAccess(), ['reports_financial']);
     await expect(
       createReportSchedule({ ...ctx, access: a }, { name: 'Sneaky P&L', memorizedReportId: m.id, frequency: 'daily' }),
     ).rejects.toMatchObject({ code: 'FORBIDDEN' });
@@ -150,8 +149,7 @@ describe('scheduling a report needs access to that report', () => {
 
   it('the same user may still schedule a report in an area they can view', async () => {
     const m = await saveMemorizedReport(ctx, { name: 'Owner AR', reportType: 'customer-balance-summary', config: {} });
-    const a = fullAccess();
-    a.permissions.reports_financial = [];
+    const a = withoutAreas(fullAccess(), ['reports_financial']);
     const s = await createReportSchedule({ ...ctx, access: a }, { name: 'AR daily', memorizedReportId: m.id, frequency: 'daily' });
     expect(s.id).toBeTruthy();
   });

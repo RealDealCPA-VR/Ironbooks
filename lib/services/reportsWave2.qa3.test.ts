@@ -29,7 +29,8 @@ import {
   updateMemorizedReport,
 } from './memorizedReports';
 import type { StdReport, StdRow } from '@/lib/reports/types';
-import { fullAccess } from '@/lib/permissions/model';
+import { fullAccess, withoutAreas } from '@/lib/permissions/model';
+import type { Area } from '@/lib/permissions/model';
 import { Money } from '@/lib/money';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-reports-wave2-qa3');
@@ -130,18 +131,12 @@ afterAll(async () => {
 
 describe('memorized report maintenance requires report access (routes are member)', () => {
   /** A user who may do everything except see any report (e.g. a data-entry clerk). */
-  const noReports = () => {
-    const a = fullAccess();
-    for (const k of Object.keys(a.permissions) as (keyof typeof a.permissions)[]) {
-      if (String(k).startsWith('reports_') || k === 'time') a.permissions[k] = [];
-    }
-    return a;
-  };
-  const salesOnly = () => {
-    const a = fullAccess();
-    a.permissions.reports_financial = [];
-    return a;
-  };
+  const noReports = () =>
+    withoutAreas(
+      fullAccess(),
+      (Object.keys(fullAccess().permissions) as Area[]).filter((k) => String(k).startsWith('reports_') || k === 'time'),
+    );
+  const salesOnly = () => withoutAreas(fullAccess(), ['reports_financial']);
 
   it('a member with no report access cannot list, save, rename, re-point or delete memorized reports', async () => {
     const m = await saveMemorizedReport(ctx, { name: 'Owner P&L', reportType: 'profit-loss', config: {} });

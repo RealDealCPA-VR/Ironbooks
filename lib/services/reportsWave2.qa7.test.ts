@@ -24,7 +24,7 @@ import type { ServiceContext } from './_base';
 import { createAccount } from './accounts';
 import { postJournalEntry } from './posting';
 import { createMemorizedGroup, createReportSchedule, runDueSchedules, saveMemorizedReport } from './memorizedReports';
-import { fullAccess } from '@/lib/permissions/model';
+import { fullAccess, withoutAreas } from '@/lib/permissions/model';
 import { apiRuleFor, routePatternFromFile, API_ROUTE_PERMISSIONS } from '@/lib/permissions/routes';
 
 const ROOT = process.cwd();
@@ -40,11 +40,7 @@ let otherCtx: ServiceContext;
 let goneId: string;
 const d = (s: string) => new Date(`${s}T12:00:00.000Z`);
 const savedEnv = { data: process.env.BKA_DATA_DIR, out: process.env.BKA_REPORT_EXPORT_DIR, tok: process.env.BKA_INTERNAL_TOKEN };
-const noFinancial = () => {
-  const a = fullAccess();
-  a.permissions.reports_financial = [];
-  return a;
-};
+const noFinancial = () => withoutAreas(fullAccess(), ['reports_financial']);
 
 beforeAll(async () => {
   fs.rmSync(TEST_DIR, { recursive: true, force: true });
@@ -246,8 +242,7 @@ describe('run-time access', () => {
   });
 
   it('a limited user without file_utilities cannot run due schedules at all', async () => {
-    const a = fullAccess();
-    a.permissions.file_utilities = [];
+    const a = withoutAreas(fullAccess(), ['file_utilities']);
     await expect(runDueSchedules({ ...ctx, access: a }, { now: NOW, outDir: OUT_DIR })).rejects.toMatchObject({ code: 'FORBIDDEN' });
   });
 });

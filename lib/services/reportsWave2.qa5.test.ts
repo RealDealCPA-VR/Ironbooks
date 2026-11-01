@@ -26,7 +26,8 @@ import {
   updateMemorizedReport,
   updateReportSchedule,
 } from './memorizedReports';
-import { fullAccess } from '@/lib/permissions/model';
+import { fullAccess, withoutAreas } from '@/lib/permissions/model';
+import type { Area } from '@/lib/permissions/model';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-reports-wave2-qa5');
 const OUT_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'bka-qa5-'));
@@ -35,18 +36,12 @@ let ctx: ServiceContext;
 const A: Record<string, string> = {};
 const d = (s: string) => new Date(`${s}T12:00:00.000Z`);
 
-const noReports = () => {
-  const a = fullAccess();
-  for (const k of Object.keys(a.permissions) as (keyof typeof a.permissions)[]) {
-    if (String(k).startsWith('reports_') || k === 'time') a.permissions[k] = [];
-  }
-  return a;
-};
-const salesOnly = () => {
-  const a = fullAccess();
-  a.permissions.reports_financial = [];
-  return a;
-};
+const noReports = () =>
+  withoutAreas(
+    fullAccess(),
+    (Object.keys(fullAccess().permissions) as Area[]).filter((k) => String(k).startsWith('reports_') || k === 'time'),
+  );
+const salesOnly = () => withoutAreas(fullAccess(), ['reports_financial']);
 const legacy = async (reportType: string, name = `Legacy ${reportType}`) =>
   (await db.insert(memorizedReports).values({ companyId: ctx.companyId, name, reportType, config: {} }).returning())[0];
 const exists = async (id: string) => (await db.select().from(memorizedReports).where(eq(memorizedReports.id, id))).length > 0;

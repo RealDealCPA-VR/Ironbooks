@@ -27,7 +27,8 @@ import { processMultipleReports, runMemorizedReport, saveMemorizedReport } from 
 import { findTransactions, graphData } from './reportsAnalysis';
 import { incomeTaxReport, type TaxLineMapper } from './reportsLists';
 import type { StdReport, StdRow } from '@/lib/reports/types';
-import { fullAccess } from '@/lib/permissions/model';
+import { fullAccess, withoutAreas } from '@/lib/permissions/model';
+import type { Area } from '@/lib/permissions/model';
 import { setBudgetLineSchema } from '@/lib/validation/budgets';
 import { Money } from '@/lib/money';
 
@@ -128,16 +129,8 @@ afterAll(async () => {
 // ---------------------------------------------------------------------------
 
 describe('memorized reports respect each report area (routes are mapped member)', () => {
-  const noFinancial = () => {
-    const a = fullAccess();
-    a.permissions.reports_financial = [];
-    return a;
-  };
-  const noSales = () => {
-    const a = fullAccess();
-    a.permissions.reports_sales = [];
-    return a;
-  };
+  const noFinancial = () => withoutAreas(fullAccess(), ['reports_financial']);
+  const noSales = () => withoutAreas(fullAccess(), ['reports_sales']);
 
   it('a memorized custom (report builder) GL report cannot be run without financial report access', async () => {
     const m = await saveMemorizedReport(ctx, { name: 'GL by account', reportType: 'custom', config: { groupBy: 'account' } });
@@ -159,10 +152,7 @@ describe('memorized reports respect each report area (routes are mapped member)'
   });
 
   it('Advanced Find and graphs carry no data for a caller without any report access when called through the registry', async () => {
-    const none = fullAccess();
-    for (const k of Object.keys(none.permissions) as (keyof typeof none.permissions)[]) {
-      if (String(k).startsWith('reports_')) none.permissions[k] = [];
-    }
+    const none = withoutAreas(fullAccess(), (Object.keys(fullAccess().permissions) as Area[]).filter((k) => String(k).startsWith('reports_')));
     for (const e of REPORT_CATALOG.filter((x) => x.area.startsWith('reports_'))) {
       await expect(run(e.key, {}, { ...ctx, access: none }), e.key).rejects.toMatchObject({ code: 'FORBIDDEN' });
     }

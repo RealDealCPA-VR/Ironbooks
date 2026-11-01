@@ -16,7 +16,7 @@ import type { ServiceContext } from './_base';
 import { createAccount } from './accounts';
 import { postJournalEntry } from './posting';
 import { createMemorizedGroup, createReportSchedule, runDueSchedules, saveMemorizedReport } from './memorizedReports';
-import { fullAccess } from '@/lib/permissions/model';
+import { fullAccess, withoutAreas } from '@/lib/permissions/model';
 
 const ROOT = process.cwd();
 const TEST_DIR = path.resolve(ROOT, '.bookkeeper-data', 'test-reports-wave2-fixes3');
@@ -27,11 +27,7 @@ let ctx: ServiceContext;
 let clerkId: string;
 const d = (s: string) => new Date(`${s}T12:00:00.000Z`);
 const NOW = new Date('2026-03-01T08:00:00.000Z');
-const noFinancial = () => {
-  const a = fullAccess();
-  a.permissions.reports_financial = [];
-  return a;
-};
+const noFinancial = () => withoutAreas(fullAccess(), ['reports_financial']);
 
 beforeAll(async () => {
   fs.rmSync(TEST_DIR, { recursive: true, force: true });

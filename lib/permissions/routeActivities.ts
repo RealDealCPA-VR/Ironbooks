@@ -83,6 +83,7 @@ export const ROUTE_ACTIVITIES: Record<string, ActivityRef> = {
   '/api/portable': 'file_utilities.export',
   '/api/portable/restore': 'file_utilities.restore',
   '/api/transaction-log': 'reports_financial.audit',
+  '/api/transaction-log/download': { GET: 'file_utilities.export' },
   '/api/qb-import': 'file_utilities.import',
   '/api/import': ['banking.bank_feeds', 'file_utilities.import'],
   '/api/import/rebuild': 'file_utilities.integrity',
