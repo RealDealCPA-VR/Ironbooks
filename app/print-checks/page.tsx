@@ -15,8 +15,10 @@
  *     on the sheet, checks left on a partly used sheet, paper size, check height, alignment nudges
  *     and (advanced) the position of every printed field, with an alignment test page that uses
  *     the unsaved setup. Works with any pre-cut / pre-printed check stock.
- *  Printing several selected checks records their numbers one by one (asking before reusing a
- *  number) and produces ONE PDF (standard checks three to a sheet).
+ *  Printing (one check or several selected ones, ONE PDF, standard checks three to a sheet) first
+ *  checks the numbers are free (asking before reusing one), then asks QB's "Did check(s) print
+ *  OK?": only then are the numbers recorded; the checks ticked Reprint stay in the queue, and a
+ *  check of the last run can be put back to reprint it (PARITY D3).
  *  4. Quick Check — ad-hoc check PDF that is not recorded.
  */
 
@@ -29,6 +31,7 @@ import {
   EmptyState,
   Input,
   Label,
+  Modal,
   PageHeader,
   Select,
   Spinner,
@@ -41,6 +44,7 @@ import {
   DocNumberInput,
 } from '@/components/ui';
 import { numberToWords } from '@/lib/pdf/check';
+import { parseTypedAmount } from '@/lib/fieldValidation';
 import {
   CHECK_FIELD_KEYS,
   CHECK_FIELD_LABELS,
@@ -84,6 +88,11 @@ interface QueueItem {
   memo: string | null;
   paymentAccountId: string | null;
   paymentAccountName: string | null;
+}
+
+/** A check of a print run and the number on the check paper it prints on. */
+interface RunCheck extends QueueItem {
+  checkNumber: string;
 }
 
 interface UnprintedPaycheck {
@@ -234,6 +243,11 @@ export default function PrintChecksPage() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [runRemaining, setRunRemaining] = useState(3);
   const [printingBatch, setPrintingBatch] = useState(false);
+  // "Did check(s) print OK?" (D3): the run waiting for the answer, and the last run recorded.
+  const [confirmRun, setConfirmRun] = useState<{ items: RunCheck[]; allowDuplicateNumber: boolean; reprint: Set<string> } | null>(null);
+  const [confirming, setConfirming] = useState(false);
+  const [lastRun, setLastRun] = useState<RunCheck[]>([]);
+  const [reprintingId, setReprintingId] = useState<string | null>(null);
 
   // ── Customer refunds not yet printed (D3) ─────────────────────────────────
   const [refunds, setRefunds] = useState<UnprintedRefund[]>([]);
@@ -316,53 +330,19 @@ export default function PrintChecksPage() {
   }, [bankId]);
 
   useEffect(() => {
-    const n = parseFloat(amount);
-    setAmountWords(!amount || isNaN(n) || n < 0 ? '' : numberToWords(amount));
+    // The money parser, as the server's (parseFloat read "12abc" as 12 and spelled it out).
+    const n = parseTypedAmount(amount);
+    setAmountWords(!n || n === 'invalid' || n.isNegative() ? '' : numberToWords(n.toFixed(2)));
   }, [amount]);
 
-  // ── Print a queued check ──────────────────────────────────────────────────
+  // ── Print checks (PARITY D3) ──────────────────────────────────────────────
+  // QB order: check the run (numbers free — asked BEFORE the paper is used), print the PDF, then
+  // "Did check(s) print OK?". Only then are the numbers recorded; the checks ticked "Reprint" stay
+  // in the queue (re-selected) to be printed again on new check paper.
 
-  async function handlePrintQueued(item: QueueItem) {
-    const num = nextNumber.trim();
-    if (!num) {
-      toast('Enter the number printed on the first check in the printer.', 'danger');
-      return;
-    }
-    setPrintingId(item.id);
-    let recorded = false;
-    try {
-      // 1. Record the number first (asks before reusing a number), then render the PDF.
-      const saved = await saveWithDuplicateCheck((allowDuplicateNumber) =>
-        api.post('/api/print-queue', { source: item.source, id: item.id, checkNumber: num, allowDuplicateNumber }),
-      );
-      if (saved === null) return; // user chose a different number
-      recorded = true;
-      // The number is used from here on, whatever happens to the PDF: advance to the next one
-      // (keeping its padding / prefix) and take the check off the queue, as a batch run does.
-      // A PDF failure used to leave both, so the next check was printed with the same number.
-      const next = nextCheckNumber(num);
-      if (next) setNextNumber(next);
-      setQueue((prev) => prev.filter((q) => !(q.id === item.id && q.source === item.source)));
-      await openCheckPdf({ source: item.source, id: item.id, checkNumber: num, firstSheetRemaining: runRemaining });
-      toast(`Check #${num} printed and recorded.`, 'success');
-      // Standard checks: one fewer left on the sheet (a fresh sheet after the last one).
-      if (settings.style === 'standard') setRunRemaining((r) => (r <= 1 ? 3 : r - 1));
-    } catch (err) {
-      toast(
-        errMsg(err, recorded ? `Check #${num} was recorded but the PDF could not be opened.` : 'Failed to print check.'),
-        'danger',
-      );
-    } finally {
-      setPrintingId(null);
-    }
-  }
+  const itemKey = (q: { source: PrintSource; id: string }) => `${q.source}:${q.id}`;
 
-  // ── Print the selected checks into ONE PDF ────────────────────────────────
-
-  const itemKey = (q: QueueItem) => `${q.source}:${q.id}`;
-
-  async function handlePrintSelected() {
-    const items = shown.filter((q) => selected.has(itemKey(q)));
+  async function startRun(items: QueueItem[]) {
     if (items.length === 0) {
       toast('Tick the checks you want to print.', 'danger');
       return;
@@ -378,54 +358,112 @@ export default function PrintChecksPage() {
       toast('To print several checks at once, the next check number must end in digits (e.g. 1001).', 'danger');
       return;
     }
+    const runItems: RunCheck[] = items.map((q, i) => ({ ...q, checkNumber: numbers[i] }));
+    const body = (allowDuplicateNumber: boolean) => ({
+      items: runItems.map((r) => ({ source: r.source, id: r.id, checkNumber: r.checkNumber })),
+      allowDuplicateNumber,
+    });
     setPrintingBatch(true);
-    const printed: Array<{ item: QueueItem; checkNumber: string }> = [];
+    if (items.length === 1) setPrintingId(items[0].id);
+    let allowDuplicateNumber = false;
     try {
-      // 1. Record each number in order (asks before reusing a number). Stop at the first check the
-      //    user does not confirm, so the numbers stay in step with the check paper.
-      for (let i = 0; i < items.length; i++) {
-        const checkNumber = numbers[i];
-        const item = items[i];
-        const saved = await saveWithDuplicateCheck((allowDuplicateNumber) =>
-          api.post('/api/print-queue', { source: item.source, id: item.id, checkNumber, allowDuplicateNumber }),
-        );
-        if (saved === null) break; // user chose a different number
-        printed.push({ item, checkNumber });
-      }
-    } catch (err) {
-      toast(errMsg(err, 'Failed to record a check number.'), 'danger');
-    }
-    try {
-      if (printed.length === 0) return;
-      // 2. One PDF for every recorded check.
+      // 1. Check the run: still waiting, one bank account, numbers free (nothing is recorded).
+      const ok = await saveWithDuplicateCheck(async (allow) => {
+        allowDuplicateNumber = allow;
+        return api.post('/api/print-queue/run', body(allow));
+      });
+      if (ok === null) return; // the user chose other numbers
+      // 2. Print: one PDF for the whole run.
       await openCheckPdf({
-        items: printed.map((p) => ({ source: p.item.source, id: p.item.id, checkNumber: p.checkNumber })),
+        items: runItems.map((r) => ({ source: r.source, id: r.id, checkNumber: r.checkNumber })),
         firstSheetRemaining: runRemaining,
       });
-      const first = printed[0].checkNumber;
-      const last = printed[printed.length - 1].checkNumber;
-      toast(
-        printed.length === 1 ? `Check #${first} printed and recorded.` : `Checks #${first}–${last} printed and recorded.`,
-        'success',
+      // 3. "Did check(s) print OK?" — nothing is recorded until it is answered.
+      setConfirmRun({ items: runItems, allowDuplicateNumber, reprint: new Set() });
+    } catch (err) {
+      toast(errMsg(err, 'The checks could not be printed. Nothing was recorded.'), 'danger');
+    } finally {
+      setPrintingBatch(false);
+      setPrintingId(null);
+    }
+  }
+
+  function handlePrintQueued(item: QueueItem) {
+    void startRun([item]);
+  }
+
+  function handlePrintSelected() {
+    void startRun(shown.filter((q) => selected.has(itemKey(q))));
+  }
+
+  /** "Did check(s) print OK?" answered: record the good ones, keep the others for a reprint. */
+  async function confirmPrinted() {
+    if (!confirmRun) return;
+    const run = confirmRun;
+    setConfirming(true);
+    try {
+      const res = await saveWithDuplicateCheck((allow) =>
+        api.post<{ printed: Array<{ source: PrintSource; id: string; checkNumber: string }>; reprint: Array<{ source: PrintSource; id: string }> }>(
+          '/api/print-queue/confirm',
+          {
+            items: run.items.map((r) => ({ source: r.source, id: r.id, checkNumber: r.checkNumber, reprint: run.reprint.has(itemKey(r)) })),
+            allowDuplicateNumber: run.allowDuplicateNumber || allow,
+          },
+        ),
       );
-      if (printed.length < items.length) toast('Printing stopped early; the other checks are still in the queue.', 'danger');
-      // Standard checks: what is left of the last sheet is the next run's first sheet.
+      if (res === null) return; // dialog stays open: the user can tick checks to reprint instead
+      setConfirmRun(null);
+      // The check paper of the whole run is used (spoiled checks included): the next check in the
+      // printer is the one after the run's last number.
+      const next = nextCheckNumber(run.items[run.items.length - 1].checkNumber);
+      if (next) setNextNumber(next);
       if (settings.style === 'standard') {
-        const left = (3 - ((3 - runRemaining + printed.length) % 3)) % 3;
+        const left = (3 - ((3 - runRemaining + run.items.length) % 3)) % 3;
         setRunRemaining(left === 0 ? 3 : left);
       }
-    } catch (err) {
-      toast(errMsg(err, 'The checks were recorded but the PDF could not be opened.'), 'danger');
-    } finally {
-      // Advance the number past every check that was recorded.
-      if (printed.length > 0) {
-        const next = nextCheckNumber(printed[printed.length - 1].checkNumber);
-        if (next) setNextNumber(next);
+      const printedKeys = new Set(res.printed.map(itemKey));
+      const reprintKeys = new Set(res.reprint.map(itemKey));
+      setQueue((prev) => prev.filter((q) => !printedKeys.has(itemKey(q))));
+      setSelected(reprintKeys);
+      setLastRun(run.items.filter((r) => printedKeys.has(itemKey(r))));
+      if (res.printed.length > 0) {
+        const first = res.printed[0].checkNumber;
+        const last = res.printed[res.printed.length - 1].checkNumber;
+        toast(res.printed.length === 1 ? `Check #${first} recorded.` : `${res.printed.length} checks recorded (#${first}–${last}).`, 'success');
       }
-      const done = new Set(printed.map((p) => itemKey(p.item)));
-      setQueue((prev) => prev.filter((q) => !done.has(itemKey(q))));
-      setSelected((prev) => new Set([...prev].filter((k) => !done.has(k))));
-      setPrintingBatch(false);
+      if (res.reprint.length > 0) {
+        toast(
+          `${res.reprint.length} check${res.reprint.length === 1 ? ' is' : 's are'} still in the list and ticked: put new check paper in and click "Print selected" to reprint.`,
+          'info',
+        );
+      }
+    } catch (err) {
+      toast(errMsg(err, 'The check numbers could not be recorded.'), 'danger');
+    } finally {
+      setConfirming(false);
+    }
+  }
+
+  /** "None printed": nothing recorded, every check of the run stays in the list. */
+  function nonePrinted() {
+    if (!confirmRun) return;
+    setSelected(new Set(confirmRun.items.map(itemKey)));
+    setConfirmRun(null);
+    toast('Nothing was recorded. The checks are still in the list, ready to print again.', 'info');
+  }
+
+  /** Reprint a check recorded in the last run (jammed or spoiled after "OK"): back in the queue. */
+  async function reprintPrinted(r: RunCheck) {
+    setReprintingId(r.id);
+    try {
+      await api.post('/api/print-queue/reprint', { source: r.source, id: r.id });
+      setLastRun((prev) => prev.filter((x) => itemKey(x) !== itemKey(r)));
+      toast(`Check #${r.checkNumber} is back in the list without its number. Print it again on new check paper.`, 'success');
+      await refreshQueue();
+    } catch (err) {
+      toastError(err, 'Could not put the check back in the list.');
+    } finally {
+      setReprintingId(null);
     }
   }
 
@@ -549,9 +587,9 @@ export default function PrintChecksPage() {
       toast('Payee name is required.', 'danger');
       return;
     }
-    const amountNum = parseFloat(amount);
-    if (!amount || isNaN(amountNum) || amountNum <= 0) {
-      toast('Amount must be a positive number.', 'danger');
+    const amountNum = parseTypedAmount(amount);
+    if (!amountNum || amountNum === 'invalid' || !amountNum.greaterThan(0)) {
+      toast('Enter the amount as money, more than zero (for example 1,250.00).', 'danger');
       return;
     }
     if (!date) {
@@ -590,9 +628,11 @@ export default function PrintChecksPage() {
             <div>
               <h2 className="text-lg font-bold text-navy">Checks to Print</h2>
               <p className="text-sm text-navy/50">
-                Checks written with &quot;Print later&quot;, bill payments marked &quot;To be printed&quot;, and
-                paychecks you added below. Printing records the check number on the transaction. Tick several
-                checks and use &quot;Print selected&quot; to get them all in one PDF.
+                Checks written with &quot;Print later&quot;, bill payments marked &quot;To be printed&quot;, sales tax,
+                liability and refund checks, and paychecks you added below. Tick several checks and use &quot;Print
+                selected&quot; to get them all in one PDF. After printing you are asked whether the checks printed
+                correctly: only then are the check numbers recorded, and any check that printed wrong stays here to
+                be reprinted.
               </p>
             </div>
             <Button variant="secondary" size="sm" onClick={refreshQueue} disabled={queueLoading}>
@@ -729,7 +769,7 @@ export default function PrintChecksPage() {
                     <Td className="text-right">
                       <Button size="sm" loading={printingId === q.id} onClick={() => handlePrintQueued(q)}>
                         <Printer className="h-4 w-4" />
-                        Print &amp; Record
+                        Print
                       </Button>
                     </Td>
                   </Tr>
@@ -738,6 +778,118 @@ export default function PrintChecksPage() {
             </Table>
           )}
         </Card>
+
+        {/* D3: reprint a check recorded in the last run */}
+        {lastRun.length > 0 && (
+          <Card className="p-6 space-y-3">
+            <div>
+              <h2 className="text-lg font-bold text-navy">Just Printed</h2>
+              <p className="text-sm text-navy/50">
+                A check jammed or came out wrong after you said it printed OK? Reprint it: it goes back in the list
+                without its number and is recorded with the number of the new check paper.
+              </p>
+            </div>
+            <Table>
+              <thead>
+                <tr>
+                  <Th>Check No.</Th>
+                  <Th>Pay to</Th>
+                  <Th numeric>Amount</Th>
+                  <Th className="text-right">Actions</Th>
+                </tr>
+              </thead>
+              <tbody>
+                {lastRun.map((r) => (
+                  <Tr key={itemKey(r)}>
+                    <Td className="font-mono">{r.checkNumber}</Td>
+                    <Td className="font-medium">{r.payee || '—'}</Td>
+                    <Td numeric>{formatCurrency(r.amount)}</Td>
+                    <Td className="text-right">
+                      <Button size="sm" variant="secondary" loading={reprintingId === r.id} onClick={() => void reprintPrinted(r)}>
+                        Reprint
+                      </Button>
+                    </Td>
+                  </Tr>
+                ))}
+              </tbody>
+            </Table>
+          </Card>
+        )}
+
+        {/* D3: QB "Did check(s) print OK?" */}
+        <Modal
+          open={confirmRun !== null}
+          onClose={() => !confirming && nonePrinted()}
+          title="Did check(s) print OK?"
+          size="lg"
+          footer={
+            <>
+              <Button variant="secondary" onClick={nonePrinted} disabled={confirming}>
+                None printed
+              </Button>
+              <Button onClick={() => void confirmPrinted()} loading={confirming}>
+                OK
+              </Button>
+            </>
+          }
+        >
+          {confirmRun && (
+            <div className="space-y-3">
+              <p className="text-sm text-navy/70">
+                If your checks printed correctly, click OK: their numbers are recorded. If a check needs to be
+                printed again, tick it under Reprint first; it stays in the list without a number.
+              </p>
+              <div className="flex gap-2">
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={() => setConfirmRun((c) => (c ? { ...c, reprint: new Set(c.items.map(itemKey)) } : c))}
+                >
+                  Select all
+                </Button>
+                <Button size="sm" variant="secondary" onClick={() => setConfirmRun((c) => (c ? { ...c, reprint: new Set() } : c))}>
+                  Clear
+                </Button>
+              </div>
+              <Table>
+                <thead>
+                  <tr>
+                    <Th>Reprint</Th>
+                    <Th>Check No.</Th>
+                    <Th>Pay to</Th>
+                    <Th numeric>Amount</Th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {confirmRun.items.map((r) => (
+                    <Tr key={itemKey(r)}>
+                      <Td>
+                        <input
+                          type="checkbox"
+                          aria-label={`Reprint check ${r.checkNumber}`}
+                          className="h-4 w-4 accent-electric"
+                          checked={confirmRun.reprint.has(itemKey(r))}
+                          onChange={(e) =>
+                            setConfirmRun((c) => {
+                              if (!c) return c;
+                              const next = new Set(c.reprint);
+                              if (e.target.checked) next.add(itemKey(r));
+                              else next.delete(itemKey(r));
+                              return { ...c, reprint: next };
+                            })
+                          }
+                        />
+                      </Td>
+                      <Td className="font-mono">{r.checkNumber}</Td>
+                      <Td className="font-medium">{r.payee || '—'}</Td>
+                      <Td numeric>{formatCurrency(r.amount)}</Td>
+                    </Tr>
+                  ))}
+                </tbody>
+              </Table>
+            </div>
+          )}
+        </Modal>
 
         {/* Add paychecks */}
         <Card className="p-6 space-y-4">

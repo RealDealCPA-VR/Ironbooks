@@ -25,6 +25,7 @@ import {
   useGridKeys,
 } from '@/components/ui';
 import { api } from '@/lib/client';
+import { saveWithReconciledCheck } from '@/lib/purchasesClient';
 import { todayISO } from '@/lib/dates';
 import { Money, formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
@@ -406,7 +407,11 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId, n
         ...(vendorCur && fxRate.trim() ? { exchangeRate: fxRate.trim() } : {}),
       };
       if (editId) {
-        await api.patch(`/api/vendor-credits/${editId}`, body);
+        // QB's "has been reconciled … Change it anyway?" when a reconciled line changes.
+        const saved = await saveWithReconciledCheck((allowReconciledEdit) =>
+          api.patch(`/api/vendor-credits/${editId}`, allowReconciledEdit ? { ...body, allowReconciledEdit } : body),
+        );
+        if (saved === null) return;
         toast('Vendor credit updated.', 'success');
       } else {
         await api.post('/api/vendor-credits', body);

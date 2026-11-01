@@ -47,6 +47,8 @@ export async function PATCH(req: NextRequest, { params }: Params) {
         reference: body.reference === undefined ? undefined : (input.reference ?? null),
         lines: input.lines,
         isAdjusting: input.isAdjusting,
+        // QB "this transaction has been reconciled" warning confirmed (reconciledEdits.ts).
+        allowReconciledEdit: input.allowReconciledEdit,
       }),
     );
     return NextResponse.json({ entry });

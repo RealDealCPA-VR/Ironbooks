@@ -166,6 +166,7 @@ export const FORM_COLUMNS: Record<FormType, Array<[string, string, boolean, numb
     ['account', 'Account', true, 1.4],
     ['quantity', 'Qty', true, 1.1],
     ['rate', 'Rate', true, 1.5],
+    ['customer', 'Customer', false, 2],
     ['amount', 'Amount', true, 1.7],
   ],
   statement: [

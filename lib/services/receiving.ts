@@ -49,7 +49,7 @@ import { Money, toAmountString } from '@/lib/money';
 import { postJournalEntry } from './posting';
 import { cogsAccountForItem, fifoLayerValue, valueRemainderAfter } from './inventory';
 import { layersWorth } from './fifo';
-import { dueDateFromTermsList } from './lists/terms';
+import { assertBillNumberAvailable, billTermsFor } from './bills';
 import { findAccrualAccount, getOrCreateAccrualAccount, receiptAccrualAccounts } from './itemReceipts';
 import {
   type ReceivingSettings,
@@ -266,6 +266,8 @@ export interface EnterReceiptBillInput {
   dueDate?: Date | null;
   memo?: string | null;
   lines: ReceiptBillLineInput[];
+  /** The user confirmed QB's duplicate vendor reference number warning (A4). */
+  allowDuplicateNumber?: boolean;
 }
 
 export interface ReceiptBillLinePreview {
@@ -787,10 +789,24 @@ export async function enterBillForReceivedItems(ctx: ServiceContext, input: Ente
   return inTransaction(ctx, async (tx) => {
     // Plan INSIDE the transaction so quantities/costs/layers cannot shift underneath us.
     const { vendor, planned, preview, apAccountId } = await planReceiptBill(tx, input);
+    // QB duplicate vendor reference warning (A4), as Enter Bills gives it.
+    await assertBillNumberAvailable(tx, {
+      vendorId: input.vendorId,
+      billNumber: input.billNumber ?? null,
+      checkDuplicateNumber: !input.allowDuplicateNumber,
+    });
     // QB fills the bill's terms and due date from the vendor (as Enter Bills does): without them
     // A/P aging aged the bill from its own date and Pay Bills' "due on or before" ignored it.
-    const terms = vendor.terms?.trim() || null;
-    const dueDate = input.dueDate ?? (await dueDateFromTermsList(tx, terms, input.date));
+    // D5: the vendor's Terms list entry decides (standard or date-driven).
+    const [vendorTerms] = await tx.db
+      .select({ terms: vendors.terms, termsId: vendors.termsId })
+      .from(vendors)
+      .where(and(eq(vendors.id, input.vendorId), eq(vendors.companyId, tx.companyId)));
+    const { terms, termsId, dueDate } = await billTermsFor(
+      tx,
+      { dueDate: input.dueDate, date: input.date },
+      { terms: vendorTerms?.terms ?? vendor.terms ?? null, termsId: vendorTerms?.termsId ?? null },
+    );
 
     const [bill] = await tx.db
       .insert(bills)
@@ -801,6 +817,7 @@ export async function enterBillForReceivedItems(ctx: ServiceContext, input: Ente
         date: input.date,
         dueDate,
         terms,
+        termsId,
         memo:
           input.memo ??
           (Money.isZero(preview.billTotal)

@@ -32,6 +32,8 @@ export const itemReceiptActionSchema = z.discriminatedUnion('action', [
     billNumber: z.string().max(100, 'can be at most 100 characters').nullish(),
     date: zDate.optional(),
     dueDate: zDate.nullish(),
+    /** The user confirmed QB's "this vendor already has a bill with that reference number" warning. */
+    allowDuplicateNumber: z.boolean().optional(),
   }),
   z.object({ action: z.literal('void') }),
 ]);

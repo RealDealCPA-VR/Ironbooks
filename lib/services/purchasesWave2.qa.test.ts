@@ -422,18 +422,19 @@ describe('wave2 purchases — QA', () => {
       await invariants();
     });
 
-    it('reconciled transfer: memo OK, amount / account blocked; from == to refused', async () => {
+    it("reconciled transfer: memo OK, amount gives QB's reconciled warning; from == to refused", async () => {
       const t = await createTransfer(ctx, { date: d('2026-02-03'), fromAccountId: acct['1012'], toAccountId: acct['1000'], amount: '250.00' });
       await reconcileAll('1012', d('2026-02-28'));
       const ok = await updateTransfer(ctx, t.id, { date: d('2026-02-03'), fromAccountId: acct['1012'], toAccountId: acct['1000'], amount: '250.00', memo: 'to ops' });
       expect(ok.memo).toBe('to ops');
       expect(ok.postedEntryId).toBe(t.postedEntryId);
+      // purchbank: QB warns ("has been reconciled … Change it anyway?") and saves once confirmed.
       await expect(
         updateTransfer(ctx, t.id, { date: d('2026-02-03'), fromAccountId: acct['1012'], toAccountId: acct['1000'], amount: '260.00' }),
-      ).rejects.toThrow(/reconciliation/);
-      await expect(
-        updateTransfer(ctx, t.id, { date: d('2026-02-03'), fromAccountId: acct['1012'], toAccountId: acct['1011'], amount: '250.00' }),
-      ).rejects.toThrow(/reconciliation/);
+      ).rejects.toThrow(/has been reconciled/);
+      // The reconciled side (1012) stays as it was: moving the other side needs no confirmation.
+      const moved = await updateTransfer(ctx, t.id, { date: d('2026-02-03'), fromAccountId: acct['1012'], toAccountId: acct['1011'], amount: '250.00' });
+      expect(moved.toAccountId).toBe(acct['1011']);
       const t2 = await createTransfer(ctx, { date: d('2026-03-03'), fromAccountId: acct['1000'], toAccountId: acct['1011'], amount: '5.00' });
       await expect(
         updateTransfer(ctx, t2.id, { date: d('2026-03-03'), fromAccountId: acct['1000'], toAccountId: acct['1000'], amount: '5.00' }),

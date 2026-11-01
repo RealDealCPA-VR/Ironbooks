@@ -73,13 +73,14 @@ interface ReceiveForm {
   memo: string;
 }
 
-const EMPTY_RECEIVE: ReceiveForm = {
+/** A new Receive form, dated today when it opens (not the day the page was first loaded). */
+const emptyReceive = (): ReceiveForm => ({
   itemId: '',
   quantity: '',
   unitCost: '',
   date: todayISO(),
   memo: '',
-};
+});
 
 // ---------------------------------------------------------------------------
 // Consume modal form
@@ -92,12 +93,13 @@ interface ConsumeForm {
   memo: string;
 }
 
-const EMPTY_CONSUME: ConsumeForm = {
+/** A new Consume form, dated today when it opens. */
+const emptyConsume = (): ConsumeForm => ({
   itemId: '',
   quantity: '',
   date: todayISO(),
   memo: '',
-};
+});
 
 // ---------------------------------------------------------------------------
 // Page
@@ -113,13 +115,13 @@ export default function FifoPage() {
 
   // Receive modal
   const [receiveOpen, setReceiveOpen] = useState(false);
-  const [receiveForm, setReceiveForm] = useState<ReceiveForm>(EMPTY_RECEIVE);
+  const [receiveForm, setReceiveForm] = useState<ReceiveForm>(emptyReceive);
   const [receiveSaving, setReceiveSaving] = useState(false);
   const [receiveAdj, setReceiveAdj] = useState<AdjustmentFieldValues>(EMPTY_ADJUSTMENT_FIELDS);
 
   // Consume modal
   const [consumeOpen, setConsumeOpen] = useState(false);
-  const [consumeForm, setConsumeForm] = useState<ConsumeForm>(EMPTY_CONSUME);
+  const [consumeForm, setConsumeForm] = useState<ConsumeForm>(emptyConsume);
   const [consumeSaving, setConsumeSaving] = useState(false);
 
   // ---------------------------------------------------------------------------
@@ -157,7 +159,7 @@ export default function FifoPage() {
   // ---------------------------------------------------------------------------
 
   function openReceive() {
-    setReceiveForm(EMPTY_RECEIVE);
+    setReceiveForm(emptyReceive());
     setReceiveAdj(EMPTY_ADJUSTMENT_FIELDS);
     setReceiveOpen(true);
   }
@@ -202,7 +204,7 @@ export default function FifoPage() {
   // ---------------------------------------------------------------------------
 
   function openConsume(itemId?: string) {
-    setConsumeForm({ ...EMPTY_CONSUME, itemId: itemId ?? '' });
+    setConsumeForm({ ...emptyConsume(), itemId: itemId ?? '' });
     setConsumeOpen(true);
   }
 

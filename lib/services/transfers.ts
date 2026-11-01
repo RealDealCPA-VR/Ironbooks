@@ -41,6 +41,7 @@ import { planPostedEdit, retitleEntry } from './postedEdit';
 import { currencyRate, foreignCode, homeCode, parseRate, toHome } from './exchangeRates';
 import { subledgerAccountReason } from '@/lib/registerEntryPlan';
 import { syncLineMemos } from './entryLineMemos';
+import { carryReconciledLines, prepareReconciledRepost } from './reconciledEdits';
 import Decimal from 'decimal.js';
 
 // ---------------------------------------------------------------------------
@@ -63,6 +64,11 @@ export interface CreateTransferInput {
   toAmount?: string | number | null;
   /** p1 fx: home-currency value of the transfer (overrides the computed one). */
   homeAmount?: string | number | null;
+  /**
+   * Edits: the user confirmed QB's "this transaction has been reconciled" warning, so a change to
+   * the amount or account of a reconciled transfer is saved (reconciledEdits.ts).
+   */
+  allowReconciledEdit?: boolean;
 }
 
 /** p1 fx: currencies + amounts of a transfer, all resolved. */
@@ -224,9 +230,29 @@ async function assertAccountsOwned(ctx: ServiceContext, input: CreateTransferInp
       .from(accounts)
       .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, id)));
     if (!row) throw notFound('Account');
-    const reason = keep.includes(id) ? null : subledgerAccountReason(row);
+    if (keep.includes(id)) continue;
+    const reason = subledgerAccountReason(row) ?? transferAccountReason(row);
     if (reason) throw validation(`${reason} It can't be used in Transfer Funds.`);
   }
+}
+
+/**
+ * QB Transfer Funds moves money between balance sheet accounts (banks, credit cards, other assets
+ * and liabilities, equity). A/R and A/P need a customer / vendor on every amount (a transfer has
+ * no name, so the control account would move without its subledger — invariant I11); income and
+ * expense accounts are not transfers (use Write Checks / Make Deposits); a non-posting account
+ * holds no money.
+ */
+function transferAccountReason(a: { type: string; subtype: string | null; name: string }): string | null {
+  const name = `"${a.name}"`;
+  if (a.subtype === 'accounts_receivable' || a.subtype === 'accounts_payable') {
+    return `${name} needs a ${a.subtype === 'accounts_receivable' ? 'customer' : 'vendor'} on every amount (use Receive Payments, Pay Bills or a journal entry with the name).`;
+  }
+  if (a.subtype === 'non_posting') return `${name} is a non-posting account and holds no money.`;
+  if (a.type === 'revenue' || a.type === 'expense') {
+    return `${name} is an income or expense account, not a balance sheet account (use Write Checks or Make Deposits).`;
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -310,10 +336,17 @@ export async function updateTransfer(ctx: ServiceContext, id: string, input: Cre
       date: input.date,
       lines,
       what: 'transfer',
+      allowReconciledEdit: input.allowReconciledEdit,
     });
     // p1 fx: a change of the account-currency amount alone (same home value) still re-posts.
     if (plan === 'unchanged' && (fx.amount !== toAmountString(existing.amount) || fx.toAmount !== toAmountString(existing.toAmount ?? existing.amount))) {
       plan = 'repost';
+      await prepareReconciledRepost(tx, {
+        entryId: existing.postedEntryId,
+        lines,
+        what: 'transfer',
+        allowReconciledEdit: input.allowReconciledEdit,
+      });
     }
     let entryId = existing.postedEntryId;
     if (plan === 'repost') {
@@ -325,6 +358,8 @@ export async function updateTransfer(ctx: ServiceContext, id: string, input: Cre
         lines,
       });
       entryId = entry.id;
+      // A reconciled transfer the user chose to change stays reconciled at its new amount.
+      await carryReconciledLines(tx, { oldEntryId: existing.postedEntryId, newEntryId: entry.id });
     } else {
       await retitleEntry(tx, entryId, { description: transferDescription(input) });
       // The memo is on both lines too (the register's Memo column): keep them in step.

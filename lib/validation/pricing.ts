@@ -126,6 +126,8 @@ export const receiptBillSchema = z.object({
   date: zDate,
   dueDate: zDate.nullish(),
   memo: z.string().nullish(),
+  /** The user confirmed QB's "this vendor already has a bill with that reference number" warning. */
+  allowDuplicateNumber: z.boolean().optional(),
   lines: zLines(
     z.object({
       receiptLineId: zUuid,

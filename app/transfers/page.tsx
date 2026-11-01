@@ -21,6 +21,7 @@ import {
   toast, toastError,
 } from '@/components/ui';
 import { api } from '@/lib/client';
+import { saveWithReconciledCheck } from '@/lib/purchasesClient';
 // wave2 prefs: Memorize (Ctrl+M)
 import MemorizeButton from '@/components/MemorizeButton';
 import { formatCurrency } from '@/lib/money';
@@ -130,7 +131,11 @@ function NewTransferModal({ open, onClose, accounts: allAccounts, onCreated, edi
         ...((crossCurrency || sameForeign) && homeAmount.trim() ? { homeAmount: homeAmount.trim() } : {}),
       };
       if (editing) {
-        await api.patch(`/api/transfers/${editing.id}`, body);
+        // A reconciled transfer: QB's "has been reconciled … Change it anyway?" first.
+        const saved = await saveWithReconciledCheck((allowReconciledEdit) =>
+          api.patch(`/api/transfers/${editing.id}`, allowReconciledEdit ? { ...body, allowReconciledEdit } : body),
+        );
+        if (saved === null) return;
         toast('Transfer updated.', 'success');
       } else {
         await api.post('/api/transfers', body);

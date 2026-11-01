@@ -26,6 +26,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
+import { saveWithDuplicateCheck } from '@/lib/purchasesClient';
 import { createLatestGate } from '@/lib/latestRequest';
 import { todayISO } from '@/lib/dates';
 import { formatCurrency } from '@/lib/money';
@@ -274,7 +275,11 @@ export default function ReceiveBillPage() {
     if (previewError) return toast(previewError, 'danger');
     setSaving(true);
     try {
-      const bill = await api.post<{ total: string }>('/api/receiving/bill', payload);
+      // QB: "This vendor already has a bill with reference number …" asks before keeping it.
+      const bill = await saveWithDuplicateCheck((allowDuplicateNumber) =>
+        api.post<{ total: string }>('/api/receiving/bill', { ...payload, allowDuplicateNumber }),
+      );
+      if (bill === null) return;
       toast(`Bill saved for ${formatCurrency(bill.total)}.`, 'success');
       setBillNumber('');
       setMemo('');

@@ -6,6 +6,12 @@
  * Track loans against a liability account: see the payment, remaining balance and the
  * amortization schedule, and "Set up payment" to write the next payment as a check or a bill
  * split between principal (reduces the loan), interest (expense) and escrow.
+ *
+ * F1 (QB parity): the balance owed is read from the loan's liability account; a loan that was
+ * already being paid is added at its next payment number and due date; the lender's payment
+ * amount, a balloon at the end and interest on the exact days between payments (365- or 360-day
+ * year) are supported; What If Scenarios compare another rate, payment, term, a lump sum or
+ * extra principal (and "Estimate" works out a new loan before it is saved).
  */
 import { useCallback, useEffect, useState } from 'react';
 import { Landmark, Plus } from 'lucide-react';
@@ -30,7 +36,8 @@ import {
 } from '@/components/ui';
 import { api } from '@/lib/client';
 import { todayISO } from '@/lib/dates';
-import { formatCurrency } from '@/lib/money';
+import { Money, formatCurrency } from '@/lib/money';
+import { parseTypedAmount } from '@/lib/fieldValidation';
 import { formatDate } from '@/lib/utils';
 import { saveWithDuplicateCheck } from '@/lib/purchasesClient';
 
@@ -74,6 +81,27 @@ interface LoanRow {
   /** p1 fx: loan currency (null = home) and the rate it was booked at. */
   currency?: string | null;
   exchangeRate?: string | null;
+  /** F1: 'account' = read from the liability account; 'schedule' = the Loan Manager's own figures. */
+  balanceSource?: 'account' | 'schedule';
+  balanceReason?: 'shared' | 'currency' | 'not_recorded' | null;
+}
+interface ScheduleTotals {
+  payments: number;
+  principal: string;
+  interest: string;
+  total: string;
+  payoffDate: string | null;
+}
+interface WhatIfSide {
+  payment: string;
+  balance: string;
+  totals: ScheduleTotals;
+}
+interface WhatIfResult {
+  current: WhatIfSide;
+  scenario: WhatIfSide;
+  interestDifference: string;
+  paymentsDifference: number;
 }
 interface LoanDetail extends LoanRow {
   lenderVendorId: string | null;
@@ -89,6 +117,33 @@ interface LoanDetail extends LoanRow {
   interestPaid: string;
   schedule: ScheduleRow[];
   payments: Array<{ id: string; paymentNumber: number; date: string; total: string; principal: string; interest: string; kind: string; active: boolean; reference: string | null }>;
+  balloonAmount: string | null;
+  compounding: string;
+  dayCount: number;
+  paymentAmount: string | null;
+  scheduleStartNumber: number;
+  scheduleStartDate: string | null;
+  scheduleBalance: string;
+  nextNumber: number;
+  remaining: ScheduleTotals;
+}
+
+/** Why the balance is not the liability account's (F1). */
+const BALANCE_REASON: Record<string, string> = {
+  shared: 'Another loan uses the same liability account, so this balance is the Loan Manager’s own figure (give each loan its own account to read it from the account).',
+  currency: 'A foreign-currency loan’s balance is kept by the Loan Manager in the loan’s currency.',
+  not_recorded:
+    'Nothing has been recorded in the loan account yet, so this is the Loan Manager’s own figure. Record the loan proceeds (a deposit or journal entry into the loan account) or its opening balance, and the balance will come from the account.',
+};
+
+/** Sum of typed amounts (blank or not money = 0), Decimal-safe. */
+function sumTyped(...values: string[]): string {
+  return values
+    .reduce((s, v) => {
+      const d = parseTypedAmount(v);
+      return d && d !== 'invalid' ? s.plus(d) : s;
+    }, Money.zero())
+    .toFixed(2);
 }
 
 const FREQUENCIES: Array<[number, string]> = [
@@ -120,6 +175,38 @@ function emptyForm() {
     escrowAmount: '',
     notes: '',
     exchangeRate: '',
+    // F1
+    paymentAmount: '',
+    balloonAmount: '',
+    compounding: 'monthly',
+    dayCount: '365',
+    inProgress: false,
+    nextPaymentNumber: '',
+    nextPaymentDate: '',
+  };
+}
+
+type LoanForm = ReturnType<typeof emptyForm>;
+
+/** The body POST / PATCH /api/loans takes for the form (blank optional fields cleared). */
+function loanBody(form: LoanForm, lenderCurrency: string | null) {
+  const { inProgress, ...f } = form;
+  return {
+    ...f,
+    lenderVendorId: f.lenderVendorId || null,
+    escrowAccountId: f.escrowAccountId || null,
+    paymentAccountId: f.paymentAccountId || null,
+    escrowAmount: f.escrowAmount || null,
+    termMonths: Number(f.termMonths),
+    paymentsPerYear: Number(f.paymentsPerYear),
+    notes: f.notes || null,
+    exchangeRate: lenderCurrency && f.exchangeRate.trim() ? f.exchangeRate.trim() : null,
+    paymentAmount: f.paymentAmount.trim() || null,
+    balloonAmount: f.balloonAmount.trim() || null,
+    compounding: f.compounding,
+    dayCount: Number(f.dayCount),
+    nextPaymentNumber: inProgress && f.nextPaymentNumber.trim() ? Number(f.nextPaymentNumber) : 1,
+    nextPaymentDate: inProgress && f.nextPaymentDate ? f.nextPaymentDate : null,
   };
 }
 
@@ -134,6 +221,13 @@ export default function LoansPage() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [form, setForm] = useState(emptyForm());
   const [saving, setSaving] = useState(false);
+
+  // F1: new-loan estimate (Add a Loan) and What If Scenarios (open loan).
+  const [estimate, setEstimate] = useState<WhatIfSide | null>(null);
+  const [estimating, setEstimating] = useState(false);
+  const [whatIf, setWhatIf] = useState({ annualRate: '', paymentAmount: '', termMonths: '', lumpSum: '', extraPrincipal: '', balloonAmount: '' });
+  const [whatIfResult, setWhatIfResult] = useState<WhatIfResult | null>(null);
+  const [whatIfBusy, setWhatIfBusy] = useState(false);
 
   const [payOpen, setPayOpen] = useState(false);
   const [payKind, setPayKind] = useState<'check' | 'bill'>('check');
@@ -167,6 +261,7 @@ export default function LoansPage() {
   async function openDetail(id: string) {
     try {
       setDetail(await api.get<LoanDetail>(`/api/loans/${id}`));
+      setWhatIfResult(null);
     } catch (err) {
       toastError(err, 'Failed to load the loan.');
     }
@@ -175,6 +270,7 @@ export default function LoansPage() {
   function openNew() {
     setEditingId(null);
     setForm(emptyForm());
+    setEstimate(null);
     setFormOpen(true);
   }
 
@@ -196,24 +292,69 @@ export default function LoansPage() {
       escrowAmount: Number(d.escrowAmount) > 0 ? d.escrowAmount : '',
       notes: d.notes ?? '',
       exchangeRate: d.exchangeRate ? String(Number(d.exchangeRate)) : '',
+      paymentAmount: d.paymentAmount ?? '',
+      balloonAmount: d.balloonAmount ?? '',
+      compounding: d.compounding === 'exact_days' ? 'exact_days' : 'monthly',
+      dayCount: String(d.dayCount ?? 365),
+      inProgress: (d.scheduleStartNumber ?? 1) > 1,
+      nextPaymentNumber: (d.scheduleStartNumber ?? 1) > 1 ? String(d.scheduleStartNumber) : '',
+      nextPaymentDate: d.scheduleStartDate ? d.scheduleStartDate.slice(0, 10) : '',
     });
+    setEstimate(null);
     setFormOpen(true);
+  }
+
+  /** Add a Loan > Estimate: the payment, total interest and payoff date of the terms typed. */
+  async function estimateLoan() {
+    setEstimating(true);
+    try {
+      const b = loanBody(form, lenderCurrency);
+      const r = await api.post<WhatIfSide>('/api/loans/what-if', {
+        originalAmount: b.originalAmount,
+        annualRate: b.annualRate,
+        termMonths: b.termMonths,
+        paymentsPerYear: b.paymentsPerYear,
+        originDate: b.originDate,
+        firstPaymentDate: b.firstPaymentDate,
+        balloonAmount: b.balloonAmount,
+        compounding: b.compounding,
+        dayCount: b.dayCount,
+        paymentAmount: b.paymentAmount,
+        escrowAmount: b.escrowAmount,
+      });
+      setEstimate(r);
+    } catch (err) {
+      toastError(err, 'Could not work out the loan.');
+    } finally {
+      setEstimating(false);
+    }
+  }
+
+  /** What If Scenarios on the open loan (nothing is saved). */
+  async function runWhatIf() {
+    if (!detail) return;
+    setWhatIfBusy(true);
+    try {
+      const body = {
+        annualRate: whatIf.annualRate.trim() || null,
+        paymentAmount: whatIf.paymentAmount.trim() || null,
+        termMonths: whatIf.termMonths.trim() ? Number(whatIf.termMonths) : null,
+        lumpSum: whatIf.lumpSum.trim() || null,
+        extraPrincipal: whatIf.extraPrincipal.trim() || null,
+        balloonAmount: whatIf.balloonAmount.trim() || null,
+      };
+      setWhatIfResult(await api.post<WhatIfResult>(`/api/loans/${detail.id}/what-if`, body));
+    } catch (err) {
+      toastError(err, 'Could not work out the scenario.');
+    } finally {
+      setWhatIfBusy(false);
+    }
   }
 
   async function saveLoan() {
     setSaving(true);
     try {
-      const body = {
-        ...form,
-        lenderVendorId: form.lenderVendorId || null,
-        escrowAccountId: form.escrowAccountId || null,
-        paymentAccountId: form.paymentAccountId || null,
-        escrowAmount: form.escrowAmount || null,
-        termMonths: Number(form.termMonths),
-        paymentsPerYear: Number(form.paymentsPerYear),
-        notes: form.notes || null,
-        exchangeRate: lenderCurrency && form.exchangeRate.trim() ? form.exchangeRate.trim() : null,
-      };
+      const body = loanBody(form, lenderCurrency);
       if (editingId) await api.patch(`/api/loans/${editingId}`, body);
       else await api.post('/api/loans', body);
       toast(editingId ? 'Loan updated.' : 'Loan added.', 'success');
@@ -366,6 +507,28 @@ export default function LoansPage() {
                 {detail.paymentsMade} of {detail.numberOfPayments} payments made. Principal paid {formatCurrency(detail.principalPaid, cur)},
                 interest paid {formatCurrency(detail.interestPaid, cur)}.
               </p>
+              <p className="text-sm text-navy/80 mt-1">
+                Balance owed: <strong>{formatCurrency(detail.balance, cur)}</strong>
+                {detail.balanceSource === 'account' ? ' (from the loan account)' : ''}. Next payment #{detail.nextNumber}
+                {detail.remaining?.payoffDate ? `; paid off ${formatDate(detail.remaining.payoffDate, 'MMM d, yyyy')}` : ''}
+                {detail.remaining ? ` after ${detail.remaining.payments} more payments, ${formatCurrency(detail.remaining.interest, cur)} interest still to pay` : ''}.
+              </p>
+              {detail.balanceSource === 'schedule' && detail.balanceReason && (
+                <p className="text-xs text-navy/50 mt-1">{BALANCE_REASON[detail.balanceReason]}</p>
+              )}
+              {detail.balanceSource === 'account' && !Money.eq(detail.balance, detail.scheduleBalance) && (
+                <p className="text-xs text-navy/50 mt-1">
+                  The Loan Manager&apos;s own payments alone would leave {formatCurrency(detail.scheduleBalance, cur)}; the loan account also has
+                  amounts entered outside the Loan Manager.
+                </p>
+              )}
+              {(detail.balloonAmount || detail.paymentAmount || detail.compounding === 'exact_days') && (
+                <p className="text-xs text-navy/50 mt-1">
+                  {detail.paymentAmount ? `Payment set by the lender: ${formatCurrency(detail.paymentAmount, cur)}. ` : ''}
+                  {detail.balloonAmount ? `Balloon of ${formatCurrency(detail.balloonAmount, cur)} with the last payment. ` : ''}
+                  {detail.compounding === 'exact_days' ? `Interest on the exact days between payments (${detail.dayCount}-day year).` : ''}
+                </p>
+              )}
               {detail.currency && (
                 <p className="text-xs text-navy/50 mt-1">
                   This loan is in {detail.currency}, booked at {Number(detail.exchangeRate ?? 0)} home per {detail.currency}. Payments are
@@ -456,6 +619,93 @@ export default function LoansPage() {
                 </tbody>
               </Table>
             </div>
+          </div>
+
+          {/* QB Loan Manager: What If Scenarios */}
+          <div className="border-t border-navy/10 pt-4">
+            <h3 className="text-sm font-semibold text-navy mb-1">What if…</h3>
+            <p className="text-xs text-navy/50 mb-3">
+              See what another rate, payment or term, a lump sum paid now or extra principal with every payment would do. Nothing is
+              saved.
+            </p>
+            <form
+              className="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-7 gap-3 items-end"
+              onSubmit={(e) => {
+                e.preventDefault();
+                void runWhatIf();
+              }}
+            >
+              <div>
+                <Label htmlFor="wi-rate">Interest rate (%)</Label>
+                <Input id="wi-rate" inputMode="decimal" placeholder={String(Number(detail.annualRate))} value={whatIf.annualRate} onChange={(e) => setWhatIf((w) => ({ ...w, annualRate: e.target.value }))} />
+              </div>
+              <div>
+                <Label htmlFor="wi-pay">Payment</Label>
+                <Input id="wi-pay" inputMode="decimal" placeholder={detail.payment} value={whatIf.paymentAmount} onChange={(e) => setWhatIf((w) => ({ ...w, paymentAmount: e.target.value }))} />
+              </div>
+              <div>
+                <Label htmlFor="wi-term">Term (months)</Label>
+                <Input id="wi-term" inputMode="numeric" placeholder={String(detail.termMonths)} value={whatIf.termMonths} onChange={(e) => setWhatIf((w) => ({ ...w, termMonths: e.target.value }))} />
+              </div>
+              <div>
+                <Label htmlFor="wi-lump">Lump sum now</Label>
+                <Input id="wi-lump" inputMode="decimal" placeholder="0.00" value={whatIf.lumpSum} onChange={(e) => setWhatIf((w) => ({ ...w, lumpSum: e.target.value }))} />
+              </div>
+              <div>
+                <Label htmlFor="wi-extra">Extra principal each payment</Label>
+                <Input id="wi-extra" inputMode="decimal" placeholder="0.00" value={whatIf.extraPrincipal} onChange={(e) => setWhatIf((w) => ({ ...w, extraPrincipal: e.target.value }))} />
+              </div>
+              <div>
+                <Label htmlFor="wi-balloon">Balloon at the end</Label>
+                <Input id="wi-balloon" inputMode="decimal" placeholder={detail.balloonAmount ?? '0.00'} value={whatIf.balloonAmount} onChange={(e) => setWhatIf((w) => ({ ...w, balloonAmount: e.target.value }))} />
+              </div>
+              <div>
+                <Button type="submit" variant="secondary" loading={whatIfBusy}>
+                  Compare
+                </Button>
+              </div>
+            </form>
+            {whatIfResult && (
+              <div className="mt-3">
+                <Table>
+                  <thead>
+                    <tr>
+                      <Th />
+                      <Th numeric>Payment</Th>
+                      <Th numeric>Payments left</Th>
+                      <Th numeric>Interest to pay</Th>
+                      <Th>Paid off</Th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(
+                      [
+                        ['As it is now', whatIfResult.current],
+                        ['With the changes', whatIfResult.scenario],
+                      ] as const
+                    ).map(([label, side]) => (
+                      <Tr key={label}>
+                        <Td className="font-medium">{label}</Td>
+                        <Td numeric>{formatCurrency(side.payment, cur)}</Td>
+                        <Td numeric>{side.totals.payments}</Td>
+                        <Td numeric>{formatCurrency(side.totals.interest, cur)}</Td>
+                        <Td>{side.totals.payoffDate ? formatDate(side.totals.payoffDate, 'MMM d, yyyy') : '—'}</Td>
+                      </Tr>
+                    ))}
+                  </tbody>
+                </Table>
+                <p className="text-sm text-navy/70 mt-2" role="status">
+                  {Money.isNegative(whatIfResult.interestDifference)
+                    ? `You would save ${formatCurrency(Money.abs(whatIfResult.interestDifference).toFixed(2), cur)} in interest`
+                    : Money.isZero(whatIfResult.interestDifference)
+                      ? 'The interest stays the same'
+                      : `You would pay ${formatCurrency(whatIfResult.interestDifference, cur)} more interest`}
+                  {whatIfResult.paymentsDifference !== 0
+                    ? ` and make ${Math.abs(whatIfResult.paymentsDifference)} ${whatIfResult.paymentsDifference < 0 ? 'fewer' : 'more'} payments.`
+                    : '.'}
+                </p>
+              </div>
+            )}
           </div>
         </Card>
       )}
@@ -561,9 +811,74 @@ export default function LoansPage() {
               {acctOptions(accounts)}
             </Select>
           </div>
+          <div>
+            <Label htmlFor="ln-payment">Payment amount from the lender (optional)</Label>
+            <Input id="ln-payment" inputMode="decimal" placeholder="Worked out from the terms" value={form.paymentAmount} onChange={set('paymentAmount')} />
+          </div>
+          <div>
+            <Label htmlFor="ln-balloon">Balloon payment at the end (optional)</Label>
+            <Input id="ln-balloon" inputMode="decimal" placeholder="0.00" value={form.balloonAmount} onChange={set('balloonAmount')} />
+          </div>
+          <div>
+            <Label htmlFor="ln-comp">Interest is worked out</Label>
+            <Select id="ln-comp" value={form.compounding} onChange={set('compounding')}>
+              <option value="monthly">Per payment period</option>
+              <option value="exact_days">On the exact days between payments</option>
+            </Select>
+          </div>
+          {form.compounding === 'exact_days' ? (
+            <div>
+              <Label htmlFor="ln-days">Days in the interest year</Label>
+              <Select id="ln-days" value={form.dayCount} onChange={set('dayCount')}>
+                <option value="365">365 days</option>
+                <option value="360">360 days (bank year)</option>
+              </Select>
+            </div>
+          ) : (
+            <div />
+          )}
+          <div className="md:col-span-2">
+            <label className="flex items-center gap-2 text-sm text-navy/80 select-none">
+              <input
+                type="checkbox"
+                className="h-4 w-4 accent-electric"
+                checked={form.inProgress}
+                onChange={(e) => setForm((f) => ({ ...f, inProgress: e.target.checked }))}
+              />
+              This loan is already being paid (some payments were made before it was added here)
+            </label>
+          </div>
+          {form.inProgress && (
+            <>
+              <div>
+                <Label htmlFor="ln-next-no" required>Next payment number</Label>
+                <Input id="ln-next-no" inputMode="numeric" placeholder="e.g. 13" value={form.nextPaymentNumber} onChange={set('nextPaymentNumber')} />
+              </div>
+              <div>
+                <Label htmlFor="ln-next-date" required>Due date of the next payment</Label>
+                <Input id="ln-next-date" type="date" value={form.nextPaymentDate} onChange={set('nextPaymentDate')} />
+              </div>
+              <p className="md:col-span-2 text-xs text-navy/50">
+                The balance still owed is read from the loan account: make sure its balance (an opening balance or the proceeds less what
+                was already paid) is in the books.
+              </p>
+            </>
+          )}
           <div className="md:col-span-2">
             <Label htmlFor="ln-notes">Notes</Label>
             <Input id="ln-notes" value={form.notes} onChange={set('notes')} />
+          </div>
+          <div className="md:col-span-2 flex flex-wrap items-center gap-3">
+            <Button type="button" variant="secondary" onClick={() => void estimateLoan()} loading={estimating}>
+              Estimate
+            </Button>
+            {estimate && (
+              <p className="text-sm text-navy/70" role="status">
+                Payment {formatCurrency(estimate.payment, lenderCurrency ?? undefined)} × {estimate.totals.payments}; total interest{' '}
+                {formatCurrency(estimate.totals.interest, lenderCurrency ?? undefined)}
+                {estimate.totals.payoffDate ? `; paid off ${formatDate(estimate.totals.payoffDate, 'MMM d, yyyy')}` : ''}.
+              </p>
+            )}
           </div>
         </div>
       </Modal>
@@ -630,7 +945,7 @@ export default function LoansPage() {
           <p className="col-span-2 text-sm text-navy/70">
             Total:{' '}
             <strong>
-              {formatCurrency(((Number(pay.principal) || 0) + (Number(pay.interest) || 0) + (Number(pay.escrow) || 0)).toFixed(2), detail?.currency ?? undefined)}
+              {formatCurrency(sumTyped(pay.principal, pay.interest, pay.escrow), detail?.currency ?? undefined)}
             </strong>
           </p>
         </div>

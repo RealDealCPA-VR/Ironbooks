@@ -31,6 +31,34 @@ export async function saveWithDuplicateCheck<T>(send: (allowDuplicate: boolean) 
   }
 }
 
+/**
+ * QB "The transaction you are editing has been reconciled … Change it anyway?" (409 with
+ * details.reconciledEdit, lib/services/reconciledEdits.ts).
+ */
+export function isReconciledEditError(err: unknown): err is ApiError {
+  return (
+    err instanceof ApiError &&
+    err.status === 409 &&
+    Boolean((err.details as { reconciledEdit?: unknown } | null | undefined)?.reconciledEdit)
+  );
+}
+
+/**
+ * Run `send(false)`; when the transaction was reconciled, show QB's warning and save again with
+ * allowReconciledEdit when the user chooses to change it anyway. Returns null when they don't.
+ * For forms without the Fix panel (which offers the same "Change it anyway" as a button).
+ */
+export async function saveWithReconciledCheck<T>(send: (allowReconciledEdit: boolean) => Promise<T>): Promise<T | null> {
+  try {
+    return await send(false);
+  } catch (err) {
+    if (!isReconciledEditError(err)) throw err;
+    const ok = typeof window !== 'undefined' && window.confirm(err.message);
+    if (!ok) return null;
+    return send(true);
+  }
+}
+
 /** Payment terms offered on vendors and bills (the four standard terms plus a discount term). */
 export const TERMS_CHOICES: Array<{ value: string; label: string }> = [
   { value: 'due_on_receipt', label: 'Due on receipt' },

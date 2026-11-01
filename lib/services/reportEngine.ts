@@ -814,8 +814,18 @@ for (const [k, list] of Object.entries(TXN_PREFIXES) as [TxnTypeKey, string[]][]
 export function txnTypeOf(sourceRef: string | null | undefined): TxnTypeKey {
   if (!sourceRef) return 'journal';
   const prefix = sourceRef.split(':')[0];
+  // Reconcile's statement adjustments (reconcile.reconciliationAdjustmentRef): the service charge
+  // is a Check and interest earned a Deposit, as QB shows them.
+  if (prefix === 'reconciliation') {
+    if (sourceRef.endsWith(':charge')) return 'check';
+    if (sourceRef.endsWith(':interest')) return 'deposit';
+  }
   return PREFIX_TO_TYPE.get(prefix) ?? 'other';
 }
+
+/** Reconcile statement adjustments of one kind (see txnTypeOf). */
+const reconcileAdjustments = (kind: 'charge' | 'interest') =>
+  sql`(${journalEntries.sourceRef} LIKE 'reconciliation:%' AND ${journalEntries.sourceRef} LIKE ${`%:${kind}`})`;
 
 /**
  * Journal entries posted by Transfer Funds. A transfer's entry carries no sourceRef (the transfer
@@ -837,8 +847,8 @@ function txnTypeCondition(t: TxnTypeKey, companyId: string): SQL {
   const parts = prefixes.map((p) => sql`${journalEntries.sourceRef} LIKE ${p + ':%'}`);
   parts.push(...prefixes.map((p) => sql`${journalEntries.sourceRef} = ${p}`));
   if (t === 'transfer') parts.push(sql`${journalEntries.id} IN (${transferEntryIds(companyId)})`);
-  if (t === 'check') parts.push(bankFeedEntries(companyId, 'out'));
-  if (t === 'deposit') parts.push(bankFeedEntries(companyId, 'in'));
+  if (t === 'check') parts.push(bankFeedEntries(companyId, 'out'), reconcileAdjustments('charge'));
+  if (t === 'deposit') parts.push(bankFeedEntries(companyId, 'in'), reconcileAdjustments('interest'));
   if (t === 'journal') {
     parts.push(sql`${journalEntries.sourceRef} IS NULL`);
     return sql`((${sql.join(parts, sql` OR `)}) AND ${journalEntries.id} NOT IN (${transferEntryIds(companyId)}))`;
@@ -846,7 +856,7 @@ function txnTypeCondition(t: TxnTypeKey, companyId: string): SQL {
   if (t === 'other') {
     // Anything whose prefix is not a known type (bank-feed lines are Checks / Deposits).
     const known = [...PREFIX_TO_TYPE.keys()].filter((p) => !TXN_PREFIXES.other.includes(p));
-    return sql`(${journalEntries.sourceRef} IS NOT NULL AND split_part(${journalEntries.sourceRef}, ':', 1) NOT IN (${sql.join(known.map((k) => sql`${k}`), sql`, `)}) AND NOT ${bankFeedEntries(companyId, 'out')} AND NOT ${bankFeedEntries(companyId, 'in')})`;
+    return sql`(${journalEntries.sourceRef} IS NOT NULL AND split_part(${journalEntries.sourceRef}, ':', 1) NOT IN (${sql.join(known.map((k) => sql`${k}`), sql`, `)}) AND NOT ${bankFeedEntries(companyId, 'out')} AND NOT ${bankFeedEntries(companyId, 'in')} AND NOT ${reconcileAdjustments('charge')} AND NOT ${reconcileAdjustments('interest')})`;
   }
   return sql`(${sql.join(parts, sql` OR `)})`;
 }

@@ -12,7 +12,7 @@
  * The journal entry stays the ledger record (sales tax: sourceRef "tax_agency:<agencyId>").
  */
 import { and, desc, eq, inArray, ne, sql } from 'drizzle-orm';
-import { isBankAccount } from '@/lib/accountTypes';
+import { isBankAccount, isCreditCardAccount } from '@/lib/accountTypes';
 import {
   accounts,
   creditMemos,
@@ -1015,20 +1015,25 @@ export async function payCreditCard(ctx: ServiceContext, input: PayCreditCardInp
     throw validation('Payment account must be different from the credit card account.');
   }
 
-  // Both accounts must belong to this company; the CC side must be a liability.
+  // Both accounts must belong to this company. QB's Pay Credit Card pays a Credit Card account
+  // from a bank account: a loan or another liability is paid through Loan Manager / Write Checks,
+  // and an expense, card or Undeposited Funds "pay from" is not a payment at all.
   const [cc] = await ctx.db
-    .select({ id: accounts.id, type: accounts.type })
+    .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype, name: accounts.name })
     .from(accounts)
     .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, input.creditCardAccountId)));
   if (!cc) throw notFound('Credit card account');
-  if (cc.type !== 'liability') {
-    throw validation('creditCardAccountId must be a liability (credit card) account.');
+  if (!isCreditCardAccount(cc)) {
+    throw validation(`"${cc.name}" is not a credit card account. Pay a loan or other liability with Loan Manager or Write Checks.`);
   }
   const [pay] = await ctx.db
-    .select({ id: accounts.id })
+    .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype, name: accounts.name })
     .from(accounts)
     .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.id, input.paymentAccountId)));
   if (!pay) throw notFound('Payment account');
+  if (!isBankAccount(pay)) {
+    throw validation(`"${pay.name}" is not a bank account. Pay the credit card from a checking or savings (bank) account.`);
+  }
 
   const sourceRef = input.reconciliationId ? `cc-payment:${input.reconciliationId}` : undefined;
   const amtStr = toAmountString(amt);

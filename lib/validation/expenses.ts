@@ -51,6 +51,8 @@ export const createExpenseSchema = z
     exchangeRate: zDecimal.nullish(),
     /** The user saw the duplicate check-number warning and chose to keep the number. */
     allowDuplicateNumber: z.boolean().optional(),
+    /** Edits: the user confirmed QB's "this transaction has been reconciled" warning (reconciledEdits.ts). */
+    allowReconciledEdit: z.boolean().optional(),
     lines: zLines(expenseLineSchema),
   })
   .refine((e) => Boolean(e.vendorId) || Boolean(e.otherNameId) || Boolean(e.payeeName?.trim()), {

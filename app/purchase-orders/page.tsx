@@ -46,6 +46,7 @@ import {
   useDuplicateNumberConfirm,
 } from '@/components/sales/DocNumberField';
 import { TransactionNav, useAdjacentTransactions } from '@/components/TransactionNav';
+import { saveWithDuplicateCheck } from '@/lib/purchasesClient';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -83,6 +84,27 @@ interface PurchaseOrder {
   status: PoStatus;
   convertedBillId: string | null;
   memo: string | null;
+  /** purchbank: Ship To typed on the P.O. or a drop-ship customer's (null = the company address). */
+  shipTo?: ShipTo | null;
+  shipToCustomerId?: string | null;
+}
+
+interface ShipTo {
+  name?: string;
+  line1?: string;
+  line2?: string;
+  city?: string;
+  state?: string;
+  zip?: string;
+  country?: string;
+}
+
+interface NamedRow {
+  id: string;
+  name?: string;
+  displayName?: string;
+  customerId?: string | null;
+  isActive?: boolean;
 }
 
 interface PoLine {
@@ -95,6 +117,9 @@ interface PoLine {
   amount: string;
   quantityBilled: string;
   lineOrder: number;
+  customerId?: string | null;
+  jobId?: string | null;
+  classId?: string | null;
 }
 
 interface PoDetail extends PurchaseOrder {
@@ -111,6 +136,24 @@ interface LineRow {
   description: string;
   quantity: string;
   rate: string;
+  /** QB Customer:Job column: '' | 'c:<customerId>' | 'j:<jobId>'. */
+  custJob?: string;
+  classId?: string;
+}
+
+/** Ship To choice on the P.O.: the company's address, a customer (drop ship) or a typed address. */
+type ShipMode = 'company' | 'customer' | 'address';
+
+const EMPTY_SHIP: Required<Omit<ShipTo, 'country'>> = { name: '', line1: '', line2: '', city: '', state: '', zip: '' };
+
+/** The request fields a line's Customer:Job choice sends. */
+function custJobFields(value: string | undefined, jobs: NamedRow[]): { customerId: string | null; jobId: string | null } {
+  if (!value) return { customerId: null, jobId: null };
+  if (value.startsWith('j:')) {
+    const jobId = value.slice(2);
+    return { customerId: jobs.find((j) => j.id === jobId)?.customerId ?? null, jobId };
+  }
+  return { customerId: value.slice(2), jobId: null };
 }
 
 // ---------------------------------------------------------------------------
@@ -166,6 +209,37 @@ function NewPoModal({ open, onClose, vendors, accounts, items, onCreated, editId
   const [memo, setMemo] = useState('');
   const [lines, setLines] = useState<LineRow[]>([{ ...EMPTY_LINE }]);
   const [saving, setSaving] = useState(false);
+  // purchbank: Ship To, and the Customer:Job / Class lists for the lines.
+  const [shipMode, setShipMode] = useState<ShipMode>('company');
+  const [shipCustomerId, setShipCustomerId] = useState('');
+  const [shipAddr, setShipAddr] = useState({ ...EMPTY_SHIP });
+  const [savedShip, setSavedShip] = useState<ShipTo | null>(null);
+  const [customerList, setCustomerList] = useState<NamedRow[]>([]);
+  const [jobList, setJobList] = useState<NamedRow[]>([]);
+  const [classList, setClassList] = useState<NamedRow[]>([]);
+  useEffect(() => {
+    if (!open) return;
+    let live = true;
+    Promise.all([
+      api.get<NamedRow[]>('/api/customers').catch(() => [] as NamedRow[]),
+      api.get<NamedRow[]>('/api/jobs').catch(() => [] as NamedRow[]),
+      api.get<NamedRow[]>('/api/classes').catch(() => [] as NamedRow[]),
+    ]).then(([c, j, k]) => {
+      if (!live) return;
+      setCustomerList(Array.isArray(c) ? c : []);
+      setJobList(Array.isArray(j) ? j.filter((x) => x.isActive !== false) : []);
+      setClassList(Array.isArray(k) ? k.filter((x) => x.isActive !== false) : []);
+    });
+    return () => {
+      live = false;
+    };
+  }, [open]);
+  const customerName = (id: string | null | undefined) => customerList.find((c) => c.id === id)?.displayName ?? '';
+  // Customer:Job choices: each customer, then its jobs (QB "Customer:Job").
+  const custJobChoices: Array<{ value: string; label: string }> = customerList.flatMap((c) => [
+    { value: `c:${c.id}`, label: c.displayName ?? '' },
+    ...jobList.filter((j) => j.customerId === c.id).map((j) => ({ value: `j:${j.id}`, label: `${c.displayName}:${j.name}` })),
+  ]);
 
   const [loadingEdit, setLoadingEdit] = useState(false);
   // P.O. No. (next number on a new PO; the saved one once the edited PO has loaded).
@@ -182,6 +256,10 @@ function NewPoModal({ open, onClose, vendors, accounts, items, onCreated, editId
     setMemo('');
     setLines([{ ...EMPTY_LINE }]);
     setEditRef(null);
+    setShipMode('company');
+    setShipCustomerId('');
+    setShipAddr({ ...EMPTY_SHIP });
+    setSavedShip(null);
     if (!editId) return;
     let cancelled = false;
     setLoadingEdit(true);
@@ -194,6 +272,22 @@ function NewPoModal({ open, onClose, vendors, accounts, items, onCreated, editId
         setDate(String(po.date).slice(0, 10));
         setExpectedDate(po.expectedDate ? String(po.expectedDate).slice(0, 10) : '');
         setMemo(po.memo ?? '');
+        const ship = po.shipTo ?? null;
+        setSavedShip(ship);
+        if (po.shipToCustomerId) {
+          setShipMode('customer');
+          setShipCustomerId(po.shipToCustomerId);
+        } else if (ship) {
+          setShipMode('address');
+          setShipAddr({
+            name: ship.name ?? '',
+            line1: ship.line1 ?? '',
+            line2: ship.line2 ?? '',
+            city: ship.city ?? '',
+            state: ship.state ?? '',
+            zip: ship.zip ?? '',
+          });
+        }
         setLines(
           po.lines.length > 0
             ? po.lines.map((l) => ({
@@ -204,6 +298,8 @@ function NewPoModal({ open, onClose, vendors, accounts, items, onCreated, editId
                 description: l.description ?? '',
                 quantity: String(parseFloat(l.quantity)),
                 rate: String(parseFloat(l.rate)),
+                custJob: l.jobId ? `j:${l.jobId}` : l.customerId ? `c:${l.customerId}` : '',
+                classId: l.classId ?? '',
               }))
             : [{ ...EMPTY_LINE }],
         );
@@ -268,6 +364,10 @@ function NewPoModal({ open, onClose, vendors, accounts, items, onCreated, editId
       }
     }
 
+    if (shipMode === 'customer' && !shipCustomerId) {
+      toast('Pick the customer to ship to, or choose another Ship To.', 'danger');
+      return;
+    }
     setSaving(true);
     try {
       const lineBody = validLines.map((l) => ({
@@ -277,7 +377,16 @@ function NewPoModal({ open, onClose, vendors, accounts, items, onCreated, editId
         description: l.description || null,
         quantity: l.quantity,
         rate: l.rate,
+        ...custJobFields(l.custJob, jobList),
+        classId: l.classId || null,
       }));
+      // Ship To: the company (nothing), a customer (their shipping address) or the typed address.
+      const shipBody =
+        shipMode === 'customer'
+          ? { shipToCustomerId: shipCustomerId, shipTo: null }
+          : shipMode === 'address'
+            ? { shipToCustomerId: null, shipTo: { ...shipAddr } }
+            : { shipToCustomerId: null, shipTo: null };
       const saved = await dupConfirm.run((allowDuplicateNumber) =>
         editId
           ? api.patch<PurchaseOrder>(`/api/purchase-orders/${editId}`, {
@@ -288,6 +397,7 @@ function NewPoModal({ open, onClose, vendors, accounts, items, onCreated, editId
               expectedDate: expectedDate || null,
               memo: memo || null,
               lines: lineBody,
+              ...shipBody,
             })
           : api.post<PurchaseOrder>('/api/purchase-orders', {
               vendorId,
@@ -297,6 +407,7 @@ function NewPoModal({ open, onClose, vendors, accounts, items, onCreated, editId
               expectedDate: expectedDate || undefined,
               memo: memo || undefined,
               lines: lineBody,
+              ...shipBody,
             }),
       );
       if (saved === undefined) return;
@@ -341,7 +452,14 @@ function NewPoModal({ open, onClose, vendors, accounts, items, onCreated, editId
                   description: l.description || null,
                   quantity: l.quantity,
                   rate: l.rate,
+                  ...custJobFields(l.custJob, jobList),
+                  classId: l.classId || null,
                 })),
+                ...(shipMode === 'customer' && shipCustomerId
+                  ? { shipToCustomerId: shipCustomerId }
+                  : shipMode === 'address'
+                    ? { shipTo: { ...shipAddr } }
+                    : {}),
               };
             }}
           />
@@ -407,6 +525,66 @@ function NewPoModal({ open, onClose, vendors, accounts, items, onCreated, editId
               onChange={(e) => setExpectedDate(e.target.value)}
             />
           </div>
+        </div>
+
+        {/* Ship To (QB: the company, a customer for a drop ship, or any address) */}
+        <div className="space-y-2">
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <Label htmlFor="po-ship-mode">Ship To</Label>
+              <Select id="po-ship-mode" value={shipMode} onChange={(e) => setShipMode(e.target.value as ShipMode)}>
+                <option value="company">Our company address</option>
+                <option value="customer">A customer (drop ship)</option>
+                <option value="address">Another address…</option>
+              </Select>
+            </div>
+            {shipMode === 'customer' && (
+              <div>
+                <Label htmlFor="po-ship-customer">Customer</Label>
+                <Select id="po-ship-customer" value={shipCustomerId} onChange={(e) => setShipCustomerId(e.target.value)}>
+                  <option value="">Select a customer…</option>
+                  {shipCustomerId && !customerList.some((c) => c.id === shipCustomerId) && (
+                    <option value={shipCustomerId}>{savedShip?.name || '(customer)'}</option>
+                  )}
+                  {customerList.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.displayName}
+                    </option>
+                  ))}
+                </Select>
+              </div>
+            )}
+          </div>
+          {shipMode === 'customer' && (
+            <p className="text-xs text-navy/50">
+              The order ships to {customerName(shipCustomerId) || 'the customer'}&apos;s shipping address (printed in the
+              P.O.&apos;s Ship To).
+            </p>
+          )}
+          {shipMode === 'address' && (
+            <div className="grid grid-cols-2 gap-2">
+              {(
+                [
+                  ['name', 'Name'],
+                  ['line1', 'Address'],
+                  ['line2', 'Address line 2'],
+                  ['city', 'City'],
+                  ['state', 'State'],
+                  ['zip', 'ZIP'],
+                ] as const
+              ).map(([k, label]) => (
+                <div key={k}>
+                  <Label htmlFor={`po-ship-${k}`}>{label}</Label>
+                  <Input
+                    id={`po-ship-${k}`}
+                    value={shipAddr[k]}
+                    maxLength={255}
+                    onChange={(e) => setShipAddr((a) => ({ ...a, [k]: e.target.value }))}
+                  />
+                </div>
+              ))}
+            </div>
+          )}
         </div>
 
         {/* Line items */}
@@ -495,6 +673,38 @@ function NewPoModal({ open, onClose, vendors, accounts, items, onCreated, editId
                 >
                   <MinusCircle className="h-4 w-4" />
                 </button>
+                {(custJobChoices.length > 0 || classList.length > 0 || line.custJob || line.classId) && (
+                  <div className="col-span-6 grid grid-cols-2 gap-2">
+                    <Select
+                      aria-label={`Line ${idx + 1} customer:job`}
+                      value={line.custJob ?? ''}
+                      onChange={(e) => updateLine(idx, 'custJob', e.target.value)}
+                    >
+                      <option value="">Customer:Job (none)</option>
+                      {line.custJob && !custJobChoices.some((c) => c.value === line.custJob) && (
+                        <option value={line.custJob}>(customer or job)</option>
+                      )}
+                      {custJobChoices.map((c) => (
+                        <option key={c.value} value={c.value}>
+                          {c.label}
+                        </option>
+                      ))}
+                    </Select>
+                    <Select
+                      aria-label={`Line ${idx + 1} class`}
+                      value={line.classId ?? ''}
+                      onChange={(e) => updateLine(idx, 'classId', e.target.value)}
+                    >
+                      <option value="">Class (none)</option>
+                      {line.classId && !classList.some((c) => c.id === line.classId) && <option value={line.classId}>(class)</option>}
+                      {classList.map((c) => (
+                        <option key={c.id} value={c.id}>
+                          {c.name}
+                        </option>
+                      ))}
+                    </Select>
+                  </div>
+                )}
               </div>
             ))}
           </div>
@@ -621,13 +831,18 @@ function ReceiveBillModal({ po, onClose, onBilled, accounts, items }: ReceiveBil
         toast('Enter the bill date.', 'danger');
         return;
       }
-      await api.post(`/api/purchase-orders/${po.id}`, {
-        action: 'convert',
-        lines: billLines,
-        // Without a date the bill (and the stock it receives) was dated on the PO's date.
-        date: billDate,
-        billNumber: billNumber.trim() || null,
-      });
+      // QB: "This vendor already has a bill with reference number …" asks before keeping it.
+      const saved = await saveWithDuplicateCheck((allowDuplicateNumber) =>
+        api.post(`/api/purchase-orders/${po.id}`, {
+          action: 'convert',
+          lines: billLines,
+          // Without a date the bill (and the stock it receives) was dated on the PO's date.
+          date: billDate,
+          billNumber: billNumber.trim() || null,
+          allowDuplicateNumber,
+        }),
+      );
+      if (saved === null) return;
       toast(`Bill created from PO #${docNo(po.refNumber, po.poNumber)}.`, 'success');
       onBilled();
       onClose();

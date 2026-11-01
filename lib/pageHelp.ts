@@ -201,7 +201,7 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
   '/print-checks': {
     title: 'Print Checks',
     what: 'Print the checks you marked "to be printed" on your check stock.',
-    first: 'Pick the bank account, check the starting check number, then print.',
+    first: 'Pick the bank account, check the starting check number, then print. Answer "Did checks print OK?" to record the numbers; tick any check that printed wrong to reprint it.',
   },
   '/sales-tax': {
     title: 'Pay Sales Tax',
@@ -272,8 +272,8 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
   },
   '/loans': {
     title: 'Loans',
-    what: 'Track loans you owe, their payments and how much is interest.',
-    first: 'Add a loan with its amount, rate and term.',
+    what: 'Track loans you owe, their payments and how much is interest. The balance owed is read from the loan account; "What if" compares another rate, payment or term, a lump sum or extra principal.',
+    first: 'Add a loan with its amount, rate and term (tick "already being paid" for a loan you have been paying). Then set up each payment as a check or a bill.',
     qb: 'Loan Manager',
   },
   '/accountant/batch-enter': {

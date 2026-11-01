@@ -1397,6 +1397,9 @@ export async function vendor1099Report(
         eq(vendors.is1099, true),
         gte(billPayments.date, yearStart),
         lt(billPayments.date, yearEnd),
+        // A voided payment paid nothing (the worksheet filters it the same way; voidBillPayment
+        // deletes the applications today, but a void that keeps them must not count either).
+        isNull(billPayments.voidedAt),
         // Exclude card-settled payments (1099-K territory, not 1099-NEC box 1).
         ne(billPayments.method, 'credit_card'),
         fundingAccountNotCreditCard,

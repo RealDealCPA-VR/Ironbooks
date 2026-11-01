@@ -6,7 +6,7 @@
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
 import path from 'node:path';
 import fs from 'node:fs';
-import { and, eq } from 'drizzle-orm';
+import { and, eq, like } from 'drizzle-orm';
 import { getDb, closeDb, type DB } from '@/lib/db';
 import { accounts, bankAccounts, bankTransactions, journalEntries, reconciliationItems, users } from '@/lib/db/schema';
 import { Money } from '@/lib/money';
@@ -212,7 +212,7 @@ describe('reconciliation statement adjustments', () => {
     const posted = await db
       .select()
       .from(journalEntries)
-      .where(and(eq(journalEntries.companyId, ctx.companyId), eq(journalEntries.sourceRef, `reconciliation:${recon.id}`)));
+      .where(and(eq(journalEntries.companyId, ctx.companyId), like(journalEntries.sourceRef, `reconciliation:${recon.id}%`)));
     expect(posted).toHaveLength(0);
     expect(await gl('1000')).toBe('0.00');
   });

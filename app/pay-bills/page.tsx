@@ -13,7 +13,7 @@
  * payments can be queued "To be printed"; foreign-currency bills take an exchange rate;
  * duplicate check numbers are warned about; recent payments can be edited or voided.
  */
-import { isPaymentSourceAccount } from '@/lib/accountTypes';
+import { isCreditCardAccount, isPaymentSourceAccount } from '@/lib/accountTypes';
 import { methodForPaymentAccount } from '@/lib/billPaymentMethod';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { HandCoins, Pencil, Trash2 } from 'lucide-react';
@@ -63,6 +63,25 @@ interface Account {
   type: string;
   subtype: string | null;
 }
+
+/**
+ * The payment method that goes with the pay-from account (QB): a credit card account pays by
+ * Credit Card; a bank account can't take "Credit Card" (it becomes Check).
+ */
+function methodForAccount(account: Account | undefined, current: string): string {
+  if (!account) return current;
+  if (isCreditCardAccount(account)) return 'credit_card';
+  return current === 'credit_card' ? 'check' : current;
+}
+
+const METHOD_CHOICES: Array<[string, string]> = [
+  ['check', 'Check'],
+  ['cash', 'Cash'],
+  ['credit_card', 'Credit Card'],
+  ['ach', 'ACH'],
+  ['bank_transfer', 'Bank Transfer'],
+  ['other', 'Other'],
+];
 
 interface Bill {
   id: string;
@@ -195,6 +214,8 @@ export default function PayBillsPage() {
   const [editDate, setEditDate] = useState('');
   const [editRef, setEditRef] = useState('');
   const [editAccount, setEditAccount] = useState('');
+  // The Edit Payment dialog's method (it used to resend the saved one whatever the account).
+  const [editMethod, setEditMethod] = useState('check');
   const [editBills, setEditBills] = useState<Record<string, { billNumber: string | null; balanceDue: string }>>({});
   const [savingEdit, setSavingEdit] = useState(false);
   const [pendingVoid, setPendingVoid] = useState<BillPayment | null>(null);
@@ -562,6 +583,7 @@ export default function PayBillsPage() {
       setEditDate(detail.date.slice(0, 10));
       setEditRef(detail.reference ?? '');
       setEditAccount(detail.paymentAccountId ?? '');
+      setEditMethod(detail.method);
       editFixer.clear();
       setEditPay(detail);
     } catch (err) {
@@ -589,9 +611,9 @@ export default function PayBillsPage() {
     const body: BillPaymentBody = {
       vendorId,
       date: editDate,
-      method: editPay.method,
-      reference: editPay.toPrint ? undefined : editRef.trim() || undefined,
-      toPrint: editPay.toPrint,
+      method: editMethod,
+      reference: editPay.toPrint && editMethod === 'check' ? undefined : editRef.trim() || undefined,
+      toPrint: editPay.toPrint && editMethod === 'check',
       paymentAccountId: editAccount,
       exchangeRate: editPay.currency && editPay.exchangeRate ? editPay.exchangeRate : undefined,
       applications,
@@ -634,6 +656,7 @@ export default function PayBillsPage() {
       if (op.path === 'date') setEditDate(str);
       else if (op.path === 'reference') setEditRef(str);
       else if (op.path === 'paymentAccountId') setEditAccount(str);
+      else if (op.path === 'method') setEditMethod(str);
       else {
         const lp = parseLinePath(op.path);
         const billId = lp?.collection === 'applications' ? patched.applications[lp.index]?.billId : undefined;
@@ -687,7 +710,10 @@ export default function PayBillsPage() {
             <Select
               id="pb-account"
               value={paymentAccountId}
-              onChange={(e) => setPaymentAccountId(e.target.value)}
+              onChange={(e) => {
+                setPaymentAccountId(e.target.value);
+                setMethod((m) => methodForAccount(accounts.find((a) => a.id === e.target.value), m));
+              }}
             >
               <option value="">Select account…</option>
               {paymentAccounts.map((a) => (
@@ -1045,8 +1071,8 @@ export default function PayBillsPage() {
           <div className="space-y-4">
             {editFixer.panel}
             <p className="text-xs text-navy/50 rounded-lg bg-slate-50 border border-slate-200 px-3 py-2">
-              Changing only the check number keeps the original entry. Changing amounts, the account or
-              the date replaces the entry (not allowed once the check is reconciled).
+              Changing only the check number keeps the original entry. Changing amounts, the account, the
+              method or the date replaces the entry (a reconciled payment asks first, as QB does).
             </p>
             <div className="grid grid-cols-2 gap-3">
               <div>
@@ -1058,15 +1084,34 @@ export default function PayBillsPage() {
                 <DocNumberInput id="ep-ref" value={editPay.toPrint ? '' : editRef} disabled={editPay.toPrint} placeholder={editPay.toPrint ? 'assigned when printed' : ''} onChange={(e) => setEditRef(e.target.value)} />
               </div>
             </div>
-            <div>
-              <Label htmlFor="ep-acct">Payment Account</Label>
-              <Select id="ep-acct" value={editAccount} onChange={(e) => setEditAccount(e.target.value)}>
-                {paymentAccounts.map((a) => (
-                  <option key={a.id} value={a.id}>
-                    {a.code} — {a.name}
-                  </option>
-                ))}
-              </Select>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <Label htmlFor="ep-acct">Payment Account</Label>
+                <Select
+                  id="ep-acct"
+                  value={editAccount}
+                  onChange={(e) => {
+                    setEditAccount(e.target.value);
+                    setEditMethod((m) => methodForAccount(accounts.find((a) => a.id === e.target.value), m));
+                  }}
+                >
+                  {paymentAccounts.map((a) => (
+                    <option key={a.id} value={a.id}>
+                      {a.code} — {a.name}
+                    </option>
+                  ))}
+                </Select>
+              </div>
+              <div>
+                <Label htmlFor="ep-method">Method</Label>
+                <Select id="ep-method" value={editMethod} onChange={(e) => setEditMethod(e.target.value)}>
+                  {METHOD_CHOICES.map(([v, label]) => (
+                    <option key={v} value={v}>
+                      {label}
+                    </option>
+                  ))}
+                </Select>
+              </div>
             </div>
             {(editPay.journalApplications ?? []).filter((j) => j.kind === 'bill_payment').length > 0 && (
               <p className="text-xs text-navy/60">

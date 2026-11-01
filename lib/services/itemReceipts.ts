@@ -46,6 +46,7 @@ import {
   vendors,
 } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
+import { renameLineMemos } from './entryLineMemos';
 import { postJournalEntry, voidJournalEntry } from '@/lib/services/posting';
 import { createBill } from '@/lib/services/bills';
 import {
@@ -117,6 +118,8 @@ export interface ConvertReceiptToBillOptions {
   /** Bill date; defaults to the receipt date. */
   date?: Date;
   dueDate?: Date | null;
+  /** The user confirmed QB's duplicate vendor reference number warning (A4). */
+  allowDuplicateNumber?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -570,6 +573,22 @@ async function updateReceiptHeaderInTx(tx: ServiceContext, id: string, input: Cr
       .set({ description: input.lines[i].description ?? names.get(o.itemId) ?? null })
       .where(eq(itemReceiptLines.id, o.id));
   }
+  // The kept entry's line memos (each stock line's description, the accrual line's reference):
+  // the register / reports Memo column showed the text from before the edit.
+  await renameLineMemos(tx, cur.postedEntryId, [
+    ...oldLines
+      .filter((o) => Money.gt(o.amount, 0))
+      .map((o) => ({
+        from: o.description ?? null,
+        to: input.lines[oldLines.indexOf(o)].description ?? names.get(o.itemId) ?? null,
+        debit: o.amount,
+      })),
+    {
+      from: `Item receipt ${cur.reference ?? id} - ${vendor?.name ?? ''}`,
+      to: `Item receipt ${input.reference ?? id} - ${vendor?.name ?? ''}`,
+      credit: cur.total,
+    },
+  ]);
   await retitleEntry(tx, cur.postedEntryId, {
     description: `Item receipt ${input.reference ? `#${input.reference}` : id} - ${vendor?.name ?? ''}`.trim(),
     reference: input.reference ?? null,
@@ -793,7 +812,12 @@ async function saveItemReceipt(
         tx,
         input.purchaseOrderId,
         resolved.map((l) => ({ itemId: l.itemId, quantity: l.quantity.toFixed(4) })),
-        { vendorId: input.vendorId, sourceRef: 'item_receipt_claim' },
+        {
+          vendorId: input.vendorId,
+          sourceRef: 'item_receipt_claim',
+          // Editing a receipt of a P.O. closed by hand re-claims on it (the P.O. stays closed).
+          reclaimOnManualClose: Boolean(existing && existing.purchaseOrderId === input.purchaseOrderId),
+        },
       );
     }
 
@@ -1042,6 +1066,8 @@ export async function convertToBill(
     const bill = await createBill(tx, {
       vendorId: receipt.vendorId,
       billNumber: opts?.billNumber ?? receipt.reference ?? null,
+      // QB duplicate vendor reference warning (A4), as Enter Bills gives it.
+      checkDuplicateNumber: !opts?.allowDuplicateNumber,
       date: opts?.date ?? receipt.date,
       dueDate: opts?.dueDate ?? null,
       memo:

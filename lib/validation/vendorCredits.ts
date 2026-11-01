@@ -40,5 +40,7 @@ export const createVendorCreditSchema = z.object({
   // p1 fx: the vendor's currency is used; a stated rate overrides the currency list's rate.
   currency: z.string().max(3).nullish(),
   exchangeRate: zDecimalPositive.nullish(),
+  /** Edits: the user confirmed QB's "this transaction has been reconciled" warning (reconciledEdits.ts). */
+  allowReconciledEdit: z.boolean().optional(),
 });
 export type CreateVendorCreditBody = z.infer<typeof createVendorCreditSchema>;

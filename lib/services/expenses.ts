@@ -73,6 +73,9 @@ import {
   reverseDocumentInventory,
 } from './inventorySites';
 import { assertClosedPeriodEdit, planPostedEdit, retitleEntry } from './postedEdit';
+import { carryReconciledLines, prepareReconciledRepost } from './reconciledEdits';
+import { syncLineMemos } from './entryLineMemos';
+import { subledgerAccountReason } from '@/lib/registerEntryPlan';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -126,6 +129,11 @@ export interface CreateExpenseInput {
    * unless the user confirmed the duplicate.
    */
   checkDuplicateNumber?: boolean;
+  /**
+   * Edits: the user confirmed QB's "this transaction has been reconciled" warning, so a change to
+   * the amount or account of a reconciled check / charge is saved (reconciledEdits.ts).
+   */
+  allowReconciledEdit?: boolean;
 }
 
 type ResolvedExpenseLine = {
@@ -183,7 +191,7 @@ async function accountIdByCode(ctx: ServiceContext, code: string): Promise<strin
 async function prepareExpense(
   ctx: ServiceContext,
   input: CreateExpenseInput,
-  opts: { keepOtherNameId?: string | null } = {},
+  opts: { keepOtherNameId?: string | null; keepLineAccountIds?: ReadonlySet<string> } = {},
 ): Promise<PreparedExpense> {
   // ── payee ─────────────────────────────────────────────────────────────────
   let payeeDisplay = input.payeeName?.trim() || '';
@@ -371,7 +379,7 @@ async function prepareExpense(
   // Validate line GL accounts belong to the company and are not the payment account.
   const lineAccountIds = [...new Set(lines.map((l) => l.accountId))];
   const acctRows = await ctx.db
-    .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype })
+    .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype, name: accounts.name })
     .from(accounts)
     .where(and(eq(accounts.companyId, ctx.companyId), inArray(accounts.id, lineAccountIds)));
   const acctById = new Map(acctRows.map((a) => [a.id, a]));
@@ -381,6 +389,16 @@ async function prepareExpense(
     if (id === input.paymentAccountId) {
       throw validation('An expense line cannot post to the payment account itself. Use a transfer instead.');
     }
+  }
+  // An account line (no item) on Undeposited Funds moved money that no Make Deposits list shows;
+  // one on an inventory asset account changed its balance without the inventory valuation (QB
+  // lists inventory only through items). The banking forms refuse both the same way. A saved
+  // check that already has such a line can still be re-saved as it is.
+  for (const [i, l] of lines.entries()) {
+    if (l.itemId || opts.keepLineAccountIds?.has(l.accountId)) continue;
+    const acct = acctById.get(l.accountId);
+    const reason = acct ? subledgerAccountReason(acct) : null;
+    if (reason) throw validation(`Line ${i + 1}: ${reason}`);
   }
 
   // QB: a check line on A/R (e.g. refunding a customer) carries that customer's name, and a
@@ -661,8 +679,9 @@ export async function createExpense(ctx: ServiceContext, input: CreateExpenseInp
  *     (allowed even when the check was cleared in a completed reconciliation).
  *   - otherwise: void the entry (closing date checked on the OLD date), pull received stock back
  *     out, replace the lines, post a fresh entry (closing date checked on the NEW date) and
- *     receive stock again. Refused when a line was cleared in a completed reconciliation, was
- *     already billed to a customer invoice, or the check carries a Loan Manager payment.
+ *     receive stock again. A check cleared in a completed reconciliation gives QB's warning and
+ *     is saved once the user confirms (allowReconciledEdit; reconciledEdits.ts). Refused when a
+ *     line was already billed to a customer invoice, or the check carries a Loan Manager payment.
  */
 export async function updateExpense(ctx: ServiceContext, id: string, input: CreateExpenseInput) {
   const [existing] = await ctx.db
@@ -672,8 +691,16 @@ export async function updateExpense(ctx: ServiceContext, id: string, input: Crea
   if (!existing) throw notFound('Expense');
   if (existing.voidedAt) throw new ServiceError('CONFLICT', 'This transaction is void and cannot be edited.');
 
-  // An inactive Other Names payee already on this check may stay on it.
-  const prep = await prepareExpense(ctx, input, { keepOtherNameId: existing.otherNameId });
+  // An inactive Other Names payee already on this check may stay on it, and so may a line account
+  // the subledger rule (prepareExpense) refuses on a new check.
+  const savedLineAccounts = await ctx.db
+    .select({ accountId: expenseLines.accountId })
+    .from(expenseLines)
+    .where(eq(expenseLines.expenseId, id));
+  const prep = await prepareExpense(ctx, input, {
+    keepOtherNameId: existing.otherNameId,
+    keepLineAccountIds: new Set(savedLineAccounts.map((l) => l.accountId)),
+  });
 
   const toPrint = Boolean(input.toPrint) && input.method === 'check';
 
@@ -719,11 +746,13 @@ export async function updateExpense(ctx: ServiceContext, id: string, input: Crea
           Money.of(o.quantity ?? 0).equals(Money.of(prep.lines[i].quantity ?? 0)),
       );
     const sameCurrency = (cur.currency ?? null) === prep.currency;
+    const what = input.method === 'credit_card' ? 'charge' : 'check';
     let plan = await planPostedEdit(tx, {
       entryId: cur.postedEntryId,
       date: input.date,
       lines: glLines,
-      what: input.method === 'credit_card' ? 'charge' : 'check',
+      what,
+      allowReconciledEdit: input.allowReconciledEdit,
     });
     if (plan === 'unchanged' && !(sameItems && sameCurrency && cur.method === input.method)) plan = 'repost';
 
@@ -758,6 +787,8 @@ export async function updateExpense(ctx: ServiceContext, id: string, input: Crea
           .where(eq(expenseLines.id, o.id));
       }
       await retitleEntry(tx, entryId, { description: entryDescription(prep, input.method), reference });
+      // The kept entry's line memos follow the edited descriptions (register / report Memo column).
+      await syncLineMemos(tx, entryId, glLines);
     } else {
       if (oldLines.some((l) => l.billedInvoiceId)) {
         throw new ServiceError(
@@ -776,6 +807,13 @@ export async function updateExpense(ctx: ServiceContext, id: string, input: Crea
           'This check is a Loan Manager payment. To change its amounts, void it and set up the loan payment again.',
         );
       }
+      // Reconciled check / charge: QB's warning (or the user's confirmation) before re-posting it.
+      await prepareReconciledRepost(tx, {
+        entryId: cur.postedEntryId,
+        lines: glLines,
+        what,
+        allowReconciledEdit: input.allowReconciledEdit,
+      });
       if (cur.postedEntryId) await voidJournalEntry(tx, cur.postedEntryId);
       await reverseExpenseStock(tx, cur, 'expense_edit');
       await tx.db.delete(expenseLines).where(eq(expenseLines.expenseId, id));
@@ -788,6 +826,7 @@ export async function updateExpense(ctx: ServiceContext, id: string, input: Crea
         lines: glLines,
       });
       entryId = entry.id;
+      await carryReconciledLines(tx, { oldEntryId: cur.postedEntryId, newEntryId: entry.id });
       await tx.db.update(expenses).set({ ...header, postedEntryId: entry.id }).where(eq(expenses.id, id));
       await receiveExpenseStock(tx, id, input.date, input, prep, {
         reason: 'expense_edit_receipt',

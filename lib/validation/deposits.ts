@@ -28,6 +28,8 @@ export const createDepositSchema = z
     memo: z.string().nullish(),
     // p1 fx: foreign-currency bank account — home units per 1 unit (default: list rate)
     exchangeRate: zDecimalPositive.nullish(),
+    /** Edits: the user confirmed QB's "this transaction has been reconciled" warning (reconciledEdits.ts). */
+    allowReconciledEdit: z.boolean().optional(),
   })
   .refine(
     (d) =>

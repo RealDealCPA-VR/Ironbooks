@@ -20,6 +20,7 @@ import {
   bankAccounts,
   journalEntries,
   journalEntryLines,
+  reconciliationChanges,
   reconciliationItems,
   reconciliations,
 } from '@/lib/db/schema';
@@ -28,7 +29,7 @@ import { canFinishReconciliation } from '@/lib/reconcileRules';
 import { MAX_DATE_YEAR, MIN_DATE_YEAR, parseDateInput } from '@/lib/validation/helpers';
 import { todayISO } from '@/lib/dates';
 import { subledgerAccountReason } from '@/lib/registerEntryPlan';
-import { isBankAccount } from '@/lib/accountTypes';
+import { isBankAccount, isCreditCardAccount } from '@/lib/accountTypes';
 import {
   type ServiceContext,
   ServiceError,
@@ -43,6 +44,7 @@ import { payCreditCard } from './liabilityPayments';
 import { accountCreditSql, accountDebitSql, foreignCurrencyOfAccount, nz } from './fxLedger';
 import { currencyRate, toHome } from './exchangeRates';
 import { foreignCode, homeCode } from './fxLines';
+import { carriedLineIds } from './reconciledEdits';
 
 // ---------------------------------------------------------------------------
 // Input / output types
@@ -833,8 +835,14 @@ export interface ReconcileInfo {
   glAccountName: string;
   glAccountCode: string;
   glType: string;
-  /** True when the linked GL account is a liability (credit card) account. */
+  /**
+   * True when the linked GL account is a Credit Card account: QB offers "Write a check for the
+   * balance" / Enter a bill after reconciling one. A loan or other liability is not a credit card
+   * (it is paid through Loan Manager or Write Checks).
+   */
   isCreditCard: boolean;
+  /** True for any liability account (statement amounts read credit − debit: charges / borrowings +). */
+  isLiability: boolean;
   lastReconciledDate: Date | null;
   /** Carried-forward beginning balance (last statement balance; "0.00" when never reconciled). */
   beginningBalance: string;
@@ -870,6 +878,7 @@ export async function getReconcileInfo(
       glAccountName: accounts.name,
       glAccountCode: accounts.code,
       glType: accounts.type,
+      glSubtype: accounts.subtype,
     })
     .from(bankAccounts)
     .innerJoin(accounts, eq(bankAccounts.accountId, accounts.id))
@@ -917,7 +926,8 @@ export async function getReconcileInfo(
     glAccountName: ba.glAccountName,
     glAccountCode: ba.glAccountCode,
     glType: ba.glType,
-    isCreditCard: ba.glType === 'liability',
+    isCreditCard: isCreditCardAccount({ type: ba.glType, subtype: ba.glSubtype }),
+    isLiability: ba.glType === 'liability',
     lastReconciledDate: ba.lastReconciledDate,
     beginningBalance: toAmountString(beginning),
     recomputedBalance: toAmountString(recomputed),
@@ -962,9 +972,24 @@ async function autoClearBankLine(
 }
 
 /**
+ * Source ref of a statement adjustment posted from Reconcile: "reconciliation:<id>:charge" for
+ * the service charge, "reconciliation:<id>:interest" for interest earned. Reports show them as a
+ * Check / Deposit (QB) instead of "Other"; entries posted before this carry "reconciliation:<id>".
+ */
+export function reconciliationAdjustmentRef(reconciliationId: string, kind: 'charge' | 'interest'): string {
+  return `reconciliation:${reconciliationId}:${kind}`;
+}
+
+/** True when `sourceRef` is a statement adjustment of reconciliation `reconciliationId` (either form). */
+export function isReconciliationAdjustmentRef(sourceRef: string | null | undefined, reconciliationId: string): boolean {
+  if (!sourceRef) return false;
+  return sourceRef === `reconciliation:${reconciliationId}` || sourceRef.startsWith(`reconciliation:${reconciliationId}:`);
+}
+
+/**
  * Record statement-only adjustments (bank service charge and/or interest earned)
  * during an in-progress reconciliation. Each adjustment posts a journal entry
- * dated the statement date (sourceRef "reconciliation:<id>") and its bank-side
+ * dated the statement date (sourceRef reconciliationAdjustmentRef) and its bank-side
  * line is automatically cleared into the current session, so the reconciliation
  * still balances against the statement.
  *
@@ -1029,7 +1054,7 @@ export async function addStatementAdjustments(
       const entry = await postJournalEntry(tx, {
         date: recon.statementDate,
         description: 'Bank service charge',
-        sourceRef: `reconciliation:${reconciliationId}`,
+        sourceRef: reconciliationAdjustmentRef(reconciliationId, 'charge'),
         lines: [
           { accountId: charge.accountId, debit: homeStr },
           { accountId: recon.glAccountId, credit: homeStr, ...(adjFx ? { foreignAmount: charge.amtStr } : {}) },
@@ -1044,7 +1069,7 @@ export async function addStatementAdjustments(
       const entry = await postJournalEntry(tx, {
         date: recon.statementDate,
         description: 'Interest earned',
-        sourceRef: `reconciliation:${reconciliationId}`,
+        sourceRef: reconciliationAdjustmentRef(reconciliationId, 'interest'),
         lines: [
           { accountId: recon.glAccountId, debit: homeStr, ...(adjFx ? { foreignAmount: interest.amtStr } : {}) },
           { accountId: interest.accountId, credit: homeStr },
@@ -1171,6 +1196,91 @@ export interface ReconciliationReportLine {
   isVoided: boolean;
 }
 
+/** A reconciled transaction changed after it was reconciled (reconciledEdits.ts). */
+export interface ReconciliationChangeRow {
+  id: string;
+  reconciliationId: string;
+  /** The transaction as it is now (the re-posted entry), else the one that was reconciled. */
+  journalEntryId: string | null;
+  entryNumber: number | null;
+  date: Date;
+  description: string | null;
+  sourceRef: string | null;
+  /** In statement terms: + money in / charge, - money out / payment. */
+  reconciledAmount: string;
+  /** The amount now ('0.00' once the transaction left the account). */
+  newAmount: string;
+  /** newAmount - reconciledAmount: what the change did to the reconciled balance. */
+  effect: string;
+  /** 'amount' (amount changed) | 'removed' (no longer on this account). */
+  changeType: 'amount' | 'removed';
+  changedAt: Date;
+  changedBy: string | null;
+}
+
+/**
+ * Changes made to reconciled transactions after they were reconciled, for completed
+ * reconciliations (all of a bank account's, or the ones listed). A change that kept the amount
+ * ('unchanged', e.g. only the expense account moved) is not a discrepancy and is left out.
+ */
+async function reconciliationChangeRows(
+  ctx: ServiceContext,
+  where: { bankAccountId?: string; reconciliationIds?: string[] },
+): Promise<ReconciliationChangeRow[]> {
+  if (where.reconciliationIds && where.reconciliationIds.length === 0) return [];
+  const rows = await ctx.db
+    .select({
+      c: reconciliationChanges,
+      newEntryNumber: journalEntries.entryNumber,
+      newDescription: journalEntries.description,
+      newSourceRef: journalEntries.sourceRef,
+    })
+    .from(reconciliationChanges)
+    .innerJoin(reconciliations, eq(reconciliationChanges.reconciliationId, reconciliations.id))
+    .leftJoin(journalEntries, eq(reconciliationChanges.newEntryId, journalEntries.id))
+    .where(
+      and(
+        eq(reconciliationChanges.companyId, ctx.companyId),
+        eq(reconciliations.status, 'completed'),
+        inArray(reconciliationChanges.changeType, ['amount', 'removed']),
+        ...(where.bankAccountId ? [eq(reconciliationChanges.bankAccountId, where.bankAccountId)] : []),
+        ...(where.reconciliationIds ? [inArray(reconciliationChanges.reconciliationId, where.reconciliationIds)] : []),
+      ),
+    )
+    .orderBy(desc(reconciliationChanges.createdAt));
+  return rows.map(({ c, newEntryNumber, newDescription, newSourceRef }) => ({
+    id: c.id,
+    reconciliationId: c.reconciliationId,
+    journalEntryId: c.newEntryId ?? c.oldEntryId,
+    entryNumber: newEntryNumber ?? c.entryNumber,
+    date: c.transactionDate,
+    description: newDescription ?? c.description,
+    sourceRef: newSourceRef ?? c.sourceRef,
+    reconciledAmount: toAmountString(c.reconciledAmount),
+    newAmount: toAmountString(c.newAmount ?? 0),
+    effect: toAmountString(c.effect ?? 0),
+    changeType: c.changeType as 'amount' | 'removed',
+    changedAt: c.createdAt,
+    changedBy: c.createdBy,
+  }));
+}
+
+/** Old (reconciled) line ids of a set of reconciliations that a later change replaced. */
+async function changedOldLineIds(ctx: ServiceContext, reconciliationIds: string[]): Promise<Set<string>> {
+  if (reconciliationIds.length === 0) return new Set();
+  const rows = await ctx.db
+    .select({ lineId: reconciliationChanges.oldLineId })
+    .from(reconciliationChanges)
+    .where(
+      and(
+        eq(reconciliationChanges.companyId, ctx.companyId),
+        inArray(reconciliationChanges.reconciliationId, reconciliationIds),
+        ne(reconciliationChanges.changeType, 'pending'),
+      ),
+    );
+  return new Set(rows.map((r) => r.lineId).filter((x): x is string => !!x));
+}
+
 export interface ReconciliationReport {
   id: string;
   bankAccountId: string;
@@ -1202,6 +1312,11 @@ export interface ReconciliationReport {
   lines: ReconciliationReportLine[];
   /** Cleared lines whose journal entry is now void (reconciliation discrepancies). */
   discrepancies: ReconciliationReportLine[];
+  /**
+   * purchbank: reconciled transactions changed after this statement was reconciled (QB warns,
+   * then allows it). The lines above stay as reconciled; these are the changes since.
+   */
+  changes: ReconciliationChangeRow[];
   /** p1 fx: the account's currency (null = home); every amount above is in it. */
   currency?: string | null;
 }
@@ -1273,6 +1388,14 @@ export async function getReconciliationReport(
       ),
     );
 
+  // purchbank: a reconciled transaction changed after the statement was reconciled has its mark
+  // carried onto the re-posted line (reconciledEdits.ts). The report shows the statement as it was
+  // reconciled — the line that was cleared — and lists the change separately.
+  const carried = await carriedLineIds(ctx, [reconciliationId]);
+  const replaced = await changedOldLineIds(ctx, [reconciliationId]);
+  const changes = await reconciliationChangeRows(ctx, { reconciliationIds: [reconciliationId] });
+  for (let i = rows.length - 1; i >= 0; i--) if (carried.has(rows[i].lineId)) rows.splice(i, 1);
+
   rows.sort((a, b) => a.date.getTime() - b.date.getTime() || a.entryNumber - b.entryNumber);
 
   let clearedTotal = Money.zero();
@@ -1306,7 +1429,8 @@ export async function getReconciliationReport(
       debit: r.debit,
       credit: r.credit,
       amount: toAmountString(amount),
-      isVoided: r.jeStatus === 'void',
+      // A line re-posted by a later change is not a "deleted" transaction (see `changes`).
+      isVoided: r.jeStatus === 'void' && !replaced.has(r.lineId),
     };
   });
 
@@ -1337,6 +1461,7 @@ export async function getReconciliationReport(
     paymentsTotal: toAmountString(paymentsTotal),
     lines,
     discrepancies: lines.filter((l) => l.isVoided),
+    changes,
     currency: reportCurrency,
   };
 }
@@ -1353,9 +1478,23 @@ export interface DiscrepancyRow {
   description: string;
   debit: string | null;
   credit: string | null;
-  /** Natural-side signed amount that the void removed from the reconciled balance. */
+  /**
+   * What the change did to the reconciled balance: for a voided transaction the natural-side
+   * amount the void removed; for a changed one its effect (new amount - reconciled amount).
+   */
   amount: string;
   voidedAt: Date | null;
+  /**
+   * QB "Type of Change": 'void' (the reconciled transaction was voided — possible before the
+   * posting guard), 'amount' (changed after QB's warning), 'removed' (moved off this account).
+   */
+  changeType: 'void' | 'amount' | 'removed';
+  /** Amount as reconciled (statement terms: + in, - out). */
+  reconciledAmount: string;
+  /** Amount now ('0.00' for a voided or removed transaction). */
+  newAmount: string;
+  /** When the change was made (the void date for a voided transaction). */
+  changedAt: Date | null;
 }
 
 /**
@@ -1384,6 +1523,7 @@ export async function reconciliationDiscrepancies(
       bankName: bankAccounts.bankName,
       accountNumber: bankAccounts.accountNumber,
       glType: accounts.type,
+      lineId: journalEntryLines.id,
       journalEntryId: journalEntries.id,
       entryNumber: journalEntries.entryNumber,
       date: journalEntries.date,
@@ -1402,21 +1542,80 @@ export async function reconciliationDiscrepancies(
     .where(and(...conditions))
     .orderBy(desc(reconciliations.statementDate));
 
-  return rows.map((r) => ({
-    reconciliationId: r.reconciliationId,
-    statementDate: r.statementDate,
-    bankAccountId: r.bankAccountId,
-    bankName: r.bankName,
-    accountNumber: accountNumberFor(ctx, r.accountNumber),
-    journalEntryId: r.journalEntryId,
-    entryNumber: r.entryNumber,
-    date: r.date,
-    description: r.description,
-    debit: r.debit,
-    credit: r.credit,
-    amount: toAmountString(naturalAmount(r.glType, r.debit, r.credit)),
-    voidedAt: r.voidedAt,
-  }));
+  // purchbank: a line re-posted by a change made after QB's warning is listed as that change
+  // (its amount and effect), not as a voided transaction.
+  const replaced = await changedOldLineIds(ctx, [...new Set(rows.map((r) => r.reconciliationId))]);
+  const voided: DiscrepancyRow[] = rows
+    .filter((r) => !replaced.has(r.lineId))
+    .map((r) => {
+      const amount = naturalAmount(r.glType, r.debit, r.credit);
+      return {
+        reconciliationId: r.reconciliationId,
+        statementDate: r.statementDate,
+        bankAccountId: r.bankAccountId,
+        bankName: r.bankName,
+        accountNumber: accountNumberFor(ctx, r.accountNumber),
+        journalEntryId: r.journalEntryId,
+        entryNumber: r.entryNumber,
+        date: r.date,
+        description: r.description,
+        debit: r.debit,
+        credit: r.credit,
+        amount: toAmountString(amount),
+        voidedAt: r.voidedAt,
+        changeType: 'void' as const,
+        reconciledAmount: toAmountString(amount),
+        newAmount: '0.00',
+        changedAt: r.voidedAt,
+      };
+    });
+
+  const changes = await reconciliationChangeRows(ctx, { bankAccountId });
+  const meta = new Map<string, { statementDate: Date; bankName: string; accountNumber: string; bankAccountId: string }>();
+  const metaIds = [...new Set(changes.map((c) => c.reconciliationId))];
+  if (metaIds.length > 0) {
+    const m = await ctx.db
+      .select({
+        id: reconciliations.id,
+        statementDate: reconciliations.statementDate,
+        bankAccountId: bankAccounts.id,
+        bankName: bankAccounts.bankName,
+        accountNumber: bankAccounts.accountNumber,
+      })
+      .from(reconciliations)
+      .innerJoin(bankAccounts, eq(reconciliations.bankAccountId, bankAccounts.id))
+      .where(and(eq(bankAccounts.companyId, ctx.companyId), inArray(reconciliations.id, metaIds)));
+    for (const r of m) meta.set(r.id, { ...r, accountNumber: accountNumberFor(ctx, r.accountNumber) });
+  }
+  const changed: DiscrepancyRow[] = changes.flatMap((c) => {
+    const r = meta.get(c.reconciliationId);
+    if (!r) return [];
+    return [
+      {
+        reconciliationId: c.reconciliationId,
+        statementDate: r.statementDate,
+        bankAccountId: r.bankAccountId,
+        bankName: r.bankName,
+        accountNumber: r.accountNumber,
+        journalEntryId: c.journalEntryId ?? '',
+        entryNumber: c.entryNumber ?? 0,
+        date: c.date,
+        description: c.description ?? '',
+        debit: null,
+        credit: null,
+        amount: c.effect,
+        voidedAt: null,
+        changeType: c.changeType,
+        reconciledAmount: c.reconciledAmount,
+        newAmount: c.newAmount,
+        changedAt: c.changedAt,
+      },
+    ];
+  });
+
+  return [...voided, ...changed].sort(
+    (a, b) => b.statementDate.getTime() - a.statementDate.getTime() || a.date.getTime() - b.date.getTime(),
+  );
 }
 
 /**
@@ -1531,12 +1730,17 @@ export async function payCreditCardBalance(
     }
 
     const [gl] = await tx.db
-      .select({ type: accounts.type, name: accounts.name })
+      .select({ type: accounts.type, subtype: accounts.subtype, name: accounts.name })
       .from(accounts)
       .where(and(eq(accounts.id, recon.glAccountId), eq(accounts.companyId, tx.companyId)));
     if (!gl) throw notFound('Credit card GL account');
-    if (gl.type !== 'liability') {
-      throw validation('This reconciliation is not for a credit card (liability) account.');
+    // QB offers Make Payment only after reconciling a Credit Card account. A reconciled loan, line
+    // of credit or other liability used to be paid off in full from here (Dr Truck Loan 20,000 /
+    // Cr Checking); loans are paid through Loan Manager or Write Checks.
+    if (!isCreditCardAccount(gl)) {
+      throw validation(
+        `"${gl.name}" is not a credit card account, so there is no credit card balance to pay. Pay a loan or other liability with Loan Manager or Write Checks.`,
+      );
     }
 
     // QB "Write a check for the balance": the check comes from a bank account (the same rule as

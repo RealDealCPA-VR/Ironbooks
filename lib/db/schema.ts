@@ -170,6 +170,36 @@ export const reconciliationItems = pgTable('reconciliation_items', {
   clearedDate: timestamp('cleared_date'),
 });
 
+/**
+ * purchbank (0081): a reconciled transaction that was changed afterwards (QB warns, then allows
+ * it). Listed on the Previous Reconciliation Discrepancy report. Line / entry ids are plain
+ * references (Condense may remove the old lines); the shown values are kept on the row.
+ */
+export const reconciliationChanges = pgTable('reconciliation_changes', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  reconciliationId: uuid('reconciliation_id').references(() => reconciliations.id).notNull(),
+  bankAccountId: uuid('bank_account_id').references(() => bankAccounts.id).notNull(),
+  oldEntryId: uuid('old_entry_id'),
+  oldLineId: uuid('old_line_id'),
+  newEntryId: uuid('new_entry_id'),
+  newLineId: uuid('new_line_id'),
+  transactionDate: timestamp('transaction_date').notNull(),
+  entryNumber: integer('entry_number'),
+  description: text('description'),
+  sourceRef: varchar('source_ref', { length: 100 }),
+  /** Amount as reconciled, in statement terms (bank: deposit +, payment -; card: charge +). */
+  reconciledAmount: decimal('reconciled_amount', { precision: 15, scale: 2 }).notNull(),
+  newAmount: decimal('new_amount', { precision: 15, scale: 2 }),
+  /** newAmount - reconciledAmount (what the change did to the reconciled balance). */
+  effect: decimal('effect', { precision: 15, scale: 2 }),
+  /** 'pending' (inside the editing transaction) | 'amount' | 'removed' | 'unchanged'. */
+  changeType: varchar('change_type', { length: 20 }).notNull().default('pending'),
+  txId: varchar('tx_id', { length: 40 }),
+  createdBy: uuid('created_by'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+}, (t) => [index('reconciliation_changes_account_idx').on(t.companyId, t.bankAccountId)]);
+
 // File Imports
 export const fileImports = pgTable('file_imports', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -705,6 +735,8 @@ export const bills = pgTable('bills', {
   date: timestamp('date').notNull(),
   dueDate: timestamp('due_date'),
   terms: varchar('terms', { length: 50 }),
+  /** purchbank (0081): the Terms list entry the bill was entered with (due date / Pay Bills discount). */
+  termsId: uuid('terms_id').references((): any => paymentTerms.id),
   status: docStatusEnum('status').notNull().default('open'),
   classId: uuid('class_id').references(() => classes.id),
   total: decimal('total', { precision: 15, scale: 2 }).notNull().default('0'),
@@ -1318,6 +1350,12 @@ export const purchaseOrders = pgTable('purchase_orders', {
   total: decimal('total', { precision: 15, scale: 2 }).notNull().default('0'),
   memo: text('memo'),
   convertedBillId: uuid('converted_bill_id'),
+  /** purchbank (0081): Ship To address ({ line1, line2, city, state, zip, country, name }). */
+  shipTo: jsonb('ship_to'),
+  /** purchbank (0081): the customer the order ships to (drop ship), when one was picked. */
+  shipToCustomerId: uuid('ship_to_customer_id').references(() => customers.id),
+  /** purchbank (0081): closed by hand (Mark as Closed), not because everything was received. */
+  closedManually: boolean('closed_manually').notNull().default(false),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -1340,6 +1378,10 @@ export const purchaseOrderLines = pgTable('purchase_order_lines', {
     .notNull()
     .default('0'),
   lineOrder: integer('line_order').notNull().default(0),
+  /** purchbank (0081): Customer:Job and Class, carried onto the bill / receipt lines. */
+  customerId: uuid('customer_id').references(() => customers.id),
+  jobId: uuid('job_id').references(() => jobs.id),
+  classId: uuid('class_id').references(() => classes.id),
 }, (t) => [index('purchase_order_lines_po_idx').on(t.purchaseOrderId)]);
 
 // ---- Item receipts (QB "Receive Items" before the bill arrives) ----
@@ -1415,6 +1457,9 @@ export const depositLines = pgTable('deposit_lines', {
   amount: decimal('amount', { precision: 15, scale: 2 }).notNull().default('0'),
   /** Account an "extra" (non-payment) deposit line credits (0037; null on payment/receipt lines). */
   accountId: uuid('account_id').references(() => accounts.id),
+  /** purchbank (0081): Received From name of an extra line ('customer' | 'vendor' | 'employee' | 'other'). */
+  entityType: varchar('entity_type', { length: 20 }),
+  entityId: uuid('entity_id'),
 });
 
 // ---- Multi-currency: currencies & exchange rates (relative to the company base currency) ----
@@ -2416,6 +2461,17 @@ export const loans = pgTable('loans', {
   /** p1 fx (0043): loan currency (null = home) and the rate the loan was booked at. */
   currency: varchar('currency', { length: 3 }),
   exchangeRate: decimal('exchange_rate', { precision: 18, scale: 8 }),
+  /** purchbank (0081): balloon paid with the last payment (null = none). */
+  balloonAmount: decimal('balloon_amount', { precision: 15, scale: 2 }),
+  /** purchbank (0081): 'monthly' (per payment period) | 'exact_days' (days between payments). */
+  compounding: varchar('compounding', { length: 16 }).notNull().default('monthly'),
+  /** purchbank (0081): days in the interest year for exact-days compounding (365 or 360). */
+  dayCount: integer('day_count').notNull().default(365),
+  /** purchbank (0081): principal + interest per payment set by the lender (null = computed). */
+  paymentAmount: decimal('payment_amount', { precision: 15, scale: 2 }),
+  /** purchbank (0081): loan in progress — number and date of the first payment the Loan Manager tracks. */
+  scheduleStartNumber: integer('schedule_start_number').notNull().default(1),
+  scheduleStartDate: timestamp('schedule_start_date'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });

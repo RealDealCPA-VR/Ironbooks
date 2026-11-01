@@ -23,6 +23,38 @@ export const loanSchema = z.object({
   // p1 fx: loan currency (default: the lender's) and the rate it was booked at
   currency: z.string().max(3).nullish(),
   exchangeRate: zDecimalPositive.nullish(),
+  // purchbank F1: balloon, compounding, the lender's payment amount, a loan already in progress
+  balloonAmount: zMoney.nullish(),
+  compounding: z.enum(['monthly', 'exact_days']).nullish(),
+  dayCount: z.coerce.number().int().nullish(),
+  paymentAmount: zMoney.nullish(),
+  nextPaymentNumber: z.coerce.number().int().min(1).nullish(),
+  nextPaymentDate: zDate.nullish(),
+});
+
+/** POST /api/loans/:id/what-if — QB Loan Manager "What If Scenarios" (nothing is saved). */
+export const loanWhatIfSchema = z.object({
+  annualRate: zDecimal.nullish(),
+  paymentAmount: zMoney.nullish(),
+  termMonths: z.coerce.number().int().min(1).max(600).nullish(),
+  lumpSum: zMoney.nullish(),
+  extraPrincipal: zMoney.nullish(),
+  balloonAmount: zMoney.nullish(),
+});
+
+/** POST /api/loans/what-if — evaluate a new loan's payment, interest and payoff. */
+export const loanEvaluateSchema = z.object({
+  originalAmount: zMoney,
+  annualRate: zDecimal,
+  termMonths: z.coerce.number().int().min(1).max(600),
+  paymentsPerYear: z.coerce.number().int().optional(),
+  originDate: zDate,
+  firstPaymentDate: zDate,
+  balloonAmount: zMoney.nullish(),
+  compounding: z.enum(['monthly', 'exact_days']).nullish(),
+  dayCount: z.coerce.number().int().nullish(),
+  paymentAmount: zMoney.nullish(),
+  escrowAmount: zMoney.nullish(),
 });
 
 export const loanPaymentSchema = z.object({
@@ -46,6 +78,34 @@ export const markPrintedSchema = z.object({
   id: zUuid,
   checkNumber: z.string().max(100).nullish(),
   allowDuplicateNumber: z.boolean().optional(),
+});
+
+/** purchbank D3: one check of a print run and the number on the check paper it prints on. */
+const printRunItemSchema = z.object({
+  source: printSourceSchema,
+  id: zUuid,
+  checkNumber: z.string().trim().min(1, 'Each check needs the number printed on its check paper.').max(100),
+});
+
+/** POST /api/print-queue/run — check a print run before printing (nothing is recorded). */
+export const printRunSchema = z.object({
+  items: z.array(printRunItemSchema).min(1, 'Pick at least one check to print.').max(300, 'Print at most 300 checks at a time.'),
+  allowDuplicateNumber: z.boolean().optional(),
+});
+
+/** POST /api/print-queue/confirm — "Did check(s) print OK?": `reprint` marks the ones that printed wrong. */
+export const confirmPrintRunSchema = z.object({
+  items: z
+    .array(printRunItemSchema.extend({ reprint: z.boolean().optional() }))
+    .min(1, 'Pick at least one check to print.')
+    .max(300, 'Print at most 300 checks at a time.'),
+  allowDuplicateNumber: z.boolean().optional(),
+});
+
+/** POST /api/print-queue/reprint — put a printed check back in the queue to print it again. */
+export const reprintCheckSchema = z.object({
+  source: printSourceSchema,
+  id: zUuid,
 });
 
 export const queuePaychecksSchema = z.object({

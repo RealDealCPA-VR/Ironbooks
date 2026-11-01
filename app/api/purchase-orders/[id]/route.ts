@@ -64,9 +64,9 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
 
     if (parsed.data.action === 'convert') {
       // A stale tab must not bill a purchase order another user just changed.
-      const { lines, date, billNumber } = parsed.data;
+      const { lines, date, billNumber, allowDuplicateNumber } = parsed.data;
       const bill = await withVersionCheck(ctx, 'purchase_order', id, expectedVersion(req), (c) =>
-        convertToBill(c, id, { lines, date, billNumber: billNumber ?? null }),
+        convertToBill(c, id, { lines, date, billNumber: billNumber ?? null, allowDuplicateNumber: allowDuplicateNumber === true }),
       );
       return NextResponse.json(bill);
     }

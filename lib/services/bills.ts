@@ -41,16 +41,20 @@ import {
   journalEntries,
   journalEntryLines,
   loanPayments,
+  paymentTerms,
   vendors,
 } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type DiscountInfo, discountFor, dueDateFromTerms } from './billTerms';
-import { computeDiscount, computeDueDate, dueDateFromTermsList, findTermsRef, type TermsLike, type TermsRow } from './lists/terms';
+import { computeDiscount, computeDueDate, findTermsRef, termsLabel, type TermsLike, type TermsRow } from './lists/terms';
 import { duplicateNumberFixes } from '@/lib/errorFixes';
 import { getPreferences } from './company';
 import { assertLineAccountsInDocumentCurrency, homeAmounts, resolveDocumentCurrency, sameCurrencyAccountIds } from './currencies';
-import { postJournalEntry, voidJournalEntry } from '@/lib/services/posting';
+import { postJournalEntry, voidJournalEntry, type PostingLine } from '@/lib/services/posting';
 import { assertClosedPeriodEdit, retitleEntry, sameLedgerLines } from './postedEdit';
+import { syncLineMemos } from './entryLineMemos';
+import { subledgerAccountReason } from '@/lib/registerEntryPlan';
+import { companyToday } from './salesDates';
 import {
   type DocumentInventoryLine,
   type InventoryLineDetail,
@@ -142,7 +146,11 @@ export async function findDuplicateBillNumbers(
     );
 }
 
-async function assertBillNumberAvailable(ctx: ServiceContext, input: CreateBillInput, excludeId?: string) {
+export async function assertBillNumberAvailable(
+  ctx: ServiceContext,
+  input: Pick<CreateBillInput, 'vendorId' | 'billNumber' | 'checkDuplicateNumber'>,
+  excludeId?: string,
+) {
   if (!input.checkDuplicateNumber) return;
   // Preferences > Bills: "Warn about duplicate bill numbers from same vendor" off accepts it silently.
   if (!(await getPreferences(ctx)).warnDuplicateBillNumbers) return;
@@ -260,6 +268,8 @@ interface PreparedBill {
   currency: string | null;
   rate: Decimal;
   terms: string | null;
+  /** D5: the Terms list entry the terms resolved to (null for free text not on the list). */
+  termsId: string | null;
   dueDate: Date | null;
   apAccountId: string;
   /** review5 fx: line accounts in the bill's own foreign currency (they take the typed amount). */
@@ -267,16 +277,72 @@ interface PreparedBill {
 }
 
 /**
+ * D5 — a bill's terms and due date (QB Enter Bills: the vendor's terms fill in, the due date follows
+ * them, a typed due date wins). The Terms list decides: the terms typed / picked on the bill (an
+ * entry's code, name or id), else the vendor's Terms list entry (vendors.termsId — a renamed entry
+ * still counts), else the vendor's legacy terms text. Standard (net / discount days) and
+ * date-driven (day of month) entries both give the due date; free text that is not on the list
+ * falls back to the legacy parser ('2/10 n/30', 'net 45').
+ */
+export async function billTermsFor(
+  ctx: ServiceContext,
+  input: { terms?: string | null; dueDate?: Date | null; date: Date },
+  vendor: { terms: string | null; termsId: string | null },
+  /** Edits: the bill's saved terms. Its label sent back unchanged keeps the entry it was entered with. */
+  existing?: { terms: string | null; termsId: string | null } | null,
+): Promise<{ terms: string | null; termsId: string | null; dueDate: Date | null }> {
+  const typed = input.terms?.trim() || null;
+  let row: TermsRow | null = null;
+  let label: string | null = null;
+  const keptEntry =
+    typed && existing?.termsId && existing.terms && existing.terms.trim().toLowerCase() === typed.toLowerCase()
+      ? (
+          await ctx.db
+            .select()
+            .from(paymentTerms)
+            .where(and(eq(paymentTerms.companyId, ctx.companyId), eq(paymentTerms.id, existing.termsId)))
+        )[0]
+      : undefined;
+  if (keptEntry) {
+    // The bill's own entry, renamed since (the form sends the label the bill was saved with): it
+    // keeps giving the due date and the Pay Bills discount, under its current name.
+    row = keptEntry;
+    label = termsLabel(keptEntry);
+  } else if (typed) {
+    row = await findTermsRef(ctx, typed);
+    label = row && row.id === typed ? termsLabel(row) : typed.slice(0, 50);
+  } else if (vendor.termsId) {
+    const [byId] = await ctx.db
+      .select()
+      .from(paymentTerms)
+      .where(and(eq(paymentTerms.companyId, ctx.companyId), eq(paymentTerms.id, vendor.termsId)));
+    row = byId ?? null;
+    label = row ? termsLabel(row) : vendor.terms;
+  } else if (vendor.terms?.trim()) {
+    row = await findTermsRef(ctx, vendor.terms);
+    label = vendor.terms.trim().slice(0, 50);
+  }
+  const dueDate =
+    input.dueDate ?? (row ? computeDueDate(row as TermsLike, input.date) : label ? dueDateFromTerms(input.date, label) : null);
+  return { terms: label, termsId: row?.id ?? null, dueDate };
+}
+
+/**
  * Validate a bill input (vendor ownership, line shapes) and resolve each line to
  * { debit account, amount, qty, unitCost } using Money (no JS floats). Read-only.
  */
-async function prepareBill(ctx: ServiceContext, input: CreateBillInput): Promise<PreparedBill> {
+async function prepareBill(
+  ctx: ServiceContext,
+  input: CreateBillInput,
+  opts: { keepLineAccountIds?: ReadonlySet<string>; existingTerms?: { terms: string | null; termsId: string | null } } = {},
+): Promise<PreparedBill> {
   // --- Validate vendor belongs to this company ---
   const [vendorRow] = await ctx.db
     .select({
       id: vendors.id,
       name: vendors.displayName,
       terms: vendors.terms,
+      termsId: vendors.termsId,
       currency: vendors.currency,
     })
     .from(vendors)
@@ -291,10 +357,8 @@ async function prepareBill(ctx: ServiceContext, input: CreateBillInput): Promise
     vendorCurrency: vendorRow.currency,
   });
 
-  // --- Terms + due date (explicit due date wins) ---
-  const terms = (input.terms ?? vendorRow.terms ?? null) || null;
-  // B5: the Terms list (standard / date-driven) decides; legacy free text falls back to the parser.
-  const dueDate = input.dueDate ?? (await dueDateFromTermsList(ctx, terms, input.date));
+  // --- Terms + due date (explicit due date wins; D5: the Terms list decides) ---
+  const { terms, termsId, dueDate } = await billTermsFor(ctx, input, vendorRow, opts.existingTerms);
 
   // --- Validate lines ---
   if (!input.lines || input.lines.length === 0) {
@@ -439,6 +503,26 @@ async function prepareBill(ctx: ServiceContext, input: CreateBillInput): Promise
     throw validation('The bill total must be more than zero.');
   }
 
+  // An account line (no item) on Undeposited Funds or an inventory asset account moves a balance
+  // that the Make Deposits list / inventory valuation never shows (QB lists inventory only through
+  // items); the banking forms refuse both the same way. A saved bill keeps the lines it has.
+  const accountLineIds = [
+    ...new Set(resolvedLines.filter((l) => !l.itemId && !opts.keepLineAccountIds?.has(l.accountId)).map((l) => l.accountId)),
+  ];
+  if (accountLineIds.length > 0) {
+    const rows = await ctx.db
+      .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype, name: accounts.name })
+      .from(accounts)
+      .where(and(eq(accounts.companyId, ctx.companyId), inArray(accounts.id, accountLineIds)));
+    const byId = new Map(rows.map((r) => [r.id, r] as const));
+    for (const [i, l] of resolvedLines.entries()) {
+      if (l.itemId || opts.keepLineAccountIds?.has(l.accountId)) continue;
+      const acct = byId.get(l.accountId);
+      const reason = acct ? subledgerAccountReason(acct) : null;
+      if (reason) throw validation(`Line ${i + 1}: ${reason}`);
+    }
+  }
+
   // review5 fx: no line on a bank / card account in a third currency (its amount would be invented).
   await assertLineAccountsInDocumentCurrency(ctx, resolvedLines.map((l) => l.accountId), fx.currency);
   // Home-currency amounts: one anchor (round2(total x rate)) penny-allocated across the lines,
@@ -469,6 +553,7 @@ async function prepareBill(ctx: ServiceContext, input: CreateBillInput): Promise
     currency: fx.currency,
     rate: fx.rate,
     terms,
+    termsId,
     dueDate,
     apAccountId,
     sameCurrencyLineAccounts,
@@ -814,6 +899,7 @@ export async function createBill(ctx: ServiceContext, input: CreateBillInput) {
         date: input.date,
         dueDate: prep.dueDate,
         terms: prep.terms,
+        termsId: prep.termsId,
         memo: input.memo ?? null,
         status: 'open',
         classId: input.classId ?? null,
@@ -1016,8 +1102,88 @@ function keepSavedAccountLineQuantities(
   });
 }
 
+/** What a header-only bill edit writes: terms / due date and each line's text and Customer:Job. */
+type BillHeaderEdit = Pick<PreparedBill, 'terms' | 'termsId' | 'dueDate'> & {
+  resolvedLines: Array<Pick<ResolvedLine, 'description' | 'customerId' | 'jobId'>>;
+  /** The posting the bill would make (its line memos are copied onto the kept entry); null = skip. */
+  postingLines: PostingLine[] | null;
+};
+
+/**
+ * L20 — a header-only edit of a bill whose lines prepareBill refuses although they are the bill's
+ * own: a bill for received items carries the signed price-variance lines Enter Bill for Received
+ * Items posted (a vendor billing below the receipt cost gives a negative line). Such a bill can't
+ * take the full edit (it is tied to its receipts), so fixing its memo or vendor reference number
+ * used to mean voiding it. When the vendor, date, currency and every line's account / item /
+ * quantity / amount / class are exactly the saved ones, the edit only touches the header and the
+ * line text. Returns null otherwise (the full edit then gives its own message).
+ */
+async function receiptBillHeaderEdit(
+  ctx: ServiceContext,
+  bill: typeof bills.$inferSelect,
+  input: CreateBillInput,
+  saved: ReadonlyArray<typeof billLines.$inferSelect>,
+): Promise<BillHeaderEdit | null> {
+  if (bill.vendorId !== input.vendorId || !bill.postedEntryId) return null;
+  if (new Date(bill.date).toISOString().slice(0, 10) !== new Date(input.date).toISOString().slice(0, 10)) return null;
+  const inputCurrency = input.currency === undefined ? (bill.currency ?? null) : (input.currency?.trim().toUpperCase() || null);
+  if ((bill.currency ?? null) !== inputCurrency) return null;
+  if (
+    bill.currency &&
+    input.exchangeRate != null &&
+    String(input.exchangeRate).trim() !== '' &&
+    !Money.of(bill.exchangeRate ?? 0).equals(Money.of(input.exchangeRate))
+  ) {
+    return null;
+  }
+  if (!input.lines || input.lines.length !== saved.length) return null;
+  const ordered = [...saved].sort((a, b) => a.lineOrder - b.lineOrder);
+  for (const [i, l] of input.lines.entries()) {
+    const o = ordered[i];
+    let amount: Decimal;
+    try {
+      amount =
+        l.amount != null && String(l.amount).trim() !== ''
+          ? Money.round2(l.amount)
+          : l.itemId
+            ? Money.round2(Money.of(l.quantity ?? 0).times(Money.of(l.unitCost ?? 0)))
+            : Money.zero();
+    } catch {
+      return null;
+    }
+    if ((l.itemId ?? null) !== (o.itemId ?? null)) return null;
+    if (!l.itemId && (l.accountId ?? null) !== o.accountId) return null;
+    if (l.itemId && l.accountId && l.accountId !== o.accountId) return null;
+    if (l.itemId && !Money.of(l.quantity ?? 0).equals(Money.of(o.quantity))) return null;
+    if (!amount.equals(Money.of(o.amount))) return null;
+    if ((l.classId ?? input.classId ?? null) !== (o.classId ?? null)) return null;
+  }
+  // The changed header / line fields still have to be valid.
+  for (const l of input.lines) {
+    if (l.customerId) await assertRefInCompany(ctx, customers, l.customerId, 'Customer');
+    if (l.jobId) await assertRefInCompany(ctx, jobs, l.jobId, 'Job');
+  }
+  if (input.classId) await assertRefInCompany(ctx, classes, input.classId, 'Class');
+  const [vendorRow] = await ctx.db
+    .select({ terms: vendors.terms, termsId: vendors.termsId })
+    .from(vendors)
+    .where(and(eq(vendors.id, input.vendorId), eq(vendors.companyId, ctx.companyId)));
+  if (!vendorRow) throw notFound('Vendor');
+  const t = await billTermsFor(ctx, input, vendorRow, bill);
+  return {
+    ...t,
+    resolvedLines: input.lines.map((l, i) => ({
+      description: l.description ?? ordered[i].description ?? null,
+      customerId: l.customerId ?? null,
+      jobId: l.jobId ?? null,
+    })),
+    // Its entry posts the receipts' accrual / variance lines, not one line per bill line.
+    postingLines: null,
+  };
+}
+
 /** Ledger-neutral bill edit (see isLedgerNeutralBillEdit): header and line text only. */
-async function updateBillHeaderInTx(tx: ServiceContext, id: string, input: CreateBillInput, prep: PreparedBill) {
+async function updateBillHeaderInTx(tx: ServiceContext, id: string, input: CreateBillInput, prep: BillHeaderEdit) {
   const [bill] = await tx.db
     .select()
     .from(bills)
@@ -1039,6 +1205,7 @@ async function updateBillHeaderInTx(tx: ServiceContext, id: string, input: Creat
       billNumber: input.billNumber ?? null,
       dueDate: prep.dueDate,
       terms: prep.terms,
+      termsId: prep.termsId,
       memo: input.memo ?? null,
       classId: input.classId ?? null,
       updatedAt: new Date(),
@@ -1061,6 +1228,8 @@ async function updateBillHeaderInTx(tx: ServiceContext, id: string, input: Creat
     description: `Bill ${input.billNumber ? `#${input.billNumber}` : id}`,
     reference: input.billNumber ?? null,
   });
+  // The kept entry's line memos follow the edited descriptions (register / report Memo column).
+  if (prep.postingLines) await syncLineMemos(tx, bill.postedEntryId, prep.postingLines);
   await writeAudit(tx, {
     action: 'update',
     entityType: 'bill',
@@ -1104,17 +1273,15 @@ export async function updateBill(ctx: ServiceContext, id: string, input: CreateB
   // A memo / number / terms / description edit never touches the ledger: allowed on any bill
   // (paid, credited, received, items sold since), and re-saving an unchanged bill is a no-op for
   // the books instead of a void + repost (which a sold-out stock line refused).
+  // The bill's own line accounts may stay on it (the Undeposited Funds / inventory asset rule in
+  // prepareBill applies to lines added now).
+  const savedLines = await ctx.db.select().from(billLines).where(eq(billLines.billId, id));
+  const keepLineAccountIds = new Set(savedLines.map((l) => l.accountId));
   {
-    // An input the full edit would refuse anyway (e.g. the negative variance lines of a bill for
-    // received items) falls through to it, so its own checks give the usual message.
-    const neutralPrep = await prepareBill(ctx, input).catch(() => null);
-    if (neutralPrep) {
-      const saved = await ctx.db
-        .select({ lineOrder: billLines.lineOrder, itemId: billLines.itemId, quantity: billLines.quantity })
-        .from(billLines)
-        .where(eq(billLines.billId, id));
-      keepSavedAccountLineQuantities(input, neutralPrep, saved);
-    }
+    // An input the full edit would refuse anyway falls through to it, so its own checks give the
+    // usual message.
+    const neutralPrep = await prepareBill(ctx, input, { keepLineAccountIds, existingTerms: existing }).catch(() => null);
+    if (neutralPrep) keepSavedAccountLineQuantities(input, neutralPrep, savedLines);
     if (neutralPrep && (await isLedgerNeutralBillEdit(ctx, existing, input, neutralPrep))) {
       return inTransaction(ctx, async (tx) => {
         const [cur] = await tx.db.select().from(bills).where(and(eq(bills.id, id), eq(bills.companyId, tx.companyId)));
@@ -1123,8 +1290,27 @@ export async function updateBill(ctx: ServiceContext, id: string, input: CreateB
         if (!(await isLedgerNeutralBillEdit(tx, cur, input, neutralPrep))) {
           throw new ServiceError('CONFLICT', 'This bill was changed by someone else while you edited it. Reload it and try again.');
         }
-        return updateBillHeaderInTx(tx, id, input, neutralPrep);
+        return updateBillHeaderInTx(tx, id, input, {
+          ...neutralPrep,
+          postingLines: buildPostingLines(neutralPrep, input.billNumber ?? null, id),
+        });
       });
+    }
+    // A bill for received items (negative price-variance lines prepareBill refuses): the header
+    // and line text can still be fixed without voiding it.
+    if (!neutralPrep && (await billHasReceiptLinks(ctx, id))) {
+      const headerEdit = await receiptBillHeaderEdit(ctx, existing, input, savedLines);
+      if (headerEdit) {
+        return inTransaction(ctx, async (tx) => {
+          const [cur] = await tx.db.select().from(bills).where(and(eq(bills.id, id), eq(bills.companyId, tx.companyId)));
+          if (!cur) throw notFound('Bill');
+          const nowLines = await tx.db.select().from(billLines).where(eq(billLines.billId, id));
+          if (!(await receiptBillHeaderEdit(tx, cur, input, nowLines))) {
+            throw new ServiceError('CONFLICT', 'This bill was changed by someone else while you edited it. Reload it and try again.');
+          }
+          return updateBillHeaderInTx(tx, id, input, headerEdit);
+        });
+      }
     }
   }
   if (existing.amountPaid && Money.gt(existing.amountPaid, 0)) {
@@ -1150,7 +1336,7 @@ export async function updateBill(ctx: ServiceContext, id: string, input: CreateB
   }
 
   // Validate + resolve the new document (read-only).
-  const prep = await prepareBill(ctx, input);
+  const prep = await prepareBill(ctx, input, { keepLineAccountIds, existingTerms: existing });
 
   return inTransaction(ctx, async (tx) => {
     // Duplicate vendor-reference check in the same transaction as the save (see createBill).
@@ -1275,6 +1461,7 @@ export async function updateBill(ctx: ServiceContext, id: string, input: CreateB
         date: input.date,
         dueDate: prep.dueDate,
         terms: prep.terms,
+        termsId: prep.termsId,
         memo: input.memo ?? null,
         classId: input.classId ?? null,
         currency: prep.currency,
@@ -1429,25 +1616,34 @@ export async function listBillsToPay(
   ];
   if (opts?.vendorId) conditions.push(eq(bills.vendorId, opts.vendorId));
   const rows = await ctx.db
-    .select({ bill: bills, vendorName: vendors.displayName, vendorTerms: vendors.terms })
+    .select({ bill: bills, vendorName: vendors.displayName, vendorTerms: vendors.terms, vendorTermsId: vendors.termsId })
     .from(bills)
     .leftJoin(vendors, eq(bills.vendorId, vendors.id))
     .where(and(...conditions))
     .orderBy(asc(bills.dueDate), asc(bills.date));
 
-  const asOf = opts?.asOf ?? new Date();
+  // The payment date the discount is offered for: the day picked, else today in the company's
+  // time zone (not the UTC day, which is tomorrow in the evening west of UTC).
+  const asOf = opts?.asOf ?? (await companyToday(ctx));
   const todayKey = asOf.toISOString().slice(0, 10);
   const out: BillToPay[] = [];
-  // Terms list rows by reference (B5/C3), resolved once per distinct terms string.
+  // D5: the Terms list entry of each bill — the one it was entered with (bills.termsId, which
+  // survives a rename), else its terms text, else the vendor's entry / text. Resolved once each.
+  const listRows = await ctx.db.select().from(paymentTerms).where(eq(paymentTerms.companyId, ctx.companyId));
+  const termsById = new Map(listRows.map((r) => [r.id, r] as const));
   const termsCache = new Map<string, TermsRow | null>();
   const termsRow = async (ref: string | null) => {
     if (!ref) return null;
     if (!termsCache.has(ref)) termsCache.set(ref, await findTermsRef(ctx, ref));
     return termsCache.get(ref) ?? null;
   };
-  for (const { bill, vendorName, vendorTerms } of rows) {
+  for (const { bill, vendorName, vendorTerms, vendorTermsId } of rows) {
+    const usesVendorTerms = !bill.termsId && !bill.terms;
     const terms = bill.terms ?? vendorTerms ?? null;
-    const row = await termsRow(terms);
+    const row =
+      (bill.termsId ? termsById.get(bill.termsId) : undefined) ??
+      (usesVendorTerms && vendorTermsId ? termsById.get(vendorTermsId) : undefined) ??
+      (await termsRow(terms));
     const dueDate = bill.dueDate ?? (row ? computeDueDate(row as TermsLike, bill.date) : dueDateFromTerms(bill.date, terms));
     if (opts?.dueOnOrBefore && dueDate) {
       if (dueDate.toISOString().slice(0, 10) > opts.dueOnOrBefore.toISOString().slice(0, 10)) continue;

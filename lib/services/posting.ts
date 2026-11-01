@@ -37,6 +37,7 @@ import {
 } from './_base';
 import { assertPeriodOpen, recordClosingDateException } from './fiscalPeriods';
 import { foreignLineColumns } from './fxLines';
+import { isReconciledRepostArmed } from './reconciledEdits';
 
 export interface PostingLine {
   accountId: string;
@@ -826,7 +827,10 @@ export async function voidJournalEntry(ctx: ServiceContext, entryId: string) {
           ),
         )
         .limit(1);
-      if (reconciled) {
+      // An edit the user confirmed after QB's "this transaction has been reconciled" warning
+      // re-posts the document in this same transaction (reconciledEdits.ts): its reconciled marks
+      // move onto the new entry and the change is recorded for the discrepancy report.
+      if (reconciled && !(await isReconciledRepostArmed(tx, entryId))) {
         throw new ServiceError(
           'CONFLICT',
           'This entry contains lines cleared in a completed bank reconciliation and cannot be voided. Undo the reconciliation first.',

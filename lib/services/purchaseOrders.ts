@@ -23,12 +23,13 @@
  */
 import { assertAccountantMayConvert, assertDividingDateOpen } from './accountantCopy/guard';
 import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
-import { accounts, auditLogs, items, purchaseOrders, purchaseOrderLines, vendors } from '@/lib/db/schema';
+import { accounts, auditLogs, classes, customers, items, jobs, purchaseOrders, purchaseOrderLines, vendors } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { createBill } from '@/lib/services/bills';
 import {
   type ServiceContext,
   ServiceError,
+  assertRefInCompany,
   inTransaction,
   notFound,
   validation,
@@ -53,6 +54,23 @@ export interface PurchaseOrderLineInput {
   description?: string | null;
   quantity: string | number;
   rate: string | number;
+  /** QB Customer:Job column: carried onto the bill line (billable to the customer). */
+  customerId?: string | null;
+  /** The customer's job (its customer is filled in when only the job is given). */
+  jobId?: string | null;
+  /** QB Class column: carried onto the bill line. */
+  classId?: string | null;
+}
+
+/** P.O. Ship To address (QB "Ship To": the company, a customer for a drop ship, or typed). */
+export interface PoShipTo {
+  name?: string | null;
+  line1?: string | null;
+  line2?: string | null;
+  city?: string | null;
+  state?: string | null;
+  zip?: string | null;
+  country?: string | null;
 }
 
 export interface CreatePurchaseOrderInput {
@@ -68,6 +86,16 @@ export interface CreatePurchaseOrderInput {
   expectedDate?: Date | null;
   lines: PurchaseOrderLineInput[];
   memo?: string | null;
+  /**
+   * Ship To typed on the P.O. (null / blank = the company's address). On an edit, undefined
+   * keeps the saved one.
+   */
+  shipTo?: PoShipTo | null;
+  /**
+   * Drop ship to this customer: their shipping address fills the Ship To when none is typed.
+   * On an edit, undefined keeps the saved one.
+   */
+  shipToCustomerId?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -108,6 +136,103 @@ async function assertPoLineRefsOwned(
 }
 
 /**
+ * Each line's Customer:Job and Class (QB P.O. columns): they belong to the company, a job belongs
+ * to the customer picked (a job alone brings its customer).
+ */
+async function resolvePoLineDims(
+  ctx: ServiceContext,
+  lines: ReadonlyArray<{ customerId?: string | null; jobId?: string | null; classId?: string | null }>,
+): Promise<Array<{ customerId: string | null; jobId: string | null; classId: string | null }>> {
+  const checked = new Set<string>();
+  const once = async (table: typeof customers | typeof classes, id: string, label: string) => {
+    const key = `${label}:${id}`;
+    if (checked.has(key)) return;
+    await assertRefInCompany(ctx, table, id, label);
+    checked.add(key);
+  };
+  const out: Array<{ customerId: string | null; jobId: string | null; classId: string | null }> = [];
+  for (const [i, l] of lines.entries()) {
+    let customerId = l.customerId || null;
+    const jobId = l.jobId || null;
+    const classId = l.classId || null;
+    if (jobId) {
+      const [job] = await ctx.db
+        .select({ customerId: jobs.customerId, name: jobs.name })
+        .from(jobs)
+        .where(and(eq(jobs.companyId, ctx.companyId), eq(jobs.id, jobId)));
+      if (!job) throw validation(`Line ${i + 1}: the job does not exist in this company.`);
+      if (customerId && job.customerId && job.customerId !== customerId) {
+        throw validation(`Line ${i + 1}: the job "${job.name}" belongs to another customer. Pick the job under its customer.`);
+      }
+      customerId = customerId ?? job.customerId ?? null;
+    }
+    if (customerId) await once(customers, customerId, 'Customer');
+    if (classId) await once(classes, classId, 'Class');
+    out.push({ customerId, jobId, classId });
+  }
+  return out;
+}
+
+const SHIP_TO_KEYS = ['name', 'line1', 'line2', 'city', 'state', 'zip', 'country'] as const;
+
+/** A Ship To address with the known fields, trimmed; null when nothing is filled in. */
+function cleanShipTo(raw: unknown): Record<string, string> | null {
+  if (raw == null) return null;
+  if (typeof raw !== 'object' || Array.isArray(raw)) throw validation('The Ship To address must be an address.');
+  const src = raw as Record<string, unknown>;
+  const out: Record<string, string> = {};
+  for (const k of SHIP_TO_KEYS) {
+    const v = src[k];
+    if (v == null) continue;
+    if (typeof v !== 'string') throw validation('Each Ship To line must be text.');
+    const t = v.trim();
+    if (t.length > 255) throw validation('A Ship To line can be at most 255 characters.');
+    if (t) out[k] = t;
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+/**
+ * The P.O.'s Ship To: an address typed wins; else a drop-ship customer's shipping address (with
+ * their name); else none (the company address prints). `existing` = the saved P.O. on an edit:
+ * fields the request leaves out keep their saved value.
+ */
+async function resolvePoShipTo(
+  ctx: ServiceContext,
+  input: Pick<CreatePurchaseOrderInput, 'shipTo' | 'shipToCustomerId'>,
+  existing?: { shipTo: unknown; shipToCustomerId: string | null },
+): Promise<{ shipTo: Record<string, string> | null; shipToCustomerId: string | null }> {
+  const customerId =
+    input.shipToCustomerId === undefined ? (existing?.shipToCustomerId ?? null) : input.shipToCustomerId || null;
+  let shipTo = input.shipTo === undefined ? cleanShipTo(existing?.shipTo ?? null) : cleanShipTo(input.shipTo);
+  if (customerId) {
+    const [cust] = await ctx.db
+      .select({ displayName: customers.displayName, shippingAddress: customers.shippingAddress, billingAddress: customers.billingAddress })
+      .from(customers)
+      .where(and(eq(customers.companyId, ctx.companyId), eq(customers.id, customerId)));
+    if (!cust) throw validation('The Ship To customer does not exist in this company.');
+    // A customer picked now (or changed) brings their address unless one was typed with it.
+    const customerChanged =
+      input.shipToCustomerId !== undefined && (input.shipToCustomerId || null) !== (existing?.shipToCustomerId ?? null);
+    if (!shipTo || (customerChanged && input.shipTo === undefined)) {
+      const addr = (cust.shippingAddress ?? cust.billingAddress ?? {}) as Record<string, unknown>;
+      const pick = (...keys: string[]) =>
+        keys.map((k) => addr[k]).find((v): v is string => typeof v === 'string' && v.trim() !== '');
+      shipTo = cleanShipTo({
+        name: cust.displayName,
+        line1: pick('line1', 'street', 'address1', 'addressLine1'),
+        line2: pick('line2', 'address2', 'addressLine2'),
+        city: pick('city'),
+        state: pick('state', 'region'),
+        zip: pick('zip', 'postalCode', 'postal_code'),
+        country: pick('country'),
+      });
+    }
+  }
+  return { shipTo, shipToCustomerId: customerId };
+}
+
+/**
  * A PO line's description: the one typed, else (item lines) the item's description / name. QB
  * fills it from the item's purchase description — the vendor reads the printed P.O., which used
  * to show "—" for an item line left blank (the Item column is off by default).
@@ -140,6 +265,8 @@ export async function createPurchaseOrder(
     .where(and(eq(vendors.id, input.vendorId), eq(vendors.companyId, ctx.companyId)));
   if (!vendor) throw notFound('Vendor');
   const itemText = await assertPoLineRefsOwned(ctx, input.lines);
+  const dims = await resolvePoLineDims(ctx, input.lines);
+  const ship = await resolvePoShipTo(ctx, input);
 
   // Compute per-line amounts using safe decimal math.
   type ComputedLine = {
@@ -150,6 +277,9 @@ export async function createPurchaseOrder(
     rate: string;
     amount: string;
     lineOrder: number;
+    customerId: string | null;
+    jobId: string | null;
+    classId: string | null;
   };
 
   let total = Money.zero();
@@ -178,6 +308,7 @@ export async function createPurchaseOrder(
       rate: rate.toFixed(4),
       amount: toAmountString(amount),
       lineOrder: i,
+      ...dims[i],
     });
   }
 
@@ -200,6 +331,8 @@ export async function createPurchaseOrder(
         status: 'open',
         total: totalStr,
         memo: input.memo ?? null,
+        shipTo: ship.shipTo,
+        shipToCustomerId: ship.shipToCustomerId,
       })
       .returning();
 
@@ -213,6 +346,9 @@ export async function createPurchaseOrder(
         rate: cl.rate,
         amount: cl.amount,
         lineOrder: cl.lineOrder,
+        customerId: cl.customerId,
+        jobId: cl.jobId,
+        classId: cl.classId,
       })),
     );
 
@@ -220,7 +356,7 @@ export async function createPurchaseOrder(
       action: 'create',
       entityType: 'purchase_order',
       entityId: po.id,
-      newValues: { poNumber, vendorId: input.vendorId, total: totalStr },
+      newValues: { poNumber, vendorId: input.vendorId, total: totalStr, shipTo: ship.shipTo, shipToCustomerId: ship.shipToCustomerId },
     });
 
     return { ...po, lines: computedLines };
@@ -295,6 +431,7 @@ export async function updatePurchaseOrder(ctx: ServiceContext, id: string, input
     .where(and(eq(vendors.id, input.vendorId), eq(vendors.companyId, ctx.companyId)));
   if (!vendor) throw notFound('Vendor');
   const itemText = await assertPoLineRefsOwned(ctx, input.lines);
+  const dims = await resolvePoLineDims(ctx, input.lines);
 
   return inTransaction(ctx, async (tx) => {
     const [po] = await tx.db
@@ -313,6 +450,7 @@ export async function updatePurchaseOrder(ctx: ServiceContext, id: string, input
       tx, 'purchase_order', id, { refNumber: po.refNumber, number: po.poNumber },
       input.refNumber, { allowDuplicate: input.allowDuplicateNumber === true },
     );
+    const ship = await resolvePoShipTo(tx, input, po);
     const oldLines = await tx.db
       .select()
       .from(purchaseOrderLines)
@@ -360,6 +498,7 @@ export async function updatePurchaseOrder(ctx: ServiceContext, id: string, input
         rate: rate.toFixed(4),
         amount: toAmountString(amount),
         lineOrder: i,
+        ...dims[i],
       };
     });
     for (const l of oldLines) {
@@ -381,6 +520,9 @@ export async function updatePurchaseOrder(ctx: ServiceContext, id: string, input
         rate: c.rate,
         amount: c.amount,
         lineOrder: c.lineOrder,
+        customerId: c.customerId,
+        jobId: c.jobId,
+        classId: c.classId,
       };
       if (c.id) {
         await tx.db.update(purchaseOrderLines).set(values).where(eq(purchaseOrderLines.id, c.id));
@@ -406,6 +548,8 @@ export async function updatePurchaseOrder(ctx: ServiceContext, id: string, input
         memo: input.memo ?? null,
         total: toAmountString(total),
         status,
+        shipTo: ship.shipTo,
+        shipToCustomerId: ship.shipToCustomerId,
         ...(renum ? { refNumber: renum.refNumber, poNumber: renum.number } : {}),
       })
       .where(eq(purchaseOrders.id, id))
@@ -423,7 +567,18 @@ export async function updatePurchaseOrder(ctx: ServiceContext, id: string, input
         memo: po.memo,
         total: po.total,
         status: po.status,
-        lines: oldLines.map((l) => ({ id: l.id, itemId: l.itemId, accountId: l.accountId, quantity: l.quantity, rate: l.rate })),
+        shipTo: po.shipTo,
+        shipToCustomerId: po.shipToCustomerId,
+        lines: oldLines.map((l) => ({
+          id: l.id,
+          itemId: l.itemId,
+          accountId: l.accountId,
+          quantity: l.quantity,
+          rate: l.rate,
+          customerId: l.customerId,
+          jobId: l.jobId,
+          classId: l.classId,
+        })),
       },
       newValues: {
         vendorId: input.vendorId,
@@ -434,6 +589,8 @@ export async function updatePurchaseOrder(ctx: ServiceContext, id: string, input
         memo: input.memo ?? null,
         total: toAmountString(total),
         status,
+        shipTo: ship.shipTo,
+        shipToCustomerId: ship.shipToCustomerId,
         lines: computed,
       },
     });
@@ -510,7 +667,8 @@ async function updateStatusInTx(ctx: ServiceContext, id: string, status: 'open' 
 
   const [updated] = await ctx.db
     .update(purchaseOrders)
-    .set({ status })
+    // Mark as Closed by hand: a later receipt edit or bill void that releases quantity keeps it closed.
+    .set({ status, closedManually: status === 'closed' })
     .where(eq(purchaseOrders.id, id))
     .returning();
 
@@ -548,6 +706,11 @@ export interface ConvertToBillOptions {
   date?: Date;
   /** Vendor bill / reference number for the created bill. */
   billNumber?: string | null;
+  /**
+   * The user confirmed QB's "this vendor already has a bill with that reference number" warning
+   * (A4). Without it a reference number already on another bill of the vendor is refused.
+   */
+  allowDuplicateNumber?: boolean;
 }
 
 /**
@@ -663,12 +826,19 @@ export async function convertToBill(
           quantity: qty.toFixed(4),
           unitCost: line.rate,
           amount,
+          // QB carries the P.O. line's Customer:Job and Class onto the bill line.
+          customerId: line.customerId ?? null,
+          jobId: line.jobId ?? null,
+          classId: line.classId ?? null,
         }
       : {
           accountId: line.accountId,
           description: line.description ?? null,
           quantity: qty.toFixed(4),
           amount,
+          customerId: line.customerId ?? null,
+          jobId: line.jobId ?? null,
+          classId: line.classId ?? null,
         };
   });
 
@@ -738,6 +908,8 @@ export async function convertToBill(
     const bill = await createBill(tx, {
       vendorId: po.vendorId,
       billNumber: opts?.billNumber ?? null,
+      // QB duplicate vendor reference warning (A4), as Enter Bills gives it.
+      checkDuplicateNumber: !opts?.allowDuplicateNumber,
       date: opts?.date ?? po.date,
       // The PO's expected date is a DELIVERY date, not a payment due date: leave it blank so
       // createBill works the due date out from the vendor's terms (QB parity).
@@ -947,7 +1119,7 @@ export async function syncPoBillingForBillEdit(
       }
     }
     const derivedAfter = poStatusFromLines(await linesOf(poId), enhancedReceiving);
-    const status = po.status !== derivedBefore ? po.status : derivedAfter;
+    const status = (po.closedManually && po.status === 'closed') || po.status !== derivedBefore ? po.status : derivedAfter;
     await ctx.db
       .update(purchaseOrders)
       .set({
@@ -1016,7 +1188,7 @@ export async function releasePoBillingForBill(ctx: ServiceContext, billId: strin
     }
 
     const derivedAfter = poStatusFromLines(await linesNow(), enhancedReceiving);
-    const keepManualStatus = po.status !== derivedBefore;
+    const keepManualStatus = (po.closedManually && po.status === 'closed') || po.status !== derivedBefore;
     const newStatus = keepManualStatus ? po.status : derivedAfter;
     await ctx.db
       .update(purchaseOrders)
@@ -1078,6 +1250,13 @@ async function recomputePoStatusFromLines(
   prevStatus: string,
   reason: string,
 ): Promise<'open' | 'partial' | 'closed'> {
+  // A P.O. closed by hand (Mark as Closed) stays closed: a receipt edit that releases quantity
+  // used to reopen it, since nothing told a manual close from one the line quantities imply.
+  const [cur] = await ctx.db
+    .select({ status: purchaseOrders.status, closedManually: purchaseOrders.closedManually })
+    .from(purchaseOrders)
+    .where(and(eq(purchaseOrders.id, poId), eq(purchaseOrders.companyId, ctx.companyId)));
+  if (cur?.closedManually && cur.status === 'closed') return 'closed';
   const refreshed = await ctx.db
     .select({
       quantity: purchaseOrderLines.quantity,
@@ -1118,7 +1297,12 @@ export async function claimReceiptQuantities(
   ctx: ServiceContext,
   poId: string,
   requests: ReceiptQuantityRequest[],
-  opts?: { vendorId?: string; sourceRef?: string },
+  opts?: {
+    vendorId?: string;
+    sourceRef?: string;
+    /** An edit of a receipt already against this P.O. re-claims its quantities on a P.O. closed by hand. */
+    reclaimOnManualClose?: boolean;
+  },
 ): Promise<void> {
   const [po] = await ctx.db
     .select()
@@ -1128,7 +1312,7 @@ export async function claimReceiptQuantities(
   if (po.status === 'void') {
     throw new ServiceError('CONFLICT', 'Cannot receive against a voided purchase order.');
   }
-  if (po.status === 'closed') {
+  if (po.status === 'closed' && !(opts?.reclaimOnManualClose && po.closedManually)) {
     throw new ServiceError('CONFLICT', 'Cannot receive against a closed purchase order.');
   }
   if (opts?.vendorId && po.vendorId !== opts.vendorId) {

@@ -12,6 +12,8 @@ export interface PurchaseOrderPdfLine {
   rate: string | number;
   amount: string | number;
   item?: string | null;
+  /** Customer:Job the line is for (QB P.O. "Customer" column, off by default). */
+  customer?: string | null;
 }
 
 export interface PurchaseOrderPdfData {
@@ -26,6 +28,8 @@ export interface PurchaseOrderPdfData {
     memo?: string | null;
   };
   vendorLines?: string[];
+  /** Ship To typed on the P.O. or a drop-ship customer's (none = the company's address). */
+  shipToName?: string | null;
   shipToLines?: string[];
   lines: PurchaseOrderPdfLine[];
   currency?: string;
@@ -53,7 +57,9 @@ export async function renderPurchaseOrderPdf(
       },
       parties: {
         vendor: [data.vendorName, ...(data.vendorLines ?? [])],
-        shipTo: [data.company.name, ...(data.shipToLines ?? data.company.addressLines ?? [])],
+        shipTo: data.shipToLines
+          ? [data.shipToName?.trim() || data.company.name, ...data.shipToLines]
+          : [data.company.name, ...(data.company.addressLines ?? [])],
       },
       lines: data.lines.map((l) => ({
         // An item line saved without a description prints the item (the Item column is off by
@@ -64,6 +70,7 @@ export async function renderPurchaseOrderPdf(
         rate: l.rate,
         amount: l.amount,
         item: l.item,
+        customer: l.customer ?? '',
       })),
       totals: [{ label: 'Total', value: po.total, emphasis: 'total' }],
       memo: po.memo,

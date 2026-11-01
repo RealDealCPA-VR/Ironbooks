@@ -7,7 +7,7 @@
  * `resolveFormTemplate(ctx, '<form>', templateId)`, then `renderFormPdf(doc, t.design, t.logo)`.
  */
 import { and, eq, inArray } from 'drizzle-orm';
-import { accounts, customers, items, vendors } from '@/lib/db/schema';
+import { accounts, customers, items, jobs, vendors } from '@/lib/db/schema';
 import type { ServiceContext } from '@/lib/services/_base';
 import { getCompany, getPreferences } from '@/lib/services/company';
 import { docRef } from '@/lib/services/docNumbers';
@@ -18,7 +18,7 @@ import type { CustomerStatement } from '@/lib/services/statements';
 import { resolveFormTemplate } from '@/lib/services/formTemplates';
 import { renderInvoicePdf } from './invoice';
 import { renderEstimatePdf } from './estimate';
-import { renderPurchaseOrderPdf } from './purchaseOrder';
+import { renderPurchaseOrderPdf, type PurchaseOrderPdfData } from './purchaseOrder';
 import { renderStatementPdf } from './statement';
 
 export interface Letterhead {
@@ -198,11 +198,11 @@ export async function buildEstimatePdf(
   return { bytes, number: docRef(estimate.refNumber, estimate.estimateNumber) };
 }
 
-export async function buildPurchaseOrderPdf(
-  ctx: ServiceContext,
-  poId: string,
-  templateId?: string | null,
-): Promise<{ bytes: Uint8Array; number: number | string }> {
+/**
+ * The data a purchase order prints with: vendor block, Ship To (a typed or drop-ship address with
+ * its name; none = the company's own address), lines with the item, account and Customer:Job.
+ */
+export async function purchaseOrderPdfData(ctx: ServiceContext, poId: string): Promise<PurchaseOrderPdfData> {
   const po = await getPurchaseOrder(ctx, poId);
   const [vendor] = await ctx.db
     .select({ displayName: vendors.displayName, address: vendors.address })
@@ -228,35 +228,65 @@ export async function buildPurchaseOrderPdf(
       itemNames.set(it.id, it.name);
     }
   }
-  const [letterhead, template] = await Promise.all([
-    companyLetterhead(ctx),
-    resolveFormTemplate(ctx, 'purchase_order', templateId),
-  ]);
-  const bytes = await renderPurchaseOrderPdf(
-    {
-      company: letterhead,
-      vendorName: vendor?.displayName ?? 'Vendor',
-      vendorLines: addressToLines(vendor?.address),
-      po: {
-        number: docRef(po.refNumber, po.poNumber),
-        date: isoDate(po.date),
-        expectedDate: po.expectedDate ? isoDate(po.expectedDate) : null,
-        total: po.total,
-        status: po.status,
-        memo: po.memo ?? null,
-      },
-      lines: po.lines.map((l) => ({
-        description: l.description ?? '',
-        accountCode: l.accountId ? (accountMap.get(l.accountId) ?? null) : null,
-        quantity: l.quantity,
-        rate: l.rate,
-        amount: l.amount,
-        item: l.itemId ? (itemNames.get(l.itemId) ?? null) : null,
-      })),
+  // Customer:Job column (QB P.O. "Customer").
+  const customerIds = [...new Set(po.lines.map((l) => l.customerId).filter(Boolean))] as string[];
+  const jobIds = [...new Set(po.lines.map((l) => l.jobId).filter(Boolean))] as string[];
+  const customerNames = new Map<string, string>();
+  const jobNames = new Map<string, string>();
+  if (customerIds.length > 0) {
+    for (const c of await ctx.db
+      .select({ id: customers.id, name: customers.displayName })
+      .from(customers)
+      .where(and(eq(customers.companyId, ctx.companyId), inArray(customers.id, customerIds)))) {
+      customerNames.set(c.id, c.name);
+    }
+  }
+  if (jobIds.length > 0) {
+    for (const j of await ctx.db
+      .select({ id: jobs.id, name: jobs.name })
+      .from(jobs)
+      .where(and(eq(jobs.companyId, ctx.companyId), inArray(jobs.id, jobIds)))) {
+      jobNames.set(j.id, j.name);
+    }
+  }
+  const letterhead = await companyLetterhead(ctx);
+  const shipTo = (po.shipTo ?? null) as Record<string, string> | null;
+  const shipToLines = shipTo ? addressToLines(shipTo) : [];
+  return {
+    company: letterhead,
+    vendorName: vendor?.displayName ?? 'Vendor',
+    vendorLines: addressToLines(vendor?.address),
+    ...(shipTo ? { shipToName: shipTo.name?.trim() || null, shipToLines } : {}),
+    po: {
+      number: docRef(po.refNumber, po.poNumber),
+      date: isoDate(po.date),
+      expectedDate: po.expectedDate ? isoDate(po.expectedDate) : null,
+      total: po.total,
+      status: po.status,
+      memo: po.memo ?? null,
     },
-    template,
-  );
-  return { bytes, number: docRef(po.refNumber, po.poNumber) };
+    lines: po.lines.map((l) => ({
+      description: l.description ?? '',
+      accountCode: l.accountId ? (accountMap.get(l.accountId) ?? null) : null,
+      quantity: l.quantity,
+      rate: l.rate,
+      amount: l.amount,
+      item: l.itemId ? (itemNames.get(l.itemId) ?? null) : null,
+      customer: l.customerId
+        ? [customerNames.get(l.customerId), l.jobId ? jobNames.get(l.jobId) : null].filter(Boolean).join(':') || null
+        : null,
+    })),
+  };
+}
+
+export async function buildPurchaseOrderPdf(
+  ctx: ServiceContext,
+  poId: string,
+  templateId?: string | null,
+): Promise<{ bytes: Uint8Array; number: number | string }> {
+  const [data, template] = await Promise.all([purchaseOrderPdfData(ctx, poId), resolveFormTemplate(ctx, 'purchase_order', templateId)]);
+  const bytes = await renderPurchaseOrderPdf(data, template);
+  return { bytes, number: data.po.number };
 }
 
 /** Statement PDF with the company letterhead and the selected (or default) statement template. */

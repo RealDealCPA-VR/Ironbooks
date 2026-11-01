@@ -79,9 +79,12 @@ import {
 } from './_base';
 import { markExpensePrinted } from './expenses';
 import { markBillPaymentPrinted } from './billPayments';
-import { allocateCheckNumber } from './checkNumbers';
+import { type CheckNumberUse, allocateCheckNumber, findDuplicateCheckNumbers } from './checkNumbers';
 import { markPaymentCheckPrinted } from './liabilityPayments';
 import { assertClosedPeriodEdit } from './postedEdit';
+import { requirePermission } from './access';
+import { getPreferences } from './company';
+import { assertAccountantDatesOpen } from './accountantCopy/guard';
 
 export type PrintSource = 'expense' | 'bill_payment' | 'paycheck' | 'payment_check';
 export const PRINT_SOURCES: PrintSource[] = ['expense', 'bill_payment', 'paycheck', 'payment_check'];
@@ -443,6 +446,290 @@ export async function markPrinted(
     default:
       throw validation('Unknown check source.');
   }
+}
+
+// ---------------------------------------------------------------------------
+// Print runs (PARITY D3): QB prints the checks first and records their numbers only after
+// "Did check(s) print OK?"; the ones that printed wrong stay in the queue to be reprinted.
+// ---------------------------------------------------------------------------
+
+/** Most checks in one print run (the batch PDF takes the same number). */
+export const MAX_PRINT_RUN = 300;
+
+export interface PrintRunItem {
+  source: PrintSource;
+  id: string;
+  /** The number on the check paper this check prints on. */
+  checkNumber: string;
+}
+
+/** A check's print state, whatever document it is. */
+interface CheckState {
+  source: PrintSource;
+  id: string;
+  label: string;
+  isCheck: boolean;
+  voided: boolean;
+  toPrint: boolean;
+  paymentAccountId: string | null;
+  date: Date;
+  postedEntryId: string | null;
+  number: string | null;
+}
+
+const SOURCE_LABEL: Record<PrintSource, string> = {
+  expense: 'check',
+  bill_payment: 'bill payment check',
+  payment_check: 'check',
+  paycheck: 'paycheck',
+};
+
+/** Printing paychecks (or putting one back in the queue) needs the payroll permission too. */
+function assertMayPrintSources(ctx: ServiceContext, sources: Iterable<PrintSource>) {
+  for (const s of sources) if (s === 'paycheck') requirePermission(ctx, 'payroll', 'print');
+}
+
+async function checkState(ctx: ServiceContext, source: PrintSource, id: string): Promise<CheckState> {
+  const base = { source, id, label: SOURCE_LABEL[source] };
+  if (source === 'expense') {
+    const [e] = await ctx.db
+      .select()
+      .from(expenses)
+      .where(and(eq(expenses.companyId, ctx.companyId), eq(expenses.id, id)));
+    if (!e) throw notFound('Check');
+    return {
+      ...base,
+      isCheck: e.method === 'check',
+      voided: Boolean(e.voidedAt),
+      toPrint: e.toPrint,
+      paymentAccountId: e.paymentAccountId,
+      date: e.date,
+      postedEntryId: e.postedEntryId,
+      number: e.reference?.trim() || null,
+    };
+  }
+  if (source === 'bill_payment') {
+    const [p] = await ctx.db
+      .select()
+      .from(billPayments)
+      .where(and(eq(billPayments.companyId, ctx.companyId), eq(billPayments.id, id)));
+    if (!p) throw notFound('Bill payment');
+    return {
+      ...base,
+      isCheck: p.method === 'check',
+      voided: Boolean(p.voidedAt),
+      toPrint: p.toPrint,
+      paymentAccountId: p.paymentAccountId,
+      date: p.date,
+      postedEntryId: p.postedEntryId,
+      number: p.reference?.trim() || null,
+    };
+  }
+  if (source === 'payment_check') {
+    const [r] = await ctx.db
+      .select({ c: paymentChecks, entryStatus: journalEntries.status })
+      .from(paymentChecks)
+      .leftJoin(journalEntries, eq(paymentChecks.postedEntryId, journalEntries.id))
+      .where(and(eq(paymentChecks.companyId, ctx.companyId), eq(paymentChecks.id, id)));
+    if (!r) throw notFound('Check');
+    return {
+      ...base,
+      isCheck: true,
+      voided: Boolean(r.c.voidedAt) || r.entryStatus === 'void',
+      toPrint: r.c.toPrint,
+      paymentAccountId: r.c.paymentAccountId,
+      date: r.c.date,
+      postedEntryId: r.c.postedEntryId,
+      number: r.c.reference?.trim() || null,
+    };
+  }
+  if (source === 'paycheck') {
+    const [p] = await ctx.db
+      .select()
+      .from(paychecks)
+      .where(and(eq(paychecks.companyId, ctx.companyId), eq(paychecks.id, id)));
+    if (!p) throw notFound('Paycheck');
+    const bank =
+      (p.postedEntryId ? (await paycheckBankAccounts(ctx, [p.postedEntryId])).get(p.postedEntryId) : undefined) ??
+      (await checkingAccount(ctx));
+    return {
+      ...base,
+      isCheck: p.entryType === 'paycheck' && Money.of(p.netPay).greaterThan(0),
+      voided: Boolean(p.voidedAt),
+      toPrint: p.toPrint,
+      paymentAccountId: bank?.id ?? null,
+      date: p.payDate,
+      postedEntryId: p.postedEntryId,
+      number: p.checkNumber?.trim() || null,
+    };
+  }
+  throw validation('Unknown check source.');
+}
+
+/** The run's checks: each still waiting to print, all drawn on one bank account. */
+async function loadRun(ctx: ServiceContext, items: ReadonlyArray<{ source: PrintSource; id: string }>) {
+  const states: CheckState[] = [];
+  const accountsSeen = new Set<string | null>();
+  for (const it of items) {
+    const s = await checkState(ctx, it.source, it.id);
+    if (s.voided) throw new ServiceError('CONFLICT', `A ${s.label} in this run was voided, so it can't be printed. Refresh the list.`);
+    if (!s.isCheck) throw validation(`A ${s.label} in this run is not a check, so it can't be printed.`);
+    if (!s.toPrint) {
+      throw new ServiceError(
+        'CONFLICT',
+        `A ${s.label} in this run is no longer waiting to be printed (it was printed or taken off the list). Refresh the list.`,
+      );
+    }
+    accountsSeen.add(s.paymentAccountId);
+    if (accountsSeen.size > 1) {
+      throw validation("These checks are drawn on different bank accounts. Print one bank account's checks at a time, on that account's check paper.");
+    }
+    states.push(s);
+  }
+  return { states, paymentAccountId: states[0]?.paymentAccountId ?? null };
+}
+
+function normalizeRunItems<T extends PrintRunItem>(items: ReadonlyArray<T>): T[] {
+  if (!Array.isArray(items) || items.length === 0) throw validation('Pick at least one check to print.');
+  if (items.length > MAX_PRINT_RUN) throw validation(`Print at most ${MAX_PRINT_RUN} checks at a time.`);
+  const seenIds = new Set<string>();
+  const seenNumbers = new Set<string>();
+  return items.map((it) => {
+    if (!PRINT_SOURCES.includes(it.source)) throw validation('Unknown check source.');
+    const checkNumber = String(it.checkNumber ?? '').trim();
+    if (!checkNumber) throw validation('Each check in the run needs the number printed on its check paper.');
+    if (checkNumber.length > 100) throw validation('A check number is at most 100 characters.');
+    const key = `${it.source}:${it.id}`;
+    if (seenIds.has(key)) throw validation('The same check is in the run twice.');
+    seenIds.add(key);
+    if (seenNumbers.has(checkNumber.toLowerCase())) {
+      throw validation(`Check number ${checkNumber} is used twice in this run. Each check prints on its own numbered check.`);
+    }
+    seenNumbers.add(checkNumber.toLowerCase());
+    return { ...it, checkNumber };
+  });
+}
+
+/** QB's duplicate check-number warning for a whole run, before anything prints. */
+async function assertRunNumbersAvailable(
+  ctx: ServiceContext,
+  paymentAccountId: string | null,
+  items: ReadonlyArray<PrintRunItem>,
+  allowDuplicate: boolean | undefined,
+) {
+  if (allowDuplicate || !paymentAccountId) return;
+  if (!(await getPreferences(ctx)).warnDuplicateCheckNumbers) return;
+  const dups: string[] = [];
+  const matches: CheckNumberUse[] = [];
+  for (const it of items) {
+    const m = await findDuplicateCheckNumbers(ctx, { paymentAccountId, number: it.checkNumber, exclude: { source: it.source, id: it.id } });
+    if (m.length > 0) {
+      dups.push(it.checkNumber);
+      matches.push(...m);
+    }
+  }
+  if (dups.length === 0) return;
+  throw new ServiceError(
+    'CONFLICT',
+    dups.length === 1
+      ? `Check number ${dups[0]} is already used on this bank account. Use a different number, or confirm that you want to keep the duplicate.`
+      : `Check numbers ${dups.join(', ')} are already used on this bank account. Use different numbers, or confirm that you want to keep the duplicates.`,
+    { duplicateNumber: true, numbers: dups, matches },
+  );
+}
+
+/**
+ * Step 1 of a print run (QB Print Checks > Print): the checks are still waiting to be printed, on
+ * one bank account, and the numbers they will print with are free (QB's duplicate warning comes
+ * BEFORE the paper is used). Nothing is recorded: the PDF is printed next, then confirmPrintRun.
+ */
+export async function preparePrintRun(
+  ctx: ServiceContext,
+  input: { items: ReadonlyArray<PrintRunItem>; allowDuplicateNumber?: boolean },
+): Promise<{ paymentAccountId: string | null; items: PrintRunItem[] }> {
+  const items = normalizeRunItems(input.items);
+  assertMayPrintSources(ctx, items.map((i) => i.source));
+  const { paymentAccountId } = await loadRun(ctx, items);
+  await assertRunNumbersAvailable(ctx, paymentAccountId, items, input.allowDuplicateNumber);
+  return { paymentAccountId, items: items.map(({ source, id, checkNumber }) => ({ source, id, checkNumber })) };
+}
+
+/**
+ * Step 2 (QB "Did check(s) print OK?"): records the number of every check that printed correctly
+ * on the check and its journal entry, in one transaction (a refusal records none of them). The
+ * checks marked `reprint` printed wrong: they stay in the queue, without a number, to be printed
+ * again with new numbers.
+ */
+export async function confirmPrintRun(
+  ctx: ServiceContext,
+  input: { items: ReadonlyArray<PrintRunItem & { reprint?: boolean }>; allowDuplicateNumber?: boolean },
+): Promise<{ printed: PrintRunItem[]; reprint: PrintRunItem[] }> {
+  const items = normalizeRunItems(input.items);
+  assertMayPrintSources(ctx, items.map((i) => i.source));
+  return inTransaction(ctx, async (tx) => {
+    const { paymentAccountId, states } = await loadRun(tx, items);
+    // Printing stamps a number on a check: on the accountant's side of an Accountant's Copy only
+    // checks dated on or before the dividing date are the accountant's to change.
+    await assertAccountantDatesOpen(
+      tx,
+      states.filter((_, i) => !items[i].reprint).map((s) => s.date),
+      'A check in this run',
+    );
+    const good = items.filter((i) => !i.reprint);
+    await assertRunNumbersAvailable(tx, paymentAccountId, good, input.allowDuplicateNumber);
+    const printed: PrintRunItem[] = [];
+    for (const it of good) {
+      await markPrinted(tx, { source: it.source, id: it.id, checkNumber: it.checkNumber, allowDuplicateNumber: true });
+      printed.push({ source: it.source, id: it.id, checkNumber: it.checkNumber });
+    }
+    const reprint = items.filter((i) => i.reprint).map(({ source, id, checkNumber }) => ({ source, id, checkNumber }));
+    return { printed, reprint };
+  });
+}
+
+/**
+ * Reprint a check that was already printed (QB: tick "Print Later" on it): it goes back in the
+ * print queue and its number is cleared from the check and its journal entry, so the reprint
+ * records the number of the new check paper. The closing date and an Accountant's Copy apply as
+ * for any change to the check.
+ */
+export async function requeueForReprint(
+  ctx: ServiceContext,
+  input: { source: PrintSource; id: string },
+): Promise<{ source: PrintSource; id: string; toPrint: true; previousNumber: string | null }> {
+  if (!PRINT_SOURCES.includes(input.source)) throw validation('Unknown check source.');
+  assertMayPrintSources(ctx, [input.source]);
+  return inTransaction(ctx, async (tx) => {
+    const s = await checkState(tx, input.source, input.id);
+    if (s.voided) throw new ServiceError('CONFLICT', `This ${s.label} is void, so it can't be printed again.`);
+    if (!s.isCheck) throw validation(`This ${s.label} is not a check, so there is nothing to print.`);
+    if (s.toPrint) throw new ServiceError('CONFLICT', `This ${s.label} is already waiting to be printed.`);
+    await assertAccountantDatesOpen(tx, [s.date], `This ${s.label}`);
+    await assertClosedPeriodEdit(tx, { entryId: s.postedEntryId, what: 'check number', date: s.date });
+    if (s.source === 'expense') {
+      await tx.db.update(expenses).set({ toPrint: true, reference: null }).where(eq(expenses.id, s.id));
+    } else if (s.source === 'bill_payment') {
+      await tx.db.update(billPayments).set({ toPrint: true, reference: null }).where(eq(billPayments.id, s.id));
+    } else if (s.source === 'payment_check') {
+      await tx.db.update(paymentChecks).set({ toPrint: true, reference: null }).where(eq(paymentChecks.id, s.id));
+    } else {
+      await tx.db.update(paychecks).set({ toPrint: true, checkNumber: null }).where(eq(paychecks.id, s.id));
+    }
+    if (s.postedEntryId) {
+      await tx.db
+        .update(journalEntries)
+        .set({ reference: null, updatedAt: new Date() })
+        .where(and(eq(journalEntries.id, s.postedEntryId), eq(journalEntries.companyId, tx.companyId)));
+    }
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: s.source === 'expense' ? 'expense' : s.source === 'bill_payment' ? 'bill_payment' : s.source === 'paycheck' ? 'paycheck' : 'payment_check',
+      entityId: s.id,
+      oldValues: { toPrint: false, checkNumber: s.number },
+      newValues: { toPrint: true, checkNumber: null, reprint: true },
+    });
+    return { source: s.source, id: s.id, toPrint: true as const, previousNumber: s.number };
+  });
 }
 
 // ---------------------------------------------------------------------------

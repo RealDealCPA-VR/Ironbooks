@@ -42,6 +42,9 @@ import {
   customers,
   deposits,
   depositLines,
+  employees,
+  otherNames,
+  vendors,
   invoiceLines,
   invoices,
   items,
@@ -55,13 +58,16 @@ import { Money, toAmountString } from '@/lib/money';
 import {
   type ServiceContext,
   ServiceError,
+  assertRefInCompany,
   inTransaction,
   notFound,
   validation,
   writeAudit,
 } from './_base';
-import { postJournalEntry, voidJournalEntry, type PostingLine } from './posting';
+import { assertNotControlLineAccount, postJournalEntry, voidJournalEntry, type PostingLine } from './posting';
 import { planPostedEdit, retitleEntry } from './postedEdit';
+import { carryReconciledLines, prepareReconciledRepost } from './reconciledEdits';
+import { isDepositTargetAccount, isUndepositedFunds } from '@/lib/accountTypes';
 import { syncLineMemos } from './entryLineMemos';
 import { subledgerAccountReason } from '@/lib/registerEntryPlan';
 import { homeAmounts } from './currencies';
@@ -105,7 +111,16 @@ export interface ExtraDepositLineInput {
   accountId: string;
   amount: string | number;
   description?: string | null;
+  /**
+   * QB "Received From": the customer / vendor / employee / other name the money came from. Kept on
+   * the deposit line and posted as the Name of the credited journal line.
+   */
+  entityType?: 'customer' | 'vendor' | 'employee' | 'other' | null;
+  entityId?: string | null;
 }
+
+/** Name kinds a deposit line can be received from, and the list each one lives in. */
+const RECEIVED_FROM_KINDS = ['customer', 'vendor', 'employee', 'other'] as const;
 
 export interface CashBackInput {
   /** GL account debited with the cash kept out of the deposit (e.g. Petty Cash). */
@@ -131,6 +146,11 @@ export interface CreateDepositInput {
   memo?: string | null;
   /** p1 fx: foreign-currency bank account — home units per 1 unit (default: the list rate). */
   exchangeRate?: string | number | null;
+  /**
+   * Edits: the user confirmed QB's "this transaction has been reconciled" warning, so a change to
+   * the amount or account of a reconciled deposit is saved (reconciledEdits.ts).
+   */
+  allowReconciledEdit?: boolean;
 }
 
 /** Unified row shape for the "Payments to Deposit" picker. */
@@ -150,6 +170,30 @@ export interface UndepositedItem {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * The Received From name of an extra deposit line: a customer, vendor, employee or Other Names
+ * entry of this company (both fields together, or neither).
+ */
+async function assertReceivedFrom(
+  ctx: ServiceContext,
+  line: { entityType?: string | null; entityId?: string | null },
+  where: string,
+): Promise<void> {
+  if (!line.entityType && !line.entityId) return;
+  if (!line.entityType || !line.entityId || !(RECEIVED_FROM_KINDS as readonly string[]).includes(line.entityType)) {
+    throw validation(`${where}: pick who the money was received from (a customer, vendor, employee or other name).`);
+  }
+  const table =
+    line.entityType === 'customer'
+      ? customers
+      : line.entityType === 'vendor'
+        ? vendors
+        : line.entityType === 'employee'
+          ? employees
+          : otherNames;
+  await assertRefInCompany(ctx, table, line.entityId, `${where}: the Received From name`);
+}
 
 /** Resolve the Undeposited Funds account id by code 1050, scoped to company. */
 async function getUFAccountId(ctx: ServiceContext): Promise<string> {
@@ -491,6 +535,17 @@ async function prepareDeposit(
   if (depAcct.type !== 'asset') {
     throw validation('Deposit account must be an asset (bank) account.');
   }
+  // QB Make Deposits deposits to a bank or other current asset account. Accounts Receivable, an
+  // inventory asset, a fixed asset or a non-posting account as "Deposit To" posted the money with
+  // no customer / stock / asset record behind it, so A/R aging and the inventory valuation no longer
+  // tied to the GL. A deposit saved there before the rule can still be re-saved as it is.
+  if (depAcct.id !== keepDepositAccountId && !isDepositTargetAccount(depAcct) && !isUndepositedFunds(depAcct)) {
+    throw validation(
+      `Deposit To: "${depAcct.name}" is not a bank account. Deposit to a checking, savings or other current asset account.`,
+      undefined,
+      await bankAccountFix(ctx),
+    );
+  }
   // Inventory Asset (or a second Undeposited Funds account) as Deposit To moved a balance that the
   // inventory valuation / Make Deposits list never shows — the same rule as the deposit's other
   // lines. A deposit saved there before the rule can still be re-saved as it is.
@@ -698,6 +753,10 @@ async function prepareDeposit(
     // moved its balance without the inventory valuation. Pick those payments above instead.
     const reason = keepAccountIds.has(lineAcct.id) ? null : subledgerAccountReason(lineAcct);
     if (reason) throw validation(`Extra line ${i + 1}: ${reason}`);
+    // A/R / A/P need their own forms (a customer payment, a vendor refund): a deposit line there
+    // would move the control account without an open item behind it.
+    assertNotControlLineAccount(lineAcct, `Extra line ${i + 1}`);
+    await assertReceivedFrom(ctx, line, `Extra line ${i + 1}`);
   }
 
   // ── cash back validation ─────────────────────────────────────────────────
@@ -804,6 +863,7 @@ async function prepareDeposit(
       credit: toAmountString(extraHome.lines[i]),
       memo: l.description ?? 'Additional deposit line',
       ...(extraCur[i] ? { foreignAmount: toAmountString(Money.round2(l.amount)) } : {}),
+      ...(l.entityType && l.entityId ? { entityType: l.entityType, entityId: l.entityId } : {}),
     });
   }
   if (fx) {
@@ -835,6 +895,9 @@ async function prepareDeposit(
       // The credited account lives on the deposit's own row too (0037), so Reclassify can keep it
       // in step and the edit form re-sends the right account.
       accountId: l.accountId,
+      // purchbank (0081): Received From.
+      entityType: l.entityType && l.entityId ? l.entityType : null,
+      entityId: l.entityType && l.entityId ? l.entityId : null,
     })),
   ];
   if (input.cashBack && cashBackAmt.greaterThan(0)) {
@@ -971,7 +1034,8 @@ export async function createDeposit(ctx: ServiceContext, input: CreateDepositInp
  * Edit a saved deposit in ONE transaction: payments / receipts can be added or removed (removed
  * ones go back to Undeposited Funds), extra lines and cash back changed. A ledger-neutral edit
  * (memo / descriptions only) keeps the entry, so it works on a reconciled deposit; otherwise the
- * entry is voided and re-posted (refused when it was cleared in a completed reconciliation).
+ * entry is voided and re-posted (a reconciled deposit after QB's warning is confirmed:
+ * allowReconciledEdit, reconciledEdits.ts).
  */
 export async function updateDeposit(ctx: ServiceContext, id: string, input: CreateDepositInput) {
   const [existing] = await ctx.db
@@ -1016,9 +1080,18 @@ export async function updateDeposit(ctx: ServiceContext, id: string, input: Crea
       date: input.date,
       lines: prep.glLines,
       what: 'deposit',
+      allowReconciledEdit: input.allowReconciledEdit,
     });
     // p1 fx: a foreign deposit whose amount changed re-posts even if its home value did not.
-    if (plan === 'unchanged' && prep.currency && !Money.eq(prep.netStr, existing.total)) plan = 'repost';
+    if (plan === 'unchanged' && prep.currency && !Money.eq(prep.netStr, existing.total)) {
+      plan = 'repost';
+      await prepareReconciledRepost(tx, {
+        entryId: existing.postedEntryId,
+        lines: prep.glLines,
+        what: 'deposit',
+        allowReconciledEdit: input.allowReconciledEdit,
+      });
+    }
 
     let entryId = existing.postedEntryId;
     if (plan === 'repost') {
@@ -1031,6 +1104,8 @@ export async function updateDeposit(ctx: ServiceContext, id: string, input: Crea
         ...(prep.currency ? { currency: prep.currency, exchangeRate: prep.rate } : {}),
       });
       entryId = entry.id;
+      // A reconciled deposit the user chose to change stays reconciled at its new amount.
+      await carryReconciledLines(tx, { oldEntryId: existing.postedEntryId, newEntryId: entry.id });
     } else {
       await retitleEntry(tx, entryId, { description: input.memo ? `Deposit: ${input.memo}` : 'Bank Deposit' });
       // Line descriptions / cash-back memo are the entry lines' memos (register Memo column).

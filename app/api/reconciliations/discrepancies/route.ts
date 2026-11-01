@@ -1,9 +1,11 @@
 /**
  * GET /api/reconciliations/discrepancies[?bankAccountId=<uuid>]
  *
- * Reconciliation Discrepancy report: lines cleared in a COMPLETED reconciliation
- * whose journal entry has since been voided (historical anomalies — new voids of
- * reconciled lines are blocked by the posting engine).
+ * Previous Reconciliation Discrepancy report: lines cleared in a COMPLETED reconciliation
+ * that were changed afterwards (amount changed / moved off the account after QB's warning —
+ * reconciledEdits.ts) or whose journal entry was voided (historical anomalies — new voids of
+ * reconciled lines are blocked by the posting engine). Each row has the reconciled amount, the
+ * type of change and its effect on the reconciled balance.
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
