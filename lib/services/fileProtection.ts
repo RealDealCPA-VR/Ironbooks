@@ -542,7 +542,16 @@ export async function protectionForDir(dataDir?: string): Promise<SealProtection
     if (isMarkedProtected(dir)) throw new ServiceError('FORBIDDEN', KEY_MISSING_MESSAGE, { fileKeyMissing: true });
     return null;
   }
-  const db = await withDamagedFileAccess(() => getDb(dir));
+  let db: DB;
+  try {
+    db = await withDamagedFileAccess(() => getDb(dir));
+  } catch (err) {
+    // The database there cannot be opened at all (a damaged file, or a folder that only looks
+    // like one): the backup still goes out for a file without passwords. A marked protected
+    // file is refused, never written in plain text.
+    if (isMarkedProtected(dir)) throw err;
+    return null;
+  }
   return sealProtectionFor(db, dir);
 }
 
