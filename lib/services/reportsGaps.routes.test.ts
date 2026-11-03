@@ -12,17 +12,22 @@ import { afterAll, describe, expect, it, vi } from 'vitest';
 import path from 'node:path';
 import { NextRequest } from 'next/server';
 
-const { openItemStatement, buildOpenItemPdf } = vi.hoisted(() => ({
+const { openItemStatement, buildOpenItemPdf, graphData, current } = vi.hoisted(() => ({
+  graphData: vi.fn(async (..._a: unknown[]) => ({ series: [] })),
+  current: { ctx: { db: null, companyId: 'c', userId: 'u' } as Record<string, unknown> },
   openItemStatement: vi.fn(async (..._a: unknown[]) => ({ customer: { displayName: 'Acme' }, lines: [], totalDue: '0.00', aging: {} })),
   buildOpenItemPdf: vi.fn(async (..._a: unknown[]) => new Uint8Array([37, 80, 68, 70])),
 }));
-vi.mock('@/lib/context', () => ({ getServerContext: vi.fn(async () => ({ db: null, companyId: 'c', userId: 'u' })) }));
+vi.mock('@/lib/context', () => ({ getServerContext: vi.fn(async () => current.ctx) }));
+vi.mock('@/lib/services/reportsAnalysis', async (orig) => ({ ...(await orig<object>()), graphData }));
 vi.mock('@/lib/services/statements', async (orig) => ({ ...(await orig<object>()), openItemStatement }));
 vi.mock('@/app/api/export/statements/openItemPdf', async (orig) => ({ ...(await orig<object>()), renderOpenItemStatementPdf: buildOpenItemPdf }));
 vi.mock('@/lib/services/company', async (orig) => ({ ...(await orig<object>()), getCompany: vi.fn(async () => ({ name: 'Acme' })) }));
 import { GET as openItemGET } from '@/app/api/export/statements/open-item/route';
 import { GET as openItemPdfGET } from '@/app/api/export/statements/open-item/pdf/route';
 import { POST as exportPOST } from '@/app/api/export/reports/route';
+import { GET as graphsGET } from '@/app/api/reports/graphs/route';
+import { unionRoles, type PermissionGrant } from '@/lib/permissions/model';
 
 const saved = { file: process.env.BKA_COMPANY_FILE, out: process.env.BKA_REPORT_EXPORT_DIR };
 afterAll(() => {
@@ -72,5 +77,29 @@ describe('scheduled export folder of a single company file', () => {
     delete process.env.BKA_REPORT_EXPORT_DIR;
     process.env.BKA_COMPANY_FILE = path.join(path.sep, 'Shared', 'Books', 'Acme Inc.ironbooks');
     expect(reportExportRoot()).toBe(path.resolve(path.sep, 'Shared', 'Books', 'Report Exports', 'Acme Inc'));
+  });
+});
+
+describe('report graphs check the report activity, not the whole area (post-merge review)', () => {
+  const role = (grant: PermissionGrant) =>
+    unionRoles([{ key: 'custom-activities', name: 'Custom', description: '', builtin: false, permissions: grant, flags: {} }]);
+  afterAll(() => {
+    current.ctx = { db: null, companyId: 'c', userId: 'u' };
+  });
+
+  it('the A/R graph needs the A/R reports activity; Sales reports alone are refused', async () => {
+    current.ctx = { db: null, companyId: 'c', userId: 'u', access: role({ 'reports_sales.sales': ['view'] }) };
+    expect((await graphsGET(req('/api/reports/graphs?kind=ar'))).status).toBe(403);
+    current.ctx = { db: null, companyId: 'c', userId: 'u', access: role({ 'reports_sales.receivables': ['view'] }) };
+    expect((await graphsGET(req('/api/reports/graphs?kind=ar'))).status).toBe(200);
+  });
+
+  it('the A/P graph needs Vendors & Payables reports; the others need Company & Financial', async () => {
+    current.ctx = { db: null, companyId: 'c', userId: 'u', access: role({ 'reports_purchases.purchases': ['view'], 'reports_financial.accountant': ['view'] }) };
+    expect((await graphsGET(req('/api/reports/graphs?kind=ap'))).status).toBe(403);
+    expect((await graphsGET(req('/api/reports/graphs?kind=income-expense'))).status).toBe(403);
+    current.ctx = { db: null, companyId: 'c', userId: 'u', access: role({ 'reports_purchases.payables': ['view'], 'reports_financial.company': ['view'] }) };
+    expect((await graphsGET(req('/api/reports/graphs?kind=ap'))).status).toBe(200);
+    expect((await graphsGET(req('/api/reports/graphs?kind=net-worth'))).status).toBe(200);
   });
 });
