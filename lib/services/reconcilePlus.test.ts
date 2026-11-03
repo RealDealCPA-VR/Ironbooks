@@ -62,6 +62,8 @@ async function clearAll(reconId: string, bankAccountId: string, asOf: Date) {
 
 describe('Reconciliation completion features (end-to-end)', () => {
   beforeAll(async () => {
+    // A run that was killed leaves its folder behind; start from an empty one.
+    fs.rmSync(TEST_DIR, { recursive: true, force: true });
     db = await getDb(TEST_DIR);
 
     const [user] = await db
