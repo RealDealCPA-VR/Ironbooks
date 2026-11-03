@@ -5,7 +5,7 @@
  * does NOT include this key, so the only way to change it is setNetworkPolicy() below, which is
  * owner/admin-only and audited.
  */
-import { eq } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import { z } from 'zod';
 import { companies } from '@/lib/db/schema';
 import {
@@ -89,12 +89,17 @@ export async function setNetworkPolicy(ctx: ServiceContext, input: unknown): Pro
       .from(companies)
       .where(eq(companies.id, tx.companyId));
     if (!row) throw notFound('Company');
-    const settings = { ...((row.settings ?? {}) as Record<string, unknown>) };
+    const settings = (row.settings ?? {}) as Record<string, unknown>;
     const before = readStored(settings[SETTINGS_KEY]);
-    settings[SETTINGS_KEY] = { ...next, rev: POLICY_REV };
+    const stored = { ...next, rev: POLICY_REV };
+    // Merge only this key in SQL: writing back the whole object read above could undo a
+    // concurrent closing date, password policy or file lock (prefsperms review P2).
     await tx.db
       .update(companies)
-      .set({ settings, updatedAt: new Date() })
+      .set({
+        settings: sql`coalesce(${companies.settings}, '{}'::jsonb) || jsonb_build_object(${SETTINGS_KEY}::text, ${JSON.stringify(stored)}::jsonb)`,
+        updatedAt: new Date(),
+      })
       .where(eq(companies.id, tx.companyId));
     await writeAudit(tx, {
       action: 'update',

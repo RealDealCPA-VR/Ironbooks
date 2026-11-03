@@ -17,6 +17,7 @@ import { Badge, Button, Card, Select, Spinner } from '@/components/ui';
 import EntryDetailModal from '@/components/EntryDetailModal';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import { HIDDEN_BALANCE_TITLE, balanceText } from '@/lib/permissions/balances';
 import { LIST_ACTIVE_ATTR, quickReportHref, setActiveListRow, useListKeys } from '@/lib/shortcuts';
 import { PREFILL_PATHS, stashPrefill } from '@/lib/commands/prefill';
 import type { CellValue, StdReport, StdRow } from '@/lib/reports/types';
@@ -29,7 +30,9 @@ export interface CenterRecord {
   companyName?: string | null;
   email?: string | null;
   phone?: string | null;
-  balance: string;
+  /** null with `balanceHidden` when the role has no View Balance (prefsperms). */
+  balance: string | null;
+  balanceHidden?: boolean;
   isActive: boolean;
   termsLabel?: string | null;
 }
@@ -260,8 +263,12 @@ export default function CenterDetail({
           </div>
           <div className="text-right">
             <p className="text-xs text-navy/50">Open balance</p>
-            <p className="text-xl font-semibold tabular-nums text-navy" data-center-balance>
-              {formatCurrency(record.balance)}
+            <p
+              className="text-xl font-semibold tabular-nums text-navy"
+              data-center-balance
+              title={record.balanceHidden ? HIDDEN_BALANCE_TITLE : undefined}
+            >
+              {balanceText(record.balance, formatCurrency, record.balanceHidden)}
             </p>
             {!record.isActive && <Badge tone="neutral">Inactive</Badge>}
           </div>

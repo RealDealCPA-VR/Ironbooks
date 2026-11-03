@@ -186,7 +186,7 @@ export async function setReceiptSettings(ctx: ServiceContext, input: unknown): P
   await inTransaction(ctx, async (tx) => {
     const [row] = await tx.db.select({ settings: companies.settings }).from(companies).where(eq(companies.id, tx.companyId));
     if (!row) throw notFound('Company');
-    const settings = { ...((row.settings ?? {}) as Record<string, unknown>) };
+    const settings = (row.settings ?? {}) as Record<string, unknown>;
     const before = normalizeSettings(settings[RECEIPT_SETTINGS_KEY]);
     const next: ReceiptSettings = {
       visionProviderId:
@@ -194,8 +194,14 @@ export async function setReceiptSettings(ctx: ServiceContext, input: unknown): P
       preferVision: parsed.data.preferVision ?? before.preferVision,
       dateOrder: parsed.data.dateOrder ?? before.dateOrder,
     };
-    settings[RECEIPT_SETTINGS_KEY] = next;
-    await tx.db.update(companies).set({ settings, updatedAt: new Date() }).where(eq(companies.id, tx.companyId));
+    // Merge only this key (a whole-object write could undo a concurrent settings save).
+    await tx.db
+      .update(companies)
+      .set({
+        settings: sql`coalesce(${companies.settings}, '{}'::jsonb) || jsonb_build_object(${RECEIPT_SETTINGS_KEY}::text, ${JSON.stringify(next)}::jsonb)`,
+        updatedAt: new Date(),
+      })
+      .where(eq(companies.id, tx.companyId));
     await writeAudit(tx, { action: 'update', entityType: 'receipt_settings', entityId: tx.companyId, oldValues: before, newValues: next });
   });
   return getReceiptSettingsView(ctx);

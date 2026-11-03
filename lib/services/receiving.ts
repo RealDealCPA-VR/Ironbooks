@@ -106,7 +106,8 @@ export async function updateReceivingSettings(
     if (!row) throw notFound('Company');
     await tx.db
       .update(companies)
-      .set({ settings: { ...(row.settings ?? {}), receiving: next }, updatedAt: new Date() })
+      // Merge only this key (a whole-object write could undo a concurrent settings save).
+      .set({ settings: sql`coalesce(${companies.settings}, '{}'::jsonb) || jsonb_build_object('receiving', ${JSON.stringify(next)}::jsonb)`, updatedAt: new Date() })
       .where(eq(companies.id, tx.companyId));
     await writeAudit(tx, {
       action: 'update',

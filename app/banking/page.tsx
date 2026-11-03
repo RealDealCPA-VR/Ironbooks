@@ -22,6 +22,7 @@ import {
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/dates';
+import { HIDDEN_BALANCE_TITLE } from '@/lib/permissions/balances';
 import { StatementReview, type StatementExtract, type ReviewedStatement } from '@/components/StatementReview';
 import { usePreferences } from '@/lib/usePreferences';
 import { openBankFileWithDialog, readBankFileText, type OpenFileBridge } from '@/lib/bankFileClient';
@@ -54,6 +55,8 @@ interface BankAccount {
   lastReconciledBalance: string | null;
   glAccountName: string;
   glAccountCode: string;
+  /** prefsperms: no View Balance on Bank Accounts (lib/permissions/balances.ts). */
+  balanceHidden?: boolean;
 }
 
 interface ImportSummary {
@@ -833,9 +836,13 @@ export default function BankingPage() {
                   </Td>
                   <Td>{formatDate(ba.lastReconciledDate)}</Td>
                   <Td numeric>
-                    {ba.lastReconciledBalance != null
-                      ? formatCurrency(ba.lastReconciledBalance)
-                      : '—'}
+                    {ba.balanceHidden ? (
+                      <span className="text-navy/50" title={HIDDEN_BALANCE_TITLE}>Hidden</span>
+                    ) : ba.lastReconciledBalance != null ? (
+                      formatCurrency(ba.lastReconciledBalance)
+                    ) : (
+                      '—'
+                    )}
                   </Td>
                   {multiCurrency && (
                     <Td>

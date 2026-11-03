@@ -225,6 +225,7 @@ export const navGroups: NavGroup[] = [
       { icon: Network, label: 'Privacy & Network', path: '/privacy', qb: 'Privacy', keywords: 'internet offline' },
       { icon: Users, label: 'Multi-user', path: '/multi-user', qb: 'Multi-user mode', keywords: 'network share host' },
       { icon: Settings, label: 'Preferences', path: '/settings', qb: 'Edit > Preferences', keywords: 'settings options company info' },
+      { icon: Settings, label: 'My Preferences', path: '/my-preferences', qb: 'Edit > Preferences > My Preferences', keywords: 'my settings send from email address bcc me menu spelling' }, // prefsperms: open to every user
       { icon: KeyRound, label: 'System Accounts', path: '/system-accounts', qb: 'Accounts Ironbooks posts to (A/P, Inventory, COGS, Sales Tax, Payroll)', keywords: 'accounts payable inventory asset cost of goods sold sales tax payable payroll liabilities chart converted quickbooks numbering' }, // feature round (accountant)
       { icon: ClipboardCheck, label: 'Setup Interview', path: '/onboarding', qb: 'EasyStep Interview', keywords: 'setup wizard new company start' }, // P1 setup: run it again
       { icon: ListChecks, label: 'Document Numbers', path: '/doc-numbers', qb: 'Document numbering', keywords: 'numbering' }, // wave2 foundation

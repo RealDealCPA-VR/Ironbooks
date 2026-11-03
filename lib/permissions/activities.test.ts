@@ -252,6 +252,15 @@ describe('per-activity rights', () => {
     expect(canActivity(mixed, 'vendors.bills', 'create')).toBe(true);
   });
 
+  it('My Preferences (send-from address, Bcc me) is open to every role; Company Preferences is not', () => {
+    for (const key of ['ar_clerk', 'ap_clerk', 'banking', 'payroll_processor', 'reports_only']) {
+      const access = unionRoles([BUILTIN_ROLES.find((r) => r.key === key)!]);
+      expect(decide('/my-preferences', 'GET', access), key).toBe(true);
+      expect(decide('/api/preferences/my', 'PATCH', access), key).toBe(true);
+      expect(decide('/settings', 'GET', access), key).toBe(false);
+    }
+  });
+
   it('the company file itself (rename / archive) is its own activity, given to every old Company grant', () => {
     expect(supportedActions(activityDef('company.company_file')!)).toEqual(['view', 'modify', 'delete']);
     const accountant = unionRoles([BUILTIN_ROLES.find((r) => r.key === 'accountant')!]);
@@ -314,6 +323,22 @@ describe('reports: every catalog report needs an activity of its own area', () =
         continue;
       }
       if (activityDef(k)?.area !== e.area) problems.push(`${e.key}: ${k} is not in ${e.area}`);
+    }
+    expect(problems).toEqual([]);
+  });
+
+  it('a report needs the same activity in the catalog (standard viewer) as on its own page and route', () => {
+    // Check Detail, Deposit Detail and Missing Checks are Banking Reports, not Company & Financial.
+    for (const k of ['check-detail', 'deposit-detail', 'missing-checks']) {
+      expect(reportActivity(REPORT_CATALOG.find((e) => e.key === k)!)).toBe('reports_financial.banking');
+    }
+    const problems: string[] = [];
+    for (const e of REPORT_CATALOG) {
+      const want = reportActivity(e);
+      const route = apiActivityFor(`/api/reports/${e.key}`, 'GET');
+      if (route && activityDef(route)?.area === e.area && route !== want) problems.push(`/api/reports/${e.key}: ${route} vs catalog ${want}`);
+      const page = pageAccessFor(`/reports/${e.key}`)?.activities;
+      if (page?.length === 1 && activityDef(page[0])?.area === e.area && page[0] !== want) problems.push(`/reports/${e.key}: ${page[0]} vs catalog ${want}`);
     }
     expect(problems).toEqual([]);
   });

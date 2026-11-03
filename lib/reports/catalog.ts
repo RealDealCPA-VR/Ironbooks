@@ -247,7 +247,10 @@ export const REPORT_GROUPS: ReportGroup[] = [
 export function reportActivity(entry: Pick<CatalogEntry, 'key' | 'area' | 'group'>): ActivityKey {
   switch (entry.area) {
     case 'reports_financial':
-      return entry.group === 'Accountant & Taxes' ? 'reports_financial.accountant' : 'reports_financial.company';
+      if (entry.group === 'Accountant & Taxes') return 'reports_financial.accountant';
+      // Check Detail, Deposit Detail, Missing Checks: Banking Reports, as on their own pages.
+      if (entry.group === 'Banking') return 'reports_financial.banking';
+      return 'reports_financial.company';
     case 'reports_sales':
       return entry.group === 'Customers & Receivables' || entry.group === 'Multiple Companies'
         ? 'reports_sales.receivables'

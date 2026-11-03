@@ -35,7 +35,7 @@
  * receipts carry only a class, so rules conditioned on those never match there (the rule
  * editor says so).
  */
-import { and, asc, eq, inArray } from 'drizzle-orm';
+import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import Decimal from 'decimal.js';
 import {
   classes,
@@ -497,7 +497,8 @@ export async function updatePricingSettings(
     };
     await tx.db
       .update(companies)
-      .set({ settings: { ...(row.settings ?? {}), advancedPricing: next }, updatedAt: new Date() })
+      // Merge only this key (a whole-object write could undo a concurrent settings save).
+      .set({ settings: sql`coalesce(${companies.settings}, '{}'::jsonb) || jsonb_build_object('advancedPricing', ${JSON.stringify(next)}::jsonb)`, updatedAt: new Date() })
       .where(eq(companies.id, tx.companyId));
     await writeAudit(tx, {
       action: 'update',
