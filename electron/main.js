@@ -515,7 +515,13 @@ function currentCompanyLocation() {
 // ---------------------------------------------------------------------------
 
 function sandboxRoot() {
-  return path.join(app.getPath('userData'), 'sandboxes');
+  // %LOCALAPPDATA%\Ironbooks\Sandboxes, next to the working copies (a sandbox of a protected file
+  // is plain text like its working copy: never in the roaming profile). Sandboxes made by earlier
+  // versions in <userData>\sandboxes move there (except the one running right now).
+  const root = companySession.sandboxRoot({ userData: app.getPath('userData') });
+  const sb = loadConfig().sandbox;
+  companySession.moveLegacySandboxes(path.join(app.getPath('userData'), 'sandboxes'), root, sb && typeof sb.dir === 'string' ? [sb.dir] : []);
+  return root;
 }
 
 /** The active company file's sandbox marker (null for a real company file). */

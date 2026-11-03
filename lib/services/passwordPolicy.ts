@@ -181,7 +181,7 @@ export async function storeUserPassword(
       updatedAt: now,
     })
     .where(eq(users.id, userId));
-  await syncPasswordSlot(db, userId, password);
+  await syncPasswordSlot(db, userId, password, { rotate: true });
 }
 
 export type PasswordChangeReason = 'expired' | 'required';

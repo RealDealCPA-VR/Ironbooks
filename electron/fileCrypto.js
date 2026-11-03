@@ -320,7 +320,7 @@ async function openSlot(slot, secret) {
  * Spend exactly what opening a slot costs, for a user name that has none: a wrong user name and
  * a wrong password take the same time (no way to find out which user names exist).
  * @param {unknown} secret
- * @param {{ name: string, N: number, r: number, p: number }} [kdf]
+ * @param {{ name: string, N: number, r: number, p: number } | string} [kdf]  the cost, or a slot kind (kdfFor)
  * @returns {Promise<null>}
  */
 async function burnKdf(secret, kdf = currentKdf()) {

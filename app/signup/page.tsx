@@ -19,7 +19,7 @@ import { Briefcase } from 'lucide-react';
 import { Button, Card, Input, Label, Select, toast } from '@/components/ui';
 import { api } from '@/lib/client';
 import { MIN_PASSWORD_LENGTH } from '@/lib/passwordPolicy';
-import { CHALLENGE_QUESTIONS } from '@/lib/challengeQuestions';
+import { CHALLENGE_QUESTIONS, CHALLENGE_SLOT_RULE_TEXT, challengeAnswerOpensFile } from '@/lib/challengeQuestions';
 import { PasswordRulesHint, usePasswordPolicy } from '@/components/PasswordRules';
 import { RecoveryKeyPanel } from '@/components/FileProtection';
 
@@ -211,6 +211,11 @@ export default function SignupPage() {
               <Label htmlFor="su-answer">Answer</Label>
               <Input id="su-answer" value={form.challengeAnswer} onChange={set('challengeAnswer')} required autoComplete="off" />
               <p className="mt-1 text-xs text-navy/50">Not case-sensitive. Write it down somewhere safe.</p>
+              {info?.singleFile && protect && (
+                <p className={`mt-1 text-xs ${form.challengeAnswer.trim() && !challengeAnswerOpensFile(form.challengeAnswer) ? 'text-amber-700' : 'text-navy/50'}`}>
+                  {CHALLENGE_SLOT_RULE_TEXT}
+                </p>
+              )}
             </div>
           </fieldset>
           {info?.singleFile && (

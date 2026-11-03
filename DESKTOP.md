@@ -104,20 +104,43 @@ its passwords — and nobody else:
 - *Layout* (`electron/companyFileFormat.js`, `electron/fileCrypto.js`): the manifest stays the
   plain first entry with only what the No Company Open list shows (company name, file id, save ids,
   dates, app version) plus the key slots. Every other entry — the database, attachments, the
-  transaction log, the backup manifest — is AES-256-GCM encrypted with a random 256-bit file key,
-  a fresh nonce per entry and per save, under an opaque name, with the container's seal id and the
-  entry's names as additional data; an encrypted index lists the real names. Every entry is
-  verified (tag, then CRC) before a byte of it is written to disk; one entry at a time is in memory.
-  Ironbooks 1.6 refuses format 2 as "saved by a newer version".
-- *Key slots*: the file key wrapped (AES-256-GCM) with a key derived by scrypt (N=2^16, r=8, about
-  250 ms; its own salt) from one secret: one slot per active user with a password, one per user with
-  a challenge question (the normalized answer), and one for the **recovery key** — 24 characters in
-  groups of four, shown once when the file is created or protected (Print / Save to a File). It is
-  the only way back in if every password is lost. Slots are found by an HMAC of the user name, so
-  the manifest names nobody. Slots follow every password path: sign-in (creates a missing slot,
+  transaction log, the backup manifest — is AES-256-GCM encrypted under a subkey of a random 256-bit
+  file key made for that save alone (HKDF with its seal id, so random nonces never pile up under one
+  key), a fresh nonce per entry, under an opaque name, with the container's seal id and the entry's
+  names as additional data; an encrypted index lists the real names. The index also holds a copy of
+  the plain listing (save ids, training flag, layout, company name, encryption details — not the
+  key slots): once the key is known (sign-in, restore, a reused working copy) a listing changed
+  without the key is refused as tampered. Every entry is verified (tag, then CRC) before a byte of
+  it is written to disk; one entry at a time is in memory. Ironbooks 1.6 refuses format 2 as "saved
+  by a newer version".
+- *Key slots*: each slot has its own X25519 key pair; the private key is encrypted with a key
+  derived by scrypt (N=2^16, r=8, about 250 ms; its own salt) from one secret, and the file key is
+  wrapped to the public key. One slot per active user with a password, one per user whose challenge
+  answer is long enough (at least 10 characters with some variety — a short phrase; the slot costs
+  N=2^17: a short one-word answer to a known question could be guessed offline from a copy of the
+  file, so it still resets the password while the file is open but never opens the file), and one
+  for the **recovery key** — 24 characters in groups of four, shown once when the file is created
+  or protected (Print / Save to a File; printed from the page itself). It is the only way back in if
+  every password is lost. Slots are found by an HMAC of the user name with the file's random salt,
+  so the manifest does not list user names — but someone with a copy of the file can confirm a
+  guessed user name by computing its tag (and, on the computer that has the file, the sign-in
+  screen's "I forgot my password" says whether a name has a challenge question). Scrypt costs above
+  N=2^18, r=16, p=4 are refused (a changed slot can't make every sign-in slow). Slots follow every
+  password path: sign-in (creates a missing slot,
   re-wraps a stale or weaker one; also for teammates signing in to a hosted file), password change,
   "I forgot my password", an Admin setting a password, a new user, a changed challenge question, a
   new recovery key; a deactivated or removed user's slot is left out of the next save.
+- *The file key changes* whenever a secret stops being one that should open the file: a password
+  changed or reset, a challenge answer changed, a user made inactive, a new recovery key, a restore
+  that brought an older key back — and whenever an Admin chooses Company > Security > Change the
+  File Key. The new key is wrapped for every remaining slot through its public key, without anyone's
+  password, so nobody who may open the file is locked out; the change is made by the next save,
+  before its snapshot. From then on an old password, a removed user, an old recovery key or anyone
+  holding an OLDER copy of the file (whose slots still open the old key) can open only what was
+  saved before. Slots made by the first protected version have no public key: their users are listed
+  as "needs to sign in once" after a change (their next sign-in re-makes the slot). If the app stops
+  between the change and the save, the next open takes the file's key again (no one is locked out;
+  the next secret change rotates again).
 - *Opening* is ONE sign-in, the QuickBooks way: the shell locks the file and works out the open plan
   (and asks the conflict question) without the key, then starts the server *sealed*
   (`BKA_COMPANY_SEALED` = extract / conflict / key; `lib/db/sealed.ts`): only the sign-in page and
@@ -133,9 +156,19 @@ its passwords — and nobody else:
   archives, per-company backups and training files kept from the sandbox. A protected backup
   restores into its own file without a question; restoring one elsewhere (or File > Open or Restore
   Company) asks for a user name + password from the file it came from, or its recovery key.
-  Portable company files (`.bkp`) and Accountant's Copy transfer files (`.ibac`) are offered with a
-  password (on by default) that encrypts the whole file; a protected file's key travels inside, so
-  the company file restored from it is protected again.
+  Portable company files (`.bkp`), Period Copies and Accountant's Copy transfer files (`.ibac`) are
+  offered with a password (on by default) that encrypts the whole file; for a protected company file
+  the password is required. Such a copy never carries this file's key: it gets its own, with every
+  slot re-wrapped for it, so the company file restored from it is protected again and opens with
+  the same user names, passwords and recovery key — while whoever has the copy's password never
+  learns the original file's key. A Period Copy of a protected file is built beside its working copy
+  on this computer (never a shared temp folder) and removed right after.
+- *Sandbox* ("Try it on a copy") copies live in `%LOCALAPPDATA%\Ironbooks\Sandboxes`, next to the
+  working copies (never the roaming profile; older ones are moved there). A sandbox of a protected
+  file is plain text like its working copy; copies of it left over are removed when the real file is
+  closed cleanly.
+- *Earlier copies*: backups, portable files and copies made before a file was protected stay as they
+  were (not encrypted); Company > Security says so — delete them or keep them out of reach.
 - *Upgrading*: a file without passwords opens as before; an Admin signing in is offered "Protect
   this company file with passwords". Users who have not signed in since are listed as "needs to
   sign in once, or an Admin resets their password".
@@ -180,7 +213,8 @@ after checking, with UI Automation, that the button is really under the pointer.
 ## Sandbox mode ("Try it on a copy")
 
 - File / Help > Try It on a Copy (or Setup > Try it on a copy, `/sandbox`) copies the whole
-  company file (every company in the data dir) into `userData/sandboxes/<id>/` and opens the app
+  company file (every company in the data dir) into `%LOCALAPPDATA%\Ironbooks\Sandboxes\<id>\` (next
+  to the working copies; earlier versions used `userData/sandboxes`, moved on start) and opens the app
   on the copy. The server closes the real file's PGlite handle (checkpoint + flush) and copies the
   directory synchronously, writes a `.ironbooks-sandbox.json` marker into the copy and switches its
   active data dir; the shell then records `config.sandbox = { dir, realDir }` and relaunches into

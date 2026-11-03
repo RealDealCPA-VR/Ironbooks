@@ -18,7 +18,7 @@ import { companies, companyRoles, userCompanies, userRoleAssignments, users } fr
 import { hashPassword } from '@/lib/auth';
 import { assertPasswordAllowed, storeUserPassword } from './passwordPolicy';
 import { endUserSessions } from './sessions';
-import { syncPasswordSlot } from './fileProtection';
+import { requestFileKeyRotation, syncPasswordSlot } from './fileProtection';
 import {
   ADMIN_ROLE_KEY,
   BUILTIN_ROLES,
@@ -475,6 +475,10 @@ export async function updateUser(
       });
     }
   });
+  // A deactivated user's slot is left out of the next save; a protected file also gets a new
+  // file key then, so their password opens nothing saved from now on — not even through an older
+  // copy of the file (lib/services/fileProtection.ts rotateFileKey).
+  if (input.isActive === false && before.isActive !== false) requestFileKeyRotation();
   return (await listUsers({ ...ctx, access: undefined })).find((u) => u.userId === userId)!;
 }
 

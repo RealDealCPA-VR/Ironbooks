@@ -14,9 +14,9 @@ import { eq } from 'drizzle-orm';
 import { getSessionGate } from '@/lib/context';
 import { users } from '@/lib/db/schema';
 import { hashPassword, verifyPassword } from '@/lib/auth';
-import { MIN_CHALLENGE_ANSWER, isKnownChallengeQuestion, normalizeChallengeAnswer } from '@/lib/challengeQuestions';
+import { CHALLENGE_SLOT_RULE_TEXT, MIN_CHALLENGE_ANSWER, isKnownChallengeQuestion, normalizeChallengeAnswer } from '@/lib/challengeQuestions';
 import { logTransaction } from '@/lib/services/transactionLog';
-import { syncChallengeSlot } from '@/lib/services/fileProtection';
+import { readProtection, syncChallengeSlot } from '@/lib/services/fileProtection';
 import { originFromHeaders } from '@/lib/net/requestInfo';
 import { GLOBAL_KEY_WEIGHT, attemptKeys, loginLimiter, tooManyAttempts } from '@/lib/net/rateLimit';
 import { readJsonObject, invalidJsonBody, routeError } from '@/lib/routeErrors';
@@ -67,8 +67,10 @@ export async function POST(req: NextRequest) {
         .update(users)
         .set({ challengeQuestion: question, challengeAnswerHash: await hashPassword(normalizeChallengeAnswer(answer)), updatedAt: new Date() })
         .where(eq(users.id, userId));
-      // A protected company file: the new answer opens it ("I forgot my password"), the old one no longer does.
-      await syncChallengeSlot(db, userId, question, answer);
+      // A protected company file: the new answer opens it ("I forgot my password") when it is long
+      // enough (lib/challengeQuestions.ts challengeAnswerOpensFile); the old one no longer does.
+      const opensFile = await syncChallengeSlot(db, userId, question, answer);
+      const prot = await readProtection(db);
       await logTransaction(db, {
         userId,
         action: 'update',
@@ -77,7 +79,12 @@ export async function POST(req: NextRequest) {
         summary: `Set the challenge question for "${u.name}"`,
         data: { new: { challengeQuestion: question } }, // never the answer
       });
-      return NextResponse.json({ ok: true, question });
+      return NextResponse.json({
+        ok: true,
+        question,
+        // Protected files only: whether this answer also opens the encrypted file by itself.
+        ...(prot ? { opensFile, ...(opensFile ? {} : { note: CHALLENGE_SLOT_RULE_TEXT }) } : {}),
+      });
     } finally {
       attempt.release();
     }

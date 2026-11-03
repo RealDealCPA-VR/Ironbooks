@@ -6,7 +6,7 @@
 import * as React from 'react';
 import WorkingTrialBalancePage from '@/app/accountant/working-trial-balance/page';
 import PeriodCopyPage from '@/app/accountant/period-copy/page';
-import { $, button, check, click, domTest, equal, mount, reply, runDomTests, stubFetch, textOf, until, type FetchCall } from './kit';
+import { $, $$, button, check, click, domTest, equal, focus, mount, reply, runDomTests, stubFetch, textOf, typeText, until, type FetchCall } from './kit';
 import { atLocalTime, localInstant, straddlesUtcYear } from './clock';
 
 type Clock = [number, number, number, number, number];
@@ -65,14 +65,23 @@ domTest('Period Copy: opens on last calendar year, and creates the copy for it',
   for (const c of CASES) {
     await atLocalTime(c.clock, async () => {
       // The copy itself is not made here: the request is what is checked.
-      const calls = stubFetch({ 'POST /api/period-copy': reply(500, { error: 'not in this test' }) });
+      // filecrypto: the open company file is protected with passwords, so the copy needs one.
+      const calls = stubFetch({ 'POST /api/period-copy': reply(500, { error: 'not in this test' }), 'GET /api/file-protection': { protected: true } });
       await mount(<PeriodCopyPage />);
       await until(() => $('#pc-from'), 'the First day box');
       equal(value('pc-from'), c.lastYear.from, `${c.name}: First day`);
       equal(value('pc-to'), c.lastYear.to, `${c.name}: Last day`);
+      await until(() => textOf().includes('This company file is protected with passwords'), `${c.name}: the copy must get a password`);
+      check(!$('fieldset input[type="checkbox"]'), `${c.name}: no choice to save the copy without a password`);
+      check(button(/Create Period Copy/)?.disabled, `${c.name}: Create waits for the password`);
+      const [pw, confirm] = $$<HTMLInputElement>('fieldset input[type="password"]');
+      await focus(pw, 'the password');
+      await typeText('Audit-Pass-1');
+      await focus(confirm, 'the confirmation');
+      await typeText('Audit-Pass-1');
       await click(button(/Create Period Copy/), 'Create Period Copy');
       const post = await until(() => calls.find((x) => x.method === 'POST' && x.path === '/api/period-copy'), `${c.name}: the Period Copy request`);
-      equal(JSON.stringify(post.body), JSON.stringify(c.lastYear), `${c.name}: the period copied`);
+      equal(JSON.stringify(post.body), JSON.stringify({ ...c.lastYear, password: 'Audit-Pass-1' }), `${c.name}: the period copied, with its password`);
     });
   }
 });

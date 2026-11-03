@@ -41,7 +41,7 @@ import { sealedMode } from '@/lib/db/sealed';
 import { currentFingerprint } from './backupFingerprint';
 import { BACKUP_HISTORY_FILE } from './backupHistory';
 import { isRestoreInProgress, whenRestoreDone } from './restoreState';
-import { KEY_MISSING_MESSAGE, cachedSealProtection, sealProtectionFor, type SealProtection } from './fileProtection';
+import { KEY_MISSING_MESSAGE, applyPendingKeyRotation, cachedSealProtection, fileKeyRotationPending, sealProtectionFor, type SealProtection } from './fileProtection';
 import { APP_VERSION } from '@/lib/appVersion';
 
 /** How often the autosave timer looks for changes. */
@@ -413,9 +413,20 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
 
   s.status = 'saving';
   try {
+    // A protected file whose key is to change (a password replaced, a user deactivated, …): the
+    // new key and its re-wrapped slots go into the database BEFORE the snapshot, so this save is
+    // the first one only the remaining secrets open (lib/services/fileProtection.ts rotateFileKey).
+    let rotated = false;
+    if (workingCopyActive(s) && isDbOpen(dataDir) && fileKeyRotationPending(dataDir)) {
+      try {
+        rotated = Boolean((await applyPendingKeyRotation(await withDamagedFileAccess(() => getDb(dataDir)), dataDir))?.rotated);
+      } catch (err) {
+        console.warn('[company-file] could not change the file key (saving with the current one):', (err as Error).message);
+      }
+    }
     // A checkpoint writes the database's pending changes into its table files, so the saved
     // file opens without replaying a long write-ahead log.
-    if (workingCopyActive(s) && isDbOpen(dataDir) && (opts.final || Date.now() - s.lastCheckpointAt > CHECKPOINT_EVERY_MS)) {
+    if (workingCopyActive(s) && isDbOpen(dataDir) && (rotated || opts.final || Date.now() - s.lastCheckpointAt > CHECKPOINT_EVERY_MS)) {
       try {
         const db = await withDamagedFileAccess(() => getDb(dataDir));
         await db.execute(sql`checkpoint`);
@@ -732,7 +743,18 @@ export async function closeCompanyFile(): Promise<CloseResult> {
   // The server is on a sandbox copy ("Try it on a copy"): leaving it comes back to this working
   // copy, so it stays (plain text only on this computer, like any working copy) until then.
   if (path.resolve(active) !== path.resolve(dir)) return result;
-  return finishClose(s, result);
+  const closed = finishClose(s, result);
+  // A protected file's plain-text books are gone from this computer now: so are the sandbox copies
+  // of them left over here (never discarded), which would otherwise be the last plain-text copies.
+  if (closed.workingCopyRemoved) {
+    try {
+      const { discardProtectedLeftoverSandboxes } = await import('./sandbox');
+      discardProtectedLeftoverSandboxes(dir);
+    } catch (err) {
+      console.warn('[company-file] could not remove leftover sandbox copies:', (err as Error).message);
+    }
+  }
+  return closed;
 }
 
 /**
@@ -820,6 +842,13 @@ export async function saveCopyAs(
   target: string,
   opts: { companyName?: string | null; keepBackupHistory?: boolean } = {},
 ): Promise<{ path: string; bytes: number; encrypted: boolean }> {
+  // A protected file nobody has signed in to yet: its books are not here (or not readable) and
+  // there is no key to write a copy with — never an empty or plain-text copy.
+  if (sealedMode()) {
+    throw Object.assign(new Error('Sign in first: this company file is protected with passwords, and a copy is made from the open books.'), {
+      code: 'VALIDATION',
+    });
+  }
   const dataDir = resolveDataDir();
   const abs = path.resolve(target);
   if (!abs.toLowerCase().endsWith(format.COMPANY_FILE_EXT)) {

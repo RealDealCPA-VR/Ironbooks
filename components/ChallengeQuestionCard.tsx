@@ -8,7 +8,7 @@ import * as React from 'react';
 import { CheckCircle2, KeyRound } from 'lucide-react';
 import { Button, Card, Input, Label, Select, toast } from '@/components/ui';
 import { api } from '@/lib/client';
-import { CHALLENGE_QUESTIONS } from '@/lib/challengeQuestions';
+import { CHALLENGE_QUESTIONS, CHALLENGE_SLOT_RULE_TEXT, challengeAnswerOpensFile } from '@/lib/challengeQuestions';
 
 export function ChallengeQuestionCard({ prompt = false, onDone }: { prompt?: boolean; onDone?: () => void }) {
   const [current, setCurrent] = React.useState<string | null | undefined>(undefined);
@@ -33,12 +33,14 @@ export function ChallengeQuestionCard({ prompt = false, onDone }: { prompt?: boo
     e.preventDefault();
     setBusy(true);
     try {
-      await api.post('/api/auth/challenge', { currentPassword: password, question, answer });
+      const r = await api.post<{ opensFile?: boolean; note?: string }>('/api/auth/challenge', { currentPassword: password, question, answer });
       setCurrent(question);
       setEditing(false);
       setAnswer('');
       setPassword('');
-      toast('Challenge question saved.', 'success');
+      // A protected company file: say plainly when this answer is too short to open the file.
+      if (r && r.opensFile === false) toast(`Challenge question saved. ${r.note ?? CHALLENGE_SLOT_RULE_TEXT}`, 'info');
+      else toast('Challenge question saved.', 'success');
       onDone?.();
     } catch (err) {
       toast(err instanceof Error ? err.message : 'Could not save the challenge question.', 'danger');
@@ -85,6 +87,7 @@ export function ChallengeQuestionCard({ prompt = false, onDone }: { prompt?: boo
             <Label htmlFor="cq-answer">Answer</Label>
             <Input id="cq-answer" value={answer} onChange={(e) => setAnswer(e.target.value)} autoComplete="off" autoFocus={prompt} />
             <p className="mt-1 text-xs text-navy/50">Not case-sensitive. Write it down somewhere safe.</p>
+            <p className={`mt-1 text-xs ${answer.trim() && !challengeAnswerOpensFile(answer) ? 'text-amber-700' : 'text-navy/50'}`}>{CHALLENGE_SLOT_RULE_TEXT}</p>
           </div>
           <div>
             <Label htmlFor="cq-password">Your current password</Label>

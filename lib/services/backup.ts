@@ -88,6 +88,7 @@ import {
   PROTECTED_MARKER,
   cachedSealProtection,
   carryProtectionIntoRestore,
+  isMarkedProtected,
   protectionForDir,
   snapshotProtection,
   type SealProtection,
@@ -632,6 +633,15 @@ async function restoreBackupInto(dir: string, buffer: Buffer, opts: { credential
     } catch (err) {
       console.warn('[backup] the current protection could not be read before the restore:', (err as Error).message);
     }
+  }
+  // A protected company file whose protection could not be read (its database does not open):
+  // a backup made without passwords would leave the restored books unprotected yet marked
+  // protected — every later save refused. Refused here; a protected backup brings its own key.
+  if (!before && !opened.key && isMarkedProtected(dir)) {
+    throw new ServiceError(
+      'VALIDATION',
+      'This company file is protected with passwords, but its protection could not be read, so a backup made without passwords is not restored into it. Restore the backup as a new company file instead (File > Open or Restore Company), then protect that file.',
+    );
   }
 
   // (1b) Backup-before-destructive: snapshot the CURRENT data dir as a rotating
