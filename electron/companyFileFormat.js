@@ -17,9 +17,12 @@
 //
 //   ironbooks-company.json     the manifest, with `encryption` { sealId, keyCheck, lookupSalt, slots }
 //   sealed/000001, …           one encrypted entry per file (AES-256-GCM: nonce | data | tag; the
-//                              sealId and the entry's opaque and real names are the additional data)
+//                              sealId and the entry's opaque and real names are the additional data;
+//                              layout 2: under a subkey of the file key for this container alone)
 //   sealed/index               encrypted: the real names, sizes and checksums of the entries above,
-//                              and the save's private details (transaction-log head, who saved it)
+//                              the save's private details (transaction-log head, who saved it) and
+//                              a copy of the plain manifest's listing — checked when the file is
+//                              opened, so the plain fields can't be changed without the key
 //
 // Backups (.bka) of a protected file use the same layout with the backup manifest as the plain
 // first entry, so a backup is protected exactly like the file it was made from.
@@ -272,8 +275,44 @@ function prepareEntrySync(entry) {
 }
 
 /**
- * Sealing (encryption) of a container being written. `seal` = { fileKey, sealId, plain: Set of
- * entry names kept in plain text (the first manifest), info: private details for the index }.
+ * JSON with its object keys sorted (at every level): two listings compare equal exactly when they
+ * hold the same fields and values, whatever order they were written in.
+ */
+function canonicalJson(v) {
+  if (Array.isArray(v)) return `[${v.map(canonicalJson).join(',')}]`;
+  if (v && typeof v === 'object') {
+    return `{${Object.keys(v)
+      .filter((k) => v[k] !== undefined)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${canonicalJson(v[k])}`)
+      .join(',')}}`;
+  }
+  return JSON.stringify(v === undefined ? null : v);
+}
+
+/** A sealed manifest's encryption block without its key slots (those are rewritten in place). */
+function encryptionListing(enc) {
+  if (!enc || typeof enc !== 'object') return null;
+  const out = { ...enc };
+  delete out.slots;
+  return out;
+}
+
+/**
+ * What of a sealed container's plain manifest is bound into its encrypted index (and so checked
+ * once the file key is known): every plain field, the encryption details too — except the key
+ * slots, which open the key and are themselves authenticated.
+ */
+function listingOf(manifest) {
+  const out = { ...manifest };
+  if (out.encryption) out.encryption = encryptionListing(out.encryption);
+  return out;
+}
+
+/**
+ * Sealing (encryption) of a container being written. `seal` = { fileKey, sealId, v (layout),
+ * plain: Set of entry names kept in plain text (the first manifest), info: private details for
+ * the index, bound: { head, fields } — the plain manifest's listing, bound into the index }.
  * Each other entry is replaced by an encrypted one under an opaque name; directories are only
  * listed in the index; the index is the last entry.
  */
@@ -281,6 +320,7 @@ function makeSealer(seal) {
   if (!seal) return null;
   const index = [];
   const sealedAt = Date.now();
+  const key = fileCrypto.containerKey(seal.fileKey, seal.sealId, seal.v);
   let n = 0;
   return {
     /** The entry as written: itself (plain), an encrypted stand-in, or null (listed only). */
@@ -295,14 +335,17 @@ function makeSealer(seal) {
       }
       n++;
       const z = `${SEALED_PREFIX}${String(n).padStart(6, '0')}`;
-      const sealed = fileCrypto.sealBytes(seal.fileKey, e.compressed, fileCrypto.entryAad(seal.sealId, z, e.name));
+      const sealed = fileCrypto.sealBytes(key, e.compressed, fileCrypto.entryAad(seal.sealId, z, e.name));
       index.push({ z, name: e.name, m: e.method, size: e.size, crc: e.crc, t: Math.round(e.mtimeMs || 0) });
       return { name: z, nameBuf: Buffer.from(z, 'utf8'), method: 0, crc: crc32(sealed), size: sealed.length, compressed: sealed, mtimeMs: sealedAt };
     },
     /** The encrypted index, the container's last entry. */
     finish() {
-      const body = Buffer.from(JSON.stringify({ v: 1, sealId: seal.sealId, entries: index, info: seal.info || {} }), 'utf8');
-      const sealed = fileCrypto.sealBytes(seal.fileKey, body, fileCrypto.entryAad(seal.sealId, SEALED_INDEX_ENTRY, SEALED_INDEX_ENTRY));
+      const body = Buffer.from(
+        JSON.stringify({ v: seal.v === 1 ? 1 : 2, sealId: seal.sealId, entries: index, info: seal.info || {}, ...(seal.v === 1 || !seal.bound ? {} : { plain: seal.bound }) }),
+        'utf8',
+      );
+      const sealed = fileCrypto.sealBytes(key, body, fileCrypto.entryAad(seal.sealId, SEALED_INDEX_ENTRY, SEALED_INDEX_ENTRY));
       return {
         name: SEALED_INDEX_ENTRY,
         nameBuf: Buffer.from(SEALED_INDEX_ENTRY, 'utf8'),
@@ -538,7 +581,9 @@ function removeStaleSaves(filePath, now = Date.now()) {
  */
 function encryptionBlock(protection, sealId) {
   return {
-    v: 1,
+    // Layout 2: entries under a per-container subkey, the listing bound into the index. (Tests
+    // write layout 1, the first protected files' layout, with protection.sealV = 1.)
+    v: protection.sealV === 1 ? 1 : fileCrypto.SEAL_VERSION,
     cipher: fileCrypto.CIPHER,
     kdf: 'scrypt',
     sealId,
@@ -591,7 +636,16 @@ async function writeCompanyFile(filePath, { manifest, backupManifest, entries, c
       else info[k] = v;
     }
     plainManifest = { schema: COMPANY_FILE_SCHEMA, ...visible, formatVersion: COMPANY_FILE_FORMAT_VERSION, encryption: encryptionBlock(prot, sealId) };
-    seal = { fileKey: prot.fileKey, sealId, plain: new Set([COMPANY_MANIFEST_ENTRY]), info };
+    // The listing (save ids, training flag, layout, …) is bound into the encrypted index: changed
+    // without the key, the file is refused as tampered when it is opened.
+    seal = {
+      fileKey: prot.fileKey,
+      sealId,
+      v: plainManifest.encryption.v,
+      plain: new Set([COMPANY_MANIFEST_ENTRY]),
+      info,
+      bound: { head: COMPANY_MANIFEST_ENTRY, fields: listingOf(plainManifest) },
+    };
   }
   const head = [{ name: COMPANY_MANIFEST_ENTRY, data: Buffer.from(JSON.stringify(plainManifest, null, 2), 'utf8'), store: true }];
   if (backupManifest) {
@@ -638,7 +692,16 @@ function buildBackupArchive({ backupManifest, entries, protection }) {
   const plain = { ...visible, formatVersion: BACKUP_FORMAT_VERSION, encryption: encryptionBlock(prot, sealId) };
   return zipBufferSync(
     [{ name: BACKUP_MANIFEST_ENTRY, data: Buffer.from(JSON.stringify(plain, null, 2), 'utf8'), store: true }, ...entries.filter((e) => e.name !== BACKUP_MANIFEST_ENTRY)],
-    { seal: { fileKey: prot.fileKey, sealId, plain: new Set([BACKUP_MANIFEST_ENTRY]), info } },
+    {
+      seal: {
+        fileKey: prot.fileKey,
+        sealId,
+        v: plain.encryption.v,
+        plain: new Set([BACKUP_MANIFEST_ENTRY]),
+        info,
+        bound: { head: BACKUP_MANIFEST_ENTRY, fields: listingOf(plain) },
+      },
+    },
   );
 }
 
@@ -1028,31 +1091,77 @@ function parseIndex(plain, sealId) {
   return index;
 }
 
+/** The key a sealed container's entries were encrypted with (its layout says how; fileCrypto.containerKey). */
+function entriesKeyOf(manifest, fileKey) {
+  const v = manifest.encryption.v;
+  if (typeof v === 'number' && v > fileCrypto.SEAL_VERSION) throw newerFormatError('file');
+  return fileCrypto.containerKey(fileKey, sealIdOf(manifest), v);
+}
+
+const LISTING_WHAT = 'The details of the company file (its name, save or layout)';
+
+/**
+ * The plain manifest of a sealed container (`headName`: the company or the backup manifest) must
+ * be the one its index was written with — checked as soon as the file key is known, before
+ * anything is used or written. Changed without the key (a save id, the training flag, the layout,
+ * the company name), the file is refused as tampered. The key slots are exempt: they are
+ * rewritten in place and are authenticated themselves. Layout 1 (the first protected files) did
+ * not bind its listing.
+ */
+function checkListingBinding(manifest, index, headName) {
+  const bound = index && index.plain;
+  if (!bound || typeof bound !== 'object') {
+    if (manifest.encryption && manifest.encryption.v !== 1 && manifest.encryption.v !== undefined) throw new fileCrypto.TamperedError(LISTING_WHAT);
+    return;
+  }
+  if (bound.head === headName) {
+    if (canonicalJson(listingOf(manifest)) !== canonicalJson(bound.fields)) throw new fileCrypto.TamperedError(LISTING_WHAT);
+    return;
+  }
+  // A company file made from a protected backup without decrypting it (sealedBackupAsCompanyFile)
+  // carries the backup's bound listing: its own new listing is checked where it can be (the same
+  // encryption details and company name, the backup's layout, never a training file) and is
+  // rewritten — and bound — by its first save.
+  const fields = bound.fields && typeof bound.fields === 'object' ? bound.fields : {};
+  if (headName !== COMPANY_MANIFEST_ENTRY || bound.head !== BACKUP_MANIFEST_ENTRY) throw new fileCrypto.TamperedError(LISTING_WHAT);
+  const ok =
+    canonicalJson(encryptionListing(manifest.encryption)) === canonicalJson(fields.encryption) &&
+    manifest.training !== true &&
+    (typeof fields.companyName !== 'string' || !fields.companyName || manifest.companyName === fields.companyName) &&
+    (typeof fields.dbSchemaAt !== 'number' || !manifest.dbSchema || Number(manifest.dbSchema.lastMigrationAt) === fields.dbSchemaAt);
+  if (!ok) throw new fileCrypto.TamperedError(LISTING_WHAT);
+}
+
 /** The decrypted index of a sealed container ({ entries, info }), through an async reader. */
-async function readSealedIndex(reader, list, manifest, fileKey) {
+async function readSealedIndex(reader, list, manifest, fileKey, headName) {
   const sealId = sealIdOf(manifest);
   const e = list.find((x) => x.name === SEALED_INDEX_ENTRY);
   if (!e) throw new NotACompanyFileError('its encrypted contents are missing');
   const sealed = await inflateBytes(await readEntryBytes(reader, e), e);
-  const plain = fileCrypto.openBytes(fileKey, sealed, fileCrypto.entryAad(sealId, SEALED_INDEX_ENTRY, SEALED_INDEX_ENTRY), 'The list of what is in the company file');
-  return parseIndex(plain, sealId);
+  const plain = fileCrypto.openBytes(entriesKeyOf(manifest, fileKey), sealed, fileCrypto.entryAad(sealId, SEALED_INDEX_ENTRY, SEALED_INDEX_ENTRY), 'The list of what is in the company file');
+  const index = parseIndex(plain, sealId);
+  checkListingBinding(manifest, index, headName);
+  return index;
 }
 
-function readSealedIndexSync(reader, list, manifest, fileKey) {
+function readSealedIndexSync(reader, list, manifest, fileKey, headName) {
   const sealId = sealIdOf(manifest);
   const e = list.find((x) => x.name === SEALED_INDEX_ENTRY);
   if (!e) throw new NotACompanyFileError('its encrypted contents are missing');
   const sealed = inflateBytesSync(readEntryBytesSync(reader, e), e);
-  const plain = fileCrypto.openBytes(fileKey, sealed, fileCrypto.entryAad(sealId, SEALED_INDEX_ENTRY, SEALED_INDEX_ENTRY), 'The list of what is in the company file');
-  return parseIndex(plain, sealId);
+  const plain = fileCrypto.openBytes(entriesKeyOf(manifest, fileKey), sealed, fileCrypto.entryAad(sealId, SEALED_INDEX_ENTRY, SEALED_INDEX_ENTRY), 'The list of what is in the company file');
+  const index = parseIndex(plain, sealId);
+  checkListingBinding(manifest, index, headName);
+  return index;
 }
 
 /**
  * Turn one index row's encrypted entry back into its verified bytes: authenticate and decrypt the
  * whole entry (nothing is used before its tag checks out), then inflate and check its CRC.
+ * `entriesKey` is the container's key (entriesKeyOf).
  */
-function unsealRow(sealedBytes, row, sealId, fileKey, inflateSync) {
-  const compressed = fileCrypto.openBytes(fileKey, sealedBytes, fileCrypto.entryAad(sealId, row.z, row.name), `${row.name} in the company file`);
+function unsealRow(sealedBytes, row, sealId, entriesKey, inflateSync) {
+  const compressed = fileCrypto.openBytes(entriesKey, sealedBytes, fileCrypto.entryAad(sealId, row.z, row.name), `${row.name} in the company file`);
   const e = { name: row.name, method: row.m, size: row.size, crc: row.crc };
   return inflateSync ? inflateBytesSync(compressed, e) : inflateBytes(compressed, e);
 }
@@ -1112,14 +1221,15 @@ async function extractInto(reader, files, root, notEmptyMessage, decode) {
   }
 }
 
-/** extractInto for a sealed container. */
-async function extractSealedInto(reader, list, manifest, fileKey, root, notEmptyMessage) {
+/** extractInto for a sealed container (`headName`: its plain manifest entry). */
+async function extractSealedInto(reader, list, manifest, fileKey, root, notEmptyMessage, headName) {
   const sealId = sealIdOf(manifest);
-  const index = await readSealedIndex(reader, list, manifest, fileKey);
+  const index = await readSealedIndex(reader, list, manifest, fileKey, headName);
   const files = sealedPlan(index, list, root);
+  const key = entriesKeyOf(manifest, fileKey);
   await extractInto(reader, files, root, notEmptyMessage, async (f) => {
     const sealed = await inflateBytes(await readEntryBytes(reader, f.e), f.e);
-    return unsealRow(sealed, f.row, sealId, fileKey, false);
+    return unsealRow(sealed, f.row, sealId, key, false);
   });
   return index;
 }
@@ -1155,11 +1265,34 @@ async function extractCompanyFile(filePath, destDir, { fileKey } = {}) {
     const root = path.resolve(destDir);
     if (isSealedManifest(manifest)) {
       if (!fileKey) throw new SealedFileError();
-      const index = await extractSealedInto(reader, list, manifest, fileKey, root, 'The working folder is not empty');
+      const index = await extractSealedInto(reader, list, manifest, fileKey, root, 'The working folder is not empty', COMPANY_MANIFEST_ENTRY);
       return { ...(index.info || {}), ...manifest };
     }
     await extractInto(reader, extractionPlan(list, root), root, 'The working folder is not empty');
     return manifest;
+  } finally {
+    await reader.close();
+  }
+}
+
+/**
+ * Check a sealed company file with its key without extracting it: its index opens, and its plain
+ * listing (save ids, training flag, layout, name) is the one the index was written with. Used when
+ * a sign-in reuses the working copy already on this computer (the open plan was worked out from
+ * the plain listing before anyone signed in). Throws TamperedError; returns the index's private
+ * details. A file sealed with another key (keyCheck) is not this check's business: returns null.
+ */
+async function verifySealedCompanyFile(filePath, fileKey) {
+  const reader = await openFileReader(filePath);
+  try {
+    const list = await readDirectory(reader);
+    const manifestEntry = list.find((e) => e.name === COMPANY_MANIFEST_ENTRY);
+    if (!manifestEntry) throw new NotACompanyFileError('no company manifest');
+    const manifest = parseManifest(await inflateBytes(await readEntryBytes(reader, manifestEntry), manifestEntry));
+    if (!manifest || !isSealedManifest(manifest)) return null;
+    if (manifest.encryption.keyCheck && manifest.encryption.keyCheck !== fileCrypto.keyCheckOf(fileKey)) return null;
+    const index = await readSealedIndex(reader, list, manifest, fileKey, COMPANY_MANIFEST_ENTRY);
+    return index.info || {};
   } finally {
     await reader.close();
   }
@@ -1201,7 +1334,7 @@ async function extractBackupArchive(filePath, destDir, { knownSchemaAt, fileKey 
       if (head.name === BACKUP_MANIFEST_ENTRY) checkBackupManifest(head.manifest, knownSchemaAt);
       else if (Number.isFinite(knownSchemaAt) && savedByNewer(head.manifest, knownSchemaAt)) throw newerFormatError('backup');
       if (!fileKey) throw new SealedFileError();
-      const index = await readSealedIndex(reader, list, head.manifest, fileKey);
+      const index = await readSealedIndex(reader, list, head.manifest, fileKey, head.name);
       // A sealed company file restored as a backup: its own backup manifest is inside.
       const innerRow = index.entries.find((r) => r && r.name === BACKUP_MANIFEST_ENTRY && r.z);
       let manifest = head.name === BACKUP_MANIFEST_ENTRY ? { ...(index.info || {}), ...head.manifest } : null;
@@ -1210,7 +1343,7 @@ async function extractBackupArchive(filePath, destDir, { knownSchemaAt, fileKey 
         if (e) {
           const sealed = await inflateBytes(await readEntryBytes(reader, e), e);
           try {
-            manifest = JSON.parse((await unsealRow(sealed, innerRow, sealIdOf(head.manifest), fileKey, false)).toString('utf8'));
+            manifest = JSON.parse((await unsealRow(sealed, innerRow, sealIdOf(head.manifest), entriesKeyOf(head.manifest, fileKey), false)).toString('utf8'));
           } catch (err) {
             if (err && err.code === 'TAMPERED') throw err;
             throw new NotACompanyFileError('the backup information in it is unreadable');
@@ -1218,7 +1351,7 @@ async function extractBackupArchive(filePath, destDir, { knownSchemaAt, fileKey 
           checkBackupManifest(manifest, knownSchemaAt);
         }
       }
-      await extractSealedInto(reader, list, head.manifest, fileKey, root, 'The folder is not empty');
+      await extractSealedInto(reader, list, head.manifest, fileKey, root, 'The folder is not empty', head.name);
       return {
         companyName: (manifest && manifest.companyName) || head.manifest.companyName || null,
         createdAt: (manifest && manifest.createdAt) || head.manifest.savedAt || null,
@@ -1289,7 +1422,8 @@ function unsealArchiveSync(buffer, fileKey) {
   const head = readArchiveHead(buffer);
   if (!head || !head.manifest || !isSealedManifest(head.manifest)) throw new NotACompanyFileError('it is not a protected Ironbooks file');
   const sealId = sealIdOf(head.manifest);
-  const index = readSealedIndexSync(reader, list, head.manifest, fileKey);
+  const index = readSealedIndexSync(reader, list, head.manifest, fileKey, head.name);
+  const key = entriesKeyOf(head.manifest, fileKey);
   const byZ = new Map(list.map((e) => [e.name, e]));
   const entries = [];
   for (const row of index.entries) {
@@ -1303,7 +1437,7 @@ function unsealArchiveSync(buffer, fileKey) {
     const e = byZ.get(row.z);
     if (!e) throw new NotACompanyFileError(`${row.name} is missing from it — the file is damaged`);
     const sealed = inflateBytesSync(readEntryBytesSync(reader, e), e);
-    entries.push({ name, data: unsealRow(sealed, row, sealId, fileKey, true) });
+    entries.push({ name, data: unsealRow(sealed, row, sealId, key, true) });
   }
   return { headName: head.name, head: head.manifest, info: index.info || {}, entries };
 }
@@ -1383,6 +1517,7 @@ module.exports = {
   isSealedManifest,
   isCompanyFile,
   extractCompanyFile,
+  verifySealedCompanyFile,
   extractBackupArchive,
   unsealArchiveSync,
   sealedBackupAsCompanyFile,

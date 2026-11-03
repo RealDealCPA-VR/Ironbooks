@@ -13,8 +13,17 @@
 //   recovery   one printable recovery key, shown once — the way back in when every password is lost
 //
 // A slot is found by a lookup tag (an HMAC of the user name with the file's random lookup salt),
-// so the manifest never lists user names. The app server keeps the file key in memory only
+// so the manifest does not list user names (a guessed user name can still be confirmed against a
+// copy of the file, by computing its tag). The app server keeps the file key in memory only
 // (lib/services/fileProtection.ts): never in a file, the environment, a log or a URL.
+//
+// Slots made by this version (v2) wrap the file key to a per-slot X25519 PUBLIC key; the slot's
+// private key is what the secret's scrypt key encrypts. So the app can wrap a NEW file key for
+// every remaining slot without knowing anyone's password (rotateFileKey: a removed user, a changed
+// password, a new recovery key), while the secret stays the only way to open a slot. A MAC keyed
+// from the file key binds each slot's public key, so a slot pasted into a file is never re-wrapped
+// to. Entries are encrypted with a per-container subkey (HKDF of the file key and the sealId), so
+// one long-lived file key never approaches the GCM random-nonce limit.
 //
 // Pure Node (crypto): used by the desktop shell and the app server, and unit-tested from vitest
 // (test/fileCrypto.test.ts).
@@ -35,15 +44,34 @@ const SLOT_KINDS = new Set(['password', 'challenge', 'recovery']);
  * with, so a later version can raise them; a sign-in re-wraps a slot made with weaker ones.
  */
 const DEFAULT_KDF = Object.freeze({ name: 'scrypt', N: 65536, r: 8, p: 1 });
+/**
+ * Challenge answers are short, lower-cased words to a known question ("first pet"): their slots
+ * cost twice the memory and time to try (N=2^17, 128 MiB), on top of the minimum answer length a
+ * challenge slot needs (lib/challengeQuestions.ts MIN_CHALLENGE_SLOT_ANSWER).
+ */
+const CHALLENGE_KDF = Object.freeze({ name: 'scrypt', N: 131072, r: 8, p: 1 });
 /** Unit tests only (NODE_ENV=test and BKA_TEST_FAST_KDF=1): the same code with a cheap cost. */
 const TEST_KDF = Object.freeze({ name: 'scrypt', N: 1024, r: 8, p: 1 });
-/** Never derive with absurd parameters from a tampered manifest (a memory / CPU bomb). */
-const MAX_N = 1 << 20;
-const MAX_R = 32;
-const MAX_P = 16;
+/**
+ * Never derive with absurd parameters from a tampered manifest (a memory / CPU bomb): at most
+ * N=2^18, r=16, p=4 — never more than about half a GiB and a few seconds per try.
+ */
+const MAX_N = 1 << 18;
+const MAX_R = 16;
+const MAX_P = 4;
+
+function fastKdfForTests() {
+  return process.env.NODE_ENV === 'test' && process.env.BKA_TEST_FAST_KDF === '1';
+}
 
 function currentKdf() {
-  return process.env.NODE_ENV === 'test' && process.env.BKA_TEST_FAST_KDF === '1' ? TEST_KDF : DEFAULT_KDF;
+  return fastKdfForTests() ? TEST_KDF : DEFAULT_KDF;
+}
+
+/** The cost of new slots of one kind (a challenge slot costs more; see CHALLENGE_KDF). */
+function kdfFor(kind) {
+  if (fastKdfForTests()) return TEST_KDF;
+  return kind === 'challenge' ? CHALLENGE_KDF : DEFAULT_KDF;
 }
 
 function b64(buf) {
@@ -65,8 +93,8 @@ function validKdf(kdf) {
 }
 
 /** True when a slot was made with at least today's cost (otherwise a sign-in re-wraps it). */
-function kdfIsCurrent(kdf) {
-  const cur = currentKdf();
+function kdfIsCurrent(kdf, kind = 'password') {
+  const cur = kdfFor(kind);
   return validKdf(kdf) && kdf.N >= cur.N && kdf.r >= cur.r && kdf.p >= cur.p;
 }
 
@@ -85,6 +113,57 @@ function deriveKek(secret, salt, kdf) {
 
 function slotAad(kind, salt) {
   return Buffer.from(`ironbooks-slot/v1\n${kind}\n${salt}`, 'utf8');
+}
+
+/** v2: the private key's additional data binds the kind, the salt and the public key. */
+function slotSkAad(kind, salt, pub) {
+  return Buffer.from(`ironbooks-slot-sk/v2\n${kind}\n${salt}\n${pub}`, 'utf8');
+}
+
+/** v2: the wrapped file key's additional data binds the kind, the public key and the ephemeral one. */
+function slotWrapAad(kind, pub, epk) {
+  return Buffer.from(`ironbooks-slot-wrap/v2\n${kind}\n${pub}\n${epk}`, 'utf8');
+}
+
+function hkdf(ikm, salt, info) {
+  return Buffer.from(crypto.hkdfSync('sha256', ikm, salt, Buffer.from(info, 'utf8'), KEY_BYTES));
+}
+
+function x25519Public(x) {
+  return crypto.createPublicKey({ key: { kty: 'OKP', crv: 'X25519', x }, format: 'jwk' });
+}
+
+/** The key that wraps the file key for a slot's public key (ECDH with an ephemeral key, then HKDF). */
+function wrapKey(shared, pub, epk, kind) {
+  return hkdf(shared, Buffer.from(`${epk}\n${pub}`, 'utf8'), `ironbooks-slot-wrap/v2\n${kind}`);
+}
+
+/** Wrap `fileKey` to a slot's public key `pub` (base64url X25519): { epk, nonce, wrapped }. */
+function wrapToPublic(fileKey, pub, kind) {
+  const eph = crypto.generateKeyPairSync('x25519');
+  const epk = eph.publicKey.export({ format: 'jwk' }).x;
+  const shared = crypto.diffieHellman({ privateKey: eph.privateKey, publicKey: x25519Public(pub) });
+  const nonce = crypto.randomBytes(NONCE_BYTES);
+  const c = crypto.createCipheriv(CIPHER, wrapKey(shared, pub, epk, kind), nonce);
+  c.setAAD(slotWrapAad(kind, pub, epk));
+  return { epk, nonce: b64(nonce), wrapped: b64(Buffer.concat([c.update(fileKey), c.final(), c.getAuthTag()])) };
+}
+
+/**
+ * The MAC that binds a v2 slot's public key to the file key it was made for: only slots the app
+ * made (or re-wrapped) for this file are ever re-wrapped to a new file key.
+ */
+function slotMac(fileKey, slot) {
+  const k = hkdf(fileKey, Buffer.alloc(0), 'ironbooks-slot-mac/v2');
+  return crypto.createHmac('sha256', k).update(`v2\n${slot.kind}\n${slot.pub}\n${slot.salt}\n${slot.sk}`).digest('base64url').slice(0, 32);
+}
+
+/** True when `slot` is a v2 slot whose public key was bound to `fileKey` (slotMac). */
+function slotMacOk(fileKey, slot) {
+  if (!slot || slot.v !== 2 || typeof slot.mac !== 'string' || !Buffer.isBuffer(fileKey)) return false;
+  const want = Buffer.from(slotMac(fileKey, slot));
+  const got = Buffer.from(slot.mac);
+  return want.length === got.length && crypto.timingSafeEqual(want, got);
 }
 
 /** A fresh random file key (32 bytes). */
@@ -125,28 +204,56 @@ function keyCheckOf(fileKey) {
  * Wrap `fileKey` into a new slot for `secret` (a password, a normalized challenge answer, or a
  * normalized recovery key). `tag` (lookupTag) names whose slot it is; `question` is shown before
  * the challenge answer is asked (it comes from a fixed list, lib/challengeQuestions.ts).
+ *
+ * The slot (v2) has its own X25519 key pair: the private key is encrypted with the secret's scrypt
+ * key and the file key is wrapped to the public key — so a NEW file key can be wrapped for this
+ * slot later without the secret (rewrapSlot), while only the secret opens it.
  * @param {{ kind: string, secret: string, fileKey: Buffer, tag?: string | null, question?: string | null, kdf?: { name: string, N: number, r: number, p: number } }} opts
  * @returns {Promise<Record<string, any>>}
  */
-async function makeSlot({ kind, secret, fileKey, tag = null, question = null, kdf = currentKdf() }) {
+async function makeSlot({ kind, secret, fileKey, tag = null, question = null, kdf = kdfFor(kind) }) {
   if (!SLOT_KINDS.has(kind)) throw new Error(`unknown key slot kind ${kind}`);
   if (!Buffer.isBuffer(fileKey) || fileKey.length !== KEY_BYTES) throw new Error('invalid file key');
   if (typeof secret !== 'string' || !secret) throw new Error('a key slot needs a secret');
   const salt = b64(crypto.randomBytes(SALT_BYTES));
   const kek = await deriveKek(secret, salt, kdf);
-  const nonce = crypto.randomBytes(NONCE_BYTES);
-  const c = crypto.createCipheriv(CIPHER, kek, nonce);
-  c.setAAD(slotAad(kind, salt));
-  const wrapped = Buffer.concat([c.update(fileKey), c.final(), c.getAuthTag()]);
-  return {
+  const pair = crypto.generateKeyPairSync('x25519');
+  const jwk = pair.privateKey.export({ format: 'jwk' });
+  const pub = jwk.x;
+  const skNonce = crypto.randomBytes(NONCE_BYTES);
+  const c = crypto.createCipheriv(CIPHER, kek, skNonce);
+  c.setAAD(slotSkAad(kind, salt, pub));
+  const sk = b64(Buffer.concat([skNonce, c.update(unb64(jwk.d)), c.final(), c.getAuthTag()]));
+  const slot = {
+    v: 2,
     kind,
     ...(tag ? { tag } : {}),
     ...(question ? { question } : {}),
     kdf: { name: 'scrypt', N: kdf.N, r: kdf.r, p: kdf.p },
     salt,
-    nonce: b64(nonce),
-    wrapped: b64(wrapped),
+    pub,
+    sk,
+    ...wrapToPublic(fileKey, pub, kind),
   };
+  return { ...slot, mac: slotMac(fileKey, slot) };
+}
+
+/**
+ * The same v2 slot wrapping `newFileKey` instead (a key rotation, or a copy given its own key) —
+ * no secret needed. Only for a slot whose public key `currentFileKey` vouches for (slotMacOk);
+ * null otherwise (a v1 slot, or one that was not made for this file): its owner signs in once.
+ */
+function rewrapSlot(slot, currentFileKey, newFileKey) {
+  if (!wellFormedSlot(slot) || !slotMacOk(currentFileKey, slot)) return null;
+  if (!Buffer.isBuffer(newFileKey) || newFileKey.length !== KEY_BYTES) throw new Error('invalid file key');
+  const next = { ...slot, ...wrapToPublic(newFileKey, slot.pub, slot.kind) };
+  delete next.mac;
+  return { ...next, mac: slotMac(newFileKey, next) };
+}
+
+/** True when a new file key can be wrapped for the slot without its secret (v2: it has a public key). */
+function isRewrappable(slot) {
+  return Boolean(slot && slot.v === 2 && typeof slot.pub === 'string');
 }
 
 /** The same slot with a new lookup tag (the user name changed; the secret did not). */
@@ -159,7 +266,13 @@ function wellFormedSlot(slot) {
   const salt = unb64(slot.salt);
   const nonce = unb64(slot.nonce);
   const wrapped = unb64(slot.wrapped);
-  return Boolean(salt && salt.length >= 8 && nonce && nonce.length === NONCE_BYTES && wrapped && wrapped.length === KEY_BYTES + TAG_BYTES);
+  const base = Boolean(salt && salt.length >= 8 && nonce && nonce.length === NONCE_BYTES && wrapped && wrapped.length === KEY_BYTES + TAG_BYTES);
+  if (!base || slot.v === undefined || slot.v === 1) return base;
+  if (slot.v !== 2) return false;
+  const pub = unb64(slot.pub);
+  const epk = unb64(slot.epk);
+  const sk = unb64(slot.sk);
+  return Boolean(pub && pub.length === 32 && epk && epk.length === 32 && sk && sk.length === NONCE_BYTES + 32 + TAG_BYTES);
 }
 
 /**
@@ -179,8 +292,22 @@ async function openSlot(slot, secret) {
   }
   try {
     const wrapped = unb64(slot.wrapped);
-    const d = crypto.createDecipheriv(CIPHER, kek, unb64(slot.nonce));
-    d.setAAD(slotAad(slot.kind, slot.salt));
+    let unwrapKey = kek;
+    let aad = slotAad(slot.kind, slot.salt);
+    if (slot.v === 2) {
+      // The slot's private key (the secret's key opens it), then ECDH with the ephemeral key.
+      const sk = unb64(slot.sk);
+      const ds = crypto.createDecipheriv(CIPHER, kek, sk.subarray(0, NONCE_BYTES));
+      ds.setAAD(slotSkAad(slot.kind, slot.salt, slot.pub));
+      ds.setAuthTag(sk.subarray(sk.length - TAG_BYTES));
+      const priv = Buffer.concat([ds.update(sk.subarray(NONCE_BYTES, sk.length - TAG_BYTES)), ds.final()]);
+      const privateKey = crypto.createPrivateKey({ key: { kty: 'OKP', crv: 'X25519', x: slot.pub, d: b64(priv) }, format: 'jwk' });
+      const shared = crypto.diffieHellman({ privateKey, publicKey: x25519Public(slot.epk) });
+      unwrapKey = wrapKey(shared, slot.pub, slot.epk, slot.kind);
+      aad = slotWrapAad(slot.kind, slot.pub, slot.epk);
+    }
+    const d = crypto.createDecipheriv(CIPHER, unwrapKey, unb64(slot.nonce));
+    d.setAAD(aad);
     d.setAuthTag(wrapped.subarray(KEY_BYTES));
     const key = Buffer.concat([d.update(wrapped.subarray(0, KEY_BYTES)), d.final()]);
     return key.length === KEY_BYTES ? key : null;
@@ -197,6 +324,7 @@ async function openSlot(slot, secret) {
  * @returns {Promise<null>}
  */
 async function burnKdf(secret, kdf = currentKdf()) {
+  if (typeof kdf === 'string') kdf = kdfFor(kdf);
   try {
     await deriveKek(String(secret || 'x'), crypto.randomBytes(SALT_BYTES), kdf);
   } catch {
@@ -228,7 +356,7 @@ function findSlots(encryption, kind, tag = null) {
 async function unlockWith(encryption, { kind, login = null, secret }) {
   const tag = kind === 'recovery' ? null : lookupTag(encryption && encryption.lookupSalt, login || '');
   const candidates = findSlots(encryption, kind, tag).filter(wellFormedSlot);
-  if (!candidates.length) return burnKdf(secret);
+  if (!candidates.length) return burnKdf(secret, kdfFor(kind));
   for (const slot of candidates) {
     const key = await openSlot(slot, secret);
     if (key && (!encryption.keyCheck || keyCheckOf(key) === encryption.keyCheck)) return key;
@@ -292,6 +420,21 @@ function formatRecoveryKey(normalized) {
 /** Additional data of one encrypted entry: the container (sealId) and both of its names. */
 function entryAad(sealId, zipName, name) {
   return Buffer.from(`ironbooks-sealed/v1\n${sealId}\n${zipName}\n${name}`, 'utf8');
+}
+
+/** The newest layout of a sealed container (`encryption.v`): 2 = per-container subkey + bound listing. */
+const SEAL_VERSION = 2;
+
+/**
+ * The key a sealed container's entries and index are encrypted with. Layout 2 (this version): a
+ * subkey of the file key for this container alone (HKDF-SHA256 with its sealId), so the random
+ * 96-bit GCM nonces of one container never share a key with any other save, backup or copy.
+ * Layout 1 (the first protected files): the file key itself.
+ */
+function containerKey(fileKey, sealId, v) {
+  if (v === 1 || v === undefined || v === null) return fileKey;
+  if (v !== 2) throw new TamperedError('The encryption details of the file');
+  return hkdf(fileKey, Buffer.from(String(sealId), 'utf8'), 'ironbooks-entries/v2');
 }
 
 class TamperedError extends Error {
@@ -421,7 +564,13 @@ module.exports = {
   CIPHER,
   KEY_BYTES,
   DEFAULT_KDF,
+  CHALLENGE_KDF,
+  MAX_N,
+  MAX_R,
+  MAX_P,
+  SEAL_VERSION,
   currentKdf,
+  kdfFor,
   kdfIsCurrent,
   validKdf,
   generateFileKey,
@@ -430,6 +579,9 @@ module.exports = {
   lookupTag,
   keyCheckOf,
   makeSlot,
+  rewrapSlot,
+  isRewrappable,
+  slotMacOk,
   retagSlot,
   wellFormedSlot,
   openSlot,
@@ -440,6 +592,7 @@ module.exports = {
   normalizeRecoveryKey,
   formatRecoveryKey,
   entryAad,
+  containerKey,
   sealBytes,
   openBytes,
   newSealId,
