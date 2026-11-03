@@ -6,7 +6,7 @@
 import { describe, expect, it } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
-import { REPORT_CATALOG, REPORT_GROUPS } from './catalog';
+import { REPORT_CATALOG, REPORT_GROUPS, listedReports, reportFeatureOff } from './catalog';
 import { REPORT_CENTER_SECTIONS } from '@/app/reports/_components/reportCenterSections';
 
 const REPORTS = path.join(process.cwd(), 'app', 'reports');
@@ -45,7 +45,26 @@ describe('Report Center', () => {
       expect(REPORT_GROUPS, e.key).toContain(e.group);
       expect(e.hidden, e.key).toBeFalsy();
     }
-    const src = fs.readFileSync(path.join(REPORTS, 'page.tsx'), 'utf8');
-    expect(src).toMatch(/REPORT_CATALOG\.filter\(\(r\) => !r\.hidden && canDoActivity\(me, reportActivity\(r\), 'view'\) && !hidden\(r\.key\)\)/);
+    // Everything is listed for someone who may view every report, with every feature on.
+    expect(listedReports(() => true).map((r) => r.key)).toEqual(REPORT_CATALOG.map((r) => r.key));
+  });
+
+  it('lists a report by its own activity (not the whole area) and drops reports of a feature that is off', () => {
+    const keys = (canView: (a: string) => boolean, off?: Parameters<typeof listedReports>[1]) => listedReports(canView, off).map((r) => r.key);
+    const companyOnly = keys((a) => a === 'reports_financial.company');
+    expect(companyOnly).toContain('profit-loss');
+    expect(companyOnly).toContain('balance-sheet');
+    expect(companyOnly).not.toContain('trial-balance'); // Accountant & Taxes
+    expect(companyOnly).not.toContain('ar-aging-summary'); // another area
+    const arOnly = keys((a) => a === 'reports_sales.receivables');
+    expect(arOnly).toContain('ar-aging-summary');
+    expect(arOnly).not.toContain('sales-by-customer-summary');
+
+    const noInventory = { inventoryEnabled: false } as Parameters<typeof reportFeatureOff>[1];
+    const all = keys(() => true, (r) => reportFeatureOff(r, noInventory));
+    expect(all).not.toContain('inventory-valuation-summary');
+    expect(all).toContain('profit-loss');
+    // The page renders exactly this list.
+    expect(fs.readFileSync(path.join(REPORTS, 'page.tsx'), 'utf8')).toContain('listedReports(');
   });
 });

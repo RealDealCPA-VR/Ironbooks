@@ -12,7 +12,7 @@
  */
 import Link from 'next/link';
 import { BarChart2 } from 'lucide-react';
-import { REPORT_CATALOG, REPORT_GROUPS, reportActivity } from '@/lib/reports/catalog';
+import { REPORT_CATALOG, REPORT_GROUPS, listedReports, reportFeatureOff } from '@/lib/reports/catalog';
 import { canDoActivity, useMe } from '@/lib/usePermissions';
 import { usePreferences } from '@/lib/usePreferences';
 import { featureHiddenPaths } from '@/lib/preferences';
@@ -60,7 +60,7 @@ function SectionHeading({ children }: { children: React.ReactNode }) {
 
 function AllStandardReports({ hidden }: { hidden: (key: string) => boolean }) {
   const { me } = useMe();
-  const visible = REPORT_CATALOG.filter((r) => !r.hidden && canDoActivity(me, reportActivity(r), 'view') && !hidden(r.key));
+  const visible = listedReports((activity) => canDoActivity(me, activity, 'view'), (r) => hidden(r.key));
   return (
     <>
       <SectionHeading>All reports</SectionHeading>
@@ -95,7 +95,7 @@ export default function ReportsPage() {
   const hiddenPaths = featureHiddenPaths(prefs.company);
   const offFeature = (key: string) => {
     const e = REPORT_CATALOG.find((r) => r.key === key);
-    return !!e?.feature && prefs.company[e.feature] === false;
+    return !!e && reportFeatureOff(e, prefs.company);
   };
   const cardHidden = (href: string) => {
     if (hiddenPaths.has(href)) return true;

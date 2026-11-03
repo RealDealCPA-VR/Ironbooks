@@ -24,14 +24,16 @@ import { closeDb, getDb, type DB } from '@/lib/db';
 import { accounts, bankAccounts, bankTransactions, users } from '@/lib/db/schema';
 import type { StdReport } from '@/lib/reports/types';
 import type { ServiceContext } from './_base';
-import { createCompany } from './company';
+import { createCompany, setClosingDate } from './company';
 import { createCustomer } from './customers';
 import { createVendor } from './vendors';
 import { createBill } from './bills';
 import { payBills } from './billPayments';
-import { createExpense } from './expenses';
+import { createExpense, updateExpense, voidExpense } from './expenses';
 import { postJournalEntry } from './posting';
 import { runStandardReport } from './reportRegistry';
+import { splitByShares } from './reportEngine';
+import { Money } from '@/lib/money';
 import { checkDetail, depositDetail } from './reportsExtra';
 import { categorize } from './bankCategorize';
 import { createEmployee } from './payroll';
@@ -309,5 +311,82 @@ describe('7. Purchases by Item / Vendor in home currency', () => {
     expect(byVendor.rows.find((x) => x.cells.label === 'Paris Parts')?.cells.amount).toBe('120.00');
     const detail = await runStandardReport(pctx, 'purchases-by-item-detail', params);
     expect(detail.rows.find((x) => x.kind === 'data' && x.cells.num === 'P-1')?.cells.amount).toBe('120.00');
+  });
+});
+
+describe('cash-basis job split: the largest share takes the rounding cents (post-merge review)', () => {
+  it('splits by share, the pieces add up exactly, and only the largest share absorbs the remainder', () => {
+    const parts = (amount: string, shares: string[]) => splitByShares(Money.of(amount), shares.map((x) => Money.of(x))).map((d) => d.toFixed(2));
+    // 0.05 by 40 / 30 / 30: 0.02 + 0.015→0.02 + 0.015→0.02 = 0.06; the largest share gives the cent back.
+    expect(parts('0.05', ['40', '30', '30'])).toEqual(['0.01', '0.02', '0.02']);
+    expect(parts('10.00', ['1', '1', '1'])).toEqual(['3.34', '3.33', '3.33']);
+    expect(parts('-10.00', ['2', '1'])).toEqual(['-6.67', '-3.33']);
+    for (const [a, sh] of [['99.99', ['7', '3', '1']], ['0.01', ['5', '5']], ['1234.57', ['13', '29', '58']]] as const) {
+      const p = splitByShares(Money.of(a), sh.map((x) => Money.of(x)));
+      expect(p.reduce((s2, x) => s2.plus(x), Money.zero()).toFixed(2)).toBe(Money.of(a).toFixed(2));
+    }
+  });
+});
+
+describe('Balance Sheet: the Retained Earnings account row QuickZooms to what it adds up (post-merge review)', () => {
+  it('with earlier years folded in, the row opens the prior years’ Profit & Loss, which ties', async () => {
+    await postJournalEntry(ctx, {
+      date: d('2025-05-15'),
+      description: 'Prior-year sale',
+      lines: [
+        { accountId: A['1000'], debit: '300.00' },
+        { accountId: A['4000'], credit: '300.00' },
+      ],
+    });
+    const bs = await runStandardReport(ctx, 'balance-sheet', { asOf: '2026-12-31' });
+    const re = row(bs, (x) => x.id.endsWith(`:a:${A['3900']}`) || x.id.endsWith(A['3900']))!;
+    expect(re, JSON.stringify(bs.rows.map((x) => [x.id, x.cells.label]))).toBeTruthy();
+    const amountKey = bs.columns.find((c) => c.type === 'money')!.key;
+    expect(re.cells[amountKey]).toBe('300.00');
+    expect(re.href).toBeTruthy();
+    const url = new URL(`http://x${re.href}`);
+    expect(url.pathname.endsWith('/profit-loss')).toBe(true);
+    const q = Object.fromEntries(url.searchParams);
+    expect(q.to).toBe('2025-12-31');
+    const pl = await runStandardReport(ctx, 'profit-loss', q);
+    const net = pl.rows.find((x) => x.kind === 'grand')!;
+    expect(net.cells[pl.columns.find((c) => c.type === 'money')!.key]).toBe('300.00');
+  });
+});
+
+describe('Closing Date Exception Report on the standard viewer (post-merge review: grouped layout)', () => {
+  it('one heading per changed transaction, its Latest values, then each Prior version; a void has no Latest', async () => {
+    const over = { ...ctx, closingDateOverride: true };
+    const check = { vendorId: S.vendor, date: d('2026-01-10'), method: 'check', reference: '501', paymentAccountId: A['1000'] };
+    const edited = await createExpense(ctx, { ...check, lines: [{ accountId: A['6000'], amount: '100.00', description: 'Paper' }] } as never);
+    const voided = await createExpense(ctx, { ...check, date: d('2026-01-20'), reference: '502', lines: [{ accountId: A['6000'], amount: '33.00', description: 'Toner' }] } as never);
+    await setClosingDate(ctx, { closingDate: '2026-01-31', password: 'pw' });
+    try {
+      await updateExpense(over, edited.id, { ...check, lines: [{ accountId: A['6000'], amount: '125.00', description: 'Paper' }] } as never);
+      await voidExpense(over, voided.id);
+      const r = await runStandardReport(ctx, 'closing-date-exceptions', {});
+      expect(r.subtitle).toBe('Closing date 01/31/2026');
+      expect(new Set(r.rows.map((x) => x.id)).size).toBe(r.rows.length);
+      const headings = r.rows.filter((x) => x.kind === 'section');
+      const editedHead = headings.find((h) => String(h.cells.state).includes('dated 01/10/2026'))!;
+      expect(String(editedHead.cells.state)).toMatch(/^Check.*dated 01\/10\/2026: .*with password.* \(closed through 01\/31\/2026\)$/);
+      const editedRows = r.rows.filter((x) => x.parentId === editedHead.id);
+      const debitOf = (state: string) => editedRows.filter((x) => x.cells.state === state).map((x) => x.cells.debit).filter(Boolean);
+      expect(debitOf('Latest')).toEqual(['125.00']);
+      expect(debitOf('Prior')).toEqual(['100.00']);
+      // The Latest rows come before the Prior ones, and the first line of a version says who and when.
+      const states = editedRows.map((x) => x.cells.state);
+      expect(states.indexOf('Prior')).toBeGreaterThan(states.lastIndexOf('Latest'));
+      expect(editedRows.find((x) => x.cells.state === 'Latest')!.cells.changed).not.toBe('');
+
+      const voidHead = headings.find((h) => String(h.cells.state).includes('dated 01/20/2026'))!;
+      const voidRows = r.rows.filter((x) => x.parentId === voidHead.id);
+      expect(voidRows[0].id).toBe(`${voidHead.id}:void-now`);
+      expect(voidRows[0].cells.memo).toMatch(/Void now/);
+      expect(voidRows.filter((x) => x.cells.state === 'Prior').map((x) => x.cells.debit).filter(Boolean)).toEqual(['33.00']);
+      expect(voidRows.some((x) => x.cells.state === 'Latest' && x.cells.debit)).toBe(false);
+    } finally {
+      await setClosingDate(ctx, { closingDate: null });
+    }
   });
 });
