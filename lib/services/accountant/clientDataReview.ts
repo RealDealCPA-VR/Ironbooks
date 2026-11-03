@@ -55,6 +55,8 @@ import { applyToInvoice } from '../creditMemos';
 import { applyToBill } from '../vendorCredits';
 import { journalOpenItems, resolveEntityNames } from '../journal';
 import { requirePermission } from '../access';
+import { can } from '@/lib/permissions/model';
+import { companyTodayIso } from '../preferences';
 import { isIsoDate } from '@/lib/onboarding';
 import { systemAccountIdOrNull } from '../accountRoles';
 import {
@@ -450,17 +452,22 @@ export async function clientDataReview(
   const status = new Map(statusRows.map((s) => [s.taskKey, s]));
   const cmp = await compareBalances(ctx);
   const snap = await latestSnapshot(ctx);
-  // The review year (1099s): the reviewed period's year, else this year.
-  const reviewYear = snap ? Number(snap.asOf.slice(0, 4)) : new Date().getUTCFullYear();
+  // The review year (1099s): the reviewed period's year, else this year in the company's calendar
+  // (not the UTC year, which is already next year on the evening of Dec 31 west of UTC).
+  const reviewYear = snap ? Number(snap.asOf.slice(0, 4)) : Number((await companyTodayIso(ctx)).slice(0, 4));
+  // The review page needs only Accounting view; payroll and vendor details (employee names,
+  // missing SSN / W-4, 1099 vendors, bill payments) are shown only to members who may see them.
+  const seesPayroll = !ctx.access || can(ctx.access, 'payroll', 'view');
+  const seesVendors = !ctx.access || can(ctx.access, 'vendors', 'view');
   const found: Record<ReviewTaskKey, ReviewIssue[]> = {
     unapplied_customer_credits: await unappliedCustomerCredits(ctx),
     undeposited_funds: await undepositedFundsIssues(ctx, opts.undepositedOlderThanDays ?? 30),
     unapplied_vendor_credits: await unappliedVendorCredits(ctx),
-    unapplied_bill_payments: await unappliedVendorPaymentIssues(ctx),
-    vendor_1099: await vendor1099Issues(ctx, reviewYear),
+    unapplied_bill_payments: seesVendors ? await unappliedVendorPaymentIssues(ctx) : [],
+    vendor_1099: seesVendors ? await vendor1099Issues(ctx, reviewYear) : [],
     item_setup: await itemSetup(ctx),
-    payroll_liabilities: await payrollLiabilityMispayments(ctx),
-    employee_defaults: await employeeDefaultIssues(ctx),
+    payroll_liabilities: seesPayroll ? await payrollLiabilityMispayments(ctx) : [],
+    employee_defaults: seesPayroll ? await employeeDefaultIssues(ctx) : [],
     closing_date: await closingDateIssues(ctx, snap ? { asOf: snap.asOf, at: snap.createdAt } : null),
     compare_balances: cmp.issues,
     prior_balances: cmp.prior,

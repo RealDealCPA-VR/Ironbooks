@@ -77,6 +77,10 @@ interface DirectLine {
   amount: string;
   accountLabel: string;
   currency: string | null;
+  /** The line's own description and Received From name (purchbank 0081), when set. */
+  description: string | null;
+  entityType: string | null;
+  entityId: string | null;
 }
 
 /** Deposit lines that credit income or A/R directly (not through Undeposited Funds). */
@@ -88,6 +92,9 @@ async function directIncomeLines(ctx: ServiceContext): Promise<DirectLine[]> {
       currency: deposits.currency,
       lineId: depositLines.id,
       amount: depositLines.amount,
+      description: depositLines.description,
+      entityType: depositLines.entityType,
+      entityId: depositLines.entityId,
       code: accounts.code,
       name: accounts.name,
       type: accounts.type,
@@ -110,6 +117,9 @@ async function directIncomeLines(ctx: ServiceContext): Promise<DirectLine[]> {
       amount: toAmountString(r.amount),
       accountLabel: `${r.code} · ${r.name}`,
       currency: r.currency ? r.currency.toUpperCase() : null,
+      description: r.description ?? null,
+      entityType: r.entityType ?? null,
+      entityId: r.entityId ?? null,
     }));
 }
 
@@ -120,8 +130,10 @@ export interface UndepositedMatch {
 
 /**
  * Pair Undeposited Funds items with direct deposit lines: one item of the same amount deposited
- * within 30 days after it (closest date first), else all the items of one day that add up to the
- * line. Each item and each line is used once.
+ * within 30 days after it (same customer first, then the closest date), else all the items of one
+ * day that add up to the line. A line whose Received From names someone can only take that
+ * customer's payments (another customer's cash sale is not the same money). Each item and each
+ * line is used once.
  */
 export async function matchUndepositedFunds(ctx: ServiceContext): Promise<{ matches: UndepositedMatch[]; waiting: UndepositedItem[] }> {
   let waiting: UndepositedItem[];
@@ -139,15 +151,19 @@ export async function matchUndepositedFunds(ctx: ServiceContext): Promise<{ matc
     const days = (l.depositDate.getTime() - i.date.getTime()) / 86_400_000;
     return days >= -0.5 && days <= MATCH_WINDOW_DAYS + 0.5;
   };
+  /** The line names who paid: only that customer's payments fit it. */
+  const nameFits = (i: UndepositedItem, l: DirectLine) =>
+    !l.entityType || !l.entityId || (l.entityType === 'customer' && i.customerId === l.entityId);
+  const sameCustomer = (i: UndepositedItem, l: DirectLine) => l.entityType === 'customer' && !!i.customerId && i.customerId === l.entityId;
   // 1) One payment, one line.
-  const pairs: Array<{ i: UndepositedItem; l: DirectLine; gap: number }> = [];
+  const pairs: Array<{ i: UndepositedItem; l: DirectLine; gap: number; same: boolean }> = [];
   for (const l of lines) {
     for (const i of waiting) {
-      if (cur(i) !== l.currency || !Money.eq(i.amount, l.amount) || !inWindow(i, l)) continue;
-      pairs.push({ i, l, gap: Math.abs(l.depositDate.getTime() - i.date.getTime()) });
+      if (cur(i) !== l.currency || !Money.eq(i.amount, l.amount) || !inWindow(i, l) || !nameFits(i, l)) continue;
+      pairs.push({ i, l, gap: Math.abs(l.depositDate.getTime() - i.date.getTime()), same: sameCustomer(i, l) });
     }
   }
-  pairs.sort((a, b) => a.gap - b.gap);
+  pairs.sort((a, b) => Number(b.same) - Number(a.same) || a.gap - b.gap);
   const lineUsed = new Set<string>();
   for (const p of pairs) {
     const key = `${p.i.kind}:${p.i.id}`;
@@ -161,7 +177,7 @@ export async function matchUndepositedFunds(ctx: ServiceContext): Promise<{ matc
     if (lineUsed.has(l.lineId)) continue;
     const byDay = new Map<string, UndepositedItem[]>();
     for (const i of waiting) {
-      if (used.has(`${i.kind}:${i.id}`) || cur(i) !== l.currency || !inWindow(i, l)) continue;
+      if (used.has(`${i.kind}:${i.id}`) || cur(i) !== l.currency || !inWindow(i, l) || !nameFits(i, l)) continue;
       const k = isoDay(i.date);
       (byDay.get(k) ?? byDay.set(k, []).get(k)!).push(i);
     }
@@ -187,7 +203,7 @@ export async function undepositedFundsIssues(ctx: ServiceContext, olderThanDays:
     return {
       id: `uf_match:${m.line.lineId}`,
       title: `${who}: ${what} is still in Undeposited Funds, but the deposit of ${isoDay(m.line.depositDate)} recorded the same ${m.line.amount}`,
-      detail: `The deposit put ${m.line.amount} straight to ${m.line.accountLabel} instead of taking the payment out of Undeposited Funds, so this income is counted twice. Clear it up: the deposit takes the payment in place of that line (its total and date stay the same).`,
+      detail: `The deposit put ${m.line.amount} straight to ${m.line.accountLabel}${m.line.description ? ` (line "${m.line.description}")` : ''} instead of taking the payment out of Undeposited Funds, so this income is counted twice. Clear it up: the deposit takes the payment in place of that line (its total and date stay the same).`,
       amount: m.line.amount,
       fix: { kind: 'clear_undeposited', depositId: m.line.depositId, lineId: m.line.lineId, items: m.items.map((i) => ({ kind: i.kind, id: i.id })) },
     };
@@ -241,7 +257,17 @@ export async function clearUpUndepositedFunds(
     else if (desc.startsWith(RECEIPT_LINE_PREFIX)) salesReceiptIds.push(desc.slice(RECEIPT_LINE_PREFIX.length));
     else if (desc.startsWith(INVOICE_PAYMENT_LINE_PREFIX)) invoicePaymentIds.push(desc.slice(INVOICE_PAYMENT_LINE_PREFIX.length));
     else if (desc.startsWith(CASHBACK_LINE_PREFIX)) cashBack = { accountId: desc.slice(CASHBACK_LINE_PREFIX.length), amount: toAmountString(Money.of(l.amount).abs()) };
-    else if (l.accountId) extraLines.push({ accountId: l.accountId, amount: l.amount, description: l.description });
+    // Keep each other line exactly as it was, including its Received From name (purchbank 0081),
+    // so the re-posted journal line keeps its Name too.
+    else if (l.accountId) {
+      extraLines.push({
+        accountId: l.accountId,
+        amount: l.amount,
+        description: l.description,
+        entityType: (l.entityType as ExtraDepositLineInput['entityType']) ?? null,
+        entityId: l.entityId ?? null,
+      });
+    }
     else throw new ServiceError('CONFLICT', 'This deposit has a line from an older version. Open the deposit and add the payment there.');
   }
   for (const c of chosen) {

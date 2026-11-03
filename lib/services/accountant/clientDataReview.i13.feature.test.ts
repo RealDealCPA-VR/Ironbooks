@@ -5,7 +5,7 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { eq } from 'drizzle-orm';
-import { accounts } from '@/lib/db/schema';
+import { accounts, journalEntryLines } from '@/lib/db/schema';
 import { setClosingDate } from '../company';
 import { createCustomer } from '../customers';
 import { createVendor, updateVendor } from '../vendors';
@@ -79,6 +79,42 @@ describe('I13 Client Data Review tasks', () => {
     expect((await trialBalance(t.ctx)).balanced).toBe(true);
   });
 
+  it('Clear up keeps the Received From name on the deposit\'s other lines (review P1)', async () => {
+    const owner = (await createCustomer(t.ctx, { displayName: 'Owner Person' })).id;
+    const inv = await createInvoice(t.ctx, { customerId, date: d('2026-06-01'), lines: [{ description: 'Lunch', quantity: 1, rate: '275.00' }] });
+    await receivePayment(t.ctx, { customerId, date: d('2026-06-02'), method: 'check', amount: '275.00', applications: [{ invoiceId: inv.id, amountApplied: '275.00' }] });
+    const dep = await createDeposit(t.ctx, {
+      depositAccountId: t.acct['1000'],
+      date: d('2026-06-03'),
+      extraLines: [
+        { accountId: t.acct['4000'], amount: '275.00', description: 'Corner Cafe check' },
+        { accountId: t.acct['3000'], amount: '100.00', description: 'Owner money', entityType: 'customer', entityId: owner },
+      ],
+    });
+    const issue = (await task('undeposited_funds')).issues.find((i) => i.fix?.kind === 'clear_undeposited' && (i.fix as { depositId: string }).depositId === dep.id);
+    expect(issue).toBeDefined();
+    await clearUpUndepositedFunds(t.ctx, issue!.fix as never);
+    const after = await getDeposit(t.ctx, dep.id);
+    const kept = after.lines.find((l) => l.description === 'Owner money');
+    expect(kept).toMatchObject({ entityType: 'customer', entityId: owner });
+    // The journal line keeps its Name too.
+    const jl = await t.db.select().from(journalEntryLines).where(eq(journalEntryLines.journalEntryId, after.postedEntryId!));
+    expect(jl.some((l) => l.memo === 'Owner money' && l.entityType === 'customer' && l.entityId === owner)).toBe(true);
+  });
+
+  it('a line received from another customer is not offered as the duplicate of a payment (review P2)', async () => {
+    const other = (await createCustomer(t.ctx, { displayName: 'Walk-up Buyer' })).id;
+    const inv = await createInvoice(t.ctx, { customerId, date: d('2026-07-01'), lines: [{ description: 'Box', quantity: 1, rate: '61.00' }] });
+    await receivePayment(t.ctx, { customerId, date: d('2026-07-02'), method: 'cash', amount: '61.00', applications: [{ invoiceId: inv.id, amountApplied: '61.00' }] });
+    const dep = await createDeposit(t.ctx, {
+      depositAccountId: t.acct['1000'],
+      date: d('2026-07-03'),
+      extraLines: [{ accountId: t.acct['4000'], amount: '61.00', description: 'Cash sale', entityType: 'customer', entityId: other }],
+    });
+    const issues = (await task('undeposited_funds')).issues;
+    expect(issues.some((i) => i.fix?.kind === 'clear_undeposited' && (i.fix as { depositId: string }).depositId === dep.id)).toBe(false);
+  });
+
   it('1099: vendors without a tax ID, no mapping, then accounts not mapped to a box', async () => {
     const v = await createVendor(t.ctx, { displayName: 'Jo Contractor', is1099: true } as never);
     await createExpense(t.ctx, { vendorId: v.id, date: d('2026-05-01'), method: 'check', paymentAccountId: t.acct['1000'], lines: [{ accountId: t.acct['6600'], amount: '800.00' }] });
@@ -108,6 +144,16 @@ describe('I13 Client Data Review tasks', () => {
     expect(issue?.title).toMatch(/pay rate/);
     expect(issue?.title).toMatch(/Social Security number/);
     expect(issue?.title).toMatch(/address/);
+  });
+
+  it('payroll and vendor tasks are empty for a member without Payroll / Vendors view (review P2)', async () => {
+    const accountingOnly = { ...t.ctx, access: { permissions: { accounting: ['view'] } } } as never;
+    const tasks = (await clientDataReview(accountingOnly, { undepositedOlderThanDays: 3650 })).tasks;
+    for (const key of ['employee_defaults', 'payroll_liabilities', 'vendor_1099', 'unapplied_bill_payments']) {
+      expect(tasks.find((x) => x.key === key)!.issues).toEqual([]);
+    }
+    // The owner still sees them.
+    expect((await task('employee_defaults')).issues.length).toBeGreaterThan(0);
   });
 
   it('closing date: none set, behind the reviewed period, no password', async () => {
