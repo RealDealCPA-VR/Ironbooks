@@ -109,25 +109,30 @@ export default function ReportBuilderPage() {
   const [saveOpen, setSaveOpen] = useState(false);
   const [saveName, setSaveName] = useState('');
 
-  // Load saved reports
-  const loadSaved = useCallback(async (): Promise<MemorizedReport[]> => {
+  // Load saved reports. A failed load is an error (the reason), not an empty list: a server that
+  // is restarting must not make a memorized report look deleted.
+  const loadSaved = useCallback(async (): Promise<{ rows: MemorizedReport[] } | { error: string }> => {
     try {
       const rows = (await api.get<MemorizedReport[]>('/api/memorized-reports')).filter((r) => r.reportType === 'custom');
       setSaved(rows);
-      return rows;
-    } catch {
-      // non-fatal
-      return [];
+      return { rows };
+    } catch (e) {
+      return { error: e instanceof ApiError ? e.message : 'The saved reports could not be loaded.' };
     }
   }, []);
 
   useEffect(() => {
-    void loadSaved().then((rows) => {
+    void loadSaved().then((loaded) => {
       // Opened from the Memorized Report List (?mem=<id>): load and run that saved report.
       const memId = memorizedIdFrom(window.location.search);
-      const hit = memId ? rows.find((r) => r.id === memId) : undefined;
+      if (!memId) return;
+      if ('error' in loaded) {
+        toast(`That saved report could not be loaded (${loaded.error}). Open it again from the Memorized Report List.`, 'danger');
+        return;
+      }
+      const hit = loaded.rows.find((r) => r.id === memId);
       if (hit) void handleLoadSaved(hit);
-      else if (memId) toast('That saved report could not be found. It may have been deleted.', 'danger');
+      else toast('That saved report could not be found. It may have been deleted.', 'danger');
     });
     // Once, on open (handleLoadSaved only sets state and runs the saved setup).
     // eslint-disable-next-line react-hooks/exhaustive-deps

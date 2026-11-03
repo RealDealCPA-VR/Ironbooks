@@ -27,7 +27,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
-import { formatCurrency } from '@/lib/money';
+import { toDecimal } from '@/lib/money';
 import { formatDate, todayISO } from '@/lib/dates';
 import { HomeCurrencyAdjustmentHistory, HomeCurrencyAdjustmentModal } from './HomeCurrencyAdjustment';
 import FeatureOff from '@/components/FeatureOff';
@@ -353,6 +353,27 @@ function FxAdjustmentModal({
 // Main page
 // ---------------------------------------------------------------------------
 
+/**
+ * A conversion rate in the home currency with every decimal it has (up to 8, at least 2):
+ * 1 JPY = $0.0067, 1 EUR = $1.085 — never rounded to a cent ($0.01), which hid small rates.
+ */
+function conversionRateText(rateToBase: string, homeCode: string): string {
+  let plain: string;
+  try {
+    plain = toDecimal(rateToBase).toDecimalPlaces(8).toFixed();
+  } catch {
+    return rateToBase;
+  }
+  const decimals = Math.min(8, Math.max(2, (plain.split('.')[1] ?? '').replace(/0+$/, '').length));
+  try {
+    return new Intl.NumberFormat('en-US', { style: 'currency', currency: homeCode, minimumFractionDigits: decimals, maximumFractionDigits: decimals }).format(
+      Number(plain),
+    );
+  } catch {
+    return `${plain} ${homeCode}`;
+  }
+}
+
 export default function CurrenciesPage() {
   const prefs = usePreferences();
   const [currencies, setCurrencies] = useState<Currency[]>([]);
@@ -514,7 +535,6 @@ export default function CurrenciesPage() {
             {currencies
               .filter((c) => !c.isBase)
               .map((cur) => {
-                const rate = parseFloat(cur.rateToBase);
                 return (
                   <div
                     key={cur.id}
@@ -524,7 +544,7 @@ export default function CurrenciesPage() {
                       1 {cur.code} =
                     </div>
                     <div className="font-bold text-navy tabular-nums">
-                      {formatCurrency(rate, baseCurrency.code)}
+                      {conversionRateText(cur.rateToBase, baseCurrency.code)}
                     </div>
                     <div className="text-xs text-navy/40 mt-0.5">
                       {baseCurrency.code}

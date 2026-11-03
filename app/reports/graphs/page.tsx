@@ -11,7 +11,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { PieChart } from 'lucide-react';
-import { Button, Card, Input, Label, PageHeader, Select, Spinner, toast } from '@/components/ui';
+import { Button, Card, Input, Label, PageHeader, Select, Spinner, toast, useListKeys } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { todayISO } from '@/lib/dates';
 
@@ -180,6 +180,8 @@ export default function GraphsPage() {
   const [data, setData] = useState<GraphData | null>(null);
   const [loading, setLoading] = useState(false);
   const [asTable, setAsTable] = useState(false);
+  // The data table takes the QuickBooks list keys: arrows move, Enter QuickZooms the period.
+  const tableKeys = useListKeys<HTMLDivElement>();
 
   useEffect(() => {
     api
@@ -304,6 +306,7 @@ export default function GraphsPage() {
               </div>
             )}
             {asTable ? (
+              <div {...tableKeys} aria-label="Graph data">
               <table className="w-full text-sm">
                 <thead>
                   <tr className="border-b border-navy/20">
@@ -328,6 +331,7 @@ export default function GraphsPage() {
                   ))}
                 </tbody>
               </table>
+              </div>
             ) : (
               <BarChart data={data} onZoom={(i) => data.hrefs?.[i] && router.push(data.hrefs[i])} />
             )}

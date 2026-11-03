@@ -72,7 +72,7 @@ export async function runDomFile(file: string, timeoutMs = 150_000): Promise<Dom
   const html = path.join(dir, 'index.html');
   fs.writeFileSync(
     html,
-    `<!doctype html><html><head><meta charset="utf-8"><title>dom test</title></head><body><main id="dom-main"></main><script src="bundle.js"></script></body></html>`,
+    `<!doctype html><html><head><meta charset="utf-8"><title>dom test</title></head><body><script src="bundle.js"></script></body></html>`,
   );
   const results = path.join(dir, 'results.json');
   const env = { ...process.env };
@@ -103,6 +103,9 @@ ${stderr.slice(-2000)}`;
 
 /** Fail with every failed DOM test's name and reason. */
 export function expectAllPassed(results: DomResult[], expectedNames?: string[]) {
+  // IB_DOM_TIMES=1: how long each test took.
+  if (process.env.IB_DOM_TIMES) for (const r of results) process.stderr.write(`${String(r.ms ?? '?').padStart(6)} ms  ${r.name}
+`);
   const failed = results.filter((r) => !r.ok).map((r) => `✗ ${r.name}: ${r.error}`);
   expect(failed, failed.join('\n\n')).toEqual([]);
   if (expectedNames) expect(results.map((r) => r.name)).toEqual(expectedNames);
