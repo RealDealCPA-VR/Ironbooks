@@ -8,9 +8,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { eq } from 'drizzle-orm';
 import { closeDb, getDb, type DB } from '@/lib/db';
-import { accounts, auditLogs, commentedReports, users } from '@/lib/db/schema';
+import { accounts, auditLogs, commentedReports, employees, users } from '@/lib/db/schema';
 import { commentMarks, commentedTable } from '@/lib/reports/comments';
-import { normalizeGrant, type EffectiveAccess } from '@/lib/permissions/model';
+import { normalizeGrant, unionRoles, type EffectiveAccess, type PermissionGrant } from '@/lib/permissions/model';
 import type { ServiceContext } from './_base';
 import { createCompany } from './company';
 import { createCustomer } from './customers';
@@ -19,6 +19,7 @@ import { createInvoice } from './invoices';
 import { createExpense } from './expenses';
 import { createBill } from './bills';
 import { createManualEntry } from './journal';
+import { createEmployee } from './payroll';
 import { runStandardReport } from './reportRegistry';
 import {
   deleteCommentedReport,
@@ -193,6 +194,79 @@ describe('Commented Reports', () => {
   });
 });
 
+/** A role saved by the per-activity editor (rights on single activities, not whole areas). */
+function activityRole(grant: PermissionGrant, flags: EffectiveAccess['flags'] = { sensitivePayroll: false, fullAccountNumbers: false, closedPeriod: false }): EffectiveAccess {
+  return unionRoles([{ key: 'custom-activities', name: 'Custom', description: '', builtin: false, permissions: grant, flags }]);
+}
+
+describe('Commented Reports: sensitive data and per-activity report rights', () => {
+  it('keeps SSNs masked in the picture, even when its creator may see them (and for every reader)', async () => {
+    const emp = await createEmployee(ctx, { firstName: 'Sam', lastName: 'Secret', payType: 'hourly', payRate: '20.00' } as never);
+    await db.update(employees).set({ ssn: '123-45-6789' }).where(eq(employees.id, emp.id));
+    // The owner (trusted context: sees full SSNs on the live report) saves a commented copy.
+    const live = await runStandardReport(ctx, 'employee-contact-list', {});
+    expect(live.rows.some((r) => r.cells.ssn === '123-45-6789')).toBe(true);
+    const saved = await saveCommentedReport(ctx, { name: 'Staff list', reportType: 'employee-contact-list', params: {} });
+    const json = (x: unknown) => JSON.stringify(x);
+    expect(json(saved.snapshot)).not.toContain('123-45-6789');
+    expect(saved.snapshot.rows.some((r) => r.cells.ssn === '***-**-6789')).toBe(true);
+    const [stored] = await db.select().from(commentedReports).where(eq(commentedReports.id, saved.id));
+    expect(json(stored.snapshot)).not.toContain('123-45-6789');
+    // A payroll-reports reader without "view sensitive payroll data" never sees the full SSN.
+    const payrollReader = { ...ctx, access: activityRole({ 'reports_payroll.payroll': ['view'] }) };
+    expect(json((await getCommentedReport(payrollReader, saved.id)).snapshot)).not.toContain('123-45-6789');
+  });
+
+  it('masks commented reports saved before this fix when they are read', async () => {
+    const [old] = await db
+      .insert(commentedReports)
+      .values({
+        companyId: ctx.companyId,
+        name: 'Saved unmasked',
+        reportType: 'employee-contact-list',
+        params: {},
+        snapshot: {
+          key: 'employee-contact-list',
+          title: 'Employee Contact List',
+          columns: [{ key: 'label', header: 'Employee' }, { key: 'ssn', header: 'SS No.' }, { key: 'note', header: 'Original values' }],
+          rows: [
+            { id: 'ecl:1', depth: 0, kind: 'data', cells: { label: 'Secret, Sam', ssn: '123-45-6789', note: 'ssn: 987-65-4321 · accountNumber: 000123456789 · taxId: 12-3456789 · memo: ok' } },
+          ],
+        },
+        comments: [],
+      })
+      .returning();
+    const fullReader = { ...ctx, access: activityRole({ 'reports_payroll.payroll': ['view'] }, { sensitivePayroll: true, fullAccountNumbers: true, closedPeriod: false }) };
+    for (const reader of [ctx, fullReader]) {
+      const got = await getCommentedReport(reader, old.id);
+      const text = JSON.stringify(got.snapshot);
+      expect(text).not.toMatch(/123-45-6789|987-65-4321|000123456789|12-3456789/);
+      expect(got.snapshot.rows[0].cells.ssn).toBe('***-**-6789');
+      expect(got.snapshot.rows[0].cells.note).toContain('memo: ok');
+    }
+  });
+
+  it("checks the report's own activity, not the whole area (Company & Financial does not open Accountant & Taxes)", async () => {
+    const tb = await saveCommentedReport(ctx, { name: 'Year-end TB', reportType: 'trial-balance', params: { asOf: '2026-12-31' } });
+    const pl = await saveCommentedReport(ctx, { name: 'Year P&L', reportType: 'profit-loss', params: range });
+    const companyOnly = { ...ctx, access: activityRole({ 'reports_financial.company': ['view'] }) };
+    // The live report is refused to this role…
+    await expect(runStandardReport(companyOnly, 'trial-balance', { asOf: '2026-12-31' })).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    // …and so is its commented copy: not listed, not readable, not renamable or deletable, not savable.
+    const ids = (await listCommentedReports(companyOnly)).map((r) => r.id);
+    expect(ids).toContain(pl.id);
+    expect(ids).not.toContain(tb.id);
+    await expect(getCommentedReport(companyOnly, tb.id)).rejects.toMatchObject({ code: 'NOT_FOUND' });
+    await expect(updateCommentedReport(companyOnly, tb.id, { name: 'x' })).rejects.toMatchObject({ code: 'NOT_FOUND' });
+    await expect(deleteCommentedReport(companyOnly, tb.id)).rejects.toMatchObject({ code: 'NOT_FOUND' });
+    await expect(saveCommentedReport(companyOnly, { name: 'x', reportType: 'trial-balance', params: { asOf: '2026-12-31' } })).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    expect((await getCommentedReport(companyOnly, pl.id)).id).toBe(pl.id);
+    const accountantOnly = { ...ctx, access: activityRole({ 'reports_financial.accountant': ['view'] }) };
+    expect((await getCommentedReport(accountantOnly, tb.id)).id).toBe(tb.id);
+    await expect(getCommentedReport(accountantOnly, pl.id)).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  });
+});
+
 describe('QuickZoom to the source form', () => {
   async function entryOf(table: 'invoices' | 'expenses' | 'bills', id: string): Promise<string> {
     const schema = await import('@/lib/db/schema');
@@ -236,7 +310,8 @@ describe('QuickZoom to the source form', () => {
     const id = '22222222-2222-4222-8222-222222222222';
     for (const [kind, make] of Object.entries(SOURCE_FORMS)) {
       const href = make(id);
-      if (href.startsWith('/api/')) continue; // the pay stub opens as a document
+      // Every QuickZoom opens a page of the app (the pay stub PDF used to replace the app window).
+      expect(href.startsWith('/api/'), `${kind}: ${href} is a page`).toBe(false);
       const [pagePath, query] = href.split('?');
       const src = fs.readFileSync(path.join(process.cwd(), 'app', ...pagePath.split('/').filter(Boolean), 'page.tsx'), 'utf8');
       if (query.startsWith('open=')) expect(/useOpenParam\(/.test(src), `${kind}: ${pagePath} reads ?open=`).toBe(true);

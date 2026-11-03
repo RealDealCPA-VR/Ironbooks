@@ -28,8 +28,11 @@ import { accounts, reportSchedules, users } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
 import { createCompany } from './company';
 import { postJournalEntry } from './posting';
+import { unionRoles, type EffectiveAccess, type PermissionGrant } from '@/lib/permissions/model';
 import {
   createReportSchedule,
+  deleteReportSchedule,
+  listReportSchedules,
   normalizeRecipients,
   runDueSchedules,
   saveMemorizedReport,
@@ -147,5 +150,43 @@ describe('export files are replaced atomically (leftover)', () => {
     }
     expect(fs.readFileSync(file, 'utf8')).toBe('LAST GOOD EXPORT');
     expect(fs.readdirSync(path.dirname(file)).filter((f) => f.includes('.tmp'))).toEqual([]);
+  });
+});
+
+/** A role saved by the per-activity editor (rights on single activities, not whole areas). */
+function activityRole(grant: PermissionGrant): EffectiveAccess {
+  return unionRoles([{ key: 'custom-activities', name: 'Custom', description: '', builtin: false, permissions: grant, flags: {} }]);
+}
+
+describe('per-activity rights (post-merge review)', () => {
+  it('Scheduled Reports needs its own activity: another File Utilities activity is not enough', async () => {
+    const backupOnly = { ...ctx, access: activityRole({ 'file_utilities.backup': ['view', 'create', 'modify'], 'reports_financial.accountant': ['view'] }) };
+    await expect(listReportSchedules(backupOnly)).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    await expect(createReportSchedule(backupOnly, { name: 'x', memorizedReportId: memId, frequency: 'daily' })).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    await expect(runDueSchedules(backupOnly, { now: d('2026-02-01'), outDir: OUT })).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    // Scheduled Reports alone (plus the report itself): allowed.
+    const schedulesOnly = { ...ctx, access: activityRole({ 'file_utilities.schedules': ['view', 'create', 'modify', 'delete'], 'reports_financial.accountant': ['view'] }) };
+    const s = await createReportSchedule(schedulesOnly, { name: 'Mine', memorizedReportId: memId, frequency: 'daily', startDate: '2026-02-01' });
+    expect((await listReportSchedules(schedulesOnly)).map((x) => x.id)).toContain(s.id);
+    await expect(updateReportSchedule(backupOnly, s.id, { name: 'x' })).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    await expect(deleteReportSchedule(backupOnly, s.id)).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    await expect(updateReportSchedule(schedulesOnly, s.id, { name: 'Renamed' })).resolves.toMatchObject({ name: 'Renamed' });
+    await expect(deleteReportSchedule(schedulesOnly, s.id)).resolves.toEqual({ deleted: true });
+  });
+
+  it('only someone who may view the scheduled report can add or change its email recipients', async () => {
+    // The owner schedules the Trial Balance (an Accountant & Taxes report).
+    const s = await createReportSchedule(ctx, { name: 'TB', memorizedReportId: memId, frequency: 'monthly', startDate: '2026-02-01' });
+    // An editor with Scheduled Reports: Modify who may run only Company & Financial reports.
+    const editor = { ...ctx, access: activityRole({ 'file_utilities.schedules': ['view', 'modify'], 'reports_financial.company': ['view'] }) };
+    await expect(updateReportSchedule(editor, s.id, { emailTo: 'me@outside.example' })).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    const [row] = await db.select().from(reportSchedules).where(eq(reportSchedules.id, s.id));
+    expect(row.emailTo).toBeNull();
+    // Other changes, and taking recipients off, stay allowed.
+    await expect(updateReportSchedule(editor, s.id, { name: 'TB monthly' })).resolves.toMatchObject({ name: 'TB monthly' });
+    await expect(updateReportSchedule(editor, s.id, { emailTo: null })).resolves.toMatchObject({ emailTo: null });
+    // Someone who may view the report can.
+    const viewer = { ...ctx, access: activityRole({ 'file_utilities.schedules': ['view', 'modify'], 'reports_financial.accountant': ['view'] }) };
+    await expect(updateReportSchedule(viewer, s.id, { emailTo: 'cpa@x.com' })).resolves.toMatchObject({ emailTo: 'cpa@x.com' });
   });
 });

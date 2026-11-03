@@ -6,7 +6,7 @@
  */
 import type { Area } from '@/lib/permissions/model';
 import type { ActivityKey } from '@/lib/permissions/activities';
-import type { FeatureKey } from '@/lib/preferences';
+import type { CompanyPreferences, FeatureKey } from '@/lib/preferences';
 
 export type ReportControl =
   /** From / To dates (defaults to fiscal year to date). */
@@ -270,6 +270,20 @@ export function reportActivity(entry: Pick<CatalogEntry, 'key' | 'area' | 'group
     default:
       throw new Error(`No report activity for area ${entry.area}`);
   }
+}
+
+/** True when the report belongs to a Preferences feature that is switched off (QB hides them). */
+export function reportFeatureOff(entry: Pick<CatalogEntry, 'feature'>, prefs: Partial<Pick<CompanyPreferences, FeatureKey>>): boolean {
+  return !!entry.feature && prefs[entry.feature] === false;
+}
+
+/**
+ * The catalog reports the Report Center's "All reports" lists: not hidden, a report the user may
+ * view by ITS OWN activity (Company & Financial does not list Accountant & Taxes reports), and not
+ * dropped by `off` (a feature switched off).
+ */
+export function listedReports(canView: (activity: ActivityKey) => boolean, off: (entry: CatalogEntry) => boolean = () => false): CatalogEntry[] {
+  return REPORT_CATALOG.filter((r) => !r.hidden && canView(reportActivity(r)) && !off(r));
 }
 
 /**

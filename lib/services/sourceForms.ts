@@ -5,7 +5,7 @@
  *
  *  - the documents that keep their posted entry (postedEntryId): invoices, bills, checks and
  *    card charges, deposits, credit memos, bill credits, sales receipts, received payments, bill
- *    payments, paychecks (the pay stub), transfers, item receipts, expense reports and the sales
+ *    payments, paychecks (their row on Pay Stubs), transfers, item receipts, expense reports and the sales
  *    tax / liability / refund checks;
  *  - otherwise the entry's sourceRef (COGS entries of an invoice or credit memo, bank-feed lines,
  *    item adjustments and opening quantities, reconciliation charges, fixed assets, loans…);
@@ -48,7 +48,8 @@ export const SOURCE_FORMS = {
   sales_receipt: (id: string) => `/sales-receipts?open=${id}`,
   payment: (id: string) => `/payments?open=${id}`,
   bill_payment: (id: string) => `/pay-bills?open=${id}`,
-  paycheck: (id: string) => `/api/payroll/paystub?paycheckId=${id}`,
+  // The paycheck's row on Pay Stubs (its PDF opens from there in a window of its own).
+  paycheck: (id: string) => `/pay-stubs?open=${id}`,
   transfer: (id: string) => `/transfers?open=${id}`,
   item_receipt: (id: string) => `/item-receipts?open=${id}`,
   expense_report: (id: string) => `/expense-reports?open=${id}`,
