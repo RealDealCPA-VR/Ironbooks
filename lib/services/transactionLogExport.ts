@@ -9,25 +9,29 @@
  *    downloaded later still starts with the bytes a report describes.
  *    The log file is shared by every company in the company file and cannot be filtered without
  *    breaking its chain: the raw download is for someone who manages every company it records
- *    (owner / admin / accountant of each), like a full copy of the file.
+ *    (owner, Admin or a role that may export the file, in each of them — checked on the
+ *    effective roles, not the legacy role column), like a full copy of the file.
  *  - A CSV of the filtered, plain-language log with NO row cap, streamed in batches (the page
  *    shows the newest 5,000; the export used to stop there too).
  */
 import fs from 'node:fs';
 import { createHash } from 'node:crypto';
-import { and, eq, inArray } from 'drizzle-orm';
-import { companies, userCompanies } from '@/lib/db/schema';
+import { eq, inArray } from 'drizzle-orm';
+import { companies } from '@/lib/db/schema';
+import { canActivity, type EffectiveAccess } from '@/lib/permissions/model';
 import { resolveDataDir } from '@/lib/db';
 import { dataDirOf } from '@/lib/db/txHooks';
 import { csvQuoted } from '@/lib/csv';
 import { ServiceError, notFound, type ServiceContext } from './_base';
+import { requireFileAdmin, resolveAccess } from './access';
 import {
   entityLabel,
-  queryTransactionLog,
+  matchTransactionLog,
   readAllTransactionLog,
   transactionLogPath,
   verifyTransactionLog,
   type TransactionLogFilter,
+  type TransactionLogRecord,
   type TransactionLogVerification,
 } from './transactionLog';
 
@@ -44,36 +48,48 @@ function logDir(ctx: ServiceContext): string {
 }
 
 /**
- * The raw log may be taken only by someone who manages every company it records: the caller's
- * role in each other company must be owner / admin / accountant (or they own it).
+ * The right to take the raw log in one company: the owner, an Admin, or a role with File
+ * Utilities > Export & Portable Files (create) — the right the download route itself requires
+ * (built-in Admin, Full Access, Accountant and External Accountant have it; clerks do not).
+ * Never the legacy user_companies.role: it says "accountant" for ANY role with a write right.
+ */
+function mayTakeRawLog(r: { isOwner?: boolean; access: EffectiveAccess }): boolean {
+  return !!r.isOwner || r.access.isAdmin || canActivity(r.access, 'file_utilities.export', 'create');
+}
+
+const RAW_LOG_DENIED =
+  'This company file’s transaction log also records another company you do not manage, and the log cannot be split without breaking its fingerprints. Ask that company’s owner, or export the log as CSV instead.';
+
+/**
+ * The raw log may be taken only by someone who manages every company it records: in the active
+ * company the caller's own rights, in each other company their effective rights THERE (active
+ * member; owner, Admin or the export right). Records of a company deleted since can no longer be
+ * checked that way, so they go only to an Admin of every company in the file (requireFileAdmin).
  */
 async function requireAllCompanies(ctx: ServiceContext, dir: string): Promise<void> {
+  if (ctx.access && !mayTakeRawLog({ access: ctx.access })) {
+    throw new ServiceError('FORBIDDEN', 'Only the owner, an Admin or someone who may export the company file can download the transaction log.');
+  }
   const others = new Set<string>();
   for (const r of readAllTransactionLog(dir).records) if (r.companyId && r.companyId !== ctx.companyId) others.add(r.companyId);
   if (!others.size) return;
   if (!ctx.userId) throw new ServiceError('FORBIDDEN', 'Sign in to download the transaction log.');
   const ids = [...others];
-  const owned = new Set(
-    (await ctx.db.select({ id: companies.id }).from(companies).where(and(inArray(companies.id, ids), eq(companies.ownerId, ctx.userId)))).map((c) => c.id),
-  );
-  const managed = new Set(
-    (
-      await ctx.db
-        .select({ companyId: userCompanies.companyId, role: userCompanies.role, isActive: userCompanies.isActive })
-        .from(userCompanies)
-        .where(and(eq(userCompanies.userId, ctx.userId), inArray(userCompanies.companyId, ids)))
-    )
-      .filter((m) => m.isActive !== false && MANAGER_ROLES.has(m.role))
-      .map((m) => m.companyId),
-  );
-  // A company deleted since keeps its records; only an existing company can be someone else's.
   const existing = new Set((await ctx.db.select({ id: companies.id }).from(companies).where(inArray(companies.id, ids))).map((c) => c.id));
-  const blocked = ids.filter((id) => existing.has(id) && !owned.has(id) && !managed.has(id));
-  if (blocked.length) {
-    throw new ServiceError(
-      'FORBIDDEN',
-      'This company file’s transaction log also records another company you do not manage, and the log cannot be split without breaking its fingerprints. Ask that company’s owner, or export the log as CSV instead.',
-    );
+  for (const id of ids) {
+    if (!existing.has(id)) continue;
+    const r = await resolveAccess(ctx.db, id, ctx.userId);
+    if (!r.member || !r.active || !mayTakeRawLog(r)) throw new ServiceError('FORBIDDEN', RAW_LOG_DENIED);
+  }
+  if (ids.some((id) => !existing.has(id))) {
+    try {
+      await requireFileAdmin(ctx);
+    } catch {
+      throw new ServiceError(
+        'FORBIDDEN',
+        'This company file’s transaction log also records a company that has since been deleted. Only an Admin of every company in the file can download it; export the log as CSV instead.',
+      );
+    }
   }
 }
 
@@ -210,27 +226,30 @@ const BATCH = 2000;
 /**
  * The filtered log as CSV (newest first), every matching record — streamed in batches, so a log
  * of any size exports without a row cap. Other companies' records are left out, like the page.
+ * The matching records are taken once, when the export starts: records written meanwhile are not
+ * in it, and the batches walk that list (paging the live, newest-first log by offset repeated
+ * rows when a record arrived, and re-filtered the whole log for every batch).
  */
 export function streamTransactionLogCsv(ctx: ServiceContext, filter: LogExportFilter): ReadableStream<Uint8Array> {
   requireLogRole(ctx);
   const dir = logDir(ctx);
   const enc = new TextEncoder();
   let offset = 0;
-  let started = false;
+  let records: TransactionLogRecord[] | null = null;
   return new ReadableStream<Uint8Array>({
     pull(controller) {
-      if (!started) {
-        started = true;
+      if (!records) {
+        records = matchTransactionLog(dir, { ...filter, companyId: ctx.companyId });
         controller.enqueue(enc.encode('﻿' + CSV_HEADER.map(csvQuoted).join(',') + '\r\n'));
         return;
       }
-      const page = queryTransactionLog(dir, { ...filter, companyId: ctx.companyId, limit: BATCH, offset });
-      if (!page.rows.length) {
+      const batch = records.slice(offset, offset + BATCH);
+      if (!batch.length) {
         controller.close();
         return;
       }
-      offset += page.rows.length;
-      const text = page.rows
+      offset += batch.length;
+      const text = batch
         .map((r) =>
           [r.seq, r.ts, r.userName ?? (r.userId ? 'Unknown user' : 'System'), r.action, entityLabel(r.entityType), r.summary, r.entityId ?? '']
             .map((v) => csvQuoted(v))
@@ -238,7 +257,7 @@ export function streamTransactionLogCsv(ctx: ServiceContext, filter: LogExportFi
         )
         .join('\r\n');
       controller.enqueue(enc.encode(text + '\r\n'));
-      if (offset >= page.total) controller.close();
+      if (offset >= records.length) controller.close();
     },
   });
 }

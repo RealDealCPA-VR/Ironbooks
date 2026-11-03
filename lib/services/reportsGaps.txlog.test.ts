@@ -9,8 +9,10 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { NextRequest } from 'next/server';
 import { closeDb, getDb, type DB } from '@/lib/db';
-import { companies, userCompanies, users } from '@/lib/db/schema';
+import { companies, userCompanies, userRoleAssignments, users } from '@/lib/db/schema';
 import { writeAudit, type ServiceContext } from './_base';
+import { and, eq } from 'drizzle-orm';
+import { builtinRole, unionRoles } from '@/lib/permissions/model';
 import { appendTransactionLog, transactionLogPath } from './transactionLog';
 import { prepareRawLogDownload, sha256OfPrefix, streamTransactionLogCsv, transactionLogVerificationReport } from './transactionLogExport';
 
@@ -101,6 +103,41 @@ describe('raw .bktlg download with its verification report', () => {
     await db.insert(userCompanies).values({ userId: owner.userId!, companyId: otherCompanyId, role: 'admin' });
     await expect(prepareRawLogDownload(owner)).resolves.toMatchObject({ bytes: expect.any(Number) });
   });
+
+  it('a clerk of the other company is refused, although their stored legacy role is "accountant"', async () => {
+    // users.ts setUserRoles stores 'accountant' as the legacy role of ANY role with a write right:
+    // the A/R clerk of Otto's company must not take Otto's whole change log.
+    await db.update(userCompanies).set({ role: 'accountant' }).where(and(eq(userCompanies.userId, owner.userId!), eq(userCompanies.companyId, otherCompanyId)));
+    await db.insert(userRoleAssignments).values({ userId: owner.userId!, companyId: otherCompanyId, roleKey: 'ar_clerk' });
+    await expect(prepareRawLogDownload(owner)).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    await expect(transactionLogVerificationReport(owner)).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    // The built-in Accountant role there (it may export the file): allowed.
+    await db.update(userRoleAssignments).set({ roleKey: 'accountant' }).where(and(eq(userRoleAssignments.userId, owner.userId!), eq(userRoleAssignments.companyId, otherCompanyId)));
+    await expect(prepareRawLogDownload(owner)).resolves.toMatchObject({ bytes: expect.any(Number) });
+    // Deactivated there: refused again.
+    await db.update(userCompanies).set({ isActive: false }).where(and(eq(userCompanies.userId, owner.userId!), eq(userCompanies.companyId, otherCompanyId)));
+    await expect(prepareRawLogDownload(owner)).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    await db.update(userCompanies).set({ isActive: true }).where(and(eq(userCompanies.userId, owner.userId!), eq(userCompanies.companyId, otherCompanyId)));
+  });
+
+  it('in the current company too, the File Utilities export right is needed (not just any write right)', async () => {
+    const clerk = unionRoles([builtinRole('ar_clerk')!]);
+    await expect(prepareRawLogDownload({ ...owner, role: 'accountant', access: clerk })).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    const accountant = unionRoles([builtinRole('accountant')!]);
+    await expect(prepareRawLogDownload({ ...owner, role: 'accountant', access: accountant })).resolves.toMatchObject({ bytes: expect.any(Number) });
+  });
+
+  it("a deleted company's records go only to an Admin of every company in the file", async () => {
+    appendTransactionLog(TEST_DIR, [
+      { userId: otherOwnerId, userName: 'Otto', companyId: '00000000-0000-4000-8000-0000000000dd', action: 'create', entityType: 'vendor', entityId: null, summary: 'Gone Co vendor', data: null },
+    ]);
+    // Accountant (not Admin) of Otto's company: may not take the deleted company's history.
+    await expect(prepareRawLogDownload(owner)).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    // Admin of both companies in the file: allowed.
+    await db.delete(userRoleAssignments).where(and(eq(userRoleAssignments.userId, owner.userId!), eq(userRoleAssignments.companyId, otherCompanyId)));
+    await db.update(userCompanies).set({ role: 'admin' }).where(and(eq(userCompanies.userId, owner.userId!), eq(userCompanies.companyId, otherCompanyId)));
+    await expect(prepareRawLogDownload(owner)).resolves.toMatchObject({ bytes: expect.any(Number) });
+  });
 });
 
 describe('CSV export of the filtered log — no row cap', () => {
@@ -131,5 +168,24 @@ describe('CSV export of the filtered log — no row cap', () => {
     ctx = { ...owner, role: 'viewer' };
     expect((await exportGET(new NextRequest('http://localhost/api/transaction-log/export'))).status).toBe(403);
     ctx = owner;
+  });
+  it('records written while the export runs neither shift nor repeat its rows (post-merge review)', async () => {
+    const stream = streamTransactionLogCsv(owner, { entityType: 'item' });
+    const reader = stream.getReader();
+    const chunks: string[] = [];
+    const dec = new TextDecoder();
+    // Header and the first batch, then more matching records arrive (newest first: they would
+    // have pushed the next page down by as many rows, repeating them).
+    for (let i = 0; i < 2; i++) chunks.push(dec.decode((await reader.read()).value));
+    appendTransactionLog(TEST_DIR, Array.from({ length: 50 }, (_, i) => ({ userId: owner.userId!, userName: 'Olive', companyId: owner.companyId, action: 'update', entityType: 'item', entityId: null, summary: `During export ${i}`, data: null })));
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(dec.decode(value));
+    }
+    const rows = chunks.join('').trim().split('\r\n').slice(1);
+    expect(rows).toHaveLength(6200);
+    expect(new Set(rows).size).toBe(rows.length);
+    expect(rows.join('\n')).not.toContain('During export');
   });
 });

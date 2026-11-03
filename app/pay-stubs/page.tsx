@@ -20,6 +20,7 @@ import {
 import { api, ApiError } from '@/lib/client';
 import { Money, formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/dates';
+import { useOpenParam } from '@/lib/useOpenParam';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -79,6 +80,8 @@ export default function PayStubsPage() {
   const [loading, setLoading] = useState(true);
   const [pendingVoid, setPendingVoid] = useState<Paycheck | null>(null);
   const [voidingId, setVoidingId] = useState<string | null>(null);
+  // QuickZoom from a payroll report (?open=<paycheck id>): that paycheck's row, highlighted.
+  const [openedId, setOpenedId] = useState<string | null>(null);
 
   const employeeMap = Object.fromEntries(
     employees.map((e) => [e.id, `${e.firstName} ${e.lastName}`]),
@@ -106,6 +109,11 @@ export default function PayStubsPage() {
   useEffect(() => {
     fetchData();
   }, [fetchData]);
+
+  useOpenParam((id) => {
+    setOpenedId(id);
+    requestAnimationFrame(() => document.getElementById(`paycheck-${id}`)?.scrollIntoView({ block: 'center' }));
+  }, !loading);
 
   function openPaystubPdf(paycheckId: string) {
     window.open(`/api/payroll/paystub?paycheckId=${encodeURIComponent(paycheckId)}`, '_blank');
@@ -163,7 +171,12 @@ export default function PayStubsPage() {
             </thead>
             <tbody>
               {paychecks.map((pc) => (
-                <Tr key={pc.id} className={pc.isVoid ? 'opacity-60' : undefined}>
+                <Tr
+                  key={pc.id}
+                  id={`paycheck-${pc.id}`}
+                  aria-current={openedId === pc.id ? 'true' : undefined}
+                  className={[pc.isVoid ? 'opacity-60' : '', openedId === pc.id ? 'bg-electric/[.08] ring-1 ring-inset ring-electric/40' : ''].filter(Boolean).join(' ') || undefined}
+                >
                   <Td className="font-semibold text-navy">
                     {employeeMap[pc.employeeId] ?? (
                       <span className="text-navy/40 italic font-normal">Unknown employee</span>
