@@ -78,8 +78,7 @@
     "tsx": "^4.22.4",
     "typescript": "^5.7.2",
     "vitest": "^4.1.8",
-    "wait-on": "^9.0.10",
-    "@vitest/coverage-v8": "^4.1.8"
+    "wait-on": "^9.0.10"
   },
   "build": {
     "appId": "com.bookkeeperai.desktop",

@@ -1,4 +1,4 @@
-﻿# icon-from-image.ps1
+# icon-from-image.ps1
 # Takes a source image (default build/icon-source.png), detects the background /
 # crops square (crop-to-artwork is ON by default; pass -NoCrop to disable),
 # applies rounded-corner transparency with anti-aliased mask and padding, and
@@ -13,6 +13,12 @@ param(
     [int]$PaddingPercent = 8,         # padding around artwork, % of final size
     [switch]$NoCrop                   # disable the default uniform-background trim
 )
+
+# Defaults resolve against the repo root (parent of scripts/); user-passed relative paths stay against the current folder.
+$repoRoot = Split-Path -Parent $PSScriptRoot
+if (-not $PSBoundParameters.ContainsKey('SourceImage')) { $SourceImage = Join-Path $repoRoot 'build/icon-source.png' }
+if (-not $PSBoundParameters.ContainsKey('PngOutput'))   { $PngOutput   = Join-Path $repoRoot 'build/icon.png' }
+if (-not $PSBoundParameters.ContainsKey('IcoOutput'))   { $IcoOutput   = Join-Path $repoRoot 'build/icon.ico' }
 
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing

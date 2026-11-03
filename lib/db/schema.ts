@@ -2636,12 +2636,12 @@ export const reportSchedules = pgTable('report_schedules', {
   lastMessage: text('last_message'),
   createdBy: uuid('created_by').references(() => users.id),
   createdAt: timestamp('created_at').defaultNow().notNull(),
-  /** reports (0082): also email the export to these addresses (comma separated); null = files only. */
+  /** reports (0083): also email the export to these addresses (comma separated); null = files only. */
   emailTo: text('email_to'),
 });
 
 /**
- * reports (0082): Commented Reports (QB "Comment on Report"). A report saved as a picture of what
+ * reports (0083): Commented Reports (QB "Comment on Report"). A report saved as a picture of what
  * it showed (snapshot: columns + rows, no QuickZoom targets) with comments on its amounts.
  */
 export const commentedReports = pgTable('commented_reports', {

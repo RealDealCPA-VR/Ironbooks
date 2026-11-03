@@ -8,7 +8,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 const root = process.cwd();
-const SKIP = new Set(['node_modules', '.next', '.git', '.wt', 'dist', 'out', 'release']);
+const SKIP = new Set(['.bookkeeper-data', 'node_modules', '.next', '.git', '.wt', 'dist', 'out', 'release']);
 
 function declarationFiles(dir: string, out: string[] = []): string[] {
   for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
