@@ -46,7 +46,7 @@ import {
 import type { DB } from '@/lib/db';
 import { resolveDataDir } from '@/lib/db';
 import { Money, formatCurrency, toAmountString } from '@/lib/money';
-import { can, type Action, type Area } from '@/lib/permissions/model';
+import { canRef, type AccessRef, type Action } from '@/lib/permissions/model';
 import { DEFAULT_SEND_FORMS, addDaysIso, fillMergeFields, todayInTimeZone, type SendFormDefaults } from '@/lib/preferences';
 import { ServiceError, notFound, validation, writeAudit, type ServiceContext } from './_base';
 import { getCompany, getPreferences } from './company';
@@ -154,8 +154,9 @@ const OPEN_DOC_STATUSES = ['open', 'partial', 'overdue'] as const;
 // Small helpers
 // ---------------------------------------------------------------------------
 
-function allowed(ctx: ServiceContext, area: Area, action: Action = 'view'): boolean {
-  return !ctx.access || can(ctx.access, area, action);
+/** prefsperms: an activity (the item's own: Bank Feeds, Invoices, Pay Bills…) or a whole area. */
+function allowed(ctx: ServiceContext, area: AccessRef, action: Action = 'view'): boolean {
+  return !ctx.access || canRef(ctx.access, area, action);
 }
 
 /** The company's home currency code: the multi-currency base, else Company settings, else USD. */
@@ -484,7 +485,7 @@ const overdueInvoiceSource: Source = async ({ ctx, today, countOnly, companyName
     for (const s of sent) lastSent.set(s.id, instantDay(s.at, timeZone) ?? '');
   }
 
-  const canEmail = allowed(ctx, 'customers', 'print');
+  const canEmail = allowed(ctx, 'customers.invoices', 'print');
   const items = rows.map((r) => {
     const due = isoDay(r.dueDate)!;
     const days = daysBetween(due, today);
@@ -862,16 +863,17 @@ const undepositedSource: Source = async ({ ctx, today, undepositedDays }) => {
 };
 
 /** Which sources a person may see: they must be able to act on the item. */
-const SOURCES: Array<{ kind: AttentionKind; source: Source; area: Area | null; action: Action }> = [
-  { kind: 'bank_txn', source: bankTxnSource, area: 'banking', action: 'create' },
-  { kind: 'overdue_invoice', source: overdueInvoiceSource, area: 'customers', action: 'view' },
-  { kind: 'bill_due', source: billSource, area: 'vendors', action: 'create' },
+const SOURCES: Array<{ kind: AttentionKind; source: Source; area: AccessRef | null; action: Action }> = [
+  // prefsperms: the activity of the screen each item is acted on.
+  { kind: 'bank_txn', source: bankTxnSource, area: 'banking.bank_feeds', action: 'create' },
+  { kind: 'overdue_invoice', source: overdueInvoiceSource, area: 'customers.invoices', action: 'view' },
+  { kind: 'bill_due', source: billSource, area: 'vendors.pay_bills', action: 'create' },
   { kind: 'ai_error', source: aiErrorSource, area: 'accounting', action: 'view' },
-  { kind: 'reconcile', source: reconcileSource, area: 'accounting', action: 'create' },
-  { kind: 'payroll_tax', source: payrollTaxSource, area: 'payroll', action: 'create' },
+  { kind: 'reconcile', source: reconcileSource, area: 'accounting.reconcile', action: 'create' },
+  { kind: 'payroll_tax', source: payrollTaxSource, area: 'payroll.liabilities', action: 'create' },
   { kind: 'todo', source: todoSource, area: null, action: 'view' },
-  { kind: 'backup', source: backupSource, area: 'file_utilities', action: 'create' },
-  { kind: 'undeposited', source: undepositedSource, area: 'banking', action: 'create' },
+  { kind: 'backup', source: backupSource, area: 'file_utilities.backup', action: 'create' },
+  { kind: 'undeposited', source: undepositedSource, area: 'banking.deposits', action: 'create' },
 ];
 
 /** The kinds this person can act on (Users & Roles). */
@@ -1113,7 +1115,7 @@ export async function sendPaymentReminder(
 ): Promise<{ ok: true; to: string }> {
   if (typeof invoiceId !== 'string' || !/^[0-9a-f-]{36}$/i.test(invoiceId)) throw notFound('Invoice');
   // Same right as emailing the invoice itself (the route asks for it too).
-  requirePermission(ctx, 'customers', 'print');
+  requirePermission(ctx, 'customers.invoices', 'print');
   const [inv] = await ctx.db
     .select({
       id: invoices.id,

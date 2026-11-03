@@ -30,6 +30,7 @@ import {
 import { API_ROUTE_PERMISSIONS, PAGE_AREAS, apiActivityFor, pageAccessFor, pageAreasFor, type HttpMethod } from './routes';
 import { authorizeRequest } from './enforce';
 import { activityForRoute } from './routeActivities';
+import { REPORT_CATALOG, reportActivity } from '@/lib/reports/catalog';
 
 const UUID = '11111111-2222-4333-8444-555555555555';
 const SAMPLE: Record<string, string> = {
@@ -193,6 +194,11 @@ describe('upgrade: roles stored before activities keep exactly the same access',
     for (const r of roles) {
       const access = unionRoles([r]);
       expect(access.permissions).toEqual(normalizeGrant(r.permissions));
+      // can() (requirePermission, member / self routes, undo, view filters) answers exactly as before.
+      const old = normalizeGrant(r.permissions);
+      for (const area of AREA_KEYS) {
+        for (const action of ACTIONS) expect(can(access, area, action), `${r.key} ${area} ${action}`).toBe(old[area].includes(action));
+      }
       for (const def of ACTIVITIES) {
         if (!def.viewBalance) continue;
         expect(canActivity(access, def.key, 'view_balance')).toBe(access.permissions[def.area].includes('view'));
@@ -212,10 +218,47 @@ describe('per-activity rights', () => {
     expect(decide('/api/export/statements/batch', 'GET', access)).toBe(false);
     expect(decide('/invoices', 'GET', access)).toBe(true);
     expect(decide('/payments', 'GET', access)).toBe(false);
-    // The coarse area answer is still "can view Customers & Receivables" (any activity).
-    expect(can(access, 'customers', 'view')).toBe(true);
-    // A route no activity is mapped to would need the whole area.
+    // An area-level check (services, member routes) needs the action on the WHOLE area: Invoices
+    // alone is not "Customers & Receivables".
+    expect(can(access, 'customers', 'view')).toBe(false);
+    expect(can(access, 'customers', 'create')).toBe(false);
     expect(canWholeArea(access, 'customers', 'create')).toBe(false);
+  });
+
+  it('activity-only roles never pass an area-level check through another activity (review P1)', () => {
+    // Form Templates: Delete is not Delete on Company & Preferences (archive the company file).
+    const templates = unionRoles([role({ 'company.templates': ['view', 'delete'] })]);
+    expect(can(templates, 'company', 'delete')).toBe(false);
+    expect(canActivity(templates, 'company.company_file', 'delete')).toBe(false);
+    // Budgets: Modify does not rename the company.
+    const budgets = unionRoles([role({ 'company.budgets': ['view', 'modify'] })]);
+    expect(can(budgets, 'company', 'modify')).toBe(false);
+    expect(canActivity(budgets, 'company.company_file', 'modify')).toBe(false);
+    // Purchase Orders: Create is not Vendors & Payables: Create (save a receipt as a bill).
+    const po = unionRoles([role({ 'vendors.purchase_orders': ['view', 'create'] })]);
+    expect(can(po, 'vendors', 'create')).toBe(false);
+    expect(can(po, 'vendors', 'view')).toBe(false);
+    // Receive Payments without Delete, even with Invoices: Full.
+    const pay = unionRoles([role({ 'customers.invoices': ['full'], 'customers.payments': ['view', 'create'] })]);
+    expect(can(pay, 'customers', 'delete')).toBe(false);
+    // Every activity of the area with the right: the area check passes.
+    const allVendors: PermissionGrant = {};
+    for (const d of activitiesOf('vendors')) (allVendors as Record<string, string[]>)[d.key] = ['view', 'create'];
+    expect(can(unionRoles([role(allVendors)]), 'vendors', 'create')).toBe(true);
+    // Mixed: an old-style area grant plus one activity is still only the area grant.
+    const mixed = unionRoles([role({ vendors: ['view'] }), role({ 'vendors.bills': ['view', 'create'] })]);
+    expect(can(mixed, 'vendors', 'view')).toBe(true);
+    expect(can(mixed, 'vendors', 'create')).toBe(false);
+    expect(canActivity(mixed, 'vendors.bills', 'create')).toBe(true);
+  });
+
+  it('the company file itself (rename / archive) is its own activity, given to every old Company grant', () => {
+    expect(supportedActions(activityDef('company.company_file')!)).toEqual(['view', 'modify', 'delete']);
+    const accountant = unionRoles([BUILTIN_ROLES.find((r) => r.key === 'accountant')!]);
+    expect(canActivity(accountant, 'company.company_file', 'modify')).toBe(true);
+    expect(canActivity(accountant, 'company.company_file', 'delete')).toBe(false);
+    const admin = unionRoles([BUILTIN_ROLES.find((r) => r.key === 'admin')!]);
+    expect(canActivity(admin, 'company.company_file', 'delete')).toBe(true);
   });
 
   it('Statements alone: print statements, nothing else', () => {
@@ -256,5 +299,22 @@ describe('per-activity rights', () => {
     const wantsInvoices = unionRoles([role({ 'customers.invoices': ['view', 'create'] })]);
     expect(isSubset(wantsInvoices, manager)).toBe(true);
     expect(isSubset(wantsPayments, manager)).toBe(false);
+  });
+});
+
+describe('reports: every catalog report needs an activity of its own area', () => {
+  it('reportActivity maps every REPORT_CATALOG entry (a new report area would otherwise be a 500)', () => {
+    const problems: string[] = [];
+    for (const e of REPORT_CATALOG) {
+      let k: string | null = null;
+      try {
+        k = reportActivity(e);
+      } catch (err) {
+        problems.push(`${e.key}: ${(err as Error).message}`);
+        continue;
+      }
+      if (activityDef(k)?.area !== e.area) problems.push(`${e.key}: ${k} is not in ${e.area}`);
+    }
+    expect(problems).toEqual([]);
   });
 });

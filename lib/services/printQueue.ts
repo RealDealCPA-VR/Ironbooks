@@ -486,7 +486,7 @@ const SOURCE_LABEL: Record<PrintSource, string> = {
 
 /** Printing paychecks (or putting one back in the queue) needs the payroll permission too. */
 function assertMayPrintSources(ctx: ServiceContext, sources: Iterable<PrintSource>) {
-  for (const s of sources) if (s === 'paycheck') requirePermission(ctx, 'payroll', 'print');
+  for (const s of sources) if (s === 'paycheck') requirePermission(ctx, 'payroll.paychecks', 'print');
 }
 
 async function checkState(ctx: ServiceContext, source: PrintSource, id: string): Promise<CheckState> {

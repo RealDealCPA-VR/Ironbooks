@@ -58,7 +58,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     // Opening quantity on hand posts to the ledger (Inventory Asset vs Opening Balance Equity),
     // so it needs inventory rights on top of the list rights this route is mapped to.
     const hasOpening = openingQuantity != null && openingQuantity !== '' && Number(openingQuantity) !== 0;
-    if (hasOpening) requirePermission(ctx, 'inventory', 'create');
+    if (hasOpening) requirePermission(ctx, 'inventory.adjust', 'create');
     let item = hasOpening
       ? (await createItemWithOpeningStock(ctx, { ...input, openingQuantity, openingValue, openingUnitCost, openingAsOf, openingCosting })).item
       : await createItem(ctx, input);

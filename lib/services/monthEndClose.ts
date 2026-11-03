@@ -559,7 +559,7 @@ async function stepUndeposited({ ctx, periodEnd, asOf, accounts: accts, ledger }
 async function stepAging(side: 'ar' | 'ap', { ctx, periodEnd, accounts: accts, ledger }: StepInput): Promise<Computed> {
   // Per-customer / per-vendor balances belong to the Customers & Sales / Vendors & Purchases
   // reports (as in the report pack); without that area only the tie-out figures are shown.
-  const showNames = await canAccess(ctx, side === 'ar' ? 'reports_sales' : 'reports_purchases', 'view');
+  const showNames = await canAccess(ctx, side === 'ar' ? 'reports_sales.receivables' : 'reports_purchases.payables', 'view');
   const report = await agingSummary(ctx, { asOf: periodEnd } as ReportParams, side);
   const grand = report.rows.find((r) => r.id === 'ag:grand');
   const agingTotal = Money.of((grand?.cells.total as string | null) ?? 0);
@@ -655,7 +655,7 @@ async function stepPayroll({ ctx, periodEnd, asOf }: StepInput): Promise<Compute
 
 async function stepErrorScan({ ctx, scanRanAt }: StepInput): Promise<Computed> {
   // Verify Data belongs to File Utilities (/api/integrity); people without it see only the scan.
-  const showIntegrity = await canAccess(ctx, 'file_utilities', 'view');
+  const showIntegrity = await canAccess(ctx, 'file_utilities.integrity', 'view');
   const integrity = showIntegrity ? await verifyIntegrity(ctx) : { allOk: true, checks: [] as Awaited<ReturnType<typeof verifyIntegrity>>['checks'] };
   const open = await listErrors(ctx, { resolved: false });
   const rows: StepRow[] = integrity.checks.map((c) => ({
@@ -918,7 +918,7 @@ async function canAccess(
 }
 
 function canSetClosingDate(ctx: ServiceContext): Promise<boolean> {
-  return canAccess(ctx, 'closing', 'modify');
+  return canAccess(ctx, 'closing.closing_date', 'modify');
 }
 
 function effectiveStatus(row: CloseRow | null, closingDate: string | null, periodEnd: string): 'open' | 'closed' {
@@ -1146,7 +1146,7 @@ export interface CloseMonthResult {
  * or reviewed.
  */
 export async function closeMonth(ctx: ServiceContext, input: CloseMonthInput): Promise<CloseMonthResult> {
-  await requireEffectivePermission(ctx, 'closing', 'modify');
+  await requireEffectivePermission(ctx, 'closing.closing_date', 'modify');
   const periodEnd = parsePeriodEnd(input.periodEnd);
   // The local calendar day (the desktop app's clock, the same one the page builds its month ends
   // from, not UTC), and the period end must be over: its last day itself is still too early.
@@ -1295,9 +1295,9 @@ async function reconciliationSummary(ctx: ServiceContext, periodStart: string, p
 export async function buildMonthEndReportPack(ctx: ServiceContext, periodEndInput: string): Promise<ReportPack> {
   const periodEnd = parsePeriodEnd(periodEndInput);
   // The pack carries customer and vendor balances too, so it needs those report areas as well.
-  await requireEffectivePermission(ctx, 'reports_financial', 'print');
-  await requireEffectivePermission(ctx, 'reports_sales', 'view');
-  await requireEffectivePermission(ctx, 'reports_purchases', 'view');
+  await requireEffectivePermission(ctx, 'reports_financial.company', 'print');
+  await requireEffectivePermission(ctx, 'reports_sales.receivables', 'view');
+  await requireEffectivePermission(ctx, 'reports_purchases.payables', 'view');
   const periodStart = periodStartFor(periodEnd);
   const company = await getCompany(ctx);
   if (!company) throw notFound('company');
@@ -1315,7 +1315,7 @@ export async function buildMonthEndReportPack(ctx: ServiceContext, periodEndInpu
   const reconTitle = 'Reconciliation Summary';
   // Reconciliation reports are Sensitive Accounting: print (/api/reconciliations/[id]/report);
   // without it the section stays in the pack with a note instead of the figures.
-  const reconAllowed = await canAccess(ctx, 'accounting', 'print');
+  const reconAllowed = await canAccess(ctx, 'accounting.reconcile', 'print');
   const reconRows: PdfCell[][] = reconAllowed
     ? await reconciliationSummary(ctx, periodStart, periodEnd)
     : [[RECON_NO_ACCESS, '', '', '', '', '', '', '']];

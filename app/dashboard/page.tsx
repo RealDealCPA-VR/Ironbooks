@@ -81,7 +81,8 @@ export default async function DashboardPage({ searchParams }: { searchParams: Pr
   const allowedHrefs = await allowedWorkflowHrefs(ctx);
   // Users & Roles: the financial snapshot needs Reports — Financial (QB Company Snapshot parity).
   // Everyone else gets the Home workflow (only the tasks they can do) and their reminders.
-  if (ctx.access && !can(ctx.access, 'reports_financial', 'view')) {
+  // prefsperms: the same activity GET /api/dashboard needs (Company & Financial reports).
+  if (ctx.access && !canActivity(ctx.access, 'reports_financial.company', 'view')) {
     const myPrefs = await getMyPreferences(ctx);
     return <LimitedHome allowedHrefs={myPrefs.showHomeWorkflow ? allowedHrefs : null} />;
   }

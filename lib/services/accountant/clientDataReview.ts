@@ -525,7 +525,7 @@ export async function autoApplyCustomerCredit(
 ): Promise<{ applied: string; invoices: number }> {
   // The route only guarantees Accounting; applying a payment / credit memo is a Customers change
   // (Receive Payments needs Customers: modify), so this fix is never a side door around it.
-  requirePermission(ctx, 'customers', 'modify');
+  requirePermission(ctx, input.refType === 'credit_memo' ? 'customers.credit_memos' : 'customers.payments', 'modify');
   let customerId: string;
   let available: ReturnType<typeof Money.zero>;
   if (input.refType === 'payment') {
@@ -576,7 +576,7 @@ export async function autoApplyCustomerCredit(
 /** Apply an unapplied bill credit to the vendor's oldest open bills. */
 export async function autoApplyVendorCredit(ctx: ServiceContext, input: { refId: string }) {
   // Applying a bill credit is a Vendors change (the bill credit's own Apply needs Vendors: modify).
-  requirePermission(ctx, 'vendors', 'modify');
+  requirePermission(ctx, 'vendors.vendor_credits', 'modify');
   const [c] = await ctx.db
     .select()
     .from(vendorCredits)

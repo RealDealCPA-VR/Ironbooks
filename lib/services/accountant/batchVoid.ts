@@ -37,22 +37,23 @@ import { voidPaycheck } from '../payroll';
 import { voidJournalEntry } from '../posting';
 import { requirePermission } from '../access';
 import { orphanedSalesTaxFixes, voidOrphanedSalesTaxFixes } from './salesTaxTools';
-import type { Area } from '@/lib/permissions/model';
+import type { AccessRef } from '@/lib/permissions/model';
 
 /** The area that owns each document type — voiding needs that area's delete right too (the route
  *  only guarantees accounting:delete). */
-const VOID_AREA: Record<BatchTxnType, Area> = {
-  invoice: 'customers',
-  sales_receipt: 'customers',
-  credit_memo: 'customers',
-  payment: 'customers',
-  bill: 'vendors',
-  bill_payment: 'vendors',
-  vendor_credit: 'vendors',
-  check: 'banking',
-  deposit: 'banking',
-  paycheck: 'payroll',
-  journal: 'accounting',
+const VOID_AREA: Record<BatchTxnType, AccessRef> = {
+  // prefsperms: the document's own activity (Invoices, Receive Payments, Pay Bills, …).
+  invoice: 'customers.invoices',
+  sales_receipt: 'customers.sales_receipts',
+  credit_memo: 'customers.credit_memos',
+  payment: 'customers.payments',
+  bill: 'vendors.bills',
+  bill_payment: 'vendors.pay_bills',
+  vendor_credit: 'vendors.vendor_credits',
+  check: 'banking.write_checks',
+  deposit: 'banking.deposits',
+  paycheck: 'payroll.paychecks',
+  journal: 'accounting.journal_entries',
 };
 
 export const BATCH_TXN_TYPES = [
@@ -276,7 +277,7 @@ async function voidOne(ctx: ServiceContext, type: BatchTxnType, id: string): Pro
         throw new ServiceError('CONFLICT', 'This entry belongs to a document — void the document instead.');
       }
       const srcKind = entry.sourceRef?.split(':')[0];
-      if (srcKind === 'tax_agency' || srcKind === 'sales_tax_adj') requirePermission(ctx, 'sales_tax', 'delete');
+      if (srcKind === 'tax_agency' || srcKind === 'sales_tax_adj') requirePermission(ctx, 'sales_tax.pay', 'delete');
       if (entry.status === 'draft') {
         // Never posted → no ledger impact; deleting it is safe (QB "delete").
         await inTransaction(ctx, async (tx) => {

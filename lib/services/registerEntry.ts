@@ -17,6 +17,7 @@ import { Money } from '@/lib/money';
 import { planRegisterEntry, type RegisterEntryKind, type RegisterSide } from '@/lib/registerEntryPlan';
 import { notFound, validation, type ServiceContext } from './_base';
 import { requirePermission } from './access';
+import type { AccessRef } from '@/lib/permissions/model';
 import { createExpense } from './expenses';
 import { createDeposit } from './deposits';
 import { createTransfer } from './transfers';
@@ -52,13 +53,14 @@ export interface RegisterEntryResult {
   id: string;
 }
 
-const KIND_AREA: Record<RegisterEntryKind, 'banking' | 'accounting'> = {
-  check: 'banking',
-  deposit: 'banking',
-  card_charge: 'banking',
-  card_credit: 'banking',
-  transfer: 'accounting',
-  journal: 'accounting',
+/** prefsperms: Use Register for bank / card lines; Transfer Funds and General Journal Entries by their own activity. */
+const KIND_AREA: Record<RegisterEntryKind, AccessRef> = {
+  check: 'banking.registers',
+  deposit: 'banking.registers',
+  card_charge: 'banking.registers',
+  card_credit: 'banking.registers',
+  transfer: 'accounting.transfers',
+  journal: 'accounting.journal_entries',
 };
 
 async function loadAccount(ctx: ServiceContext, id: string, what: string) {

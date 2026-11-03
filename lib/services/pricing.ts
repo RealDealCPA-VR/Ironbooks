@@ -688,7 +688,7 @@ export function requirePriceLevelChangeAccess(
 ): void {
   if (next === undefined) return;
   if ((next ?? null) === (current ?? null)) return;
-  requirePermission(ctx, 'lists', 'view');
+  requirePermission(ctx, 'lists.price_levels', 'view');
 }
 
 export async function assignCustomerPricing(

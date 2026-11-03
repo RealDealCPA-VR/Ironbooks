@@ -77,7 +77,7 @@ export async function POST(req: NextRequest) {
         result = await mergeClasses(ctx, input);
         break;
       case 'employee':
-        requirePermission(ctx, 'payroll', 'delete');
+        requirePermission(ctx, 'payroll.employees', 'delete');
         result = await mergeEmployees(ctx, input);
         break;
       case 'other_name':

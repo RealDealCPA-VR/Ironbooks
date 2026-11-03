@@ -70,7 +70,7 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    requirePermission(ctx, 'file_utilities', 'delete');
+    requirePermission(ctx, 'file_utilities.restore', 'delete');
     if (!ctx.userId) throw new ServiceError('FORBIDDEN', 'Authentication required.');
     await assertExclusiveAccess(ctx, 'Restore'); // adds a NEW company: other companies untouched
 

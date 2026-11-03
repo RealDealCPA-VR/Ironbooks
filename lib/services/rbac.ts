@@ -107,7 +107,7 @@ export async function setMemberRole(
 ): Promise<CompanyMember> {
   // Enterprise roles: Users & Roles — modify (setUserRoles below adds the escalation and
   // last-Admin guards).
-  await requireEffectivePermission(ctx, 'users', 'modify');
+  await requireEffectivePermission(ctx, 'users.users', 'modify');
   const actorRole = await getRole(ctx);
   if (!ALL_ROLES.includes(role)) {
     throw validation(`role must be one of: ${ALL_ROLES.join(', ')}.`);

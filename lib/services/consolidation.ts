@@ -21,7 +21,14 @@ import type { CellValue, StdColumn, StdReport, StdRow } from '@/lib/reports/type
 import type { ReportParams } from '@/lib/validation/reports';
 import { validation } from './_base';
 import { resolveAccess } from './access';
-import { can } from '@/lib/permissions/model';
+import { canActivity, type ActivityKey } from '@/lib/permissions/model';
+
+/** The activity each combined report needs in every company it combines (lib/reports/catalog.ts reportActivity). */
+const CONSOLIDATED_ACTIVITY: Record<'reports_financial' | 'reports_sales' | 'reports_purchases', ActivityKey> = {
+  reports_financial: 'reports_financial.company',
+  reports_sales: 'reports_sales.receivables',
+  reports_purchases: 'reports_purchases.payables',
+};
 import { trialBalanceAmounts } from './reportsStandard';
 import { apAging, arAging, cashFlow, type CashFlowLine, type CashFlowReport } from './reportsExtra';
 import {
@@ -212,7 +219,8 @@ export async function reportableCompanies(
     // Archived (soft-deleted) company files are not combined, as in QB (closed files).
     if ((c.settings as Record<string, unknown> | null)?.archived === true) continue;
     const r = await resolveAccess(ctx.db, c.id, ctx.userId);
-    if (r.member && r.active && can(r.access, area, 'view')) out.push(c);
+    // prefsperms: the combined report's own activity in that company, not any report of the area.
+    if (r.member && r.active && canActivity(r.access, CONSOLIDATED_ACTIVITY[area], 'view')) out.push(c);
   }
   return out;
 }

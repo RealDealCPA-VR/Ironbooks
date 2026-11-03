@@ -24,8 +24,8 @@ export async function POST(req: NextRequest) {
     const parsed = schema.safeParse(await req.json().catch(() => ({})));
     if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     const { levelId, ...person } = parsed.data;
-    if (person.employeeId) requirePermission(ctx, 'payroll', 'modify');
-    else if (person.vendorId) requirePermission(ctx, 'vendors', 'modify');
+    if (person.employeeId) requirePermission(ctx, 'payroll.employees', 'modify');
+    else if (person.vendorId) requirePermission(ctx, 'vendors.center', 'modify');
     return NextResponse.json(await assignBillingRateLevel(ctx, person, levelId));
   } catch (err) {
     return routeError(err, 'POST /api/billing-rate-levels/assign');

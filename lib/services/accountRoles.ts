@@ -343,7 +343,7 @@ export async function listAccountRoles(ctx: ServiceContext): Promise<AccountRole
  */
 export async function setAccountRole(ctx: ServiceContext, role: AccountRole, accountId: string | null): Promise<AccountRoleRow> {
   if (!ACCOUNT_ROLE_KEYS.includes(role)) throw validation('Unknown system account.');
-  requirePermission(ctx, 'company', 'modify');
+  requirePermission(ctx, 'company.preferences', 'modify');
   const def = ACCOUNT_ROLES[role];
   await inTransaction(ctx, async (tx) => {
     const { rows, chosen } = await loadAll(tx);

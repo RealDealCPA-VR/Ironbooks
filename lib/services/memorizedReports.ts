@@ -182,7 +182,7 @@ export async function deleteMemorizedReport(ctx: ServiceContext, id: string) {
 /** Turn a report-builder result into the standard report shape (for groups / schedules). */
 async function runCustomReport(ctx: ServiceContext, name: string, config: Record<string, unknown>): Promise<StdReport> {
   // Report builder output is general-ledger data: same gate as the GL / financial reports.
-  requirePermission(ctx, 'reports_financial', 'view');
+  requirePermission(ctx, 'reports_financial.custom', 'view');
   const res = await runReport(ctx, config as unknown as ReportConfig);
   return {
     key: 'custom',
@@ -291,7 +291,7 @@ function canRunReportTypes(access: EffectiveAccess | undefined, types: string[])
     const entry = standardReportEntry(t);
     if (entry) return canActivity(access, reportActivity(entry), 'view');
     if (t === 'custom') return canActivity(access, 'reports_financial.custom', 'view');
-    return can(access, area, 'view');
+    return can(access, area, 'view'); // an area with no catalog entry: the whole area (fail closed)
   });
 }
 
@@ -526,7 +526,7 @@ async function emailScheduledReport(
 }
 
 export async function listReportSchedules(ctx: ServiceContext) {
-  requirePermission(ctx, 'file_utilities', 'view');
+  requirePermission(ctx, 'file_utilities.schedules', 'view');
   return ctx.db
     .select()
     .from(reportSchedules)
@@ -549,7 +549,7 @@ export async function createReportSchedule(
     emailTo?: string | null;
   },
 ) {
-  requirePermission(ctx, 'file_utilities', 'create');
+  requirePermission(ctx, 'file_utilities.schedules', 'create');
   const emailTo = normalizeRecipients(input.emailTo);
   if (!!input.memorizedReportId === !!input.groupId) throw validation('Choose either one memorized report or one report group.');
   if (input.memorizedReportId) {
@@ -599,7 +599,7 @@ export async function updateReportSchedule(
   id: string,
   patch: { name?: string; frequency?: ScheduleFrequency; isActive?: boolean; format?: 'csv' | 'xlsx'; emailTo?: string | null },
 ) {
-  requirePermission(ctx, 'file_utilities', 'modify');
+  requirePermission(ctx, 'file_utilities.schedules', 'modify');
   const emailTo = patch.emailTo !== undefined ? normalizeRecipients(patch.emailTo) : undefined;
   const [before] = await ctx.db.select().from(reportSchedules).where(and(eq(reportSchedules.id, id), eq(reportSchedules.companyId, ctx.companyId)));
   if (!before) throw notFound('Report schedule');
@@ -633,7 +633,7 @@ export async function updateReportSchedule(
 }
 
 export async function deleteReportSchedule(ctx: ServiceContext, id: string) {
-  requirePermission(ctx, 'file_utilities', 'delete');
+  requirePermission(ctx, 'file_utilities.schedules', 'delete');
   const [before] = await ctx.db.select().from(reportSchedules).where(and(eq(reportSchedules.id, id), eq(reportSchedules.companyId, ctx.companyId)));
   if (!before) throw notFound('Report schedule');
   return inTransaction(ctx, async (tx) => {
@@ -671,7 +671,7 @@ export async function runDueSchedules(
   ctx: ServiceContext,
   opts: { now?: Date; outDir?: string } = {},
 ): Promise<ScheduleRunResult[]> {
-  requirePermission(ctx, 'file_utilities', 'create');
+  requirePermission(ctx, 'file_utilities.schedules', 'create');
   assertNotSandbox('Scheduled reports'); // sandbox mode: schedules wait for the real file
   const now = opts.now ?? new Date();
   const root = opts.outDir ?? reportExportRoot();

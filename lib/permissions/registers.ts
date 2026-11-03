@@ -13,7 +13,7 @@
  * Pure (no DB): the registers routes use it to filter the list and to guard one register.
  */
 import { isBankAccount, isCreditCardAccount, isUndepositedFunds } from '@/lib/accountTypes';
-import { can, type Area, type EffectiveAccess } from './model';
+import { canRef, type AccessRef, type Area, type EffectiveAccess } from './model';
 
 export interface RegisterAccountLike {
   type: string;
@@ -30,8 +30,20 @@ export function registerViewAreas(a: RegisterAccountLike): Area[] {
   return ['accounting'];
 }
 
+/**
+ * prefsperms: what each of those areas means for a register, per activity. A bank / card register
+ * is Banking > Use Register; the General Ledger detail of an income or expense account is Reports
+ * — Financial > Accountant & Taxes. A/R, A/P and other balance-sheet registers list every kind of
+ * document of their area, so they need the WHOLE area (fail closed for roles built per activity).
+ */
+function registerViewRefs(a: RegisterAccountLike): AccessRef[] {
+  return registerViewAreas(a).map((area): AccessRef =>
+    area === 'banking' ? 'banking.registers' : area === 'reports_financial' ? 'reports_financial.accountant' : area,
+  );
+}
+
 /** True when `access` may open the register (trusted contexts without access: yes). */
 export function canViewRegister(access: EffectiveAccess | null | undefined, a: RegisterAccountLike): boolean {
   if (!access) return true;
-  return registerViewAreas(a).some((area) => can(access, area, 'view'));
+  return registerViewRefs(a).some((ref) => canRef(access, ref, 'view'));
 }

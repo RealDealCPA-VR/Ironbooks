@@ -125,7 +125,9 @@ export interface EffectiveAccess {
   roleKeys: string[];
   /**
    * Per area: an action is here when the role grants it on the area (old-style grant) or on ANY
-   * activity of the area. Coarse - routes and pages check the activity (`canActivity`).
+   * activity of the area. Coarse ("uses some part of the area": menus, hasAnyWrite, isSubset) -
+   * never read it to ALLOW something: `can` (area-level checks) also needs the action on every
+   * activity of the area, routes and pages check the activity (`canActivity`).
    */
   permissions: PermissionSet;
   /**
@@ -405,8 +407,8 @@ const isAction = (a: string): a is Action => (ACTIONS as readonly string[]).incl
 
 /**
  * Expand 'full' and the implicit view; drop unknown areas/actions; stable action order. An
- * ACTIVITY key adds its rights (View Balance aside) to its area, so `can(access, area, …)` stays
- * true when any activity of the area allows it.
+ * ACTIVITY key adds its rights (View Balance aside) to its area: the coarse set says "some part of
+ * the area" (`canSomeActivity`); `can` also checks every activity (fail closed).
  */
 export function normalizeGrant(grant: PermissionGrant | null | undefined): PermissionSet {
   const out = emptyPermissionSet();
@@ -543,13 +545,58 @@ export function withoutAreas(
   return { ...access, permissions, activities };
 }
 
-export function can(
-  access: Pick<EffectiveAccess, 'permissions'> | null | undefined,
-  area: Area,
-  action: Action,
-): boolean {
+/** What the checks below read: the coarse area set and (when known) the per-activity rights. */
+type AccessLike = Pick<EffectiveAccess, 'permissions'> & { activities?: ActivitySet };
+
+/**
+ * AREA-level check (requirePermission, member / self routes, undo, the view filters): may the
+ * access do `action` on the whole area? Fail closed for roles built per ACTIVITY: the action is
+ * needed on EVERY activity of the area that has that right, so Form Templates: Delete is not
+ * "Company & Preferences: Delete" and Purchase Orders: Create is not "Vendors & Payables: Create"
+ * (prefsperms review P1). For a role stored the old way (one grant per area: every built-in role
+ * and every role saved before activities) each activity holds the area's grant, so the answer is
+ * exactly the old area answer (lib/permissions/activities.test.ts proves it for every area and
+ * action). Where the thing checked belongs to one activity, check that activity instead
+ * (`canActivity`, or `canRef` with an activity key).
+ */
+export function can(access: AccessLike | null | undefined, area: Area, action: Action): boolean {
+  if (!access) return false;
+  if (!(access.permissions[area]?.includes(action) ?? false)) return false;
+  const acts = access.activities;
+  if (!acts) return true; // an access built by hand without activity rights: the area grant decides
+  return activitiesOf(area).every(
+    (d) => !supportedActions(d).includes(action) || (acts[d.key as ActivityKey]?.includes(action) ?? false),
+  );
+}
+
+/**
+ * The coarse answer: SOME activity of the area (or an area grant) allows the action. Only for
+ * "may use any part of this area" questions (may open the reports at all, show a menu) - never to
+ * allow an action on a particular thing.
+ */
+export function canSomeActivity(access: AccessLike | null | undefined, area: Area, action: Action): boolean {
   if (!access) return false;
   return access.permissions[area]?.includes(action) ?? false;
+}
+
+/** An area, or one activity of an area, that a service check names. */
+export type AccessRef = Area | ActivityKey;
+
+/** The area of an area-or-activity reference. */
+export function refArea(ref: AccessRef): Area {
+  return activityDef(ref)?.area ?? (ref as Area);
+}
+
+/**
+ * Check an area (the whole area, `can`) or one ACTIVITY (`canActivity`). An activity without that
+ * right (Statements has no Modify) falls back to the whole area, so a mapping can never lock out
+ * an Admin.
+ */
+export function canRef(access: AccessLike | null | undefined, ref: AccessRef, action: Action): boolean {
+  const def = activityDef(ref);
+  if (!def) return can(access, ref as Area, action);
+  if (!supportedActions(def).includes(action)) return can(access, def.area, action);
+  return canActivity(access, def.key, action);
 }
 
 /**
@@ -558,15 +605,21 @@ export function can(
  * follows View.
  */
 export function canActivity(
-  access: Pick<EffectiveAccess, 'permissions' | 'activities'> | null | undefined,
+  access: AccessLike | null | undefined,
   activity: string,
   action: ActivityAction,
 ): boolean {
   if (!access) return false;
   const def = activityDef(activity);
   if (!def) return false;
-  if (access.activities) return access.activities[def.key as ActivityKey]?.includes(action) ?? false;
-  return can(access, def.area, action === VIEW_BALANCE ? 'view' : action);
+  const areaAction: Action = action === VIEW_BALANCE ? 'view' : action;
+  if (access.activities) {
+    // An activity right always comes with its action in the coarse area set (unionRoles); an access
+    // whose area was taken away by hand (tests, tooling) has none of its activities either.
+    if (!canSomeActivity(access, def.area, areaAction)) return false;
+    return access.activities[def.key as ActivityKey]?.includes(action) ?? false;
+  }
+  return can(access, def.area, areaAction);
 }
 
 /**
@@ -574,16 +627,8 @@ export function canActivity(
  * needed on EVERY activity of the area that has that right. For a role stored the old way (one
  * grant for the whole area) this is exactly the old area check.
  */
-export function canWholeArea(
-  access: Pick<EffectiveAccess, 'permissions' | 'activities'> | null | undefined,
-  area: Area,
-  action: Action,
-): boolean {
-  if (!access) return false;
-  if (!access.activities) return can(access, area, action);
-  const defs = activitiesOf(area).filter((d) => supportedActions(d).includes(action));
-  if (!defs.length) return can(access, area, action);
-  return defs.every((d) => access.activities![d.key as ActivityKey]?.includes(action));
+export function canWholeArea(access: AccessLike | null | undefined, area: Area, action: Action): boolean {
+  return can(access, area, action);
 }
 
 /** True when `inner` grants nothing beyond `outer` (used to block privilege escalation). */

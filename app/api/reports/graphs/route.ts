@@ -17,7 +17,7 @@ export async function GET(req: NextRequest) {
     const sp = req.nextUrl.searchParams;
     const kind = (sp.get('kind') ?? 'income-expense') as GraphKind;
     if (!GRAPH_KINDS.includes(kind)) throw new ServiceError('VALIDATION', 'Unknown graph.');
-    requirePermission(ctx, kind === 'ar' ? 'reports_sales' : kind === 'ap' ? 'reports_purchases' : 'reports_financial', 'view');
+    requirePermission(ctx, kind === 'ar' ? 'reports_sales.receivables' : kind === 'ap' ? 'reports_purchases.payables' : 'reports_financial.company', 'view');
     const rest = new URLSearchParams(sp);
     rest.delete('kind');
     const parsed = parseReportParams(rest);
