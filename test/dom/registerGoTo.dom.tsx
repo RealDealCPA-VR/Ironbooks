@@ -4,7 +4,7 @@
 import * as React from 'react';
 import RegisterPage from '@/app/registers/[accountId]/page';
 import { Toaster } from '@/components/ui';
-import { check, domTest, mount, runDomTests, stubFetch, textOf, until, $ } from './kit';
+import { check, domTest, mount, runDomTests, stubFetch, textOf, until, $, type FetchCall } from './kit';
 
 const row = (n: number) => ({
   lineId: `l${n}`,
@@ -35,7 +35,7 @@ domTest('Ctrl+G at an older transaction: the page asks for rows back to it and h
   window.__params = { accountId: 'acct-savings' };
   window.history.replaceState(null, '', '?entry=je-2');
   const calls = stubFetch({
-    'GET /api/registers/acct-savings': (c) => (/entry=je-2/.test(c.path) ? register([1, 2, 3, 4, 5, 6].map(row)) : register([5, 6].map(row))),
+    'GET /api/registers/acct-savings': (c: FetchCall) => (/entry=je-2/.test(c.path) ? register([1, 2, 3, 4, 5, 6].map(row)) : register([5, 6].map(row))),
     'GET /api/accounts': [],
   });
   await mount(
