@@ -28,6 +28,7 @@ const require = createRequire(import.meta.url);
 const root = process.cwd();
 const format = require(path.join(root, 'electron', 'companyFileFormat.js'));
 const companyLock = require(path.join(root, 'electron', 'companyLock.js'));
+const fileCrypto = require(path.join(root, 'electron', 'fileCrypto.js'));
 const { PGlite } = require('@electric-sql/pglite');
 
 const EXE = process.env.E2E_EXE || path.join(root, 'release', 'win-unpacked', 'Ironbooks.exe');
@@ -59,7 +60,10 @@ function workstation(name, port) {
 
 async function invoicesInFile() {
   const out = path.join(tmp, `check-${randomBytes(3).toString('hex')}`);
-  await format.extractCompanyFile(companyFile, out);
+  // The company file is protected with passwords: Bob's own key slot opens it (fileCrypto), as his sign-in does.
+  const m = format.readCompanyManifest(companyFile);
+  const fileKey = format.isSealedManifest(m) ? await fileCrypto.unlockWith(m.encryption, { kind: 'password', login: 'bob', secret: 'bobpass123' }) : undefined;
+  await format.extractCompanyFile(companyFile, out, { fileKey });
   const pg = new PGlite(out);
   try {
     return (await pg.query("select total::text as total from invoices order by total")).rows.map((r) => r.total);
