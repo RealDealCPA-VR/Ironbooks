@@ -5,7 +5,7 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { and, eq, ne } from 'drizzle-orm';
-import { accounts, bills, invoices, journalEntries } from '@/lib/db/schema';
+import { accounts, bills, creditMemos, invoices, journalEntries, vendorCredits } from '@/lib/db/schema';
 import { setClosingDate } from './company';
 import { trialBalance } from './reports';
 import { applySetupInterview, type SetupInterviewInput } from './setupInterview';
@@ -92,6 +92,39 @@ describe('Setup interview opening balances', () => {
     expect(await bal(t.acct['1000'])).toBe('5500.00');
     expect((await byName('Visa Card')).balance).toBe('300.00');
     expect((await t.db.select().from(invoices).where(eq(invoices.companyId, t.ctx.companyId)))).toHaveLength(1);
+    expect((await trialBalance(t.ctx)).balanced).toBe(true);
+  });
+
+  it('re-running with NEGATIVE customer / vendor balances adds no second credit (review round 2 P1)', async () => {
+    const input = { ...base, openingBalances: { customers: [{ name: 'Neg Cust', amount: '-50.00' }], vendors: [{ name: 'Neg Vend', amount: '-30.00' }] } };
+    await applySetupInterview(t.ctx, input);
+    await applySetupInterview(t.ctx, input);
+    const cms = await t.db.select().from(creditMemos).where(and(eq(creditMemos.companyId, t.ctx.companyId), ne(creditMemos.status, 'void')));
+    const vcs = await t.db.select().from(vendorCredits).where(and(eq(vendorCredits.companyId, t.ctx.companyId), ne(vendorCredits.status, 'void')));
+    expect(cms).toHaveLength(1);
+    expect(vcs).toHaveLength(1);
+    // A sign change on a re-run is not a second document either.
+    await applySetupInterview(t.ctx, { ...base, openingBalances: { customers: [{ name: 'Neg Cust', amount: '50.00' }] } });
+    expect(
+      (await t.db.select().from(invoices).where(and(eq(invoices.companyId, t.ctx.companyId), eq(invoices.memo, 'Opening balance (setup interview)'), ne(invoices.status, 'void')))).length,
+    ).toBe(1); // only Acme Client's
+    expect((await trialBalance(t.ctx)).balanced).toBe(true);
+  });
+
+  it('a balance changed to 0 on a re-run voids the earlier opening entry / document (review round 2 P2)', async () => {
+    await applySetupInterview(t.ctx, {
+      ...base,
+      openingBalances: {
+        accounts: [{ name: 'Visa Card', kind: 'credit_card', amount: '0' }],
+        customers: [{ name: 'Acme Client', amount: '0' }],
+        vendors: [{ name: 'Neg Vend', amount: '0.00' }],
+      },
+    });
+    expect((await byName('Visa Card')).balance).toBe('0.00');
+    const inv = await t.db.select().from(invoices).where(and(eq(invoices.companyId, t.ctx.companyId), ne(invoices.status, 'void')));
+    expect(inv).toHaveLength(0);
+    const vcs = await t.db.select().from(vendorCredits).where(and(eq(vendorCredits.companyId, t.ctx.companyId), ne(vendorCredits.status, 'void')));
+    expect(vcs).toHaveLength(0);
     expect((await trialBalance(t.ctx)).balanced).toBe(true);
   });
 

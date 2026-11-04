@@ -158,7 +158,8 @@ function dayBeforeIso(iso: string): string {
 }
 /** The rows that carry an amount, as the server expects them (undefined when none). */
 function balancesPayload(b: BalancesState) {
-  const amt = (r: { amount: string }) => cleanAmount(r.amount) !== '' && Number(cleanAmount(r.amount)) !== 0;
+  // A typed 0 is sent: on a re-run it removes what the earlier run entered for that row.
+  const amt = (r: { amount: string }) => cleanAmount(r.amount) !== '';
   const accounts = b.accounts
     .filter((r) => amt(r) && (r.accountId || r.name.trim()))
     .map((r) => ({ kind: r.kind, amount: cleanAmount(r.amount), accountId: r.accountId || undefined, name: r.accountId ? undefined : r.name.trim() }));
@@ -875,7 +876,7 @@ function StepBalances({ state, set, onBack, onNext }: StepProps) {
           <legend className="px-1 text-sm font-semibold text-navy">Bank, credit card, loan and other accounts</legend>
           <p className="text-xs text-navy/50 mb-3">
             Banks and assets: the amount you have. Cards, loans and liabilities: the amount you owe. Use a minus sign for
-            an overdrawn bank or a card in credit.
+            an overdrawn bank or a card in credit. Running the interview again: enter 0 to remove a balance entered before.
           </p>
           {b.accounts.map((r, i) => (
             <div key={i} className="mb-3 grid grid-cols-12 items-end gap-2">

@@ -800,7 +800,7 @@ async function voidOne(ctx: ServiceContext, type: BatchTxnType, id: string): Pro
       if (!['manual', 'tax_agency', 'sales_tax_adj', 'adjusting'].includes(srcKind)) {
         throw new ServiceError('CONFLICT', 'This entry belongs to a document — void the document instead.');
       }
-      if (srcKind === 'tax_agency' || srcKind === 'sales_tax_adj') requirePermission(ctx, 'sales_tax', 'delete');
+      if (srcKind === 'tax_agency' || srcKind === 'sales_tax_adj') requirePermission(ctx, 'sales_tax.pay', 'delete');
       await voidJournalEntry(ctx, id);
       return 'void';
     }
