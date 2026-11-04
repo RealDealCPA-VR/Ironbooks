@@ -391,6 +391,11 @@ export function whatIfSchedule(
     : termsChanged
       ? periodicPayment(balance, rate, left, t.paymentsPerYear, balloon)
       : loanPaymentAmount(t);
+  // A payment typed for the what-if has to pay the loan down: below the interest the schedule
+  // stopped after one payment and read as a big saving although the loan never gets paid off.
+  if (has(changes.paymentAmount)) {
+    assertPaymentCoversInterest(balance, rate, t.paymentsPerYear, payment, has(changes.extraPrincipal) ? Money.of(changes.extraPrincipal!) : null);
+  }
   const params: LoanScheduleParams = {
     ...loanScheduleParams({ ...t, annualRate: rate.toString(), termMonths: term, balloonAmount: balloon.toString() }, {
       balance,
@@ -406,6 +411,26 @@ export function whatIfSchedule(
 // ---------------------------------------------------------------------------
 // Validation helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * A payment (plus any extra principal) has to be more than the first period's interest on the
+ * balance owed, or the loan is never paid off (the Loan Manager setup refuses it the same way).
+ */
+function assertPaymentCoversInterest(
+  balance: Decimal,
+  annualRate: Decimal,
+  paymentsPerYear: number,
+  payment: Decimal,
+  extraPrincipal: Decimal | null = null,
+) {
+  if (!balance.greaterThan(0)) return;
+  const firstInterest = Money.round2(balance.times(annualRate).dividedBy(100).dividedBy(paymentsPerYear));
+  if (!payment.plus(extraPrincipal ?? 0).greaterThan(firstInterest)) {
+    throw validation(
+      `A payment of ${toAmountString(payment)} does not cover the interest (${toAmountString(firstInterest)} a payment), so the loan would never be paid off.`,
+    );
+  }
+}
 
 async function accountOf(ctx: ServiceContext, id: string) {
   const [row] = await ctx.db
@@ -839,6 +864,11 @@ export function evaluateLoan(input: EvaluateLoanInput): WhatIfResult {
     throw validation('Days in the interest year must be 365 or 360.');
   }
   const terms: LoanTerms = { ...input, paymentsPerYear: ppy };
+  if (input.paymentAmount != null && String(input.paymentAmount).trim() !== '') {
+    const payment = Money.round2(input.paymentAmount);
+    if (!payment.greaterThan(0)) throw validation('The payment amount must be more than zero.');
+    assertPaymentCoversInterest(amount, rate, ppy, payment);
+  }
   return whatIfSchedule(terms, { balance: amount, nextNumber: 1 });
 }
 
