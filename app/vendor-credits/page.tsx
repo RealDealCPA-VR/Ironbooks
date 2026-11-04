@@ -31,6 +31,7 @@ import { todayISO } from '@/lib/dates';
 import { Money, formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
 import { TransactionNav, useAdjacentTransactions } from '@/components/TransactionNav';
+import MemorizeButton from '@/components/MemorizeButton';
 import {
   type InvDetail,
   InventoryLineFields,
@@ -364,6 +365,36 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId, n
     }
   }
 
+  /**
+   * Memorize (Ctrl+M): the lines the form would POST. No Ref. No. (each entry is a new credit) and
+   * no serial / lot numbers (those were returned once); the exchange rate is taken on the day.
+   */
+  function creditTemplate(): Record<string, unknown> | string {
+    if (!vendorId) return 'Pick a vendor before memorizing.';
+    if (expenseLinesFilled.length + itemLinesFilled.length === 0) return 'Add at least one complete line before memorizing.';
+    const dims = (l: { classId: string; customerId: string; jobId: string }) => ({
+      classId: l.classId || null,
+      customerId: l.customerId || null,
+      jobId: l.jobId || null,
+    });
+    return {
+      vendorId,
+      date,
+      memo: memo || null,
+      lines: [
+        ...expenseLinesFilled.map((l) => ({ accountId: l.accountId, description: l.description || null, amount: l.amount, ...dims(l) })),
+        ...itemLinesFilled.map((l) => ({
+          itemId: l.itemId,
+          quantity: l.quantity,
+          unitCost: l.unitCost || null,
+          amount: l.amount || null,
+          description: l.description || null,
+          ...dims(l),
+        })),
+      ],
+    };
+  }
+
   async function handleSubmit() {
     if (!vendorId) { toast('Please select a vendor.', 'danger'); return; }
     if (!date) { toast('Please enter a date.', 'danger'); return; }
@@ -482,6 +513,12 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId, n
       size="lg"
       footer={
         <>
+          <MemorizeButton
+            docType="vendor_credit"
+            shortcut={open}
+            defaultName={vendors.find((v) => v.id === vendorId)?.displayName}
+            getTemplate={creditTemplate}
+          />
           <Button variant="secondary" onClick={onClose} disabled={saving}>
             {editId ? 'Cancel edit' : 'Cancel'}
           </Button>

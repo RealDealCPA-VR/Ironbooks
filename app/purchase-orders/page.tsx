@@ -8,7 +8,6 @@ import {
   MinusCircle,
   ArrowRight,
   Download,
-  Ban,
   CheckSquare,
   Pencil,
   Mail,
@@ -16,7 +15,6 @@ import {
 import {
   Button,
   Card,
-  ConfirmDialog,
   EmptyState,
   Input,
   Select,
@@ -38,6 +36,7 @@ import { useFocusParam } from '@/lib/useFocusParam';
 import { todayISO } from '@/lib/dates';
 // wave2 prefs: Memorize (Ctrl+M)
 import MemorizeButton from '@/components/MemorizeButton';
+import { VoidDeleteButtons, useCanVoidDelete, useVoidDelete } from '@/components/sales/VoidDeleteButtons';
 import { formatCurrency } from '@/lib/money';
 import { billItemLineAmount, poLineAmount, sumLineAmounts } from '@/lib/purchaseLineMath';
 import { formatDate } from '@/lib/utils';
@@ -164,18 +163,18 @@ function custJobFields(value: string | undefined, jobs: NamedRow[]): { customerI
 // Helpers
 // ---------------------------------------------------------------------------
 
-function statusTone(status: PoStatus): 'info' | 'success' | 'warning' | 'neutral' {
+function statusTone(status: PoStatus): 'info' | 'success' | 'warning' | 'neutral' | 'danger' {
   if (status === 'open') return 'info';
   if (status === 'partial') return 'warning';
   if (status === 'closed') return 'success';
-  return 'neutral';
+  return 'danger';
 }
 
 function statusLabel(status: PoStatus): string {
   if (status === 'open') return 'Open';
   if (status === 'partial') return 'Partially Billed';
   if (status === 'closed') return 'Closed';
-  return 'Void';
+  return 'VOID';
 }
 
 /** The PO total as lib/services/purchaseOrders.ts saves it: the sum of round2(qty × rate) lines. */
@@ -204,9 +203,11 @@ interface NewPoModalProps {
   editId?: string | null;
   /** QB's Previous / Next / Revert / Journal toolbar (components/TransactionNav.tsx). */
   nav?: React.ReactNode;
+  /** salesar: the saved PO's Void / Delete buttons (Ctrl+D), drawn in the footer. */
+  footerExtra?: React.ReactNode;
 }
 
-function NewPoModal({ open, onClose, vendors, accounts, items, onCreated, editId, nav = null }: NewPoModalProps) {
+function NewPoModal({ open, onClose, vendors, accounts, items, onCreated, editId, nav = null, footerExtra = null }: NewPoModalProps) {
   const [vendorId, setVendorId] = useState('');
   const [date, setDate] = useState(() => todayISO());
   const [expectedDate, setExpectedDate] = useState('');
@@ -467,6 +468,7 @@ function NewPoModal({ open, onClose, vendors, accounts, items, onCreated, editId
               };
             }}
           />
+          {footerExtra}
           <Button variant="secondary" onClick={onClose} disabled={saving}>
             {editId ? 'Cancel edit' : 'Cancel'}
           </Button>
@@ -1007,10 +1009,21 @@ function PurchaseOrdersPageContent() {
   // Receive & Bill state
   const [billTarget, setBillTarget] = useState<PurchaseOrder | null>(null);
 
-  // Void / Close state
-  const [voidTarget, setVoidTarget] = useState<PurchaseOrder | null>(null);
-  const [voiding, setVoiding] = useState(false);
+  // Close state
   const [closingId, setClosingId] = useState<string | null>(null);
+  // salesar: QB Edit > Void / Delete Purchase Order (Ctrl+D), with QB's confirmation. A PO
+  // received or billed against can't be voided or deleted (the server says so too); a PO closed
+  // by hand with nothing billed can.
+  const canVoidDelete = useCanVoidDelete('purchase_order');
+  const voidDelete = useVoidDelete('purchase_order', async (_what, id) => {
+    if (editId === id) {
+      setShowNew(false);
+      setEditId(null);
+    }
+    await fetchData();
+  });
+  const poLocked = (po: PurchaseOrder) => po.status === 'partial' || !!po.convertedBillId;
+  const voidDeleteTarget = (po: PurchaseOrder) => ({ id: po.id, number: docNo(po.refNumber, po.poNumber), status: po.status });
 
   const vendorMap = Object.fromEntries(vendors.map((v) => [v.id, v.displayName]));
 
@@ -1072,22 +1085,6 @@ function PurchaseOrdersPageContent() {
       setShowNew(true);
     }
   });
-
-  async function handleVoid() {
-    if (!voidTarget) return;
-    setVoiding(true);
-    try {
-      await api.post(`/api/purchase-orders/${voidTarget.id}`, { action: 'void' });
-      toast(`PO #${docNo(voidTarget.refNumber, voidTarget.poNumber)} voided.`, 'success');
-      setVoidTarget(null);
-      await fetchData();
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Failed to void purchase order.';
-      toast(msg, 'danger');
-    } finally {
-      setVoiding(false);
-    }
-  }
 
   async function handleClose(po: PurchaseOrder) {
     setClosingId(po.id);
@@ -1205,19 +1202,19 @@ function PurchaseOrdersPageContent() {
                           >
                             <CheckSquare className="h-3.5 w-3.5" /> Close
                           </Button>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            className="text-red-500 hover:text-red-700 hover:bg-red-50"
-                            onClick={() => setVoidTarget(po)}
-                            title="Void the PO"
-                          >
-                            <Ban className="h-3.5 w-3.5" /> Void
-                          </Button>
                         </>
                       )}
                       {po.status === 'closed' && po.convertedBillId && (
                         <span className="text-xs text-navy/30 italic">Bill created</span>
+                      )}
+                      {!poLocked(po) && (
+                        <VoidDeleteButtons
+                          compact
+                          target={voidDeleteTarget(po)}
+                          allowed={canVoidDelete}
+                          canVoid={po.status !== 'void'}
+                          request={voidDelete.request}
+                        />
                       )}
                     </div>
                   </Td>
@@ -1281,6 +1278,12 @@ function PurchaseOrdersPageContent() {
         items={items}
         onCreated={fetchData}
         editId={editId}
+        footerExtra={(() => {
+          const po = editId ? pos.find((p) => p.id === editId) : null;
+          return po && !poLocked(po) ? (
+            <VoidDeleteButtons target={voidDeleteTarget(po)} allowed={canVoidDelete} canVoid={po.status !== 'void'} request={voidDelete.request} />
+          ) : null;
+        })()}
       />
 
       <ReceiveBillModal
@@ -1316,16 +1319,7 @@ function PurchaseOrdersPageContent() {
         </p>
       </Modal>
 
-      <ConfirmDialog
-        open={!!voidTarget}
-        title="Void purchase order?"
-        message={`Void PO #${docNo(voidTarget?.refNumber, voidTarget?.poNumber ?? '')} (${formatCurrency(voidTarget?.total ?? '0')})? The PO can no longer be billed. This cannot be undone.`}
-        confirmLabel="Void"
-        tone="danger"
-        loading={voiding}
-        onConfirm={handleVoid}
-        onClose={() => setVoidTarget(null)}
-      />
+      {voidDelete.dialog}
     </main>
   );
 }

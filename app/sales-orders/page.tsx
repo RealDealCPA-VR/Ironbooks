@@ -53,6 +53,8 @@ import {
 } from '@/components/sales/DocNumberField';
 import { TransactionNav, useAdjacentTransactions } from '@/components/TransactionNav';
 import AttachmentPanel from '@/components/AttachmentPanel'; // J9 Doc Center
+import MemorizeButton from '@/components/MemorizeButton';
+import { VoidDeleteButtons, useCanVoidDelete, useVoidDelete } from '@/components/sales/VoidDeleteButtons';
 // salesar (B8 / B9): Customer Message picker and the per-line Sales Tax Code column.
 import { CustomerMessageField, customerTaxStatus, useCustomerMessages, useSalesTaxCodes } from '@/components/sales/FormLists';
 import {
@@ -129,13 +131,13 @@ interface SalesOrderDetail extends SalesOrder {
 // Helpers
 // ---------------------------------------------------------------------------
 
-type StatusTone = 'info' | 'success' | 'neutral' | 'warning';
+type StatusTone = 'info' | 'success' | 'neutral' | 'warning' | 'danger';
 
 function statusTone(status: string): StatusTone {
   if (status === 'open') return 'info';
   if (status === 'partial') return 'warning';
   if (status === 'closed') return 'success';
-  if (status === 'void') return 'neutral';
+  if (status === 'void') return 'danger';
   return 'warning';
 }
 
@@ -143,7 +145,7 @@ function statusLabel(status: string): string {
   if (status === 'open') return 'Open';
   if (status === 'partial') return 'Partially Invoiced';
   if (status === 'closed') return 'Invoiced';
-  if (status === 'void') return 'Void';
+  if (status === 'void') return 'VOID';
   return status;
 }
 
@@ -171,11 +173,13 @@ interface NewOrderModalProps {
   items: PricedLineItem[];
   taxRates: TaxRate[];
   onCreated: () => void;
+  /** salesar: the saved order's Void / Delete buttons (Ctrl+D), drawn in the footer. */
+  footerExtra?: React.ReactNode;
 }
 
 type EditableLine = PricedLineValue & { id?: string; invoiced?: number };
 
-function NewOrderModal({ open, editing, onClose, customers, items, taxRates, onCreated, nav = null }: NewOrderModalProps) {
+function NewOrderModal({ open, editing, onClose, customers, items, taxRates, onCreated, nav = null, footerExtra = null }: NewOrderModalProps) {
   const [customerId, setCustomerId] = useState('');
   const [taxRateId, setTaxRateId] = useState('');
   const docNumber = useDocNumber('sales_order', open, editing ? docNo(editing.refNumber, editing.orderNumber) : null);
@@ -288,6 +292,29 @@ function NewOrderModal({ open, editing, onClose, customers, items, taxRates, onC
     selectedRate ? parseFloat(selectedRate.rate) || 0 : 0,
   );
 
+  /** Memorize (Ctrl+M): the body the form would POST, without the number (each entry gets the next). */
+  function orderTemplate(): Record<string, unknown> | string {
+    if (!customerId) return 'Pick a customer before memorizing.';
+    const validLines = lines.filter((l) => l.itemId || l.description || l.rate);
+    if (validLines.length === 0) return 'Add at least one line before memorizing.';
+    const { trackingNumber: _t, ...shipping } = shippingPayload(ship) as Record<string, unknown>;
+    return {
+      customerId,
+      date,
+      memo: memo || undefined,
+      taxRateId: taxRateId || null,
+      customerMessageId: customerMessagePayload(customerMessageId),
+      ...shipping,
+      lines: validLines.map((l) => ({
+        itemId: l.itemId || null,
+        description: l.description || null,
+        quantity: l.quantity,
+        rate: l.rate === '' ? null : l.rate,
+        ...lineTaxPayload({ ...l, taxable: l.taxable !== false, itemType: itemType(l.itemId) }, taxCodes, customerTax),
+      })),
+    };
+  }
+
   async function handleSubmit() {
     if (!customerId) { toast('Please select a customer.', 'danger'); return; }
     if (!date) { toast('Please enter an order date.', 'danger'); return; }
@@ -355,6 +382,13 @@ function NewOrderModal({ open, editing, onClose, customers, items, taxRates, onC
       size="xl"
       footer={
         <>
+          <MemorizeButton
+            docType="sales_order"
+            shortcut={open}
+            defaultName={customers.find((c) => c.id === customerId)?.displayName}
+            getTemplate={orderTemplate}
+          />
+          {footerExtra}
           <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
           <Button onClick={handleSubmit} loading={saving}>
             {editing ? 'Save Changes' : 'Create Sales Order'}
@@ -712,6 +746,20 @@ function SalesOrdersPageContent() {
 
   const customerMap = Object.fromEntries(customers.map((c) => [c.id, c.displayName]));
 
+  // salesar: QB Edit > Void / Delete Sales Order (Ctrl+D), with QB's confirmation. An order
+  // something was invoiced from can't be voided or deleted (the server says so too).
+  const canVoidDelete = useCanVoidDelete('sales_order');
+  const voidDelete = useVoidDelete('sales_order', async (_what, id) => {
+    if (editTarget?.id === id) setEditTarget(null);
+    await fetchData();
+  });
+  const orderLocked = (o: { status: string; convertedInvoiceId: string | null }) => o.status === 'partial' || !!o.convertedInvoiceId;
+  const voidDeleteTarget = (o: { id: string; refNumber?: string | null; orderNumber: number; status: string }) => ({
+    id: o.id,
+    number: docNo(o.refNumber, o.orderNumber),
+    status: o.status,
+  });
+
   const fetchData = useCallback(async () => {
     setLoading(true);
     try {
@@ -864,6 +912,15 @@ function SalesOrdersPageContent() {
                       {order.status === 'closed' && !order.convertedInvoiceId && (
                         <span className="text-xs text-navy/30 italic">Closed</span>
                       )}
+                      {!orderLocked(order) && (
+                        <VoidDeleteButtons
+                          compact
+                          target={voidDeleteTarget(order)}
+                          allowed={canVoidDelete}
+                          canVoid={order.status !== 'void'}
+                          request={voidDelete.request}
+                        />
+                      )}
                     </div>
                   </Td>
                 </Tr>
@@ -926,7 +983,18 @@ function SalesOrdersPageContent() {
         items={items}
         taxRates={taxRates}
         onCreated={fetchData}
+        footerExtra={
+          editTarget && !orderLocked(editTarget) ? (
+            <VoidDeleteButtons
+              target={voidDeleteTarget(editTarget)}
+              allowed={canVoidDelete}
+              canVoid={editTarget.status !== 'void'}
+              request={voidDelete.request}
+            />
+          ) : null
+        }
       />
+      {voidDelete.dialog}
 
       <InvoiceModal
         open={!!invoiceTarget}
