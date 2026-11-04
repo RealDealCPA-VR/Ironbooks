@@ -60,6 +60,7 @@ import {
   recomputePoStatus,
   recomputeReceiptStatus,
 } from './receivingLinks';
+import { poLineDimsByItem } from './purchaseOrders';
 import {
   type ServiceContext,
   ServiceError,
@@ -834,7 +835,10 @@ export async function enterBillForReceivedItems(ctx: ServiceContext, input: Ente
     // No itemId on any line — stock was received by the receipt (voidBill must not reverse it).
     const lineRows: Array<typeof billLines.$inferInsert> = [];
     let order = 0;
+    // QB: the P.O. line's Customer:Job and Class carry through Receive Items onto this bill.
+    const poDims = await poLineDimsByItem(tx, planned.map((l) => l.receipt.purchaseOrderId));
     for (const l of planned) {
+      const dims = l.receipt.purchaseOrderId ? poDims.get(`${l.receipt.purchaseOrderId}|${l.itemId}`) : undefined;
       const memo = `${l.itemName} — ${Money.of(l.quantityBilled).toString()} @ ${Money.of(l.billUnitCost).toFixed(2)} (received @ ${Money.of(l.receiptUnitCost).toFixed(2)})`;
       lineRows.push({
         billId: bill.id,
@@ -842,6 +846,7 @@ export async function enterBillForReceivedItems(ctx: ServiceContext, input: Ente
         description: memo,
         quantity: l.quantityBilled,
         amount: l.accrualAmount,
+        ...(dims ?? {}),
         lineOrder: order++,
       });
       if (!Money.isZero(l.inventoryVariance) && l.inventoryAccountId) {

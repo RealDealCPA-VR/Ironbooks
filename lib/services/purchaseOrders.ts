@@ -1440,6 +1440,42 @@ async function recomputePoStatusFromLines(
   return newStatus;
 }
 
+export interface PoLineDims {
+  customerId: string | null;
+  jobId: string | null;
+  classId: string | null;
+}
+
+/**
+ * QB: the Customer:Job and Class of a P.O. line carry through Receive Items onto the bill for the
+ * received items. Receipt lines are matched to the P.O. by item (as the received quantities are),
+ * so each item takes the first P.O. line for it (lineOrder) that has a Customer:Job or Class.
+ * Keyed `${purchaseOrderId}|${itemId}`; items without either are left out.
+ */
+export async function poLineDimsByItem(ctx: ServiceContext, poIds: ReadonlyArray<string | null | undefined>): Promise<Map<string, PoLineDims>> {
+  const ids = [...new Set(poIds.filter((x): x is string => !!x))];
+  const out = new Map<string, PoLineDims>();
+  if (ids.length === 0) return out;
+  const rows = await ctx.db
+    .select({
+      purchaseOrderId: purchaseOrderLines.purchaseOrderId,
+      itemId: purchaseOrderLines.itemId,
+      customerId: purchaseOrderLines.customerId,
+      jobId: purchaseOrderLines.jobId,
+      classId: purchaseOrderLines.classId,
+    })
+    .from(purchaseOrderLines)
+    .innerJoin(purchaseOrders, eq(purchaseOrderLines.purchaseOrderId, purchaseOrders.id))
+    .where(and(eq(purchaseOrders.companyId, ctx.companyId), inArray(purchaseOrderLines.purchaseOrderId, ids)))
+    .orderBy(asc(purchaseOrderLines.lineOrder));
+  for (const r of rows) {
+    if (!r.itemId || !(r.customerId || r.jobId || r.classId)) continue;
+    const key = `${r.purchaseOrderId}|${r.itemId}`;
+    if (!out.has(key)) out.set(key, { customerId: r.customerId ?? null, jobId: r.jobId ?? null, classId: r.classId ?? null });
+  }
+  return out;
+}
+
 /**
  * Claim received quantities against a PO for an item receipt. Call INSIDE the
  * receipt's transaction. Validates the PO (exists, not void/closed, optional
