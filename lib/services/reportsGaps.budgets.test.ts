@@ -23,6 +23,7 @@ import { createBill } from './bills';
 import { createBudget, getBudget, setBudgetLine } from './budgets';
 import { adjustBudget, copyBudget, fillBudgetFromActuals } from './budgetTools';
 import { runStandardReport } from './reportRegistry';
+import { unionRoles } from '@/lib/permissions/model';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-reports-gaps-budgets');
 let db: DB;
@@ -173,5 +174,18 @@ describe('Budget reports by class', () => {
     const [kept] = await db.select().from(budgets).where(eq(budgets.id, b.id));
     expect(kept.companyId).toBe(ctx.companyId);
     expect((await db.select().from(budgetLines).where(eq(budgetLines.budgetId, b.id))).length).toBe(1);
+  });
+});
+
+describe('Create from actuals needs the right to see actuals (post-merge review)', () => {
+  it('a Budgets-only user may not copy actual P&L amounts into a budget', async () => {
+    const role = (grant: Record<string, string[]>) =>
+      unionRoles([{ key: 'custom-activities', name: 'Custom', description: '', builtin: false, permissions: grant as never, flags: {} }]);
+    const b = await createBudget(ctx, { name: 'Budgets only', fiscalYear: 2026 });
+    const budgetsOnly = { ...ctx, access: role({ 'company.budgets': ['view', 'create', 'modify'] }) };
+    await expect(fillBudgetFromActuals(budgetsOnly, b.id, {})).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    expect((await getBudget(ctx, b.id)).lines ?? []).toEqual([]);
+    const withReports = { ...ctx, access: role({ 'company.budgets': ['view', 'create', 'modify'], 'reports_financial.company': ['view'] }) };
+    await expect(fillBudgetFromActuals(withReports, b.id, {})).resolves.toMatchObject({ lines: expect.any(Number) });
   });
 });

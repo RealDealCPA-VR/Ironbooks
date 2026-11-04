@@ -16,6 +16,7 @@ import type Decimal from 'decimal.js';
 import { budgetLines, budgets, classes, customers } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from './_base';
+import { requireActivity } from './access';
 import { budgetFiscalYear, type Budget } from './budgets';
 import { PL_SECTIONS, activityByAccount, fetchGlLines, isPLSection, loadAccountMeta, naturalAmount } from './reportEngine';
 
@@ -80,12 +81,16 @@ async function checkDimension(ctx: ServiceContext, input: { classId?: string | n
  * Fill a budget (one slice of it: the whole company, a class or a Customer:Job) with the actual
  * amounts of a fiscal year (default: the year before the budget's). The slice's old amounts are
  * replaced; a budget kept by another criteria (company / class / Customer:Job) is refused.
+ * The actuals are the Profit & Loss / Balance Sheet amounts, so the caller must also be allowed to
+ * run Company & Financial reports (the Budgets activity alone does not show actuals, just as
+ * Budget vs. Actual itself needs that report right).
  */
 export async function fillBudgetFromActuals(
   ctx: ServiceContext,
   budgetId: string,
   input: { fiscalYear?: number | string | null; classId?: string | null; customerId?: string | null },
 ): Promise<{ lines: number; fiscalYear: number }> {
+  requireActivity(ctx, 'reports_financial.company', 'view');
   const budget = await loadBudget(ctx, budgetId);
   const dim = await checkDimension(ctx, input);
   const isBs = budget.kind === 'balance_sheet';

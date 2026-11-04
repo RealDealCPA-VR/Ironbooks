@@ -2,22 +2,32 @@
  * Commented Reports (QB "Comment on Report", Reports > Commented Reports).
  *
  * A commented report is a picture of a report as it was when someone commented on it: the
- * server runs the report itself (runStandardReport — the caller's permission for that report's
- * area is checked, and the numbers come from the books, never from the browser), keeps its
+ * server runs the report itself (runStandardReport — the caller's right to that report's own
+ * activity is checked, and the numbers come from the books, never from the browser), keeps its
  * columns and rows without QuickZoom targets (a commented report does not change when the books
  * do, and its links would go stale), and stores the comments typed on its amounts. Comments are
  * numbered in order; each points at one cell (row id + column key) of the snapshot.
  *
- * Only someone who may view the report's area can see, change or delete its commented copies.
+ * Only someone who may view the report itself (its QB Enterprise report activity, e.g.
+ * Accountant & Taxes reports, not merely any report of the area) can see, change or delete its
+ * commented copies.
+ *
+ * Sensitive data: the picture is shared with every reader, so it never holds what some reader
+ * may not see. It is taken with the sensitive-data rights switched off (SSNs / tax ids and bank
+ * account numbers come out masked to the last four digits, as for a user without "view sensitive
+ * payroll data" / "view full account numbers"), and every picture is masked again when read —
+ * which also covers pictures saved before this rule.
  */
 import { randomUUID } from 'node:crypto';
 import { and, desc, eq } from 'drizzle-orm';
 import { commentedReports } from '@/lib/db/schema';
-import { can } from '@/lib/permissions/model';
-import { CATALOG_BY_KEY } from '@/lib/reports/catalog';
+import { canActivity, fullAccess } from '@/lib/permissions/model';
+import type { ActivityKey } from '@/lib/permissions/activities';
+import { maskAccountNumber, maskSensitive, maskSsn } from '@/lib/permissions/mask';
+import { CATALOG_BY_KEY, reportActivity } from '@/lib/reports/catalog';
 import type { StdReport, StdRow } from '@/lib/reports/types';
 import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from './_base';
-import { requirePermission } from './access';
+import { requireActivity } from './access';
 import { runStandardReport, standardReportEntry } from './reportRegistry';
 
 import type { ReportComment } from '@/lib/reports/comments';
@@ -27,17 +37,57 @@ export type { ReportComment };
 export const MAX_COMMENTS = 200;
 export const MAX_COMMENT_LENGTH = 2000;
 
-/** The report's area: the caller must be able to view it (unknown types: no one may). */
-function areaOf(reportType: string) {
-  const e = standardReportEntry(reportType);
-  if (!e) throw validation(`Unknown report type "${reportType}".`);
-  return e.area;
+/** The report's own activity (memorizedReports / runStandardReport check the same); null for unknown types. */
+function activityOf(reportType: unknown): ActivityKey | null {
+  const e = typeof reportType === 'string' ? standardReportEntry(reportType) : undefined;
+  if (!e) return null;
+  try {
+    return reportActivity(e);
+  } catch {
+    return null; // a report area with no activity: no one may see it (fail closed)
+  }
 }
 
 function canView(ctx: ServiceContext, reportType: string): boolean {
   if (!ctx.access) return true;
-  const e = typeof reportType === 'string' ? CATALOG_BY_KEY[reportType] : undefined;
-  return !!e && can(ctx.access, e.area, 'view');
+  const activity = activityOf(reportType);
+  return !!activity && canActivity(ctx.access, activity, 'view');
+}
+
+/** The caller's context with the sensitive-data rights off: what the picture is taken with. */
+function maskedRunContext(ctx: ServiceContext): ServiceContext {
+  const base = ctx.access ?? fullAccess();
+  return { ...ctx, access: { ...base, flags: { ...base.flags, sensitivePayroll: false, fullAccountNumbers: false } } };
+}
+
+const NO_SENSITIVE = { flags: { sensitivePayroll: false, fullAccountNumbers: false, closedPeriod: false } };
+const SSN_TEXT_KEYS = new Set(['ssn', 'employeeSsn', 'taxId']);
+/** "ssn: 123-45-6789" inside a text cell (Voided/Deleted Detail's "Original values" summary). */
+const SENSITIVE_IN_TEXT = /\b(ssn|employeeSsn|taxId|accountNumber|routingNumber|bankAccountNumber)(\s*[:=]\s*)([^·;\n]*?)(?=\s*[·;\n]|$)/g;
+
+function maskText(v: string): string {
+  return v.replace(SENSITIVE_IN_TEXT, (_m, key: string, sep: string, value: string) => {
+    if (!value.trim()) return `${key}${sep}${value}`;
+    const masked = SSN_TEXT_KEYS.has(key) ? maskSsn(value.trim()) : maskAccountNumber(value.trim());
+    return `${key}${sep}${masked ?? ''}`;
+  });
+}
+
+function maskStrings(v: unknown): unknown {
+  if (typeof v === 'string') return maskText(v);
+  if (Array.isArray(v)) return v.map(maskStrings);
+  if (v && typeof v === 'object') return Object.fromEntries(Object.entries(v as Record<string, unknown>).map(([k, x]) => [k, maskStrings(x)]));
+  return v;
+}
+
+/**
+ * A picture as every reader may see it: SSN / tax-id and account-number cells masked to the last
+ * four digits (by column key, as maskSensitive does for API answers) and the same values masked
+ * where a text cell quotes them. Idempotent (a masked value stays as it is).
+ */
+export function maskSnapshot(r: StdReport): StdReport {
+  const rows = maskStrings(maskSensitive(r.rows, NO_SENSITIVE)) as StdRow[];
+  return { ...r, rows };
 }
 
 /** A static copy of the report: no QuickZoom targets, entry links or explanations. */
@@ -81,7 +131,7 @@ function publicRow(row: typeof commentedReports.$inferSelect) {
     name: row.name,
     reportType: row.reportType,
     params: row.params,
-    snapshot: row.snapshot as unknown as StdReport,
+    snapshot: maskSnapshot(row.snapshot as unknown as StdReport),
     comments: row.comments as ReportComment[],
     createdBy: row.createdBy,
     createdAt: row.createdAt,
@@ -135,11 +185,14 @@ export async function saveCommentedReport(
   if (!name) throw validation('Give the commented report a name.');
   if (name.length > 255) throw validation('The name is too long.');
   if (typeof input.reportType !== 'string') throw validation('Report type is required.');
-  requirePermission(ctx, areaOf(input.reportType), 'view');
+  const activity = activityOf(input.reportType);
+  if (!activity) throw validation(`Unknown report type "${input.reportType}".`);
+  requireActivity(ctx, activity, 'view');
   const params: Record<string, string> = {};
   for (const [k, v] of Object.entries(input.params ?? {})) if (v !== undefined && v !== null && String(v) !== '') params[k] = String(v);
-  const report = await runStandardReport(ctx, input.reportType, params);
-  const snapshot = staticSnapshot(report);
+  // Taken with the sensitive-data rights off: the picture is shown to readers who may lack them.
+  const report = await runStandardReport(maskedRunContext(ctx), input.reportType, params);
+  const snapshot = maskSnapshot(staticSnapshot(report));
   const comments = cleanComments(snapshot, input.comments);
   return inTransaction(ctx, async (tx) => {
     const [row] = await tx.db

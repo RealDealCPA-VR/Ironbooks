@@ -1950,6 +1950,24 @@ async function applyCashBasisToGlLines(
 }
 
 /**
+ * Split `amount` in proportion to `shares` (same order). Every part but the largest share's is
+ * rounded to the cent; the largest share takes what is left, so the parts add up exactly and the
+ * rounding cents land where they matter least.
+ */
+export function splitByShares(amount: Decimal, shares: Decimal[]): Decimal[] {
+  const total = shares.reduce((s, v) => s.plus(v), Money.zero());
+  if (shares.length === 0) return [];
+  if (total.isZero()) return shares.map((_, k) => (k === 0 ? amount : Money.zero()));
+  let largest = 0;
+  shares.forEach((v, k) => {
+    if (v.abs().greaterThan(shares[largest].abs())) largest = k;
+  });
+  const parts = shares.map((v, k) => (k === largest ? Money.zero() : Money.round2(amount.times(v).dividedBy(total))));
+  parts[largest] = parts.reduce((rest, p, k) => (k === largest ? rest : rest.minus(p)), amount);
+  return parts;
+}
+
+/**
  * Carry the Customer:Job of a bill's / vendor credit's document lines onto its cash-basis lines.
  * The cash-basis ledger groups a document's P&L lines by account and class, so each synthetic
  * line is matched to the document lines on its account (and class, when one matches): one job →
@@ -2022,12 +2040,10 @@ async function withCashBasisJobs(
       return;
     }
     // Several jobs on one account: split the line by their share (largest share takes the cents).
-    const total = jobs.reduce((s2, [, v]) => s2.plus(v), Money.zero());
     jobs.sort((x, y) => y[1].comparedTo(x[1]));
-    let rest = l.amount;
-    jobs.forEach(([job, v], k) => {
-      const part = k === jobs.length - 1 ? rest : Money.round2(l.amount.times(v).dividedBy(total));
-      rest = rest.minus(part);
+    const parts = splitByShares(l.amount, jobs.map(([, v]) => v));
+    jobs.forEach(([job], k) => {
+      const part = parts[k];
       const debit = part.greaterThan(0) ? part : Money.zero();
       const credit = part.lessThan(0) ? part.negated() : Money.zero();
       out.push({

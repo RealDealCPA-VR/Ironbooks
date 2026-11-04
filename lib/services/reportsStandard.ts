@@ -573,6 +573,8 @@ function buildBSRows(
     .sort((a, b) => a.code.localeCompare(b.code))[0];
   const priorYears = cols.map((c) => Money.of(c.bs.priorYearsEarnings));
   const netIncome = cols.map((c) => Money.of(c.bs.currentYearNetIncome));
+  // The account's own balance before earlier years' earnings are folded in (QuickZoom below).
+  const reOwn = reAccount ? (amounts.get('equity')!.get(reAccount.id)?.[0] ?? Money.zero()) : Money.zero();
   if (reAccount) cols.forEach((_, i) => put(reAccount.id, i, priorYears[i]));
 
   const cells = (label: string, v: Amounts): Record<string, CellValue> => {
@@ -582,8 +584,17 @@ function buildBSRows(
     return c;
   };
   const rows: StdRow[] = [];
+  // Earlier fiscal years' Profit & Loss (what Retained Earnings adds to the account's balance).
+  const priorPLHref = cols[0].bs.fiscalYearStart
+    ? stdHref('profit-loss', { to: dayStr(new Date(new Date(cols[0].bs.fiscalYearStart).getTime() - 1)), from: '1900-01-01', basis, ...zf })
+    : null;
   const hrefFor = (a: AccountMeta) =>
-    stdHref('transaction-detail-by-account', { accountId: a.id, to: dayStr(cols[0].asOf), basis, ...zf });
+    // The Retained Earnings account row is earlier years' earnings when the account itself holds
+    // nothing: QuickZoom opens those years' Profit & Loss (QB), which ties to the row. With
+    // entries of its own too, the account's transactions open as for any account.
+    a.id === reAccount?.id && priorPLHref && !priorYears[0].isZero() && reOwn.isZero()
+      ? priorPLHref
+      : stdHref('transaction-detail-by-account', { accountId: a.id, to: dayStr(cols[0].asOf), basis, ...zf });
 
   const sectionTotal = new Map<BSSection, Amounts>();
   const block = (s: BSSection, depth: number, parent: string | null) => {
@@ -675,9 +686,7 @@ function buildBSRows(
             depth: 2,
             kind: 'data',
             cells: cells('Retained Earnings', priorYears),
-            href: cols[0].bs.fiscalYearStart
-              ? stdHref('profit-loss', { to: dayStr(new Date(new Date(cols[0].bs.fiscalYearStart).getTime() - 1)), from: '1900-01-01', basis, ...zf })
-              : null,
+            href: priorPLHref,
           });
           addInto(t, priorYears);
         }

@@ -551,13 +551,17 @@ export interface TransactionLogPage {
 }
 
 /**
- * Filtered, newest-first view of the log. When `companyId` is set, records of other
- * companies sharing the data dir are hidden (records without a company — users, the
- * genesis record — are always shown).
+ * Every record matching the filter (limit / offset ignored), newest first. When `companyId` is
+ * set, records of other companies sharing the data dir are left out (records without a company —
+ * users, the genesis record — are always in). The array is a snapshot: records appended later
+ * are not in it (the CSV export pages through it, so rows never shift or repeat).
  */
-export function queryTransactionLog(dataDir: string, filter: TransactionLogFilter = {}): TransactionLogPage {
+export function matchTransactionLog(dataDir: string, filter: TransactionLogFilter = {}): TransactionLogRecord[] {
   const { records } = readAllTransactionLog(dataDir);
-  const scoped = records.filter((r) => !filter.companyId || !r.companyId || r.companyId === filter.companyId);
+  return matchRecords(records.filter((r) => !filter.companyId || !r.companyId || r.companyId === filter.companyId), filter);
+}
+
+function matchRecords(scoped: TransactionLogRecord[], filter: TransactionLogFilter): TransactionLogRecord[] {
   const fromIso = filter.from?.toISOString();
   const toIso = filter.to?.toISOString();
   const q = filter.search?.trim().toLowerCase();
@@ -574,7 +578,18 @@ export function queryTransactionLog(dataDir: string, filter: TransactionLogFilte
     }
     return true;
   });
-  matches.reverse(); // newest first
+  return matches.reverse(); // newest first
+}
+
+/**
+ * Filtered, newest-first view of the log. When `companyId` is set, records of other
+ * companies sharing the data dir are hidden (records without a company — users, the
+ * genesis record — are always shown).
+ */
+export function queryTransactionLog(dataDir: string, filter: TransactionLogFilter = {}): TransactionLogPage {
+  const { records } = readAllTransactionLog(dataDir);
+  const scoped = records.filter((r) => !filter.companyId || !r.companyId || r.companyId === filter.companyId);
+  const matches = matchRecords(scoped, filter);
   const offset = Math.max(0, filter.offset ?? 0);
   const limit = Math.max(1, Math.min(filter.limit ?? 100, 50_000));
 

@@ -116,6 +116,8 @@ interface BillPayment {
 }
 
 interface PaymentDetail extends BillPayment {
+  /** The payment's vendor (a payment opened from a report arrives with no vendor picked). */
+  vendorId: string;
   applications: Array<{ billId: string; amountApplied: string }>;
   /** I11: General Journal amounts this payment paid / journal credits applied with it. */
   journalApplications?: Array<{ kind: string; journalLineId: string; billId: string | null; amount: string; entryNumber: number }>;
@@ -219,6 +221,8 @@ export default function PayBillsPage() {
   const [editMethod, setEditMethod] = useState('check');
   const [editBills, setEditBills] = useState<Record<string, { billNumber: string | null; balanceDue: string }>>({});
   const [savingEdit, setSavingEdit] = useState(false);
+  // A payment that took an early-payment discount can't be edited here: it opens read-only.
+  const [editReadOnly, setEditReadOnly] = useState(false);
   const [pendingVoid, setPendingVoid] = useState<BillPayment | null>(null);
   // Fix errors where they happen: server fixes (pay exactly what the bill owes, closed period, ...).
   const payFixer = useErrorFixes<BillPaymentBody>();
@@ -573,10 +577,6 @@ export default function PayBillsPage() {
   async function openEditPayment(p: BillPayment) {
     try {
       const detail = await api.get<PaymentDetail>(`/api/bill-payments/${p.id}`);
-      if (Number(detail.discountTotal) > 0) {
-        toast('This payment took an early-payment discount. Void it and pay the bills again to change it.', 'danger');
-        return;
-      }
       const info: Record<string, { billNumber: string | null; balanceDue: string }> = {};
       for (const a of detail.applications) {
         const b = await api.get<{ billNumber: string | null; balanceDue: string }>(`/api/bills/${a.billId}`);
@@ -589,6 +589,10 @@ export default function PayBillsPage() {
       setEditAccount(detail.paymentAccountId ?? '');
       setEditMethod(detail.method);
       editFixer.clear();
+      setEditReadOnly(Number(detail.discountTotal) > 0);
+      // QuickZoom from a report (?open=) arrives with no vendor picked: show the payment's vendor,
+      // so the page lists its bills and a save goes to the right vendor.
+      if (detail.vendorId) setVendorId(detail.vendorId);
       setEditPay(detail);
     } catch (err) {
       toastError(err, 'Failed to load the payment.');
@@ -596,7 +600,7 @@ export default function PayBillsPage() {
   }
 
   async function saveEditPayment() {
-    if (!editPay) return;
+    if (!editPay || editReadOnly) return;
     const applications = Object.entries(editAmounts)
       .filter(([, v]) => num(v) > 0)
       .map(([billId, v]) => ({ billId, amountApplied: num(v).toFixed(2) }));
@@ -613,7 +617,8 @@ export default function PayBillsPage() {
       return;
     }
     const body: BillPaymentBody = {
-      vendorId,
+      // The payment's own vendor (a payment can't move to another vendor).
+      vendorId: editPay.vendorId,
       date: editDate,
       method: editMethod,
       reference: editPay.toPrint && editMethod === 'check' ? undefined : editRef.trim() || undefined,
@@ -647,7 +652,7 @@ export default function PayBillsPage() {
       editFixer.clear();
       toast('Payment updated.', 'success');
       setEditPay(null);
-      await loadVendorData(vendorId);
+      await loadVendorData(String(body.vendorId || vendorId));
     } finally {
       setSavingEdit(false);
     }
@@ -1059,33 +1064,46 @@ export default function PayBillsPage() {
           editFixer.clear();
           setEditPay(null);
         }}
-        title="Edit Bill Payment"
+        title={editReadOnly ? 'Bill Payment' : 'Edit Bill Payment'}
         footer={
-          <>
-            <Button variant="secondary" onClick={() => setEditPay(null)} disabled={savingEdit}>
-              Cancel
+          editReadOnly ? (
+            <Button variant="secondary" onClick={() => setEditPay(null)}>
+              Close
             </Button>
-            <Button onClick={saveEditPayment} loading={savingEdit}>
-              Save Changes
-            </Button>
-          </>
+          ) : (
+            <>
+              <Button variant="secondary" onClick={() => setEditPay(null)} disabled={savingEdit}>
+                Cancel
+              </Button>
+              <Button onClick={saveEditPayment} loading={savingEdit}>
+                Save Changes
+              </Button>
+            </>
+          )
         }
       >
         {editPay && (
           <div className="space-y-4">
             {editFixer.panel}
-            <p className="text-xs text-navy/50 rounded-lg bg-slate-50 border border-slate-200 px-3 py-2">
-              Changing only the check number keeps the original entry. Changing amounts, the account, the
-              method or the date replaces the entry (a reconciled payment asks first, as QB does).
-            </p>
+            {editReadOnly ? (
+              <p role="note" className="text-xs text-navy/70 rounded-lg bg-sky-50 border border-sky-200 px-3 py-2">
+                This payment took an early-payment discount ({formatCurrency(editPay.discountTotal)}), so it can't be
+                changed here. Void it and pay the bills again to change it.
+              </p>
+            ) : (
+              <p className="text-xs text-navy/50 rounded-lg bg-slate-50 border border-slate-200 px-3 py-2">
+                Changing only the check number keeps the original entry. Changing amounts, the account, the
+                method or the date replaces the entry (a reconciled payment asks first, as QB does).
+              </p>
+            )}
             <div className="grid grid-cols-2 gap-3">
               <div>
                 <Label htmlFor="ep-date">Date</Label>
-                <Input id="ep-date" type="date" value={editDate} onChange={(e) => setEditDate(e.target.value)} />
+                <Input id="ep-date" type="date" value={editDate} disabled={editReadOnly} onChange={(e) => setEditDate(e.target.value)} />
               </div>
               <div>
                 <Label htmlFor="ep-ref">Check # / Ref</Label>
-                <DocNumberInput id="ep-ref" value={editPay.toPrint ? '' : editRef} disabled={editPay.toPrint} placeholder={editPay.toPrint ? 'assigned when printed' : ''} onChange={(e) => setEditRef(e.target.value)} />
+                <DocNumberInput id="ep-ref" value={editPay.toPrint ? '' : editRef} disabled={editPay.toPrint || editReadOnly} placeholder={editPay.toPrint ? 'assigned when printed' : ''} onChange={(e) => setEditRef(e.target.value)} />
               </div>
             </div>
             <div className="grid grid-cols-2 gap-3">
@@ -1094,6 +1112,7 @@ export default function PayBillsPage() {
                 <Select
                   id="ep-acct"
                   value={editAccount}
+                  disabled={editReadOnly}
                   onChange={(e) => {
                     setEditAccount(e.target.value);
                     setEditMethod((m) => methodForAccount(accounts.find((a) => a.id === e.target.value), m));
@@ -1108,7 +1127,7 @@ export default function PayBillsPage() {
               </div>
               <div>
                 <Label htmlFor="ep-method">Method</Label>
-                <Select id="ep-method" value={editMethod} onChange={(e) => setEditMethod(e.target.value)}>
+                <Select id="ep-method" value={editMethod} disabled={editReadOnly} onChange={(e) => setEditMethod(e.target.value)}>
                   {METHOD_CHOICES.map(([v, label]) => (
                     <option key={v} value={v}>
                       {label}
@@ -1142,6 +1161,7 @@ export default function PayBillsPage() {
                     step="0.01"
                     className="w-32 text-right"
                     value={amt}
+                    disabled={editReadOnly}
                     onChange={(e) => setEditAmounts((prev) => ({ ...prev, [billId]: e.target.value }))}
                   />
                 </div>

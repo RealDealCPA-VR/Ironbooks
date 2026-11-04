@@ -181,8 +181,8 @@ export async function deleteMemorizedReport(ctx: ServiceContext, id: string) {
 
 /** Turn a report-builder result into the standard report shape (for groups / schedules). */
 async function runCustomReport(ctx: ServiceContext, name: string, config: Record<string, unknown>): Promise<StdReport> {
-  // Report builder output is general-ledger data: same gate as the GL / financial reports.
-  requirePermission(ctx, 'reports_financial', 'view');
+  // Report builder output is general-ledger data: the Custom Reports activity, as for the builder.
+  requireActivity(ctx, 'reports_financial.custom', 'view');
   const res = await runReport(ctx, config as unknown as ReportConfig);
   return {
     key: 'custom',
@@ -525,8 +525,10 @@ async function emailScheduledReport(
   );
 }
 
+// Scheduled reports are their own File Utilities activity (prefsperms): another File Utilities
+// activity (Back Up, Import, ...) gives no right to them.
 export async function listReportSchedules(ctx: ServiceContext) {
-  requirePermission(ctx, 'file_utilities', 'view');
+  requireActivity(ctx, 'file_utilities.schedules', 'view');
   return ctx.db
     .select()
     .from(reportSchedules)
@@ -549,7 +551,7 @@ export async function createReportSchedule(
     emailTo?: string | null;
   },
 ) {
-  requirePermission(ctx, 'file_utilities', 'create');
+  requireActivity(ctx, 'file_utilities.schedules', 'create');
   const emailTo = normalizeRecipients(input.emailTo);
   if (!!input.memorizedReportId === !!input.groupId) throw validation('Choose either one memorized report or one report group.');
   if (input.memorizedReportId) {
@@ -599,10 +601,18 @@ export async function updateReportSchedule(
   id: string,
   patch: { name?: string; frequency?: ScheduleFrequency; isActive?: boolean; format?: 'csv' | 'xlsx'; emailTo?: string | null },
 ) {
-  requirePermission(ctx, 'file_utilities', 'modify');
+  requireActivity(ctx, 'file_utilities.schedules', 'modify');
   const emailTo = patch.emailTo !== undefined ? normalizeRecipients(patch.emailTo) : undefined;
   const [before] = await ctx.db.select().from(reportSchedules).where(and(eq(reportSchedules.id, id), eq(reportSchedules.companyId, ctx.companyId)));
   if (!before) throw notFound('Report schedule');
+  // The unattended run uses its creator's access and mails the reports to these addresses: only
+  // someone who may view every report it runs may add or change recipients (as when creating it).
+  if (emailTo && emailTo !== before.emailTo) {
+    for (const t of await scheduleReportTypes(ctx, before)) {
+      const area = typeof t === 'string' ? areaForReportType(t) : undefined;
+      if (area) requireReportView(ctx, t, area);
+    }
+  }
   // Monthly schedules run on an anchor day of month. Keep it when frequency is unchanged (and set);
   // otherwise derive it from the next scheduled run so a switch to monthly doesn't drift.
   const frequency = patch.frequency ?? before.frequency;
@@ -633,7 +643,7 @@ export async function updateReportSchedule(
 }
 
 export async function deleteReportSchedule(ctx: ServiceContext, id: string) {
-  requirePermission(ctx, 'file_utilities', 'delete');
+  requireActivity(ctx, 'file_utilities.schedules', 'delete');
   const [before] = await ctx.db.select().from(reportSchedules).where(and(eq(reportSchedules.id, id), eq(reportSchedules.companyId, ctx.companyId)));
   if (!before) throw notFound('Report schedule');
   return inTransaction(ctx, async (tx) => {
@@ -671,7 +681,7 @@ export async function runDueSchedules(
   ctx: ServiceContext,
   opts: { now?: Date; outDir?: string } = {},
 ): Promise<ScheduleRunResult[]> {
-  requirePermission(ctx, 'file_utilities', 'create');
+  requireActivity(ctx, 'file_utilities.schedules', 'create');
   assertNotSandbox('Scheduled reports'); // sandbox mode: schedules wait for the real file
   const now = opts.now ?? new Date();
   const root = opts.outDir ?? reportExportRoot();
