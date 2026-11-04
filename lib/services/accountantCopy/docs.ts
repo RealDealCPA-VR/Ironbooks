@@ -210,6 +210,7 @@ async function invoicePayload(ctx: ServiceContext, id: string): Promise<P> {
     toBePrinted: r.toBePrinted,
     toBeEmailed: r.toBeEmailed,
     isStatementCharge: r.isStatementCharge,
+    customerMessageId: r.customerMessageId ?? null,
     total: toAmountString(r.total),
     lines: r.lines.map((l) => ({
       itemId: l.itemId,
@@ -218,6 +219,8 @@ async function invoicePayload(ctx: ServiceContext, id: string): Promise<P> {
       quantity: dec(l.quantity) ?? '1',
       rate: dec(l.rate),
       taxable: l.taxable,
+      // The line's Sales Tax Code (B9): without it the client re-derives the code from the item.
+      salesTaxCodeId: l.salesTaxCodeId ?? null,
       taxRateId: l.taxRateId,
       classId: l.classId,
       jobId: l.jobId,
@@ -244,6 +247,8 @@ async function salesReceiptPayload(ctx: ServiceContext, id: string): Promise<P> 
     taxRateId: r.taxRateId,
     depositAccountId: r.depositAccountId,
     method: r.method,
+    paymentMethodId: r.paymentMethodId ?? null,
+    customerMessageId: r.customerMessageId ?? null,
     reference: r.reference,
     memo: r.memo,
     classId: r.classId,
@@ -263,6 +268,7 @@ async function salesReceiptPayload(ctx: ServiceContext, id: string): Promise<P> 
       quantity: dec(l.quantity) ?? '1',
       rate: dec(l.rate),
       taxable: l.taxable,
+      salesTaxCodeId: l.salesTaxCodeId ?? null,
       taxRateId: l.taxRateId,
       ...invOf(l as P),
       ...(l.itemId && inventory.has(l.itemId) && costs.has(l.id) ? { cost: costs.get(l.id) } : {}),
@@ -282,6 +288,9 @@ async function creditMemoPayload(ctx: ServiceContext, id: string): Promise<P> {
     memo: r.memo,
     toBePrinted: r.toBePrinted,
     toBeEmailed: r.toBeEmailed,
+    classId: r.classId ?? null,
+    jobId: r.jobId ?? null,
+    customerMessageId: r.customerMessageId ?? null,
     total: toAmountString(r.total),
     lines: r.lines.map((l) => ({
       itemId: l.itemId,
@@ -290,6 +299,9 @@ async function creditMemoPayload(ctx: ServiceContext, id: string): Promise<P> {
       quantity: dec(l.quantity) ?? '1',
       rate: dec(l.rate),
       taxable: l.taxable,
+      salesTaxCodeId: l.salesTaxCodeId ?? null,
+      classId: l.classId ?? null,
+      jobId: l.jobId ?? null,
       restock: l.restock,
       ...invOf(l as P),
       // Restocked inventory: what the restock was valued at here (no entry = $0).
@@ -316,6 +328,7 @@ async function paymentPayload(ctx: ServiceContext, id: string): Promise<P> {
     customerId: r.customerId,
     date: iso(r.date),
     method: r.method,
+    paymentMethodId: r.paymentMethodId ?? null,
     reference: r.reference,
     amount: toAmountString(r.amount),
     depositAccountId: r.depositAccountId,
@@ -484,6 +497,7 @@ async function estimatePayload(ctx: ServiceContext, id: string): Promise<P> {
     shipTo: strMap(r.shipTo),
     toBePrinted: r.toBePrinted,
     toBeEmailed: r.toBeEmailed,
+    customerMessageId: r.customerMessageId ?? null,
     status: r.status,
     total: toAmountString(r.total),
     lines: r.lines.map((l) => ({
@@ -493,6 +507,7 @@ async function estimatePayload(ctx: ServiceContext, id: string): Promise<P> {
       quantity: dec(l.quantity) ?? '1',
       rate: dec(l.rate),
       taxable: l.taxable,
+      salesTaxCodeId: l.salesTaxCodeId ?? null,
       classId: l.classId,
     })),
   };
@@ -514,6 +529,7 @@ async function salesOrderPayload(ctx: ServiceContext, id: string): Promise<P> {
     poNumber: r.poNumber,
     toBePrinted: r.toBePrinted,
     toBeEmailed: r.toBeEmailed,
+    customerMessageId: r.customerMessageId ?? null,
     status: r.status,
     total: toAmountString(r.total),
     lines: r.lines.map((l) => ({
@@ -523,6 +539,7 @@ async function salesOrderPayload(ctx: ServiceContext, id: string): Promise<P> {
       quantity: dec(l.quantity) ?? '1',
       rate: dec(l.rate),
       taxable: l.taxable,
+      salesTaxCodeId: l.salesTaxCodeId ?? null,
     })),
   };
 }

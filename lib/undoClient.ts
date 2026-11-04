@@ -56,10 +56,15 @@ export function classifyWrite(method: string, path: string, body: unknown): Clas
   const list = UNDO_RESOURCES[resource].list;
   if (method === 'POST' && !id) return { resource, kind: 'create', id: null };
   if (!id) return null;
+  const action = body && typeof body === 'object' ? (body as { action?: unknown }).action : undefined;
+  const status = body && typeof body === 'object' ? (body as { status?: unknown }).status : undefined;
+  // Deleting an estimate / purchase order, or voiding an estimate, has no Undo (as in QB): the
+  // deleted record can't be restored and a void estimate can't be reopened.
+  if (method === 'DELETE' && (resource === 'estimates' || resource === 'purchase-orders')) return null;
+  if (resource === 'estimates' && (status === 'void' || action === 'void')) return null;
   if (method === 'PUT' || method === 'PATCH') return { resource, kind: 'update', id };
   if (method === 'DELETE') return { resource, kind: list ? 'delete' : 'void', id };
   // Purchase orders are voided with POST { action: 'void' } (status change, no posting).
-  const action = body && typeof body === 'object' ? (body as { action?: unknown }).action : undefined;
   if (method === 'POST' && resource === 'purchase-orders' && action === 'void') return { resource, kind: 'void', id };
   return null;
 }

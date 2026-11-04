@@ -21,6 +21,7 @@ import {
   estimateLines,
   estimates,
   invoiceLines,
+  items,
   purchaseOrderLines,
   purchaseOrders,
   salesOrderLines,
@@ -377,6 +378,18 @@ describe('2. Memorized estimates, sales orders and bill credits', () => {
     expect((await refusal(createTemplate(ctx, { ...base, docType: 'vendor_credit', template: { vendorId: cust, lines: [{}] } }))).code).toBe(
       'NOT_FOUND',
     );
+    // A line naming another company's item / account / tax code is refused when memorized.
+    const foreignItem = (
+      await db.insert(items).values({ companyId: other.id, name: `Foreign item ${seq}`, type: 'service' as never }).returning()
+    )[0].id;
+    const [foreignAcct] = await db.select().from(accounts).where(eq(accounts.companyId, other.id)).limit(1);
+    const foreignCode = String((await listEntries({ db, companyId: other.id, userId }, 'sales-tax-codes'))[0].id);
+    for (const line of [{ itemId: foreignItem }, { accountId: foreignAcct.id }, { salesTaxCodeId: foreignCode }]) {
+      expect(
+        (await refusal(createTemplate(ctx, { ...base, docType: 'estimate', template: { customerId: cust, lines: [{ description: 'x', quantity: 1, ...line }] } })))
+          .code,
+      ).toBe('VALIDATION');
+    }
     // A re-memorized payload is checked the same way.
     const ok = await createTemplate(ctx, {
       ...base,

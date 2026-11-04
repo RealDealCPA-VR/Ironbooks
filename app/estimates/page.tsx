@@ -54,6 +54,8 @@ import PrefillNotice from '@/components/PrefillNotice';
 import { usePrefill } from '@/lib/commands/usePrefill';
 import { TransactionNav, useAdjacentTransactions } from '@/components/TransactionNav';
 import AttachmentPanel from '@/components/AttachmentPanel'; // J9 Doc Center
+import MemorizeButton from '@/components/MemorizeButton';
+import { VoidDeleteButtons, useCanVoidDelete, useVoidDelete } from '@/components/sales/VoidDeleteButtons';
 // salesar (B8 / B9): Customer Message picker and the per-line Sales Tax Code column.
 import { CustomerMessageField, customerTaxStatus, useCustomerMessages, useSalesTaxCodes } from '@/components/sales/FormLists';
 import {
@@ -188,11 +190,13 @@ function statusTone(status: string): 'neutral' | 'success' | 'warning' | 'danger
     case 'partial': return 'warning';
     case 'rejected': return 'danger';
     case 'closed': return 'info';
+    case 'void': return 'danger';
     default: return 'neutral';
   }
 }
 
 function statusLabel(status: string): string {
+  if (status === 'void') return 'VOID';
   return status.charAt(0).toUpperCase() + status.slice(1);
 }
 
@@ -607,9 +611,43 @@ function EstimatesPageContent() {
   // QB Previous / Next: estimates in date and number order (Previous from a new one opens the latest).
   const nav = useAdjacentTransactions(estimates, editingId, (e) => e.date, (e) => e.estimateNumber);
   const editingEstimate = editingId ? estimates.find((e) => e.id === editingId) ?? null : null;
+  // salesar: QB Edit > Void / Delete Estimate (Ctrl+D), with QB's confirmation.
+  const canVoidDelete = useCanVoidDelete('estimate');
+  const voidDelete = useVoidDelete('estimate', async (_what, id) => {
+    if (id === editingId) setAddOpen(false);
+    await fetchEstimates();
+  });
+  /** An estimate an invoice was made from (closed / partly billed) can't be voided or deleted. */
+  const voidDeleteTarget = (e: Estimate) => ({ id: e.id, number: docNo(e.refNumber, e.estimateNumber), status: e.status });
+  const estimateLocked = (e: Estimate) => e.status === 'closed' || e.status === 'partial' || Number(e.amountInvoiced) > 0;
 
   function handleFormChange(field: keyof EstimateForm, value: string) {
     setAddForm((prev) => ({ ...prev, [field]: value }));
+  }
+
+  /** Memorize (Ctrl+M): the body the form would POST, without the number (each entry gets the next). */
+  function estimateTemplate(): Record<string, unknown> | string {
+    if (!addForm.customerId) return 'Pick a customer before memorizing.';
+    if (addForm.lines.length === 0 || addForm.lines.some((l) => !l.description.trim())) return 'Every line needs a description before memorizing.';
+    const numbers = addForm.lines.map((l, i) => estimateLineNumbers(l, i + 1));
+    const bad = numbers.find((x): x is { error: string } => 'error' in x);
+    if (bad) return bad.error;
+    return {
+      ...shippingPayload(sendFlags, { shipToOnly: true }),
+      customerId: addForm.customerId,
+      date: addForm.date,
+      expirationDate: addForm.expirationDate || null,
+      taxRateId: addForm.taxRateId || null,
+      memo: addForm.memo || null,
+      customerMessageId: customerMessagePayload(addForm.customerMessageId),
+      lines: addForm.lines.map((l, i) => ({
+        itemId: l.itemId || null,
+        description: l.description.trim(),
+        ...(numbers[i] as { quantity: string; rate: string | number | null }),
+        ...lineTaxPayload({ ...l, itemType: items.find((it) => it.id === l.itemId)?.type ?? null }, taxCodes, customerTax),
+        classId: l.classId || null,
+      })),
+    };
   }
 
   async function handleCreate() {
@@ -869,13 +907,13 @@ function EstimatesPageContent() {
                     <div className="flex items-center justify-end gap-1">
                       {/* Print (PDF) + Email */}
                       <FormSendButtons kind="estimate" id={e.id} />
-                      {e.status !== 'closed' && e.status !== 'partial' && (
+                      {e.status !== 'closed' && e.status !== 'partial' && e.status !== 'void' && (
                         <Button variant="ghost" size="sm" title="Edit estimate" aria-label="Edit estimate" onClick={() => openEditModal(e)}>
                           <Pencil className="h-3.5 w-3.5" />
                         </Button>
                       )}
-                      {/* Status transitions for non-closed, non-partial estimates */}
-                      {e.status !== 'closed' && e.status !== 'partial' && (
+                      {/* Status transitions for non-closed, non-partial, non-void estimates */}
+                      {e.status !== 'closed' && e.status !== 'partial' && e.status !== 'void' && (
                         <>
                           {e.status !== 'accepted' && (
                             <Button
@@ -913,7 +951,7 @@ function EstimatesPageContent() {
                           )}
                         </>
                       )}
-                      {e.status !== 'closed' && e.status !== 'rejected' && (
+                      {e.status !== 'closed' && e.status !== 'rejected' && e.status !== 'void' && (
                         <>
                           {progressOn && <Button
                             variant="ghost"
@@ -940,6 +978,15 @@ function EstimatesPageContent() {
                       {e.status === 'closed' && e.convertedInvoiceId && (
                         <span className="text-xs text-navy/40 italic">Converted</span>
                       )}
+                      {!estimateLocked(e) && (
+                        <VoidDeleteButtons
+                          compact
+                          target={voidDeleteTarget(e)}
+                          allowed={canVoidDelete}
+                          canVoid={e.status !== 'void'}
+                          request={voidDelete.request}
+                        />
+                      )}
                     </div>
                   </Td>
                 </Tr>
@@ -957,6 +1004,20 @@ function EstimatesPageContent() {
         title={editingId ? `Edit Estimate #${editingNumber}` : 'New Estimate'}
         footer={
           <>
+            <MemorizeButton
+              docType="estimate"
+              shortcut={addOpen}
+              defaultName={customers.find((c) => c.id === addForm.customerId)?.displayName}
+              getTemplate={estimateTemplate}
+            />
+            {editingEstimate && !estimateLocked(editingEstimate) && (
+              <VoidDeleteButtons
+                target={voidDeleteTarget(editingEstimate)}
+                allowed={canVoidDelete}
+                canVoid={editingEstimate.status !== 'void'}
+                request={voidDelete.request}
+              />
+            )}
             <Button variant="secondary" onClick={() => setAddOpen(false)} disabled={addSaving}>
               Cancel
             </Button>
@@ -1210,6 +1271,7 @@ function EstimatesPageContent() {
         </p>
       </Modal>
       {creditLimit.dialog}
+      {voidDelete.dialog}
       <ConfirmDialog
         open={!!overbillPending}
         title="More than the estimate"

@@ -34,7 +34,7 @@
  * inverse (closing date, reconciliation, ...) leaves the token usable, so the user can retry
  * with the closing-date password; two clicks can never undo twice.
  */
-import { and, desc, eq, gte, inArray, isNotNull, lt, sql } from 'drizzle-orm';
+import { and, desc, eq, gte, inArray, isNotNull, lt, ne, sql } from 'drizzle-orm';
 import {
   accounts,
   auditLogs,
@@ -260,6 +260,53 @@ function copyMessage(noun: string, before: Snap, created: Snap | null, numberKey
   );
 }
 
+/**
+ * Undo of a New Customer / New Vendor saved with an Opening Balance (salesar): void the opening
+ * invoice / credit memo (customer) or bill / vendor credit (vendor) the save posted, so A/R or A/P
+ * goes back with the name. Returns how many were voided.
+ */
+async function voidOpeningBalanceDocs(ctx: ServiceContext, side: 'customer' | 'vendor', id: string): Promise<number> {
+  const MEMO = 'Opening Balance';
+  let n = 0;
+  if (side === 'customer') {
+    const invs = await ctx.db
+      .select({ id: invoices.id })
+      .from(invoices)
+      .where(and(eq(invoices.companyId, ctx.companyId), eq(invoices.customerId, id), eq(invoices.memo, MEMO), ne(invoices.status, 'void')));
+    for (const r of invs) {
+      await voidInvoice(ctx, r.id);
+      n++;
+    }
+    const cms = await ctx.db
+      .select({ id: creditMemos.id })
+      .from(creditMemos)
+      .where(and(eq(creditMemos.companyId, ctx.companyId), eq(creditMemos.customerId, id), eq(creditMemos.memo, MEMO), ne(creditMemos.status, 'void')));
+    for (const r of cms) {
+      await voidCreditMemo(ctx, r.id);
+      n++;
+    }
+  } else {
+    const bs = await ctx.db
+      .select({ id: bills.id })
+      .from(bills)
+      .where(and(eq(bills.companyId, ctx.companyId), eq(bills.vendorId, id), eq(bills.memo, MEMO), ne(bills.status, 'void')));
+    for (const r of bs) {
+      await voidBill(ctx, r.id);
+      n++;
+    }
+    const vcs = await ctx.db
+      .select({ id: vendorCredits.id })
+      .from(vendorCredits)
+      .where(and(eq(vendorCredits.companyId, ctx.companyId), eq(vendorCredits.vendorId, id), eq(vendorCredits.memo, MEMO), ne(vendorCredits.status, 'void')));
+    for (const r of vcs) {
+      await voidVendorCredit(ctx, r.id);
+      n++;
+    }
+  }
+  return n;
+}
+const openingNote = (n: number) => (n ? ' Its opening balance was voided.' : '');
+
 // ---------------------------------------------------------------------------
 // Snapshot -> service input mappers
 // ---------------------------------------------------------------------------
@@ -279,6 +326,9 @@ function invoiceInput(s: Snap): CreateInvoiceInput {
       quantity: reqStr(l.quantity ?? '1'),
       rate: num(l.rate),
       taxable: l.taxable !== false,
+      // The line's Sales Tax Code (B9): without it the code is re-derived from the item, so a
+      // stated "Tax" on a "Non" item would lose its tax.
+      salesTaxCodeId: str(l.salesTaxCodeId),
       taxRateId: str(l.taxRateId),
       classId: str(l.classId),
       jobId: str(l.jobId),
@@ -308,6 +358,7 @@ function invoiceInput(s: Snap): CreateInvoiceInput {
     poNumber: str(s.poNumber),
     toBePrinted: bool(s.toBePrinted),
     toBeEmailed: bool(s.toBeEmailed),
+    customerMessageId: str(s.customerMessageId),
     // The user already accepted these warnings when the invoice was first saved.
     overrideCreditLimit: true,
     allowOverBilling: true,
@@ -425,6 +476,7 @@ function paymentInput(s: Snap): ReceivePaymentInput {
     customerId: reqStr(s.customerId),
     date: reqDate(s.date),
     method: (str(s.method) ?? 'check') as ReceivePaymentInput['method'],
+    paymentMethodId: str(s.paymentMethodId),
     reference: str(s.reference),
     amount: reqStr(s.amount),
     depositAccountId: str(s.depositAccountId),
@@ -532,12 +584,14 @@ function estimateInput(s: Snap): CreateEstimateInput {
     shipTo: (s.shipTo as Record<string, string> | null) ?? null,
     toBePrinted: bool(s.toBePrinted),
     toBeEmailed: bool(s.toBeEmailed),
+    customerMessageId: str(s.customerMessageId),
     lines: arr(s.lines).map((l) => ({
       itemId: str(l.itemId),
       description: str(l.description),
       quantity: reqStr(l.quantity ?? '1'),
       rate: num(l.rate),
       taxable: l.taxable !== false,
+      salesTaxCodeId: str(l.salesTaxCodeId),
       classId: str(l.classId),
     })),
   };
@@ -552,6 +606,8 @@ function salesReceiptInput(s: Snap): CreateSalesReceiptInput {
     taxRateId: str(s.taxRateId),
     depositAccountId: str(s.depositAccountId),
     method: (str(s.method) ?? 'cash') as CreateSalesReceiptInput['method'],
+    paymentMethodId: str(s.paymentMethodId),
+    customerMessageId: str(s.customerMessageId),
     reference: str(s.reference),
     memo: str(s.memo),
     classId: str(s.classId),
@@ -570,6 +626,7 @@ function salesReceiptInput(s: Snap): CreateSalesReceiptInput {
       quantity: reqStr(l.quantity ?? '1'),
       rate: num(l.rate),
       taxable: l.taxable !== false,
+      salesTaxCodeId: str(l.salesTaxCodeId),
       taxRateId: str(l.taxRateId),
       ...invDetail(l),
     })),
@@ -586,6 +643,9 @@ function creditMemoInput(s: Snap): CreateCreditMemoInput {
     memo: str(s.memo),
     toBePrinted: bool(s.toBePrinted),
     toBeEmailed: bool(s.toBeEmailed),
+    classId: str(s.classId),
+    jobId: str(s.jobId),
+    customerMessageId: str(s.customerMessageId),
     lines: arr(s.lines).map((l) => ({
       itemId: str(l.itemId),
       accountId: str(l.accountId),
@@ -593,6 +653,9 @@ function creditMemoInput(s: Snap): CreateCreditMemoInput {
       quantity: reqStr(l.quantity ?? '1'),
       rate: reqStr(l.rate ?? '0'),
       taxable: l.taxable !== false,
+      salesTaxCodeId: str(l.salesTaxCodeId),
+      classId: str(l.classId),
+      jobId: str(l.jobId),
       restock: l.restock !== false,
       ...invDetail(l),
     })),
@@ -1037,9 +1100,9 @@ const ADAPTERS: Record<string, Adapter> = {
     snapshot: async (ctx, id) => toJson(await getEstimate(ctx, id)),
     describe: (s) => named('estimate', docNo(s, 'refNumber', 'estimateNumber')),
     async undoCreate(ctx, id, snap) {
-      // Estimates have no delete; Rejected takes it out of every open-estimate list.
+      // Undo of a new estimate marks it Rejected (out of every open-estimate list); the user can delete it.
       await updateEstimateStatus(ctx, id, 'rejected');
-      return { message: `Undone: ${this.describe(snap)} was marked Rejected (estimates can't be deleted).` };
+      return { message: `Undone: ${this.describe(snap)} was marked Rejected. Delete it from the Estimates list if it should go.` };
     },
     async restore(ctx, id, before, now) {
       const sameBody =
@@ -1061,7 +1124,7 @@ const ADAPTERS: Record<string, Adapter> = {
     describe: (s) => named('purchase order', docNo(s, 'refNumber', 'poNumber')),
     async undoCreate(ctx, id, snap) {
       await updatePurchaseOrderStatus(ctx, id, 'void');
-      return { message: `Undone: ${this.describe(snap)} was voided (purchase orders can't be deleted).` };
+      return { message: `Undone: ${this.describe(snap)} was voided. Delete it from the Purchase Orders list if it should go.` };
     },
     async restore(ctx, id, before, now) {
       const current = new Set(arr(now.lines).map((l) => String(l.id)));
@@ -1083,8 +1146,9 @@ const ADAPTERS: Record<string, Adapter> = {
     snapshot: async (ctx, id) => toJson(await getCustomer(ctx, id)),
     describe: (s) => `customer “${s.displayName}”`,
     async undoCreate(ctx, id, snap) {
+      const voided = await voidOpeningBalanceDocs(ctx, 'customer', id);
       await deactivateCustomer(ctx, id);
-      return { message: `Undone: ${this.describe(snap)} was removed from your active customers (made inactive).` };
+      return { message: `Undone: ${this.describe(snap)} was removed from your active customers (made inactive).${openingNote(voided)}` };
     },
     async restore(ctx, id, before, now) {
       await updateCustomer(ctx, id, customerPatch(before));
@@ -1108,8 +1172,9 @@ const ADAPTERS: Record<string, Adapter> = {
     snapshot: async (ctx, id) => toJson(await loadVendorUnmasked(ctx, id)),
     describe: (s) => `vendor “${s.displayName}”`,
     async undoCreate(ctx, id, snap) {
+      const voided = await voidOpeningBalanceDocs(ctx, 'vendor', id);
       await deactivateVendor(ctx, id);
-      return { message: `Undone: ${this.describe(snap)} was removed from your active vendors (made inactive).` };
+      return { message: `Undone: ${this.describe(snap)} was removed from your active vendors (made inactive).${openingNote(voided)}` };
     },
     async restore(ctx, id, before, now) {
       await updateVendor(ctx, id, vendorPatch(before));
