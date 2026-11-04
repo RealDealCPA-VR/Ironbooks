@@ -54,6 +54,15 @@ export function reconciledEditFixes() {
   ];
 }
 
+/** QB's warning for a reconciled transaction whose amount or account the edit changes. */
+export function reconciledEditWarning(what: string, entryId: string): ServiceError {
+  return new ServiceError(
+    'CONFLICT',
+    `This ${what} has been reconciled. If you change its amount or account, the beginning balance of your next reconciliation won't match your bank statement, and the change is listed on the Previous Reconciliation Discrepancy report. Change it anyway?`,
+    { reconciledEdit: true, entryId },
+  ).withFixes(reconciledEditFixes());
+}
+
 interface ReconciledLine {
   lineId: string;
   accountId: string;
@@ -198,13 +207,7 @@ export async function prepareReconciledRepost(
     pool.splice(i, 1);
     return true;
   });
-  if (!preserved && !params.allowReconciledEdit) {
-    throw new ServiceError(
-      'CONFLICT',
-      `This ${params.what} has been reconciled. If you change its amount or account, the beginning balance of your next reconciliation won't match your bank statement, and the change is listed on the Previous Reconciliation Discrepancy report. Change it anyway?`,
-      { reconciledEdit: true, entryId: params.entryId },
-    ).withFixes(reconciledEditFixes());
-  }
+  if (!preserved && !params.allowReconciledEdit) throw reconciledEditWarning(params.what, params.entryId);
 
   await ctx.db.insert(reconciliationChanges).values(
     reconciled.map((r) => ({
@@ -232,8 +235,8 @@ export async function prepareReconciledRepost(
 export async function carryReconciledLines(
   ctx: ServiceContext,
   params: { oldEntryId: string | null | undefined; newEntryId: string | null | undefined },
-): Promise<void> {
-  if (!params.oldEntryId) return;
+): Promise<{ changed: boolean }> {
+  if (!params.oldEntryId) return { changed: false };
   const pending = await ctx.db
     .select({
       id: reconciliationChanges.id,
@@ -255,7 +258,8 @@ export async function carryReconciledLines(
         sql`${reconciliationChanges.txId} = txid_current()::text`,
       ),
     );
-  if (pending.length === 0) return;
+  if (pending.length === 0) return { changed: false };
+  let changed = false;
   const newLines = params.newEntryId
     ? await ctx.db
         .select({
@@ -282,6 +286,7 @@ export async function carryReconciledLines(
       used.add(match.id);
       const amount = statementAmount(match, p.glType, foreign);
       const effect = Money.round2(amount.minus(old));
+      if (!effect.isZero()) changed = true;
       await ctx.db.insert(reconciliationItems).values({
         reconciliationId: p.reconciliationId,
         journalEntryLineId: match.id,
@@ -300,6 +305,7 @@ export async function carryReconciledLines(
         })
         .where(eq(reconciliationChanges.id, p.id));
     } else {
+      changed = true;
       await ctx.db
         .update(reconciliationChanges)
         .set({
@@ -312,6 +318,33 @@ export async function carryReconciledLines(
         .where(eq(reconciliationChanges.id, p.id));
     }
   }
+  return { changed };
+}
+
+/**
+ * For documents whose new posting is only built after the old one is undone (a sales receipt, a
+ * received payment, a bill payment re-applied to its bills): arm the void of `entryId` before it is
+ * voided — no question asked yet — and call confirmReconciledRepost after the new entry is posted.
+ */
+export async function armReconciledRepost(
+  ctx: ServiceContext,
+  params: { entryId: string | null | undefined; what: string },
+): Promise<void> {
+  await prepareReconciledRepost(ctx, { entryId: params.entryId, lines: [], what: params.what, allowReconciledEdit: true });
+}
+
+/**
+ * After posting the new entry of an edit armed with armReconciledRepost: carries the reconciled
+ * marks over, and when a reconciled line's amount changed or it left the account without the
+ * user's confirmation, gives QB's warning — the throw rolls the whole save back. An edit that
+ * keeps the bank line as it was (memo, date, another income account) is saved without a question.
+ */
+export async function confirmReconciledRepost(
+  ctx: ServiceContext,
+  params: { oldEntryId: string | null | undefined; newEntryId: string | null | undefined; what: string; allowReconciledEdit?: boolean | null },
+): Promise<void> {
+  const { changed } = await carryReconciledLines(ctx, params);
+  if (changed && !params.allowReconciledEdit) throw reconciledEditWarning(params.what, params.oldEntryId!);
 }
 
 /** Line ids of a reconciliation that were carried onto it by a later edit (not reconciled as such). */

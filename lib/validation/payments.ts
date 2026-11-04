@@ -93,6 +93,8 @@ export const receivePaymentSchema = z.object({
    * deposit (the rest of the deposit stays) and save the edit, in one step.
    */
   removeFromDeposit: z.boolean().optional(),
+  /** Edit only: QB's "this transaction has been reconciled" warning confirmed. */
+  allowReconciledEdit: z.boolean().optional(),
 });
 export type ReceivePaymentBody = z.infer<typeof receivePaymentSchema>;
 
