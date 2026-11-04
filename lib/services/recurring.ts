@@ -19,10 +19,11 @@
  */
 
 import { and, eq, lte } from 'drizzle-orm';
-import { recurringTemplates, customers, vendors } from '@/lib/db/schema';
+import { recurringTemplates, customers, vendors, items, accounts, salesTaxCodes, classes } from '@/lib/db/schema';
 import {
   type ServiceContext,
   ServiceError,
+  assertRefInCompany,
   inTransaction,
   notFound,
   validation,
@@ -439,9 +440,10 @@ async function assertMayAutomate(ctx: ServiceContext, docType: string): Promise<
 }
 
 /**
- * Memorizing a document runs the payload through the same checks the document's own create
- * service applies to its identity fields (the name must exist in this company) and its lines,
- * so a typo is refused when it is memorized — not months later when the recurrence fires.
+ * Memorizing an estimate / sales order / vendor credit checks what would otherwise fail only when
+ * the recurrence fires: the name must exist in this company, there must be at least one line, and
+ * every item / account / Sales Tax Code / class a line names must be this company's. (Amounts and
+ * the rest of the create rules are applied by the document's own service when it is entered.)
  */
 async function validateDocPayload(
   tx: ServiceContext,
@@ -468,6 +470,11 @@ async function validateDocPayload(
       if (!line || typeof line !== 'object' || Array.isArray(line)) {
         throw validation('Each line must be an object.');
       }
+      const l = line as Record<string, unknown>;
+      if (l.itemId) await assertRefInCompany(tx, items, String(l.itemId), 'Item');
+      if (l.accountId) await assertRefInCompany(tx, accounts, String(l.accountId), 'Account');
+      if (l.salesTaxCodeId) await assertRefInCompany(tx, salesTaxCodes, String(l.salesTaxCodeId), 'Sales tax code');
+      if (l.classId) await assertRefInCompany(tx, classes, String(l.classId), 'Class');
     }
   }
 }
