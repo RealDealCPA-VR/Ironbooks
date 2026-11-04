@@ -79,6 +79,14 @@ export const batchEnterSchema = z.object({
 
 export const batchVoidSchema = z.object({
   keys: z.array(z.string().regex(/^[a-z_]+:[0-9a-f-]{36}$/i, 'invalid transaction key')).min(1).max(500),
+  /** 'delete' = QB Batch Delete where allowed (default 'void'). */
+  action: z.enum(['void', 'delete']).optional(),
+  /** Record locking: key -> the version (updated_at) the row was listed with. */
+  versions: z.record(z.string().nullish()).optional(),
+});
+
+export const batchRestoreSchema = z.object({
+  ids: z.array(zUuid).min(1).max(500),
 });
 
 export const wtbNoteSchema = z.object({

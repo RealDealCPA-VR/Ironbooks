@@ -9,7 +9,7 @@
  * that touched an account together with a running balance. The running balance respects the
  * natural sign convention (debit-normal for asset/expense, credit-normal for liability/equity/revenue).
  */
-import { and, asc, desc, eq, gte, inArray, lt, lte, ne, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, gte, inArray, isNull, lt, lte, ne, sql } from 'drizzle-orm';
 import {
   accounts,
   classes,
@@ -459,7 +459,8 @@ export function onOrBeforeDay(to: Date) {
 }
 
 export async function listEntries(ctx: ServiceContext, opts: ListEntriesOptions = {}) {
-  const conds = [eq(journalEntries.companyId, ctx.companyId)];
+  // Entries deleted by Batch Delete/Void (accountant 0089) are gone from the Journal, as in QB.
+  const conds = [eq(journalEntries.companyId, ctx.companyId), isNull(journalEntries.deletedAt)];
   if (opts.from) conds.push(gte(journalEntries.date, opts.from));
   if (opts.to) conds.push(onOrBeforeDay(opts.to));
 
