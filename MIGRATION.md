@@ -83,11 +83,17 @@ you while migrating.
 Order matters: each step references records created by the previous one.
 
 1. **Create the company** (File → New Company / first-run setup). Set the
-   fiscal-year start to match QuickBooks.
+   fiscal-year start to match QuickBooks. For a small company starting fresh, the setup
+   interview's **Opening balances** step can take the bank, credit card, loan and other account
+   balances plus what each customer owes and what you owe each vendor, as of the day before the
+   start date: each is balanced through Opening Balance Equity (customers become invoices,
+   vendors bills), respects the closing date, and re-running the interview never doubles them.
+   If you do that, skip step 8 below for those accounts.
 2. **Chart of Accounts** — *Migrate from QuickBooks → Step 1 (Lists)*: the
    QuickBooks IIF file (`!ACCNT` sections), or a CSV / Excel list. Verify account
    types/subtypes after import; A/R and A/P accounts must keep their special
-   subtypes. Pick the IIF file with **Choose file…** as QuickBooks saved it: it is
+   subtypes. Files over **60 MB** (IIF, CSV or Excel) are refused before they are read — split
+   the export. Pick the IIF file with **Choose file…** as QuickBooks saved it: it is
    read in QuickBooks' own Windows character set, so accented names (Société,
    Müller) come over exactly.
 3. **Customers and Vendors** — IIF (`!CUST`, `!VEND`) or CSV list import.
@@ -157,6 +163,9 @@ File → Migrate from QuickBooks…):
    - A difference against the **Trial Balance** cannot be moved to suspense: if the General
      Ledger reconciles but the Trial Balance doesn't, the two exports describe different books
      (date, accrual/cash basis, filters) and the import is always rolled back.
+   - The Trial Balance check reads it the way QuickBooks prints it: income and expense
+     accounts for the **fiscal year to date** only, with earlier years' profit in Retained
+     Earnings — so a multi-year General Ledger checks against a Trial Balance as of its last day.
    - Lines that offset each other but whose `Split` column points to other accounts are not
      forced into one entry; they go to the review list.
    - The proof compares the entries this import posted. If the company file already has other
@@ -184,11 +193,16 @@ Notes:
   creates it. Item quantities on hand imported afterwards (an IIF or CSV item list with
   quantities) set up the stock without posting it again: the GL import already holds the
   Inventory Asset balance.
-- After the import you may have two accounts for the same thing (QuickBooks' "11000 Accounts
-  Receivable - Trade" next to Ironbooks' "1200 Accounts Receivable"). Merge the **QuickBooks**
-  one into the Ironbooks one (sidebar → Admin → Merge Records): invoices, bills, payments, inventory, sales tax and
-  payroll post to Ironbooks' own accounts by number, so those are always the ones to keep
-  (rename them afterwards if you like). The merge refuses the other direction.
+- After the import you may have two accounts for the same thing (QuickBooks' "20000 Accounts
+  Payable" next to Ironbooks' "2000 Accounts Payable"). Ironbooks posts Accounts Payable,
+  Inventory Asset, Cost of Goods Sold, Sales Tax Payable and Payroll Liabilities to the account
+  that holds that **role** — see **Company → System Accounts**: by default the usual number when
+  it is that kind of account, else the one account that clearly is, and you can choose your
+  QuickBooks account there while the current one has no balance yet. Accounts Receivable and
+  Undeposited Funds still go by their number (1200, 1050). To combine two accounts, merge the
+  other one **into** the account that holds the role (sidebar → Admin → Merge Records) and rename
+  it afterwards if you like: the merge refuses to merge a role account away, and an account that
+  holds a role can't be made inactive.
 - Running an import twice at once (a double click, two windows) is safe: imports into one
   company run one after the other, and the second one finds everything already there.
 
@@ -237,11 +251,21 @@ period; historical detail you didn't migrate lives there.
   `(12.50)`, `12.50-` and `$1,250.00` are understood, a `-` in an empty Debit or
   Credit cell counts as blank, and a file with an amount or date that is not
   real (`NaN`, Feb 30) is refused with the row number instead of being imported.
-  Importing the same file again (or twice at once) adds nothing. A statement
+  Importing the same file again (or twice at once) adds nothing. Dates must carry
+  their year: `01/31`, `Jan 31` and similar are refused with the row number rather than
+  guessed; an Excel date serial (`46053`, from a re-saved CSV) and `YYYYMMDD` are read as
+  dates. A statement
   **PDF, scan or photo** is read on this computer (text layer or offline OCR —
   your AI is asked only under its usual routing rules), and its rows are shown
   for review and **tied out** to the statement's opening and closing balances;
   a statement that doesn't tie out is only imported if you say so.
+- **Batch work after the move:** *Accountant → Batch Enter Transactions* takes checks, deposits,
+  card charges / credits, invoices, credit memos, bills, bill credits and journal entries typed
+  or pasted from Excel — with item lines (quantity, rate, tax code, sales tax item), split lines,
+  Customer:Job and check numbers — and saves each through its normal form, so the postings are
+  the same as entering them one by one. *Batch Delete/Void* voids transactions in bulk and
+  deletes General Journal entries, estimates, sales orders and purchase orders where QuickBooks
+  allows it; deleted ones can be restored from the same screen.
 - **IIF details:** names an IIF transaction uses on an A/R or A/P line that are
   not on your lists are added (as QuickBooks does), so those lines keep their
   name. Budgets (`!BUD`) land in the fiscal year each month belongs to.
