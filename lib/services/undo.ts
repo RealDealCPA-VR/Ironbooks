@@ -1054,9 +1054,9 @@ const ADAPTERS: Record<string, Adapter> = {
     snapshot: async (ctx, id) => toJson(await getEstimate(ctx, id)),
     describe: (s) => named('estimate', docNo(s, 'refNumber', 'estimateNumber')),
     async undoCreate(ctx, id, snap) {
-      // Estimates have no delete; Rejected takes it out of every open-estimate list.
+      // Undo of a new estimate marks it Rejected (out of every open-estimate list); the user can delete it.
       await updateEstimateStatus(ctx, id, 'rejected');
-      return { message: `Undone: ${this.describe(snap)} was marked Rejected (estimates can't be deleted).` };
+      return { message: `Undone: ${this.describe(snap)} was marked Rejected. Delete it from the Estimates list if it should go.` };
     },
     async restore(ctx, id, before, now) {
       const sameBody =
@@ -1078,7 +1078,7 @@ const ADAPTERS: Record<string, Adapter> = {
     describe: (s) => named('purchase order', docNo(s, 'refNumber', 'poNumber')),
     async undoCreate(ctx, id, snap) {
       await updatePurchaseOrderStatus(ctx, id, 'void');
-      return { message: `Undone: ${this.describe(snap)} was voided (purchase orders can't be deleted).` };
+      return { message: `Undone: ${this.describe(snap)} was voided. Delete it from the Purchase Orders list if it should go.` };
     },
     async restore(ctx, id, before, now) {
       const current = new Set(arr(now.lines).map((l) => String(l.id)));

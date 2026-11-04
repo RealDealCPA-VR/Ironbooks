@@ -22,6 +22,15 @@ describe('classifyWrite', () => {
     });
   });
 
+  it('offers no Undo for deleting an estimate / purchase order or voiding an estimate (as in QB)', () => {
+    expect(classifyWrite('DELETE', `/api/estimates/${ID}`, undefined)).toBeNull();
+    expect(classifyWrite('DELETE', `/api/purchase-orders/${ID}`, undefined)).toBeNull();
+    expect(classifyWrite('PATCH', `/api/estimates/${ID}`, { status: 'void' })).toBeNull();
+    expect(classifyWrite('POST', `/api/estimates/${ID}`, { action: 'void' })).toBeNull();
+    // Other estimate status changes stay undoable.
+    expect(classifyWrite('PATCH', `/api/estimates/${ID}`, { status: 'accepted' })).toEqual({ resource: 'estimates', kind: 'update', id: ID });
+  });
+
   it('ignores other actions and other resources', () => {
     expect(classifyWrite('POST', `/api/purchase-orders/${ID}`, { action: 'convert' })).toBeNull();
     expect(classifyWrite('POST', `/api/payments/${ID}`, { action: 'apply' })).toBeNull();
