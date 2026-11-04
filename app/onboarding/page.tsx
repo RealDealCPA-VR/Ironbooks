@@ -16,11 +16,13 @@
  *          accrual/cash reporting
  * Step 6 — Yes/no features: sales tax, inventory, employees, estimates (+ progress invoicing),
  *          time tracking, class tracking, more than one currency
- * Step 7 — Review (the summary is built from the values that will be saved) and finish
+ * Step 7 — Opening balances (optional, QB EasyStep "Add your bank accounts"): bank, credit card,
+ *          loan and other accounts, what customers owe you and what you owe vendors, as of the
+ *          day before the start date; each is balanced through Opening Balance Equity
+ * Step 8 — Review (the summary is built from the values that will be saved) and finish
  *
  * Finishing POSTs the answers to /api/company/setup-interview, which applies them to the open
- * company in one transaction (lib/services/setupInterview.ts). No opening balances are posted,
- * so the books start in balance.
+ * company in one transaction (lib/services/setupInterview.ts + setupOpeningBalances.ts).
  */
 
 import { Suspense, useEffect, useMemo, useState } from 'react';
@@ -38,6 +40,9 @@ import {
   CalendarRange,
   ToggleRight,
   ClipboardCheck,
+  Wallet,
+  Plus,
+  Trash2,
 } from 'lucide-react';
 import { Button, Card, Input, Select, Label, toast, toastError } from '@/components/ui';
 import { Help } from '@/components/Help';
@@ -89,6 +94,7 @@ const STEPS = [
   { label: 'Tax form', icon: Landmark },
   { label: 'Dates', icon: CalendarRange },
   { label: 'Features', icon: ToggleRight },
+  { label: 'Balances', icon: Wallet },
   { label: 'Finish', icon: ClipboardCheck },
 ];
 
@@ -110,6 +116,57 @@ interface WizardState extends FeatureAnswers {
   company: Required<CompanyInfo>;
   /** Whether the user has touched the inventory question (else it follows the industry). */
   inventoryTouched: boolean;
+  balances: BalancesState;
+}
+
+type OpeningKind = 'bank' | 'credit_card' | 'loan' | 'other_current_asset' | 'fixed_asset' | 'other_current_liability';
+const OPENING_KIND_LABELS: Record<OpeningKind, string> = {
+  bank: 'Bank',
+  credit_card: 'Credit card',
+  loan: 'Loan',
+  other_current_asset: 'Other current asset',
+  fixed_asset: 'Fixed asset',
+  other_current_liability: 'Other current liability',
+};
+interface BalanceAccountRow {
+  kind: OpeningKind;
+  /** An existing account's id, or '' for a new account named `name`. */
+  accountId: string;
+  name: string;
+  amount: string;
+}
+interface BalanceNameRow {
+  name: string;
+  amount: string;
+}
+interface BalancesState {
+  /** '' = the day before the start date. */
+  asOf: string;
+  accounts: BalanceAccountRow[];
+  customers: BalanceNameRow[];
+  vendors: BalanceNameRow[];
+}
+
+const AMOUNT_RE = /^-?\d+(\.\d{1,2})?$/;
+const cleanAmount = (s: string) => s.replace(/[$,\s]/g, '');
+/** The day before an ISO day ('' when not a date). */
+function dayBeforeIso(iso: string): string {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(iso)) return '';
+  const d = new Date(`${iso}T00:00:00.000Z`);
+  d.setUTCDate(d.getUTCDate() - 1);
+  return d.toISOString().slice(0, 10);
+}
+/** The rows that carry an amount, as the server expects them (undefined when none). */
+function balancesPayload(b: BalancesState) {
+  // A typed 0 is sent: on a re-run it removes what the earlier run entered for that row.
+  const amt = (r: { amount: string }) => cleanAmount(r.amount) !== '';
+  const accounts = b.accounts
+    .filter((r) => amt(r) && (r.accountId || r.name.trim()))
+    .map((r) => ({ kind: r.kind, amount: cleanAmount(r.amount), accountId: r.accountId || undefined, name: r.accountId ? undefined : r.name.trim() }));
+  const customers = b.customers.filter((r) => amt(r) && r.name.trim()).map((r) => ({ name: r.name.trim(), amount: cleanAmount(r.amount) }));
+  const vendors = b.vendors.filter((r) => amt(r) && r.name.trim()).map((r) => ({ name: r.name.trim(), amount: cleanAmount(r.amount) }));
+  if (!accounts.length && !customers.length && !vendors.length) return undefined;
+  return { ...(b.asOf ? { asOf: b.asOf } : {}), accounts, customers, vendors };
 }
 
 function firstOfYear(): string {
@@ -146,6 +203,7 @@ const INITIAL: WizardState = {
     email: '',
   },
   inventoryTouched: false,
+  balances: { asOf: '', accounts: [{ kind: 'bank', accountId: '', name: '', amount: '' }], customers: [], vendors: [] },
 };
 
 /** The answers object sent to the server (and used for the review preview). */
@@ -168,6 +226,12 @@ function toAnswers(s: WizardState): InterviewAnswers {
     multiCurrency: s.multiCurrency,
     company: s.company,
   };
+}
+
+/** What Finish sends: the answers plus the opening balances that carry an amount. */
+function toPayload(s: WizardState) {
+  const ob = balancesPayload(s.balances);
+  return { ...toAnswers(s), ...(ob ? { openingBalances: ob } : {}) };
 }
 
 /** Pre-fill from the open company (so re-running the interview starts from what is saved). */
@@ -764,6 +828,165 @@ function StepFeatures({ state, set, onBack, onNext }: StepProps) {
   );
 }
 
+function StepBalances({ state, set, onBack, onNext }: StepProps) {
+  const [choices, setChoices] = useState<Array<{ id: string; code: string; name: string; type: string; subtype: string | null }>>([]);
+  useEffect(() => {
+    api
+      .get<Array<{ id: string; code: string; name: string; type: string; subtype: string | null; isActive?: boolean }>>('/api/accounts')
+      .then((rows) => setChoices(rows.filter((a) => a.isActive !== false)))
+      .catch(() => setChoices([]));
+  }, []);
+  const b = state.balances;
+  const setB = (patch: Partial<BalancesState>) => set({ balances: { ...b, ...patch } });
+  const fitsKind = (a: { subtype: string | null }, k: OpeningKind) => {
+    if (k === 'bank') return a.subtype === 'checking' || a.subtype === 'savings';
+    if (k === 'credit_card') return a.subtype === 'credit_card';
+    if (k === 'loan') return a.subtype === 'long_term_liability';
+    if (k === 'fixed_asset') return a.subtype === 'fixed_assets';
+    if (k === 'other_current_asset') return a.subtype === 'other_current_asset' || a.subtype === 'other_asset';
+    return a.subtype === 'other_current_liability';
+  };
+  const asOf = b.asOf || dayBeforeIso(state.startDate);
+  const bad = [...b.accounts, ...b.customers, ...b.vendors].some(
+    (r) => cleanAmount(r.amount) !== '' && !AMOUNT_RE.test(cleanAmount(r.amount)),
+  );
+  const setAccountRow = (i: number, patch: Partial<BalanceAccountRow>) =>
+    setB({ accounts: b.accounts.map((r, j) => (j === i ? { ...r, ...patch } : r)) });
+  const setNameRow = (key: 'customers' | 'vendors', i: number, patch: Partial<BalanceNameRow>) =>
+    setB({ [key]: b[key].map((r, j) => (j === i ? { ...r, ...patch } : r)) });
+  return (
+    <div>
+      <StepHeading
+        icon={Wallet}
+        title="Opening balances"
+        subtitle="Optional. Enter what each account held, and who owed what, just before you start. Leave blank to add them later."
+      />
+      <div className="flex flex-col gap-5">
+        <div>
+          <Label htmlFor="ob-asof">Balances as of</Label>
+          <Input id="ob-asof" type="date" value={asOf} onChange={(e) => setB({ asOf: e.target.value })} aria-describedby="ob-asof-hint" />
+          <p id="ob-asof-hint" className="mt-1 text-xs text-navy/40">
+            Usually the day before your start date: the ending balance on that bank or card statement. Each amount is
+            balanced through Opening Balance Equity, so your books stay in balance. A date in a closed period needs the
+            closing date password.
+          </p>
+        </div>
+
+        <fieldset className="rounded-xl border border-slate-200 p-4">
+          <legend className="px-1 text-sm font-semibold text-navy">Bank, credit card, loan and other accounts</legend>
+          <p className="text-xs text-navy/50 mb-3">
+            Banks and assets: the amount you have. Cards, loans and liabilities: the amount you owe. Use a minus sign for
+            an overdrawn bank or a card in credit. Running the interview again: enter 0 to remove a balance entered before.
+          </p>
+          {b.accounts.map((r, i) => (
+            <div key={i} className="mb-3 grid grid-cols-12 items-end gap-2">
+              <div className="col-span-3">
+                <Label htmlFor={`ob-kind-${i}`}>Type</Label>
+                <Select id={`ob-kind-${i}`} value={r.kind} onChange={(e) => setAccountRow(i, { kind: e.target.value as OpeningKind, accountId: '' })}>
+                  {(Object.keys(OPENING_KIND_LABELS) as OpeningKind[]).map((k) => (
+                    <option key={k} value={k}>
+                      {OPENING_KIND_LABELS[k]}
+                    </option>
+                  ))}
+                </Select>
+              </div>
+              <div className="col-span-4">
+                <Label htmlFor={`ob-acct-${i}`}>Account</Label>
+                <Select id={`ob-acct-${i}`} value={r.accountId} onChange={(e) => setAccountRow(i, { accountId: e.target.value })}>
+                  <option value="">New account…</option>
+                  {choices
+                    .filter((a) => fitsKind(a, r.kind))
+                    .map((a) => (
+                      <option key={a.id} value={a.id}>
+                        {a.code} · {a.name}
+                      </option>
+                    ))}
+                </Select>
+                {!r.accountId && (
+                  <Input
+                    className="mt-1"
+                    aria-label={`Row ${i + 1} new account name`}
+                    placeholder="Name, e.g. Business Checking"
+                    value={r.name}
+                    onChange={(e) => setAccountRow(i, { name: e.target.value })}
+                  />
+                )}
+              </div>
+              <div className="col-span-4">
+                <Label htmlFor={`ob-amt-${i}`}>Balance</Label>
+                <Input id={`ob-amt-${i}`} inputMode="decimal" className="text-right" value={r.amount} onChange={(e) => setAccountRow(i, { amount: e.target.value })} />
+              </div>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="col-span-1"
+                aria-label={`Remove account row ${i + 1}`}
+                onClick={() => setB({ accounts: b.accounts.filter((_, j) => j !== i) })}
+              >
+                <Trash2 className="h-4 w-4" />
+              </Button>
+            </div>
+          ))}
+          <Button variant="ghost" size="sm" onClick={() => setB({ accounts: [...b.accounts, { kind: 'bank', accountId: '', name: '', amount: '' }] })}>
+            <Plus className="h-4 w-4" /> Add an account
+          </Button>
+        </fieldset>
+
+        {(['customers', 'vendors'] as const).map((key) => (
+          <fieldset key={key} className="rounded-xl border border-slate-200 p-4">
+            <legend className="px-1 text-sm font-semibold text-navy">
+              {key === 'customers' ? 'Customers who owe you (Accounts Receivable)' : 'Vendors you owe (Accounts Payable)'}
+            </legend>
+            <p className="text-xs text-navy/50 mb-3">
+              {key === 'customers'
+                ? 'Each balance becomes an invoice to that customer, so you can receive payment against it. New names are added to your customer list.'
+                : 'Each balance becomes a bill from that vendor, so you can pay it with Pay Bills. New names are added to your vendor list.'}
+            </p>
+            {b[key].map((r, i) => (
+              <div key={i} className="mb-2 grid grid-cols-12 items-end gap-2">
+                <div className="col-span-7">
+                  <Label htmlFor={`ob-${key}-name-${i}`}>{key === 'customers' ? 'Customer' : 'Vendor'}</Label>
+                  <Input id={`ob-${key}-name-${i}`} value={r.name} onChange={(e) => setNameRow(key, i, { name: e.target.value })} />
+                </div>
+                <div className="col-span-4">
+                  <Label htmlFor={`ob-${key}-amt-${i}`}>Amount</Label>
+                  <Input id={`ob-${key}-amt-${i}`} inputMode="decimal" className="text-right" value={r.amount} onChange={(e) => setNameRow(key, i, { amount: e.target.value })} />
+                </div>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="col-span-1"
+                  aria-label={`Remove ${key === 'customers' ? 'customer' : 'vendor'} row ${i + 1}`}
+                  onClick={() => setB({ [key]: b[key].filter((_, j) => j !== i) })}
+                >
+                  <Trash2 className="h-4 w-4" />
+                </Button>
+              </div>
+            ))}
+            <Button variant="ghost" size="sm" onClick={() => setB({ [key]: [...b[key], { name: '', amount: '' }] })}>
+              <Plus className="h-4 w-4" /> {key === 'customers' ? 'Add a customer balance' : 'Add a vendor balance'}
+            </Button>
+          </fieldset>
+        ))}
+      </div>
+      <NavButtons
+        onBack={onBack}
+        onNext={() => {
+          if (bad) {
+            toast('Amounts must be numbers with at most 2 decimals, like 1250.00.', 'danger');
+            return;
+          }
+          if (balancesPayload(b) && !asOf) {
+            toast('Enter the date your balances are as of.', 'danger');
+            return;
+          }
+          onNext();
+        }}
+      />
+    </div>
+  );
+}
+
 function StepFinish({
   state,
   onBack,
@@ -784,13 +1007,22 @@ function StepFinish({
   const preview = useMemo(() => buildSetupPlan(toAnswers(state), existing), [state, existing]);
   const bt = businessTypeOption(state.businessType);
   const entity = entityTypeOption(state.entityType);
+  const balanceRows = useMemo(() => {
+    const ob = balancesPayload(state.balances);
+    if (!ob) return [];
+    return [
+      ...ob.accounts.map((a) => `${OPENING_KIND_LABELS[a.kind]} ${a.name ? `"${a.name}" (new)` : 'account'}: ${a.amount}`),
+      ...ob.customers.map((c) => `${c.name} owes you ${c.amount}`),
+      ...ob.vendors.map((v) => `You owe ${v.name} ${v.amount}`),
+    ];
+  }, [state.balances]);
 
   async function handleFinish() {
     setLoading(true);
     try {
       const res = await api.post<{ nextSteps: SetupStep[]; accountsAdded: number }>(
         '/api/company/setup-interview',
-        toAnswers(state),
+        toPayload(state),
       );
       onDone(res.nextSteps, res.accountsAdded);
     } catch (err) {
@@ -820,6 +1052,18 @@ function StepFinish({
           <p className="text-navy/40 text-xs mt-1">
             Plus the standard chart: checking, savings, A/R, A/P, sales tax, equity and common expenses.
           </p>
+        </div>
+      )}
+      {balanceRows.length > 0 && (
+        <div className="mt-4 text-sm">
+          <p className="font-semibold text-navy mb-1">
+            Opening balances as of {state.balances.asOf || dayBeforeIso(state.startDate)} (balanced through Opening Balance Equity):
+          </p>
+          <ul className="text-navy/60 text-xs leading-relaxed" aria-label="Opening balances">
+            {balanceRows.map((r) => (
+              <li key={r}>{r}</li>
+            ))}
+          </ul>
         </div>
       )}
       <NavButtons onBack={onBack} onNext={handleFinish} loading={loading} nextLabel="Finish setup" />
@@ -935,10 +1179,11 @@ function Interview() {
     <StepEntity key="e" state={state} set={set} onBack={() => go(3)} onNext={() => go(5)} />,
     <StepDates key="d" state={state} set={set} onBack={() => go(4)} onNext={() => go(6)} />,
     <StepFeatures key="f" state={state} set={set} onBack={() => go(5)} onNext={() => go(7)} />,
+    <StepBalances key="ob" state={state} set={set} onBack={() => go(6)} onNext={() => go(8)} />,
     <StepFinish
       key="r"
       state={state}
-      onBack={() => go(6)}
+      onBack={() => go(7)}
       onDone={(nextSteps, accountsAdded) => setDone({ nextSteps, accountsAdded })}
     />,
   ];

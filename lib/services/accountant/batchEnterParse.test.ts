@@ -106,11 +106,11 @@ describe('column mapping', () => {
 describe('pasteBlockAt (spreadsheet-style paste into a cell)', () => {
   it('fills right and down from the cell, adding rows and dropping cells past the last column', () => {
     const rows = [{ date: '3/1/2026', account: '' }, { date: '', account: '' }];
-    // check columns: date, ref, name, account, amount, memo, className — start at "name" on row 2
-    const out = pasteBlockAt(rows, { row: 1, col: 2 }, [['Acme', '6300', '5', 'Paper', 'Admin', 'EXTRA'], ['Beta', '6600', '7']], 'check');
+    // check columns: date, ref, name, account, amount, memo, className, item, quantity, rate, customerJob — start at "name" on row 2
+    const out = pasteBlockAt(rows, { row: 1, col: 2 }, [['Acme', '6300', '5', 'Paper', 'Admin', 'Toner', '1', '5', 'Slow Payer', 'EXTRA'], ['Beta', '6600', '7']], 'check');
     expect(out).toHaveLength(3);
     expect(out[0]).toEqual(rows[0]);
-    expect(out[1]).toEqual({ date: '', account: '6300', name: 'Acme', amount: '5', memo: 'Paper', className: 'Admin' });
+    expect(out[1]).toEqual({ date: '', account: '6300', name: 'Acme', amount: '5', memo: 'Paper', className: 'Admin', item: 'Toner', quantity: '1', rate: '5', customerJob: 'Slow Payer' });
     expect(out[2]).toEqual({ date: '', account: '6600', name: 'Beta', amount: '7' });
     expect(rows[1]).toEqual({ date: '', account: '' }); // input untouched
   });

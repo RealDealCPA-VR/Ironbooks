@@ -8,6 +8,10 @@
  * createManualEntry) — so posting, closing-date, audit and transaction-log rules are identical to
  * entering the forms one by one.
  *
+ * Rows become documents with one or more lines: an item line (item, quantity, rate, tax code), an
+ * account line, a Customer:Job on purchase lines, a Received From and check number on deposit
+ * lines. Rows under a document that leave Date / Ref / Name blank are its split lines.
+ *
  * Modes:
  *  - 'all'  — one database transaction: either every row saves or none does (any error rolls the
  *             whole batch back and is reported per row).
@@ -16,7 +20,7 @@
  *             report includes business-rule errors (closed period, unbalanced JE…) without saving.
  */
 import { and, eq } from 'drizzle-orm';
-import { accounts, classes, customers, vendors } from '@/lib/db/schema';
+import { accounts, classes, customers, items, jobs, salesTaxCodes, taxRates, vendors } from '@/lib/db/schema';
 import { type ServiceContext, inTransaction, notFound, validation } from '../_base';
 import { createExpense } from '../expenses';
 import { createDeposit } from '../deposits';
@@ -33,6 +37,7 @@ import { BATCH_ENTER_TYPES, type BatchEnterRow, type BatchEnterType } from './ba
 import {
   type BatchLookupLists,
   type ResolvedBatchDoc,
+  type ResolvedBatchLine,
   createBatchMatchers,
   resolveBatchRows,
 } from './batchEnterMatch';
@@ -85,11 +90,31 @@ async function loadLists(ctx: ServiceContext): Promise<BatchLookupLists> {
     .select({ id: vendors.id, name: vendors.displayName })
     .from(vendors)
     .where(eq(vendors.companyId, ctx.companyId));
+  const itm = await ctx.db
+    .select({ id: items.id, name: items.name })
+    .from(items)
+    .where(and(eq(items.companyId, ctx.companyId), eq(items.isActive, true)));
+  const rates = await ctx.db
+    .select({ id: taxRates.id, name: taxRates.name })
+    .from(taxRates)
+    .where(and(eq(taxRates.companyId, ctx.companyId), eq(taxRates.isActive, true)));
+  const codes = await ctx.db
+    .select({ id: salesTaxCodes.id, name: salesTaxCodes.code })
+    .from(salesTaxCodes)
+    .where(and(eq(salesTaxCodes.companyId, ctx.companyId), eq(salesTaxCodes.isActive, true)));
+  const jb = await ctx.db
+    .select({ id: jobs.id, name: jobs.name, customerId: jobs.customerId })
+    .from(jobs)
+    .where(and(eq(jobs.companyId, ctx.companyId), eq(jobs.isActive, true)));
   return {
     accounts: acct.map((a) => ({ ...a, type: String(a.type), subtype: a.subtype ? String(a.subtype) : null })),
     classes: cls,
     customers: cust,
     vendors: vend,
+    items: itm,
+    taxRates: rates,
+    taxCodes: codes,
+    jobs: jb,
   };
 }
 
@@ -128,7 +153,36 @@ function toDate(iso: string): Date {
 
 type Job = { rows: number[]; errors: string[]; warnings: string[]; run?: (tx: ServiceContext) => Promise<{ id: string }> };
 
-/** The normal document service call that saves one resolved row (or journal-entry group). */
+/** Purchase line (checks, card charges / credits, bills, bill credits): account or item line. */
+function purchaseLine(l: ResolvedBatchLine) {
+  return {
+    accountId: l.accountId,
+    itemId: l.itemId,
+    ...(l.itemId ? { quantity: l.quantity, unitCost: l.rate } : {}),
+    amount: l.amount,
+    description: l.description,
+    classId: l.classId,
+    customerId: l.customerId ?? null,
+    jobId: l.jobId ?? null,
+  };
+}
+
+/** Sales line (invoices, credit memos): item line priced by the server when no rate is given. */
+function salesLine(l: ResolvedBatchLine) {
+  return {
+    itemId: l.itemId,
+    accountId: l.accountId,
+    description: l.description,
+    quantity: l.itemId ? l.quantity ?? 1 : 1,
+    // An account line's rate is its amount; an item line without a rate is priced like the form.
+    ...(l.itemId ? (l.rate !== null ? { rate: l.rate } : {}) : { rate: l.amount }),
+    ...(l.taxable !== undefined ? { taxable: l.taxable } : {}),
+    ...(l.salesTaxCodeId ? { salesTaxCodeId: l.salesTaxCodeId } : {}),
+    classId: l.classId,
+  };
+}
+
+/** The normal document service call that saves one resolved document (or journal-entry group). */
 function runnerFor(doc: ResolvedBatchDoc, bank: string | null): (tx: ServiceContext) => Promise<{ id: string }> {
   switch (doc.kind) {
     case 'expense':
@@ -142,7 +196,7 @@ function runnerFor(doc: ResolvedBatchDoc, bank: string | null): (tx: ServiceCont
           paymentAccountId: bank!,
           memo: doc.memo,
           isRefund: doc.type === 'cc_credit' ? true : undefined,
-          lines: [{ accountId: doc.accountId, amount: doc.amount, description: doc.memo, classId: doc.classId }],
+          lines: doc.lines.map(purchaseLine),
         });
     case 'deposit':
       return (tx) =>
@@ -150,26 +204,41 @@ function runnerFor(doc: ResolvedBatchDoc, bank: string | null): (tx: ServiceCont
           depositAccountId: bank!,
           date: toDate(doc.date),
           memo: doc.memo,
-          extraLines: [{ accountId: doc.accountId, amount: doc.amount, description: doc.description }],
+          extraLines: doc.lines.map((l) => ({
+            accountId: l.accountId!,
+            amount: l.amount!,
+            description: l.description,
+            entityType: l.entityType ?? null,
+            entityId: l.entityId ?? null,
+          })),
         });
     case 'invoice':
       return (tx) =>
         createInvoice(tx, {
           customerId: doc.customerId,
+          jobId: doc.jobId,
           refNumber: doc.ref,
           date: toDate(doc.date),
           memo: doc.memo,
           classId: doc.classId,
-          lines: [{ accountId: doc.accountId, description: doc.memo, quantity: 1, rate: doc.amount, taxable: false, classId: doc.classId }],
+          ...(doc.taxRateId !== undefined ? { taxRateId: doc.taxRateId } : {}),
+          lines: doc.lines.map(salesLine),
         });
     case 'credit_memo':
       return (tx) =>
         createCreditMemo(tx, {
           customerId: doc.customerId,
+          jobId: doc.jobId,
           refNumber: doc.ref,
           date: toDate(doc.date),
           memo: doc.memo,
-          lines: [{ accountId: doc.accountId, description: doc.memo, quantity: 1, rate: doc.amount, taxable: false }],
+          ...(doc.taxRateId !== undefined ? { taxRateId: doc.taxRateId } : {}),
+          lines: doc.lines.map((l) => {
+            // Credit memo lines keep no class.
+            // eslint-disable-next-line @typescript-eslint/no-unused-vars
+            const { classId, ...rest } = salesLine(l);
+            return rest;
+          }),
         });
     case 'bill':
       return (tx) =>
@@ -180,7 +249,7 @@ function runnerFor(doc: ResolvedBatchDoc, bank: string | null): (tx: ServiceCont
           dueDate: doc.dueDate ? toDate(doc.dueDate) : null,
           memo: doc.memo,
           classId: doc.classId,
-          lines: [{ accountId: doc.accountId, amount: doc.amount, description: doc.memo, classId: doc.classId }],
+          lines: doc.lines.map(purchaseLine),
         });
     case 'bill_credit':
       return (tx) =>
@@ -189,7 +258,7 @@ function runnerFor(doc: ResolvedBatchDoc, bank: string | null): (tx: ServiceCont
           refNumber: doc.ref,
           date: toDate(doc.date),
           memo: doc.memo,
-          lines: [{ accountId: doc.accountId, amount: doc.amount, description: doc.memo, classId: doc.classId }],
+          lines: doc.lines.map(purchaseLine),
         });
     case 'journal':
       return (tx) =>

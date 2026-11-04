@@ -47,27 +47,51 @@ export interface BatchEnterRow {
   className?: string;
   /** Bills only (optional). */
   dueDate?: string;
+  /**
+   * Item lines (QB Batch Enter "Items" columns): the item by name, its quantity and its rate
+   * (sales price on invoices / credit memos, unit cost on checks, card charges, bills and bill
+   * credits). Amount may be left blank on an item line (quantity x rate).
+   */
+  item?: string;
+  quantity?: string;
+  rate?: string;
+  /** Invoices / credit memos: the line's sales tax code ("Tax", "Non") or Y / N. */
+  taxCode?: string;
+  /** Invoices / credit memos: the sales tax item (tax rate) of the document, by name. */
+  taxItem?: string;
+  /** Checks, card charges, bills, bill credits: the line's Customer:Job ("Customer" or "Customer:Job"). */
+  customerJob?: string;
 }
 
 export type BatchColumn = keyof BatchEnterRow;
 
-/** Column order used by the grid and expected when pasting from a spreadsheet. */
+/**
+ * Column order used by the grid and expected when pasting from a spreadsheet. The item, tax and
+ * Customer:Job columns come after the original ones, so spreadsheets laid out for the earlier
+ * grid still paste in the same order.
+ */
 export function batchColumns(type: BatchEnterType): BatchColumn[] {
   switch (type) {
     case 'journal':
       return ['date', 'ref', 'account', 'debit', 'credit', 'memo', 'name', 'className'];
     case 'bill':
-      return ['date', 'ref', 'name', 'account', 'amount', 'memo', 'className', 'dueDate'];
+      return ['date', 'ref', 'name', 'account', 'amount', 'memo', 'className', 'dueDate', 'item', 'quantity', 'rate', 'customerJob'];
     // Deposit and credit memo lines keep no class (lib/services/accountant/reclassifySync.ts), so
     // their grids offer no Class column (a typed class would be dropped on save).
     case 'deposit':
-      return ['date', 'name', 'account', 'amount', 'memo'];
+      return ['date', 'name', 'account', 'amount', 'memo', 'ref'];
     case 'credit_memo':
-      return ['date', 'ref', 'name', 'account', 'amount', 'memo'];
+      return ['date', 'ref', 'name', 'account', 'amount', 'memo', 'item', 'quantity', 'rate', 'taxCode', 'taxItem'];
+    case 'invoice':
+      return ['date', 'ref', 'name', 'account', 'amount', 'memo', 'className', 'item', 'quantity', 'rate', 'taxCode', 'taxItem'];
     default:
-      return ['date', 'ref', 'name', 'account', 'amount', 'memo', 'className'];
+      // checks, credit card charges and credits, bill credits
+      return ['date', 'ref', 'name', 'account', 'amount', 'memo', 'className', 'item', 'quantity', 'rate', 'customerJob'];
   }
 }
+
+/** Types whose rows can be item lines (everything but deposits and journal entries). */
+export const ITEM_TYPES: BatchEnterType[] = ['check', 'cc_charge', 'cc_credit', 'invoice', 'credit_memo', 'bill', 'bill_credit'];
 
 export const BATCH_COLUMN_LABELS: Record<BatchColumn, string> = {
   date: 'Date',
@@ -80,6 +104,12 @@ export const BATCH_COLUMN_LABELS: Record<BatchColumn, string> = {
   memo: 'Memo',
   className: 'Class',
   dueDate: 'Due date',
+  item: 'Item',
+  quantity: 'Qty',
+  rate: 'Rate',
+  taxCode: 'Tax',
+  taxItem: 'Sales tax item',
+  customerJob: 'Customer:Job',
 };
 
 // ---------------------------------------------------------------------------
@@ -147,6 +177,12 @@ export const BATCH_COLUMN_ALIASES: Record<BatchColumn, string[]> = {
   memo: ['memo', 'description', 'desc', 'note', 'notes', 'details', 'detail', 'comment'],
   className: ['class', 'department', 'dept', 'division'],
   dueDate: ['due', 'due date', 'date due', 'due on'],
+  item: ['item', 'product', 'service', 'product service', 'item name', 'sku'],
+  quantity: ['qty', 'quantity', 'units', 'qty ordered'],
+  rate: ['rate', 'price', 'unit price', 'cost', 'unit cost', 'sales price', 'price each'],
+  taxCode: ['tax', 'tax code', 'taxable', 'sales tax code'],
+  taxItem: ['tax item', 'sales tax item', 'tax rate', 'customer tax code'],
+  customerJob: ['billable to', 'job', 'billable customer'],
 };
 
 function normHeader(s: string): string {
@@ -203,6 +239,11 @@ export function guessColumnMapping(grid: string[][], type: BatchEnterType): Colu
     const used = new Set<BatchColumn>();
     const mapping = Array.from({ length: width }, (_, i) => {
       let col = named[i] ?? null;
+      // "Customer:Job" names the customer on an invoice, but the billable Customer:Job of a
+      // check, charge or bill line (its payee is the Name column).
+      if (col === 'name' && normHeader(first[i] ?? '') === 'customer job' && allowed.has('customerJob') && !allowed.has('taxCode')) {
+        col = 'customerJob';
+      }
       // "Debit"/"Credit" headers on a single-amount type fold into Amount (first one wins).
       if (col && !allowed.has(col)) {
         col = (col === 'debit' || col === 'credit') && allowed.has('amount') ? 'amount' : null;

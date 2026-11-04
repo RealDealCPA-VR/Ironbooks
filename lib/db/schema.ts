@@ -116,6 +116,8 @@ export const journalEntries = pgTable('journal_entries', {
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
   voidedAt: timestamp('voided_at'),
+  /** accountant (0089): a posted GJ entry deleted by Batch Delete/Void (voided, then hidden). */
+  deletedAt: timestamp('deleted_at'),
 });
 
 // Journal Entry Lines (Debits and Credits)

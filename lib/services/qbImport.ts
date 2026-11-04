@@ -3118,6 +3118,19 @@ export type ListImportKind = 'customers' | 'vendors' | 'items' | 'accounts';
 export const MAX_QB_IMPORT_BYTES = 60 * 1024 * 1024;
 
 /**
+ * Largest request body the import routes read: a 60 MB file sent as base64 (xlsx, 4/3 larger)
+ * inside JSON, plus room for the mapping. Checked from Content-Length BEFORE the body is read,
+ * so an oversized upload is refused without being held in memory (review P2).
+ */
+export const MAX_QB_IMPORT_BODY_BYTES = Math.ceil((MAX_QB_IMPORT_BYTES * 4) / 3) + 1024 * 1024;
+
+/** True when the request declares a body larger than the import routes accept. */
+export function importBodyTooLarge(headers: { get(name: string): string | null }): boolean {
+  const declared = Number(headers.get('content-length') ?? '');
+  return Number.isFinite(declared) && declared > MAX_QB_IMPORT_BODY_BYTES;
+}
+
+/**
  * Refuse a file over MAX_QB_IMPORT_BYTES before it is parsed (IIF / CSV text or .xlsx bytes):
  * the other import paths already did; these read any size into memory.
  */

@@ -99,6 +99,13 @@ describe('J7 Reminders: the rest of QB\'s list', () => {
     await updateCompany(t.ctx, { settings: { reminders: { liabilitiesDue: { mode: 'summary', days: 40 } } } });
     const later = (await getReminders(t.ctx, { today: TODAY })).sections.find((x) => x.key === 'liabilitiesDue')!;
     expect(later.items.some((i) => i.date === '2026-07-15')).toBe(true);
+    // Review P2: last month's liabilities due on the 15th honour the look-ahead days too (only
+    // overdue ones always show).
+    await updateCompany(t.ctx, { settings: { reminders: { liabilitiesDue: { mode: 'summary', days: 5 } } } });
+    const early = (await getReminders(t.ctx, { today: '2026-06-02' })).sections.find((x) => x.key === 'liabilitiesDue');
+    expect((early?.items ?? []).some((i) => i.date === '2026-06-15')).toBe(false);
+    const overdue = (await getReminders(t.ctx, { today: '2026-06-20' })).sections.find((x) => x.key === 'liabilitiesDue')!;
+    expect(overdue.items.some((i) => i.date === '2026-06-15' && /overdue/.test(i.label))).toBe(true);
   });
 
   it('section totals count foreign documents at their home value', async () => {

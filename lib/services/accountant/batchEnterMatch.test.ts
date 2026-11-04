@@ -90,13 +90,11 @@ describe('resolveBatchRows', () => {
       payeeName: null,
       ref: '1001',
       memo: 'Toner',
-      accountId: 'a6300',
-      amount: '1234.50',
-      classId: 'k1',
+      lines: [{ accountId: 'a6300', itemId: null, quantity: null, rate: null, amount: '1234.50', description: 'Toner', classId: 'k1' }],
     });
     // Unknown payee: still fine (one-time payee), with a note.
     expect(jobs[1].errors).toEqual([]);
-    expect(jobs[1].doc).toMatchObject({ vendorId: null, payeeName: 'Walk-in Payee', accountId: 'a6600' });
+    expect(jobs[1].doc).toMatchObject({ vendorId: null, payeeName: 'Walk-in Payee', lines: [{ accountId: 'a6600' }] });
     expect(jobs[1].warnings[0]).toMatch(/one-time payee/);
     // Bad date, unknown account (with a suggestion), bad amount.
     expect(jobs[2].doc).toBeUndefined();
@@ -126,7 +124,7 @@ describe('resolveBatchRows', () => {
       },
       M,
     );
-    expect(bills[0].doc).toMatchObject({ kind: 'bill', vendorId: 'v2', ref: 'B-1', dueDate: '2026-04-07', amount: '99.99' });
+    expect(bills[0].doc).toMatchObject({ kind: 'bill', vendorId: 'v2', ref: 'B-1', dueDate: '2026-04-07', lines: [{ amount: '99.99' }] });
     expect(bills[1].errors[0]).toMatch(/vendor "City Powr" was not found .*Did you mean "City Power"/);
     expect(bills[2].errors[0]).toMatch(/due date is before the bill date/);
 
@@ -183,7 +181,7 @@ describe('resolveBatchRows', () => {
     );
     expect(jobs[0].warnings[0]).toMatch(/closing date \(2026-01-31\)/);
     expect(jobs[1].warnings).toEqual([]);
-    expect(jobs[0].doc).toMatchObject({ kind: 'deposit', accountId: 'a3000', amount: '100', description: 'Owner' });
+    expect(jobs[0].doc).toMatchObject({ kind: 'deposit', lines: [{ accountId: 'a3000', amount: '100', description: 'Owner' }] });
   });
 });
 
@@ -286,7 +284,7 @@ describe('amounts to the cent (review P2)', () => {
     expect(jobs[0].errors).toContain('Row 1: amounts can have at most 2 decimals.');
     expect(jobs[1].errors).toContain('Row 2: amounts can have at most 2 decimals.');
     expect(jobs[2].errors).toEqual([]);
-    expect(jobs[2].doc).toMatchObject({ amount: '1234.56' });
+    expect(jobs[2].doc).toMatchObject({ lines: [{ amount: '1234.56' }] });
 
     const je = resolveBatchRows(
       {

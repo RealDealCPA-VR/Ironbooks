@@ -379,7 +379,8 @@ const SOURCES: Record<ReminderKey, Source> = {
       const is = Money.of(it.balance);
       const owedThen = was.isPositive() ? (was.lessThan(is) ? was : is) : Money.zero();
       const accruedSince = Money.of(it.balance).minus(owedThen);
-      if (owedThen.isPositive()) {
+      // Overdue ones always show; one not yet due only within the look-ahead days (review P2).
+      if (owedThen.isPositive() && (dueThisMonth < today || dueThisMonth <= horizon)) {
         out.push({ id: `${it.name}:${dueThisMonth}`, label: `${it.name}${dueThisMonth < today ? ' (overdue)' : ''}`, date: dueThisMonth, amount: toAmountString(owedThen), href: '/pay-liabilities' });
       }
       if (accruedSince.isPositive() && dueNextMonth <= horizon) {

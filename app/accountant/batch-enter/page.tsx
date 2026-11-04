@@ -12,6 +12,10 @@
  *  - "Save transactions" posts every good row through the normal document services (each row its
  *    own transaction by default) and reports a result per row; saved rows leave the grid, rows
  *    that failed stay with their reason.
+ * Rows under a document that leave Date, Ref and Name blank (deposits: Date) are its split lines;
+ * item lines take Item, Qty and Rate (and, on invoices / credit memos, a Tax code and the sales tax
+ * item); checks, card charges and bills take a Customer:Job per line; deposit lines keep their
+ * check number (Ref) and Received From.
  * Keyboard: Tab across cells, Enter / Down next line (adds one at the end), Up previous line,
  * Ctrl+Insert insert, Ctrl+D delete line, Ctrl+S save, + / - / T in date cells, Alt+letter buttons.
  */
@@ -104,10 +108,16 @@ const blank = blankKeyedRow;
 const FREE_TEXT_NAME_TYPES: BatchEnterType[] = ['check', 'cc_charge', 'cc_credit', 'deposit'];
 const NEEDS_BANK: BatchEnterType[] = ['check', 'deposit', 'cc_charge', 'cc_credit'];
 const MONEY_COLS: BatchColumn[] = ['amount', 'debit', 'credit'];
+/** Number columns that are not money amounts (right-aligned, any decimals the server allows). */
+const NUMBER_COLS: BatchColumn[] = ['quantity', 'rate'];
+const PURCHASE_TYPES: BatchEnterType[] = ['check', 'cc_charge', 'cc_credit', 'bill', 'bill_credit'];
 const DATE_COLS: BatchColumn[] = ['date', 'dueDate'];
 
 /** Plain-language column headings per type (the Name column means different people). */
 function columnLabel(c: BatchColumn, type: BatchEnterType): string {
+  if (c === 'rate') return PURCHASE_TYPES.includes(type) ? 'Cost' : 'Rate';
+  if (c === 'ref' && type === 'deposit') return 'Chk No.';
+  if (c === 'name' && (type === 'invoice' || type === 'credit_memo')) return 'Customer:Job';
   if (c !== 'name') return BATCH_COLUMN_LABELS[c];
   if (type === 'invoice' || type === 'credit_memo') return 'Customer';
   if (type === 'bill' || type === 'bill_credit') return 'Vendor';
@@ -121,6 +131,10 @@ const EMPTY_LOOKUPS: Lookups = {
   customers: [],
   vendors: [],
   classes: [],
+  items: [],
+  taxRates: [],
+  taxCodes: [],
+  jobs: [],
   closingDate: null,
   closingDateHasPassword: false,
   apAccountLabel: null,
@@ -190,6 +204,12 @@ export default function BatchEnterPage() {
       const r = rows[i];
       const v = normalizeAmount(type === 'journal' ? r.debit : r.amount);
       if (v) t = t.plus(Money.of(v));
+      else if (type !== 'journal' && r.item) {
+        // Item line without an amount: quantity x rate.
+        const q = normalizeAmount(r.quantity || '1');
+        const rt = normalizeAmount(r.rate);
+        if (q && rt) t = t.plus(Money.round2(Money.of(q).times(Money.of(rt))));
+      }
     }
     return t.toFixed(2);
   }, [filledIdx, rows, type]);
@@ -199,16 +219,37 @@ export default function BatchEnterPage() {
     () => lookups.accounts.map((a) => ({ value: `${a.code} · ${a.name}`, terms: [a.code, a.name], hint: a.type })),
     [lookups.accounts],
   );
+  /** "Customer" and "Customer:Job" choices (QB's Customer:Job list). */
+  const customerJobOptions: TypeaheadOption[] = useMemo(() => {
+    const byId = new Map(lookups.customers.map((c) => [c.id, c.name]));
+    const cust = lookups.customers.filter((c) => c.name).map((c) => ({ value: c.name!, hint: 'Customer' }));
+    const jobs = (lookups.jobs ?? [])
+      .filter((j) => j.name && j.customerId && byId.get(j.customerId))
+      .map((j) => ({ value: `${byId.get(j.customerId!)}:${j.name}`, hint: 'Job' }));
+    return [...cust, ...jobs];
+  }, [lookups.customers, lookups.jobs]);
   const nameOptions: TypeaheadOption[] = useMemo(() => {
     const cust = lookups.customers.filter((c) => c.name).map((c) => ({ value: c.name!, hint: 'Customer' }));
     const vend = lookups.vendors.filter((v) => v.name).map((v) => ({ value: v.name!, hint: 'Vendor' }));
-    if (type === 'invoice' || type === 'credit_memo') return cust;
+    if (type === 'invoice' || type === 'credit_memo') return customerJobOptions;
     if (type === 'bill' || type === 'bill_credit' || type === 'check' || type === 'cc_charge' || type === 'cc_credit') return vend;
     return [...cust, ...vend];
-  }, [lookups.customers, lookups.vendors, type]);
+  }, [lookups.customers, lookups.vendors, type, customerJobOptions]);
   const classOptions: TypeaheadOption[] = useMemo(
     () => lookups.classes.filter((c) => c.name).map((c) => ({ value: c.name! })),
     [lookups.classes],
+  );
+  const itemOptions: TypeaheadOption[] = useMemo(
+    () => (lookups.items ?? []).filter((c) => c.name).map((c) => ({ value: c.name!, hint: 'Item' })),
+    [lookups.items],
+  );
+  const taxRateOptions: TypeaheadOption[] = useMemo(
+    () => (lookups.taxRates ?? []).filter((c) => c.name).map((c) => ({ value: c.name! })),
+    [lookups.taxRates],
+  );
+  const taxCodeOptions: TypeaheadOption[] = useMemo(
+    () => [...(lookups.taxCodes ?? []).filter((c) => c.name).map((c) => ({ value: c.name! })), { value: 'Y', hint: 'Taxable' }, { value: 'N', hint: 'Not taxable' }],
+    [lookups.taxCodes],
   );
 
   // ---- grid editing ----
@@ -398,10 +439,18 @@ export default function BatchEnterPage() {
             <ClipboardPaste className="h-4 w-4" /> <AccessKeyText text="Paste from Excel" accessKey="p" />
           </Button>
         </div>
-        {type === 'journal' && (
+        {type === 'journal' ? (
           <p className="mt-3 text-xs text-navy/50">
             Journal entries: give every row of one entry the same date and Ref (or leave both blank on the follow-on rows).
             Debits and credits of each entry must be equal.
+          </p>
+        ) : (
+          <p className="mt-3 text-xs text-navy/50">
+            {type === 'deposit'
+              ? 'Split a deposit over several lines: leave the Date blank on the rows under it. Chk No. is kept on each line.'
+              : 'Split lines: leave Date, Ref and Name blank on the rows under a transaction (or repeat the same Date, Ref and Name). An item line takes Item, Qty and ' +
+                (PURCHASE_TYPES.includes(type) ? 'Cost' : 'Rate (blank = the item\'s price), Tax (a tax code, or Y / N) and, on the first row, the sales tax item') +
+                '; Amount may stay blank.'}
           </p>
         )}
         {needsClosingPassword && (
@@ -479,15 +528,27 @@ export default function BatchEnterPage() {
                       let cell: React.ReactNode;
                       if (c === 'className' && !classOn && !v) {
                         cell = <span className="block px-2 py-1.5" aria-hidden="true" />;
-                      } else if (c === 'account' || c === 'name' || c === 'className') {
+                      } else if (c === 'account' || c === 'name' || c === 'className' || c === 'item' || c === 'taxItem' || c === 'taxCode' || c === 'customerJob') {
+                        const options =
+                          c === 'account' ? accountOptions
+                          : c === 'name' ? nameOptions
+                          : c === 'item' ? itemOptions
+                          : c === 'taxItem' ? taxRateOptions
+                          : c === 'taxCode' ? taxCodeOptions
+                          : c === 'customerJob' ? customerJobOptions
+                          : classOptions;
                         cell = (
                           <Typeahead
                             {...common}
                             value={v}
                             onChange={(val) => setCell(i, c, val)}
-                            options={c === 'account' ? accountOptions : c === 'name' ? nameOptions : classOptions}
-                            allowFreeText={c === 'name' && FREE_TEXT_NAME_TYPES.includes(type)}
+                            options={options}
+                            allowFreeText={(c === 'name' && FREE_TEXT_NAME_TYPES.includes(type)) || c === 'taxCode'}
                           />
+                        );
+                      } else if (NUMBER_COLS.includes(c)) {
+                        cell = (
+                          <Input {...common} inputMode="decimal" className="px-2 py-1.5 text-right" value={v} onChange={(e) => setCell(i, c, e.target.value)} />
                         );
                       } else if (MONEY_COLS.includes(c)) {
                         cell = (

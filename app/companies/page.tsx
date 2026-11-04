@@ -1,6 +1,6 @@
 'use client';
 import { useEffect, useMemo, useState } from 'react';
-import { Archive, Building2, Check, Pencil, Plus, X } from 'lucide-react';
+import { Archive, ArchiveRestore, Building2, Check, Pencil, Plus, X } from 'lucide-react';
 import {
   Button,
   Card,
@@ -43,11 +43,14 @@ export default function CompaniesPage() {
   const [archiveTarget, setArchiveTarget] = useState<Company | null>(null);
   const [confirmName, setConfirmName] = useState('');
   const [archiving, setArchiving] = useState(false);
+  // Archived files are listed (to restore them) only when asked for, as QB lists them apart.
+  const [showArchived, setShowArchived] = useState(false);
+  const [restoring, setRestoring] = useState<string | null>(null);
 
-  async function load() {
+  async function load(withArchived = showArchived) {
     setLoading(true);
     try {
-      setCompanies(await api.get<Company[]>('/api/companies'));
+      setCompanies(await api.get<Company[]>(`/api/companies${withArchived ? '?includeArchived=1' : ''}`));
     } catch (e) {
       toast(e instanceof Error ? e.message : 'Failed to load', 'danger');
     } finally {
@@ -58,6 +61,7 @@ export default function CompaniesPage() {
     load();
   }, []);
 
+  const archived = useMemo(() => companies.filter((c) => c.settings?.archived), [companies]);
   // Hide archived files; order by last opened (most recent first), then created date.
   const visible = useMemo(() => {
     return companies
@@ -143,15 +147,39 @@ export default function CompaniesPage() {
     }
   }
 
+  async function restore(c: Company) {
+    setRestoring(c.id);
+    try {
+      await api.patch(`/api/companies/${c.id}`, { archived: false });
+      toast(`${c.name} is back in your company list`, 'success');
+      load();
+    } catch (e) {
+      toast(e instanceof Error ? e.message : 'Restore failed', 'danger');
+    } finally {
+      setRestoring(null);
+    }
+  }
+
+  function toggleArchived() {
+    const next = !showArchived;
+    setShowArchived(next);
+    load(next);
+  }
+
   return (
     <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader
         title="Companies"
         icon={Building2}
         action={
-          <Button onClick={() => setOpen(true)}>
-            <Plus className="h-4 w-4" /> New Company
-          </Button>
+          <div className="flex gap-2">
+            <Button variant="secondary" onClick={toggleArchived} aria-pressed={showArchived}>
+              <ArchiveRestore className="h-4 w-4" /> {showArchived ? 'Hide archived' : 'Show archived'}
+            </Button>
+            <Button onClick={() => setOpen(true)}>
+              <Plus className="h-4 w-4" /> New Company
+            </Button>
+          </div>
         }
       />
       {loading ? (
@@ -246,6 +274,38 @@ export default function CompaniesPage() {
             </Card>
           ))}
         </div>
+      )}
+
+      {showArchived && !loading && (
+        <section className="mt-8" aria-labelledby="archived-companies">
+          <h2 id="archived-companies" className="mb-3 text-sm font-bold text-navy">
+            Archived companies
+          </h2>
+          {archived.length === 0 ? (
+            <p className="text-sm text-navy/50">No archived company files.</p>
+          ) : (
+            <ul className="divide-y divide-slate-100 rounded-xl border border-slate-200 bg-white">
+              {archived.map((c) => (
+                <li key={c.id} className="flex items-center gap-3 px-4 py-3">
+                  <Archive className="h-4 w-4 text-navy/40" aria-hidden />
+                  <span className="flex-1 truncate text-navy">{c.name}</span>
+                  <span className="text-xs text-navy/40">
+                    {typeof c.settings?.archivedAt === 'string' ? `Archived ${formatDate(c.settings.archivedAt)}` : 'Archived'}
+                  </span>
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    loading={restoring === c.id}
+                    onClick={() => restore(c)}
+                    aria-label={`Restore ${c.name}`}
+                  >
+                    <ArchiveRestore className="h-4 w-4" /> Restore
+                  </Button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
       )}
 
       <Modal

@@ -1,7 +1,7 @@
 'use client';
 
-import { useState } from 'react';
-import { Trash2 } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { ArchiveRestore, Trash2 } from 'lucide-react';
 import {
   Badge, Button, Card, ConfirmDialog, EmptyState, Input, Label, PageHeader, Select, Table, Td, Th, Tr, toast, toastError,
 } from '@/components/ui';
@@ -15,7 +15,17 @@ interface Txn {
   date: string;
   description: string;
   amount: string;
-  status: 'posted' | 'draft';
+  status: 'posted' | 'draft' | 'open' | 'void' | 'closed';
+  canDelete?: boolean;
+  version?: string | null;
+}
+interface DeletedTxn {
+  id: string;
+  typeLabel: string;
+  label: string;
+  date: string;
+  amount: string;
+  deletedAt: string;
 }
 interface VoidResult {
   key: string;
@@ -37,6 +47,12 @@ const TYPES: Array<[string, string]> = [
   ['vendor_credit', 'Bill credits'],
   ['paycheck', 'Paychecks'],
   ['journal', 'Journal entries'],
+  ['transfer', 'Transfers'],
+  ['item_receipt', 'Item receipts'],
+  ['inventory_adjustment', 'Inventory adjustments'],
+  ['estimate', 'Estimates'],
+  ['sales_order', 'Sales orders'],
+  ['purchase_order', 'Purchase orders'],
 ];
 
 export default function BatchVoidPage() {
@@ -49,6 +65,45 @@ export default function BatchVoidPage() {
   const [loading, setLoading] = useState(false);
   const [confirm, setConfirm] = useState(false);
   const [saving, setSaving] = useState(false);
+  /** QB Batch Delete/Void: void everything selected, or delete the ones QuickBooks lets you delete. */
+  const [action, setAction] = useState<'void' | 'delete'>('void');
+  const [deleted, setDeleted] = useState<DeletedTxn[]>([]);
+  const [restoreSel, setRestoreSel] = useState<Set<string>>(new Set());
+  const [restoring, setRestoring] = useState(false);
+
+  async function loadDeleted() {
+    try {
+      const res = await api.get<{ deleted: DeletedTxn[] }>('/api/accountant/batch-void?view=deleted');
+      setDeleted(res.deleted);
+      setRestoreSel(new Set());
+    } catch (err) {
+      toastError(err, 'Could not load the deleted transactions.');
+    }
+  }
+  useEffect(() => {
+    loadDeleted();
+  }, []);
+
+  async function restore() {
+    setRestoring(true);
+    try {
+      const res = await api.post<{ results: Array<{ id: string; ok: boolean; error?: string }>; restored: number }>(
+        '/api/accountant/batch-void/restore',
+        { ids: [...restoreSel] },
+      );
+      const failed = res.results.filter((r) => !r.ok);
+      toast(
+        `${res.restored} transaction(s) restored${failed.length ? `; ${failed.length} could not be: ${failed.map((f) => f.error).join(' ')}` : ''}.`,
+        failed.length ? 'info' : 'success',
+      );
+      await loadDeleted();
+      if (rows !== null) await load();
+    } catch (err) {
+      toastError(err, 'Could not restore the transactions.');
+    } finally {
+      setRestoring(false);
+    }
+  }
 
   async function load() {
     setLoading(true);
@@ -67,12 +122,15 @@ export default function BatchVoidPage() {
   async function run() {
     setSaving(true);
     try {
+      const versions = Object.fromEntries((rows ?? []).filter((r) => selected.has(r.key)).map((r) => [r.key, r.version ?? null]));
       const res = await api.post<{ results: VoidResult[]; succeeded: number; failed: number; salesTaxFixesVoided?: number }>('/api/accountant/batch-void', {
         keys: [...selected],
+        action,
+        versions,
       });
       setResults(new Map(res.results.map((r) => [r.key, r])));
       toast(
-        `${res.succeeded} transaction(s) voided${res.failed ? `; ${res.failed} could not be (see the reasons in the list)` : ''}.` +
+        `${res.succeeded} transaction(s) ${action === 'delete' ? 'deleted' : 'voided'}${res.failed ? `; ${res.failed} could not be (see the reasons in the list)` : ''}.` +
           (res.salesTaxFixesVoided ? ` ${res.salesTaxFixesVoided} sales tax correction(s) for those payments were undone too.` : ''),
         res.failed ? 'info' : 'success',
       );
@@ -83,6 +141,7 @@ export default function BatchVoidPage() {
       const failedKeys = new Set(res.results.filter((r) => !r.ok).map((r) => r.key));
       setRows(fresh.transactions);
       setSelected(failedKeys);
+      if (action === 'delete') await loadDeleted();
     } catch (err) {
       toastError(err, 'Could not void the transactions.');
     } finally {
@@ -95,9 +154,11 @@ export default function BatchVoidPage() {
       <BackToCenter />
       <PageHeader title="Batch Delete/Void Transactions" icon={Trash2} />
       <p className="mb-4 max-w-3xl text-sm text-navy/60">
-        Select transactions to void in one step. Voiding keeps the transaction on record with a zero amount, so your history
-        stays complete. Transactions that other transactions depend on (for example an invoice with a payment applied) are
-        protected — remove the link first. Unposted draft journal entries are deleted.
+        Select transactions to void or delete in one step. Voiding keeps the transaction on record with a zero amount, so your
+        history stays complete. Delete removes General Journal entries you entered, estimates, sales orders and purchase
+        orders (other transactions are voided, as in QuickBooks); deleted ones are listed below and can be restored.
+        Transactions that other transactions depend on (for example an invoice with a payment applied), reconciled lines and
+        closed periods are protected. Unposted draft journal entries are deleted.
       </p>
       <Card className="mb-6 p-4">
         <div className="flex flex-wrap items-end gap-3">
@@ -141,6 +202,7 @@ export default function BatchVoidPage() {
                     <Th>Type</Th>
                     <Th>Entry #</Th>
                     <Th>Description</Th>
+                    <Th>Can delete</Th>
                     <Th numeric>Amount</Th>
                     <Th>Result</Th>
                   </tr>
@@ -166,9 +228,11 @@ export default function BatchVoidPage() {
                         <Td>{r.date.slice(0, 10)}</Td>
                         <Td>
                           {r.typeLabel} {r.status === 'draft' && <Badge tone="neutral">Draft</Badge>}
+                          {r.status === 'void' && <Badge tone="neutral">Void</Badge>}
                         </Td>
                         <Td>{r.entryNumber ?? ''}</Td>
                         <Td>{r.description}</Td>
+                        <Td>{r.canDelete ? 'Yes' : 'Void only'}</Td>
                         <Td numeric>{money(r.amount)}</Td>
                         <Td className="text-sm">{res && !res.ok ? <span className="text-red-600">{res.error}</span> : null}</Td>
                       </Tr>
@@ -176,21 +240,91 @@ export default function BatchVoidPage() {
                   })}
                 </tbody>
               </Table>
-              <div className="mt-4 flex justify-end">
+              <div className="mt-4 flex flex-wrap items-end justify-end gap-3">
+                <div>
+                  <Label htmlFor="bv-action">Action</Label>
+                  <Select id="bv-action" value={action} onChange={(e) => setAction(e.target.value as 'void' | 'delete')}>
+                    <option value="void">Void</option>
+                    <option value="delete">Delete (where allowed)</option>
+                  </Select>
+                </div>
                 <Button variant="danger" disabled={selected.size === 0} onClick={() => setConfirm(true)}>
-                  Void {selected.size || ''} selected
+                  {action === 'delete' ? 'Delete' : 'Void'} {selected.size || ''} selected
                 </Button>
               </div>
             </>
           )}
         </Card>
       )}
+      <Card className="mt-6 p-6">
+        <h2 className="mb-2 flex items-center gap-2 text-sm font-bold text-navy">
+          <ArchiveRestore className="h-4 w-4" aria-hidden /> Deleted transactions you can restore
+        </h2>
+        {deleted.length === 0 ? (
+          <p className="text-sm text-navy/50">Nothing deleted with Batch Delete is waiting to be restored.</p>
+        ) : (
+          <>
+            <Table>
+              <thead>
+                <tr>
+                  <Th>
+                    <input
+                      type="checkbox"
+                      aria-label="Select all deleted transactions"
+                      checked={restoreSel.size === deleted.length}
+                      onChange={(e) => setRestoreSel(e.target.checked ? new Set(deleted.map((x) => x.id)) : new Set())}
+                    />
+                  </Th>
+                  <Th>Date</Th>
+                  <Th>Type</Th>
+                  <Th>Transaction</Th>
+                  <Th numeric>Amount</Th>
+                  <Th>Deleted</Th>
+                </tr>
+              </thead>
+              <tbody>
+                {deleted.map((x) => (
+                  <Tr key={x.id}>
+                    <Td>
+                      <input
+                        type="checkbox"
+                        aria-label={`Select ${x.label}`}
+                        checked={restoreSel.has(x.id)}
+                        onChange={() => {
+                          const n = new Set(restoreSel);
+                          if (n.has(x.id)) n.delete(x.id);
+                          else n.add(x.id);
+                          setRestoreSel(n);
+                        }}
+                      />
+                    </Td>
+                    <Td>{x.date.slice(0, 10)}</Td>
+                    <Td>{x.typeLabel}</Td>
+                    <Td>{x.label}</Td>
+                    <Td numeric>{money(x.amount)}</Td>
+                    <Td>{x.deletedAt.slice(0, 10)}</Td>
+                  </Tr>
+                ))}
+              </tbody>
+            </Table>
+            <div className="mt-4 flex justify-end">
+              <Button variant="secondary" loading={restoring} disabled={restoreSel.size === 0} onClick={restore}>
+                Restore {restoreSel.size || ''} selected
+              </Button>
+            </div>
+          </>
+        )}
+      </Card>
       <ConfirmDialog
         open={confirm}
         tone="danger"
-        title="Void the selected transactions?"
-        message={`${selected.size} transaction(s) will be voided (drafts deleted). Each one is recorded in the audit trail and on the Voided/Deleted Transactions report.`}
-        confirmLabel="Void"
+        title={action === 'delete' ? 'Delete the selected transactions?' : 'Void the selected transactions?'}
+        message={
+          action === 'delete'
+            ? `${selected.size} transaction(s) will be deleted where QuickBooks allows it (the others are refused with the reason). Each delete is in the audit trail and on the Voided/Deleted Transactions report, and can be restored below.`
+            : `${selected.size} transaction(s) will be voided (drafts deleted). Each one is recorded in the audit trail and on the Voided/Deleted Transactions report.`
+        }
+        confirmLabel={action === 'delete' ? 'Delete' : 'Void'}
         loading={saving}
         onConfirm={run}
         onClose={() => setConfirm(false)}
