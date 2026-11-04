@@ -672,7 +672,8 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       writeLocal(NAV_MODE_KEY, prefs.my.navMode);
     }
   }, [prefs.loaded, prefs.my.navMode]);
-  const navMode: NavMode = localMode ?? (prefs.loaded ? prefs.my.navMode : 'simple');
+  // Before preferences load, prefs.my is DEFAULT_MY_PREFERENCES (All menus): no Simple flash.
+  const navMode: NavMode = localMode ?? prefs.my.navMode;
   async function changeMode(m: NavMode) {
     setLocalMode(m);
     writeLocal(NAV_MODE_KEY, m);

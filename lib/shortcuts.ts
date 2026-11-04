@@ -715,7 +715,7 @@ export interface KeyLike {
   altKey: boolean;
   shiftKey: boolean;
   /** KeyboardEvent.getModifierState: 'AltGraph' says the right Alt is down as AltGr. */
-  getModifierState?: (key: string) => boolean;
+  getModifierState?(key: 'AltGraph'): boolean;
 }
 
 const ctrlOrCmd = (e: KeyLike) => e.ctrlKey || e.metaKey;

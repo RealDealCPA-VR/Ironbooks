@@ -14,6 +14,9 @@ import ProductInfo from '@/components/ProductInfo';
 import FormShortcuts from '@/components/FormShortcuts';
 import PreferenceBehaviors from '@/components/PreferenceBehaviors';
 import WindowTitleBar from '@/components/WindowTitleBar';
+import AppShell from '@/components/AppShell';
+import { setTestPathname } from './stubs/next-navigation';
+import { refreshPreferences } from '@/lib/usePreferences';
 import { Button, Input, Modal } from '@/components/ui';
 import { historyGuarded, navigateGuarded, UNSAVED_WORK_ATTR } from '@/lib/shortcuts';
 import { QB_SHORTCUTS, QB_SHORTCUT_GROUPS } from '@/lib/qbShortcuts';
@@ -45,6 +48,45 @@ function TypedPage({ withChrome = false }: { withChrome?: boolean }) {
     </>
   );
 }
+
+// First: nothing cached yet (a new user). The preference cache it fills is shared by later mounts.
+domTest('the real app shell: All menus from the first paint; Esc and Ctrl+F4 close the window beside its sidebar', async () => {
+  resetNav();
+  window.localStorage.removeItem('bka.navMode');
+  window.sessionStorage.setItem('ironbooks.openWindows', JSON.stringify([{ path: '/customers', href: '/customers', label: 'Customer Center' }]));
+  setTestPathname('/invoices');
+  // Preferences still loading (a new user, nothing cached): the menu must already be All menus.
+  let releasePrefs: (v: unknown) => void = () => {};
+  const prefsLoaded = new Promise((r) => (releasePrefs = r));
+  stubFetch({
+    'GET /api/preferences': () => prefsLoaded,
+    'GET /api/me': { id: 'u1', name: 'Pat', email: 'pat@example.com', permissions: null },
+  });
+  try {
+    await mount(
+      <AppShell>
+        <p>Create Invoices</p>
+      </AppShell>,
+    );
+    await until(() => $('nav[aria-label]'), 'the sidebar');
+    equal($('nav[aria-label]')!.getAttribute('aria-label'), 'All menus', 'All menus while preferences load');
+    check($$('aside[data-shell-chrome] [aria-expanded="true"]').length > 0, 'an expanded menu group is on screen');
+    releasePrefs({ company: {}, my: {} });
+    await settle(150);
+    equal($('nav[aria-label]')!.getAttribute('aria-label'), 'All menus', 'and after (no flash)');
+    (document.activeElement as HTMLElement | null)?.blur?.();
+    await press('Escape');
+    await until(() => nav().pushes.includes('/customers'), 'Esc closed the window');
+    resetNav();
+    window.sessionStorage.setItem('ironbooks.openWindows', JSON.stringify([{ path: '/customers', href: '/customers', label: 'Customer Center' }]));
+    (document.activeElement as HTMLElement | null)?.blur?.();
+    await press('F4', { ctrl: true });
+    await until(() => nav().pushes.includes('/customers'), 'Ctrl+F4 closed the window');
+  } finally {
+    setTestPathname('/');
+    window.sessionStorage.removeItem('ironbooks.openWindows');
+  }
+});
 
 domTest('leaving a form being typed asks first: Cancel stays, Leave goes', async () => {
   resetNav();
@@ -205,15 +247,42 @@ domTest('Esc with nothing open or selected closes the window (back to the one be
   resetNav();
   window.sessionStorage.setItem('ironbooks.openWindows', JSON.stringify([{ path: '/customers', href: '/customers', label: 'Customer Center' }]));
   await mount(
-    <main>
-      <WindowList />
-      <p>A page</p>
-    </main>,
+    <>
+      {/* The "All menus" sidebar: the current page's group is an expanded disclosure, not a popup. */}
+      <aside data-shell-chrome="">
+        <button type="button" aria-expanded="true" aria-controls="nav-group-sales">
+          Sales
+        </button>
+      </aside>
+      <main>
+        <WindowList />
+        <p>A page</p>
+      </main>
+    </>,
   );
   await settle(120);
   (document.activeElement as HTMLElement | null)?.blur?.();
   await press('Escape');
   await until(() => nav().pushes.includes('/customers'), 'Esc closed this window and showed the one before it');
+  window.sessionStorage.removeItem('ironbooks.openWindows');
+});
+
+domTest('Esc with an open list or menu leaves the window alone (the list takes Esc)', async () => {
+  resetNav();
+  window.sessionStorage.setItem('ironbooks.openWindows', JSON.stringify([{ path: '/customers', href: '/customers', label: 'Customer Center' }]));
+  await mount(
+    <main>
+      <WindowList />
+      <button type="button" aria-haspopup="menu" aria-expanded="true">
+        New Transaction
+      </button>
+    </main>,
+  );
+  await settle(120);
+  (document.activeElement as HTMLElement | null)?.blur?.();
+  await press('Escape');
+  await settle(100);
+  equal(nav().pushes.length, 0, 'an open menu keeps the window');
   window.sessionStorage.removeItem('ironbooks.openWindows');
 });
 
@@ -228,6 +297,7 @@ function TwoFieldForm({ onSave }: { onSave: () => void }) {
 
 domTest('"Pressing Enter moves between fields" on: Enter goes to the next field instead of recording', async () => {
   stubFetch({ 'GET /api/preferences': { company: {}, my: { enterMovesBetweenFields: true } } });
+  await refreshPreferences(); // the shell test above cached other preferences
   let saved = 0;
   await mount(
     <>

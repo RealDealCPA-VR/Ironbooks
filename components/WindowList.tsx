@@ -57,9 +57,12 @@ function writeList(list: OpenWindow[]) {
   }
 }
 
-/** Something on the page has a list or menu open (it takes Esc for itself). */
+/**
+ * Something on the page has a list or menu open (it takes Esc for itself): an expanded combobox
+ * or menu button. The "All menus" sidebar's expanded groups are disclosures, not popups.
+ */
 function popupOpen(): boolean {
-  return !!document.querySelector('[aria-expanded="true"]');
+  return !!document.querySelector('[role="combobox"][aria-expanded="true"], [aria-haspopup]:not([aria-haspopup="false"])[aria-expanded="true"]');
 }
 
 export default function WindowList() {
