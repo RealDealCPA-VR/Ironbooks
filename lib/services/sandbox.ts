@@ -29,9 +29,11 @@
  *    ("Copies left over") where it can be resumed or discarded.
  *
  * Every sandbox lives in its own container folder under sandboxRoot() (BKA_SANDBOX_ROOT, set by
- * the desktop shell to <userData>/sandboxes, else "Ironbooks Sandboxes" next to the real file),
- * so the copy's own side folders (pre-op backups, report exports, condense archives — all
- * siblings of a data dir) are removed with it on discard.
+ * the desktop shell to %LOCALAPPDATA%\Ironbooks\Sandboxes — next to the working copies, never a
+ * roaming profile — else "Ironbooks Sandboxes" next to the real file), so the copy's own side
+ * folders (pre-op backups, report exports, condense archives — all siblings of a data dir) are
+ * removed with it on discard. The copy of a protected file is plain text like its working copy:
+ * leftovers of it are removed when the real file is closed cleanly and its working copy goes.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -250,6 +252,26 @@ function locateSandboxes(realDataDir: string): LocatedSandbox[] {
     }
   }
   return out.sort((a, b) => b.marker.createdAt.localeCompare(a.marker.createdAt));
+}
+
+/**
+ * A company file protected with passwords was closed cleanly and its plain-text working copy was
+ * removed from this computer (lib/services/companyFileSave.ts closeCompanyFile): its sandbox copies
+ * left over here (never discarded: the app was closed while in one, or another file was opened)
+ * are plain-text copies of protected books, so they are removed too. Returns how many were.
+ */
+export function discardProtectedLeftoverSandboxes(realDataDir: string): number {
+  let removed = 0;
+  for (const s of locateSandboxes(realDataDir)) {
+    if (!isMarkedProtected(s.dir)) continue;
+    try {
+      removeContainer(s.container);
+      removed++;
+    } catch (err) {
+      console.warn('[sandbox] a leftover copy could not be removed yet:', (err as Error).message);
+    }
+  }
+  return removed;
 }
 
 export function listLeftoverSandboxes(realDataDir: string = resolveDataDir()): LeftoverSandbox[] {

@@ -20,6 +20,7 @@ export interface ProtectionUserStatus {
   name: string;
   login: string;
   canOpen: boolean;
+  oldLayout?: boolean;
   challenge: 'ok' | 'missing' | 'none';
 }
 
@@ -29,6 +30,8 @@ export interface ProtectionStatus {
   keyAvailable: boolean;
   protectedAt: string | null;
   recoveryCreatedAt: string | null;
+  hasRecoveryKey?: boolean;
+  oldRecoveryKey?: boolean;
   canManage: boolean;
   self: { canOpen: boolean; challenge: 'ok' | 'missing' | 'none' } | null;
   users: ProtectionUserStatus[] | null;
@@ -60,7 +63,7 @@ function companyNameGuess(): string {
 export function FileProtectionCard({ highlight = false, onDone }: { highlight?: boolean; onDone?: () => void }) {
   const [status, reload] = useProtectionStatus();
   const [password, setPassword] = React.useState('');
-  const [mode, setMode] = React.useState<null | 'protect' | 'rekey'>(highlight ? 'protect' : null);
+  const [mode, setMode] = React.useState<null | 'protect' | 'rekey' | 'filekey'>(highlight ? 'protect' : null);
   const [busy, setBusy] = React.useState(false);
   const [recoveryKey, setRecoveryKey] = React.useState<string | null>(null);
   const [companyName, setCompanyName] = React.useState('Company');
@@ -77,6 +80,19 @@ export function FileProtectionCard({ highlight = false, onDone }: { highlight?: 
     if (!mode) return;
     setBusy(true);
     try {
+      if (mode === 'filekey') {
+        const r = await api.post<{ result: { kept: number; dropped: number; recoveryKept: boolean } }>('/api/file-protection/file-key', { password });
+        setPassword('');
+        setMode(null);
+        toast(
+          r.result.recoveryKept
+            ? 'The file key was changed. Everyone who could open the file still can; older copies and removed users open nothing saved from now on.'
+            : 'The file key was changed. The recovery key could not be kept: make a new one now.',
+          r.result.recoveryKept ? 'success' : 'danger',
+        );
+        await reload();
+        return;
+      }
       const r = await api.post<{ recoveryKey: string }>(mode === 'protect' ? '/api/file-protection' : '/api/file-protection/recovery-key', { password });
       setPassword('');
       setRecoveryKey(r.recoveryKey);
@@ -128,6 +144,26 @@ export function FileProtectionCard({ highlight = false, onDone }: { highlight?: 
             <CheckCircle2 className="h-5 w-5" aria-hidden /> This company file is protected with passwords.
           </p>
           {status.protectedAt && <p className="text-xs text-navy/50">Protected since {new Date(status.protectedAt).toLocaleDateString()}.</p>}
+          {status.canManage && (
+            <p className="text-xs text-amber-700 flex items-start gap-1.5">
+              <ShieldAlert className="h-3.5 w-3.5 mt-0.5 flex-none" aria-hidden />
+              Backups, portable files and copies made before the file was protected are not encrypted: delete them, or keep them where only
+              you can reach them.
+            </p>
+          )}
+          {status.canManage && (status.oldRecoveryKey || status.users?.some((u) => u.oldLayout)) && (
+            <p className="text-sm text-amber-700">
+              The file key can&apos;t change by itself yet (it should after a password change or a removed user):{' '}
+              {status.users?.some((u) => u.oldLayout)
+                ? `${status.users.filter((u) => u.oldLayout).map((u) => u.name).join(', ')} need to sign in once (their access was made by an earlier version). `
+                : ''}
+              {status.oldRecoveryKey ? 'Make a new recovery key (the current one was made by an earlier version). ' : ''}
+              Change the File Key below goes ahead anyway, and drops that access.
+            </p>
+          )}
+          {status.canManage && status.hasRecoveryKey === false && (
+            <p className="text-sm text-red-700">This file has no recovery key: make one now, so the file can be opened if every password is lost.</p>
+          )}
           {!status.keyAvailable && (
             <p className="text-sm text-amber-700">Sign out and sign in again with your user name and password, so this computer can save the file.</p>
           )}
@@ -163,10 +199,22 @@ export function FileProtectionCard({ highlight = false, onDone }: { highlight?: 
               Lost it, or someone else may have seen it? Make a new one; the old one stops opening the file.
             </p>
           )}
-          {status.canManage && status.keyAvailable && mode !== 'rekey' && (
-            <Button variant="secondary" onClick={() => setMode('rekey')}>
-              Make a New Recovery Key…
-            </Button>
+          {status.canManage && status.keyAvailable && (
+            <p className="text-sm text-navy/70">
+              The file key changes by itself whenever a password is changed or reset, a user is made inactive or a new recovery key is made:
+              older copies of the file and replaced passwords then open nothing saved afterwards. Change it yourself any time — everyone who
+              can open the file now still can.
+            </p>
+          )}
+          {status.canManage && status.keyAvailable && !mode && (
+            <div className="flex flex-wrap gap-2">
+              <Button variant="secondary" onClick={() => setMode('rekey')}>
+                Make a New Recovery Key…
+              </Button>
+              <Button variant="secondary" onClick={() => setMode('filekey')}>
+                Change the File Key…
+              </Button>
+            </div>
           )}
         </div>
       ) : !status.singleFile ? (
@@ -192,7 +240,9 @@ export function FileProtectionCard({ highlight = false, onDone }: { highlight?: 
           <p className="text-sm text-navy/70">
             {mode === 'protect'
               ? 'Enter your password to protect the file. You get a recovery key next: print it or save it. Users who have not signed in since get their access the next time they sign in (or when you reset their password).'
-              : 'Enter your password to make a new recovery key.'}
+              : mode === 'filekey'
+                ? 'Enter your password to give the file a new key now. Removed users and older copies of the file (backups, a copy on a USB stick) then open nothing saved from now on.'
+                : 'Enter your password to make a new recovery key.'}
           </p>
           <div>
             <Label htmlFor="fp-password">Your password</Label>
@@ -200,7 +250,7 @@ export function FileProtectionCard({ highlight = false, onDone }: { highlight?: 
           </div>
           <div className="flex gap-2">
             <Button type="submit" loading={busy}>
-              {mode === 'protect' ? 'Protect the File' : 'Make the New Key'}
+              {mode === 'protect' ? 'Protect the File' : mode === 'filekey' ? 'Change the File Key' : 'Make the New Key'}
             </Button>
             <Button type="button" variant="secondary" onClick={() => setMode(null)} disabled={busy}>
               {highlight && mode === 'protect' ? 'Not Now' : 'Cancel'}

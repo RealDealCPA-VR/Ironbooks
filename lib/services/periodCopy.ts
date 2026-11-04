@@ -39,7 +39,8 @@ import { Money } from '@/lib/money';
 import { type ServiceContext, ServiceError, validation, writeAudit } from './_base';
 import { allowLedgerRewriteRaw } from './posting';
 import { condensePeriod } from './condense';
-import { createPortableCompanyFile, restorePortableCompanyFile } from './portableFile';
+import { assertFilePassword, createPortableCompanyFile, restorePortableCompanyFile } from './portableFile';
+import { assertCopyPasswordGiven, forgetFileKey, readProtection, shareFileKey } from './fileProtection';
 import { trialBalance } from './reports';
 import { TRANSACTION_LOG_FILE, resetTransactionLogCache } from './transactionLog';
 
@@ -52,6 +53,13 @@ export interface PeriodCopyInput {
   to: string;
   /** Data dir of the open company file (tests / multi-dir setups). */
   dataDir?: string;
+  /**
+   * The copy's password (filecrypto): the whole .bkp is encrypted under it. Required for a company
+   * file protected with passwords — the copy then also carries its own file key with every slot
+   * of the file re-wrapped for it, so once restored it opens with the same user names, passwords
+   * and recovery key as the original. Optional (offered, on by default) for other files.
+   */
+  password?: string | null;
 }
 
 export interface PeriodCopySummary {
@@ -61,6 +69,10 @@ export interface PeriodCopySummary {
   removedAfter: { journalEntries: number; documents: number };
   condensed: { entries: number; summaryEntries: number; keptOpenDocumentEntries: number } | null;
   otherCompaniesRemoved: number;
+  /** The .bkp is encrypted under a password (filecrypto). */
+  passwordProtected: boolean;
+  /** Once restored, the copy is protected with the same user names and passwords as this file. */
+  protectedLikeOriginal: boolean;
   verified: {
     /** Trial balance on the day before the start date (the opening balances). */
     openingTrialBalance: { totalDebit: string; totalCredit: string };
@@ -756,6 +768,12 @@ export async function createPeriodCopy(ctx: ServiceContext, input: PeriodCopyInp
   }
   if (from > to) throw validation('The start date must be on or before the end date.');
   if (!ctx.userId) throw new ServiceError('FORBIDDEN', 'A Period Copy needs a signed-in user.');
+  const password = input.password ?? null;
+  if (password != null) assertFilePassword(password);
+  // filecrypto: a copy of a company file protected with passwords is protected too.
+  await assertCopyPasswordGiven(ctx.db, password);
+  const sourceDir = resolveDataDir(input.dataDir);
+  const protectedFile = Boolean(await readProtection(ctx.db));
 
   const [co] = await ctx.db.select({ name: companies.name, settings: companies.settings }).from(companies).where(eq(companies.id, ctx.companyId));
   if (!co) throw new ServiceError('NOT_FOUND', 'Company not found');
@@ -763,12 +781,21 @@ export async function createPeriodCopy(ctx: ServiceContext, input: PeriodCopyInp
   const origOpening = await trialBalance(ctx, endOfDay(openingDay));
   const origClosing = await trialBalance(ctx, endOfDay(to));
 
-  const portable = await createPortableCompanyFile(ctx, { dataDir: resolveDataDir(input.dataDir) });
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ironbooks-period-copy-'));
+  const portable = await createPortableCompanyFile(ctx, { dataDir: sourceDir });
+  // The books are worked on in plain text for a moment: a protected file's copy is made beside its
+  // working copy on this computer (the only place its books are ever in plain text — removed with
+  // that cache if anything is left behind), never in a shared temp folder.
+  const root = protectedFile
+    ? path.join(path.dirname(path.resolve(sourceDir)), `data.period-copy-${Date.now()}`)
+    : fs.mkdtempSync(path.join(os.tmpdir(), 'ironbooks-period-copy-'));
+  fs.mkdirSync(root, { recursive: true });
   const work = path.join(root, 'company');
   let result: PeriodCopyResult;
   try {
     await restorePortableCompanyFile(portable.buffer, work);
+    // The copy has this file's protection record and slots, but no key: share it for the duration,
+    // so the safety copy and archive Condense makes inside it are sealed like every other copy.
+    shareFileKey(sourceDir, work);
     const db = await getDb(work);
     const wctx: ServiceContext = { db, companyId: ctx.companyId, userId: ctx.userId };
 
@@ -817,7 +844,10 @@ export async function createPeriodCopy(ctx: ServiceContext, input: PeriodCopyInp
     resetTransactionLogCache(work);
 
     // prefsperms: an auditor / lender copy never carries the file's own secrets (AI keys, mail).
-    const out = await createPortableCompanyFile(wctx, { dataDir: work, omitFileSecrets: true });
+    // filecrypto: with a password the whole .bkp is encrypted; a protected file's copy carries its
+    // OWN new file key (never this file's), every slot re-wrapped for it — restored, it opens with
+    // the same user names, passwords and recovery key as this file.
+    const out = await createPortableCompanyFile(wctx, { dataDir: work, omitFileSecrets: true, password });
     const safe = co.name.replace(/[\\/:*?"<>|\u0000-\u001F]/g, '-').replace(/\s+/g, ' ').trim() || 'Company';
     result = {
       buffer: out.buffer,
@@ -829,6 +859,8 @@ export async function createPeriodCopy(ctx: ServiceContext, input: PeriodCopyInp
         removedAfter: { journalEntries: trimmed.journalEntries, documents: trimmed.documents },
         condensed,
         otherCompaniesRemoved: trimmed.otherCompanies,
+        passwordProtected: Boolean(password),
+        protectedLikeOriginal: protectedFile,
         verified: {
           openingTrialBalance: { totalDebit: copyOpening.totalDebit, totalCredit: copyOpening.totalCredit },
           closingTrialBalance: { totalDebit: copyClosing.totalDebit, totalCredit: copyClosing.totalCredit },
@@ -838,8 +870,9 @@ export async function createPeriodCopy(ctx: ServiceContext, input: PeriodCopyInp
     };
   } finally {
     await closeDb(work).catch(() => undefined);
+    forgetFileKey(work);
     try {
-      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     } catch {
       /* temp folder: best effort */
     }

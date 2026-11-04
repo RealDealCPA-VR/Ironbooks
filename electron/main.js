@@ -515,7 +515,13 @@ function currentCompanyLocation() {
 // ---------------------------------------------------------------------------
 
 function sandboxRoot() {
-  return path.join(app.getPath('userData'), 'sandboxes');
+  // %LOCALAPPDATA%\Ironbooks\Sandboxes, next to the working copies (a sandbox of a protected file
+  // is plain text like its working copy: never in the roaming profile). Sandboxes made by earlier
+  // versions in <userData>\sandboxes move there (except the one running right now).
+  const root = companySession.sandboxRoot({ userData: app.getPath('userData') });
+  const sb = loadConfig().sandbox;
+  companySession.moveLegacySandboxes(path.join(app.getPath('userData'), 'sandboxes'), root, sb && typeof sb.dir === 'string' ? [sb.dir] : []);
+  return root;
 }
 
 /** The active company file's sandbox marker (null for a real company file). */
@@ -1229,6 +1235,12 @@ async function saveCopyAsFlow({ convert = false } = {}) {
   }
   if (isDev) {
     dialog.showErrorBox('Not available in development', 'Run the packaged app to save a copy of the company file.');
+    return;
+  }
+  // A file protected with passwords that nobody has signed in to yet (the server is sealed): its
+  // books are not open, so there is nothing to copy (the server refuses too).
+  if (openFile && openFile.sealed && !openFile.appUser) {
+    dialog.showErrorBox('Sign in first', 'This company file is protected with passwords. Sign in, then save a copy of it.');
     return;
   }
   const name = companyFile.locationName(currentCompanyLocation());

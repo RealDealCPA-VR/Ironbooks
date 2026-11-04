@@ -8,7 +8,8 @@
  * POST /api/portable { password?: string, protect?: boolean } — the same file protected with a
  * PASSWORD (filecrypto; the screens offer it, on by default): the whole file is encrypted and
  * opening it needs the password. `protect: false` (and no password) saves it without one. GET is
- * the file without a password.
+ * the file without a password. A company file protected with passwords only ever gets an
+ * encrypted portable file: GET and `protect: false` are refused for it (400).
  *
  * SECURITY: middleware excludes /api from the session check, so this handler fails closed
  * via getServerContext() before producing any bytes.
@@ -19,6 +20,7 @@ import { requireFileAdmin } from '@/lib/services/access';
 import { resolveDataDir } from '@/lib/db';
 import { dataDirOf } from '@/lib/db/txHooks';
 import { createPortableCompanyFile } from '@/lib/services/portableFile';
+import { assertCopyPasswordGiven } from '@/lib/services/fileProtection';
 import { ServiceError } from '@/lib/services/_base';
 import { readJsonObject, serviceErrorStatus } from '@/lib/routeErrors';
 
@@ -58,6 +60,9 @@ async function download(password: string | null) {
     // The portable file carries EVERY company and user of this file: like a whole-file backup it
     // needs an Admin of every company (lib/services/access requireFileAdmin).
     await requireFileAdmin(ctx);
+    // A company file protected with passwords: its portable file is protected too (never plain-text
+    // books on disk) — GET and `protect: false` are refused for it.
+    await assertCopyPasswordGiven(ctx.db, password);
     const { buffer, filename } = await createPortableCompanyFile(ctx, {
       dataDir: dataDirOf(ctx.db) ?? resolveDataDir(),
       password,
