@@ -1,5 +1,7 @@
 /**
- * PATCH  /api/companies/[id]  — rename a company file (Company & Preferences: modify).
+ * PATCH  /api/companies/[id]  — rename a company file (Company & Preferences: modify), or
+ *                               { archived: false } to restore an archived file (Company: delete,
+ *                               the same right as archiving it).
  * DELETE /api/companies/[id]  — archive (soft-delete) a company file (Company: delete;
  *                               ?confirm=<exact company name> required; refuses the
  *                               caller's only active company). See manage.ts for why
@@ -12,7 +14,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getSessionGate } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
-import { archiveCompany, renameCompany } from './manage';
+import { archiveCompany, renameCompany, unarchiveCompany } from './manage';
 import { serviceErrorStatus } from '@/lib/routeErrors';
 import { stripSecrets } from '@/lib/permissions/mask';
 import { assertSessionAllowed } from '@/lib/services/sessions';
@@ -42,6 +44,9 @@ export async function PATCH(req: NextRequest, { params }: RouteParams) {
     // Single-user mode keeps everyone but its holder out of the company — renaming it included.
     await assertSessionAllowed(db, sessionId, id);
     const body = await req.json().catch(() => null);
+    if (body?.archived === false && body?.name === undefined) {
+      return NextResponse.json(stripSecrets(await unarchiveCompany(db, userId, id)));
+    }
     if (typeof body?.name !== 'string') {
       return NextResponse.json({ error: 'name is required', code: 'VALIDATION' }, { status: 400 });
     }

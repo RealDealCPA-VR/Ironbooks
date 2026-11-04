@@ -150,6 +150,39 @@ export async function archiveCompany(
 }
 
 /**
+ * Restore an archived company file (QB: the file comes back to the company list). Needs the same
+ * right as archiving (Company & Preferences: delete) in that company. Only the archive keys are
+ * removed, in one statement; the books were never touched. Audit: an 'update' row marked restored.
+ */
+export async function unarchiveCompany(db: DB, userId: string, companyId: string): Promise<CompanyRow> {
+  const { company, access } = await getAccessInCompany(db, userId, companyId);
+  if (!can(access, 'company', 'delete')) throw permissionDenied('company', 'delete');
+  if (!isArchived(company.settings)) {
+    throw new ServiceError('CONFLICT', 'This company is not archived.');
+  }
+  const archivedAt = (company.settings as { archivedAt?: unknown } | null)?.archivedAt ?? null;
+  const [updated] = await db
+    .update(companies)
+    .set({
+      settings: sql`(coalesce(${companies.settings}, '{}'::jsonb) - 'archived') - 'archivedAt'`,
+      updatedAt: new Date(),
+    })
+    .where(eq(companies.id, companyId))
+    .returning();
+  await writeAudit(
+    { db, companyId, userId },
+    {
+      action: 'update',
+      entityType: 'company',
+      entityId: companyId,
+      oldValues: { archived: true, archivedAt },
+      newValues: { archived: false, restored: true },
+    },
+  );
+  return updated;
+}
+
+/**
  * Record settings.lastOpenedAt = now (ISO). Called by /api/companies/select so the companies
  * page can order files by recency. Best-effort merge; never throws on a missing row.
  */
