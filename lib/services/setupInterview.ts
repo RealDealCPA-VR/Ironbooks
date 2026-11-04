@@ -6,9 +6,12 @@
  *   2. interview-only facts (entity type, tax-year start month, start date, finished/skipped);
  *   3. the income-tax form for the entity type, and a tax line on every account that has none
  *      yet and fits a line of that form (QB maps the starter chart for you);
- *   4. industry + equity accounts (createAccount — no opening balances, so the books stay
- *      balanced).
- * Re-running is safe: accounts are deduped by name, tax lines already set are never replaced.
+ *   4. industry + equity accounts (createAccount);
+ *   5. optional opening balances — bank, credit card, loan and other accounts, what customers owe
+ *      (A/R) and what you owe vendors (A/P) — as of the day before the start date, each balanced
+ *      through Opening Balance Equity (lib/services/setupOpeningBalances.ts).
+ * Re-running is safe: accounts are deduped by name, tax lines already set are never replaced,
+ * opening balances already entered are kept (a changed account balance is re-posted).
  */
 import { eq, sql } from 'drizzle-orm';
 import { z } from 'zod';
@@ -27,6 +30,7 @@ import { type ServiceContext, inTransaction, notFound, validation, writeAudit } 
 import { getCompany, updateCompany } from './company';
 import { hasForeignCurrencyData } from './multiCurrency';
 import { createAccount, listAccounts, setIncomeTaxForm, updateAccount } from './accounts';
+import { openingBalancesSchema, postSetupOpeningBalances } from './setupOpeningBalances';
 
 export type SetupInterviewStatus = 'done' | 'skipped';
 
@@ -82,6 +86,8 @@ export const setupInterviewSchema = z.object({
       email: z.union([z.literal(''), z.string().trim().email('Email is not a valid email address')]).optional(),
     })
     .optional(),
+  /** Opening balances (QB EasyStep "Add your bank accounts", customers' and vendors' balances). */
+  openingBalances: openingBalancesSchema.optional(),
 });
 export type SetupInterviewInput = z.infer<typeof setupInterviewSchema>;
 
@@ -89,6 +95,8 @@ export interface SetupInterviewResult {
   plan: SetupPlan;
   accountsAdded: number;
   taxLinesMapped: number;
+  /** Plain-language lines for the opening balances posted (or kept on a re-run). */
+  openingBalances: string[];
 }
 
 /** The interview record for the active company (null when never run or skipped). */
@@ -189,6 +197,9 @@ export async function applySetupInterview(
       }
     }
 
+    // 5. Opening balances (after the accounts exist; same transaction: refused = nothing saved).
+    const ob = await postSetupOpeningBalances(tx, parsed.data.openingBalances, plan.interview.startDate ?? null);
+
     await saveRecord(tx, {
       status: 'done',
       at: new Date().toISOString(),
@@ -197,7 +208,7 @@ export async function applySetupInterview(
       startDate: plan.interview.startDate,
     });
 
-    return { plan, accountsAdded, taxLinesMapped };
+    return { plan, accountsAdded, taxLinesMapped, openingBalances: ob.lines };
   });
 }
 

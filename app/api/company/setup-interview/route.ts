@@ -40,6 +40,7 @@ export async function POST(req: NextRequest) {
       nextSteps: result.plan.nextSteps,
       accountsAdded: result.accountsAdded,
       taxLinesMapped: result.taxLinesMapped,
+      openingBalances: result.openingBalances,
     });
   } catch (err) {
     return routeError(err, 'company/setup-interview');
