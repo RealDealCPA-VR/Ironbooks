@@ -17,7 +17,8 @@ import WindowTitleBar from '@/components/WindowTitleBar';
 import AppShell from '@/components/AppShell';
 import { setTestPathname } from './stubs/next-navigation';
 import { refreshPreferences } from '@/lib/usePreferences';
-import { Button, Input, Modal } from '@/components/ui';
+import { Button, Input, Modal, Toaster } from '@/components/ui';
+import KeyboardCommands from '@/components/KeyboardCommands';
 import { historyGuarded, navigateGuarded, UNSAVED_WORK_ATTR } from '@/lib/shortcuts';
 import { QB_SHORTCUTS, QB_SHORTCUT_GROUPS } from '@/lib/qbShortcuts';
 
@@ -241,6 +242,103 @@ domTest("the browser's own Ctrl keys never open its dialogs (print, find, new wi
   } finally {
     window.removeEventListener('keydown', spy, true);
   }
+});
+
+domTest('Ctrl+P presses the Print button; with none it says so and never opens the system print dialog', async () => {
+  const printed: string[] = [];
+  const realPrint = window.print;
+  window.print = () => {
+    printed.push('system');
+  };
+  try {
+    await mount(
+      <>
+        <Toaster />
+        <KeyboardCommands />
+        <KeyboardBase />
+        <main>
+          <p>A page without a Print button</p>
+        </main>
+      </>,
+    );
+    (document.activeElement as HTMLElement | null)?.blur?.();
+    await press('p', { ctrl: true });
+    await until(() => /nothing to print/i.test(textOf()), 'a note that there is nothing to print');
+    equal(printed.join(','), '', 'no system print dialog');
+    await mount(
+      <>
+        <KeyboardCommands />
+        <main>
+          <Button onClick={() => printed.push('button')}>Print</Button>
+        </main>
+      </>,
+    );
+    (document.activeElement as HTMLElement | null)?.blur?.();
+    await press('p', { ctrl: true });
+    await until(() => printed.includes('button'), "the page's Print button");
+    equal(printed.join(','), 'button', 'only the Print button');
+  } finally {
+    window.print = realPrint;
+  }
+});
+
+domTest('closing the window (Alt+F4) asks only when a form was changed, not because one is open', async () => {
+  const unsaved = () => window.__ironbooksUnsavedWork?.() ?? false;
+  await mount(
+    <>
+      <LeaveGuard />
+      <Modal open onClose={() => {}} title="New Customer">
+        <Input aria-label="Name" />
+      </Modal>
+    </>,
+  );
+  $<HTMLInputElement>('[aria-label="Name"]')!.focus();
+  await settle();
+  equal(unsaved(), false, 'an unchanged form dialog');
+  await typeText('Acme');
+  equal(unsaved(), true, 'after typing in it');
+  await mount(
+    <>
+      <LeaveGuard />
+      <main>
+        <div data-shortcut-scope="">
+          <Input aria-label="Pay to" />
+        </div>
+        <input aria-label="Ticked bill" type="checkbox" />
+      </main>
+    </>,
+  );
+  $<HTMLInputElement>('[aria-label="Pay to"]')!.focus();
+  await settle();
+  equal(unsaved(), false, 'the cursor in an unchanged page form');
+  $<HTMLInputElement>('[aria-label="Ticked bill"]')!.focus();
+  await settle();
+  equal(unsaved(), false, 'the cursor on an unticked checkbox');
+  await press(' ');
+  check($<HTMLInputElement>('[aria-label="Ticked bill"]')!.checked, 'Space ticked it');
+  equal(unsaved(), true, 'a ticked bill (Pay Bills) is work');
+  await mount(
+    <>
+      <LeaveGuard />
+      <main>
+        <div data-shortcut-scope="">
+          <Input aria-label="Pay to" />
+        </div>
+      </main>
+    </>,
+  );
+  $<HTMLInputElement>('[aria-label="Pay to"]')!.focus();
+  await typeText('Acme');
+  equal(unsaved(), true, 'a changed page form');
+  await mount(
+    <>
+      <LeaveGuard />
+      <main {...{ [UNSAVED_WORK_ATTR]: '' }}>
+        <p>Step 3 of 9</p>
+      </main>
+    </>,
+  );
+  equal(unsaved(), true, 'the setup interview');
 });
 
 domTest('Esc with nothing open or selected closes the window (back to the one before it)', async () => {

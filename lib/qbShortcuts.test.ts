@@ -187,7 +187,10 @@ const CHECKS: Record<string, () => void> = {
   'forms|Alt+P': () => expect(formShortcutFor(alt('p'))).toBe('prev'),
   'forms|Alt+R': () => expect(formShortcutFor(alt('r'))).toBe('revert'),
   'forms|Ctrl+Enter': () => expect(formShortcutFor(ctrl('Enter'))).toBe('save-new'),
-  'forms|Ctrl+P': () => expect(global(ctrl('p'))).toBe('print'),
+  'forms|Ctrl+P': () => {
+    expect(global(ctrl('p'))).toBe('print');
+    dom(SHELL, 'Ctrl+P presses the Print button; with none it says so and never opens the system print dialog')();
+  },
   'forms|Ctrl+M': () => expect(global(ctrl('m'))).toBe('memorize'),
   'forms|Ctrl+T': () => expect(global(ctrl('t'))).toBe('/recurring'),
   'forms|Ctrl+H': () => expect(global(ctrl('h'))).toBe('history'),
@@ -248,7 +251,8 @@ const CHECKS: Record<string, () => void> = {
   // ---- Open, set up and close ----
   'open-close|Alt+F4': () => {
     const main = fs.readFileSync(path.resolve(process.cwd(), 'electron/main.js'), 'utf8');
-    expect(main).toContain('confirmCloseOverUnsavedWork');
+    expect(main).toContain('__ironbooksUnsavedWork'); // the window asks the page (LeaveGuard closeRisk)
+    dom(SHELL, 'closing the window (Alt+F4) asks only when a form was changed, not because one is open')();
   },
   'open-close|Ctrl+Alt+Y (Product Information)': () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), 'components/ProductInfo.tsx'), 'utf8');

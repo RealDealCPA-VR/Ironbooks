@@ -12,7 +12,10 @@
  *    repeats too, which used to slip through to the window's own reload); the page area is
  *    started over in place (components/PageRefresh.tsx), which fetches its data again; screens
  *    without one reload.
- *  - closing the desktop window (Alt+F4): electron/main.js asks window.__ironbooksUnsavedWork().
+ *  - closing the desktop window (Alt+F4): electron/main.js asks window.__ironbooksUnsavedWork(),
+ *    which answers from changes (closeRisk), since the question says the form "has changes": a
+ *    changed form dialog, a changed page form, a changed loose field on the page (a bill ticked in
+ *    Pay Bills), or a page with unsaved answers (data-unsaved-work).
  *
  * "Could be lost" is lib/shortcuts.ts leaveRisk: a form dialog is open, a page holds unsaved
  * answers (data-unsaved-work), or the cursor is in a field on the page — or was, just before the
@@ -32,6 +35,7 @@ import {
   isFormField,
   isReloadKey,
   leaveRisk,
+  UNSAVED_WORK_ATTR,
 } from '@/lib/shortcuts';
 
 type Pending = { kind: 'leave' | 'refresh'; run: () => void };
@@ -80,6 +84,39 @@ export function resetPageFormChanges(root: ParentNode = document) {
   });
 }
 
+/** Loose page fields (outside any tracked form) and how they were when the cursor first came in. */
+const looseFieldStart = new WeakMap<Element, string>();
+const looseFields = new Set<WeakRef<Element>>();
+const fieldState = (el: Element) => {
+  const f = el as HTMLInputElement;
+  return f.type === 'checkbox' || f.type === 'radio' ? String(f.checked) : String(f.value ?? '');
+};
+function noteLooseField(el: Element) {
+  if (looseFieldStart.has(el) || (el as HTMLInputElement).type === 'search') return;
+  looseFieldStart.set(el, fieldState(el));
+  looseFields.add(new WeakRef(el));
+}
+
+/**
+ * Closing the window would lose a change (Alt+F4 / File > Exit): judged from changes, not from
+ * where the cursor is — an unchanged form closes without a question, as Esc closes it.
+ */
+export function closeRisk(root: ParentNode = document): boolean {
+  if (root.querySelector(`[${UNSAVED_WORK_ATTR}]`)) return true;
+  const dialogs = Array.from(root.querySelectorAll<HTMLElement>('[role="dialog"][data-modal]'));
+  if (dialogs.some((d) => formWasChanged(d))) return true;
+  if (pageFormChanged(root)) return true;
+  for (const ref of looseFields) {
+    const el = ref.deref();
+    if (!el || !el.isConnected) {
+      looseFields.delete(ref);
+      continue;
+    }
+    if (looseFieldStart.get(el) !== fieldState(el)) return true;
+  }
+  return false;
+}
+
 /** A form on the page has been changed. */
 export function pageFormChanged(root: ParentNode = document): boolean {
   return Array.from(root.querySelectorAll<HTMLElement>(PAGE_FORMS)).some(
@@ -108,6 +145,7 @@ export default function LeaveGuard() {
       // Start noticing changes to the page form this field belongs to.
       const form = isFormField(el) ? (el.closest(PAGE_FORMS) as HTMLElement | null) : null;
       if (form && !form.closest('[role="dialog"]')) trackFormChanges(form);
+      else if (isFormField(el) && !el.closest('[role="dialog"]')) noteLooseField(el);
     }
     function onFocusOut(e: FocusEvent) {
       // Clicking the page's background leaves no field active (the window losing focus to a
@@ -129,7 +167,8 @@ export default function LeaveGuard() {
   const atRisk = React.useCallback(() => leaveRisk(document.activeElement, remembered.current) || pageFormChanged(), []);
 
   React.useEffect(() => {
-    window.__ironbooksUnsavedWork = atRisk;
+    const closing = () => closeRisk();
+    window.__ironbooksUnsavedWork = closing;
     // In a browser, closing the tab or typing another address asks too (the desktop window asks
     // through electron/main.js instead: there a beforeunload refusal would silently keep it open).
     const desktop = Boolean((window as unknown as { bookkeeper?: { isDesktop?: boolean } }).bookkeeper?.isDesktop);
@@ -141,7 +180,7 @@ export default function LeaveGuard() {
     window.addEventListener('beforeunload', onBeforeUnload);
     return () => {
       window.removeEventListener('beforeunload', onBeforeUnload);
-      if (window.__ironbooksUnsavedWork === atRisk) delete window.__ironbooksUnsavedWork;
+      if (window.__ironbooksUnsavedWork === closing) delete window.__ironbooksUnsavedWork;
     };
   }, [atRisk]);
 
