@@ -31,6 +31,10 @@ describe('QuickBooks keys in the browser', () => {
     expectAllPassed(await runDomFile('test/dom/registerGoTo.dom.tsx'));
   }, 180_000);
 
+  it('Chart of Accounts: one list across the account types; type-ahead on the number or the name', async () => {
+    expectAllPassed(await runDomFile('test/dom/chartOfAccounts.dom.tsx'));
+  }, 180_000);
+
   it('Customer / Vendor Center: arrows and type-ahead choose the name, the right side follows', async () => {
     expectAllPassed(await runDomFile('test/dom/centerView.dom.tsx'));
   }, 180_000);

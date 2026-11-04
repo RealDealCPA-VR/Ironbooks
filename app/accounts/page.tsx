@@ -23,7 +23,7 @@ import {
   PageHeader,
   toast,
 } from '@/components/ui';
-import { accountRegisterHref, quickReportHref } from '@/lib/shortcuts';
+import { accountRegisterHref, quickReportHref, useListKeys } from '@/lib/shortcuts';
 import { Help } from '@/components/Help';
 import WhyChanged from '@/components/WhyChanged';
 import { api, ApiError } from '@/lib/client';
@@ -403,7 +403,7 @@ function AccountGroup({ type, roots, onDeactivate, onReactivate, onEdit }: Accou
       </button>
 
       {!collapsed && (
-        <Table>
+        <Table listKeys={false}>
           <thead>
             <tr>
               {prefs.company.accountNumbersEnabled && <Th className="w-24">Code</Th>}
@@ -449,6 +449,7 @@ export default function AccountsPage() {
   const [editTarget, setEditTarget] = useState<AccountNode | null>(null);
   const [deactivateTarget, setDeactivateTarget] = useState<Account | null>(null);
   const [deactivating, setDeactivating] = useState(false);
+  const chartList = useListKeys<HTMLDivElement>();
 
   async function fetchAccounts() {
     try {
@@ -548,16 +549,19 @@ export default function AccountsPage() {
           </Card>
         ) : (
           <Card className="p-6">
-            {grouped.map(({ type, roots }) => (
-              <AccountGroup
-                key={type}
-                type={type}
-                roots={roots}
-                onDeactivate={setDeactivateTarget}
-                onReactivate={handleReactivate}
-                onEdit={setEditTarget}
-              />
-            ))}
+            {/* One list, as in QuickBooks: arrows and type-ahead (number or name) run across every account type. */}
+            <div {...chartList}>
+              {grouped.map(({ type, roots }) => (
+                <AccountGroup
+                  key={type}
+                  type={type}
+                  roots={roots}
+                  onDeactivate={setDeactivateTarget}
+                  onReactivate={handleReactivate}
+                  onEdit={setEditTarget}
+                />
+              ))}
+            </div>
           </Card>
         )}
 

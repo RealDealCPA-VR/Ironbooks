@@ -329,10 +329,20 @@ export function Badge({
  * with data-list-label (type-ahead text), data-row-open (Enter clicks the row),
  * data-quick-report (Ctrl+Q target), data-journal-entry (Ctrl+Y / Ctrl+H) and data-list-skip.
  */
-export function Table({ children }: { children: React.ReactNode }) {
-  const list = useListKeys<HTMLDivElement>();
+export function Table({
+  children,
+  listKeys = true,
+}: {
+  children: React.ReactNode;
+  /**
+   * false: this table is one section of a larger list (the Chart of Accounts' account types), so
+   * its rows take the list keys of the element around it that has useListKeys, as one list.
+   */
+  listKeys?: boolean;
+}) {
+  const list = useListKeys<HTMLDivElement>({ disabled: !listKeys });
   return (
-    <div className="overflow-x-auto" {...list}>
+    <div className="overflow-x-auto" {...(listKeys ? list : {})}>
       <table className="w-full border-collapse">{children}</table>
     </div>
   );
