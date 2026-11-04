@@ -146,6 +146,7 @@ describe('transaction line grids use the find-as-you-type picker (review P2)', (
   it('Batch Enter Name column is free text for checks, card charges / credits and deposits', () => {
     const src = read('app', 'accountant', 'batch-enter', 'page.tsx');
     expect(src).toMatch(/FREE_TEXT_NAME_TYPES: BatchEnterType\[\] = \['check', 'cc_charge', 'cc_credit', 'deposit'\]/);
-    expect(src).toMatch(/allowFreeText=\{c === 'name' && FREE_TEXT_NAME_TYPES\.includes\(type\)\}/);
+    // (the Tax Code column is free text too since the accountant round: codes are typed)
+    expect(src).toMatch(/allowFreeText=\{\(?c === 'name' && FREE_TEXT_NAME_TYPES\.includes\(type\)\)?( \|\| c === 'taxCode')?\}/);
   });
 });
