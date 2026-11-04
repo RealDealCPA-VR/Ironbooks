@@ -178,6 +178,25 @@ its passwords — and nobody else:
 **Older company folders** (`*.ironbooks` folders from earlier versions) still open (File > Open
 Company Folder (Older Format)); File > Save as a Single Company File converts one.
 
+**Known limits** (recorded so they are decided, not forgotten):
+
+- *Restore or preview of a backup over about 2 GB from the Back Up and Restore page* reads the whole
+  upload in memory (adm-zip; a protected backup is decrypted in memory too, about 2-3x its size).
+  Restoring it as a new company file through the desktop shell (File > Open or Restore Company)
+  reads with positioned reads and works at any size; streaming the page's restore is a larger
+  rewrite of `lib/services/backup.ts` / `backupPreview.ts`.
+- *Safety copies made before a restore, condense or year-end close* stay in the working-copy folder
+  of the computer that made them (rotated per company file); they are not moved next to the shared
+  file, so another computer does not see them.
+- *Backup health counts every computer's backups*: the history travels with the file, so "Last
+  backup" and the schedule include backups this computer cannot see. Per-computer versus per-file
+  backup semantics is a product decision.
+- *Ironbooks 1.6.0 cannot refuse files from later versions it does not know about* beyond
+  `formatVersion` (it refuses format 2, so protected and newer files are safe). Update every
+  computer of an office together (release notes).
+- *A file key change waits for the next save*: if the app stops between a password change (or a
+  deactivated user) and that save, the change is not made; the next secret change makes it.
+
 ## Testing the desktop app
 
 After `npm run build && npx electron-builder --dir` (the packaged app in `release/win-unpacked`):

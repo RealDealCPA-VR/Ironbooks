@@ -39,7 +39,8 @@ import { hashPassword } from '@/lib/auth';
 import { normalizeChallengeAnswer } from '@/lib/challengeQuestions';
 import { POST as signupPOST } from '@/app/api/auth/signup/route';
 import { POST as loginPOST } from '@/app/api/auth/login/route';
-import { closeCompanyFile, saveCompanyFile } from './companyFileSave';
+import { closeCompanyFile, saveCompanyFile, saveCopyAs } from './companyFileSave';
+import { restoreBackup } from './backup';
 import { createCustomer } from './customers';
 import { createManualEntry } from './journal';
 import { addUser, resetUserPassword, updateUser } from './users';
@@ -310,6 +311,10 @@ describe('a reused working copy checks the plain listing of the file', () => {
 
     let opened = await openOn(FILE, PC2, 'launch-hardening-2');
     expect(opened.sealed).toBe('key');
+    // Nobody has signed in yet: Save Copy As makes no copy (never an empty or plain-text one).
+    const early = path.join(SHARE, 'copy before sign-in.ironbooks');
+    await expect(saveCopyAs(early)).rejects.toMatchObject({ code: 'VALIDATION' });
+    expect(fs.existsSync(early)).toBe(false);
     resetLimiters();
     const refused = await loginPOST(apiRequest('POST', '/api/auth/login', { email: 'cleo', password: PW }));
     expect(refused.status).toBe(409);
@@ -323,4 +328,19 @@ describe('a reused working copy checks the plain listing of the file', () => {
     const ok = await loginPOST(apiRequest('POST', '/api/auth/login', { email: 'cleo', password: PW }));
     expect(ok.status).toBe(200);
   }, 180_000);
+});
+
+describe('restoring into a protected file whose protection cannot be read', () => {
+  it('refuses a backup made without passwords (the restored books could never be saved)', async () => {
+    const dir = path.join(ROOT, 'damaged', 'data');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'PG_VERSION'), '17\n');
+    fs.writeFileSync(path.join(dir, '.ironbooks-protected'), JSON.stringify({ keyCheck: 'x' }));
+    const plainBackup = format.buildBackupArchive({
+      backupManifest: { app: 'bookkeeper-ai', formatVersion: 1, kind: 'full', companyName: 'Old Books', createdAt: new Date().toISOString() },
+      entries: [{ name: 'PG_VERSION', data: Buffer.from('17\n') }],
+    });
+    await expect(restoreBackup(plainBackup, dir)).rejects.toMatchObject({ code: 'VALIDATION', message: expect.stringMatching(/protection could not be read/) });
+    expect(fs.readdirSync(dir).sort()).toEqual(['.ironbooks-protected', 'PG_VERSION']);
+  }, 120_000);
 });

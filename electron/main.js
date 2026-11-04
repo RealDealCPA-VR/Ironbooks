@@ -1237,6 +1237,12 @@ async function saveCopyAsFlow({ convert = false } = {}) {
     dialog.showErrorBox('Not available in development', 'Run the packaged app to save a copy of the company file.');
     return;
   }
+  // A file protected with passwords that nobody has signed in to yet (the server is sealed): its
+  // books are not open, so there is nothing to copy (the server refuses too).
+  if (openFile && openFile.sealed && !openFile.appUser) {
+    dialog.showErrorBox('Sign in first', 'This company file is protected with passwords. Sign in, then save a copy of it.');
+    return;
+  }
   const name = companyFile.locationName(currentCompanyLocation());
   const res = await dialog.showSaveDialog(mainWindow, {
     title: convert ? 'Save as a Single Company File' : 'Save a Copy of the Company File',

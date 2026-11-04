@@ -170,6 +170,19 @@ describe('the plain listing of a protected file is bound to its encrypted conten
   });
 });
 
+describe('Ironbooks 1.6 and a protected file', () => {
+  it('the released 1.6.0 reader refuses it as "saved by a newer version" and writes nothing', async () => {
+    const v16 = require('./fixtures/companyFileFormat.v1.6.0.cjs');
+    const prot = await protection({ mary: 'pw-12345678' });
+    const file = await writeSealed('ForOldVersion', prot);
+    const out = path.join(root, 'v16-out');
+    await expect(v16.extractCompanyFile(file, out)).rejects.toMatchObject({ code: 'NEWER_FORMAT' });
+    expect(fs.existsSync(out) ? fs.readdirSync(out) : []).toEqual([]);
+    // Its No Company Open list still reads the listing.
+    expect(v16.readCompanyManifest(file)).toMatchObject({ companyName: COMPANY, fileId: 'f-1' });
+  });
+});
+
 describe('entries are encrypted with a per-container subkey', () => {
   it('no entry of a layout-2 file opens with the file key itself; each container has its own subkey', async () => {
     const prot = await protection({ mary: 'pw-12345678' });
