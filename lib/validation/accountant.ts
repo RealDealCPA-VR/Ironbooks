@@ -61,6 +61,12 @@ const batchRowSchema = z.object({
   memo: z.string().optional(),
   className: z.string().optional(),
   dueDate: z.string().optional(),
+  item: z.string().optional(),
+  quantity: z.string().optional(),
+  rate: z.string().optional(),
+  taxCode: z.string().optional(),
+  taxItem: z.string().optional(),
+  customerJob: z.string().optional(),
 });
 
 export const batchEnterSchema = z.object({

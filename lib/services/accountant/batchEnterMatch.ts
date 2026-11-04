@@ -10,7 +10,7 @@
  *    (check, deposit, card charge/credit, invoice, credit memo, bill, bill credit or journal entry).
  */
 import { Money } from '@/lib/money';
-import { type BatchEnterRow, type BatchEnterType, normalizeAmount, normalizeDate } from './batchEnterParse';
+import { ITEM_TYPES, type BatchEnterRow, type BatchEnterType, normalizeAmount, normalizeDate } from './batchEnterParse';
 
 export interface BatchAccountRef {
   id: string;
@@ -28,9 +28,21 @@ export interface BatchLookupLists {
   customers: BatchNamedRef[];
   vendors: BatchNamedRef[];
   classes: BatchNamedRef[];
+  /** Items (item lines), sales tax items (tax rates), Sales Tax Codes (name = the code) and jobs. */
+  items?: BatchNamedRef[];
+  taxRates?: BatchNamedRef[];
+  taxCodes?: BatchNamedRef[];
+  jobs?: Array<BatchNamedRef & { customerId: string | null }>;
 }
 
-export type MatchKind = 'account' | 'customer' | 'vendor' | 'class';
+export type MatchKind = 'account' | 'customer' | 'vendor' | 'class' | 'item' | 'taxRate';
+
+/** A resolved "Customer" or "Customer:Job"; jobMissing = the job part named no job of that customer. */
+export interface CustomerJobMatch {
+  customerId: string;
+  jobId: string | null;
+  jobMissing?: string;
+}
 
 export interface BatchMatchers {
   account: (s: string) => string | null;
@@ -40,6 +52,12 @@ export interface BatchMatchers {
   className: (s: string) => string | null;
   customer: (s: string) => string | null;
   vendor: (s: string) => string | null;
+  item: (s: string) => string | null;
+  taxRate: (s: string) => string | null;
+  /** Sales Tax Code by its code ("Tax", "Non"). */
+  taxCode: (s: string) => string | null;
+  /** "Customer" or "Customer:Job" (QB's Customer:Job column). */
+  customerJob: (s: string) => CustomerJobMatch | null;
   /** Closest existing entry for a value that did not match (for "did you mean"), or null. */
   suggest: (kind: MatchKind, s: string) => string | null;
 }
@@ -178,6 +196,28 @@ export function createBatchMatchers(
   const closestCustomer = closestMatcher(labels(lists.customers));
   const closestVendor = closestMatcher(labels(lists.vendors));
   const closestClass = closestMatcher(labels(lists.classes));
+  const closestItem = closestMatcher(labels(lists.items ?? []));
+  const closestTaxRate = closestMatcher(labels(lists.taxRates ?? []));
+  const customerByName = byName(lists.customers);
+  const jobsByCustomer = new Map<string, Map<string, string | null>>();
+  for (const j of lists.jobs ?? []) {
+    if (!j.customerId || !j.name) continue;
+    const m = jobsByCustomer.get(j.customerId) ?? jobsByCustomer.set(j.customerId, new Map()).get(j.customerId)!;
+    const k = normName(j.name);
+    m.set(k, m.has(k) ? null : j.id);
+  }
+  const matchCustomerJob = (s: string): CustomerJobMatch | null => {
+    const whole = customerByName(s);
+    if (whole) return { customerId: whole, jobId: null };
+    const at = s.indexOf(':');
+    if (at < 0) return null;
+    const cust = customerByName(s.slice(0, at));
+    if (!cust) return null;
+    const jobName = s.slice(at + 1).trim();
+    if (!jobName) return { customerId: cust, jobId: null };
+    const jobId = jobsByCustomer.get(cust)?.get(normName(jobName)) ?? null;
+    return jobId ? { customerId: cust, jobId } : { customerId: cust, jobId: null, jobMissing: jobName };
+  };
   const suggesters: Record<MatchKind, (s: string) => string | null> = {
     account: memo('suggest-account', (s) => {
       // Compare against the bare names first ("Ofice Suplies"), then "number · name".
@@ -188,6 +228,8 @@ export function createBatchMatchers(
     customer: memo('suggest-customer', closestCustomer),
     vendor: memo('suggest-vendor', closestVendor),
     class: memo('suggest-class', closestClass),
+    item: memo('suggest-item', closestItem),
+    taxRate: memo('suggest-taxRate', closestTaxRate),
   };
   // Account codes are compared exactly, so that cache is keyed by the trimmed text, not the
   // case-folded name.
@@ -216,13 +258,41 @@ export function createBatchMatchers(
       return null;
     },
     className: memo('class', byName(lists.classes)),
-    customer: memo('customer', byName(lists.customers)),
+    customer: memo('customer', customerByName),
     vendor: memo('vendor', byName(lists.vendors)),
+    item: memo('item', byName(lists.items ?? [])),
+    taxRate: memo('taxRate', byName(lists.taxRates ?? [])),
+    taxCode: memo('taxCode', byName(lists.taxCodes ?? [])),
+    customerJob: memo('customerJob', matchCustomerJob),
     suggest: (kind: MatchKind, s: string) => suggesters[kind](s),
   };
 }
 
-/** The document a valid row (or journal-entry group) will create. Amounts are decimal strings. */
+/** One line of a resolved document. Amounts are decimal strings. */
+export interface ResolvedBatchLine {
+  /** GL account (account lines; an optional override on item lines). */
+  accountId: string | null;
+  itemId: string | null;
+  /** Item lines: units (default 1). */
+  quantity: string | null;
+  /** Item lines: sales price (invoices, credit memos) or unit cost (purchases); null = from the item / amount. */
+  rate: string | null;
+  /** Line amount; null on an item line priced by quantity x rate. */
+  amount: string | null;
+  description: string | null;
+  classId: string | null;
+  /** Purchases: the line's billable Customer:Job. */
+  customerId?: string | null;
+  jobId?: string | null;
+  /** Invoices / credit memos: Y / N, or the line's Sales Tax Code. Undefined = the item decides. */
+  taxable?: boolean;
+  salesTaxCodeId?: string | null;
+  /** Deposits: the line's Received From name. */
+  entityType?: 'customer' | 'vendor' | null;
+  entityId?: string | null;
+}
+
+/** The document a valid row group (or journal-entry group) will create. */
 export type ResolvedBatchDoc =
   | {
       kind: 'expense';
@@ -232,20 +302,20 @@ export type ResolvedBatchDoc =
       payeeName: string | null;
       ref: string | null;
       memo: string | null;
-      accountId: string;
-      amount: string;
-      classId: string | null;
+      lines: ResolvedBatchLine[];
     }
-  | { kind: 'deposit'; date: string; accountId: string; amount: string; description: string | null; memo: string | null }
+  | { kind: 'deposit'; date: string; memo: string | null; lines: ResolvedBatchLine[] }
   | {
       kind: 'invoice' | 'credit_memo';
       customerId: string;
+      jobId: string | null;
       ref: string | null;
       date: string;
       memo: string | null;
-      accountId: string;
-      amount: string;
       classId: string | null;
+      /** Sales tax item; undefined = the customer's own (as the form does). */
+      taxRateId?: string | null;
+      lines: ResolvedBatchLine[];
     }
   | {
       kind: 'bill';
@@ -254,11 +324,10 @@ export type ResolvedBatchDoc =
       date: string;
       dueDate: string | null;
       memo: string | null;
-      accountId: string;
-      amount: string;
       classId: string | null;
+      lines: ResolvedBatchLine[];
     }
-  | { kind: 'bill_credit'; vendorId: string; ref: string | null; date: string; memo: string | null; accountId: string; amount: string; classId: string | null }
+  | { kind: 'bill_credit'; vendorId: string; ref: string | null; date: string; memo: string | null; lines: ResolvedBatchLine[] }
   | {
       kind: 'journal';
       date: string;
@@ -407,101 +476,238 @@ export function resolveBatchRows(input: ResolveBatchInput, M: BatchMatchers, opt
     return jobs;
   }
 
+  // Documents: a row starts a new document, and the rows under it are its split lines when they
+  // leave Date, Ref and Name blank (deposits: Date blank — Ref is each line's check number), or
+  // repeat the same Date + Ref + Name with a Ref given (how a spreadsheet of split lines is usually
+  // pasted).
+  const groups: Array<{ idx: number[]; key: string }> = [];
   input.rows.forEach((r, i) => {
+    const date = r.date?.trim() ?? '';
+    const ref = r.ref?.trim() ?? '';
+    const name = normName(r.name ?? '');
+    const key = `${date}|${ref}|${name}`;
+    const last = groups[groups.length - 1];
+    const continues = t === 'deposit' ? !date : !date && !ref && !name;
+    const same = t !== 'deposit' && ref !== '' && last?.key === key;
+    if (last && (continues || same)) last.idx.push(i);
+    else groups.push({ idx: [i], key });
+  });
+  const itemType = ITEM_TYPES.includes(t);
+  const sales = t === 'invoice' || t === 'credit_memo';
+  const purchase = t === 'check' || t === 'cc_charge' || t === 'cc_credit' || t === 'bill' || t === 'bill_credit';
+  const classless = t === 'deposit' || t === 'credit_memo';
+
+  for (const g of groups) {
     const errors: string[] = [];
     const warnings: string[] = [];
-    const n = `Row ${rn(i)}`;
-    const date = normalizeDate(r.date);
-    if (!date) errors.push(`${n}: date "${r.date ?? ''}" is not a valid date.`);
-    closedWarning(rn(i), date, warnings);
-    const accountId = r.account ? M.account(r.account) : null;
-    if (!accountId) errors.push(accountError(n, r.account));
-    else if (bank && accountId === bank) errors.push(`${n}: the account can't be the same as the ${t.startsWith('cc') ? 'credit card' : 'bank'} account.`);
-    const amount = normalizeAmount(r.amount);
-    if (amount === null) errors.push(`${n}: amount "${r.amount ?? ''}" is not a number.`);
-    else if (subCent(amount)) errors.push(`${n}: ${SUB_CENT}`);
-    else if (!Money.gt(amount, 0)) errors.push(`${n}: amount must be greater than zero.`);
-    const classless = t === 'deposit' || t === 'credit_memo';
-    const classId = r.className?.trim() && !classless ? M.className(r.className) : null;
-    if (r.className?.trim() && classless) {
-      // Their lines keep no class: refuse it rather than save the row without it.
-      errors.push(`${n}: ${t === 'deposit' ? 'deposits' : 'credit memos'} don't keep a class on their lines — clear the Class column.`);
-    } else if (r.className?.trim() && !classId) {
-      errors.push(`${n}: class "${r.className}" was not found.${didYouMean(M.suggest('class', r.className))}`);
-    }
+    const first = input.rows[g.idx[0]];
+    const n = `Row ${rn(g.idx[0])}`;
+    const date = normalizeDate(first.date);
+    if (!date) errors.push(`${n}: date "${first.date ?? ''}" is not a valid date.`);
+    closedWarning(rn(g.idx[0]), date, warnings);
     if (needsBank && !bank) errors.push(`${n}: choose the ${t.startsWith('cc') ? 'credit card' : 'bank'} account first.`);
+
+    // ---- the document's name ----
     let customerId: string | null = null;
+    let jobId: string | null = null;
     let vendorId: string | null = null;
-    if (t === 'invoice' || t === 'credit_memo') {
-      customerId = r.name ? M.customer(r.name) : null;
+    if (sales) {
+      const cj = first.name?.trim() ? M.customerJob(first.name) : null;
+      customerId = cj?.customerId ?? null;
+      jobId = cj?.jobId ?? null;
       if (!customerId) {
-        errors.push(`${n}: customer "${r.name ?? ''}" was not found (add it to the customer list first).${r.name ? didYouMean(M.suggest('customer', r.name)) : ''}`);
+        errors.push(`${n}: customer "${first.name ?? ''}" was not found (add it to the customer list first).${first.name ? didYouMean(M.suggest('customer', first.name)) : ''}`);
+      } else if (cj?.jobMissing) {
+        errors.push(`${n}: job "${cj.jobMissing}" was not found for that customer.`);
       }
     } else if (t === 'bill' || t === 'bill_credit') {
-      vendorId = r.name ? M.vendor(r.name) : null;
+      vendorId = first.name ? M.vendor(first.name) : null;
       if (!vendorId) {
-        errors.push(`${n}: vendor "${r.name ?? ''}" was not found (add it to the vendor list first).${r.name ? didYouMean(M.suggest('vendor', r.name)) : ''}`);
+        errors.push(`${n}: vendor "${first.name ?? ''}" was not found (add it to the vendor list first).${first.name ? didYouMean(M.suggest('vendor', first.name)) : ''}`);
       }
     } else if (t === 'check' || t === 'cc_charge' || t === 'cc_credit') {
-      vendorId = r.name ? M.vendor(r.name) : null;
-      if (!r.name?.trim()) errors.push(`${n}: enter a payee name.`);
+      vendorId = first.name ? M.vendor(first.name) : null;
+      if (!first.name?.trim()) errors.push(`${n}: enter a payee name.`);
       else if (!vendorId) {
-        const near = M.suggest('vendor', r.name);
-        warnings.push(`${n}: "${r.name.trim()}" is not in your vendor list, so it is saved as a one-time payee.${didYouMean(near)}`);
+        const near = M.suggest('vendor', first.name);
+        warnings.push(`${n}: "${first.name.trim()}" is not in your vendor list, so it is saved as a one-time payee.${didYouMean(near)}`);
       }
     }
     let dueDate: string | null = null;
-    if (t === 'bill' && r.dueDate) {
-      dueDate = normalizeDate(r.dueDate);
-      if (!dueDate) errors.push(`${n}: due date "${r.dueDate}" is not a valid date.`);
+    if (t === 'bill' && first.dueDate) {
+      dueDate = normalizeDate(first.dueDate);
+      if (!dueDate) errors.push(`${n}: due date "${first.dueDate}" is not a valid date.`);
       else if (date && dueDate < date) errors.push(`${n}: the due date is before the bill date.`);
     }
-    if (errors.length) {
-      jobs.push({ rows: [i], errors, warnings });
-      return;
+    let taxRateId: string | null | undefined;
+    if (sales && first.taxItem?.trim()) {
+      taxRateId = M.taxRate(first.taxItem);
+      if (!taxRateId) errors.push(`${n}: sales tax item "${first.taxItem}" was not found.${didYouMean(M.suggest('taxRate', first.taxItem))}`);
     }
-    const memo = r.memo?.trim() || null;
+
+    // ---- the lines ----
+    const lines: ResolvedBatchLine[] = [];
+    for (const i of g.idx) {
+      const r = input.rows[i];
+      const ln = `Row ${rn(i)}`;
+      if (i !== g.idx[0]) {
+        if (sales && r.taxItem?.trim() && r.taxItem.trim() !== (first.taxItem ?? '').trim()) {
+          errors.push(`${ln}: one ${t === 'invoice' ? 'invoice' : 'credit memo'} has one sales tax item — put it on its first row.`);
+        }
+        if (t === 'bill' && r.dueDate?.trim() && r.dueDate.trim() !== (first.dueDate ?? '').trim()) {
+          errors.push(`${ln}: one bill has one due date — put it on its first row.`);
+        }
+      }
+      const itemId = itemType && r.item?.trim() ? M.item(r.item) : null;
+      if (itemType && r.item?.trim() && !itemId) errors.push(`${ln}: item "${r.item}" was not found.${didYouMean(M.suggest('item', r.item))}`);
+      if (!itemType && r.item?.trim()) errors.push(`${ln}: deposits have no item lines — clear the Item column.`);
+      const accountId = r.account?.trim() ? M.account(r.account) : null;
+      if (r.account?.trim() && !accountId) errors.push(accountError(ln, r.account));
+      else if (!accountId && !(itemType && r.item?.trim())) errors.push(accountError(ln, r.account));
+      else if (accountId && bank && accountId === bank) {
+        errors.push(`${ln}: the account can't be the same as the ${t.startsWith('cc') ? 'credit card' : 'bank'} account.`);
+      }
+      const isItemLine = Boolean(r.item?.trim());
+
+      const amount = r.amount?.trim() ? normalizeAmount(r.amount) : null;
+      if (r.amount?.trim() && amount === null) errors.push(`${ln}: amount "${r.amount}" is not a number.`);
+      else if (subCent(amount)) errors.push(`${ln}: ${SUB_CENT}`);
+      else if (amount !== null && !Money.gt(amount, 0)) errors.push(`${ln}: amount must be greater than zero.`);
+      else if (amount === null && !isItemLine) errors.push(`${ln}: amount "${r.amount ?? ''}" is not a number.`);
+
+      let quantity: string | null = null;
+      let rate: string | null = null;
+      if (r.quantity?.trim() || r.rate?.trim()) {
+        if (!isItemLine) errors.push(`${ln}: Qty and Rate go with an item — choose the item, or clear them.`);
+      }
+      if (isItemLine) {
+        quantity = r.quantity?.trim() ? normalizeAmount(r.quantity) : '1';
+        if (quantity === null) errors.push(`${ln}: quantity "${r.quantity}" is not a number.`);
+        else if (!Money.gt(quantity, 0)) errors.push(`${ln}: quantity must be greater than zero.`);
+        else if (/\.\d{5,}$/.test(quantity)) errors.push(`${ln}: quantity can have at most 4 decimals.`);
+        rate = r.rate?.trim() ? normalizeAmount(r.rate) : null;
+        if (r.rate?.trim() && rate === null) errors.push(`${ln}: rate "${r.rate}" is not a number.`);
+        else if (rate !== null && Money.lt(rate, 0)) errors.push(`${ln}: rate can't be negative.`);
+        else if (rate !== null && /\.\d{6,}$/.test(rate)) errors.push(`${ln}: rate can have at most 5 decimals.`);
+        if (purchase && rate === null && amount === null) errors.push(`${ln}: enter the item's cost (Rate) or the Amount.`);
+        if (sales && rate === null && amount !== null && quantity !== null && Money.gt(quantity, 0)) {
+          // Amount without a rate: the rate is amount / quantity, when that is exact to 5 decimals.
+          const q = Money.of(quantity);
+          const per = Money.of(amount).div(q);
+          if (per.decimalPlaces() > 5 || !per.times(q).equals(Money.of(amount))) {
+            errors.push(`${ln}: ${amount} can't be split evenly over ${quantity} — enter the Rate.`);
+          } else rate = per.toFixed(Math.max(2, per.decimalPlaces()));
+        }
+        if (rate !== null && amount !== null && quantity !== null && !errors.length) {
+          const computed = Money.round2(Money.of(quantity).times(Money.of(rate)));
+          if (!computed.equals(Money.of(amount))) {
+            errors.push(`${ln}: Qty x Rate is ${computed.toFixed(2)}, not ${amount}. Fix one of them (or leave Amount blank).`);
+          }
+        }
+      }
+
+      const classId = r.className?.trim() && !classless ? M.className(r.className) : null;
+      if (r.className?.trim() && classless) {
+        errors.push(`${ln}: ${t === 'deposit' ? 'deposits' : 'credit memos'} don't keep a class on their lines — clear the Class column.`);
+      } else if (r.className?.trim() && !classId) {
+        errors.push(`${ln}: class "${r.className}" was not found.${didYouMean(M.suggest('class', r.className))}`);
+      }
+
+      const line: ResolvedBatchLine = {
+        accountId,
+        itemId,
+        quantity,
+        rate,
+        amount,
+        description: r.memo?.trim() || null,
+        classId,
+      };
+
+      if (purchase && r.customerJob?.trim()) {
+        const cj = M.customerJob(r.customerJob);
+        if (!cj) errors.push(`${ln}: Customer:Job "${r.customerJob}" was not found.${didYouMean(M.suggest('customer', r.customerJob.split(':')[0]))}`);
+        else if (cj.jobMissing) errors.push(`${ln}: job "${cj.jobMissing}" was not found for that customer.`);
+        else {
+          line.customerId = cj.customerId;
+          line.jobId = cj.jobId;
+        }
+      } else if (!purchase && r.customerJob?.trim()) {
+        errors.push(`${ln}: this type has no Customer:Job column on its lines.`);
+      }
+
+      if (sales) {
+        const tc = r.taxCode?.trim() ?? '';
+        if (tc) {
+          const yes = /^(y|yes|true|t|taxable)$/i.test(tc);
+          const no = /^(n|no|false|f|non|non-taxable|nontaxable)$/i.test(tc);
+          const codeId = M.taxCode(tc);
+          if (codeId) line.salesTaxCodeId = codeId;
+          else if (yes) line.taxable = true;
+          else if (no) line.taxable = false;
+          else errors.push(`${ln}: tax code "${tc}" was not found (use a Sales Tax Code such as Tax / Non, or Y / N).`);
+        } else if (!isItemLine) {
+          // A plain account line with no tax code is not taxed (as before items were added).
+          line.taxable = false;
+        }
+      } else if (r.taxCode?.trim() || r.taxItem?.trim()) {
+        errors.push(`${ln}: only invoices and credit memos have sales tax columns.`);
+      }
+
+      if (t === 'deposit') {
+        // QB "Received From": a name that is exactly one customer or vendor is kept as the line's
+        // name; anything else stays in the line's description, as before.
+        const name = r.name?.trim() ?? '';
+        const cust = name ? M.customer(name) : null;
+        const vend = name ? M.vendor(name) : null;
+        if (cust && !vend) Object.assign(line, { entityType: 'customer', entityId: cust });
+        else if (vend && !cust) Object.assign(line, { entityType: 'vendor', entityId: vend });
+        const ref = r.ref?.trim();
+        line.description =
+          [line.entityId ? null : name || null, r.memo?.trim() || null, ref ? `Chk No. ${ref}` : null].filter(Boolean).join(' — ') || null;
+      }
+      lines.push(line);
+    }
+
+    if (errors.length) {
+      jobs.push({ rows: g.idx, errors, warnings });
+      continue;
+    }
+    const memo = first.memo?.trim() || null;
+    const ref = first.ref?.trim() || null;
+    const firstClass = lines[0]?.classId ?? null;
     let doc: ResolvedBatchDoc;
     switch (t) {
       case 'check':
       case 'cc_charge':
       case 'cc_credit':
-        doc = {
-          kind: 'expense',
-          type: t,
-          date: date!,
-          vendorId,
-          payeeName: vendorId ? null : r.name!.trim(),
-          ref: r.ref?.trim() || null,
-          memo,
-          accountId: accountId!,
-          amount: amount!,
-          classId,
-        };
+        doc = { kind: 'expense', type: t, date: date!, vendorId, payeeName: vendorId ? null : first.name!.trim(), ref, memo, lines };
         break;
       case 'deposit':
-        doc = {
-          kind: 'deposit',
-          date: date!,
-          accountId: accountId!,
-          amount: amount!,
-          description: [r.name?.trim(), memo].filter(Boolean).join(' — ') || null,
-          memo,
-        };
+        doc = { kind: 'deposit', date: date!, memo, lines };
         break;
       case 'invoice':
       case 'credit_memo':
-        doc = { kind: t, customerId: customerId!, ref: r.ref?.trim() || null, date: date!, memo, accountId: accountId!, amount: amount!, classId };
+        doc = {
+          kind: t,
+          customerId: customerId!,
+          jobId,
+          ref,
+          date: date!,
+          memo,
+          classId: t === 'invoice' ? firstClass : null,
+          ...(taxRateId !== undefined ? { taxRateId } : {}),
+          lines,
+        };
         break;
       case 'bill':
-        doc = { kind: 'bill', vendorId: vendorId!, ref: r.ref?.trim() || null, date: date!, dueDate, memo, accountId: accountId!, amount: amount!, classId };
+        doc = { kind: 'bill', vendorId: vendorId!, ref, date: date!, dueDate, memo, classId: firstClass, lines };
         break;
-      case 'bill_credit':
-        doc = { kind: 'bill_credit', vendorId: vendorId!, ref: r.ref?.trim() || null, date: date!, memo, accountId: accountId!, amount: amount!, classId };
+      default:
+        doc = { kind: 'bill_credit', vendorId: vendorId!, ref, date: date!, memo, lines };
         break;
     }
-    jobs.push({ rows: [i], errors, warnings, doc });
-  });
+    jobs.push({ rows: g.idx, errors, warnings, doc });
+  }
   return jobs;
 }
 
