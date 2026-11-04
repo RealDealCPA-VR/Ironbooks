@@ -352,6 +352,38 @@ domTest('Ctrl+Alt+Y copies a line; Ctrl+Alt+V pastes it into a blank line, or ab
   await until(() => val('Item 1') === 'Widget' && val('Qty 1') === '2' && val('Item 2') === 'Widget', 'pasted above');
 });
 
+domTest('AltGr characters type in a line and a form (Hungarian AltGr+V "@", Polish AltGr+S "ś"); they never paste a line or Save & New', async () => {
+  let saved = 0;
+  await mount(
+    <>
+      <FormShortcuts />
+      <Modal open onClose={() => {}} title="Create Invoices" footer={<Button onClick={() => saved++}>Save &amp; New</Button>}>
+        <Lines />
+      </Modal>
+    </>,
+  );
+  await focusOn('Item 1');
+  await press('y', { ctrl: true, alt: true }); // a line on the clipboard: a paste would show
+  await focusOn('Item 2');
+  await press('@', { ctrl: true, alt: true, code: 'KeyV', text: '@' });
+  await press('ś', { ctrl: true, alt: true, code: 'KeyS', text: 'ś' });
+  await settle(80);
+  equal(val('Item 2'), '@ś', 'AltGr typed its characters');
+  equal(val('Qty 2'), '', 'no line pasted');
+  equal($$('[data-grid-row]').length, 2, 'no line inserted');
+  equal(saved, 0, 'no Save & New');
+  // The browser says AltGr is down (AltGraph): a Cyrillic letter typed with it pastes nothing either.
+  const ev = new KeyboardEvent('keydown', { key: 'ґ', code: 'KeyV', ctrlKey: true, altKey: true, modifierAltGraph: true, bubbles: true, cancelable: true });
+  $<HTMLInputElement>('[aria-label="Item 2"]')!.dispatchEvent(ev);
+  await settle(80);
+  check(!ev.defaultPrevented, 'AltGr left to type');
+  equal(val('Qty 2'), '', 'still no line pasted');
+  // Real Ctrl+Alt+V still pastes.
+  await focusOn('Qty 2');
+  await press('v', { ctrl: true, alt: true });
+  await until(() => $$('[data-grid-row]').length === 3, 'Ctrl+Alt+V pastes above the filled line');
+});
+
 // ---------------------------------------------------------------------------
 // QuickBooks' Tab order on a transaction form
 // ---------------------------------------------------------------------------

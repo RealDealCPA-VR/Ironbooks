@@ -157,7 +157,11 @@ const CHECKS: Record<string, () => void> = {
     expect(gridKeyAction(key('y', { ctrlKey: true, altKey: true }), { tag: 'INPUT', type: 'text' })).toBe('copy-line');
     dom(FORMS, 'Ctrl+Alt+Y copies a line; Ctrl+Alt+V pastes it into a blank line, or above a filled one')();
   },
-  'forms|Ctrl+Alt+V': () => expect(gridKeyAction(key('v', { ctrlKey: true, altKey: true }), { tag: 'INPUT', type: 'text' })).toBe('paste-line'),
+  'forms|Ctrl+Alt+V': () => {
+    expect(gridKeyAction(key('v', { ctrlKey: true, altKey: true }), { tag: 'INPUT', type: 'text' })).toBe('paste-line');
+    expect(gridKeyAction(key('@', { ctrlKey: true, altKey: true, code: 'KeyV' }), { tag: 'INPUT', type: 'text' })).toBeNull(); // AltGr "@"
+    dom(FORMS, 'AltGr characters type in a line and a form (Hungarian AltGr+V "@", Polish AltGr+S "ś"); they never paste a line or Save & New')();
+  },
   'forms|Up / Down': () => {
     expect(gridKeyAction(key('ArrowDown'), { tag: 'INPUT', type: 'text' })).toBe('next');
     expect(gridKeyAction(key('ArrowUp'), { tag: 'INPUT', type: 'text' })).toBe('prev');

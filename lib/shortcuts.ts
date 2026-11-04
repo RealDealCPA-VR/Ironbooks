@@ -714,9 +714,28 @@ export interface KeyLike {
   metaKey: boolean;
   altKey: boolean;
   shiftKey: boolean;
+  /** KeyboardEvent.getModifierState: 'AltGraph' says the right Alt is down as AltGr. */
+  getModifierState?: (key: string) => boolean;
 }
 
 const ctrlOrCmd = (e: KeyLike) => e.ctrlKey || e.metaKey;
+
+/**
+ * The press types an AltGr character, so it is never a Ctrl+Alt shortcut. Windows reports AltGr
+ * as Ctrl+Alt: Hungarian / Czech AltGr+V types "@", Polish AltGr+S "ś", German AltGr+E "€".
+ * True when the browser says AltGr is down and the key prints something other than a plain
+ * letter or digit, or when Ctrl+Alt prints a symbol or an accented Latin letter (the layout's
+ * AltGr level). A plain a-z letter is a real Ctrl+Alt+letter; a letter of a non-Latin script
+ * (Cyrillic, Greek, …) without AltGr is too — the physical key decides there.
+ */
+export function isAltGraphCharacter(e: KeyLike): boolean {
+  const altGr = e.getModifierState?.('AltGraph') === true;
+  if (!altGr && !(ctrlOrCmd(e) && e.altKey)) return false;
+  const chars = Array.from(e.key);
+  if (chars.length !== 1 || /^[a-z0-9]$/i.test(e.key) || /\p{C}/u.test(e.key)) return false;
+  if (altGr) return true;
+  return !(/\p{L}/u.test(e.key) && !/\p{Script=Latin}/u.test(e.key));
+}
 
 /** The a-z letter of a key press: the typed letter, else the physical key (AltGr / non-Latin layouts). */
 function letterOf(e: KeyLike): string | null {
@@ -799,6 +818,7 @@ export const FORM_ALT_KEYS: Readonly<Record<string, FormShortcutAction>> = {
 export function formShortcutFor(e: KeyLike): FormShortcutAction | null {
   const key = e.key.length === 1 ? e.key.toLowerCase() : e.key;
   const isS = key === 's' || e.code === 'KeyS';
+  if (isAltGraphCharacter(e)) return null; // AltGr types its character (Polish AltGr+S "ś")
   if (ctrlOrCmd(e) && e.altKey && !e.shiftKey && isS) return 'save-new';
   if (ctrlOrCmd(e) && !e.altKey && !e.shiftKey) {
     if (key === 'Enter') return 'save-new';
@@ -1040,6 +1060,7 @@ const ARROW_SKIP_TYPES = new Set(['date', 'datetime-local', 'month', 'week', 'ti
 export function gridKeyAction(e: KeyLike, cell: GridCell): GridKeyAction {
   const tag = cell.tag.toUpperCase();
   if (ctrlOrCmd(e) && e.altKey && !e.shiftKey) {
+    if (isAltGraphCharacter(e)) return null; // AltGr+V types "@" on a Hungarian keyboard
     const letter = letterOf(e);
     if (letter === 'y') return 'copy-line';
     if (letter === 'v') return 'paste-line';
