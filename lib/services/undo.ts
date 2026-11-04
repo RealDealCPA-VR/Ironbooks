@@ -34,7 +34,7 @@
  * inverse (closing date, reconciliation, ...) leaves the token usable, so the user can retry
  * with the closing-date password; two clicks can never undo twice.
  */
-import { and, desc, eq, gte, inArray, isNotNull, lt, sql } from 'drizzle-orm';
+import { and, desc, eq, gte, inArray, isNotNull, lt, ne, sql } from 'drizzle-orm';
 import {
   accounts,
   auditLogs,
@@ -260,6 +260,53 @@ function copyMessage(noun: string, before: Snap, created: Snap | null, numberKey
     ` with the same details. The voided ${noun}${oldNo ? ` ${oldNo}` : ''} stays in your records marked VOID.`
   );
 }
+
+/**
+ * Undo of a New Customer / New Vendor saved with an Opening Balance (salesar): void the opening
+ * invoice / credit memo (customer) or bill / vendor credit (vendor) the save posted, so A/R or A/P
+ * goes back with the name. Returns how many were voided.
+ */
+async function voidOpeningBalanceDocs(ctx: ServiceContext, side: 'customer' | 'vendor', id: string): Promise<number> {
+  const MEMO = 'Opening Balance';
+  let n = 0;
+  if (side === 'customer') {
+    const invs = await ctx.db
+      .select({ id: invoices.id })
+      .from(invoices)
+      .where(and(eq(invoices.companyId, ctx.companyId), eq(invoices.customerId, id), eq(invoices.memo, MEMO), ne(invoices.status, 'void')));
+    for (const r of invs) {
+      await voidInvoice(ctx, r.id);
+      n++;
+    }
+    const cms = await ctx.db
+      .select({ id: creditMemos.id })
+      .from(creditMemos)
+      .where(and(eq(creditMemos.companyId, ctx.companyId), eq(creditMemos.customerId, id), eq(creditMemos.memo, MEMO), ne(creditMemos.status, 'void')));
+    for (const r of cms) {
+      await voidCreditMemo(ctx, r.id);
+      n++;
+    }
+  } else {
+    const bs = await ctx.db
+      .select({ id: bills.id })
+      .from(bills)
+      .where(and(eq(bills.companyId, ctx.companyId), eq(bills.vendorId, id), eq(bills.memo, MEMO), ne(bills.status, 'void')));
+    for (const r of bs) {
+      await voidBill(ctx, r.id);
+      n++;
+    }
+    const vcs = await ctx.db
+      .select({ id: vendorCredits.id })
+      .from(vendorCredits)
+      .where(and(eq(vendorCredits.companyId, ctx.companyId), eq(vendorCredits.vendorId, id), eq(vendorCredits.memo, MEMO), ne(vendorCredits.status, 'void')));
+    for (const r of vcs) {
+      await voidVendorCredit(ctx, r.id);
+      n++;
+    }
+  }
+  return n;
+}
+const openingNote = (n: number) => (n ? ' Its opening balance was voided.' : '');
 
 // ---------------------------------------------------------------------------
 // Snapshot -> service input mappers
@@ -1100,8 +1147,9 @@ const ADAPTERS: Record<string, Adapter> = {
     snapshot: async (ctx, id) => toJson(await getCustomer(ctx, id)),
     describe: (s) => `customer “${s.displayName}”`,
     async undoCreate(ctx, id, snap) {
+      const voided = await voidOpeningBalanceDocs(ctx, 'customer', id);
       await deactivateCustomer(ctx, id);
-      return { message: `Undone: ${this.describe(snap)} was removed from your active customers (made inactive).` };
+      return { message: `Undone: ${this.describe(snap)} was removed from your active customers (made inactive).${openingNote(voided)}` };
     },
     async restore(ctx, id, before, now) {
       await updateCustomer(ctx, id, customerPatch(before));
@@ -1125,8 +1173,9 @@ const ADAPTERS: Record<string, Adapter> = {
     snapshot: async (ctx, id) => toJson(await loadVendorUnmasked(ctx, id)),
     describe: (s) => `vendor “${s.displayName}”`,
     async undoCreate(ctx, id, snap) {
+      const voided = await voidOpeningBalanceDocs(ctx, 'vendor', id);
       await deactivateVendor(ctx, id);
-      return { message: `Undone: ${this.describe(snap)} was removed from your active vendors (made inactive).` };
+      return { message: `Undone: ${this.describe(snap)} was removed from your active vendors (made inactive).${openingNote(voided)}` };
     },
     async restore(ctx, id, before, now) {
       await updateVendor(ctx, id, vendorPatch(before));
