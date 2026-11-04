@@ -172,7 +172,7 @@ describe('upgrade: roles stored before activities keep exactly the same access',
       }
     }
     expect(diffs.slice(0, 20)).toEqual([]);
-  });
+  }, 300_000); // every role x every route: slow on CI runners
 
   it('every page answers the same as the old area check', () => {
     const diffs: string[] = [];
