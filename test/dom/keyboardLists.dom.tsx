@@ -336,6 +336,10 @@ domTest('the window keys: Ctrl+F4 closes the open form; Ctrl+Tab / Ctrl+Shift+Ta
   equal(pushes()[0], '/customers', 'the first open window');
   await press('Tab', { ctrl: true, shift: true });
   await until(() => pushes().length === 2, 'Ctrl+Shift+Tab');
+  equal(pushes()[1], '/invoices', 'Ctrl+Shift+Tab: the previous open window (this one is last in the list)');
+  await press('F6', { ctrl: true, shift: true });
+  await until(() => pushes().length === 3, 'Ctrl+Shift+F6');
+  equal(pushes()[2], '/invoices', 'Ctrl+Shift+F6 too');
   window.sessionStorage.removeItem('ironbooks.openWindows');
 });
 

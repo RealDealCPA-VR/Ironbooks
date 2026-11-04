@@ -60,8 +60,13 @@ const CHECKS: Record<string, () => void> = {
     expect(formShortcutFor(key('Escape'))).toBe('cancel');
     dom(FORMS, 'Esc on a changed form asks; No closes without saving, Yes records, Cancel stays')();
     dom(SHELL, 'Esc with nothing open or selected closes the window (back to the one before it)')();
+    dom(SHELL, 'the real app shell: All menus from the first paint; Esc and Ctrl+F4 close the window beside its sidebar')();
   },
-  'navigate|Ctrl+F4': () => expect(global(ctrl('F4'))).toBe('close-window'),
+  'navigate|Ctrl+F4': () => {
+    expect(global(ctrl('F4'))).toBe('close-window');
+    dom(LISTS, 'the window keys: Ctrl+F4 closes the open form; Ctrl+Tab / Ctrl+Shift+Tab move between open windows')();
+    dom(SHELL, 'the real app shell: All menus from the first paint; Esc and Ctrl+F4 close the window beside its sidebar')();
+  },
   'navigate|Ctrl+Tab / Ctrl+F6': () => {
     expect(global(ctrl('Tab'))).toBe('next-window');
     expect(global(ctrl('F6'))).toBe('next-window');
@@ -70,6 +75,7 @@ const CHECKS: Record<string, () => void> = {
   'navigate|Ctrl+Shift+Tab / Ctrl+Shift+F6': () => {
     expect(global(ctrl('Tab', { shiftKey: true }))).toBe('prev-window');
     expect(global(ctrl('F6', { shiftKey: true }))).toBe('prev-window');
+    dom(LISTS, 'the window keys: Ctrl+F4 closes the open form; Ctrl+Tab / Ctrl+Shift+Tab move between open windows')();
   },
   'navigate|F2 / Ctrl+1': () => {
     expect(global(key('F2'))).toBe('product-info');
@@ -106,13 +112,19 @@ const CHECKS: Record<string, () => void> = {
     expect(global(ctrl('x'), true)).toBeNull();
   },
   'data-fields|Home / End': () => expect(listKeyAction(key('Home'))).toBe('home'), // in a field the list keys are not used
-  'data-fields|Del / Backspace': () => expect(global(key('Delete'), true)).toBeNull(),
-  'data-fields|Home Home / End End': () => {
-    const src = fs.readFileSync(path.resolve(process.cwd(), 'components/KeyboardBase.tsx'), 'utf8');
-    expect(src).toContain('Home Home / End End');
+  'data-fields|Del / Backspace': () => {
+    expect(global(key('Delete'), true)).toBeNull();
+    dom(FORMS, 'the field keys stay with the field: Space ticks a checkbox, Del / Backspace delete, Ctrl+Left / Ctrl+Right move a word')();
   },
-  'data-fields|Ctrl+Left / Ctrl+Right': () => expect(global(ctrl('ArrowLeft'), true)).toBeNull(),
-  'data-fields|Space': () => expect(global(key(' '), false)).toBeNull(),
+  'data-fields|Home Home / End End': dom(FORMS, 'Home Home / End End go to the first / last field of the form; one Home stays in the field'),
+  'data-fields|Ctrl+Left / Ctrl+Right': () => {
+    expect(global(ctrl('ArrowLeft'), true)).toBeNull();
+    dom(FORMS, 'the field keys stay with the field: Space ticks a checkbox, Del / Backspace delete, Ctrl+Left / Ctrl+Right move a word')();
+  },
+  'data-fields|Space': () => {
+    expect(global(key(' '), false)).toBeNull();
+    dom(FORMS, 'the field keys stay with the field: Space ticks a checkbox, Del / Backspace delete, Ctrl+Left / Ctrl+Right move a word')();
+  },
   'data-fields|abc, then Tab': dom(LISTS, 'a picker: typing finds the name, Tab takes it (QuickFill); Ctrl+U takes the highlighted entry'),
 
   // ---- Date fields ----

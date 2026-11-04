@@ -311,6 +311,61 @@ domTest('Esc on a changed page form (Write Checks) asks before its Cancel', asyn
   equal(pressed.join(','), 'cancel', 'nothing saved');
 });
 
+domTest('Home Home / End End go to the first / last field of the form; one Home stays in the field', async () => {
+  await mount(
+    <>
+      <KeyboardBase />
+      <FormShortcuts />
+      <Modal open onClose={() => {}} title="Enter Bills" footer={<Button>Save &amp; Close</Button>}>
+        <Input aria-label="Vendor" />
+        <Input aria-label="Ref. No." />
+        <Input aria-label="Memo" />
+      </Modal>
+    </>,
+  );
+  await focusOn('Ref. No.');
+  await typeText('12345');
+  await press('Home');
+  equal(focusedLabel(), 'Ref. No.', 'one Home: the start of this field');
+  equal($<HTMLInputElement>('[aria-label="Ref. No."]')!.selectionStart, 0, 'the cursor at its start');
+  await press('Home');
+  equal(focusedLabel(), 'Vendor', 'Home Home: the first field');
+  await press('End');
+  await press('End');
+  equal(focusedLabel(), 'Memo', 'End End: the last field');
+});
+
+domTest('the field keys stay with the field: Space ticks a checkbox, Del / Backspace delete, Ctrl+Left / Ctrl+Right move a word', async () => {
+  await mount(
+    <>
+      <KeyboardBase />
+      <FormShortcuts />
+      <main>
+        <div data-shortcut-scope="">
+          <Input aria-label="Memo" />
+          <input type="checkbox" aria-label="Pay this bill" />
+        </div>
+      </main>
+    </>,
+  );
+  await focusOn('Memo');
+  await typeText('rent for march');
+  const memo = $<HTMLInputElement>('[aria-label="Memo"]')!;
+  await press('ArrowLeft', { ctrl: true });
+  equal(memo.selectionStart, 9, 'Ctrl+Left: the start of the last word');
+  await press('Delete');
+  equal(memo.value, 'rent for arch', 'Del deletes forward');
+  await press('Backspace');
+  equal(memo.value, 'rent forarch', 'Backspace deletes back');
+  await press('ArrowRight', { ctrl: true });
+  equal(memo.selectionStart, memo.value.length, 'Ctrl+Right: the end of the word');
+  await focusOn('Pay this bill');
+  await press(' ');
+  check($<HTMLInputElement>('[aria-label="Pay this bill"]')!.checked, 'Space ticks it');
+  await press(' ');
+  check(!$<HTMLInputElement>('[aria-label="Pay this bill"]')!.checked, 'and unticks it');
+});
+
 // ---------------------------------------------------------------------------
 // Ctrl+Alt+Y / Ctrl+Alt+V: copy and paste a transaction line
 // ---------------------------------------------------------------------------
