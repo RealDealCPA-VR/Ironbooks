@@ -52,6 +52,7 @@ import { postJournalEntry, voidJournalEntry } from '@/lib/services/posting';
 import { createBill } from '@/lib/services/bills';
 import {
   claimReceiptQuantities,
+  poLineDimsByItem,
   releaseReceiptQuantities,
 } from '@/lib/services/purchaseOrders';
 import {
@@ -854,6 +855,9 @@ async function saveItemReceipt(
       .returning();
 
     // --- Post Dr Inventory/Expense (per line) / Cr 2050 accrual (total) ---
+    // Against a P.O.: each line takes its P.O. line's Class (P&L by Class), as QB Receive Items does.
+    const poDims = await poLineDimsByItem(tx, [input.purchaseOrderId]);
+    const dimsOf = (itemId: string) => (input.purchaseOrderId ? poDims.get(`${input.purchaseOrderId}|${itemId}`) : undefined);
     const entry = await postJournalEntry(tx, {
       date: input.date,
       description: `Item receipt ${input.reference ? `#${input.reference}` : receipt.id} - ${vendor.name}`,
@@ -867,6 +871,7 @@ async function saveItemReceipt(
             accountId: l.accountId,
             debit: l.amount,
             memo: l.description,
+            ...(dimsOf(l.itemId)?.classId ? { classId: dimsOf(l.itemId)!.classId } : {}),
           })),
         {
           accountId: accrualAccountId,
@@ -1059,6 +1064,8 @@ export async function convertToBill(
       .where(and(eq(items.companyId, tx.companyId), inArray(items.id, itemIds)));
     const nameById = new Map(itemRows.map((r) => [r.id, r.name]));
 
+    // The P.O. line's Customer:Job and Class carry onto the bill (billable to the customer).
+    const poDims = await poLineDimsByItem(tx, [receipt.purchaseOrderId]);
     // Bill lines all debit the accrual: Dr 2050 / Cr 2000 A/P. No itemId on the
     // lines: stock was already received by the receipt (and voidBill must not
     // reverse stock for these lines).
@@ -1077,6 +1084,7 @@ export async function convertToBill(
         description: `${nameById.get(l.itemId) ?? 'Item'} - received ${Money.of(l.quantity).toFixed(4)} @ ${Money.of(l.unitCost).toFixed(4)}${l.description ? ` (${l.description})` : ''}`,
         quantity: l.quantity,
         amount: l.amount,
+        ...(receipt.purchaseOrderId ? poDims.get(`${receipt.purchaseOrderId}|${l.itemId}`) ?? {} : {}),
       })),
     });
 

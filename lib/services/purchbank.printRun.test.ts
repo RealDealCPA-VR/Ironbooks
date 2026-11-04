@@ -10,7 +10,7 @@
  */
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { eq } from 'drizzle-orm';
-import { expenses, journalEntries, billPayments } from '@/lib/db/schema';
+import { expenses, journalEntries, journalEntryLines, billPayments } from '@/lib/db/schema';
 import { ServiceError, type ServiceContext } from './_base';
 import { makeTestCompany, type TestCompany } from './testkit.prefs';
 import { postJournalEntry } from './posting';
@@ -19,7 +19,7 @@ import { createExpense } from './expenses';
 import { createBill } from './bills';
 import { payBills } from './billPayments';
 import { setClosingDate } from './company';
-import { confirmPrintRun, listPrintQueue, markPrinted, preparePrintRun, requeueForReprint } from './printQueue';
+import { checkPrintData, confirmPrintRun, listPrintQueue, markPrinted, preparePrintRun, requeueForReprint } from './printQueue';
 import { builtinRole, unionRoles } from '@/lib/permissions/model';
 
 let t: TestCompany;
@@ -254,6 +254,44 @@ describe('reprint a check that was already printed', () => {
     expect((await refusal(requeueForReprint(noPayroll, { source: 'paycheck', id: '00000000-0000-4000-8000-000000000000' }))).code).toBe(
       'FORBIDDEN',
     );
+  });
+});
+
+describe('post-merge fixes', () => {
+  /** Memos of the bill payment's bank line (the register / reports Memo column). */
+  async function bankMemo(billPaymentId: string) {
+    const [bp] = await t.ctx.db.select().from(billPayments).where(eq(billPayments.id, billPaymentId));
+    const lines = await t.ctx.db.select().from(journalEntryLines).where(eq(journalEntryLines.journalEntryId, bp.postedEntryId!));
+    return lines.find((l) => l.accountId === t.acct['1000'])?.memo;
+  }
+
+  it('a printed bill-payment check: the bank line memo names the printed number, then the reprint number', async () => {
+    const bill = await createBill(t.ctx, { vendorId, date: D('2026-03-01'), lines: [{ accountId: t.acct['6300'], amount: '40.00' }] } as never);
+    const bp = await payBills(t.ctx, {
+      vendorId,
+      date: D('2026-03-12'),
+      method: 'check',
+      toPrint: true,
+      paymentAccountId: t.acct['1000'],
+      applications: [{ billId: bill.id, amountApplied: '40.00' }],
+    } as never);
+    expect(await bankMemo(bp.id)).toBe('Bill payment — ref: n/a');
+    await confirmPrintRun(t.ctx, { items: [{ source: 'bill_payment', id: bp.id, checkNumber: '9401' }] });
+    expect(await bankMemo(bp.id)).toBe('Bill payment — ref: 9401');
+    await requeueForReprint(t.ctx, { source: 'bill_payment', id: bp.id });
+    expect(await bankMemo(bp.id)).toBe('Bill payment — ref: n/a');
+    await confirmPrintRun(t.ctx, { items: [{ source: 'bill_payment', id: bp.id, checkNumber: '9405' }] });
+    expect(await bankMemo(bp.id)).toBe('Bill payment — ref: 9405');
+  });
+
+  it('a banking-only user cannot print a paycheck PDF or mark one printed (payroll permission)', async () => {
+    const noPayroll: ServiceContext = { ...t.ctx, access: unionRoles([builtinRole('banking')!]) };
+    const someId = '00000000-0000-4000-8000-000000000000';
+    expect((await refusal(checkPrintData(noPayroll, 'paycheck', someId))).code).toBe('FORBIDDEN');
+    expect((await refusal(markPrinted(noPayroll, { source: 'paycheck', id: someId, checkNumber: '9501' }))).code).toBe('FORBIDDEN');
+    // Ordinary checks still print for them.
+    const a = await queuedCheck('25.00');
+    expect((await checkPrintData(noPayroll, 'expense', a.id)).amount).toBeTruthy();
   });
 });
 

@@ -14,6 +14,7 @@ import { getDb, closeDb, type DB } from '@/lib/db';
 import {
   accountantCopies,
   accounts,
+  customers,
   journalEntries,
   journalEntryLines,
   reconciliationChanges,
@@ -30,6 +31,9 @@ import { createDeposit, updateDeposit } from './deposits';
 import { createTransfer, updateTransfer } from './transfers';
 import { createManualEntry, updateEntry } from './journal';
 import { createBankAccount } from './bankAccounts';
+import { createAccount } from './accounts';
+import { createSalesReceipt, updateSalesReceipt } from './salesReceipts';
+import { receivePayment, updatePayment } from './payments';
 import {
   completeReconciliation,
   getReconcileInfo,
@@ -348,6 +352,85 @@ describe('other reconciled transactions', () => {
     expect(rows[0].journalEntryId).toBe(replaced.id);
     const [old] = await db.select({ status: journalEntries.status }).from(journalEntries).where(eq(journalEntries.id, je.id));
     expect(old.status).toBe('void');
+  });
+});
+
+describe('post-merge fixes: more reconciled transactions', () => {
+  it("sales receipt deposited straight to the bank: QB's warning, then saved and still reconciled", async () => {
+    const input = (rate: number, memo?: string) => ({
+      date: d('2026-03-04'),
+      depositAccountId: acct['1000'],
+      memo,
+      lines: [{ accountId: acct['4000'], description: 'Counter sale', quantity: 1, rate }],
+    });
+    const sr = await createSalesReceipt(ctx, input(250));
+    const { bank } = await reconcileAll(acct['1000'], '250.00');
+    // A memo-only change keeps the bank line: no question, still reconciled, nothing listed.
+    await updateSalesReceipt(ctx, sr.id, input(250, 'memo only'));
+    expect(await reconciliationDiscrepancies(ctx, bank.id)).toHaveLength(0);
+    // The amount: QB's warning (it used to be refused with "Undo the reconciliation first").
+    const err = await refusal(updateSalesReceipt(ctx, sr.id, input(275)));
+    expect(err.code).toBe('CONFLICT');
+    expect(err.message).toMatch(/sales receipt has been reconciled/);
+    expect((err.details as { reconciledEdit?: boolean }).reconciledEdit).toBe(true);
+    await updateSalesReceipt(ctx, sr.id, { ...input(275), allowReconciledEdit: true } as never);
+    const rows = await reconciliationDiscrepancies(ctx, bank.id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ changeType: 'amount', reconciledAmount: '250.00', newAmount: '275.00', amount: '25.00' });
+    expect((await getReconcileInfo(ctx, bank.id)).discrepancy).toBe('-25.00');
+  });
+
+  it("customer payment deposited straight to the bank: QB's warning, then saved and still reconciled", async () => {
+    const [c] = await db.insert(customers).values({ companyId: ctx.companyId, displayName: `Walk-in ${seq}` }).returning();
+    const input = (amount: string, reference = 'CHK-1') => ({
+      customerId: c.id,
+      date: d('2026-03-06'),
+      method: 'check' as const,
+      reference,
+      amount,
+      depositAccountId: acct['1000'],
+      applications: [],
+    });
+    const { payment: pay } = await receivePayment(ctx, input('120.00'));
+    const { bank } = await reconcileAll(acct['1000'], '120.00');
+    await updatePayment(ctx, pay.id, input('120.00', 'CHK-2'));
+    expect(await reconciliationDiscrepancies(ctx, bank.id)).toHaveLength(0);
+    const err = await refusal(updatePayment(ctx, pay.id, input('100.00')));
+    expect(err.message).toMatch(/payment has been reconciled/);
+    await updatePayment(ctx, pay.id, { ...input('100.00'), allowReconciledEdit: true } as never);
+    expect((await reconciliationDiscrepancies(ctx, bank.id))[0]).toMatchObject({ changeType: 'amount', reconciledAmount: '120.00', amount: '-20.00' });
+  });
+
+  it('bill payment re-applied to other bills with the same total: no question (the bank line is unchanged)', async () => {
+    await fund();
+    const [v] = await db.insert(vendors).values({ companyId: ctx.companyId, displayName: `Supplier ${seq}` }).returning();
+    const b1 = await createBill(ctx, { vendorId: v.id, date: d('2026-03-02'), lines: [{ accountId: acct['6300'], amount: '300.00' }] });
+    const b2 = await createBill(ctx, { vendorId: v.id, date: d('2026-03-02'), lines: [{ accountId: acct['6300'], amount: '300.00' }] });
+    const base = { vendorId: v.id, date: d('2026-03-12'), method: 'check' as const, reference: '2002', paymentAccountId: acct['1000'] };
+    const pay = await payBills(ctx, { ...base, applications: [{ billId: b1.id, amountApplied: '300.00' }] });
+    const { bank } = await reconcileAll(acct['1000'], '4700.00');
+    await updateBillPayment(ctx, pay.id, { ...base, applications: [{ billId: b2.id, amountApplied: '300.00' }] });
+    expect(await reconciliationDiscrepancies(ctx, bank.id)).toHaveLength(0);
+    // Still reconciled: the next reconciliation starts with no discrepancy.
+    expect((await getReconcileInfo(ctx, bank.id)).discrepancy).toBe('0.00');
+  });
+
+  it('a voided reconciled transaction: Effect of Change is minus the reconciled amount (as for changed rows)', async () => {
+    await fund();
+    const chk = await writeCheck('200.00');
+    const { bank } = await reconcileAll(acct['1000'], '4800.00');
+    // Legacy data (voided before the posting guard): mark the check's entry void directly.
+    const [e] = await db.select().from(journalEntries).where(eq(journalEntries.id, chk.postedEntryId!));
+    await db.update(journalEntries).set({ status: 'void', voidedAt: new Date() }).where(eq(journalEntries.id, e.id));
+    const rows = await reconciliationDiscrepancies(ctx, bank.id);
+    expect(rows[0]).toMatchObject({ changeType: 'void', reconciledAmount: '-200.00', newAmount: '0.00', amount: '200.00' });
+  });
+
+  it('Reconcile info for a linked loan: a liability (amounts with the liability sign), not a credit card', async () => {
+    const loan = await createAccount(ctx, { code: '2610', name: 'Truck Loan', type: 'liability' as never, subtype: 'long_term_liability' });
+    const bank = await createBankAccount(ctx, { accountId: loan.id, bankName: 'Lender', accountNumber: `L-${seq}` });
+    const info = await getReconcileInfo(ctx, bank.id);
+    expect(info).toMatchObject({ isLiability: true, isCreditCard: false, glType: 'liability' });
   });
 });
 

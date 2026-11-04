@@ -377,7 +377,10 @@ describe('Reconciliation completion features (end-to-end)', () => {
         const all = await reconciliationDiscrepancies(tctx);
         expect(all.length).toBe(1);
         expect(all[0].description).toBe('January rent');
-        expect(all[0].amount).toBe('-800.00');
+        // Reconciled at −800.00; voiding it changed the reconciled balance by +800.00 (QB's
+        // "Effect of Change", the same sign rule as a changed transaction's row).
+        expect(all[0].reconciledAmount).toBe('-800.00');
+        expect(all[0].amount).toBe('800.00');
         expect(all[0].bankName).toBe('First National');
         expect(all[0].voidedAt).not.toBeNull();
 

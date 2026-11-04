@@ -293,18 +293,22 @@ export async function billTermsFor(
   const typed = input.terms?.trim() || null;
   let row: TermsRow | null = null;
   let label: string | null = null;
-  const keptEntry =
-    typed && existing?.termsId && existing.terms && existing.terms.trim().toLowerCase() === typed.toLowerCase()
-      ? (
-          await ctx.db
-            .select()
-            .from(paymentTerms)
-            .where(and(eq(paymentTerms.companyId, ctx.companyId), eq(paymentTerms.id, existing.termsId)))
-        )[0]
-      : undefined;
+  // The label the bill was saved with (an edit), else the vendor's own terms text (a new bill:
+  // the Bills page sends the vendor's terms as it shows them), names the entry it was linked to.
+  const sameLabel = (saved: string | null | undefined) =>
+    !!typed && !!saved && saved.trim().toLowerCase() === typed.toLowerCase();
+  const keptId = existing?.termsId && sameLabel(existing.terms) ? existing.termsId : vendor.termsId && sameLabel(vendor.terms) ? vendor.termsId : null;
+  const keptEntry = keptId
+    ? (
+        await ctx.db
+          .select()
+          .from(paymentTerms)
+          .where(and(eq(paymentTerms.companyId, ctx.companyId), eq(paymentTerms.id, keptId)))
+      )[0]
+    : undefined;
   if (keptEntry) {
-    // The bill's own entry, renamed since (the form sends the label the bill was saved with): it
-    // keeps giving the due date and the Pay Bills discount, under its current name.
+    // The bill's (or vendor's) own entry, renamed since (the form sends the label it was saved
+    // with): it keeps giving the due date and the Pay Bills discount, under its current name.
     row = keptEntry;
     label = termsLabel(keptEntry);
   } else if (typed) {

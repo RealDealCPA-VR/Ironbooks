@@ -78,7 +78,8 @@ import {
   writeAudit,
 } from './_base';
 import { markExpensePrinted } from './expenses';
-import { markBillPaymentPrinted } from './billPayments';
+import { billPaymentMemoRename, markBillPaymentPrinted } from './billPayments';
+import { renameLineMemos } from './entryLineMemos';
 import { type CheckNumberUse, allocateCheckNumber, findDuplicateCheckNumbers } from './checkNumbers';
 import { markPaymentCheckPrinted } from './liabilityPayments';
 import { assertClosedPeriodEdit } from './postedEdit';
@@ -418,6 +419,8 @@ export async function markPrinted(
   ctx: ServiceContext,
   input: { source: PrintSource; id: string; checkNumber?: string; allowDuplicateNumber?: boolean },
 ) {
+  // A paycheck's number is payroll's to record (POST /api/print-queue, a print run).
+  assertMayPrintSources(ctx, [input.source]);
   switch (input.source) {
     case 'expense':
       return markExpensePrinted(ctx, {
@@ -720,6 +723,8 @@ export async function requeueForReprint(
         .update(journalEntries)
         .set({ reference: null, updatedAt: new Date() })
         .where(and(eq(journalEntries.id, s.postedEntryId), eq(journalEntries.companyId, tx.companyId)));
+      // A bill payment's bank line memo names the check number: it no longer has one.
+      if (s.source === 'bill_payment') await renameLineMemos(tx, s.postedEntryId, [billPaymentMemoRename(s.number, null)]);
     }
     await writeAudit(tx, {
       action: 'update',
@@ -826,6 +831,8 @@ export async function checkPrintData(
   // another user while it sat in the print queue, or a stale Reprint) or that is not a check at
   // all (a credit card charge, a cash expense, an ACH bill payment) — the PDF used to come out as
   // a signed-ready check for the full original amount.
+  // A paycheck and its voucher (pay detail) print only for users who may print payroll.
+  assertMayPrintSources(ctx, [source]);
   const voided = () => new ServiceError('CONFLICT', 'This check is void, so it cannot be printed.');
   if (source === 'expense') {
     const [row] = await ctx.db

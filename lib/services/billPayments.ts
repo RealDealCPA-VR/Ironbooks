@@ -57,7 +57,7 @@ import { getOrCreateExchangeGainLossAccount, resolveDocumentCurrency } from './c
 import { effectiveHomeCurrency } from './multiCurrency';
 import { foreignCode } from './fxLines';
 import { assertClosedPeriodEdit } from './postedEdit';
-import { carryReconciledLines, prepareReconciledRepost } from './reconciledEdits';
+import { armReconciledRepost, confirmReconciledRepost } from './reconciledEdits';
 import { assertPeriodOpen } from './fiscalPeriods';
 import { applyToBill } from './vendorCredits';
 import { vendorCreditHomeOnBill } from './vendorCreditsFx';
@@ -851,20 +851,13 @@ export async function updateBillPayment(ctx: ServiceContext, id: string, input: 
           .where(and(eq(journalEntries.id, entryId), eq(journalEntries.companyId, tx.companyId)));
         // The bank line's memo names the check number (buildPaymentLines): keep it in step, or the
         // register / reports Memo column still shows the old number.
-        await renameLineMemos(tx, entryId, [
-          { from: `Bill payment — ref: ${cur.reference ?? 'n/a'}`, to: `Bill payment — ref: ${reference ?? 'n/a'}` },
-        ]);
+        await renameLineMemos(tx, entryId, [billPaymentMemoRename(cur.reference, reference)]);
       }
     } else {
-      // A reconciled payment: QB's warning, then (once the user confirms) it is re-posted and stays
-      // reconciled at its new amount. The new posting is only known after the bills are rolled
-      // back, so any such change asks first (no lines are compared).
-      await prepareReconciledRepost(tx, {
-        entryId: cur.postedEntryId,
-        lines: [],
-        what: 'bill payment',
-        allowReconciledEdit: input.allowReconciledEdit,
-      });
+      // A reconciled payment: re-posted and kept reconciled. The new posting is only known after
+      // the bills are rolled back, so QB's warning comes once it is posted (confirmReconciledRepost):
+      // re-applying the same total to other bills keeps the bank line and asks nothing.
+      await armReconciledRepost(tx, { entryId: cur.postedEntryId, what: 'bill payment' });
       if (cur.postedEntryId) await voidJournalEntry(tx, cur.postedEntryId);
       await rollbackApplications(tx, id);
       await reverseJournalApplicationsForBillPayment(tx, id);
@@ -879,7 +872,12 @@ export async function updateBillPayment(ctx: ServiceContext, id: string, input: 
         lines: buildPaymentLines(prep, input, reference),
       });
       entryId = entry.id;
-      await carryReconciledLines(tx, { oldEntryId: cur.postedEntryId, newEntryId: entry.id });
+      await confirmReconciledRepost(tx, {
+        oldEntryId: cur.postedEntryId,
+        newEntryId: entry.id,
+        what: 'bill payment',
+        allowReconciledEdit: input.allowReconciledEdit,
+      });
       await tx.db
         .update(billPayments)
         .set({
@@ -935,6 +933,14 @@ export async function updateBillPayment(ctx: ServiceContext, id: string, input: 
 // ---------------------------------------------------------------------------
 
 /** Stamp a printed bill-payment check: assign its number and clear the print flag. */
+/**
+ * The bank line memo of a bill payment names its check number (buildPaymentLines): the rename to
+ * apply when the number changes without a re-post (an edit of the number, Print Checks, Reprint).
+ */
+export function billPaymentMemoRename(from: string | null | undefined, to: string | null | undefined) {
+  return { from: `Bill payment — ref: ${from ?? 'n/a'}`, to: `Bill payment — ref: ${to ?? 'n/a'}` };
+}
+
 export async function markBillPaymentPrinted(
   ctx: ServiceContext,
   input: { billPaymentId: string; checkNumber?: string; allowDuplicateNumber?: boolean },
@@ -976,6 +982,8 @@ async function markBillPaymentPrintedInTx(
         .update(journalEntries)
         .set({ reference: checkNumber, updatedAt: new Date() })
         .where(and(eq(journalEntries.id, payment.postedEntryId), eq(journalEntries.companyId, tx.companyId)));
+      // The bank line's memo names the check number (buildPaymentLines): the printed number too.
+      await renameLineMemos(tx, payment.postedEntryId, [billPaymentMemoRename(payment.reference, checkNumber)]);
     }
     await writeAudit(tx, {
       action: 'update',

@@ -293,6 +293,25 @@ describe('what-if scenarios', () => {
     expect((await refusal(whatIfLoan(ctx, loan.id, { balloonAmount: '25000.00' }))).message).toMatch(/less than the balance owed/);
   });
 
+  it('a payment that does not cover the interest: the loan never pays off, so no saving is shown', async () => {
+    await recordInAccount('20000.00');
+    const loan = await createLoan(ctx, base());
+    // 20,000.00 at 6%: 100.00 interest a month. A payment of 50.00 never pays the loan down.
+    const low = await refusal(whatIfLoan(ctx, loan.id, { paymentAmount: '50.00' }));
+    expect(low.code).toBe('VALIDATION');
+    expect(low.message).toMatch(/does not cover the interest \(100\.00 a payment\), so the loan would never be paid off/);
+    // Exactly the interest pays nothing down either; with extra principal on top it does.
+    expect((await refusal(whatIfLoan(ctx, loan.id, { paymentAmount: '100.00' }))).message).toMatch(/never be paid off/);
+    const withExtra = await whatIfLoan(ctx, loan.id, { paymentAmount: '100.00', extraPrincipal: '500.00' });
+    expect(withExtra.scenario.schedule.at(-1)!.balance).toBe('0.00');
+    // A higher rate with the payment kept: 30% on 20,000.00 is 500.00 a month.
+    expect((await refusal(whatIfLoan(ctx, loan.id, { annualRate: '30', paymentAmount: '450.00' }))).message).toMatch(/never be paid off/);
+    // A new loan with the lender's payment below the interest.
+    expect(() =>
+      evaluateLoan({ originalAmount: '20000', annualRate: '6', termMonths: 36, originDate: d('2026-01-15'), firstPaymentDate: d('2026-02-15'), paymentAmount: '50.00' }),
+    ).toThrow(/never be paid off/);
+  });
+
   it('a new loan: payment, total interest and payoff date', () => {
     const r = evaluateLoan({ originalAmount: '20000', annualRate: '6', termMonths: 36, originDate: d('2026-01-15'), firstPaymentDate: d('2026-02-15') });
     expect(r.payment).toBe(periodicPayment('20000', '6', 36, 12).toFixed(2));

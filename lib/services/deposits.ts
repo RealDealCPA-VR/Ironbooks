@@ -1425,7 +1425,14 @@ export async function removePaymentFromDeposit(
         amount: toAmountString(Money.of(l.amount).abs()),
       };
     } else if (l.accountId) {
-      extraLines.push({ accountId: l.accountId, amount: l.amount, description: l.description });
+      extraLines.push({
+        accountId: l.accountId,
+        amount: l.amount,
+        description: l.description,
+        // The Received From name stays on the line (it is re-saved with the rest of the deposit).
+        entityType: (l.entityType ?? null) as ExtraDepositLineInput['entityType'],
+        entityId: l.entityId ?? null,
+      });
     } else {
       throw new ServiceError(
         'CONFLICT',

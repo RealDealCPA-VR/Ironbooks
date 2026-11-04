@@ -58,7 +58,7 @@ interface NameOption {
 const NAME_HINTS: Record<NameType, string> = { vendor: 'Vendor', customer: 'Customer', employee: 'Employee', other: 'Other' };
 
 /** Every name list the user may read (a list hidden by permissions is simply left out). */
-async function loadNames(): Promise<NameOption[]> {
+export async function loadNames(): Promise<NameOption[]> {
   const get = <T,>(url: string) => api.get<T>(url).catch(() => null);
   const [vendors, customers, employees, others] = await Promise.all([
     get<Array<{ id: string; displayName: string; isActive?: boolean }>>('/api/vendors'),

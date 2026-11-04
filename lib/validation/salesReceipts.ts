@@ -28,6 +28,8 @@ export const createSalesReceiptSchema = z.object({
   /** Typed document number (e.g. "INV-1001"); blank = next number. */
   refNumber: zDocNumber,
   allowDuplicateNumber: z.boolean().nullish(),
+  /** Edits: QB's "this transaction has been reconciled" warning confirmed. */
+  allowReconciledEdit: z.boolean().nullish(),
   date: zDate,
   taxRateId: zUuid.nullish(),
   depositAccountId: zUuid.nullish(),
