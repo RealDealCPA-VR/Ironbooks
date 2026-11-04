@@ -61,9 +61,9 @@ import { voidVendorCredit } from '../vendorCredits';
 import { voidPaycheck } from '../payroll';
 import { voidTransfer } from '../transfers';
 import { voidItemReceipt } from '../itemReceipts';
-import { createEstimate, deleteEstimate, voidEstimate } from '../estimates';
-import { createSalesOrder, deleteSalesOrder, voidSalesOrder } from '../salesOrders';
-import { createPurchaseOrder, deletePurchaseOrder, voidPurchaseOrder } from '../purchaseOrders';
+import { createEstimate, deleteEstimate, updateEstimateStatus, voidEstimate } from '../estimates';
+import { createSalesOrder, deleteSalesOrder, updateStatus as updateSalesOrderStatus, voidSalesOrder } from '../salesOrders';
+import { createPurchaseOrder, deletePurchaseOrder, updateStatus as updatePurchaseOrderStatus, voidPurchaseOrder } from '../purchaseOrders';
 import { voidJournalEntry } from '../posting';
 import { createManualEntry, voidEntry } from '../journal';
 import { assertNotFifoTracked } from '../inventory';
@@ -71,6 +71,7 @@ import { reverseSourceMovements } from '../inventorySites';
 import { refuseInAccountantCopy } from '../nonPostingDocs';
 import { type VersionedEntity, assertCurrentVersion } from '../concurrency';
 import { requirePermission } from '../access';
+import { systemAccountIdOrNull } from '../accountRoles';
 import { orphanedSalesTaxFixes, voidOrphanedSalesTaxFixes } from './salesTaxTools';
 import type { AccessRef } from '@/lib/permissions/model';
 
@@ -487,16 +488,22 @@ export async function voidInventoryAdjustment(ctx: ServiceContext, entryId: stri
     }
     await assertNotFifoTracked(tx, itemId);
     const qtyChange = Money.of(after.quantityOnHand).minus(Money.of(before.quantityOnHand));
-    const lines = await tx.db
-      .select({ debit: journalEntryLines.debit, credit: journalEntryLines.credit, subtype: accounts.subtype })
-      .from(journalEntryLines)
-      .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
-      .where(eq(journalEntryLines.journalEntryId, entryId));
-    const valueChange = lines
-      .filter((l) => String(l.subtype) === 'inventory')
-      .reduce((s, l) => s.plus(Money.of(l.debit ?? 0)).minus(Money.of(l.credit ?? 0)), Money.zero());
     const [item] = await tx.db.select().from(items).where(and(eq(items.companyId, tx.companyId), eq(items.id, itemId)));
     if (!item) throw notFound('Item');
+    // The value the adjustment moved is what it posted to the item's OWN inventory asset account
+    // (whatever that account's subtype), so the item's value stays equal to the GL.
+    const assetAccountId =
+      item.assetAccountId ??
+      (await systemAccountIdOrNull(tx, 'inventory_asset')) ??
+      (await tx.db.select({ id: accounts.id }).from(accounts).where(and(eq(accounts.companyId, tx.companyId), eq(accounts.code, '1300'))))[0]?.id ??
+      null;
+    const lines = await tx.db
+      .select({ accountId: journalEntryLines.accountId, debit: journalEntryLines.debit, credit: journalEntryLines.credit })
+      .from(journalEntryLines)
+      .where(eq(journalEntryLines.journalEntryId, entryId));
+    const valueChange = lines
+      .filter((l) => l.accountId === assetAccountId)
+      .reduce((s, l) => s.plus(Money.of(l.debit ?? 0)).minus(Money.of(l.credit ?? 0)), Money.zero());
     const qoh = Money.of(item.quantityOnHand ?? 0);
     const avg = Money.of(item.averageCost ?? 0);
     const newQty = qoh.minus(qtyChange);
@@ -546,6 +553,9 @@ async function snapshotFor(ctx: ServiceContext, type: DeletedSnapshot['type'], i
     if (!e) throw notFound('Journal entry');
     const lines = await ctx.db.select().from(journalEntryLines).where(eq(journalEntryLines.journalEntryId, id));
     const amount = lines.reduce((s, l) => s.plus(Money.of(l.debit ?? 0)), Money.zero());
+    // p1 fx: lines on a foreign bank / card keep their foreign amount, and the entry its currency
+    // and rate, so a restore posts the same foreign and home amounts.
+    const fx = lines.find((l) => l.currency && l.exchangeRate && Number(l.foreignAmount ?? 0) !== 0) ?? lines.find((l) => l.currency);
     return {
       type,
       docId: id,
@@ -557,6 +567,7 @@ async function snapshotFor(ctx: ServiceContext, type: DeletedSnapshot['type'], i
         description: e.description,
         reference: e.reference,
         isAdjusting: e.isAdjusting,
+        ...(fx?.currency ? { currency: fx.currency, exchangeRate: fx.exchangeRate } : {}),
         lines: lines.map((l) => ({
           accountId: l.accountId,
           debit: l.debit,
@@ -564,6 +575,7 @@ async function snapshotFor(ctx: ServiceContext, type: DeletedSnapshot['type'], i
           memo: l.memo,
           classId: l.classId,
           ...(l.entityType && l.entityId ? { entityType: l.entityType, entityId: l.entityId } : {}),
+          ...(l.currency && l.foreignAmount !== null ? { foreignAmount: l.foreignAmount } : {}),
         })),
       },
     };
@@ -588,6 +600,9 @@ async function snapshotFor(ctx: ServiceContext, type: DeletedSnapshot['type'], i
         taxRateId: h.taxRateId ?? null,
         shipTo: h.shipTo ?? null,
         customerMessageId: h.customerMessageId ?? null,
+        toBePrinted: h.toBePrinted ?? false,
+        toBeEmailed: h.toBeEmailed ?? false,
+        status: String(h.status),
         lines: lines.map((l) => ({ itemId: l.itemId, description: l.description, quantity: l.quantity, rate: l.rate, taxable: l.taxable, salesTaxCodeId: l.salesTaxCodeId, classId: l.classId })),
       },
     };
@@ -616,6 +631,10 @@ async function snapshotFor(ctx: ServiceContext, type: DeletedSnapshot['type'], i
         shipTo: h.shipTo ?? null,
         poNumber: h.poNumber,
         customerMessageId: h.customerMessageId ?? null,
+        toBePrinted: h.toBePrinted ?? false,
+        toBeEmailed: h.toBeEmailed ?? false,
+        status: String(h.status),
+        // (sales_order_lines keep no class column.)
         lines: lines.map((l) => ({ itemId: l.itemId, description: l.description, quantity: l.quantity, rate: l.rate, taxable: l.taxable, salesTaxCodeId: l.salesTaxCodeId })),
       },
     };
@@ -638,6 +657,7 @@ async function snapshotFor(ctx: ServiceContext, type: DeletedSnapshot['type'], i
       memo: h.memo,
       shipTo: h.shipTo ?? null,
       shipToCustomerId: h.shipToCustomerId ?? null,
+      status: String(h.status),
       lines: lines.map((l) => ({ itemId: l.itemId, accountId: l.accountId, description: l.description, quantity: l.quantity, rate: l.rate, customerId: l.customerId, jobId: l.jobId, classId: l.classId })),
     },
   };
@@ -957,14 +977,23 @@ export async function restoreDeletedTransactions(
             description: r.description,
             reference: r.reference ?? null,
             isAdjusting: Boolean(r.isAdjusting),
+            ...(r.currency ? { currency: r.currency, exchangeRate: r.exchangeRate ?? null } : {}),
             lines: r.lines,
           } as never)) as { id: string };
-        } else if (s.type === 'estimate') {
-          created = (await createEstimate(tx, { ...r, date: new Date(r.date), expirationDate: toDateOrNull(r.expirationDate) } as never)) as { id: string };
-        } else if (s.type === 'sales_order') {
-          created = (await createSalesOrder(tx, { ...r, date: new Date(r.date), shipDate: toDateOrNull(r.shipDate) } as never)) as { id: string };
         } else {
-          created = (await createPurchaseOrder(tx, { ...r, date: new Date(r.date), expectedDate: toDateOrNull(r.expectedDate) } as never)) as { id: string };
+          // The document comes back with the status it had (accepted / rejected / closed / void).
+          const { status, ...input } = r;
+          if (s.type === 'estimate') {
+            created = (await createEstimate(tx, { ...input, date: new Date(r.date), expirationDate: toDateOrNull(r.expirationDate) } as never)) as { id: string };
+            if (status === 'void') await voidEstimate(tx, created.id);
+            else if (status === 'accepted' || status === 'rejected' || status === 'closed') await updateEstimateStatus(tx, created.id, status);
+          } else if (s.type === 'sales_order') {
+            created = (await createSalesOrder(tx, { ...input, date: new Date(r.date), shipDate: toDateOrNull(r.shipDate) } as never)) as { id: string };
+            if (status === 'closed' || status === 'void') await updateSalesOrderStatus(tx, created.id, status);
+          } else {
+            created = (await createPurchaseOrder(tx, { ...input, date: new Date(r.date), expectedDate: toDateOrNull(r.expectedDate) } as never)) as { id: string };
+            if (status === 'closed' || status === 'void') await updatePurchaseOrderStatus(tx, created.id, status);
+          }
         }
         await writeAudit(tx, {
           action: 'create',

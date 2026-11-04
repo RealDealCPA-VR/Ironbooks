@@ -6,7 +6,11 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { and, eq } from 'drizzle-orm';
-import { accounts, auditLogs, estimates, items, journalEntries, purchaseOrders, salesOrders } from '@/lib/db/schema';
+import { accounts, auditLogs, estimates, items, journalEntries, journalEntryLines, purchaseOrders, salesOrders } from '@/lib/db/schema';
+import { createAccount } from '../accounts';
+import { setAccountCurrency, upsertCurrency } from '../currencies';
+import { updateCompany } from '../company';
+import { updateEstimateStatus } from '../estimates';
 import { setClosingDate } from '../company';
 import { createCustomer } from '../customers';
 import { createVendor } from '../vendors';
@@ -175,5 +179,53 @@ describe('I6 Batch Delete/Void', () => {
     const [still] = await t.db.select().from(journalEntries).where(eq(journalEntries.id, je.id));
     expect(still.status).toBe('posted');
     expect(still.deletedAt).toBeNull();
+  });
+  it('voiding an inventory adjustment keeps the item value equal to the GL when its asset account is not an "inventory" subtype (round 2)', async () => {
+    const asset = (await createAccount(t.ctx, { code: '1390', name: 'Stock Held', type: 'asset', subtype: 'other_current_asset' } as never)).id;
+    const nut = (await createItem(t.ctx, { name: 'Nut', type: 'inventory', salesPrice: '1.00', purchaseCost: '1.00', incomeAccountId: t.acct['4000'], assetAccountId: asset } as never)).id;
+    const a1 = await adjustInventory(t.ctx, { itemId: nut, quantityChange: '4', unitCost: '2.50', date: d('2026-06-01') });
+    await adjustInventory(t.ctx, { itemId: nut, quantityChange: '2', unitCost: '4.00', date: d('2026-06-02') });
+    const res = await batchVoidTransactions(t.ctx, [`inventory_adjustment:${a1.entry!.id}`]);
+    expect(res.results[0].ok).toBe(true);
+    const [it] = await t.db.select().from(items).where(eq(items.id, nut));
+    const [gl] = await t.db.select().from(accounts).where(eq(accounts.id, asset));
+    expect(Number(it.quantityOnHand)).toBe(2);
+    expect(gl.balance).toBe('8.00');
+    // Item value (qty x average cost) equals the GL balance.
+    expect((Number(it.quantityOnHand) * Number(it.averageCost)).toFixed(2)).toBe(gl.balance);
+  });
+
+  it('restore keeps a foreign-currency journal entry and an estimate status (round 2)', async () => {
+    await updateCompany(t.ctx, { settings: { multiCurrencyEnabled: true } });
+    await upsertCurrency(t.ctx, { code: 'EUR', name: 'Euro', rateToBase: '1.20' });
+    const eurBank = (await createAccount(t.ctx, { code: '1025', name: 'Euro Bank', type: 'asset', subtype: 'checking' } as never)).id;
+    await setAccountCurrency(t.ctx, eurBank, 'EUR');
+    const je = (await createManualEntry(t.ctx, {
+      date: d('2026-07-01'),
+      description: 'EUR capital',
+      currency: 'EUR',
+      exchangeRate: '1.25',
+      lines: [
+        { accountId: eurBank, debit: '125.00', foreignAmount: '100.00' },
+        { accountId: t.acct['3000'], credit: '125.00' },
+      ],
+    } as never)) as { id: string };
+    const before = await t.db.select().from(journalEntryLines).where(and(eq(journalEntryLines.journalEntryId, je.id), eq(journalEntryLines.accountId, eurBank)));
+    expect(before[0].foreignAmount).toBe('100.00');
+    expect((await batchVoidTransactions(t.ctx, [`journal:${je.id}`], { action: 'delete' })).results[0].ok).toBe(true);
+
+    const est = (await createEstimate(t.ctx, { customerId, date: d('2026-07-02'), lines: [{ description: 'Quote', quantity: 1, rate: '30.00', taxable: false }] })) as { id: string };
+    await updateEstimateStatus(t.ctx, est.id, 'accepted');
+    expect((await batchVoidTransactions(t.ctx, [`estimate:${est.id}`], { action: 'delete' })).results[0].ok).toBe(true);
+
+    const deleted = await listDeletedTransactions(t.ctx);
+    const res = await restoreDeletedTransactions(t.ctx, deleted.map((x) => x.id));
+    expect(res.results.every((r) => r.ok)).toBe(true);
+    const newJe = res.results.find((r) => deleted.find((x) => x.id === r.id)!.type === 'journal')!.newId!;
+    const after = await t.db.select().from(journalEntryLines).where(and(eq(journalEntryLines.journalEntryId, newJe), eq(journalEntryLines.accountId, eurBank)));
+    expect(after[0]).toMatchObject({ debit: '125.00', currency: 'EUR', foreignAmount: '100.00' });
+    expect(Number(after[0].exchangeRate)).toBe(1.25);
+    const newEst = res.results.find((r) => deleted.find((x) => x.id === r.id)!.type === 'estimate')!.newId!;
+    expect((await t.db.select().from(estimates).where(eq(estimates.id, newEst)))[0].status).toBe('accepted');
   });
 });

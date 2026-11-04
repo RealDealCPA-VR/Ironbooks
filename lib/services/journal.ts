@@ -63,6 +63,9 @@ export interface ManualEntryInput {
   lines: PostingLine[];
   /** QB "Adjusting Entry" checkbox. */
   isAdjusting?: boolean;
+  /** p1 fx: entry currency + home units per 1 unit, for lines on a foreign bank / card (fxLines.ts). */
+  currency?: string | null;
+  exchangeRate?: string | number | null;
 }
 
 export interface JournalEntryLine {
@@ -227,6 +230,7 @@ async function createManualEntryInner(
     lines: input.lines,
     sourceRef: 'manual',
     isAdjusting: input.isAdjusting ?? false,
+    ...(input.currency ? { currency: input.currency, exchangeRate: input.exchangeRate ?? null } : {}),
   });
 }
 
