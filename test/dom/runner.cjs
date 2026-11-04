@@ -67,10 +67,14 @@ app.whenReady().then(async () => {
     const shifted = Boolean(mods.shift) || (single && /[A-Z+?]/.test(key));
     const modifiers = (mods.alt ? 1 : 0) | (mods.ctrl ? 2 : 0) | (mods.meta ? 4 : 0) | (shifted ? 8 : 0);
     const code = mods.code || CODES[key] || (single && /[a-z]/i.test(key) ? `Key${key.toUpperCase()}` : single && /\d/.test(key) ? `Digit${key}` : key);
-    const vk = VK[key] ?? (single ? key.toUpperCase().charCodeAt(0) : 0);
+    const physical = /^Key([A-Z])$/.exec(code);
+    const vk = VK[key] ?? (physical ? physical[1].charCodeAt(0) : single ? key.toUpperCase().charCodeAt(0) : 0);
     const base = { key, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk, modifiers };
     await wc.debugger.sendCommand('Input.dispatchKeyEvent', { type: 'rawKeyDown', ...base });
-    if (single && !mods.ctrl && !mods.alt && !mods.meta) {
+    if (mods.text) {
+      // A character typed with modifiers held (AltGr, which Windows sends as Ctrl+Alt).
+      await wc.debugger.sendCommand('Input.dispatchKeyEvent', { type: 'char', text: mods.text, unmodifiedText: mods.text, ...base });
+    } else if (single && !mods.ctrl && !mods.alt && !mods.meta) {
       await wc.debugger.sendCommand('Input.dispatchKeyEvent', { type: 'char', text: key, unmodifiedText: key, ...base });
     }
     await wc.debugger.sendCommand('Input.dispatchKeyEvent', { type: 'keyUp', ...base });

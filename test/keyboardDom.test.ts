@@ -27,6 +27,10 @@ describe('QuickBooks keys in the browser', () => {
     expectAllPassed(await runDomFile('test/dom/nameFieldDates.dom.tsx'));
   }, 180_000);
 
+  it('Ctrl+G opens the other register at the transaction, however old', async () => {
+    expectAllPassed(await runDomFile('test/dom/registerGoTo.dom.tsx'));
+  }, 180_000);
+
   it('Customer / Vendor Center: arrows and type-ahead choose the name, the right side follows', async () => {
     expectAllPassed(await runDomFile('test/dom/centerView.dom.tsx'));
   }, 180_000);

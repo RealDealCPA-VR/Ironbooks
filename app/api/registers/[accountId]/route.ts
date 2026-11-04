@@ -12,6 +12,8 @@
  *   limit   page size (optional; omit for all rows).
  *   offset  offset into the filtered ascending row set (optional).
  *   last    only the newest N rows of the (filtered) set (optional; the page opens on these).
+ *   entry   with last: a journal entry to include (Ctrl+G from another register). When it is
+ *           older than the newest N rows, the rows reach back to it (and a few before it).
  *
  * POST /api/registers/:accountId
  *
@@ -85,7 +87,12 @@ export async function GET(req: NextRequest, { params }: Params) {
     // `last=N`: only the newest N rows (the register page opens on them). A checking account
     // converted with years of history used to send every row — tens of thousands — to the page.
     if (last !== undefined && register.rows.length > last) {
-      const dropped = register.rows.length - last;
+      let dropped = register.rows.length - last;
+      const entry = sp.get('entry');
+      if (entry) {
+        const at = register.rows.findIndex((r) => r.journalEntryId === entry);
+        if (at >= 0 && at < dropped) dropped = Math.max(0, at - 5);
+      }
       register.rows = register.rows.slice(dropped);
       register.offset = register.offset + dropped;
     }

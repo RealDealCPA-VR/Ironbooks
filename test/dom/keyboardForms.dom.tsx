@@ -311,6 +311,61 @@ domTest('Esc on a changed page form (Write Checks) asks before its Cancel', asyn
   equal(pressed.join(','), 'cancel', 'nothing saved');
 });
 
+domTest('Home Home / End End go to the first / last field of the form; one Home stays in the field', async () => {
+  await mount(
+    <>
+      <KeyboardBase />
+      <FormShortcuts />
+      <Modal open onClose={() => {}} title="Enter Bills" footer={<Button>Save &amp; Close</Button>}>
+        <Input aria-label="Vendor" />
+        <Input aria-label="Ref. No." />
+        <Input aria-label="Memo" />
+      </Modal>
+    </>,
+  );
+  await focusOn('Ref. No.');
+  await typeText('12345');
+  await press('Home');
+  equal(focusedLabel(), 'Ref. No.', 'one Home: the start of this field');
+  equal($<HTMLInputElement>('[aria-label="Ref. No."]')!.selectionStart, 0, 'the cursor at its start');
+  await press('Home');
+  equal(focusedLabel(), 'Vendor', 'Home Home: the first field');
+  await press('End');
+  await press('End');
+  equal(focusedLabel(), 'Memo', 'End End: the last field');
+});
+
+domTest('the field keys stay with the field: Space ticks a checkbox, Del / Backspace delete, Ctrl+Left / Ctrl+Right move a word', async () => {
+  await mount(
+    <>
+      <KeyboardBase />
+      <FormShortcuts />
+      <main>
+        <div data-shortcut-scope="">
+          <Input aria-label="Memo" />
+          <input type="checkbox" aria-label="Pay this bill" />
+        </div>
+      </main>
+    </>,
+  );
+  await focusOn('Memo');
+  await typeText('rent for march');
+  const memo = $<HTMLInputElement>('[aria-label="Memo"]')!;
+  await press('ArrowLeft', { ctrl: true });
+  equal(memo.selectionStart, 9, 'Ctrl+Left: the start of the last word');
+  await press('Delete');
+  equal(memo.value, 'rent for arch', 'Del deletes forward');
+  await press('Backspace');
+  equal(memo.value, 'rent forarch', 'Backspace deletes back');
+  await press('ArrowRight', { ctrl: true });
+  equal(memo.selectionStart, memo.value.length, 'Ctrl+Right: the end of the word');
+  await focusOn('Pay this bill');
+  await press(' ');
+  check($<HTMLInputElement>('[aria-label="Pay this bill"]')!.checked, 'Space ticks it');
+  await press(' ');
+  check(!$<HTMLInputElement>('[aria-label="Pay this bill"]')!.checked, 'and unticks it');
+});
+
 // ---------------------------------------------------------------------------
 // Ctrl+Alt+Y / Ctrl+Alt+V: copy and paste a transaction line
 // ---------------------------------------------------------------------------
@@ -350,6 +405,38 @@ domTest('Ctrl+Alt+Y copies a line; Ctrl+Alt+V pastes it into a blank line, or ab
   await press('v', { ctrl: true, alt: true });
   await until(() => $$('[data-grid-row]').length === 3, 'a line inserted');
   await until(() => val('Item 1') === 'Widget' && val('Qty 1') === '2' && val('Item 2') === 'Widget', 'pasted above');
+});
+
+domTest('AltGr characters type in a line and a form (Hungarian AltGr+V "@", Polish AltGr+S "ś"); they never paste a line or Save & New', async () => {
+  let saved = 0;
+  await mount(
+    <>
+      <FormShortcuts />
+      <Modal open onClose={() => {}} title="Create Invoices" footer={<Button onClick={() => saved++}>Save &amp; New</Button>}>
+        <Lines />
+      </Modal>
+    </>,
+  );
+  await focusOn('Item 1');
+  await press('y', { ctrl: true, alt: true }); // a line on the clipboard: a paste would show
+  await focusOn('Item 2');
+  await press('@', { ctrl: true, alt: true, code: 'KeyV', text: '@' });
+  await press('ś', { ctrl: true, alt: true, code: 'KeyS', text: 'ś' });
+  await settle(80);
+  equal(val('Item 2'), '@ś', 'AltGr typed its characters');
+  equal(val('Qty 2'), '', 'no line pasted');
+  equal($$('[data-grid-row]').length, 2, 'no line inserted');
+  equal(saved, 0, 'no Save & New');
+  // The browser says AltGr is down (AltGraph): a Cyrillic letter typed with it pastes nothing either.
+  const ev = new KeyboardEvent('keydown', { key: 'ґ', code: 'KeyV', ctrlKey: true, altKey: true, modifierAltGraph: true, bubbles: true, cancelable: true });
+  $<HTMLInputElement>('[aria-label="Item 2"]')!.dispatchEvent(ev);
+  await settle(80);
+  check(!ev.defaultPrevented, 'AltGr left to type');
+  equal(val('Qty 2'), '', 'still no line pasted');
+  // Real Ctrl+Alt+V still pastes.
+  await focusOn('Qty 2');
+  await press('v', { ctrl: true, alt: true });
+  await until(() => $$('[data-grid-row]').length === 3, 'Ctrl+Alt+V pastes above the filled line');
 });
 
 // ---------------------------------------------------------------------------

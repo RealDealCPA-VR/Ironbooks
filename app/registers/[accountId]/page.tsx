@@ -290,7 +290,7 @@ function RegisterPageInner() {
   const listKeys = useListKeys({ ref: scrollRef });
 
   const load = useCallback(
-    async (fromDate: string, toDate: string, q: string, all = showAll) => {
+    async (fromDate: string, toDate: string, q: string, all = showAll, entry?: string | null) => {
       if (!accountId) return;
       setLoading(true);
       try {
@@ -300,6 +300,8 @@ function RegisterPageInner() {
         if (q.trim()) params.set('search', q.trim());
         // Open on the newest rows: years of history would otherwise all be sent and drawn.
         if (!all) params.set('last', String(REGISTER_PAGE_ROWS));
+        // Ctrl+G from another register: the rows reach back to that transaction however old.
+        if (!all && entry) params.set('entry', entry);
         const qs = params.toString();
         const data = await api.get<{ register: RegisterResult }>(
           `/api/registers/${accountId}${qs ? `?${qs}` : ''}`,
@@ -317,9 +319,9 @@ function RegisterPageInner() {
     [accountId, showAll],
   );
 
-  // Initial load (honors ?from=&to= QuickZoom links from reports).
+  // Initial load (honors ?from=&to= QuickZoom links from reports, and ?entry= from Ctrl+G).
   useEffect(() => {
-    load(from, to, search);
+    load(from, to, search, showAll, searchParams.get('entry'));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [accountId]);
 
@@ -331,15 +333,19 @@ function RegisterPageInner() {
     const el = scrollRef.current;
     if (!el) return;
     el.scrollTop = el.scrollHeight;
-    if (!focusEntry || focusedEntry.current === focusEntry || !result) return;
+    // Only this account's rows, fully loaded (Ctrl+G keeps the page while the next one loads).
+    if (!focusEntry || focusedEntry.current === focusEntry || !result || loading || result.account?.id !== accountId) return;
     const row = Array.from(el.querySelectorAll<HTMLElement>('tbody > tr[data-journal-entry]')).find(
       (r) => r.getAttribute('data-journal-entry') === focusEntry,
     );
-    if (!row) return;
     focusedEntry.current = focusEntry;
+    if (!row) {
+      toast('That transaction is not in the rows shown here. Check the dates above.', 'info');
+      return;
+    }
     setActiveListRow(el, row);
     el.focus({ preventScroll: true });
-  }, [result, focusEntry]);
+  }, [result, focusEntry, loading, accountId]);
 
   const handleRowClick = (row: RegisterRow) => {
     const source = sourceRefLink(row.sourceRef);

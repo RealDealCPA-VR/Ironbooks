@@ -8,7 +8,7 @@
  *            usual confirmation follows. In an open form: its Delete / Void button. Line grids
  *            take Ctrl+D first (delete the line: useGridKeys).
  *   Ctrl+P   print: the selected row's Print button, else the open form's or page's Print
- *            button, else the browser's print
+ *            button, else a note that there is nothing to print (never the system print dialog)
  *   Ctrl+Y   Transaction Journal, Ctrl+H Transaction History (EntryDetailModal) of the selected
  *            row — register, journal, Find and report rows carry data-journal-entry — or of an
  *            open form: one that names its journal entry the same way, or a saved invoice / bill /
@@ -212,8 +212,9 @@ export default function KeyboardCommands() {
             e.preventDefault();
             btn.click();
           } else if (!dialog) {
+            // Never the system print dialog of the whole screen (QuickBooks prints forms and reports).
             e.preventDefault();
-            window.print();
+            toast('There is nothing to print on this page.', 'info');
           }
           return;
         }
