@@ -20,6 +20,7 @@ import { closeDb, getDb, type DB } from '@/lib/db';
 import { accounts, companies, undoActions, users } from '@/lib/db/schema';
 import { eq } from 'drizzle-orm';
 import { builtinRole, unionRoles, type PermissionGrant, type RoleDefinition } from '@/lib/permissions/model';
+import { activitiesOf } from '@/lib/permissions/activities';
 import type { ServiceContext } from './_base';
 import { createCompany } from './company';
 import { addUser, createRole } from './users';
@@ -220,5 +221,21 @@ describe('view filters check the own activity of a record (fail closed, not any 
     expect(canViewRegister(unionRoles([builtinRole('ar_clerk')!]), { type: 'asset', subtype: 'accounts_receivable' })).toBe(true);
     // Bank Rules alone does not open a bank register.
     expect(canViewRegister(unionRoles([role({ 'banking.bank_rules': ['view'] })]), { type: 'asset', subtype: 'checking' })).toBe(false);
+  });
+});
+
+describe('roles saved per activity keep a full area when new activities are added (round 2 P2)', () => {
+  it('Full on every activity of an area is stored as the area grant', async () => {
+    const grant: Record<string, string[]> = {};
+    for (const d of activitiesOf('company')) grant[d.key] = ['full'];
+    grant['customers.invoices'] = ['view', 'create'];
+    const r = await createRole(owner, { name: 'Full company by activity', permissions: grant as PermissionGrant, flags: {} });
+    expect(r.permissions).toMatchObject({ company: ['view', 'create', 'modify', 'delete', 'print'], 'customers.invoices': ['view', 'create'] });
+    expect(Object.keys(r.permissions).some((k) => k.startsWith('company.'))).toBe(false);
+    // One activity short of Full stays per activity.
+    const partial = { ...grant, 'company.templates': ['view'] };
+    const p = await createRole(owner, { name: 'Almost full company', permissions: partial as PermissionGrant, flags: {} });
+    expect((p.permissions as Record<string, unknown>).company).toBeUndefined();
+    expect((p.permissions as Record<string, unknown>)['company.templates']).toEqual(['view']);
   });
 });

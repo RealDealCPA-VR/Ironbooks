@@ -41,7 +41,7 @@ export async function GET(req: NextRequest) {
   try {
     const ctx = await getServerContext();
     const companyId = req.nextUrl.searchParams.get('companyId') ?? ctx.companyId;
-    const access = await requireAccessInCompany(ctx, companyId, 'file_utilities', 'create');
+    const access = await requireAccessInCompany(ctx, companyId, 'file_utilities.backup', 'create');
 
     const { buffer, filename } = await createCompanyBackup(ctx.db, companyId, { access });
     // Backup history: a one-company copy (does not count as a backup of the whole file).

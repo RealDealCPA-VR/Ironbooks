@@ -252,6 +252,23 @@ describe('per-activity rights', () => {
     expect(canActivity(mixed, 'vendors.bills', 'create')).toBe(true);
   });
 
+  it('report hub pages (QuickZoom, open source form, Report Center) open with ANY report activity (round 2 P1)', () => {
+    for (const grant of [
+      { 'reports_financial.company': ['view', 'print'] },
+      { 'reports_sales.receivables': ['view'] },
+      { 'reports_purchases.payables': ['view'] },
+    ] as PermissionGrant[]) {
+      const access = unionRoles([role(grant)]);
+      for (const page of ['/reports', '/reports/std', '/reports/drilldown', '/reports/open', '/reports/memorized', '/reports/commented']) {
+        expect(decide(page, 'GET', access), `${JSON.stringify(grant)} ${page}`).toBe(true);
+      }
+    }
+    // No report right at all: still refused.
+    expect(decide('/reports/drilldown', 'GET', unionRoles([role({ 'customers.invoices': ['view'] })]))).toBe(false);
+    // System Accounts: an Accountant Center Tools role may call /api/account-roles, so it opens the page.
+    expect(decide('/system-accounts', 'GET', unionRoles([role({ 'accounting.accountant_tools': ['view'] })]))).toBe(true);
+  });
+
   it('My Preferences (send-from address, Bcc me) is open to every role; Company Preferences is not', () => {
     for (const key of ['ar_clerk', 'ap_clerk', 'banking', 'payroll_processor', 'reports_only']) {
       const access = unionRoles([BUILTIN_ROLES.find((r) => r.key === key)!]);

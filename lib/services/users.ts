@@ -20,12 +20,15 @@ import { assertPasswordAllowed, storeUserPassword } from './passwordPolicy';
 import { endUserSessions } from './sessions';
 import { syncPasswordSlot } from './fileProtection';
 import {
+  ACTIONS,
+  AREA_KEYS,
   ADMIN_ROLE_KEY,
   BUILTIN_ROLES,
   builtinRole,
   normalizeActivities,
   normalizeGrant,
   unionRoles,
+  type ActivityKey,
   type ActivitySet,
   isSubset,
   legacyRoleFor,
@@ -34,7 +37,7 @@ import {
   type RoleDefinition,
   type RoleFlags,
 } from '@/lib/permissions/model';
-import { isActivityKey } from '@/lib/permissions/activities';
+import { activitiesOf, activityDef, isActivityKey, supportedActions } from '@/lib/permissions/activities';
 import {
   definitionsFor,
   effectiveRoleKeys,
@@ -591,7 +594,20 @@ function cleanGrant(grant: PermissionGrant): PermissionGrant {
   }
   const out: PermissionGrant = {};
   for (const [area, actions] of Object.entries(normalizeGrant(areaPart))) if (actions.length) out[area as keyof PermissionGrant] = actions;
-  for (const [key, actions] of Object.entries(normalizeActivities(activityPart))) if (actions.length) out[key as keyof PermissionGrant] = actions;
+  const acts = normalizeActivities(activityPart);
+  // Round 2: Full on EVERY activity of an area is stored as the area grant, so the role keeps the
+  // whole area (and gets activities added to the area later), like a role stored per area.
+  const fullAreas = new Set(
+    AREA_KEYS.filter((area) => {
+      const defs = activitiesOf(area);
+      return defs.length > 0 && defs.every((d) => supportedActions(d).every((a) => acts[d.key as ActivityKey].includes(a)));
+    }),
+  );
+  for (const area of fullAreas) out[area as keyof PermissionGrant] = [...ACTIONS];
+  for (const [key, actions] of Object.entries(acts)) {
+    if (!actions.length || fullAreas.has(activityDef(key)!.area)) continue;
+    out[key as keyof PermissionGrant] = actions;
+  }
   return out;
 }
 
