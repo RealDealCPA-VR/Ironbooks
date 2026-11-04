@@ -20,7 +20,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { assertExclusiveAccess } from '@/lib/services/sessions';
-import { importIIF, importCustomersCSV, importVendorsCSV } from '@/lib/services/qbImport';
+import { importIIF, importCustomersCSV, importVendorsCSV, importBodyTooLarge } from '@/lib/services/qbImport';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
 
@@ -36,6 +36,11 @@ function errorResponse(err: unknown) {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
+    // Refuse an oversized upload before reading it into memory (the 60 MB cap is also checked on
+    // the decoded file by the service).
+    if (importBodyTooLarge(req.headers)) {
+      return NextResponse.json({ error: 'The file is larger than 60 MB.', code: 'VALIDATION' }, { status: 413 });
+    }
     // QuickBooks list/transaction import: owner/admin, single-user while others are on.
     await assertExclusiveAccess(ctx, 'Import');
     const body = await requireJsonObject(req) as {

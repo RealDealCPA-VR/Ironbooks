@@ -30,6 +30,7 @@ import { foreignAccountBalances } from './fxLedger';
 import { foreignOpenPayables, foreignOpenReceivables } from './fxSubledger';
 import { getLoan, voidOrphanLoanFx } from './loans';
 import { assertListRatesKeepHomeCurrency } from './multiCurrency';
+import { systemAccountIdOrNull } from './accountRoles';
 
 export interface HcaLine {
   kind: 'account' | 'customer' | 'vendor' | 'loan';
@@ -98,7 +99,9 @@ async function defaultArAp(ctx: ServiceContext) {
     .from(accounts)
     .where(and(eq(accounts.companyId, ctx.companyId), inArray(accounts.subtype, ['accounts_receivable', 'accounts_payable'])))
     .orderBy(asc(accounts.code));
-  const ap = rows.find((r) => r.code === '2000') ?? rows.find((r) => r.subtype === 'accounts_payable');
+  // A/P by role (Company > System Accounts): the account bills really post to, not code 2000.
+  const apId = await systemAccountIdOrNull(ctx, 'accounts_payable');
+  const ap = rows.find((r) => r.id === apId) ?? rows.find((r) => r.code === '2000') ?? rows.find((r) => r.subtype === 'accounts_payable');
   const ar = rows.find((r) => r.code === '1200') ?? rows.find((r) => r.subtype === 'accounts_receivable');
   return { ar, ap };
 }

@@ -371,7 +371,7 @@ export async function setAccountRole(ctx: ServiceContext, role: AccountRole, acc
       throw new ServiceError(
         'CONFLICT',
         `${def.label} is "${current.account.code} ${current.account.name}" now, and it still has a balance of ${toAmountString(current.account.balance)}. ` +
-          `Transactions already on it would stay behind there. Move or merge that balance first (Merge Accounts), then choose the new account.`,
+          `Transactions already on it would stay behind there. To use the other account instead, merge the other account INTO "${current.account.code} ${current.account.name}" (Merge Accounts keeps this one, with every transaction), then rename or renumber it if you like.`,
       );
     }
     const [co] = await tx.db.select({ settings: companies.settings }).from(companies).where(eq(companies.id, tx.companyId));

@@ -8,6 +8,7 @@
 import { and, eq } from 'drizzle-orm';
 import { accounts } from '@/lib/db/schema';
 import { type ServiceContext, validation } from './_base';
+import { ACCOUNT_ROLES, systemAccountIds } from './accountRoles';
 
 export type PrefAccountKind = 'bank' | 'expense' | 'payroll_liability';
 
@@ -103,6 +104,17 @@ export async function assertPreferenceAccount(
   if (!accountFitsKind(row, kind)) {
     const reason = systemAccountReason(row, kind);
     throw validation(reason ? `${label}: ${reason}` : `${label} must be ${KIND_LABEL[kind]}.`);
+  }
+  if (kind === 'payroll_liability') {
+    // One account, one role (Company > System Accounts): payroll withholdings never go to the
+    // account chosen for Sales Tax Payable (or any other role but Payroll Liabilities).
+    for (const [role, id] of await systemAccountIds(ctx)) {
+      if (role !== 'payroll_liabilities' && id === row.id) {
+        throw validation(
+          `${label}: that account is your ${ACCOUNT_ROLES[role].label} account (Company > System Accounts); choose a payroll liabilities account.`,
+        );
+      }
+    }
   }
   return row;
 }

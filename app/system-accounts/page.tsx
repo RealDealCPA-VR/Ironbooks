@@ -11,6 +11,7 @@ import { KeySquare } from 'lucide-react';
 import { Badge, Button, Card, PageHeader, Select, Spinner, Table, Td, Th, Tr, toast, toastError } from '@/components/ui';
 import { api } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
+import { canDo, useMe } from '@/lib/usePermissions';
 
 interface Acct {
   id: string;
@@ -42,6 +43,10 @@ export default function SystemAccountsPage() {
   const [rows, setRows] = useState<RoleRow[] | null>(null);
   const [pick, setPick] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<string | null>(null);
+  // Choosing a system account changes company settings: Company & Preferences: modify (as the
+  // other settings pages); members with only Accounting view see the choices read-only.
+  const { me } = useMe();
+  const canEdit = canDo(me, 'company', 'modify');
 
   async function load() {
     try {
@@ -129,7 +134,7 @@ export default function SystemAccountsPage() {
                       <Select
                         aria-label={`Account for ${r.label}`}
                         value={pick[r.role] ?? ''}
-                        disabled={!r.canChange}
+                        disabled={!r.canChange || !canEdit}
                         onChange={(e) => setPick((p) => ({ ...p, [r.role]: e.target.value }))}
                         onKeyDown={(e) => {
                           if (e.key === 'Enter' && changed) void save(r);
@@ -144,12 +149,12 @@ export default function SystemAccountsPage() {
                       </Select>
                       {!r.canChange && (
                         <p className="mt-1 max-w-xs text-xs text-navy/50">
-                          The account used now has a balance. Merge it into the new account first (Merge Records), then choose it here.
+                          The account used now has a balance, so it keeps this role. To use another account, merge that account into this one (Merge Records keeps this one with all its transactions), then rename or renumber it.
                         </p>
                       )}
                     </Td>
                     <Td className="align-top">
-                      <Button size="sm" disabled={!changed || !r.canChange} loading={busy === r.role} onClick={() => save(r)}>
+                      <Button size="sm" disabled={!changed || !r.canChange || !canEdit} loading={busy === r.role} onClick={() => save(r)}>
                         Save
                       </Button>
                     </Td>

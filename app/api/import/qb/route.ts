@@ -34,6 +34,7 @@ import {
   importVendorsCSV,
   xlsxRows,
   type ListImportKind,
+  importBodyTooLarge,
 } from '@/lib/services/qbImport';
 import { requireJsonObject, routeError } from '@/lib/routeErrors';
 
@@ -46,6 +47,11 @@ function decodeBase64(data: string): Uint8Array {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
+    // Refuse an oversized upload before reading it into memory (the 60 MB cap is also checked on
+    // the decoded file by the service).
+    if (importBodyTooLarge(req.headers)) {
+      return NextResponse.json({ error: 'The file is larger than 60 MB.', code: 'VALIDATION' }, { status: 413 });
+    }
     const body = (await requireJsonObject(req, { optional: true })) as {
       format?: string;
       kind?: string;

@@ -137,6 +137,23 @@ describe('choosing the account for a role', () => {
     await expect(setAccountRole(ctx, 'sales_tax_payable', acct['2200'])).rejects.toMatchObject({ code: 'CONFLICT' });
   });
 
+  it('the refusal points to the merge that works: the other account INTO the role account (review P2)', async () => {
+    const err = await setAccountRole(ctx, 'sales_tax_payable', acct['2200']).catch((e) => e);
+    expect(err.message).toMatch(/merge the other account INTO "25500 Sales Tax Payable"/);
+    // …and Merge Accounts does accept that direction.
+    const { mergeAccounts } = await import('./merge');
+    const other = (await createAccount(ctx, { code: '25600', name: 'Sales Tax Owed', qbType: 'other_current_liability' })).id;
+    await expect(mergeAccounts(ctx, { fromId: other, toId: acct.stp })).resolves.toBeTruthy();
+  });
+
+  it('the Payroll preference refuses the account chosen for Sales Tax Payable (review P2)', async () => {
+    const { assertPreferenceAccount } = await import('./prefAccounts');
+    await expect(assertPreferenceAccount(ctx, acct.stp, 'payroll_liability', 'Payroll liabilities')).rejects.toMatchObject({
+      code: 'VALIDATION',
+      message: expect.stringMatching(/Sales Tax Payable account/),
+    });
+  });
+
   it('refuses an account of the wrong kind', async () => {
     await expect(setAccountRole(ctx, 'accounts_payable', acct.exp)).rejects.toMatchObject({ code: 'VALIDATION' });
   });
