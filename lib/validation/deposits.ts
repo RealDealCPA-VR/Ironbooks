@@ -8,6 +8,9 @@ export const extraDepositLineSchema = z.object({
   accountId: zUuid,
   amount: zMoneyPositive,
   description: z.string().nullish(),
+  /** QB "Received From": the customer / vendor / employee / Other Name the money came from. */
+  entityType: z.enum(['customer', 'vendor', 'employee', 'other']).nullish(),
+  entityId: zUuid.nullish(),
 });
 
 export const cashBackSchema = z.object({

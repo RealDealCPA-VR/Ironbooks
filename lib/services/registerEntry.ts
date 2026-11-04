@@ -167,7 +167,15 @@ export async function enterRegisterTransaction(
       const deposit = await createDeposit(ctx, {
         depositAccountId: plan.debitAccountId,
         date: input.date,
-        extraLines: [{ accountId: plan.lineAccountId!, amount: amountStr, description: payee || memo }],
+        // The name picked in the Payee column is the line's Received From (deposit_lines name).
+        extraLines: [
+          {
+            accountId: plan.lineAccountId!,
+            amount: amountStr,
+            description: payee || memo,
+            ...(picked ? { entityType: picked.type, entityId: picked.id } : {}),
+          },
+        ],
         memo: memo ?? (payee || null),
       });
       return { kind: 'deposit', id: deposit.id };
