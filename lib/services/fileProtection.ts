@@ -83,6 +83,8 @@ export interface ProtectionRow {
   protectedAt: Date;
   protectedBy: string | null;
   recoveryCreatedAt: Date | null;
+  /** The key check before the last key change (the company file may still be sealed with it). */
+  previousKeyCheck: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -97,12 +99,15 @@ interface KeyState {
   conflictCopy: string | null;
   /** Folders whose file key is to change at the next save (requestFileKeyRotation). */
   rotate: Set<string>;
+  /** Every file key held in this process by its key check (a slot made just before a key change finds the new key). */
+  byCheck: Map<string, Buffer>;
 }
 
 const g = globalThis as typeof globalThis & { __ironbooksFileKeys?: KeyState };
 function keyState(): KeyState {
-  g.__ironbooksFileKeys ??= { keys: new Map(), cache: new Map(), unseal: null, conflictCopy: null, rotate: new Set() };
+  g.__ironbooksFileKeys ??= { keys: new Map(), cache: new Map(), unseal: null, conflictCopy: null, rotate: new Set(), byCheck: new Map() };
   g.__ironbooksFileKeys.rotate ??= new Set();
+  g.__ironbooksFileKeys.byCheck ??= new Map();
   return g.__ironbooksFileKeys;
 }
 
@@ -118,6 +123,16 @@ export function fileKeyFor(dataDir: string = resolveDataDir()): Buffer | null {
 
 function rememberFileKey(dataDir: string, key: Buffer): void {
   keyState().keys.set(dirKey(dataDir), Buffer.from(key));
+  knowKey(key);
+}
+
+function knowKey(key: Buffer): void {
+  keyState().byCheck.set(fileCrypto.keyCheckOf(key), Buffer.from(key));
+}
+
+/** A file key held in this process, by its key check (null when it is not known here). */
+function keyByCheck(keyCheck: string): Buffer | null {
+  return keyState().byCheck.get(keyCheck) ?? null;
 }
 
 /** A sandbox or restored copy of a protected folder has the same file key. */
@@ -134,7 +149,7 @@ export function forgetFileKey(dataDir: string): void {
 
 /** Tests: forget every key. */
 export function forgetFileKeys(): void {
-  g.__ironbooksFileKeys = { keys: new Map(), cache: new Map(), unseal: null, conflictCopy: null, rotate: new Set() };
+  g.__ironbooksFileKeys = { keys: new Map(), cache: new Map(), unseal: null, conflictCopy: null, rotate: new Set(), byCheck: new Map() };
 }
 
 function writeMarker(dataDir: string, keyCheck: string): void {
@@ -163,6 +178,7 @@ export async function readProtection(db: DB): Promise<ProtectionRow | null> {
         protectedAt: row.protectedAt,
         protectedBy: row.protectedBy ?? null,
         recoveryCreatedAt: row.recoveryCreatedAt ?? null,
+        previousKeyCheck: row.previousKeyCheck ?? null,
       }
     : null;
 }
@@ -305,6 +321,31 @@ async function upsertSlot(
   }
 }
 
+/**
+ * Write a slot made (for a few hundred milliseconds of scrypt) with `madeWith`, for the file key the
+ * database names NOW: in one transaction with re-reading the protection record, so it can't
+ * interleave with a key change (rotateFileKey runs in its own transaction). When the key changed
+ * while the slot was being made, the slot is re-wrapped for the new key (it was made for the old
+ * one, whose MAC vouches for it). Returns false when the current key is not known here.
+ */
+async function upsertSlotForKey(db: DB, madeWith: Buffer, row: Parameters<typeof upsertSlot>[1]): Promise<boolean> {
+  let written = false;
+  await db.transaction(async (txRaw) => {
+    const tx = txRaw as unknown as DB;
+    const prot = await readProtection(tx);
+    if (!prot) return;
+    let slot: Record<string, unknown> | null = row.slot;
+    if (fileCrypto.keyCheckOf(madeWith) !== prot.keyCheck) {
+      const current = keyByCheck(prot.keyCheck);
+      slot = current ? fileCrypto.rewrapSlot(row.slot, madeWith, current) : null;
+    }
+    if (!slot) return;
+    await upsertSlot(tx, { ...row, slot });
+    written = true;
+  });
+  return written;
+}
+
 /** The protection row and the key in memory, when both are there (else null: nothing can be wrapped). */
 async function keyAndProtection(db: DB): Promise<{ prot: ProtectionRow; key: Buffer } | null> {
   const prot = await readProtection(db);
@@ -326,7 +367,7 @@ export async function syncPasswordSlot(db: DB, userId: string, password: string,
   if (!u || !u.hash || u.hash === 'dev') return false;
   const tag = fileCrypto.lookupTag(kp.prot.lookupSalt, u.email);
   const slot = await fileCrypto.makeSlot({ kind: 'password', secret: password, fileKey: kp.key, tag });
-  await upsertSlot(db, { kind: 'password', userId, tag, secretRef: secretRef(u.hash), slot });
+  if (!(await upsertSlotForKey(db, kp.key, { kind: 'password', userId, tag, secretRef: secretRef(u.hash), slot }))) return false;
   // A replaced password (changed, reset, set by an Admin): the old one must not open anything
   // saved from now on — not even through an older copy of the file, whose slot still holds it.
   if (opts.rotate) requestFileKeyRotation();
@@ -352,8 +393,7 @@ export async function syncChallengeSlot(db: DB, userId: string, question: string
   }
   const tag = fileCrypto.lookupTag(kp.prot.lookupSalt, u.email);
   const slot = await fileCrypto.makeSlot({ kind: 'challenge', secret: normalizeChallengeAnswer(answer), fileKey: kp.key, tag, question });
-  await upsertSlot(db, { kind: 'challenge', userId, tag, question, secretRef: secretRef(u.hash), slot });
-  return true;
+  return upsertSlotForKey(db, kp.key, { kind: 'challenge', userId, tag, question, secretRef: secretRef(u.hash), slot });
 }
 
 /**
@@ -458,7 +498,10 @@ export function companyFileForProtection(): string | null {
 async function makeRecoverySlot(db: DB, key: Buffer): Promise<string> {
   const recoveryKey = fileCrypto.generateRecoveryKey();
   const slot = await fileCrypto.makeSlot({ kind: 'recovery', secret: fileCrypto.normalizeRecoveryKey(recoveryKey) as string, fileKey: key });
-  await upsertSlot(db, { kind: 'recovery', userId: null, secretRef: null, slot });
+  knowKey(key);
+  if (!(await upsertSlotForKey(db, key, { kind: 'recovery', userId: null, secretRef: null, slot }))) {
+    throw new ServiceError('FORBIDDEN', KEY_MISSING_MESSAGE, { fileKeyMissing: true });
+  }
   await db.update(fileProtection).set({ recoveryCreatedAt: new Date() }).where(eq(fileProtection.id, 1));
   return recoveryKey;
 }
@@ -640,7 +683,9 @@ export async function regenerateRecoveryKey(
   });
   // The old recovery key still opens older copies of the file: a new file key, so it opens
   // nothing saved from now on.
-  await rotateFileKey(ctx.db, { userId, reason: 'new recovery key' });
+  const r = await rotateFileKey(ctx.db, { userId, reason: 'new recovery key' });
+  // Waiting for slots of the first protected build to be re-made: made by a later save.
+  if (r.deferredForOldSlots) requestFileKeyRotation();
   return { recoveryKey };
 }
 
@@ -666,6 +711,8 @@ export interface KeyRotationResult {
   dropped: number;
   /** The recovery key still opens the file (false: an Admin should make a new one). */
   recoveryKept: boolean;
+  /** Not changed yet: this many slots of the first protected build would be dropped (they are re-made first). */
+  deferredForOldSlots?: number;
 }
 
 /**
@@ -678,20 +725,38 @@ export interface KeyRotationResult {
  * (made by the first protected version) are listed as "needs to sign in once" until they do.
  * No-op for a file without passwords or whose key is not known here.
  */
-export async function rotateFileKey(db: DB, opts: { dataDir?: string; userId?: string | null; reason?: string } = {}): Promise<KeyRotationResult> {
+export async function rotateFileKey(
+  db: DB,
+  opts: { dataDir?: string; userId?: string | null; reason?: string; force?: boolean } = {},
+): Promise<KeyRotationResult> {
   const dataDir = resolveDataDir(opts.dataDir);
-  const prot = await readProtection(db);
-  const key = fileKeyFor(dataDir);
-  if (!prot || !key || fileCrypto.keyCheckOf(key) !== prot.keyCheck) return { rotated: false, kept: 0, dropped: 0, recoveryKept: false };
+  const none: KeyRotationResult = { rotated: false, kept: 0, dropped: 0, recoveryKept: false };
   const next = fileCrypto.generateFileKey();
   const nextCheck = fileCrypto.keyCheckOf(next);
-  const active = await activeUserIds(db);
+  // Known before the change commits: a slot being made meanwhile (upsertSlotForKey) finds it.
+  knowKey(next);
   let kept = 0;
   let dropped = 0;
   let recoveryKept = false;
+  let deferred = 0;
+  const st: { key: Buffer | null } = { key: null };
   await db.transaction(async (txRaw) => {
     const tx = txRaw as unknown as DB;
-    for (const r of await slotRows(tx)) {
+    // Read inside the transaction: no slot write (upsertSlotForKey) can interleave.
+    const prot = await readProtection(tx);
+    const key = prot ? keyByCheck(prot.keyCheck) : null;
+    st.key = key;
+    const held = fileKeyFor(dataDir);
+    if (!prot || !key || !held || !held.equals(key)) return;
+    const active = await activeUserIds(tx);
+    const rows = await slotRows(tx);
+    // Slots made by the first protected build have no public key: a key change would drop them
+    // (their user could no longer open the file elsewhere; a recovery key would stop working). An
+    // automatic change waits until they are re-made — each user's next sign-in does it, a new
+    // recovery key replaces the old one. "Change the File Key" (force) goes ahead and says so.
+    deferred = rows.filter((r) => healthOf(r, active) === 'ok' && !fileCrypto.isRewrappable(r.slot)).length;
+    if (deferred && !opts.force) return;
+    for (const r of rows) {
       // A deactivated user's slot is kept for the new key INSIDE the encrypted database only (it is
       // left out of every save's manifest while they are inactive), so reactivating them lets them
       // in again; it can't be reached without the new key. A slot made for a replaced secret goes.
@@ -708,7 +773,7 @@ export async function rotateFileKey(db: DB, opts: { dataDir?: string; userId?: s
     }
     await tx
       .update(fileProtection)
-      .set({ keyCheck: nextCheck, ...(recoveryKept ? {} : { recoveryCreatedAt: null }) })
+      .set({ keyCheck: nextCheck, previousKeyCheck: prot.keyCheck, ...(recoveryKept ? {} : { recoveryCreatedAt: null }) })
       .where(eq(fileProtection.id, 1));
     await logTransaction(tx, {
       userId: opts.userId ?? null,
@@ -718,7 +783,12 @@ export async function rotateFileKey(db: DB, opts: { dataDir?: string; userId?: s
       summary: `Changed the file key of the company file${opts.reason ? ` (${opts.reason})` : ''}: older copies and replaced passwords no longer open what is saved from now on`,
       data: { new: { fileKeyChanged: true, slotsKept: kept, slotsDropped: dropped } }, // never a key
     });
+    st.key = next; // committed below
   });
+  if (!st.key || !st.key.equals(next)) {
+    keyState().byCheck.delete(nextCheck);
+    return { ...none, ...(deferred ? { deferredForOldSlots: deferred } : {}) };
+  }
   rememberFileKey(dataDir, next);
   writeMarker(dataDir, nextCheck);
   keyState().rotate.delete(dirKey(dataDir));
@@ -726,11 +796,14 @@ export async function rotateFileKey(db: DB, opts: { dataDir?: string; userId?: s
   return { rotated: true, kept, dropped, recoveryKept };
 }
 
-/** The next save: make the key change asked for since the last one (companyFileSave doSave). */
+/**
+ * The next save: make the key change asked for since the last one (companyFileSave doSave). One
+ * waiting for slots of the first protected build to be re-made stays asked for.
+ */
 export async function applyPendingKeyRotation(db: DB, dataDir: string = resolveDataDir()): Promise<KeyRotationResult | null> {
   if (!fileKeyRotationPending(dataDir)) return null;
   const res = await rotateFileKey(db, { dataDir, reason: 'a password, challenge answer or user changed' });
-  keyState().rotate.delete(dirKey(dataDir));
+  if (!res.deferredForOldSlots) keyState().rotate.delete(dirKey(dataDir));
   return res;
 }
 
@@ -752,7 +825,7 @@ export async function changeFileKey(ctx: { db: DB; userId: string | null }, inpu
   }
   // Your own slot is made fresh first, so you keep opening the file whatever layout it had.
   await syncPasswordSlot(ctx.db, userId, input.password);
-  return rotateFileKey(ctx.db, { userId, reason: 'asked for by an Admin' });
+  return rotateFileKey(ctx.db, { userId, reason: 'asked for by an Admin', force: true });
 }
 
 /**
@@ -763,15 +836,21 @@ export async function changeFileKey(ctx: { db: DB; userId: string | null }, inpu
  * opening it. Null for a file without passwords.
  */
 export async function copyKeyFor(db: DB, dataDir: string, userId: string | null): Promise<CarriedCopyKey | null> {
-  const prot = await readProtection(db);
-  if (!prot) return null;
-  const key = fileKeyFor(dataDir);
-  if (!key || fileCrypto.keyCheckOf(key) !== prot.keyCheck) throw new ServiceError('FORBIDDEN', KEY_MISSING_MESSAGE, { fileKeyMissing: true });
+  // One consistent read (a key change can't land between the protection record and the slots).
+  const snap = await db.transaction(async (txRaw) => {
+    const tx = txRaw as unknown as DB;
+    const prot = await readProtection(tx);
+    if (!prot) return null;
+    return { prot, active: await activeUserIds(tx), rows: await slotRows(tx) };
+  });
+  if (!snap) return null;
+  const key = keyByCheck(snap.prot.keyCheck);
+  if (!key || !fileKeyFor(dataDir)) throw new ServiceError('FORBIDDEN', KEY_MISSING_MESSAGE, { fileKeyMissing: true });
   const next = fileCrypto.generateFileKey();
-  const active = await activeUserIds(db);
+  const active = snap.active;
   const slots: CarriedCopyKey['slots'] = [];
   let mine = false;
-  for (const r of await slotRows(db)) {
+  for (const r of snap.rows) {
     if (healthOf(r, active) !== 'ok') continue;
     const re = fileCrypto.rewrapSlot(r.slot, key, next);
     if (!re) continue;
@@ -834,6 +913,8 @@ export interface ProtectionUserStatus {
   login: string;
   /** Their password opens the file. */
   canOpen: boolean;
+  /** Their access was made by the first protected build: it is re-made at their next sign-in (until then the file key can't change). */
+  oldLayout?: boolean;
   /** 'ok' their answer opens it too; 'missing' a question is set but has no slot; 'none' no question. */
   challenge: 'ok' | 'missing' | 'none';
 }
@@ -848,6 +929,8 @@ export interface ProtectionStatus {
   recoveryCreatedAt: string | null;
   /** A recovery key opens the file (false: an Admin should make one). */
   hasRecoveryKey: boolean;
+  /** The recovery key was made by the first protected build: make a new one (until then the file key can't change by itself). */
+  oldRecoveryKey?: boolean;
   /** The caller may turn protection on / make a new recovery key (Admin of every company). */
   canManage: boolean;
   /** Your own password opens the file. */
@@ -879,6 +962,7 @@ export async function protectionStatus(ctx: { db: DB; userId: string | null }): 
       name: p.name,
       login: p.login,
       canOpen: Boolean(pw && healthOf(pw, active) === 'ok'),
+      ...(pw && healthOf(pw, active) === 'ok' && !fileCrypto.isRewrappable(pw.slot) ? { oldLayout: true } : {}),
       challenge: !p.q || !p.a ? 'none' : ch && healthOf(ch, active) === 'ok' ? 'ok' : 'missing',
     };
   };
@@ -891,6 +975,7 @@ export async function protectionStatus(ctx: { db: DB; userId: string | null }): 
     protectedAt: prot?.protectedAt ? new Date(prot.protectedAt).toISOString() : null,
     recoveryCreatedAt: prot?.recoveryCreatedAt ? new Date(prot.recoveryCreatedAt).toISOString() : null,
     hasRecoveryKey: rows.some((r) => r.kind === 'recovery' && fileCrypto.wellFormedSlot(r.slot)),
+    oldRecoveryKey: rows.some((r) => r.kind === 'recovery' && fileCrypto.wellFormedSlot(r.slot) && !fileCrypto.isRewrappable(r.slot)),
     canManage,
     self: me && prot ? (({ canOpen, challenge }) => ({ canOpen, challenge }))(statusOf(me)) : null,
     users:
@@ -1094,20 +1179,31 @@ async function adoptManifestProtection(db: DB, protection: SealProtection): Prom
  * Sealed 'key' plan (the working copy is already on this computer): a sign-in that unlocked the
  * key from the working copy's own slots lets the database open for everyone.
  */
-export async function finishKeyUnseal(): Promise<void> {
+export async function finishKeyUnseal(db?: DB): Promise<void> {
   if (sealedMode() !== 'key') return;
   // The open plan (reuse this working copy) was worked out from the company file's plain listing
   // before anyone signed in: check that listing against the file's encrypted contents now. A file
-  // sealed with another key (a key change this computer had not saved yet) can't be checked here.
+  // still sealed with the key used just before this working copy's last key change (the change was
+  // not saved yet) can't be checked with this key: accepted only for exactly that previous key —
+  // any other key check in the plain listing was edited, and is refused like any other change.
   const file = companyFileForProtection();
   const key = fileKeyFor();
   if (file && key) {
+    const tampered = (message: string) =>
+      new ServiceError('CONFLICT', `${message} Open an earlier backup of it instead (File > Open or Restore Company).`);
     try {
-      await format.verifySealedCompanyFile(file, key);
-    } catch (err) {
-      if ((err as { code?: string })?.code === 'TAMPERED') {
-        throw new ServiceError('CONFLICT', `${(err as Error).message} Open an earlier backup of it instead (File > Open or Restore Company).`);
+      const checked = await format.verifySealedCompanyFile(file, key);
+      if (checked === null) {
+        const m = format.readCompanyManifest(file) as Record<string, any> | null;
+        if (m && format.isSealedManifest(m)) {
+          const prot = db ? await readProtection(db) : null;
+          if (!prot || !prot.previousKeyCheck || m.encryption.keyCheck !== prot.previousKeyCheck) {
+            throw tampered(new fileCrypto.TamperedError('The details of the company file (its name, save or layout)').message);
+          }
+        }
       }
+    } catch (err) {
+      if ((err as { code?: string })?.code === 'TAMPERED') throw tampered((err as Error).message);
       throw err;
     }
   }

@@ -20,6 +20,7 @@ export interface ProtectionUserStatus {
   name: string;
   login: string;
   canOpen: boolean;
+  oldLayout?: boolean;
   challenge: 'ok' | 'missing' | 'none';
 }
 
@@ -30,6 +31,7 @@ export interface ProtectionStatus {
   protectedAt: string | null;
   recoveryCreatedAt: string | null;
   hasRecoveryKey?: boolean;
+  oldRecoveryKey?: boolean;
   canManage: boolean;
   self: { canOpen: boolean; challenge: 'ok' | 'missing' | 'none' } | null;
   users: ProtectionUserStatus[] | null;
@@ -147,6 +149,16 @@ export function FileProtectionCard({ highlight = false, onDone }: { highlight?: 
               <ShieldAlert className="h-3.5 w-3.5 mt-0.5 flex-none" aria-hidden />
               Backups, portable files and copies made before the file was protected are not encrypted: delete them, or keep them where only
               you can reach them.
+            </p>
+          )}
+          {status.canManage && (status.oldRecoveryKey || status.users?.some((u) => u.oldLayout)) && (
+            <p className="text-sm text-amber-700">
+              The file key can&apos;t change by itself yet (it should after a password change or a removed user):{' '}
+              {status.users?.some((u) => u.oldLayout)
+                ? `${status.users.filter((u) => u.oldLayout).map((u) => u.name).join(', ')} need to sign in once (their access was made by an earlier version). `
+                : ''}
+              {status.oldRecoveryKey ? 'Make a new recovery key (the current one was made by an earlier version). ' : ''}
+              Change the File Key below goes ahead anyway, and drops that access.
             </p>
           )}
           {status.canManage && status.hasRecoveryKey === false && (

@@ -41,13 +41,14 @@ import { POST as signupPOST } from '@/app/api/auth/signup/route';
 import { POST as loginPOST } from '@/app/api/auth/login/route';
 import { closeCompanyFile, saveCompanyFile, saveCopyAs } from './companyFileSave';
 import { restoreBackup } from './backup';
+import fileCryptoEsm from '@/electron/fileCrypto';
 import { createCustomer } from './customers';
 import { createManualEntry } from './journal';
 import { addUser, resetUserPassword, updateUser } from './users';
 import { createPeriodCopy } from './periodCopy';
 import { restorePortableCompanyFile, unlockPortableBuffer } from './portableFile';
 import { createAccountantCopy } from './accountantCopy/client';
-import { changeFileKey, fileKeyFor, fileKeyRotationPending, syncChallengeSlot } from './fileProtection';
+import { changeFileKey, fileKeyFor, fileKeyRotationPending, protectionStatus, refreshSlotAtSignIn, requestFileKeyRotation, rotateFileKey, syncChallengeSlot, syncPasswordSlot } from './fileProtection';
 import { readSandboxMarker, startSandbox, switchActiveDataDir } from './sandbox';
 import { apiRequest, fileCrypto, fileOpensWith, format, keepCookies, newCompanyFile, openOn, quit, resetLimiters, sessionMod } from './fileProtection.fixture';
 
@@ -226,6 +227,67 @@ describe('the file key changes when a secret stops opening the file', () => {
   }, 120_000);
 });
 
+describe('round 2: slot writes and key changes', () => {
+  it('a slot made while an autosave changes the file key still opens the file (no lockout)', async () => {
+    const dana = (await addUser(ctx(), { name: 'Dana Clerk', login: 'dana', password: 'Dana-Pass-0001', roleKeys: ['ar_clerk'] })).userId;
+    await db.delete(fileKeySlots).where(eq(fileKeySlots.userId, dana)); // as if she never signed in here
+    const realMake = fileCryptoEsm.makeSlot;
+    let changedDuring = false;
+    // The key changes (an autosave applying a pending rotation) while her slot's scrypt runs.
+    const spy = vi.spyOn(fileCryptoEsm, 'makeSlot').mockImplementation(async (o: Parameters<typeof realMake>[0]) => {
+      const slot = await realMake(o);
+      changedDuring = (await rotateFileKey(db, { force: true })).rotated;
+      return slot;
+    });
+    try {
+      const [u] = await db.select().from(users).where(eq(users.id, dana));
+      expect(await refreshSlotAtSignIn(db, { id: dana, passwordHash: u.passwordHash! }, 'Dana-Pass-0001')).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(changedDuring).toBe(true);
+    await saveCompanyFile({ force: true });
+    expect(await fileOpensWith(FILE, 'password', 'Dana-Pass-0001', 'dana')).toBe(true);
+    // And the next key change keeps her (her slot is bound to the current key).
+    await changeFileKey({ db, userId: admin }, { password: PW });
+    await saveCompanyFile({ force: true });
+    expect(await fileOpensWith(FILE, 'password', 'Dana-Pass-0001', 'dana')).toBe(true);
+  }, 120_000);
+
+  it('a slot made by the first protected build is not dropped by an automatic key change: the change waits until it is re-made', async () => {
+    const erin = (await addUser(ctx(), { name: 'Erin Clerk', login: 'erin', password: 'Erin-Pass-0001', roleKeys: ['ar_clerk'] })).userId;
+    // Her slot as the first protected build made it (no public key).
+    const nodeCrypto = await import('node:crypto');
+    const key = fileKeyFor()!;
+    const salt = nodeCrypto.randomBytes(16).toString('base64url');
+    const kdf = fileCrypto.currentKdf();
+    const kek = nodeCrypto.scryptSync('Erin-Pass-0001', Buffer.from(salt, 'base64url'), 32, { N: kdf.N, r: kdf.r, p: kdf.p });
+    const nonce = nodeCrypto.randomBytes(12);
+    const c = nodeCrypto.createCipheriv('aes-256-gcm', kek, nonce);
+    c.setAAD(Buffer.from(`ironbooks-slot/v1\npassword\n${salt}`, 'utf8'));
+    const wrapped = Buffer.concat([c.update(key), c.final(), c.getAuthTag()]);
+    await db.update(fileKeySlots).set({ slot: { kind: 'password', kdf: { ...kdf }, salt, nonce: nonce.toString('base64url'), wrapped: wrapped.toString('base64url') } }).where(eq(fileKeySlots.userId, erin));
+    await saveCompanyFile({ force: true });
+    expect(await fileOpensWith(FILE, 'password', 'Erin-Pass-0001', 'erin')).toBe(true);
+    const status = await protectionStatus({ db, userId: admin });
+    expect(status.users?.find((u) => u.userId === erin)?.oldLayout).toBe(true);
+
+    const before = keyCheckNow();
+    requestFileKeyRotation();
+    await saveCompanyFile({ force: true });
+    expect(keyCheckNow()).toBe(before); // waits
+    expect(fileKeyRotationPending()).toBe(true);
+    expect(await fileOpensWith(FILE, 'password', 'Erin-Pass-0001', 'erin')).toBe(true);
+    // Her next sign-in re-makes the slot; the next save makes the change, and she still opens the file.
+    const [u] = await db.select().from(users).where(eq(users.id, erin));
+    await refreshSlotAtSignIn(db, { id: erin, passwordHash: u.passwordHash! }, 'Erin-Pass-0001');
+    await saveCompanyFile({ force: true });
+    expect(keyCheckNow()).not.toBe(before);
+    expect(fileKeyRotationPending()).toBe(false);
+    expect(await fileOpensWith(FILE, 'password', 'Erin-Pass-0001', 'erin')).toBe(true);
+  }, 120_000);
+});
+
 describe('challenge answers and the encrypted file', () => {
   it('a short answer (signed up with "Pip") gets no key slot; a phrase of 10+ characters does', async () => {
     const slotsOf = async () => db.select().from(fileKeySlots).where(and(eq(fileKeySlots.kind, 'challenge'), eq(fileKeySlots.userId, admin)));
@@ -321,12 +383,46 @@ describe('a reused working copy checks the plain listing of the file', () => {
     expect((await refused.json()).error).toMatch(/integrity check/);
     await quit();
 
+    // The listing changed AND its key check edited, so the check can't be done with this key:
+    // refused too (only the key used just before an unsaved key change is accepted).
+    const bad2 = Buffer.from(bad);
+    const m = format.readCompanyManifest(FILE);
+    const kc = Buffer.from(`"keyCheck": "${m.encryption.keyCheck}"`);
+    const at2 = bad2.indexOf(kc);
+    expect(at2).toBeGreaterThan(0);
+    const other = fileCrypto.keyCheckOf(fileCrypto.generateFileKey());
+    expect(other.length).toBe(m.encryption.keyCheck.length);
+    bad2.write(`"keyCheck": "${other}"`, at2, 'utf8');
+    const e2 = format.readCentralDirectory(bad2).find((x: { name: string }) => x.name === 'ironbooks-company.json');
+    const s2 = e2.offset + 30 + bad2.readUInt16LE(e2.offset + 26) + bad2.readUInt16LE(e2.offset + 28);
+    const crc2 = format.crc32(bad2.subarray(s2, s2 + e2.csize));
+    bad2.writeUInt32LE(crc2, e2.offset + 14);
+    bad2.writeUInt32LE(crc2, bad2.lastIndexOf(Buffer.from('ironbooks-company.json')) - 46 + 16);
+    fs.writeFileSync(FILE, bad2);
+    opened = await openOn(FILE, PC2, 'launch-hardening-2b');
+    expect(opened.sealed).toBe('key');
+    resetLimiters();
+    const refused2 = await loginPOST(apiRequest('POST', '/api/auth/login', { email: 'cleo', password: PW }));
+    expect(refused2.status).toBe(409);
+    await quit();
+
     fs.writeFileSync(FILE, good);
     opened = await openOn(FILE, PC2, 'launch-hardening-3');
     expect(opened.sealed).toBe('key');
     resetLimiters();
     const ok = await loginPOST(apiRequest('POST', '/api/auth/login', { email: 'cleo', password: PW }));
     expect(ok.status).toBe(200);
+
+    // A key change made here but never saved (the app stopped): the company file is still sealed
+    // with the previous key — exactly the one the working copy recorded — and opens.
+    db = await getDb();
+    expect((await rotateFileKey(db, { force: true })).rotated).toBe(true);
+    await quit();
+    opened = await openOn(FILE, PC2, 'launch-hardening-4');
+    expect(opened.sealed).toBe('key');
+    resetLimiters();
+    const again = await loginPOST(apiRequest('POST', '/api/auth/login', { email: 'cleo', password: PW }));
+    expect(again.status).toBe(200);
   }, 180_000);
 });
 
