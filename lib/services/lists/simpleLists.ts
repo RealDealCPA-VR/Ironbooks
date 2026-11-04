@@ -27,6 +27,7 @@ import {
   salesTaxCodes,
   shipViaMethods,
   vehicles,
+  vendors,
 } from '@/lib/db/schema';
 import { Money } from '@/lib/money';
 import {
@@ -431,6 +432,23 @@ async function updateEntryInTx(ctx: ServiceContext, key: SimpleListKey, id: stri
         .where(and(eq(customers.companyId, tx.companyId), eq(customers.salesTaxCodeId, id)))
         .returning({ id: customers.id });
       mirrored = { items: itemRows.length, customers: customerRows.length };
+    }
+    // Vendors and customers linked to a Terms entry keep its label (code, else name) in their
+    // `terms` text (lists/fields.ts): a rename takes them along, so forms that show and send that
+    // text (Enter Bills, invoices) keep naming the entry instead of a label no longer on the list.
+    if (key === 'terms') {
+      const label = (r: Row) => String(r.code ?? r.name ?? '').slice(0, 50);
+      const next = label(row as Row);
+      if (next && next !== label(before)) {
+        await tx.db
+          .update(vendors)
+          .set({ terms: next, updatedAt: new Date() })
+          .where(and(eq(vendors.companyId, tx.companyId), eq(vendors.termsId, id)));
+        await tx.db
+          .update(customers)
+          .set({ terms: next, updatedAt: new Date() })
+          .where(and(eq(customers.companyId, tx.companyId), eq(customers.termsId, id)));
+      }
     }
     await writeAudit(tx, {
       action: 'update',

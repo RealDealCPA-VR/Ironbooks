@@ -34,6 +34,7 @@ import {
   invoiceLines,
   invoices,
   items,
+  paymentTerms,
   salesOrderLines,
   salesOrders,
   salesReceiptLines,
@@ -113,10 +114,14 @@ async function lastBill(ctx: ServiceContext, vendorId: string): Promise<Recalled
       date: bills.date,
       number: bills.billNumber,
       terms: bills.terms,
+      // The Terms list entry the bill was entered with, under its CURRENT name (a renamed entry).
+      termsCode: paymentTerms.code,
+      termsName: paymentTerms.name,
       classId: bills.classId,
       memo: bills.memo,
     })
     .from(bills)
+    .leftJoin(paymentTerms, and(eq(paymentTerms.id, bills.termsId), eq(paymentTerms.companyId, bills.companyId)))
     .where(and(eq(bills.companyId, ctx.companyId), eq(bills.vendorId, vendorId), ne(bills.status, 'void')))
     .orderBy(desc(bills.date), desc(bills.createdAt))
     .limit(1);
@@ -132,7 +137,7 @@ async function lastBill(ctx: ServiceContext, vendorId: string): Promise<Recalled
     id: b.id,
     date: b.date,
     number: b.number,
-    header: { ...EMPTY_HEADER, terms: b.terms, classId: b.classId, memo: b.memo },
+    header: { ...EMPTY_HEADER, terms: (b.termsCode ?? b.termsName)?.slice(0, 50) ?? b.terms, classId: b.classId, memo: b.memo },
     lines: rows.map((l) => {
       if (l.itemId) {
         const qty = Money.of(l.quantity || '1');
