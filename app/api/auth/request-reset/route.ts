@@ -124,7 +124,7 @@ export async function POST(req: NextRequest) {
         if (!(await loadKeyFromChallenge(db, resolveDataDir(), user!.id, challengeAnswer))) {
           return NextResponse.json({ error: PROTECTED_NO_CHALLENGE_MESSAGE, code: 'FORBIDDEN' }, { status: 403 });
         }
-        await finishKeyUnseal();
+        await finishKeyUnseal(db);
       }
     } else if (offlineLocal && (sealed === 'key' || (await readProtection(db)))) {
       // A protected file is never reopened by the single-user rule: only a secret that opens it.

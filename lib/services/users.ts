@@ -18,14 +18,17 @@ import { companies, companyRoles, userCompanies, userRoleAssignments, users } fr
 import { hashPassword } from '@/lib/auth';
 import { assertPasswordAllowed, storeUserPassword } from './passwordPolicy';
 import { endUserSessions } from './sessions';
-import { syncPasswordSlot } from './fileProtection';
+import { requestFileKeyRotation, syncPasswordSlot } from './fileProtection';
 import {
+  ACTIONS,
+  AREA_KEYS,
   ADMIN_ROLE_KEY,
   BUILTIN_ROLES,
   builtinRole,
   normalizeActivities,
   normalizeGrant,
   unionRoles,
+  type ActivityKey,
   type ActivitySet,
   isSubset,
   legacyRoleFor,
@@ -34,7 +37,7 @@ import {
   type RoleDefinition,
   type RoleFlags,
 } from '@/lib/permissions/model';
-import { isActivityKey } from '@/lib/permissions/activities';
+import { activitiesOf, activityDef, isActivityKey, supportedActions } from '@/lib/permissions/activities';
 import {
   definitionsFor,
   effectiveRoleKeys,
@@ -125,7 +128,7 @@ async function membershipRows(ctx: ServiceContext) {
 
 /** All users of the active company with their roles. */
 export async function listUsers(ctx: ServiceContext): Promise<CompanyUser[]> {
-  requirePermission(ctx, 'users', 'view');
+  requirePermission(ctx, 'users.users', 'view');
   const { ownerId, members, byUser } = await membershipRows(ctx);
   const defs = await listRoleDefinitions(ctx.db, ctx.companyId);
   const nameOf = new Map(defs.map((d) => [d.key, d.name]));
@@ -152,7 +155,7 @@ export async function listUsers(ctx: ServiceContext): Promise<CompanyUser[]> {
 
 /** One user with their effective (union) permissions. */
 export async function getUser(ctx: ServiceContext, userId: string): Promise<CompanyUserDetail> {
-  requirePermission(ctx, 'users', 'view');
+  requirePermission(ctx, 'users.users', 'view');
   const list = await listUsers(ctx);
   const u = list.find((x) => x.userId === userId);
   if (!u) throw notFound('User');
@@ -326,7 +329,7 @@ export async function addUser(
     requireChange?: boolean;
   },
 ): Promise<AddedUser> {
-  requirePermission(ctx, 'users', 'create');
+  requirePermission(ctx, 'users.users', 'create');
   const login = normLogin(input.login);
   if (!login) throw validation('Login is required.');
   const defs = await validateRoleKeys(ctx, input.roleKeys);
@@ -398,7 +401,7 @@ export async function updateUser(
   userId: string,
   input: { name?: string; login?: string; roleKeys?: string[]; isActive?: boolean },
 ): Promise<CompanyUser> {
-  requirePermission(ctx, 'users', 'modify');
+  requirePermission(ctx, 'users.users', 'modify');
   const before = (await listUsers({ ...ctx, access: undefined })).find((u) => u.userId === userId);
   if (!before) throw notFound('User');
   await assertCanManageUser(ctx, userId);
@@ -475,6 +478,10 @@ export async function updateUser(
       });
     }
   });
+  // A deactivated user's slot is left out of the next save; a protected file also gets a new
+  // file key then, so their password opens nothing saved from now on — not even through an older
+  // copy of the file (lib/services/fileProtection.ts rotateFileKey).
+  if (input.isActive === false && before.isActive !== false) requestFileKeyRotation();
   return (await listUsers({ ...ctx, access: undefined })).find((u) => u.userId === userId)!;
 }
 
@@ -498,7 +505,7 @@ export async function resetUserPassword(
   password: string,
   opts: { requireChange?: boolean; turnOffTwoFactor?: boolean } = {},
 ): Promise<void> {
-  requirePermission(ctx, 'users', 'modify');
+  requirePermission(ctx, 'users.users', 'modify');
   if (!(await getMembership(ctx, userId))) throw notFound('User');
   await assertCanManageUser(ctx, userId);
   await assertCanChangeSharedLogin(ctx, userId);
@@ -560,7 +567,7 @@ export async function resetUserPassword(
 
 /** Built-in + custom roles with how many users hold each. */
 export async function listRoles(ctx: ServiceContext): Promise<RoleSummary[]> {
-  requirePermission(ctx, 'users', 'view');
+  requirePermission(ctx, 'users.roles', 'view');
   const defs = await listRoleDefinitions(ctx.db, ctx.companyId);
   const members = await listUsers({ ...ctx, access: undefined });
   return defs.map((d) => ({
@@ -591,7 +598,20 @@ function cleanGrant(grant: PermissionGrant): PermissionGrant {
   }
   const out: PermissionGrant = {};
   for (const [area, actions] of Object.entries(normalizeGrant(areaPart))) if (actions.length) out[area as keyof PermissionGrant] = actions;
-  for (const [key, actions] of Object.entries(normalizeActivities(activityPart))) if (actions.length) out[key as keyof PermissionGrant] = actions;
+  const acts = normalizeActivities(activityPart);
+  // Round 2: Full on EVERY activity of an area is stored as the area grant, so the role keeps the
+  // whole area (and gets activities added to the area later), like a role stored per area.
+  const fullAreas = new Set(
+    AREA_KEYS.filter((area) => {
+      const defs = activitiesOf(area);
+      return defs.length > 0 && defs.every((d) => supportedActions(d).every((a) => acts[d.key as ActivityKey].includes(a)));
+    }),
+  );
+  for (const area of fullAreas) out[area as keyof PermissionGrant] = [...ACTIONS];
+  for (const [key, actions] of Object.entries(acts)) {
+    if (!actions.length || fullAreas.has(activityDef(key)!.area)) continue;
+    out[key as keyof PermissionGrant] = actions;
+  }
   return out;
 }
 
@@ -625,7 +645,7 @@ export async function createRole(
     | { cloneFrom: string; name: string; description?: string }
     | { name: string; description?: string; permissions: PermissionGrant; flags?: RoleFlags },
 ): Promise<RoleSummary> {
-  requirePermission(ctx, 'users', 'create');
+  requirePermission(ctx, 'users.roles', 'create');
   let permissions: PermissionGrant;
   let flags: RoleFlags;
   let description = input.description;
@@ -683,7 +703,7 @@ export async function updateRole(
   roleId: string,
   input: { name?: string; description?: string; permissions?: PermissionGrant; flags?: RoleFlags },
 ): Promise<RoleSummary> {
-  requirePermission(ctx, 'users', 'modify');
+  requirePermission(ctx, 'users.roles', 'modify');
   if (builtinRole(roleId)) {
     throw new ServiceError('FORBIDDEN', 'Built-in roles cannot be edited. Clone the role to customize it.');
   }
@@ -736,7 +756,7 @@ export async function updateRole(
 
 /** Delete a custom role. Refused while any user still holds it. */
 export async function deleteRole(ctx: ServiceContext, roleId: string): Promise<void> {
-  requirePermission(ctx, 'users', 'delete');
+  requirePermission(ctx, 'users.roles', 'delete');
   if (builtinRole(roleId)) throw new ServiceError('FORBIDDEN', 'Built-in roles cannot be deleted.');
   const [row] = await ctx.db
     .select()

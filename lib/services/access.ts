@@ -16,9 +16,11 @@ import {
   LEGACY_ROLE_MAP,
   areaLabel,
   builtinRole,
-  can,
   canActivity,
+  canRef,
+  refArea,
   unionRoles,
+  type AccessRef,
   type Action,
   type ActivityAction,
   type ActivityKey,
@@ -184,13 +186,22 @@ export function balancesForContext<T>(ctx: Pick<ServiceContext, 'access'>, activ
   return canSeeBalances(ctx, activity) ? data : hideBalances(data);
 }
 
+/** FORBIDDEN for an area or activity reference (names the activity when there is one). */
+function deniedFor(ref: AccessRef, action: Action): ServiceError {
+  return permissionDenied(refArea(ref), action, activityDef(ref) ? ref : undefined);
+}
+
 /**
  * Service-level guard. Contexts without `access` (tests, system jobs, the Electron internal
  * token) are trusted and pass — exactly like the legacy `ctx.role` convention.
+ *
+ * `ref` is an AREA (the action is then needed on the whole area: every activity of it — fail
+ * closed for roles built per activity, exactly the old answer for area-stored roles) or one
+ * ACTIVITY ('vendors.bills') when the thing checked belongs to one (prefsperms review P1).
  */
-export function requirePermission(ctx: ServiceContext, area: Area, action: Action): void {
+export function requirePermission(ctx: ServiceContext, ref: AccessRef, action: Action): void {
   if (!ctx.access) return;
-  if (!can(ctx.access, area, action)) throw permissionDenied(area, action);
+  if (!canRef(ctx.access, ref, action)) throw deniedFor(ref, action);
 }
 
 /**
@@ -202,7 +213,7 @@ export function requirePermission(ctx: ServiceContext, area: Area, action: Actio
  */
 export async function requireEffectivePermission(
   ctx: ServiceContext,
-  area: Area,
+  area: AccessRef,
   action: Action,
 ): Promise<EffectiveAccess> {
   let access = ctx.access;
@@ -214,7 +225,7 @@ export async function requireEffectivePermission(
     }
     access = r.access;
   }
-  if (!can(access, area, action)) throw permissionDenied(area, action);
+  if (!canRef(access, area, action)) throw deniedFor(area, action);
   return access;
 }
 
@@ -281,7 +292,7 @@ export async function requireFileAdmin(
 export async function requireAccessInCompany(
   ctx: Pick<ServiceContext, 'db' | 'userId'>,
   companyId: string,
-  area: Area,
+  area: AccessRef,
   action: Action,
 ): Promise<EffectiveAccess> {
   if (!ctx.userId) throw new ServiceError('FORBIDDEN', 'Authentication required.');
@@ -293,6 +304,6 @@ export async function requireAccessInCompany(
   if (!r.member || !r.active) {
     throw new ServiceError('FORBIDDEN', 'You do not have access to that company.');
   }
-  if (!can(r.access, area, action)) throw permissionDenied(area, action);
+  if (!canRef(r.access, area, action)) throw deniedFor(area, action);
   return r.access;
 }

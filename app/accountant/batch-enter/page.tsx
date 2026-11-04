@@ -610,8 +610,9 @@ export default function BatchEnterPage() {
                         tabIndex={-1}
                         onClick={() => removeRow(i)}
                         className="rounded p-1 text-navy/30 hover:bg-red-50 hover:text-red-600"
-                        aria-label={`Delete row ${i + 1}`}
-                        title="Delete this row (Ctrl+D)"
+                        aria-label={`Remove row ${i + 1}`}
+                        data-activity-skip
+                        title="Remove this row (Ctrl+D)"
                       >
                         <Trash2 className="h-4 w-4" />
                       </button>

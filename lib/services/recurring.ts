@@ -19,17 +19,18 @@
  */
 
 import { and, eq, lte } from 'drizzle-orm';
-import { recurringTemplates, customers, vendors } from '@/lib/db/schema';
+import { recurringTemplates, customers, vendors, items, accounts, salesTaxCodes, classes } from '@/lib/db/schema';
 import {
   type ServiceContext,
   ServiceError,
+  assertRefInCompany,
   inTransaction,
   notFound,
   validation,
   writeAudit,
 } from './_base';
 import { requireEffectivePermission } from './access';
-import { can, type Area } from '@/lib/permissions/model';
+import { canRef, type AccessRef } from '@/lib/permissions/model';
 import { createInvoice, type CreateInvoiceInput } from './invoices';
 import { createBill, type CreateBillInput } from './bills';
 import { createManualEntry, type ManualEntryInput } from './journal';
@@ -72,20 +73,21 @@ export type DocType = (typeof DOC_TYPES)[number];
  * document's own create route in lib/permissions/routes.ts). /api/recurring/run only requires
  * Accounting, so Enter Now / Enter Group / Run due must also hold the document's own right.
  */
-const DOC_AREA: Record<DocType, Area> = {
-  invoice: 'customers',
-  estimate: 'customers',
-  sales_order: 'customers',
-  sales_receipt: 'customers',
-  credit_memo: 'customers',
-  bill: 'vendors',
-  purchase_order: 'vendors',
-  vendor_credit: 'vendors',
-  expense: 'banking',
-  check: 'banking',
-  deposit: 'banking',
-  journal_entry: 'accounting',
-  transfer: 'accounting',
+const DOC_AREA: Record<DocType, AccessRef> = {
+  // prefsperms: the document's own activity (Invoices, Enter Bills, Write Checks, …).
+  invoice: 'customers.invoices',
+  estimate: 'customers.estimates',
+  sales_order: 'customers.sales_orders',
+  sales_receipt: 'customers.sales_receipts',
+  credit_memo: 'customers.credit_memos',
+  bill: 'vendors.bills',
+  purchase_order: 'vendors.purchase_orders',
+  vendor_credit: 'vendors.vendor_credits',
+  expense: 'banking.write_checks',
+  check: 'banking.write_checks',
+  deposit: 'banking.deposits',
+  journal_entry: 'accounting.journal_entries',
+  transfer: 'accounting.transfers',
 };
 
 const DOC_LABEL_PLURAL: Record<DocType, string> = {
@@ -433,15 +435,16 @@ function parseRunDate(v: string | Date | null | undefined): Date | null {
  */
 async function assertMayAutomate(ctx: ServiceContext, docType: string): Promise<void> {
   if (!ctx.access) return;
-  await requireEffectivePermission(ctx, 'accounting', 'create');
+  await requireEffectivePermission(ctx, 'accounting.memorized_run', 'create');
   const area = DOC_AREA[docType as DocType];
   if (area) await requireEffectivePermission(ctx, area, 'create');
 }
 
 /**
- * Memorizing a document runs the payload through the same checks the document's own create
- * service applies to its identity fields (the name must exist in this company) and its lines,
- * so a typo is refused when it is memorized — not months later when the recurrence fires.
+ * Memorizing an estimate / sales order / vendor credit checks what would otherwise fail only when
+ * the recurrence fires: the name must exist in this company, there must be at least one line, and
+ * every item / account / Sales Tax Code / class a line names must be this company's. (Amounts and
+ * the rest of the create rules are applied by the document's own service when it is entered.)
  */
 async function validateDocPayload(
   tx: ServiceContext,
@@ -468,6 +471,11 @@ async function validateDocPayload(
       if (!line || typeof line !== 'object' || Array.isArray(line)) {
         throw validation('Each line must be an object.');
       }
+      const l = line as Record<string, unknown>;
+      if (l.itemId) await assertRefInCompany(tx, items, String(l.itemId), 'Item');
+      if (l.accountId) await assertRefInCompany(tx, accounts, String(l.accountId), 'Account');
+      if (l.salesTaxCodeId) await assertRefInCompany(tx, salesTaxCodes, String(l.salesTaxCodeId), 'Sales tax code');
+      if (l.classId) await assertRefInCompany(tx, classes, String(l.classId), 'Class');
     }
   }
 }
@@ -642,7 +650,7 @@ async function generateFromTemplate(
   let docId: string;
   // No-op for trusted contexts without `access` (the desktop launch-time / hourly run).
   const area = DOC_AREA[template.docType as DocType];
-  if (area && ctx.access && !can(ctx.access, area, 'create')) {
+  if (area && ctx.access && !canRef(ctx.access, area, 'create')) {
     throw new ServiceError(
       'FORBIDDEN',
       `You don't have permission to create ${DOC_LABEL_PLURAL[template.docType as DocType]}.`,

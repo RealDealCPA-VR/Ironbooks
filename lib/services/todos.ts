@@ -19,7 +19,7 @@
  */
 import { and, asc, eq, inArray, isNull, lte, or } from 'drizzle-orm';
 import { customers, employees, items, leads, otherNames, todos, userCompanies, vendors } from '@/lib/db/schema';
-import { can, type Area } from '@/lib/permissions/model';
+import { canRef, type AccessRef } from '@/lib/permissions/model';
 import { isRealIsoDay } from '@/lib/validation/prefs';
 import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from './_base';
 import { entityDisplayName, type LinkEntityType } from './lists/notes';
@@ -33,14 +33,14 @@ export type TodoKind = (typeof TODO_KINDS)[number];
 export type TodoStatus = (typeof TODO_STATUSES)[number];
 export type TodoEntityType = (typeof TODO_ENTITY_TYPES)[number];
 
-/** Which permission area a linked record belongs to. */
-export const TODO_ENTITY_AREA: Record<TodoEntityType, Area> = {
-  customer: 'customers',
-  lead: 'customers',
-  vendor: 'vendors',
-  employee: 'payroll',
-  other_name: 'lists',
-  item: 'lists',
+/** Which permission activity (prefsperms: the record's own list) a linked record belongs to. */
+export const TODO_ENTITY_AREA: Record<TodoEntityType, AccessRef> = {
+  customer: 'customers.center',
+  lead: 'customers.leads',
+  vendor: 'vendors.center',
+  employee: 'payroll.employees',
+  other_name: 'lists.other_lists',
+  item: 'lists.items',
 };
 
 /** A to-do as every caller sees it: the stored row plus the old Lists field names. */
@@ -166,7 +166,7 @@ function checkInput(input: TodoInput, creating: boolean) {
 export function canSeeTodoLink(ctx: ServiceContext, entityType: string | null | undefined): boolean {
   if (!entityType || !ctx.access) return true;
   const area = TODO_ENTITY_AREA[entityType as TodoEntityType];
-  return area ? can(ctx.access, area, 'view') : true;
+  return area ? canRef(ctx.access, area, 'view') : true;
 }
 
 /** Display name of a linked record (throws NOT_FOUND when it isn't in this company). */

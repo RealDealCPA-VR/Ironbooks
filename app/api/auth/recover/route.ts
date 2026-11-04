@@ -86,7 +86,7 @@ async function handlePost(req: NextRequest) {
       }
       // Proves the key whether or not this server already holds the file key.
       if (!(await loadKeyFromRecovery(db, resolveDataDir(), recoveryKey))) return fail();
-      await finishKeyUnseal();
+      await finishKeyUnseal(db);
     }
     limiter.recordSuccess(keys.slice(0, -1));
 

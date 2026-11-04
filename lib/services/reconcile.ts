@@ -1479,8 +1479,8 @@ export interface DiscrepancyRow {
   debit: string | null;
   credit: string | null;
   /**
-   * What the change did to the reconciled balance: for a voided transaction the natural-side
-   * amount the void removed; for a changed one its effect (new amount - reconciled amount).
+   * QB "Effect of Change": what the change did to the reconciled balance — new amount minus
+   * reconciled amount for every kind of change (a voided −800.00 check: +800.00).
    */
   amount: string;
   voidedAt: Date | null;
@@ -1561,7 +1561,8 @@ export async function reconciliationDiscrepancies(
         description: r.description,
         debit: r.debit,
         credit: r.credit,
-        amount: toAmountString(amount),
+        // Effect of Change = 0.00 now − the reconciled amount (as for changed rows).
+        amount: toAmountString(amount.negated()),
         voidedAt: r.voidedAt,
         changeType: 'void' as const,
         reconciledAmount: toAmountString(amount),

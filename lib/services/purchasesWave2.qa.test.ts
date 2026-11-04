@@ -414,10 +414,10 @@ describe('wave2 purchases — QA', () => {
       await expect(
         updateBillPayment(ctx, pay.id, { ...base, reference: '3002', applications: [{ billId: bill.id, amountApplied: '300.00' }] }),
       ).rejects.toThrow(/reconciliation/);
-      // Changing the date of a cleared check is blocked too.
-      await expect(
-        updateBillPayment(ctx, pay.id, { ...base, date: d('2026-02-06'), reference: '3002', applications: [{ billId: bill.id, amountApplied: '400.00' }] }),
-      ).rejects.toThrow(/reconciliation/);
+      // A date-only change keeps the cleared bank line as it was: saved without a question (as for
+      // checks, reconciledEdits.ts), and the payment stays reconciled.
+      const redated = await updateBillPayment(ctx, pay.id, { ...base, date: d('2026-02-06'), reference: '3002', applications: [{ billId: bill.id, amountApplied: '400.00' }] });
+      expect(new Date(redated.date).toISOString().slice(0, 10)).toBe('2026-02-06');
       expect((await getBill(ctx, bill.id)).status).toBe('paid');
       await invariants();
     });

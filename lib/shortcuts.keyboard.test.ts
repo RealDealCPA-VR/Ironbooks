@@ -36,8 +36,16 @@ describe('formShortcutFor', () => {
     expect(formShortcutFor(k('Escape'))).toBe('cancel');
   });
 
-  it('uses the physical key when Ctrl+Alt turns S into another character (AltGr layouts)', () => {
-    expect(formShortcutFor(k('ś', { ctrlKey: true, altKey: true, code: 'KeyS' }))).toBe('save-new');
+  it('uses the physical key when Ctrl+Alt turns S into a letter of a non-Latin layout (Cyrillic)', () => {
+    expect(formShortcutFor(k('ы', { ctrlKey: true, altKey: true, code: 'KeyS' }))).toBe('save-new');
+  });
+
+  it('an AltGr character types; it is never Ctrl+Alt+S (Polish AltGr+S "ś")', () => {
+    expect(formShortcutFor(k('ś', { ctrlKey: true, altKey: true, code: 'KeyS' }))).toBeNull();
+    expect(formShortcutFor(k('Ś', { ctrlKey: true, altKey: true, shiftKey: true, code: 'KeyS' }))).toBeNull();
+    // The browser says AltGr is down: never a shortcut, whatever the letter.
+    const altGr = { getModifierState: (m: string) => m === 'AltGraph' };
+    expect(formShortcutFor(k('ы', { ctrlKey: true, altKey: true, code: 'KeyS', ...altGr }))).toBeNull();
   });
 
   it("maps QB's underlined form-button letters (Alt+S / A / R / P / N)", () => {
@@ -146,6 +154,19 @@ describe('pickShortcutButton', () => {
 });
 
 describe('gridKeyAction (line grids)', () => {
+  it('Ctrl+Alt+Y / V copy and paste a line; AltGr characters type instead (Hungarian AltGr+V "@")', () => {
+    const text = { tag: 'INPUT', type: 'text' };
+    const ca = { ctrlKey: true, altKey: true };
+    expect(gridKeyAction(k('y', ca), text)).toBe('copy-line');
+    expect(gridKeyAction(k('v', ca), text)).toBe('paste-line');
+    expect(gridKeyAction(k('м', { ...ca, code: 'KeyV' }), text)).toBe('paste-line'); // Russian layout: the physical key
+    expect(gridKeyAction(k('@', { ...ca, code: 'KeyV' }), text)).toBeNull();
+    expect(gridKeyAction(k('€', { ...ca, code: 'KeyY' }), text)).toBeNull();
+    expect(gridKeyAction(k('ł', { ...ca, code: 'KeyV' }), text)).toBeNull();
+    const altGr = { getModifierState: (m: string) => m === 'AltGraph' };
+    expect(gridKeyAction(k('м', { ...ca, code: 'KeyV', ...altGr }), text)).toBeNull();
+  });
+
   const text = { tag: 'INPUT', type: 'text' };
   it('Ctrl+Insert inserts; Ctrl+D (QB Delete Line) and Ctrl+Delete delete the line', () => {
     expect(gridKeyAction(k('Insert', { ctrlKey: true }), text)).toBe('insert');

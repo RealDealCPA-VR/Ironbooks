@@ -58,6 +58,7 @@ import { createDeposit, updateDeposit, voidDeposit, getDeposit, CASHBACK_LINE_PR
 import type { PostingLine } from '../posting';
 import { currentVersion, withVersionCheck, type VersionedEntity } from '../concurrency';
 import { assertFilePassword, createPortableCompanyFile, protectPortableBuffer } from '../portableFile';
+import { assertCopyPasswordGiven } from '../fileProtection';
 import { trialBalance } from '../reports';
 import { getClosingDateSettings } from '../company';
 import {
@@ -177,6 +178,8 @@ export async function createAccountantCopy(
 ): Promise<TransferFileResult> {
   assertOwnerOrAdmin(ctx, "create an Accountant's Copy (it contains every user and password of the file)");
   if (input.password != null) assertFilePassword(input.password);
+  // A company file protected with passwords: its transfer file is protected too (filecrypto).
+  await assertCopyPasswordGiven(ctx.db, input.password);
   const dividingDate = String(input.dividingDate ?? '').trim();
   if (!DATE_RE.test(dividingDate) || isNaN(new Date(`${dividingDate}T00:00:00.000Z`).getTime())) {
     throw validation('Enter the dividing date as a date (YYYY-MM-DD).');
@@ -277,6 +280,7 @@ async function buildTransferFile(
  */
 export async function saveTransferFileAgain(ctx: ServiceContext, input: { dataDir?: string; password?: string | null } = {}): Promise<TransferFileResult> {
   assertOwnerOrAdmin(ctx, "save the Accountant's Copy (it contains every user and password of the file)");
+  await assertCopyPasswordGiven(ctx.db, input.password);
   const status = await accountantCopyStatus(ctx);
   if (status.mode === 'accountant') {
     throw new ServiceError('CONFLICT', "This file is itself an Accountant's Copy. Only your client's original file can save its transfer file.");

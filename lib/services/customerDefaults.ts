@@ -62,7 +62,11 @@ export async function applyCustomerTaxDefaults<T extends TaxableDoc>(
   opts: { defaultRate?: boolean } = {},
 ): Promise<T> {
   const d = await customerTaxDefaults(ctx, input.customerId);
-  if (!d) return input;
+  if (!d) {
+    // No customer (a walk-in sales receipt): the lines still get the item's code and a stated
+    // code must be this company's (B9 is enforced on every sales document, not only named ones).
+    return Array.isArray(input.lines) ? { ...input, lines: await applyLineTaxCodes(ctx, input.lines, null) } : input;
+  }
   let out: T = input;
   if (opts.defaultRate && input.taxRateId === undefined && d.taxRateId && (await salesTaxOn(ctx))) {
     out = { ...out, taxRateId: d.taxRateId };

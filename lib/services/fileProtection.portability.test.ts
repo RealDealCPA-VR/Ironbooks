@@ -152,7 +152,7 @@ describe('a protected company file is portable to a fresh install', () => {
         password: 'Bakery-Pass-2026',
         companyName: 'Marigold Bakery',
         challengeQuestion: 'Name of your first pet',
-        challengeAnswer: 'Biscuit',
+        challengeAnswer: 'Biscuit the corgi',
       }),
     );
     expect(res.status).toBe(201);
@@ -248,7 +248,7 @@ describe('a protected company file is portable to a fresh install', () => {
 
   it('the recovery key and the challenge answer each open the file on their own', async () => {
     const m = format.readCompanyManifest(FILE);
-    expect(await fileCrypto.unlockWith(m.encryption, { kind: 'challenge', login: 'pat', secret: 'biscuit' })).not.toBeNull();
+    expect(await fileCrypto.unlockWith(m.encryption, { kind: 'challenge', login: 'pat', secret: 'biscuit the corgi' })).not.toBeNull();
     expect(await fileCrypto.unlockWith(m.encryption, { kind: 'challenge', login: 'pat', secret: 'cookie' })).toBeNull();
   });
 });

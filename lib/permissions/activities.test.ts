@@ -30,6 +30,7 @@ import {
 import { API_ROUTE_PERMISSIONS, PAGE_AREAS, apiActivityFor, pageAccessFor, pageAreasFor, type HttpMethod } from './routes';
 import { authorizeRequest } from './enforce';
 import { activityForRoute } from './routeActivities';
+import { REPORT_CATALOG, reportActivity } from '@/lib/reports/catalog';
 
 const UUID = '11111111-2222-4333-8444-555555555555';
 const SAMPLE: Record<string, string> = {
@@ -172,7 +173,7 @@ describe('upgrade: roles stored before activities keep exactly the same access',
       }
     }
     expect(diffs.slice(0, 20)).toEqual([]);
-  });
+  }, 300_000); // every role x every route: slow on CI runners
 
   it('every page answers the same as the old area check', () => {
     const diffs: string[] = [];
@@ -193,6 +194,11 @@ describe('upgrade: roles stored before activities keep exactly the same access',
     for (const r of roles) {
       const access = unionRoles([r]);
       expect(access.permissions).toEqual(normalizeGrant(r.permissions));
+      // can() (requirePermission, member / self routes, undo, view filters) answers exactly as before.
+      const old = normalizeGrant(r.permissions);
+      for (const area of AREA_KEYS) {
+        for (const action of ACTIONS) expect(can(access, area, action), `${r.key} ${area} ${action}`).toBe(old[area].includes(action));
+      }
       for (const def of ACTIVITIES) {
         if (!def.viewBalance) continue;
         expect(canActivity(access, def.key, 'view_balance')).toBe(access.permissions[def.area].includes('view'));
@@ -212,10 +218,73 @@ describe('per-activity rights', () => {
     expect(decide('/api/export/statements/batch', 'GET', access)).toBe(false);
     expect(decide('/invoices', 'GET', access)).toBe(true);
     expect(decide('/payments', 'GET', access)).toBe(false);
-    // The coarse area answer is still "can view Customers & Receivables" (any activity).
-    expect(can(access, 'customers', 'view')).toBe(true);
-    // A route no activity is mapped to would need the whole area.
+    // An area-level check (services, member routes) needs the action on the WHOLE area: Invoices
+    // alone is not "Customers & Receivables".
+    expect(can(access, 'customers', 'view')).toBe(false);
+    expect(can(access, 'customers', 'create')).toBe(false);
     expect(canWholeArea(access, 'customers', 'create')).toBe(false);
+  });
+
+  it('activity-only roles never pass an area-level check through another activity (review P1)', () => {
+    // Form Templates: Delete is not Delete on Company & Preferences (archive the company file).
+    const templates = unionRoles([role({ 'company.templates': ['view', 'delete'] })]);
+    expect(can(templates, 'company', 'delete')).toBe(false);
+    expect(canActivity(templates, 'company.company_file', 'delete')).toBe(false);
+    // Budgets: Modify does not rename the company.
+    const budgets = unionRoles([role({ 'company.budgets': ['view', 'modify'] })]);
+    expect(can(budgets, 'company', 'modify')).toBe(false);
+    expect(canActivity(budgets, 'company.company_file', 'modify')).toBe(false);
+    // Purchase Orders: Create is not Vendors & Payables: Create (save a receipt as a bill).
+    const po = unionRoles([role({ 'vendors.purchase_orders': ['view', 'create'] })]);
+    expect(can(po, 'vendors', 'create')).toBe(false);
+    expect(can(po, 'vendors', 'view')).toBe(false);
+    // Receive Payments without Delete, even with Invoices: Full.
+    const pay = unionRoles([role({ 'customers.invoices': ['full'], 'customers.payments': ['view', 'create'] })]);
+    expect(can(pay, 'customers', 'delete')).toBe(false);
+    // Every activity of the area with the right: the area check passes.
+    const allVendors: PermissionGrant = {};
+    for (const d of activitiesOf('vendors')) (allVendors as Record<string, string[]>)[d.key] = ['view', 'create'];
+    expect(can(unionRoles([role(allVendors)]), 'vendors', 'create')).toBe(true);
+    // Mixed: an old-style area grant plus one activity is still only the area grant.
+    const mixed = unionRoles([role({ vendors: ['view'] }), role({ 'vendors.bills': ['view', 'create'] })]);
+    expect(can(mixed, 'vendors', 'view')).toBe(true);
+    expect(can(mixed, 'vendors', 'create')).toBe(false);
+    expect(canActivity(mixed, 'vendors.bills', 'create')).toBe(true);
+  });
+
+  it('report hub pages (QuickZoom, open source form, Report Center) open with ANY report activity (round 2 P1)', () => {
+    for (const grant of [
+      { 'reports_financial.company': ['view', 'print'] },
+      { 'reports_sales.receivables': ['view'] },
+      { 'reports_purchases.payables': ['view'] },
+    ] as PermissionGrant[]) {
+      const access = unionRoles([role(grant)]);
+      for (const page of ['/reports', '/reports/std', '/reports/drilldown', '/reports/open', '/reports/memorized', '/reports/commented']) {
+        expect(decide(page, 'GET', access), `${JSON.stringify(grant)} ${page}`).toBe(true);
+      }
+    }
+    // No report right at all: still refused.
+    expect(decide('/reports/drilldown', 'GET', unionRoles([role({ 'customers.invoices': ['view'] })]))).toBe(false);
+    // System Accounts: an Accountant Center Tools role may call /api/account-roles, so it opens the page.
+    expect(decide('/system-accounts', 'GET', unionRoles([role({ 'accounting.accountant_tools': ['view'] })]))).toBe(true);
+  });
+
+  it('My Preferences (send-from address, Bcc me) is open to every role; Company Preferences is not', () => {
+    for (const key of ['ar_clerk', 'ap_clerk', 'banking', 'payroll_processor', 'reports_only']) {
+      const access = unionRoles([BUILTIN_ROLES.find((r) => r.key === key)!]);
+      expect(decide('/my-preferences', 'GET', access), key).toBe(true);
+      expect(decide('/api/preferences/my', 'PATCH', access), key).toBe(true);
+      expect(decide('/settings', 'GET', access), key).toBe(false);
+    }
+  });
+
+  it('the company file itself (rename / archive) is its own activity, given to every old Company grant', () => {
+    expect(supportedActions(activityDef('company.company_file')!)).toEqual(['view', 'modify', 'delete']);
+    const accountant = unionRoles([BUILTIN_ROLES.find((r) => r.key === 'accountant')!]);
+    expect(canActivity(accountant, 'company.company_file', 'modify')).toBe(true);
+    expect(canActivity(accountant, 'company.company_file', 'delete')).toBe(false);
+    const admin = unionRoles([BUILTIN_ROLES.find((r) => r.key === 'admin')!]);
+    expect(canActivity(admin, 'company.company_file', 'delete')).toBe(true);
   });
 
   it('Statements alone: print statements, nothing else', () => {
@@ -256,5 +325,38 @@ describe('per-activity rights', () => {
     const wantsInvoices = unionRoles([role({ 'customers.invoices': ['view', 'create'] })]);
     expect(isSubset(wantsInvoices, manager)).toBe(true);
     expect(isSubset(wantsPayments, manager)).toBe(false);
+  });
+});
+
+describe('reports: every catalog report needs an activity of its own area', () => {
+  it('reportActivity maps every REPORT_CATALOG entry (a new report area would otherwise be a 500)', () => {
+    const problems: string[] = [];
+    for (const e of REPORT_CATALOG) {
+      let k: string | null = null;
+      try {
+        k = reportActivity(e);
+      } catch (err) {
+        problems.push(`${e.key}: ${(err as Error).message}`);
+        continue;
+      }
+      if (activityDef(k)?.area !== e.area) problems.push(`${e.key}: ${k} is not in ${e.area}`);
+    }
+    expect(problems).toEqual([]);
+  });
+
+  it('a report needs the same activity in the catalog (standard viewer) as on its own page and route', () => {
+    // Check Detail, Deposit Detail and Missing Checks are Banking Reports, not Company & Financial.
+    for (const k of ['check-detail', 'deposit-detail', 'missing-checks']) {
+      expect(reportActivity(REPORT_CATALOG.find((e) => e.key === k)!)).toBe('reports_financial.banking');
+    }
+    const problems: string[] = [];
+    for (const e of REPORT_CATALOG) {
+      const want = reportActivity(e);
+      const route = apiActivityFor(`/api/reports/${e.key}`, 'GET');
+      if (route && activityDef(route)?.area === e.area && route !== want) problems.push(`/api/reports/${e.key}: ${route} vs catalog ${want}`);
+      const page = pageAccessFor(`/reports/${e.key}`)?.activities;
+      if (page?.length === 1 && activityDef(page[0])?.area === e.area && page[0] !== want) problems.push(`/reports/${e.key}: ${page[0]} vs catalog ${want}`);
+    }
+    expect(problems).toEqual([]);
   });
 });

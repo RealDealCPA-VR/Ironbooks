@@ -26,11 +26,11 @@
  *
  * A PASSWORD (filecrypto; offered, on by default): the whole file is encrypted under it
  * (electron/fileCrypto.js sealWithPassword) and opening it needs it (unlockPortableBuffer). A
- * password-protected portable file of a company file protected with passwords also carries the
- * file key (`file-key.json`, inside the encryption), so the company file restored from it is
- * protected again from its first write, with the same user names, passwords and recovery key.
- * Without a password the file is plain (the person chose so) and never carries the key: the
- * restored books open with a user's password, which unwraps the key from that user's slot.
+ * portable file of a company file protected with passwords MUST have a password (its copies are
+ * protected too) and carries the copy's OWN file key (`file-key.json`, inside the encryption; the
+ * original file's key never leaves it), with every slot of the file re-wrapped for it — so the
+ * company file restored from it is protected again from its first write, with the same user
+ * names, passwords and recovery key. A file without passwords may be saved without one.
  */
 import AdmZip from 'adm-zip';
 import fs from 'node:fs';
@@ -45,7 +45,7 @@ import { ServiceError, type ServiceContext } from './_base';
 import { allowLedgerRewriteRaw } from './posting';
 import { trialBalance } from './reports';
 import { TRANSACTION_LOG_FILE, transactionLogPath, readAllTransactionLog } from './transactionLog';
-import { adoptCarriedKey, fileKeyFor, readProtection } from './fileProtection';
+import { adoptCarriedKey, adoptCopyKey, copyKeyFor, type CarriedCopyKey } from './fileProtection';
 import fileCrypto from '@/electron/fileCrypto';
 import pkg from '@/package.json';
 
@@ -384,13 +384,12 @@ export async function createPortableCompanyFile(
     transactionLog,
   };
   add(PORTABLE_MANIFEST_ENTRY, Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'));
-  // A protected company file's key travels only inside an encrypted portable / transfer file.
+  // A protected company file: the copy gets its OWN file key, with every slot that opens this
+  // file re-wrapped for it (same user names, passwords and recovery key) — carried only inside an
+  // encrypted portable / transfer file. This file's own key never leaves it.
   if (opts.password || opts.carryFileKey) {
-    const prot = await readProtection(db);
-    const key = prot ? fileKeyFor(dataDir) : null;
-    if (prot && key && fileCrypto.keyCheckOf(key) === prot.keyCheck) {
-      add(PORTABLE_KEY_ENTRY, Buffer.from(JSON.stringify({ keyCheck: prot.keyCheck, fileKey: key.toString('base64') }), 'utf8'));
-    }
+    const carried = await copyKeyFor(db, dataDir, ctx.userId ?? null);
+    if (carried) add(PORTABLE_KEY_ENTRY, Buffer.from(JSON.stringify(carried), 'utf8'));
   }
   zip.addFile(
     PORTABLE_CHECKSUMS_ENTRY,
@@ -751,15 +750,21 @@ export async function restorePortableCompanyFile(
       'utf8',
     );
 
-    // A protected company file's key carried inside a password-protected portable file: the
-    // restored books are protected again (same key, same slots), from their first write.
+    // The copy's own key carried inside a password-protected portable file (copyKeyFor): the
+    // restored books are protected again from their first write, opened by the same user names,
+    // passwords and recovery key as the file they were copied from. (Files made by the first
+    // protected version carried the original key itself: still adopted.)
     let keyAdopted = false;
     const keyEntry = zip.getEntry(PORTABLE_KEY_ENTRY);
     if (keyEntry) {
       try {
-        const k = JSON.parse(zip.readAsText(keyEntry)) as { fileKey?: string };
-        const key = typeof k.fileKey === 'string' ? Buffer.from(k.fileKey, 'base64') : null;
-        keyAdopted = Boolean(key && key.length === 32 && (await adoptCarriedKey(db, dir, key)));
+        const k = JSON.parse(zip.readAsText(keyEntry)) as { v?: number; fileKey?: string };
+        if (k.v === 2) {
+          keyAdopted = await adoptCopyKey(db, dir, k as CarriedCopyKey);
+        } else {
+          const key = typeof k.fileKey === 'string' ? Buffer.from(k.fileKey, 'base64') : null;
+          keyAdopted = Boolean(key && key.length === 32 && (await adoptCarriedKey(db, dir, key)));
+        }
       } catch {
         keyAdopted = false;
       }

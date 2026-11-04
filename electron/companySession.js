@@ -42,6 +42,56 @@ function workingRoot({ platform = process.platform, env = process.env, userData 
   return path.join(userData || path.join(require('node:os').homedir(), '.ironbooks'), 'Working');
 }
 
+/**
+ * Where "Try it on a copy" sandboxes live (lib/services/sandbox.ts): next to the working copies —
+ * on Windows %LOCALAPPDATA%\Ironbooks\Sandboxes, never the roaming profile, since a sandbox of a
+ * protected company file is plain text like its working copy.
+ */
+function sandboxRoot(opts = {}) {
+  return path.join(path.dirname(workingRoot(opts)), 'Sandboxes');
+}
+
+/** lib/services/sandbox.ts SANDBOX_CONTAINER_MARKER. */
+const SANDBOX_CONTAINER_MARKER = '.ironbooks-sandbox-container';
+
+/**
+ * Sandboxes made by earlier versions lived in the roaming profile (<userData>/sandboxes): move each
+ * sandbox container to `newRoot` (same disk: a rename), except one holding a folder in `keep` (the
+ * sandbox the app is running on right now; it moves the next time). Best effort; returns the
+ * containers moved.
+ */
+function moveLegacySandboxes(oldRoot, newRoot, keep = []) {
+  if (!oldRoot || pathKey(oldRoot) === pathKey(newRoot)) return [];
+  let names = [];
+  try {
+    names = fs.readdirSync(oldRoot);
+  } catch {
+    return [];
+  }
+  const moved = [];
+  for (const n of names) {
+    const from = path.join(oldRoot, n);
+    try {
+      if (!fs.statSync(from).isDirectory() || !fs.existsSync(path.join(from, SANDBOX_CONTAINER_MARKER))) continue;
+      const fromKey = pathKey(from);
+      if (keep.some((k) => k && (pathKey(k) === fromKey || pathKey(k).startsWith(fromKey + path.sep)))) continue;
+      const to = path.join(newRoot, n);
+      if (fs.existsSync(to)) continue;
+      fs.mkdirSync(newRoot, { recursive: true });
+      fs.renameSync(from, to);
+      moved.push(to);
+    } catch {
+      /* in use, or on another disk: it is tried again the next time */
+    }
+  }
+  try {
+    if (!fs.readdirSync(oldRoot).length) fs.rmdirSync(oldRoot);
+  } catch {
+    /* best effort */
+  }
+  return moved;
+}
+
 /** Same path, same key — case-insensitively on Windows and macOS. */
 function pathKey(filePath, platform = process.platform) {
   const abs = path.resolve(filePath);
@@ -497,7 +547,7 @@ function discardProtectedWorkingData(workDir, companyFile) {
  * copies made before a restore, scheduled report exports — and is never deleted with the cache.
  */
 function isCacheEntry(name) {
-  return name === 'data' || name === STATE_FILE || (name.startsWith(`${STATE_FILE}.`) && name.endsWith('.tmp')) || /^data\.(restore-tmp|pre-restore|refused-restore|unseal)-\d+$/.test(name);
+  return name === 'data' || name === STATE_FILE || (name.startsWith(`${STATE_FILE}.`) && name.endsWith('.tmp')) || /^data\.(restore-tmp|pre-restore|refused-restore|unseal|period-copy)-\d+$/.test(name);
 }
 
 /** Remove the cache of working copies not used for a long time, except `keep` (best effort). */
@@ -549,6 +599,8 @@ module.exports = {
   STATE_FILE,
   STATE_SCHEMA,
   workingRoot,
+  sandboxRoot,
+  moveLegacySandboxes,
   workingDirFor,
   readState,
   writeState,

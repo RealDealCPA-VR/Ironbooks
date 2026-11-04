@@ -8,7 +8,7 @@
  */
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { eq } from 'drizzle-orm';
-import { billLines, customers, itemReceiptLines } from '@/lib/db/schema';
+import { billLines, customers, itemReceiptLines, itemReceipts, journalEntryLines } from '@/lib/db/schema';
 import { ServiceError } from './_base';
 import { makeTestCompany, type TestCompany } from './testkit.prefs';
 import { createVendor } from './vendors';
@@ -20,7 +20,8 @@ import { purchaseOrderPdfData } from '@/lib/pdf/forms';
 import { createPurchaseOrderSchema } from '@/lib/validation/purchaseOrders';
 import { createBill } from './bills';
 import { createItem } from './items';
-import { createItemReceipt } from './itemReceipts';
+import { createItemReceipt, convertToBill as convertReceiptToBill } from './itemReceipts';
+import { enterBillForReceivedItems } from './receiving';
 
 let t: TestCompany;
 vi.mock('@/lib/context', () => ({ getServerContext: vi.fn(async () => t.ctx) }));
@@ -131,6 +132,37 @@ describe('P.O. lines: Customer:Job and Class', () => {
       expect(parsed.data.lines[0]).toMatchObject({ customerId, jobId, classId });
       expect(parsed.data.shipToCustomerId).toBe(customerId);
     }
+  });
+});
+
+describe('P.O. Customer:Job and Class through Receive Items (post-merge fix)', () => {
+  it('a receipt against the P.O. posts the class; its bill (Convert or Enter Bill for Received Items) gets Customer:Job and Class', async () => {
+    const item = await createItem(t.ctx, {
+      name: 'Job tile',
+      type: 'non_inventory',
+      incomeAccountId: t.acct['4000'],
+      expenseAccountId: t.acct['6300'],
+    } as never);
+    const po = await createPurchaseOrder(t.ctx, {
+      vendorId,
+      date: d('2026-05-01'),
+      lines: [{ itemId: item.id, accountId: t.acct['6300'], description: 'Tile', quantity: '4', rate: '10', customerId, jobId, classId }],
+    } as never);
+    // Receive 2, convert that receipt to a bill.
+    const r1 = await createItemReceipt(t.ctx, { vendorId, purchaseOrderId: po.id, date: d('2026-05-02'), lines: [{ itemId: item.id, quantity: 2, unitCost: '10' }] } as never);
+    const [rec] = await t.ctx.db.select().from(itemReceipts).where(eq(itemReceipts.id, r1.id));
+    const jl = await t.ctx.db.select().from(journalEntryLines).where(eq(journalEntryLines.journalEntryId, rec.postedEntryId!));
+    expect(jl.find((l) => l.accountId === t.acct['6300'])?.classId).toBe(classId);
+    const bill1 = await convertReceiptToBill(t.ctx, r1.id);
+    const bl1 = await t.ctx.db.select().from(billLines).where(eq(billLines.billId, bill1.id));
+    expect(bl1[0]).toMatchObject({ customerId, jobId, classId });
+    // Receive the other 2, bill them through Enter Bill for Received Items.
+    const r2 = await createItemReceipt(t.ctx, { vendorId, purchaseOrderId: po.id, date: d('2026-05-03'), lines: [{ itemId: item.id, quantity: 2, unitCost: '10' }] } as never);
+    const [rl] = await t.ctx.db.select().from(itemReceiptLines).where(eq(itemReceiptLines.itemReceiptId, r2.id));
+    const res = await enterBillForReceivedItems(t.ctx, { vendorId, date: d('2026-05-04'), lines: [{ receiptLineId: rl.id, quantity: '2', unitCost: '10' }] } as never);
+    const billId = (res as { bill?: { id: string }; id?: string }).bill?.id ?? (res as { id: string }).id;
+    const bl2 = await t.ctx.db.select().from(billLines).where(eq(billLines.billId, billId));
+    expect(bl2[0]).toMatchObject({ customerId, jobId, classId });
   });
 });
 

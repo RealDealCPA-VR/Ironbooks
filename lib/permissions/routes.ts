@@ -82,6 +82,7 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/auth/recover': kind('public', 'POST'), // filecrypto: the recovery key sets an Admin's new password (rate-limited, local only)
   '/api/file-protection': kind('self', 'GET POST'), // filecrypto: protect the company file with passwords (file Admin)
   '/api/file-protection/recovery-key': kind('self', 'POST'), // filecrypto: make a new recovery key (file Admin)
+  '/api/file-protection/file-key': kind('self', 'POST'), // filecrypto: change the file key (file Admin)
   '/api/unlock': kind('public', 'POST'),
   '/api/file-lock': { GET: 'member', ...r('users', 'POST:modify') },
   '/api/portal/login': kind('public', 'POST'),

@@ -69,7 +69,7 @@ beforeAll(async () => {
   await newCompanyFile(FILE, 'Slot Sync Co');
   await openOn(FILE, path.join(ROOT, 'pc'), 'launch-slots');
   const res = await signupPOST(
-    apiRequest('POST', '/api/auth/signup', { name: 'Ada Admin', email: 'ada', password: 'Ada-Pass-0001', companyName: 'Slot Sync Co', challengeQuestion: 'Name of your first pet', challengeAnswer: 'Rex' }),
+    apiRequest('POST', '/api/auth/signup', { name: 'Ada Admin', email: 'ada', password: 'Ada-Pass-0001', companyName: 'Slot Sync Co', challengeQuestion: 'Name of your first pet', challengeAnswer: 'Rex the brown dog' }),
   );
   expect(res.status).toBe(201);
   const body = await res.json();
@@ -93,7 +93,7 @@ beforeEach(() => resetLimiters());
 describe('key slots follow every password change', () => {
   it('the Admin from /signup: password, challenge answer and recovery key all open the file', async () => {
     expect(await opens('password', 'Ada-Pass-0001', 'ada')).toBe(true);
-    expect(await opens('challenge', 'rex', 'ada')).toBe(true);
+    expect(await opens('challenge', 'rex the brown dog', 'ada')).toBe(true);
     expect(await fileOpensWith(FILE, 'recovery', recoveryKey.replace(/-/g, ''))).toBe(true);
     expect(await fileOpensWith(FILE, 'password', 'wrong', 'ada')).toBe(false);
   }, 60_000);
@@ -118,18 +118,18 @@ describe('key slots follow every password change', () => {
 
   it('setting and changing the challenge question', async () => {
     signedInAs(bob);
-    const first = await challengePOST(apiRequest('POST', '/api/auth/challenge', { currentPassword: 'Bob-Pass-0003', question: 'Name of your first pet', answer: 'Fido Dog' }));
+    const first = await challengePOST(apiRequest('POST', '/api/auth/challenge', { currentPassword: 'Bob-Pass-0003', question: 'Name of your first pet', answer: 'Fido the beagle' }));
     expect(first.status).toBe(200);
-    expect(await opens('challenge', 'fido dog', 'bob')).toBe(true);
+    expect(await opens('challenge', 'fido the beagle', 'bob')).toBe(true);
     signedInAs(bob);
-    const second = await challengePOST(apiRequest('POST', '/api/auth/challenge', { currentPassword: 'Bob-Pass-0003', question: 'Street you grew up on', answer: 'Toledo' }));
+    const second = await challengePOST(apiRequest('POST', '/api/auth/challenge', { currentPassword: 'Bob-Pass-0003', question: 'Street you grew up on', answer: 'Toledo Avenue East' }));
     expect(second.status).toBe(200);
-    expect(await opens('challenge', 'toledo', 'bob')).toBe(true);
-    expect(await fileOpensWith(FILE, 'challenge', 'fido dog', 'bob')).toBe(false);
+    expect(await opens('challenge', 'toledo avenue east', 'bob')).toBe(true);
+    expect(await fileOpensWith(FILE, 'challenge', 'fido the beagle', 'bob')).toBe(false);
   }, 60_000);
 
   it('"I forgot my password": the challenge answer, then a new password that opens the file', async () => {
-    const asked = await requestResetPOST(apiRequest('POST', '/api/auth/request-reset', { email: 'bob', challengeAnswer: 'Toledo' }));
+    const asked = await requestResetPOST(apiRequest('POST', '/api/auth/request-reset', { email: 'bob', challengeAnswer: 'Toledo Avenue East' }));
     const { token } = await asked.json();
     expect(token).toBeTruthy();
     const done = await resetPOST(apiRequest('POST', '/api/auth/reset', { token, password: 'Bob-Pass-0004' }));
@@ -147,7 +147,7 @@ describe('key slots follow every password change', () => {
   it('a deactivated user is dropped at the next save (and comes back when reactivated)', async () => {
     await updateUser(ctxOf(admin), bob, { isActive: false });
     expect(await opens('password', 'Bob-Pass-0004', 'bob.clerk')).toBe(false);
-    expect(await fileOpensWith(FILE, 'challenge', 'toledo', 'bob.clerk')).toBe(false);
+    expect(await fileOpensWith(FILE, 'challenge', 'toledo avenue east', 'bob.clerk')).toBe(false);
     await updateUser(ctxOf(admin), bob, { isActive: true });
     expect(await opens('password', 'Bob-Pass-0004', 'bob.clerk')).toBe(true);
   }, 60_000);

@@ -26,6 +26,7 @@ import { createEntry, updateEntry } from './lists/simpleLists';
 import { createTaxAgency, createTaxRate, getTaxRate, listTaxRates, updateTaxRate } from './salesTax';
 import { createInvoice, getInvoice } from './invoices';
 import { createBill } from './bills';
+import { commitUndo, performUndo } from './undo';
 import { addNote, listNotes } from './lists/notes';
 import { runStandardReport } from './reportRegistry';
 import { reportFilterOptions } from './reportsAnalysis';
@@ -435,5 +436,26 @@ describe('Opening Balance on New Customer / New Vendor', () => {
     // PATCH has no opening balance: it is dropped, nothing is posted.
     await vendorPATCH(req(`/api/vendors/${v.id}`, 'PATCH', { openingBalance: '500.00', phone: '1' }), params(v.id));
     expect(await db.select().from(bills).where(eq(bills.vendorId, v.id))).toHaveLength(1);
+  });
+
+  it('Undo of a New Customer / New Vendor voids its Opening Balance document, so A/R and A/P go back too', async () => {
+    const undoCreate = async (resource: string, id: string) => {
+      const armed = await commitUndo(ctx, { resource, kind: 'create', id });
+      return performUndo(ctx, armed.token);
+    };
+    const c = await createCustomer(ctx, { displayName: `Undo open ${seq}`, openingBalance: '300.00', openingBalanceDate: '2026-01-15' });
+    await undoCreate('customers', c.id);
+    const [inv] = await db.select().from(invoices).where(eq(invoices.customerId, c.id));
+    expect(inv.status).toBe('void');
+    expect((await db.select().from(customers).where(eq(customers.id, c.id)))[0].isActive).toBe(false);
+    const cc = await createCustomer(ctx, { displayName: `Undo credit ${seq}`, openingBalance: '-20.00', openingBalanceDate: '2026-01-15' });
+    await undoCreate('customers', cc.id);
+    expect((await db.select().from(creditMemos).where(eq(creditMemos.customerId, cc.id)))[0].status).toBe('void');
+    const v = await createVendor(ctx, { displayName: `Undo vendor ${seq}`, openingBalance: '80.00', openingBalanceDate: '2026-01-15' } as never);
+    await undoCreate('vendors', v.id);
+    expect((await db.select().from(bills).where(eq(bills.vendorId, v.id)))[0].status).toBe('void');
+    expect((await db.select().from(vendors).where(eq(vendors.id, v.id)))[0].isActive).toBe(false);
+    const aging = await runStandardReport(ctx, 'ar-aging-summary', { asOf: '2026-02-28' });
+    expect(grand(aging, 'total')).toBe('0.00');
   });
 });

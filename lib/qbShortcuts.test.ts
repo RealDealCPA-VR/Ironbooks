@@ -60,8 +60,13 @@ const CHECKS: Record<string, () => void> = {
     expect(formShortcutFor(key('Escape'))).toBe('cancel');
     dom(FORMS, 'Esc on a changed form asks; No closes without saving, Yes records, Cancel stays')();
     dom(SHELL, 'Esc with nothing open or selected closes the window (back to the one before it)')();
+    dom(SHELL, 'the real app shell: All menus from the first paint; Esc and Ctrl+F4 close the window beside its sidebar')();
   },
-  'navigate|Ctrl+F4': () => expect(global(ctrl('F4'))).toBe('close-window'),
+  'navigate|Ctrl+F4': () => {
+    expect(global(ctrl('F4'))).toBe('close-window');
+    dom(LISTS, 'the window keys: Ctrl+F4 closes the open form; Ctrl+Tab / Ctrl+Shift+Tab move between open windows')();
+    dom(SHELL, 'the real app shell: All menus from the first paint; Esc and Ctrl+F4 close the window beside its sidebar')();
+  },
   'navigate|Ctrl+Tab / Ctrl+F6': () => {
     expect(global(ctrl('Tab'))).toBe('next-window');
     expect(global(ctrl('F6'))).toBe('next-window');
@@ -70,6 +75,7 @@ const CHECKS: Record<string, () => void> = {
   'navigate|Ctrl+Shift+Tab / Ctrl+Shift+F6': () => {
     expect(global(ctrl('Tab', { shiftKey: true }))).toBe('prev-window');
     expect(global(ctrl('F6', { shiftKey: true }))).toBe('prev-window');
+    dom(LISTS, 'the window keys: Ctrl+F4 closes the open form; Ctrl+Tab / Ctrl+Shift+Tab move between open windows')();
   },
   'navigate|F2 / Ctrl+1': () => {
     expect(global(key('F2'))).toBe('product-info');
@@ -106,13 +112,19 @@ const CHECKS: Record<string, () => void> = {
     expect(global(ctrl('x'), true)).toBeNull();
   },
   'data-fields|Home / End': () => expect(listKeyAction(key('Home'))).toBe('home'), // in a field the list keys are not used
-  'data-fields|Del / Backspace': () => expect(global(key('Delete'), true)).toBeNull(),
-  'data-fields|Home Home / End End': () => {
-    const src = fs.readFileSync(path.resolve(process.cwd(), 'components/KeyboardBase.tsx'), 'utf8');
-    expect(src).toContain('Home Home / End End');
+  'data-fields|Del / Backspace': () => {
+    expect(global(key('Delete'), true)).toBeNull();
+    dom(FORMS, 'the field keys stay with the field: Space ticks a checkbox, Del / Backspace delete, Ctrl+Left / Ctrl+Right move a word')();
   },
-  'data-fields|Ctrl+Left / Ctrl+Right': () => expect(global(ctrl('ArrowLeft'), true)).toBeNull(),
-  'data-fields|Space': () => expect(global(key(' '), false)).toBeNull(),
+  'data-fields|Home Home / End End': dom(FORMS, 'Home Home / End End go to the first / last field of the form; one Home stays in the field'),
+  'data-fields|Ctrl+Left / Ctrl+Right': () => {
+    expect(global(ctrl('ArrowLeft'), true)).toBeNull();
+    dom(FORMS, 'the field keys stay with the field: Space ticks a checkbox, Del / Backspace delete, Ctrl+Left / Ctrl+Right move a word')();
+  },
+  'data-fields|Space': () => {
+    expect(global(key(' '), false)).toBeNull();
+    dom(FORMS, 'the field keys stay with the field: Space ticks a checkbox, Del / Backspace delete, Ctrl+Left / Ctrl+Right move a word')();
+  },
   'data-fields|abc, then Tab': dom(LISTS, 'a picker: typing finds the name, Tab takes it (QuickFill); Ctrl+U takes the highlighted entry'),
 
   // ---- Date fields ----
@@ -157,7 +169,11 @@ const CHECKS: Record<string, () => void> = {
     expect(gridKeyAction(key('y', { ctrlKey: true, altKey: true }), { tag: 'INPUT', type: 'text' })).toBe('copy-line');
     dom(FORMS, 'Ctrl+Alt+Y copies a line; Ctrl+Alt+V pastes it into a blank line, or above a filled one')();
   },
-  'forms|Ctrl+Alt+V': () => expect(gridKeyAction(key('v', { ctrlKey: true, altKey: true }), { tag: 'INPUT', type: 'text' })).toBe('paste-line'),
+  'forms|Ctrl+Alt+V': () => {
+    expect(gridKeyAction(key('v', { ctrlKey: true, altKey: true }), { tag: 'INPUT', type: 'text' })).toBe('paste-line');
+    expect(gridKeyAction(key('@', { ctrlKey: true, altKey: true, code: 'KeyV' }), { tag: 'INPUT', type: 'text' })).toBeNull(); // AltGr "@"
+    dom(FORMS, 'AltGr characters type in a line and a form (Hungarian AltGr+V "@", Polish AltGr+S "ś"); they never paste a line or Save & New')();
+  },
   'forms|Up / Down': () => {
     expect(gridKeyAction(key('ArrowDown'), { tag: 'INPUT', type: 'text' })).toBe('next');
     expect(gridKeyAction(key('ArrowUp'), { tag: 'INPUT', type: 'text' })).toBe('prev');
@@ -183,7 +199,10 @@ const CHECKS: Record<string, () => void> = {
   'forms|Alt+P': () => expect(formShortcutFor(alt('p'))).toBe('prev'),
   'forms|Alt+R': () => expect(formShortcutFor(alt('r'))).toBe('revert'),
   'forms|Ctrl+Enter': () => expect(formShortcutFor(ctrl('Enter'))).toBe('save-new'),
-  'forms|Ctrl+P': () => expect(global(ctrl('p'))).toBe('print'),
+  'forms|Ctrl+P': () => {
+    expect(global(ctrl('p'))).toBe('print');
+    dom(SHELL, 'Ctrl+P presses the Print button; with none it says so and never opens the system print dialog')();
+  },
   'forms|Ctrl+M': () => expect(global(ctrl('m'))).toBe('memorize'),
   'forms|Ctrl+T': () => expect(global(ctrl('t'))).toBe('/recurring'),
   'forms|Ctrl+H': () => expect(global(ctrl('h'))).toBe('history'),
@@ -244,7 +263,8 @@ const CHECKS: Record<string, () => void> = {
   // ---- Open, set up and close ----
   'open-close|Alt+F4': () => {
     const main = fs.readFileSync(path.resolve(process.cwd(), 'electron/main.js'), 'utf8');
-    expect(main).toContain('confirmCloseOverUnsavedWork');
+    expect(main).toContain('__ironbooksUnsavedWork'); // the window asks the page (LeaveGuard closeRisk)
+    dom(SHELL, 'closing the window (Alt+F4) asks only when a form was changed, not because one is open')();
   },
   'open-close|Ctrl+Alt+Y (Product Information)': () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), 'components/ProductInfo.tsx'), 'utf8');

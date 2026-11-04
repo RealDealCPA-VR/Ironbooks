@@ -291,7 +291,7 @@ function canRunReportTypes(access: EffectiveAccess | undefined, types: string[])
     const entry = standardReportEntry(t);
     if (entry) return canActivity(access, reportActivity(entry), 'view');
     if (t === 'custom') return canActivity(access, 'reports_financial.custom', 'view');
-    return can(access, area, 'view');
+    return can(access, area, 'view'); // an area with no catalog entry: the whole area (fail closed)
   });
 }
 

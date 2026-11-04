@@ -27,7 +27,7 @@ import { createManualEntry, followMergedNames } from './journal';
 import { buildRouter, type BuildRouterOptions } from './aiSettings';
 import { companyToday } from './preferences';
 import { AiError } from '@/lib/ai/types';
-import { can, type Area } from '@/lib/permissions/model';
+import { canRef, type AccessRef } from '@/lib/permissions/model';
 import { requirePermission } from './access';
 
 // ---------------------------------------------------------------------------
@@ -58,8 +58,9 @@ interface ToolDef {
    * The report area the tool's data belongs to (the caller needs 'view' of it, like the report's own
    * route): A/R aging is Reports — Customers & Sales, A/P aging Reports — Vendors & Purchases, the
    * rest Reports — Financial. The assistant route only checks Reports — Financial.
+   * prefsperms: the report's own activity (Company & Financial, Customers & Receivables, …).
    */
-  area: Area;
+  area: AccessRef;
   args: z.ZodType<Record<string, unknown>, z.ZodTypeDef, unknown>;
   argsHelp: string;
   run(ctx: ServiceContext, args: Record<string, unknown>): Promise<unknown>;
@@ -67,7 +68,7 @@ interface ToolDef {
 
 export const TOOLS: Record<string, ToolDef> = {
   profit_and_loss: {
-    area: 'reports_financial',
+    area: 'reports_financial.company',
     description: 'Profit & Loss (income, expenses, net income) for a date range.',
     argsHelp: '{"from"?: "YYYY-MM-DD", "to"?: "YYYY-MM-DD"}',
     args: z.object({ from: zDateStr.optional(), to: zDateStr.optional() }),
@@ -85,7 +86,7 @@ export const TOOLS: Record<string, ToolDef> = {
     },
   },
   balance_sheet: {
-    area: 'reports_financial',
+    area: 'reports_financial.company',
     description: 'Balance Sheet (assets, liabilities, equity) as of a date.',
     argsHelp: '{"asOf"?: "YYYY-MM-DD"}',
     args: z.object({ asOf: zDateStr.optional() }),
@@ -106,7 +107,7 @@ export const TOOLS: Record<string, ToolDef> = {
     },
   },
   ar_aging: {
-    area: 'reports_sales',
+    area: 'reports_sales.receivables',
     description: 'Accounts receivable aging by customer (who owes us, how overdue).',
     argsHelp: '{"asOf"?: "YYYY-MM-DD"}',
     args: z.object({ asOf: zDateStr.optional() }),
@@ -118,7 +119,7 @@ export const TOOLS: Record<string, ToolDef> = {
     },
   },
   ap_aging: {
-    area: 'reports_purchases',
+    area: 'reports_purchases.payables',
     description: 'Accounts payable aging by vendor (what we owe, how overdue).',
     argsHelp: '{"asOf"?: "YYYY-MM-DD"}',
     args: z.object({ asOf: zDateStr.optional() }),
@@ -130,7 +131,7 @@ export const TOOLS: Record<string, ToolDef> = {
     },
   },
   account_balances: {
-    area: 'reports_financial',
+    area: 'reports_financial.accountant',
     description: 'Account balances from the general ledger (natural sign), optionally filtered by name/code.',
     argsHelp: '{"asOf"?: "YYYY-MM-DD", "query"?: "text matching account name or code"}',
     args: z.object({ asOf: zDateStr.optional(), query: z.string().max(100).optional() }),
@@ -149,7 +150,7 @@ export const TOOLS: Record<string, ToolDef> = {
     },
   },
   list_accounts: {
-    area: 'reports_financial',
+    area: 'reports_financial.accountant',
     description: 'Chart of accounts (active): code, name, type. Use before proposing an entry.',
     argsHelp: '{"query"?: "text"}',
     args: z.object({ query: z.string().max(100).optional() }),
@@ -167,7 +168,7 @@ export const TOOLS: Record<string, ToolDef> = {
     },
   },
   search_transactions: {
-    area: 'reports_financial',
+    area: 'reports_financial.accountant',
     description: 'Search posted journal entries by text (description/reference/memo), date range, account code and amount.',
     argsHelp: '{"query"?: "text", "from"?: "YYYY-MM-DD", "to"?: "YYYY-MM-DD", "accountCode"?: "6000", "minAmount"?: number, "maxAmount"?: number, "limit"?: 1-25}',
     args: z.object({
@@ -629,7 +630,7 @@ const stepJsonSchema = {
 function systemPrompt(today: string, ctx: Pick<ServiceContext, 'access'>): string {
   // Only the tools this person may use (the others would only answer "no permission").
   const tools = Object.entries(TOOLS)
-    .filter(([, t]) => !ctx.access || can(ctx.access, t.area, 'view'))
+    .filter(([, t]) => !ctx.access || canRef(ctx.access, t.area, 'view'))
     .map(([name, t]) => `- ${name}: ${t.description} Args: ${t.argsHelp}`)
     .join('\n');
   return `You are the bookkeeping assistant inside Ironbooks, a double-entry accounting app. Today is ${today}.

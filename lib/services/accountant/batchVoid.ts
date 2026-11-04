@@ -72,7 +72,7 @@ import { refuseInAccountantCopy } from '../nonPostingDocs';
 import { type VersionedEntity, assertCurrentVersion } from '../concurrency';
 import { requirePermission } from '../access';
 import { orphanedSalesTaxFixes, voidOrphanedSalesTaxFixes } from './salesTaxTools';
-import type { Area } from '@/lib/permissions/model';
+import type { AccessRef } from '@/lib/permissions/model';
 
 export const BATCH_TXN_TYPES = [
   'invoice',
@@ -97,24 +97,26 @@ export type BatchTxnType = (typeof BATCH_TXN_TYPES)[number];
 
 /** The area that owns each document type — voiding needs that area's delete right too (the route
  *  only guarantees accounting:delete). */
-const VOID_AREA: Record<BatchTxnType, Area> = {
-  invoice: 'customers',
-  sales_receipt: 'customers',
-  credit_memo: 'customers',
-  payment: 'customers',
-  bill: 'vendors',
-  bill_payment: 'vendors',
-  vendor_credit: 'vendors',
-  check: 'banking',
-  deposit: 'banking',
-  paycheck: 'payroll',
-  journal: 'accounting',
-  transfer: 'banking',
-  item_receipt: 'vendors',
+const VOID_AREA: Record<BatchTxnType, AccessRef> = {
+  // prefsperms: the document's own activity (Invoices, Receive Payments, Pay Bills, …).
+  invoice: 'customers.invoices',
+  sales_receipt: 'customers.sales_receipts',
+  credit_memo: 'customers.credit_memos',
+  payment: 'customers.payments',
+  bill: 'vendors.bills',
+  bill_payment: 'vendors.pay_bills',
+  vendor_credit: 'vendors.vendor_credits',
+  check: 'banking.write_checks',
+  deposit: 'banking.deposits',
+  paycheck: 'payroll.paychecks',
+  journal: 'accounting.journal_entries',
+  transfer: 'accounting.transfers',
+  // Receive Items / Adjust Quantity have no Delete activity: the whole Inventory area (fail closed).
+  item_receipt: 'inventory',
   inventory_adjustment: 'inventory',
-  estimate: 'customers',
-  sales_order: 'customers',
-  purchase_order: 'vendors',
+  estimate: 'customers.estimates',
+  sales_order: 'customers.sales_orders',
+  purchase_order: 'vendors.purchase_orders',
 };
 
 export const BATCH_TXN_LABELS: Record<BatchTxnType, string> = {
@@ -710,7 +712,7 @@ async function deleteDraftEntry(ctx: ServiceContext, entry: typeof journalEntrie
   if (!['manual', 'tax_agency', 'sales_tax_adj', 'adjusting'].includes(srcKind)) {
     throw new ServiceError('CONFLICT', 'This entry belongs to a document — void the document instead.');
   }
-  if (srcKind === 'tax_agency' || srcKind === 'sales_tax_adj') requirePermission(ctx, 'sales_tax', 'delete');
+  if (srcKind === 'tax_agency' || srcKind === 'sales_tax_adj') requirePermission(ctx, 'sales_tax.pay', 'delete');
   // Never posted → no ledger impact; deleting it is safe (QB "delete").
   await inTransaction(ctx, async (tx) => {
     const lines = await tx.db.select().from(journalEntryLines).where(eq(journalEntryLines.journalEntryId, id));

@@ -1790,6 +1790,8 @@ export const fileProtection = pgTable('file_protection', {
   protectedAt: timestamp('protected_at').defaultNow().notNull(),
   protectedBy: uuid('protected_by'),
   recoveryCreatedAt: timestamp('recovery_created_at'),
+  /** 0086: the key check before the last key change (the company file may still be sealed with it). */
+  previousKeyCheck: varchar('previous_key_check', { length: 64 }),
 });
 
 /**

@@ -7,6 +7,7 @@
  *    Payments, or its area) — the server refuses its data anyway; this says why in plain words.
  *  - useActivityButtons() greys out the page's New / Delete / Print / Email buttons when the role
  *    lacks that right on the page's activity (lib/permissions/buttonRights.ts), with a tooltip.
+ *    Buttons inside `data-activity-skip` (removing an unsaved grid row) are left alone.
  *
  * COSMETIC: every API route is enforced on the server (lib/permissions/enforce.ts).
  */
@@ -59,6 +60,8 @@ export function useActivityButtons(pathname: string, permissions: PermissionMap)
       for (const el of Array.from(root.querySelectorAll<HTMLButtonElement>('button'))) {
         if (el.closest('[role="dialog"]')) continue; // dialogs belong to whatever opened them
         if (el.closest('header') || el.closest('nav')) continue; // the shell's own controls
+        // Editing an unsaved grid (removing a typed row) is not the Delete right on saved records.
+        if (el.closest('[data-activity-skip]')) continue;
         const right = buttonRight(el.getAttribute('aria-label') || el.textContent, el.getAttribute('data-shortcut'));
         if (!right || allowed(right)) continue;
         // Only an enabled button is touched, so re-applying never loops (React re-enabling it on

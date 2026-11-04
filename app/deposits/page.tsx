@@ -38,12 +38,18 @@ import { FieldError, fieldA11y, focusFirstError } from '@/components/FieldError'
 import { getPath, parseLinePath, type ErrorFix } from '@/lib/errorFixes';
 import { amountMessage, collectErrors, dateMessage, hasErrors, requiredMessage, type FieldErrors } from '@/lib/fieldValidation';
 import { TransactionNav, useAdjacentTransactions } from '@/components/TransactionNav';
+// QB Make Deposits "Received From": any customer, vendor, employee or Other Name.
+import { TypeaheadSelect } from '@/components/TypeaheadSelect';
+import { loadNames } from '@/components/RegisterEntryRow';
 
 import {
   depositListHomeTotal,
   depositToAccounts,
   depositToEdit,
   emptyExtraLine,
+  extraLinePayload,
+  receivedFromPatch,
+  receivedFromValue,
   itemsForDepositCurrency,
   type Deposit,
   type DepositAccount,
@@ -112,6 +118,14 @@ function MakeDepositModal({
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [methodFilter, setMethodFilter] = useState('all');
   const [extraLines, setExtraLines] = useState<ExtraLine[]>([]);
+  const [nameChoices, setNameChoices] = useState<Array<{ id: string; label: string; hint: string }>>([]);
+  useEffect(() => {
+    if (!open) return;
+    const hints = { vendor: 'Vendor', customer: 'Customer', employee: 'Employee', other: 'Other' } as const;
+    loadNames()
+      .then((ns) => setNameChoices(ns.map((n) => ({ id: `${n.type}:${n.id}`, label: n.label, hint: hints[n.type] }))))
+      .catch(() => setNameChoices([]));
+  }, [open]);
   const [cashBackAccountId, setCashBackAccountId] = useState('');
   const [cashBackAmount, setCashBackAmount] = useState('');
   const [saving, setSaving] = useState(false);
@@ -286,11 +300,7 @@ function MakeDepositModal({
         paymentIds,
         salesReceiptIds,
         invoicePaymentIds,
-        extraLines: extraLines.map((l) => ({
-          accountId: l.accountId,
-          amount: l.amount,
-          description: l.description.trim() || undefined,
-        })),
+        extraLines: extraLines.map(extraLinePayload),
         cashBack:
           cashBackNum > 0
             ? { accountId: cashBackAccountId, amount: cashBackAmount }
@@ -333,11 +343,7 @@ function MakeDepositModal({
                 date,
                 paymentIds: [],
                 salesReceiptIds: [],
-                extraLines: rows.map((l) => ({
-                  accountId: l.accountId,
-                  amount: l.amount,
-                  description: l.description.trim() || undefined,
-                })),
+                extraLines: rows.map(extraLinePayload),
                 memo: memo || undefined,
               };
             }}
@@ -559,6 +565,15 @@ function MakeDepositModal({
                         </option>
                       ))}
                     </Select>
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <TypeaheadSelect
+                      placeholder="Received From"
+                      aria-label={`Extra line ${idx + 1} received from`}
+                      value={receivedFromValue(l)}
+                      choices={nameChoices}
+                      onChange={(v) => patchExtraLine(idx, receivedFromPatch(v))}
+                    />
                   </div>
                   <div className="flex-1 min-w-0">
                     <Input

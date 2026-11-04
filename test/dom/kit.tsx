@@ -22,6 +22,8 @@ export interface KeyMods {
   meta?: boolean;
   /** Physical key when it differs from the default for `key` ('KeyS'). */
   code?: string;
+  /** The character the press types even with Ctrl / Alt held (AltGr+V types "@" in Hungarian). */
+  text?: string;
 }
 export interface DomResult {
   name: string;

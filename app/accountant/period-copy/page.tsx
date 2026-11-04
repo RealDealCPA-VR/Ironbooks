@@ -10,6 +10,7 @@ import { Button, Card, DateInput, Label, PageHeader, toast, toastError } from '@
 import { niceDate, postAndSave } from '@/lib/accountantCopyClient';
 import { formatCurrency } from '@/lib/money';
 import { BackToCenter, lastCalendarYear } from '../_shared';
+import { FilePasswordFields, filePasswordProblem, type FilePasswordChoice } from '@/components/FileProtection';
 
 interface Summary {
   from: string;
@@ -18,6 +19,8 @@ interface Summary {
   removedAfter: { journalEntries: number; documents: number };
   condensed: { entries: number; summaryEntries: number; keptOpenDocumentEntries: number } | null;
   otherCompaniesRemoved: number;
+  passwordProtected?: boolean;
+  protectedLikeOriginal?: boolean;
   verified: {
     openingTrialBalance: { totalDebit: string; totalCredit: string };
     closingTrialBalance: { totalDebit: string; totalCredit: string };
@@ -30,13 +33,15 @@ export default function PeriodCopyPage() {
   const [to, setTo] = useState(lastCalendarYear().to);
   const [busy, setBusy] = useState(false);
   const [summary, setSummary] = useState<Summary | null>(null);
-  const invalid = !from || !to || from > to;
+  // filecrypto: the copy's password (on by default; required for a protected company file).
+  const [choice, setChoice] = useState<FilePasswordChoice>({ protect: true, password: '', confirm: '' });
+  const invalid = !from || !to || from > to || Boolean(filePasswordProblem(choice));
 
   async function create() {
     setBusy(true);
     setSummary(null);
     try {
-      const res = await postAndSave('/api/period-copy', { from, to }, 'Period Copy.bkp', {
+      const res = await postAndSave('/api/period-copy', { from, to, ...(choice.protect ? { password: choice.password } : { protect: false }) }, 'Period Copy.bkp', {
         name: 'Ironbooks Portable Company File',
         extensions: ['bkp'],
       });
@@ -48,7 +53,10 @@ export default function PeriodCopyPage() {
           /* the file itself is what matters */
         }
       }
-      if (res.saved) toast(`Period Copy saved: ${res.saved}`, 'success');
+      if (res.saved) {
+        toast(`Period Copy saved: ${res.saved}`, 'success');
+        setChoice({ protect: true, password: '', confirm: '' });
+      }
     } catch (err) {
       toastError(err, 'Could not create the Period Copy.');
     } finally {
@@ -88,6 +96,9 @@ export default function PeriodCopyPage() {
                 The first day must be on or before the last day.
               </p>
             )}
+            <div className="mt-5">
+              <FilePasswordFields value={choice} onChange={setChoice} what="the Period Copy" />
+            </div>
             <Button className="mt-5" onClick={create} loading={busy} disabled={invalid}>
               <FileDown className="h-4 w-4" aria-hidden="true" /> Create Period Copy…
             </Button>
@@ -106,8 +117,10 @@ export default function PeriodCopyPage() {
               <li>The copy&apos;s closing date is set to the last day, so nothing is added to the period by mistake.</li>
             </ul>
             <p className="mt-3 text-xs text-navy/50">
-              The copy is a portable company file (.bkp). Open it on any computer with Company File → Open Portable File. It holds the users
-              and passwords of this file, so only an admin can create it — keep it private.
+              The copy is a portable company file (.bkp). Open it on any computer with Company File → Open Portable File and its password. It
+              holds the users and passwords of this file, so only an admin can create it — keep it private. When this company file is
+              protected with passwords, the restored copy is protected the same way: it opens with the same user names, passwords and recovery
+              key (with its own encryption key — never this file&apos;s).
             </p>
           </div>
         </div>
@@ -138,6 +151,12 @@ export default function PeriodCopyPage() {
               </li>
             )}
             {summary.otherCompaniesRemoved > 0 && <li>{summary.otherCompaniesRemoved} other company(ies) in the file were left out.</li>}
+            {summary.passwordProtected && (
+              <li>
+                Encrypted with the password you gave it.
+                {summary.protectedLikeOriginal ? ' Once restored, it opens with the same user names and passwords as this company file.' : ''}
+              </li>
+            )}
           </ul>
         </Card>
       )}

@@ -47,6 +47,7 @@ import {
   writeAudit,
 } from './_base';
 import { assertNotControlAccount, postJournalEntry, postPaymentCreditFxPlugs, voidJournalEntry } from './posting';
+import { armReconciledRepost, confirmReconciledRepost } from './reconciledEdits';
 import { paymentCreditEvents, unappliedAsOf } from './customerCredits'; // p1 fx
 import { assertPeriodOpen, recordClosingDateException } from './fiscalPeriods';
 import { createInvoice, markPaidAmount } from './invoices';
@@ -163,6 +164,8 @@ export interface ReceivePaymentInput {
    * such an edit is refused; edits that keep the amount never need it.
    */
   removeFromDeposit?: boolean;
+  /** Edits: the user confirmed QB's "this transaction has been reconciled" warning (reconciledEdits.ts). */
+  allowReconciledEdit?: boolean;
 }
 
 export interface PaymentCreditFromPaymentInput {
@@ -1778,6 +1781,9 @@ export async function updatePayment(ctx: ServiceContext, id: string, input: Rece
       .where(and(eq(creditApplications.companyId, tx.companyId), eq(creditApplications.paymentId, id)));
     // P1: an edit that does not mention General Journal credit -> charge applications keeps them.
     const keptOffsets = input.journalOffsets === undefined ? await journalOffsetsOf(tx, { paymentId: id }) : null;
+    // Deposited straight to a bank and reconciled there: the re-post keeps it reconciled, and a
+    // changed amount / account gives QB's warning once the new entry is posted (below).
+    await armReconciledRepost(tx, { entryId: payment.postedEntryId, what: 'payment' });
     const oldApps = await reversePaymentEffects(tx, payment);
     await writeAudit(tx, {
       action: 'update',
@@ -1803,7 +1809,14 @@ export async function updatePayment(ctx: ServiceContext, id: string, input: Rece
     if ((input.paymentCredits ?? []).length > 0) {
       await applyEarlierPayments(tx, input, id);
     }
-    return postPayment(tx, { ...input, paymentCredits: null, journalOffsets: keptOffsets ?? input.journalOffsets }, id);
+    const posted = await postPayment(tx, { ...input, paymentCredits: null, journalOffsets: keptOffsets ?? input.journalOffsets }, id);
+    await confirmReconciledRepost(tx, {
+      oldEntryId: payment.postedEntryId,
+      newEntryId: posted.entry?.id ?? null,
+      what: 'payment',
+      allowReconciledEdit: input.allowReconciledEdit,
+    });
+    return posted;
   });
 }
 

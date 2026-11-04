@@ -84,3 +84,39 @@ describe('Quick Check: the amount is read by the money parser in the browser too
     expect(fs.readFileSync('app/print-checks/page.tsx', 'utf8')).not.toMatch(/parseFloat\(/);
   });
 });
+
+describe('Reconcile: a loan or line of credit is listed with the liability sign (post-merge fix)', () => {
+  it('the window keys the statement sign on isLiability, not on the Credit Card subtype', async () => {
+    const { reconcilesAsLiability, statementLineAmount } = await import('@/lib/reconcileRules');
+    // A long-term loan linked for reconciliation: not a credit card, but a liability.
+    const loan = { glType: 'liability', isCreditCard: false, isLiability: true };
+    expect(reconcilesAsLiability(loan)).toBe(true);
+    // A borrowing (credit) raises what is owed: +; a payment (debit) lowers it: −.
+    expect(statementLineAmount({ debit: null, credit: '5000.00' }, reconcilesAsLiability(loan))).toBe('5000.00');
+    expect(statementLineAmount({ debit: '250.00', credit: null }, reconcilesAsLiability(loan))).toBe('-250.00');
+    // Info from an older server (no isLiability): the account type decides.
+    expect(reconcilesAsLiability({ glType: 'liability', isCreditCard: false })).toBe(true);
+    expect(reconcilesAsLiability({ glType: 'asset', isCreditCard: false })).toBe(false);
+    expect(reconcilesAsLiability(null)).toBe(false);
+
+    const src = fs.readFileSync('app/reconcile/page.tsx', 'utf8');
+    expect(src).toContain('isLiability?: boolean;');
+    expect(src).toContain('lineAmount(line, reconcilesAsLiability(info))');
+    expect(src).not.toMatch(/lineAmount\(line, !!info\?\.isCreditCard\)/);
+  });
+});
+
+describe('post-merge fixes: forms', () => {
+  it('Make Deposits: other deposit lines have a Received From picker that is sent on save and edit', () => {
+    const src = fs.readFileSync('app/deposits/page.tsx', 'utf8');
+    expect(src).toContain('placeholder="Received From"');
+    expect(src).toContain('onChange={(v) => patchExtraLine(idx, receivedFromPatch(v))}');
+    expect(src.match(/extraLines: (extraLines|rows)\.map\(extraLinePayload\)/g)?.length).toBe(2);
+  });
+
+  it('Sales Receipts: editing a reconciled receipt asks QB\'s "Change it anyway?" and saves', () => {
+    const src = fs.readFileSync('app/sales-receipts/page.tsx', 'utf8');
+    expect(src).toContain('saveWithReconciledCheck((allowReconciledEdit) =>');
+    expect(src).toContain('if (saved === undefined || saved === null) return;');
+  });
+});

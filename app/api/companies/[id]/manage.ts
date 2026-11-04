@@ -20,7 +20,7 @@ import type { DB } from '@/lib/db';
 import { companies, userCompanies } from '@/lib/db/schema';
 import { ServiceError, notFound, validation, writeAudit } from '@/lib/services/_base';
 import { permissionDenied, resolveAccess } from '@/lib/services/access';
-import { can, type EffectiveAccess } from '@/lib/permissions/model';
+import { canActivity, type EffectiveAccess } from '@/lib/permissions/model';
 
 export type CompanyRow = typeof companies.$inferSelect;
 export type CompanySettings = Record<string, unknown>;
@@ -54,7 +54,11 @@ export async function getAccessInCompany(
   return { company, access: resolved.access };
 }
 
-/** Rename a company file. Needs Company & Preferences: modify in that company. */
+/**
+ * Rename a company file. Needs Company & Preferences > Rename & Archive Company File: modify in
+ * that company (every old-style Company & Preferences: modify grant includes it). Not any other
+ * Company activity: Budgets: Modify must not rename the file (prefsperms review P1).
+ */
 export async function renameCompany(
   db: DB,
   userId: string,
@@ -66,7 +70,9 @@ export async function renameCompany(
   if (trimmed.length > 255) throw validation('Company name must be 255 characters or fewer.');
 
   const { company, access } = await getAccessInCompany(db, userId, companyId);
-  if (!can(access, 'company', 'modify')) throw permissionDenied('company', 'modify');
+  if (!canActivity(access, 'company.company_file', 'modify')) {
+    throw permissionDenied('company', 'modify', 'company.company_file');
+  }
   // Archived files are hidden from the companies page and can't be opened; don't edit them either.
   if (isArchived(company.settings)) throw notFound('company');
 
@@ -90,7 +96,8 @@ export async function renameCompany(
 }
 
 /**
- * Archive (soft-delete) a company file. Needs Company & Preferences: delete; requires the company name typed back
+ * Archive (soft-delete) a company file. Needs Company & Preferences > Rename & Archive Company
+ * File: delete (Form Templates: Delete is not enough); requires the company name typed back
  * exactly (QB-style destructive confirm); refuses when it is the caller's only active company.
  */
 export async function archiveCompany(
@@ -100,7 +107,9 @@ export async function archiveCompany(
   confirmName: string,
 ): Promise<CompanyRow> {
   const { company, access } = await getAccessInCompany(db, userId, companyId);
-  if (!can(access, 'company', 'delete')) throw permissionDenied('company', 'delete');
+  if (!canActivity(access, 'company.company_file', 'delete')) {
+    throw permissionDenied('company', 'delete', 'company.company_file');
+  }
   if (isArchived(company.settings)) {
     throw new ServiceError('CONFLICT', 'This company is already archived.');
   }
@@ -156,7 +165,9 @@ export async function archiveCompany(
  */
 export async function unarchiveCompany(db: DB, userId: string, companyId: string): Promise<CompanyRow> {
   const { company, access } = await getAccessInCompany(db, userId, companyId);
-  if (!can(access, 'company', 'delete')) throw permissionDenied('company', 'delete');
+  if (!canActivity(access, 'company.company_file', 'delete')) {
+    throw permissionDenied('company', 'delete', 'company.company_file');
+  }
   if (!isArchived(company.settings)) {
     throw new ServiceError('CONFLICT', 'This company is not archived.');
   }

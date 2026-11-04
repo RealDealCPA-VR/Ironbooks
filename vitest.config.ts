@@ -1,6 +1,11 @@
 import { defineConfig } from 'vitest/config';
 import path from 'node:path';
 
+// A company with no time zone set uses the PC's zone (lib/preferences localTimeZone). The tests were
+// written on a New York PC, so every run (CI runs in UTC) uses that zone; tests that need another
+// zone pin the clock and the company zone themselves. Workers inherit this.
+process.env.TZ = 'America/New_York';
+
 export default defineConfig({
   resolve: {
     alias: { '@': path.resolve(__dirname, '.') },

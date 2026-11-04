@@ -26,7 +26,11 @@ import { createAccount, updateAccount } from './accounts';
 import { createExpense, updateExpense } from './expenses';
 import { createBill, getBill, updateBill } from './bills';
 import { createVendorCredit, updateVendorCredit } from './vendorCredits';
-import { createDeposit } from './deposits';
+import { createDeposit, getDeposit, removePaymentFromDeposit } from './deposits';
+import { enterRegisterTransaction } from './registerEntry';
+import { receivePayment } from './payments';
+import { createDepositSchema } from '@/lib/validation/deposits';
+import { depositToEdit } from '@/lib/depositEdit';
 import { createTransfer } from './transfers';
 import { payBills, updateBillPayment } from './billPayments';
 import { vendor1099Report } from './statements';
@@ -307,6 +311,59 @@ describe('Make Deposits: Deposit To and Received From', () => {
       }),
       'VALIDATION',
     );
+  });
+});
+
+describe('Received From: post-merge fixes', () => {
+  it('POST/PATCH /api/deposits keep the picked name (the schema used to strip it)', () => {
+    const v = '11111111-1111-4111-8111-111111111111';
+    const parsed = createDepositSchema.parse({
+      depositAccountId: v,
+      date: '2026-03-03',
+      extraLines: [{ accountId: v, amount: '15.00', entityType: 'vendor', entityId: v }],
+    });
+    expect(parsed.extraLines![0]).toMatchObject({ entityType: 'vendor', entityId: v });
+    expect(createDepositSchema.safeParse({ depositAccountId: v, date: '2026-03-03', extraLines: [{ accountId: v, amount: '1', entityType: 'nobody', entityId: v }] }).success).toBe(false);
+  });
+
+  it('a deposit typed into a register keeps the name picked in the Payee column', async () => {
+    const v = await vendor('Register refund vendor');
+    const res = await enterRegisterTransaction(ctx, acct['1000'], {
+      date: d('2026-03-04'),
+      name: { type: 'vendor', id: v.id },
+      otherAccountId: acct['6300'],
+      side: 'increase',
+      amount: '12.00',
+    });
+    expect(res.kind).toBe('deposit');
+    const [line] = await db.select().from(depositLines).where(eq(depositLines.depositId, res.id));
+    expect(line).toMatchObject({ entityType: 'vendor', entityId: v.id });
+  });
+
+  it("taking a payment out of a deposit keeps the other lines' Received From names", async () => {
+    const v = await vendor('Kept name vendor');
+    const cust = await createCustomer(ctx, { displayName: `Payer ${seq}` } as never);
+    const { payment } = await receivePayment(ctx, { customerId: cust.id, date: d('2026-03-02'), method: 'check', amount: '40.00', applications: [] });
+    const dep = await createDeposit(ctx, {
+      depositAccountId: acct['1000'],
+      date: d('2026-03-05'),
+      paymentIds: [payment.id],
+      extraLines: [{ accountId: acct['6300'], amount: '15.00', description: 'Refund', entityType: 'vendor', entityId: v.id }],
+    });
+    await removePaymentFromDeposit(ctx, dep.id, payment.id);
+    const lines = await db.select().from(depositLines).where(eq(depositLines.depositId, dep.id));
+    expect(lines.find((l) => l.accountId === acct['6300'])).toMatchObject({ entityType: 'vendor', entityId: v.id });
+  });
+
+  it('the Make Deposits form loads the name back for an edit (so saving the edit keeps it)', async () => {
+    const v = await vendor('Edit form vendor');
+    const dep = await createDeposit(ctx, {
+      depositAccountId: acct['1000'],
+      date: d('2026-03-05'),
+      extraLines: [{ accountId: acct['6300'], amount: '15.00', description: 'Refund', entityType: 'vendor', entityId: v.id }],
+    });
+    const full = JSON.parse(JSON.stringify(await getDeposit(ctx, dep.id)));
+    expect(depositToEdit(full).extraLines[0]).toMatchObject({ accountId: acct['6300'], entityType: 'vendor', entityId: v.id });
   });
 });
 

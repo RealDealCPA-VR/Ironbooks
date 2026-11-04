@@ -9,14 +9,21 @@ import { requirePermission } from '@/lib/services/access';
 import { bulkSave } from '@/lib/services/lists/bulk';
 import { bulkSchema } from '@/lib/validation/lists';
 import { zodErrorBody } from '@/lib/validation/helpers';
-import type { Area } from '@/lib/permissions/model';
+import type { AccessRef, Area } from '@/lib/permissions/model';
 import type { BulkList } from './bulk';
+
+/** prefsperms: the list's own activity (Customer Center, Vendor Center, Item List). */
+const LIST_ACTIVITY: Record<BulkList, AccessRef> = {
+  customers: 'customers.center',
+  vendors: 'vendors.center',
+  items: 'lists.items',
+};
 
 export async function handleBulkPost(ctx: ServiceContext, list: BulkList, area: Area, body: unknown): Promise<NextResponse> {
   const parsed = bulkSchema.safeParse(body ?? {});
   if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
   if (parsed.data.rows.some((r) => typeof r.id === 'string' && r.id.trim() !== '')) {
-    requirePermission(ctx, area, 'modify');
+    requirePermission(ctx, LIST_ACTIVITY[list] ?? area, 'modify');
   }
   // An opening quantity on hand posts to the ledger (Dr Inventory Asset / Cr Opening Balance
   // Equity), so — exactly like the New Item form (POST /api/items) — it needs inventory rights on
@@ -26,7 +33,7 @@ export async function handleBulkPost(ctx: ServiceContext, list: BulkList, area: 
     list === 'items' &&
     parsed.data.rows.some((r) => filled(r.openingQuantity) || filled(r.openingValue) || filled(r.openingAsOf))
   ) {
-    requirePermission(ctx, 'inventory', 'create');
+    requirePermission(ctx, 'inventory.adjust', 'create');
   }
   const result = await bulkSave(ctx, list, parsed.data.rows, { dryRun: parsed.data.dryRun });
   // Row problems are a normal outcome of checking a grid: 200 with per-row errors (saved=false).

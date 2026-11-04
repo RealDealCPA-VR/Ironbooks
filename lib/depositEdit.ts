@@ -42,6 +42,9 @@ export interface DepositLine {
   amount: string;
   /** Account an extra line credits (null on payment / receipt / cash-back lines). */
   accountId?: string | null;
+  /** QB "Received From" of an extra line (customer / vendor / employee / other name). */
+  entityType?: string | null;
+  entityId?: string | null;
   /**
    * salesar (B7): what a payment / sales receipt / invoice-payment line came from (GET
    * /api/deposits/:id) — its method, Payment Method entry, customer, reference and date.
@@ -77,10 +80,38 @@ export interface ExtraLine {
   accountId: string;
   amount: string;
   description: string;
+  /** QB "Received From" name ('' = none). */
+  entityType?: ReceivedFromType | '';
+  entityId?: string;
 }
 
+export type ReceivedFromType = 'customer' | 'vendor' | 'employee' | 'other';
+
 export function emptyExtraLine(): ExtraLine {
-  return { accountId: '', amount: '', description: '' };
+  return { accountId: '', amount: '', description: '', entityType: '', entityId: '' };
+}
+
+/** Received From choice id `type:id` ('' = none), as the Make Deposits picker stores it. */
+export function receivedFromValue(l: Pick<ExtraLine, 'entityType' | 'entityId'>): string {
+  return l.entityType && l.entityId ? `${l.entityType}:${l.entityId}` : '';
+}
+
+/** The line patch for a picked Received From choice id (`type:id`, '' clears it). */
+export function receivedFromPatch(value: string): Pick<ExtraLine, 'entityType' | 'entityId'> {
+  const [type, id] = value.split(':');
+  if (!id || !['customer', 'vendor', 'employee', 'other'].includes(type)) return { entityType: '', entityId: '' };
+  return { entityType: type as ReceivedFromType, entityId: id };
+}
+
+/** An extra line as /api/deposits takes it (the Received From name included, null when none). */
+export function extraLinePayload(l: ExtraLine) {
+  return {
+    accountId: l.accountId,
+    amount: l.amount,
+    description: l.description.trim() || undefined,
+    entityType: l.entityType && l.entityId ? l.entityType : null,
+    entityId: l.entityType && l.entityId ? l.entityId : null,
+  };
 }
 
 const RECEIPT_PREFIX = 'salesReceipt:';
@@ -156,7 +187,13 @@ export function depositToEdit(dep: Deposit): DepositEdit {
     } else {
       // Extra lines keep their description and credited account (deposit_lines.account_id, 0037;
       // older lines without one are re-picked — the form flags it as required).
-      extraLines.push({ accountId: l.accountId ?? '', amount: l.amount, description: desc });
+      extraLines.push({
+        accountId: l.accountId ?? '',
+        amount: l.amount,
+        description: desc,
+        // The Received From name comes back too, or saving the edit dropped it.
+        ...receivedFromPatch(l.entityType && l.entityId ? `${l.entityType}:${l.entityId}` : ''),
+      });
     }
   }
   return {

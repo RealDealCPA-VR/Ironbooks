@@ -597,32 +597,39 @@ export const DOC_SHAPES: Record<DocType, Shape> = {
     jobId: 'id?', salesRepId: 'id?', discount: 'dec?', discountType: 'str?', retainagePercent: 'dec?', memo: 'str?',
     currency: 'str?', exchangeRate: 'dec?', status: 'str', customFields: 'strmap?', shipDate: 'date?', shipVia: 'str?',
     fob: 'str?', trackingNumber: 'str?', shipTo: 'strmap?', poNumber: 'str?', toBePrinted: 'bool?', toBeEmailed: 'bool?',
-    isStatementCharge: 'bool?', total: 'dec',
+    isStatementCharge: 'bool?', customerMessageId: 'id?', total: 'dec',
     lines: {
       arr: {
         itemId: 'id?', accountId: 'id?', description: 'str?', quantity: 'dec', rate: 'dec?', taxable: 'bool?',
-        taxRateId: 'id?', classId: 'id?', jobId: 'id?', estimateLineId: 'id?',
+        salesTaxCodeId: 'id?', taxRateId: 'id?', classId: 'id?', jobId: 'id?', estimateLineId: 'id?',
         billableSource: { obj: { kind: 'str', id: 'id' }, opt: true }, cost: 'dec?', ...INV,
       },
     },
   },
   sales_receipt: {
     refNumber: 'str?', customerId: 'id?', date: 'date', taxRateId: 'id?', depositAccountId: 'id?', method: 'str?',
+    paymentMethodId: 'id?', customerMessageId: 'id?',
     reference: 'str?', memo: 'str?', classId: 'id?', shipDate: 'date?', shipVia: 'str?', fob: 'str?',
     trackingNumber: 'str?', shipTo: 'strmap?', poNumber: 'str?', toBePrinted: 'bool?', toBeEmailed: 'bool?', total: 'dec',
     lines: {
-      arr: { itemId: 'id?', accountId: 'id?', description: 'str?', quantity: 'dec', rate: 'dec?', taxable: 'bool?', taxRateId: 'id?', cost: 'dec?', ...INV },
+      arr: {
+        itemId: 'id?', accountId: 'id?', description: 'str?', quantity: 'dec', rate: 'dec?', taxable: 'bool?',
+        salesTaxCodeId: 'id?', taxRateId: 'id?', cost: 'dec?', ...INV,
+      },
     },
   },
   credit_memo: {
     refNumber: 'str?', customerId: 'id', date: 'date', taxRateId: 'id?', memo: 'str?', toBePrinted: 'bool?',
-    toBeEmailed: 'bool?', total: 'dec',
+    toBeEmailed: 'bool?', classId: 'id?', jobId: 'id?', customerMessageId: 'id?', total: 'dec',
     lines: {
-      arr: { itemId: 'id?', accountId: 'id?', description: 'str?', quantity: 'dec', rate: 'dec?', taxable: 'bool?', restock: 'bool?', cost: 'dec?', ...INV },
+      arr: {
+        itemId: 'id?', accountId: 'id?', description: 'str?', quantity: 'dec', rate: 'dec?', taxable: 'bool?',
+        salesTaxCodeId: 'id?', classId: 'id?', jobId: 'id?', restock: 'bool?', cost: 'dec?', ...INV,
+      },
     },
   },
   payment_received: {
-    customerId: 'id', date: 'date', method: 'str', reference: 'str?', amount: 'dec', depositAccountId: 'id?',
+    customerId: 'id', date: 'date', method: 'str', paymentMethodId: 'id?', reference: 'str?', amount: 'dec', depositAccountId: 'id?',
     discountAccountId: 'id?', memo: 'str?', currency: 'str?', exchangeRate: 'dec?',
     applications: { arr: { invoiceId: 'id', amountApplied: 'dec', discountAmount: 'dec?' } },
     credits: { arr: { creditMemoId: 'id', invoiceId: 'id', amount: 'dec' } },
@@ -663,16 +670,18 @@ export const DOC_SHAPES: Record<DocType, Shape> = {
   },
   estimate: {
     refNumber: 'str?', customerId: 'id', date: 'date', expirationDate: 'date?', taxRateId: 'id?', memo: 'str?',
-    shipTo: 'strmap?', toBePrinted: 'bool?', toBeEmailed: 'bool?', status: 'str', total: 'dec',
+    shipTo: 'strmap?', toBePrinted: 'bool?', toBeEmailed: 'bool?', customerMessageId: 'id?', status: 'str', total: 'dec',
     // Line ids (the accountant file's): an invoice line made in the copy may bill an estimate line
     // made there; the import maps them to the client's new lines by position.
-    lines: { arr: { id: 'id?', itemId: 'id?', description: 'str?', quantity: 'dec', rate: 'dec?', taxable: 'bool?', classId: 'id?' } },
+    lines: {
+      arr: { id: 'id?', itemId: 'id?', description: 'str?', quantity: 'dec', rate: 'dec?', taxable: 'bool?', salesTaxCodeId: 'id?', classId: 'id?' },
+    },
   },
   sales_order: {
     refNumber: 'str?', customerId: 'id', date: 'date', memo: 'str?', taxRateId: 'id?', shipDate: 'date?', shipVia: 'str?',
     fob: 'str?', trackingNumber: 'str?', shipTo: 'strmap?', poNumber: 'str?', toBePrinted: 'bool?', toBeEmailed: 'bool?',
-    status: 'str', total: 'dec',
-    lines: { arr: { id: 'id?', itemId: 'id?', description: 'str?', quantity: 'dec', rate: 'dec?', taxable: 'bool?' } },
+    customerMessageId: 'id?', status: 'str', total: 'dec',
+    lines: { arr: { id: 'id?', itemId: 'id?', description: 'str?', quantity: 'dec', rate: 'dec?', taxable: 'bool?', salesTaxCodeId: 'id?' } },
   },
   purchase_order: {
     refNumber: 'str?', vendorId: 'id', date: 'date', expectedDate: 'date?', memo: 'str?', status: 'str', total: 'dec',

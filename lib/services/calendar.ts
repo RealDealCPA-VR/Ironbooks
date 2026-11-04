@@ -18,7 +18,7 @@ import {
   salesReceipts,
   vendors,
 } from '@/lib/db/schema';
-import { can, type Area } from '@/lib/permissions/model';
+import { canRef, type AccessRef } from '@/lib/permissions/model';
 import { type ServiceContext, validation } from './_base';
 import { projectOccurrences, type Frequency } from './recurring';
 import { listTodos } from './todos';
@@ -63,8 +63,31 @@ function day(d: Date | null | undefined): string | null {
   return d ? d.toISOString().slice(0, 10) : null;
 }
 
-function canView(ctx: ServiceContext, area: Area): boolean {
-  return !ctx.access || can(ctx.access, area, 'view');
+/**
+ * prefsperms: each kind of event needs View on its own activity (Invoices, Receive Payments, Enter
+ * Bills, Write Checks, Memorized Transactions…), so a role built per activity sees exactly those.
+ */
+const EVENT_ACTIVITY: Record<string, AccessRef> = {
+  invoice: 'customers.invoices',
+  estimate: 'customers.estimates',
+  sales_order: 'customers.sales_orders',
+  payment: 'customers.payments',
+  sales_receipt: 'customers.sales_receipts',
+  bill: 'vendors.bills',
+  purchase_order: 'vendors.purchase_orders',
+  check: 'banking.write_checks',
+  deposit: 'banking.deposits',
+  memorized: 'lists.memorized',
+};
+
+function canViewKind(ctx: ServiceContext, kind: string): boolean {
+  const ref = EVENT_ACTIVITY[kind];
+  return !ctx.access || !ref || canRef(ctx.access, ref, 'view');
+}
+
+/** Any of these kinds of event viewable (decides whether a group of queries runs at all). */
+function canView(ctx: ServiceContext, ...kinds: string[]): boolean {
+  return kinds.some((k) => canViewKind(ctx, k));
 }
 
 export async function getCalendar(
@@ -81,13 +104,14 @@ export async function getCalendar(
   const events = new Map<string, CalendarEvent[]>();
   const add = (date: string | null, e: CalendarEvent) => {
     if (!date || date < opts.from || date > opts.to) return;
+    if (!canViewKind(ctx, e.kind)) return;
     const list = events.get(date) ?? [];
     list.push(e);
     events.set(date, list);
   };
   const inRange = (col: Parameters<typeof gte>[0]) => and(gte(col, fromD), lte(col, toD));
 
-  if (canView(ctx, 'customers')) {
+  if (canView(ctx, 'invoice', 'estimate', 'sales_order', 'payment', 'sales_receipt')) {
     const inv = await ctx.db
       .select({ id: invoices.id, n: sql<string>`COALESCE(NULLIF(${invoices.refNumber}, ''), CAST(${invoices.invoiceNumber} AS TEXT))`, date: invoices.date, due: invoices.dueDate, total: invoices.total, balance: invoices.balanceDue, status: invoices.status, customer: customers.displayName })
       .from(invoices)
@@ -134,7 +158,7 @@ export async function getCalendar(
     for (const r of sr) add(day(r.date), { id: r.id, kind: 'sales_receipt', type: 'entered', label: `Sales receipt ${r.n}`, amount: r.total, href: '/sales-receipts' });
   }
 
-  if (canView(ctx, 'vendors')) {
+  if (canView(ctx, 'bill', 'purchase_order')) {
     const b = await ctx.db
       .select({ id: bills.id, n: bills.billNumber, date: bills.date, due: bills.dueDate, total: bills.total, balance: bills.balanceDue, vendor: vendors.displayName })
       .from(bills)
@@ -166,7 +190,7 @@ export async function getCalendar(
     }
   }
 
-  if (canView(ctx, 'banking')) {
+  if (canView(ctx, 'check', 'deposit')) {
     const ex = await ctx.db
       .select({ id: expenses.id, date: expenses.date, total: expenses.total, method: expenses.method, payee: expenses.payeeName, vendor: vendors.displayName })
       .from(expenses)
@@ -189,7 +213,7 @@ export async function getCalendar(
     for (const r of dep) add(day(r.date), { id: r.id, kind: 'deposit', type: 'entered', label: 'Deposit', amount: r.total, href: '/deposits' });
   }
 
-  if (canView(ctx, 'lists')) {
+  if (canView(ctx, 'memorized')) {
     const tpl = await ctx.db
       .select()
       .from(recurringTemplates)

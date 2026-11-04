@@ -134,8 +134,18 @@ at once (further sign-ins over the network are refused until someone logs out).
 - While the file is open its books are decrypted only into a private working copy on that
   computer (`%LOCALAPPDATA%\Ironbooks\Working`), which is deleted after a clean close.
 - Backups, safety copies, condense archives, Save Copy As and "unsaved changes" copies of a
-  protected file are encrypted the same way. Portable company files and Accountant's Copy transfer
-  files are offered with a password (on by default).
+  protected file are encrypted the same way. Portable company files, Period Copies and Accountant's
+  Copy transfer files are offered with a password (on by default; required for a protected file),
+  and never carry the original file's key — each copy gets its own.
+- The file key changes whenever a password is changed or reset, a challenge answer is changed, a
+  user is made inactive or a new recovery key is made (and on request, Company > Security): older
+  copies of the file and replaced passwords then open nothing saved afterwards.
+- A challenge answer opens a protected file only when it is at least 10 characters long: a short
+  answer to a known question could be guessed offline from a copy of the file.
+- The plain listing (company name, file id, save dates, app version, user-name lookup tags) is
+  readable without a password, and a guessed user name can be confirmed against a copy of the file.
+- "Try it on a copy" sandboxes are kept in `%LOCALAPPDATA%\Ironbooks\Sandboxes` (never the roaming
+  profile); a protected file's leftover sandbox copies are removed when the file is closed cleanly.
 - Backups (`.bka`) are written to your own disk, including the automatic rotating backups in
   the app's data folder.
 - Sign-in sessions are stored in the company file (`user_sessions`) so admins can see and

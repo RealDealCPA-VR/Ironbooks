@@ -25,6 +25,8 @@ import {
 } from '@/components/ui';
 import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
+// purchbank: a reconciled receipt deposited to the bank asks QB's "Change it anyway?" first.
+import { saveWithReconciledCheck } from '@/lib/purchasesClient';
 import { useFocusId, useNewParam } from '@/lib/useFocusParam';
 import { useOpenParam } from '@/lib/useOpenParam';
 import { todayISO } from '@/lib/dates';
@@ -566,10 +568,16 @@ function NewReceiptModal({
       const body = { ...receiptPayload(validLines), refNumber: docNumber.payload };
       const saved = await dupConfirm.run((allowDuplicateNumber) =>
         editing
-          ? api.patch<SalesReceipt>(`/api/sales-receipts/${editing.id}`, { ...body, allowDuplicateNumber })
+          ? saveWithReconciledCheck((allowReconciledEdit) =>
+              api.patch<SalesReceipt>(`/api/sales-receipts/${editing.id}`, {
+                ...body,
+                allowDuplicateNumber,
+                ...(allowReconciledEdit ? { allowReconciledEdit } : {}),
+              }),
+            )
           : api.post<SalesReceipt>('/api/sales-receipts', { ...body, allowDuplicateNumber }),
       );
-      if (saved === undefined) return;
+      if (saved === undefined || saved === null) return;
       if (!editing) smart.rememberDate(date);
       if (editing) {
         toast(`Sales Receipt #${docNo(saved.refNumber, saved.receiptNumber)} updated.`, 'success');

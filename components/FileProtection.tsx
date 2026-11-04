@@ -38,6 +38,45 @@ function recoveryKeyText(companyName: string, recoveryKey: string): string {
   ].join('\r\n');
 }
 
+/** The print-only sheet (a direct child of <body>) and the class that hides everything else. */
+export const RECOVERY_PRINT_ID = 'ib-recovery-key-print';
+const RECOVERY_PRINT_CLASS = 'ib-printing-recovery-key';
+const RECOVERY_PRINT_CSS =
+  `#${RECOVERY_PRINT_ID}{display:none}` +
+  `@media print{body.${RECOVERY_PRINT_CLASS}>*:not(#${RECOVERY_PRINT_ID}){display:none!important}` +
+  `body.${RECOVERY_PRINT_CLASS} #${RECOVERY_PRINT_ID}{display:block!important;padding:32px;color:#000;background:#fff}}`;
+
+/**
+ * Print `text` on its own sheet from the current page: a print-only block is added to <body>, the
+ * rest of the page is hidden for printing, window.print() runs, and the block goes away again
+ * after printing. Plain text only (textContent): nothing in it is ever read as HTML.
+ */
+export function printRecoveryKeySheet(text: string): void {
+  if (typeof document === 'undefined') return;
+  document.getElementById(RECOVERY_PRINT_ID)?.remove();
+  const sheet = document.createElement('div');
+  sheet.id = RECOVERY_PRINT_ID;
+  const style = document.createElement('style');
+  style.textContent = RECOVERY_PRINT_CSS;
+  const pre = document.createElement('pre');
+  pre.style.cssText = 'font:15px ui-monospace,Consolas,monospace;white-space:pre-wrap;margin:0';
+  pre.textContent = text;
+  sheet.append(style, pre);
+  document.body.appendChild(sheet);
+  document.body.classList.add(RECOVERY_PRINT_CLASS);
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const cleanup = () => {
+    window.removeEventListener('afterprint', cleanup);
+    if (timer) clearTimeout(timer);
+    document.body.classList.remove(RECOVERY_PRINT_CLASS);
+    sheet.remove();
+  };
+  window.addEventListener('afterprint', cleanup);
+  // Should a print dialog never report back, the sheet does not stay around for long.
+  timer = setTimeout(cleanup, 5 * 60 * 1000);
+  window.print();
+}
+
 /**
  * The recovery key, shown once. `onDone` continues (enabled once the person says they kept it).
  */
@@ -63,15 +102,10 @@ export function RecoveryKeyPanel({ recoveryKey, companyName, onDone, doneLabel =
   }
 
   function print() {
-    const w = window.open('', '_blank', 'width=640,height=480');
-    if (!w) return;
-    const esc = (s: string) => s.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c] as string);
-    w.document.write(
-      `<!doctype html><title>Recovery key</title><body style="font:14px system-ui;padding:32px"><pre style="font:15px ui-monospace,monospace;white-space:pre-wrap">${esc(recoveryKeyText(companyName, recoveryKey))}</pre></body>`,
-    );
-    w.document.close();
-    w.focus();
-    w.print();
+    // Printed from this page itself, the way reports and checks print (window.print): the desktop
+    // app never opens a blank pop-up window (electron/security.js refuses it), and the key never
+    // goes into a URL. While printing, only the recovery key sheet is on the page.
+    printRecoveryKeySheet(recoveryKeyText(companyName, recoveryKey));
     setKept(true);
   }
 
@@ -127,22 +161,52 @@ export function filePasswordProblem(c: FilePasswordChoice): string | null {
   return null;
 }
 
-/** "Protect this file with a password" (on by default) + password + confirm. */
+/** True once the open company file is known to be protected with passwords (GET /api/file-protection). */
+export function useFileIsProtected(): boolean {
+  const [isProtected, setProtected] = React.useState(false);
+  React.useEffect(() => {
+    let alive = true;
+    fetch('/api/file-protection', { cache: 'no-store' })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((s: { protected?: boolean } | null) => alive && setProtected(Boolean(s?.protected)))
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, []);
+  return isProtected;
+}
+
+/**
+ * "Protect this file with a password" (on by default) + password + confirm. For a company file
+ * protected with passwords the password is required (its copies are protected too): no choice.
+ */
 export function FilePasswordFields({ value, onChange, what }: { value: FilePasswordChoice; onChange: (v: FilePasswordChoice) => void; what: string }) {
   const id = React.useId();
+  const fileProtected = useFileIsProtected();
   const problem = value.confirm || value.password.length >= MIN_FILE_PASSWORD ? filePasswordProblem(value) : null;
+  React.useEffect(() => {
+    if (fileProtected && !value.protect) onChange({ ...value, protect: true });
+  }, [fileProtected, value, onChange]);
   return (
     <fieldset className="rounded-xl border border-navy/10 p-4 space-y-3">
       <legend className="px-1 text-sm font-semibold text-navy flex items-center gap-1.5">
         <ShieldCheck className="h-4 w-4 text-electric" aria-hidden /> Password
       </legend>
-      <label className="flex items-start gap-2 text-sm text-navy">
-        <input type="checkbox" className="mt-1" checked={value.protect} onChange={(e) => onChange({ ...value, protect: e.target.checked })} />
-        <span>
-          Protect {what} with a password (recommended). It holds every user, password hash and transaction of this company file;
-          without a password anyone who gets the file can read the books.
-        </span>
-      </label>
+      {fileProtected ? (
+        <p className="text-sm text-navy">
+          This company file is protected with passwords, so {what} is too: give it a password. Once it is restored, the copy opens with
+          the same user names and passwords as this company file.
+        </p>
+      ) : (
+        <label className="flex items-start gap-2 text-sm text-navy">
+          <input type="checkbox" className="mt-1" checked={value.protect} onChange={(e) => onChange({ ...value, protect: e.target.checked })} />
+          <span>
+            Protect {what} with a password (recommended). It holds every user, password hash and transaction of this company file;
+            without a password anyone who gets the file can read the books.
+          </span>
+        </label>
+      )}
       {value.protect && (
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <div>

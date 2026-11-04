@@ -1607,11 +1607,13 @@ export async function set1099Mapping(ctx: ServiceContext, mapping: Tax1099Mappin
         .map((b) => ({ box: b.box, accountIds: [...new Set(b.accountIds)] }))
         .filter((b) => b.accountIds.length > 0),
     };
-    const newSettings = { ...oldSettings, tax1099: cleaned };
-
+    // Merge only this key (a whole-object write could undo a concurrent settings save).
     const [updated] = await tx.db
       .update(companies)
-      .set({ settings: newSettings, updatedAt: new Date() })
+      .set({
+        settings: sql`coalesce(${companies.settings}, '{}'::jsonb) || jsonb_build_object('tax1099', ${JSON.stringify(cleaned)}::jsonb)`,
+        updatedAt: new Date(),
+      })
       .where(eq(companies.id, tx.companyId))
       .returning();
 

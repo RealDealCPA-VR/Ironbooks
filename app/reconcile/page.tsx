@@ -23,7 +23,7 @@ import {
 import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
 import { formatCurrency, Money } from '@/lib/money';
-import { canFinishReconciliation, statementLineAmount } from '@/lib/reconcileRules';
+import { canFinishReconciliation, reconcilesAsLiability, statementLineAmount } from '@/lib/reconcileRules';
 import { isBankAccount } from '@/lib/accountTypes';
 import { formatDate as fmtDate, todayISO } from '@/lib/dates';
 // cmdbar: "reconcile checking" opens this page with the account picked.
@@ -87,7 +87,10 @@ interface ReconcileInfo {
   glAccountName: string;
   glAccountCode: string;
   glType: string;
+  /** Credit Card subtype only: the badge and the "Write a check for the balance" offer. */
   isCreditCard: boolean;
+  /** Any liability (card, loan, line of credit): amounts read with the liability sign. */
+  isLiability?: boolean;
   lastReconciledDate: string | null;
   beginningBalance: string;
   recomputedBalance: string;
@@ -132,9 +135,9 @@ function statusLabel(status: string): string {
   return status;
 }
 
-/** The amount as the statement shows it (a card's charges +, its payments −). */
-function lineAmount(line: ClearableLine, isCreditCard: boolean): string {
-  return statementLineAmount(line, isCreditCard);
+/** The amount as the statement shows it (a card's or loan's charges / borrowings +, its payments −). */
+function lineAmount(line: ClearableLine, isLiability: boolean): string {
+  return statementLineAmount(line, isLiability);
 }
 
 /** Finish is offered only at a difference of exactly 0.00 (lib/reconcileRules.ts, the service's rule). */
@@ -902,7 +905,7 @@ function ReconcileSession({
                   <Td className="text-navy/60">{line.memo ?? '—'}</Td>
                   <Td numeric>
                     {(() => {
-                      const amount = lineAmount(line, !!info?.isCreditCard);
+                      const amount = lineAmount(line, reconcilesAsLiability(info));
                       return (
                         <span className={Money.isZero(amount) ? 'text-navy/40' : Money.isNegative(amount) ? 'text-red-500' : 'text-navy'}>
                           {fmt(amount)}

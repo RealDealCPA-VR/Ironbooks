@@ -223,25 +223,28 @@ export default function PreferencePane({
   accounts,
   exclude = [],
   canEditCompany = true,
+  myOnly = false,
 }: {
   categoryId: string;
   accounts: Account[];
   /** Company keys already edited elsewhere on the page (legacy panes). */
   exclude?: string[];
   canEditCompany?: boolean;
+  /** Only the My Preferences side (the /my-preferences page, open to every user). */
+  myOnly?: boolean;
 }) {
   const category = PREFERENCE_CATEGORIES.find((c) => c.id === categoryId);
   const prefs = usePreferences();
-  const [scope, setScope] = React.useState<'company' | 'my'>('company');
+  const [scope, setScope] = React.useState<'company' | 'my'>(myOnly ? 'my' : 'company');
   const [draft, setDraft] = React.useState<Draft>({});
   const [myDraft, setMyDraft] = React.useState<Draft>({});
   const [saving, setSaving] = React.useState(false);
 
-  const companyKeys = (category?.company ?? []).filter((k) => !exclude.includes(k));
+  const companyKeys = myOnly ? [] : (category?.company ?? []).filter((k) => !exclude.includes(k));
   const myKeys = category?.my ?? [];
   // prefsperms A2: a tab may carry only a plain note (a QB setting Ironbooks fixes on).
   const notes = category?.notes ?? {};
-  const companyCount = companyKeys.length + (notes.company ? 1 : 0);
+  const companyCount = companyKeys.length + (!myOnly && notes.company ? 1 : 0);
   const myCount = myKeys.length + (notes.my ? 1 : 0);
 
   React.useEffect(() => {
@@ -259,7 +262,7 @@ export default function PreferencePane({
   }, [categoryId]);
 
   // A2: the Multiple Currencies switch asks before turning on and locks once foreign data exists.
-  if (categoryId === 'currencies' && companyKeys.includes('multiCurrencyEnabled')) {
+  if (!myOnly && categoryId === 'currencies' && companyKeys.includes('multiCurrencyEnabled')) {
     return <MultiCurrencyPreference canEdit={canEditCompany} />;
   }
   if (!category || (companyCount === 0 && myCount === 0)) return null;
@@ -294,6 +297,7 @@ export default function PreferencePane({
     <Card className="p-8">
       <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
         <h2 className="text-lg font-bold text-navy">{category.label}</h2>
+        {!myOnly && (
         <div className="flex rounded-lg border border-slate-200 overflow-hidden" role="tablist" aria-label="Preference scope">
           {(
             [
@@ -316,6 +320,7 @@ export default function PreferencePane({
             </button>
           ))}
         </div>
+        )}
       </div>
       <p className="mb-5 text-sm text-navy/50">
         {scope === 'company'

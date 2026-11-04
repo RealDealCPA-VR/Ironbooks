@@ -163,6 +163,7 @@ export const ACTIVITIES = [
   act('accounting', 'depreciation', 'Fixed Asset Depreciation', 'Post fixed asset depreciation', [C]),
   // ---- Company & Preferences ----
   act('company', 'preferences', 'Company Information & Preferences', 'Company information and every company preference', [M]),
+  act('company', 'company_file', 'Rename & Archive Company File', 'Rename this company file, or archive it (hide it from the list)', [M, D]),
   act('company', 'budgets', 'Budgets', 'Budgets and forecasts', [C, M]),
   act('company', 'templates', 'Form Templates', 'Invoice and other form templates, logos', [C, M, D]),
   act('company', 'doc_numbers', 'Document Numbers', 'Starting numbers for forms', [M]),

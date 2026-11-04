@@ -382,6 +382,12 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
     first: 'Pick a report, tick the roles or users to compare, then print it or download it as CSV.',
     qb: 'Users and Roles > View Permissions',
   },
+  '/my-preferences': {
+    title: 'My Preferences',
+    what: 'Your own settings, open to every user: the name and email address your forms are sent from, Bcc me, menus and more.',
+    first: 'Pick a category on the left, change what you need and save. Only you are affected.',
+    qb: 'Edit > Preferences > My Preferences',
+  },
   '/settings': {
     title: 'Preferences',
     what: 'Settings for the whole company and just for you, such as features you use, the menu style and the mail server that sends your forms (Send Forms).',

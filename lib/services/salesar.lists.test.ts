@@ -18,10 +18,13 @@ import { createCompany } from './company';
 import { createCustomer, updateCustomer } from './customers';
 import { createInvoice, getInvoice, updateInvoice } from './invoices';
 import { createSalesReceipt, getSalesReceipt, updateSalesReceipt } from './salesReceipts';
-import { createCreditMemo, getCreditMemo } from './creditMemos';
-import { convertToInvoice as convertEstimate, createEstimate, getEstimate } from './estimates';
+import { createCreditMemo, getCreditMemo, updateCreditMemo } from './creditMemos';
+import { commitUndo, performUndo, prepareUndo } from './undo';
+import { createJob } from './jobs';
+import { createClass } from './dimensions';
+import { convertToInvoice as convertEstimate, createEstimate, getEstimate, updateEstimate } from './estimates';
 import { convertToInvoice as convertSalesOrder, createSalesOrder, getSalesOrder } from './salesOrders';
-import { receivePayment, updatePayment } from './payments';
+import { getPayment, receivePayment, updatePayment } from './payments';
 import { createTaxRate } from './salesTax';
 import { createEntry, listEntries, updateEntry } from './lists/simpleLists';
 import { listUndepositedPayments } from './deposits';
@@ -184,6 +187,31 @@ describe('B9. The Sales Tax Code of each line is decided on the server', () => {
         lines: [{ accountId: acct['4000'], quantity: 1, rate: '10.00', salesTaxCodeId: theirs }],
       } as never),
     ).rejects.toMatchObject({ code: 'VALIDATION' });
+  });
+
+  it('a sales receipt with no customer (walk-in) still follows the item code and refuses a foreign code', async () => {
+    const nonItem = await item('Walk-in (Non)', { salesTaxCodeId: non, taxable: false });
+    const sr = await createSalesReceipt(ctx, {
+      date: d('2026-03-01'),
+      taxRateId: rate,
+      depositAccountId: acct['1000'],
+      lines: [{ itemId: nonItem, quantity: 1, rate: '100.00', taxable: true }],
+    } as never);
+    expect(sr.taxAmount).toBe('0.00');
+    const [line] = (await getSalesReceipt(ctx, sr.id)).lines;
+    expect(line.taxable).toBe(false);
+    expect(line.salesTaxCodeId).toBe(non);
+
+    const other = await createCompany(db, { name: `Other walk-in ${seq}`, ownerId: userId });
+    const theirs = String((await listEntries({ db, companyId: other.id, userId }, 'sales-tax-codes'))[0].id);
+    const foreign = { date: d('2026-03-01'), taxRateId: rate, depositAccountId: acct['1000'] };
+    await expect(
+      createSalesReceipt(ctx, { ...foreign, lines: [{ accountId: acct['4000'], quantity: 1, rate: '10.00', salesTaxCodeId: theirs }] } as never),
+    ).rejects.toMatchObject({ code: 'VALIDATION' });
+    await expect(
+      updateSalesReceipt(ctx, sr.id, { ...foreign, lines: [{ accountId: acct['4000'], quantity: 1, rate: '10.00', salesTaxCodeId: theirs }] } as never),
+    ).rejects.toMatchObject({ code: 'VALIDATION' });
+    expect((await getSalesReceipt(ctx, sr.id)).lines[0].salesTaxCodeId).toBe(non);
   });
 
   it('sales receipts, credit memos, estimates and sales orders store the code; conversions carry it', async () => {
@@ -358,5 +386,93 @@ describe('B7. Payment Method list on payments and sales receipts', () => {
     ).rejects.toMatchObject({ code: 'NOT_FOUND' });
     const all = await db.select().from(salesTaxCodes).where(and(eq(salesTaxCodes.companyId, ctx.companyId)));
     expect(all.length).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe('Undo keeps the line Sales Tax Code, the Customer Message, the Payment Method and the credit memo class / job', () => {
+  /** Snapshot, run the edit, arm the Undo and perform it (the toast's Undo button). */
+  async function editThenUndo(resource: string, id: string, edit: () => Promise<unknown>) {
+    const prepared = await prepareUndo(ctx, { resource, kind: 'update', id });
+    await edit();
+    const armed = await commitUndo(ctx, { resource, kind: 'update', token: prepared.token, id: null });
+    await performUndo(ctx, armed.token);
+  }
+
+  it('an invoice edit undone keeps a stated Tax on a "Non" item, its tax and the message', async () => {
+    const cust = (await createCustomer(ctx, { displayName: `Undo tax ${seq}` } as never)).id;
+    const nonItem = await item('Undo (Non)', { salesTaxCodeId: non, taxable: false });
+    const m1 = await createEntry(ctx, 'customer-messages', { message: `First ${seq}` });
+    const m2 = await createEntry(ctx, 'customer-messages', { message: `Second ${seq}` });
+    const base = { customerId: cust, date: d('2026-03-01'), taxRateId: rate };
+    const inv = await createInvoice(ctx, {
+      ...base,
+      customerMessageId: m1.id,
+      lines: [{ itemId: nonItem, quantity: 1, rate: '100.00', salesTaxCodeId: tax }],
+    } as never);
+    expect(inv.taxAmount).toBe('10.00');
+    await editThenUndo('invoices', inv.id, () =>
+      updateInvoice(ctx, inv.id, { ...base, customerMessageId: m2.id, lines: [{ itemId: nonItem, quantity: 1, rate: '200.00', salesTaxCodeId: tax }] } as never),
+    );
+    const back = await getInvoice(ctx, inv.id);
+    expect([back.taxAmount, back.total]).toEqual(['10.00', '110.00']);
+    expect(back.lines.map((l) => [l.taxable, l.salesTaxCodeId])).toEqual([[true, tax]]);
+    expect(back.customerMessageId).toBe(m1.id);
+  });
+
+  it('an estimate edit undone keeps the stated code', async () => {
+    const cust = (await createCustomer(ctx, { displayName: `Undo est ${seq}` } as never)).id;
+    const nonItem = await item('Undo est (Non)', { salesTaxCodeId: non, taxable: false });
+    const base = { customerId: cust, date: d('2026-03-01'), taxRateId: rate };
+    const est = await createEstimate(ctx, { ...base, lines: [{ itemId: nonItem, quantity: 1, rate: '100.00', salesTaxCodeId: tax }] } as never);
+    await editThenUndo('estimates', est.id, () =>
+      updateEstimate(ctx, est.id, { ...base, lines: [{ itemId: nonItem, quantity: 1, rate: '50.00', salesTaxCodeId: tax }] } as never),
+    );
+    const back = await getEstimate(ctx, est.id);
+    expect(back.taxAmount).toBe('10.00');
+    expect(back.lines[0].salesTaxCodeId).toBe(tax);
+  });
+
+  it('a credit memo edit undone keeps its class and job (header and lines)', async () => {
+    const cust = (await createCustomer(ctx, { displayName: `Undo cm ${seq}` } as never)).id;
+    const job = (await createJob(ctx, { customerId: cust, name: `Undo job ${seq}` })).id;
+    const job2 = (await createJob(ctx, { customerId: cust, name: `Undo job B ${seq}` })).id;
+    const cls = (await createClass(ctx, { name: `Undo class ${seq}` } as never)).id;
+    const cls2 = (await createClass(ctx, { name: `Undo class B ${seq}` } as never)).id;
+    const body = (memo: string, r: string) =>
+      ({
+        customerId: cust,
+        date: d('2026-03-02'),
+        taxRateId: null,
+        classId: cls,
+        jobId: job,
+        memo,
+        // The line names its own class / job (not the header's).
+        lines: [{ accountId: acct['4000'], quantity: 1, rate: r, taxable: false, classId: cls2, jobId: job2 }],
+      }) as never;
+    const cm = await createCreditMemo(ctx, body('first', '20.00'));
+    await editThenUndo('credit-memos', cm.id, () => updateCreditMemo(ctx, cm.id, body('second', '30.00')));
+    const back = await getCreditMemo(ctx, cm.id);
+    expect([back.memo, back.total, back.classId, back.jobId]).toEqual(['first', '20.00', cls, job]);
+    expect([back.lines[0].classId, back.lines[0].jobId]).toEqual([cls2, job2]);
+  });
+
+  it('a sales receipt and a payment get their Payment Method back', async () => {
+    const methods = await listEntries(ctx, 'payment-methods');
+    const visa = methods.find((m) => m.name === 'Visa')!;
+    const echeck = methods.find((m) => m.name === 'E-Check')!;
+    const cust = (await createCustomer(ctx, { displayName: `Undo pm ${seq}` } as never)).id;
+    const lines = [{ accountId: acct['4000'], quantity: 1, rate: '12.00', taxable: false }];
+    const sr = await createSalesReceipt(ctx, { customerId: cust, date: d('2026-03-01'), paymentMethodId: visa.id, lines } as never);
+    await editThenUndo('sales-receipts', sr.id, () =>
+      updateSalesReceipt(ctx, sr.id, { customerId: cust, date: d('2026-03-01'), paymentMethodId: echeck.id, lines } as never),
+    );
+    expect((await getSalesReceipt(ctx, sr.id)).paymentMethodId).toBe(visa.id);
+
+    const inv = await createInvoice(ctx, { customerId: cust, date: d('2026-03-01'), lines: [{ accountId: acct['4000'], quantity: 1, rate: '80.00', taxable: false }] } as never);
+    const pay = { customerId: cust, date: d('2026-03-05'), amount: '80.00', applications: [{ invoiceId: inv.id, amountApplied: '80.00' }] };
+    const { payment } = await receivePayment(ctx, { ...pay, method: 'credit_card', paymentMethodId: visa.id } as never);
+    await editThenUndo('payments', payment.id, () => updatePayment(ctx, payment.id, { ...pay, method: 'ach', paymentMethodId: echeck.id } as never));
+    expect((await getPayment(ctx, payment.id)).paymentMethodId).toBe(visa.id);
   });
 });

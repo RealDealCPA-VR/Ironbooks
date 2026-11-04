@@ -26,7 +26,7 @@ import {
   vendors,
 } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
-import { can, type Area } from '@/lib/permissions/model';
+import { canRef, type AccessRef } from '@/lib/permissions/model';
 import {
   REMINDER_KEYS,
   REMINDER_LABELS,
@@ -73,24 +73,24 @@ export interface RemindersResult {
   sections: ReminderSection[];
 }
 
-/** Which permission area a category's data belongs to. */
-const AREA: Record<ReminderKey, Area | null> = {
-  checksToPrint: 'banking',
-  invoicesToPrint: 'customers',
-  overdueInvoices: 'customers',
-  salesReceiptsToPrint: 'customers',
-  salesOrdersToPrint: 'customers',
-  inventoryToReorder: 'inventory',
-  billsToPay: 'vendors',
-  memorizedTransactionsDue: 'lists',
-  moneyToDeposit: 'banking',
-  purchaseOrdersToPrint: 'vendors',
+/** Which permission activity (prefsperms; an area = the whole area) a category's data belongs to. */
+const AREA: Record<ReminderKey, AccessRef | null> = {
+  checksToPrint: 'banking.print_checks',
+  invoicesToPrint: 'customers.invoices',
+  overdueInvoices: 'customers.invoices',
+  salesReceiptsToPrint: 'customers.sales_receipts',
+  salesOrdersToPrint: 'customers.sales_orders',
+  inventoryToReorder: 'inventory.center',
+  billsToPay: 'vendors.bills',
+  memorizedTransactionsDue: 'lists.memorized',
+  moneyToDeposit: 'banking.deposits',
+  purchaseOrdersToPrint: 'vendors.purchase_orders',
   toDoNotes: null,
-  almostDueInvoices: 'customers',
-  overdueBills: 'vendors',
-  paychecksToPrint: 'payroll',
-  assembliesToBuild: 'inventory',
-  liabilitiesDue: 'payroll',
+  almostDueInvoices: 'customers.invoices',
+  overdueBills: 'vendors.bills',
+  paychecksToPrint: 'payroll.paychecks',
+  assembliesToBuild: 'inventory.assemblies',
+  liabilitiesDue: 'payroll.liabilities',
 };
 
 const HREF: Record<ReminderKey, string> = {
@@ -485,9 +485,9 @@ async function openBillItems(ctx: ServiceContext, env: SourceEnv): Promise<Remin
   }));
 }
 
-function canView(ctx: ServiceContext, area: Area | null): boolean {
+function canView(ctx: ServiceContext, area: AccessRef | null): boolean {
   if (!area || !ctx.access) return true;
-  return can(ctx.access, area, 'view');
+  return canRef(ctx.access, area, 'view');
 }
 
 export async function getReminders(ctx: ServiceContext, opts: { today?: string } = {}): Promise<RemindersResult> {

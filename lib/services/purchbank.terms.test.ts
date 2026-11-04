@@ -5,9 +5,11 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { eq } from 'drizzle-orm';
-import { bills } from '@/lib/db/schema';
+import { bills, customers, vendors } from '@/lib/db/schema';
 import { makeTestCompany, type TestCompany } from './testkit.prefs';
-import { createVendor } from './vendors';
+import { createVendor, getVendor } from './vendors';
+import { createCustomer } from './customers';
+import { getSmartDefaults } from './smartDefaults';
 import { createBill, getBill, listBillsToPay, updateBill } from './bills';
 import { createEntry, updateEntry } from './lists/simpleLists';
 
@@ -84,5 +86,45 @@ describe('D5: Terms list due dates and discounts', () => {
     const [row] = await t.ctx.db.select().from(bills).where(eq(bills.id, bill.id));
     expect(row.termsId).toBe(custom.id);
     expect(iso(row.dueDate)).toBe('2026-06-15');
+  });
+
+  it('renamed entry, then a NEW bill for a vendor on it: the bill still gets the entry, due date and discount', async () => {
+    const entry = (await createEntry(t.ctx, 'terms', {
+      name: 'Custom 45',
+      kind: 'standard',
+      netDays: 45,
+      discountPercent: '2',
+      discountDays: 15,
+    })) as { id: string };
+    const v = await createVendor(t.ctx, { displayName: 'Renamed Terms Vendor', termsId: entry.id } as never);
+    const c = await createCustomer(t.ctx, { displayName: 'Renamed Terms Customer', termsId: entry.id } as never);
+    // Stale data from before the fix: the vendor's terms text is the OLD label (the rename did not
+    // refresh it). The Bills page sends the vendor's terms text as it shows it.
+    await updateEntry(t.ctx, 'terms', entry.id, { name: 'Custom 45 Days' });
+    await t.ctx.db.update(vendors).set({ terms: 'Custom 45' }).where(eq(vendors.id, v.id));
+    const bill = await createBill(t.ctx, { vendorId: v.id, date: d('2026-03-01'), terms: 'Custom 45', lines: lines() });
+    const [row] = await t.ctx.db.select().from(bills).where(eq(bills.id, bill.id));
+    expect(row.termsId).toBe(entry.id);
+    expect(row.terms).toBe('Custom 45 Days');
+    expect(iso(row.dueDate)).toBe('2026-04-15');
+    const rows = await listBillsToPay(t.ctx, { vendorId: v.id, asOf: d('2026-03-10') });
+    expect(rows[0]).toMatchObject({ discountPercent: 2, suggestedDiscount: '20.00', discountAvailable: true });
+
+    // A rename now refreshes the terms text of the vendors and customers linked to the entry, so
+    // the Bills page shows (and previews the due date from) the current name.
+    await updateEntry(t.ctx, 'terms', entry.id, { name: 'Custom Net 45' });
+    expect((await getVendor(t.ctx, v.id)).terms).toBe('Custom Net 45');
+    const [cust] = await t.ctx.db.select({ terms: customers.terms }).from(customers).where(eq(customers.id, c.id));
+    expect(cust.terms).toBe('Custom Net 45');
+    const bill2 = await createBill(t.ctx, { vendorId: v.id, date: d('2026-03-01'), terms: 'Custom Net 45', lines: lines() });
+    const [row2] = await t.ctx.db.select().from(bills).where(eq(bills.id, bill2.id));
+    expect(row2.termsId).toBe(entry.id);
+    expect(iso(row2.dueDate)).toBe('2026-04-15');
+
+    // Recall ("the vendor's last bill") offers the entry under its current name, not the saved label.
+    // The last bill was saved under the old name; rename once more to prove the CURRENT name is offered.
+    await updateEntry(t.ctx, 'terms', entry.id, { name: 'Custom 45 Net' });
+    const recalled = await getSmartDefaults(t.ctx, { form: 'bill', vendorId: v.id });
+    expect(recalled.header.terms).toBe('Custom 45 Net');
   });
 });

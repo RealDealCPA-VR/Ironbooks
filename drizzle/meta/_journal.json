@@ -479,6 +479,13 @@
       "breakpoints": true
     },
     {
+      "idx": 86,
+      "version": "7",
+      "when": 1781400086000,
+      "tag": "0086_filecrypto_fix",
+      "breakpoints": true
+    },
+    {
       "idx": 89,
       "version": "7",
       "when": 1781400089000,

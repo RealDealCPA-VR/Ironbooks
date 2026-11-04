@@ -51,6 +51,7 @@ import {
   writeAudit,
 } from './_base';
 import { assertNotControlAccount, postJournalEntry, voidJournalEntry } from './posting';
+import { armReconciledRepost, confirmReconciledRepost } from './reconciledEdits';
 import { recordCOGS, valueRemainderAfter } from './inventory';
 import { consumeStock, restoreConsumedStock } from './fifo';
 import {
@@ -113,6 +114,8 @@ export interface CreateSalesReceiptInput {
   refNumber?: string | null;
   /** The user confirmed the "this number is already used" warning. */
   allowDuplicateNumber?: boolean | null;
+  /** Edits: the user confirmed QB's "this transaction has been reconciled" warning (reconciledEdits.ts). */
+  allowReconciledEdit?: boolean | null;
   /** Optional — walk-in / counter sales have no customer. */
   customerId?: string | null;
   date: Date;
@@ -1015,7 +1018,9 @@ async function updateSalesReceiptInTx(
       input.refNumber, { allowDuplicate: input.allowDuplicateNumber === true },
     );
 
-    // 1) Reverse the old version.
+    // 1) Reverse the old version. Deposited straight to a bank and reconciled there: the re-post
+    //    keeps it reconciled, and a changed amount / account gives QB's warning (step 2).
+    await armReconciledRepost(tx, { entryId: receipt.postedEntryId, what: 'sales receipt' });
     await reverseSalesReceiptPostings(tx, receipt);
 
     // 2) Replace lines + re-post.
@@ -1031,6 +1036,12 @@ async function updateSalesReceiptInTx(
       prep,
       { carryForward: true },
     );
+    await confirmReconciledRepost(tx, {
+      oldEntryId: receipt.postedEntryId,
+      newEntryId: entry.id,
+      what: 'sales receipt',
+      allowReconciledEdit: input.allowReconciledEdit,
+    });
 
     const [updated] = await tx.db
       .update(salesReceipts)

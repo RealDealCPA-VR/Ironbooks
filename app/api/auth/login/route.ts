@@ -227,7 +227,7 @@ async function handlePost(req: NextRequest) {
         // The password is right (checked above), but nothing here can unlock the file with it.
         return NextResponse.json({ error: NO_SLOT_MESSAGE, code: 'FORBIDDEN', details: { noKeySlot: true } }, { status: 403 });
       }
-      if (haveKey && sealed === 'key') await finishKeyUnseal();
+      if (haveKey && sealed === 'key') await finishKeyUnseal(db);
       if (haveKey) await refreshSlotAtSignIn(db, user, password);
     }
     limiter.recordSuccess(keys.slice(0, -1)); // keep the global counter

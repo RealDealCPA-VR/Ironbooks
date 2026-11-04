@@ -34,6 +34,7 @@ import {
   invoiceLines,
   invoices,
   items,
+  paymentTerms,
   salesOrderLines,
   salesOrders,
   salesReceiptLines,
@@ -43,7 +44,7 @@ import {
   vendors,
 } from '@/lib/db/schema';
 import { Money } from '@/lib/money';
-import type { Area } from '@/lib/permissions/model';
+import type { AccessRef } from '@/lib/permissions/model';
 import {
   EMPTY_HEADER,
   FORM_HEADER_FIELDS,
@@ -65,15 +66,16 @@ import { getMyPreferences } from './preferences';
 /** Recalled lines are capped (a 300-line bill is not a template). */
 const MAX_LINES = 50;
 
-const FORM_AREA: Record<SmartForm, Area> = {
-  bill: 'vendors',
-  check: 'banking',
-  expense: 'banking',
-  credit_card: 'banking',
-  invoice: 'customers',
-  sales_receipt: 'customers',
-  estimate: 'customers',
-  sales_order: 'customers',
+/** prefsperms: the form's own activity (its smart defaults show that form's past entries). */
+const FORM_AREA: Record<SmartForm, AccessRef> = {
+  bill: 'vendors.bills',
+  check: 'banking.write_checks',
+  expense: 'banking.write_checks',
+  credit_card: 'banking.write_checks',
+  invoice: 'customers.invoices',
+  sales_receipt: 'customers.sales_receipts',
+  estimate: 'customers.estimates',
+  sales_order: 'customers.sales_orders',
 };
 
 export interface SmartDefaultsInput {
@@ -113,10 +115,14 @@ async function lastBill(ctx: ServiceContext, vendorId: string): Promise<Recalled
       date: bills.date,
       number: bills.billNumber,
       terms: bills.terms,
+      // The Terms list entry the bill was entered with, under its CURRENT name (a renamed entry).
+      termsCode: paymentTerms.code,
+      termsName: paymentTerms.name,
       classId: bills.classId,
       memo: bills.memo,
     })
     .from(bills)
+    .leftJoin(paymentTerms, and(eq(paymentTerms.id, bills.termsId), eq(paymentTerms.companyId, bills.companyId)))
     .where(and(eq(bills.companyId, ctx.companyId), eq(bills.vendorId, vendorId), ne(bills.status, 'void')))
     .orderBy(desc(bills.date), desc(bills.createdAt))
     .limit(1);
@@ -132,7 +138,7 @@ async function lastBill(ctx: ServiceContext, vendorId: string): Promise<Recalled
     id: b.id,
     date: b.date,
     number: b.number,
-    header: { ...EMPTY_HEADER, terms: b.terms, classId: b.classId, memo: b.memo },
+    header: { ...EMPTY_HEADER, terms: (b.termsCode ?? b.termsName)?.slice(0, 50) ?? b.terms, classId: b.classId, memo: b.memo },
     lines: rows.map((l) => {
       if (l.itemId) {
         const qty = Money.of(l.quantity || '1');

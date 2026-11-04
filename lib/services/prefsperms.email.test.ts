@@ -179,11 +179,61 @@ describe('Test button', () => {
     expect(view.lastTest).toMatchObject({ ok: true });
   });
 
-  it('tests typed, unsaved settings with the saved password, without saving them', async () => {
-    const r = await sendTestEmail(ctx, { to: 'me@acme.test', draft: { ...SERVER, port: 465, security: 'ssl', password: undefined } });
+  it('tests typed, unsaved settings with the saved password (same server), without saving them', async () => {
+    const r = await sendTestEmail(ctx, { to: 'me@acme.test', draft: { ...SERVER, fromName: 'Acme Draft', password: undefined } });
     expect(r.ok).toBe(true);
-    expect(sent[0].options).toMatchObject({ port: 465, secure: true, auth: { pass: SERVER.password } });
+    expect(sent[0].options).toMatchObject({ port: 2525, auth: { pass: SERVER.password } });
+    expect((await getEmailSetup(ctx)).fromName).toBe('Acme Billing');
+    // A changed port / security is tested with the password typed again.
+    const typed = await sendTestEmail(ctx, { to: 'me@acme.test', draft: { ...SERVER, port: 465, security: 'ssl' } });
+    expect(typed.ok).toBe(true);
+    expect(sent[1].options).toMatchObject({ port: 465, secure: true, auth: { pass: SERVER.password } });
     expect((await getEmailSetup(ctx)).port).toBe(2525);
+  });
+
+  it('never sends the saved password to a different server, port, security or user name (review P1)', async () => {
+    const changes: Array<Partial<typeof SERVER>> = [
+      { host: '10.0.0.66', port: 25, security: 'none' as never },
+      { host: '10.0.0.66' },
+      { port: 2526 },
+      { security: 'none' as never },
+      { username: 'attacker@evil.test' },
+    ];
+    for (const change of changes) {
+      const draft = { ...SERVER, ...change, password: undefined };
+      await expect(sendTestEmail(ctx, { to: 'me@acme.test', draft })).rejects.toMatchObject({
+        code: 'VALIDATION',
+        message: expect.stringMatching(/password again/),
+      });
+    }
+    expect(sent).toHaveLength(0);
+    // A relay that needs no sign-in (no user name) is tested without any password.
+    const relay = await sendTestEmail(ctx, { to: 'me@acme.test', draft: { ...SERVER, host: '10.0.0.66', username: '', password: undefined } });
+    expect(relay.ok).toBe(true);
+    expect(sent[0].options.auth).toBeUndefined();
+    expect(JSON.stringify(sent[0])).not.toContain(SERVER.password);
+  });
+
+  it('saving a different server, port, security or user name needs the password typed again (review P1)', async () => {
+    const before = await db.select().from(companyEmailSettings).where(eq(companyEmailSettings.companyId, companyId));
+    for (const change of [{ host: '10.0.0.66' }, { port: 25 }, { security: 'none' as never }, { username: 'other@acme.test' }, { host: 'localhost' }]) {
+      await expect(saveEmailSetup(ctx, { ...SERVER, ...change, password: undefined })).rejects.toMatchObject({
+        code: 'VALIDATION',
+        message: expect.stringMatching(/password again/),
+      });
+    }
+    const after = await db.select().from(companyEmailSettings).where(eq(companyEmailSettings.companyId, companyId));
+    expect(after).toEqual(before);
+    // The same server keeps the saved password.
+    await saveEmailSetup(ctx, { ...SERVER, fromName: 'Acme Billing', password: undefined });
+    expect((await resolveMailConfig(ctx))?.password).toBe(SERVER.password);
+    // Typed again: saved for the new server.
+    await saveEmailSetup(ctx, { ...SERVER, port: 2526, password: 'New-pass-1' });
+    expect((await resolveMailConfig(ctx))).toMatchObject({ port: 2526, password: 'New-pass-1' });
+    // No sign-in at all: the old password is dropped, not carried to the new server.
+    const relay = await saveEmailSetup(ctx, { ...SERVER, host: '10.0.0.66', username: '', password: undefined });
+    expect(relay.hasPassword).toBe(false);
+    await saveEmailSetup(ctx, SERVER);
   });
 
   it('explains a refused password in plain words', async () => {
@@ -215,6 +265,13 @@ describe('Test button', () => {
     expect(r.ok).toBe(true);
     expect(r.to).toBe('clerk@acme.test');
     expect(sent[0].message.to).toBe('clerk@acme.test');
+    // Their own "send from" address is free text, not verified: the test still goes only to the
+    // address they sign in with (review P2).
+    await updateMyPreferences(clerkCtx, { sendFromName: 'Carl', sendFromEmail: 'victim@else.test', bccMe: false });
+    const r2 = await sendTestEmail(clerkCtx, { to: 'anyone@else.test' });
+    expect(r2.to).toBe('clerk@acme.test');
+    expect(sent[1].message.to).toBe('clerk@acme.test');
+    await updateMyPreferences(clerkCtx, { sendFromName: '', sendFromEmail: '', bccMe: false });
     // Status is fine for any member and says nothing secret.
     const status = await getEmailStatus(clerkCtx);
     expect(status).toEqual({ configured: true, source: 'file', fromEmail: 'billing@acme.test', useSenderAddress: true });
