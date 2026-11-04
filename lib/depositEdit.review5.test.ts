@@ -32,7 +32,7 @@ describe('editing a saved deposit', () => {
   it('a home-currency deposit still shows its payments', () => {
     const edit = depositToEdit(dep(null));
     expect(itemsForDepositCurrency(edit.items, null).map((i) => i.id)).toEqual(['p1', 'inv1']);
-    expect(edit.extraLines).toEqual([{ accountId: 'equity', amount: '10.00', description: 'Owner money' }]);
+    expect(edit.extraLines).toEqual([{ accountId: 'equity', amount: '10.00', description: 'Owner money', entityType: '', entityId: '' }]);
   });
 });
 

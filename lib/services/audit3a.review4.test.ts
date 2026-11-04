@@ -49,6 +49,7 @@ import { exportChangesFile, openAccountantCopyFile } from './accountantCopy/acco
 let routeCtx: ServiceContext;
 vi.mock('@/lib/context', () => ({ getServerContext: vi.fn(async () => routeCtx) }));
 import { POST as creditMemoPOST } from '@/app/api/credit-memos/[id]/route';
+import { localTimeZone, todayInTimeZone } from '@/lib/preferences';
 
 const TEST_ROOT = path.resolve(process.cwd(), '.bookkeeper-data', 'test-review4-audit3a');
 const TEST_DIR = path.join(TEST_ROOT, 'data');
@@ -250,7 +251,8 @@ describe('B2. credit application date in an ordinary file', () => {
     } as never);
     expect(res.status).toBe(200);
     const [app] = await db.select().from(creditApplications).where(eq(creditApplications.creditMemoId, R.memo));
-    expect(ymd(app.date)).toBe(ymd(new Date()));
+    // "today" is the company's calendar day (no zone set: the PC's), not the UTC day.
+    expect(ymd(app.date)).toBe(todayInTimeZone(localTimeZone()));
   });
 
   it('the route passes a date: checked against the closing date, and validated', async () => {

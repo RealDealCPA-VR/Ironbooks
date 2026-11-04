@@ -118,8 +118,19 @@ describe('Period Copy of a protected company file', () => {
   });
 
   it('works, is encrypted, never carries the file key, and the restored copy opens with the same password and recovery key', async () => {
-    const tmpBefore = new Set(fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith('ironbooks-period-copy-')));
-    const res = await createPeriodCopy(ctx(), { from: '2026-01-01', to: '2026-12-31', password: 'Period-Pass-123' });
+    // A private temp folder for this run: other test files (in other workers) make unprotected period
+    // copies in the shared one at the same time. os.tmpdir() reads TEMP / TMP on every call.
+    const ownTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'fp-hardening-tmp-'));
+    const savedTmp = { TEMP: process.env.TEMP, TMP: process.env.TMP, TMPDIR: process.env.TMPDIR };
+    process.env.TEMP = process.env.TMP = process.env.TMPDIR = ownTmp;
+    let res: Awaited<ReturnType<typeof createPeriodCopy>>;
+    try {
+      res = await createPeriodCopy(ctx(), { from: '2026-01-01', to: '2026-12-31', password: 'Period-Pass-123' });
+      expect(fs.readdirSync(ownTmp).filter((n) => n.startsWith('ironbooks-period-copy-'))).toEqual([]);
+    } finally {
+      for (const [k, v] of Object.entries(savedTmp)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+      fs.rmSync(ownTmp, { recursive: true, force: true });
+    }
     expect(res.summary.condensed?.entries ?? 0).toBeGreaterThan(0); // the protected copy's Condense step ran
     expect(res.summary.passwordProtected).toBe(true);
     expect(res.summary.protectedLikeOriginal).toBe(true);
@@ -129,7 +140,6 @@ describe('Period Copy of a protected company file', () => {
     expect(res.buffer.includes(Buffer.from('Owner investment'))).toBe(false);
     // Its plain-text work folder was beside the working copy (never the shared temp folder), and is gone.
     expect(fs.readdirSync(workDir).filter((n) => n.startsWith('data.period-copy-'))).toEqual([]);
-    expect(fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith('ironbooks-period-copy-') && !tmpBefore.has(n))).toEqual([]);
 
     // Opened with its password: it carries the COPY's own key, never this file's.
     await expect(unlockPortableBuffer(res.buffer, 'wrong-password')).rejects.toMatchObject({ details: { wrongPassword: true } });
