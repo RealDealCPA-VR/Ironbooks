@@ -41,7 +41,7 @@ export async function GET(req: NextRequest) {
   try {
     const ctx = await getServerContext();
     const companyId = req.nextUrl.searchParams.get('companyId') ?? ctx.companyId;
-    const access = await requireAccessInCompany(ctx, companyId, 'file_utilities', 'create');
+    const access = await requireAccessInCompany(ctx, companyId, 'file_utilities.backup', 'create');
 
     const { buffer, filename } = await createCompanyBackup(ctx.db, companyId, { access });
     // Backup history: a one-company copy (does not count as a backup of the whole file).
@@ -70,7 +70,7 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    requirePermission(ctx, 'file_utilities', 'delete');
+    requirePermission(ctx, 'file_utilities.restore', 'delete');
     if (!ctx.userId) throw new ServiceError('FORBIDDEN', 'Authentication required.');
     await assertExclusiveAccess(ctx, 'Restore'); // adds a NEW company: other companies untouched
 

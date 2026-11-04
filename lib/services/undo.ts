@@ -63,9 +63,8 @@ import {
   vendors,
 } from '@/lib/db/schema';
 import { RETAINAGE_ACCOUNT_CODE } from './retainage';
-import { can } from '@/lib/permissions/model';
-import { apiRuleFor } from '@/lib/permissions/routes';
-import { permissionDenied } from './access';
+import { apiActivityFor, apiRuleFor } from '@/lib/permissions/routes';
+import { assertRule } from '@/lib/permissions/enforce';
 import { assertAccountantCopyAllowsPath } from './accountantCopy/routeGate';
 import {
   type ServiceContext,
@@ -1241,8 +1240,9 @@ function assertRoutePermission(ctx: ServiceContext, path: string, method: string
   if (!ctx.access) return; // trusted internal context (tests, jobs)
   const rule = apiRuleFor(path, method);
   if (rule === null) throw new ServiceError('FORBIDDEN', 'You do not have permission to undo this.');
-  if (rule === 'public' || rule === 'self' || rule === 'member') return;
-  if (!can(ctx.access, rule.area, rule.action)) throw permissionDenied(rule.area, rule.action);
+  // Exactly the route map's check, activity included: undoing a payment needs Receive Payments:
+  // Delete, not Delete on any Customers activity (prefsperms review P1).
+  assertRule(rule, ctx.access, `${method} ${path}`, apiActivityFor(path, method));
 }
 
 /** The API call the inverse of `kind` corresponds to (for the permission check). */

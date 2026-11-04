@@ -17,20 +17,20 @@
  */
 import { and, eq } from 'drizzle-orm';
 import { attachments } from '@/lib/db/schema';
-import type { Area } from '@/lib/permissions/model';
+import type { AccessRef } from '@/lib/permissions/model';
 import { type ServiceContext, ServiceError } from './_base';
 import { requirePermission } from './access';
 import { activeCopy } from './accountantCopy/guard';
 
 export type NonPostingDocType = 'estimate' | 'sales_order' | 'purchase_order';
 
-const AREA: Record<NonPostingDocType, Area> = {
-  estimate: 'customers',
-  sales_order: 'customers',
-  purchase_order: 'vendors',
+const AREA: Record<NonPostingDocType, AccessRef> = {
+  estimate: 'customers.estimates',
+  sales_order: 'customers.sales_orders',
+  purchase_order: 'vendors.purchase_orders',
 };
 
-/** The Delete right of the form's area (void and delete both need it). */
+/** The Delete right of the form's own activity (void and delete both need it). */
 export function assertMayVoidOrDelete(ctx: ServiceContext, type: NonPostingDocType): void {
   requirePermission(ctx, AREA[type], 'delete');
 }

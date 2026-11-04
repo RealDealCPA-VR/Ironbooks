@@ -123,4 +123,18 @@ domTest('New Invoice starts an invoice for the chosen customer', async () => {
   check(stashed.includes(ACME), 'invoice prefilled with the customer');
 });
 
+domTest('without View Balance the balance says Hidden, not $0.00 (prefsperms)', async () => {
+  stubReports();
+  await mount(
+    <CenterDetail
+      kind="customer"
+      record={{ id: ACME, displayName: 'Acme Supply', balance: null, balanceHidden: true, isActive: true }}
+      onEdit={() => {}}
+    />,
+  );
+  await until(() => ($('[data-center-balance]') ? true : null), 'balance shown');
+  equal($('[data-center-balance]')?.textContent, 'Hidden', 'Hidden instead of an amount');
+  check(($('[data-center-balance]') as HTMLElement).title.includes('View Balance'), 'tooltip says why');
+});
+
 void runDomTests();

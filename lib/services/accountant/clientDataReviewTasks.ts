@@ -213,7 +213,7 @@ export async function clearUpUndepositedFunds(
   ctx: ServiceContext,
   input: { depositId: string; lineId: string; items: Array<{ kind: UndepositedItem['kind']; id: string }> },
 ): Promise<{ depositId: string; moved: number }> {
-  requirePermission(ctx, 'banking', 'modify');
+  requirePermission(ctx, 'banking.deposits', 'modify');
   if (!input.items?.length) throw validation('Choose the payments to deposit.');
   const deposit = await getDeposit(ctx, input.depositId);
   if (deposit.voidedAt) throw new ServiceError('CONFLICT', 'This deposit is void.');

@@ -47,7 +47,7 @@ import { MAX_LEDGER_AMOUNT, Money, toAmountString } from '@/lib/money';
 import { AiRouter } from '@/lib/ai/router';
 import type { ChatMessage, StoredProviderConfig } from '@/lib/ai/types';
 import { localityOf } from '@/lib/ai/providers';
-import { can, legacyRoleFor } from '@/lib/permissions/model';
+import { canActivity, legacyRoleFor } from '@/lib/permissions/model';
 import {
   checkReceiptFile,
   isReadableKind,
@@ -176,7 +176,7 @@ export async function getReceiptSettingsView(ctx: ServiceContext): Promise<Recei
 }
 
 export async function setReceiptSettings(ctx: ServiceContext, input: unknown): Promise<ReceiptSettingsView> {
-  requirePermission(ctx, 'company', 'modify');
+  requirePermission(ctx, 'company.preferences', 'modify');
   const parsed = receiptSettingsSchema.safeParse(input);
   if (!parsed.success) throw validation('Invalid receipt settings.', parsed.error.flatten());
   const ai = await loadSettings(ctx);
@@ -186,7 +186,7 @@ export async function setReceiptSettings(ctx: ServiceContext, input: unknown): P
   await inTransaction(ctx, async (tx) => {
     const [row] = await tx.db.select({ settings: companies.settings }).from(companies).where(eq(companies.id, tx.companyId));
     if (!row) throw notFound('Company');
-    const settings = { ...((row.settings ?? {}) as Record<string, unknown>) };
+    const settings = (row.settings ?? {}) as Record<string, unknown>;
     const before = normalizeSettings(settings[RECEIPT_SETTINGS_KEY]);
     const next: ReceiptSettings = {
       visionProviderId:
@@ -194,8 +194,14 @@ export async function setReceiptSettings(ctx: ServiceContext, input: unknown): P
       preferVision: parsed.data.preferVision ?? before.preferVision,
       dateOrder: parsed.data.dateOrder ?? before.dateOrder,
     };
-    settings[RECEIPT_SETTINGS_KEY] = next;
-    await tx.db.update(companies).set({ settings, updatedAt: new Date() }).where(eq(companies.id, tx.companyId));
+    // Merge only this key (a whole-object write could undo a concurrent settings save).
+    await tx.db
+      .update(companies)
+      .set({
+        settings: sql`coalesce(${companies.settings}, '{}'::jsonb) || jsonb_build_object(${RECEIPT_SETTINGS_KEY}::text, ${JSON.stringify(next)}::jsonb)`,
+        updatedAt: new Date(),
+      })
+      .where(eq(companies.id, tx.companyId));
     await writeAudit(tx, { action: 'update', entityType: 'receipt_settings', entityId: tx.companyId, oldValues: before, newValues: next });
   });
   return getReceiptSettingsView(ctx);
@@ -276,7 +282,7 @@ export async function listReceipts(
   ctx: ServiceContext,
   opts: { status?: 'open' | 'saved' | 'all'; limit?: number } = {},
 ): Promise<ReceiptView[]> {
-  requirePermission(ctx, 'lists', 'view');
+  requirePermission(ctx, 'lists.doc_center', 'view');
   const status = opts.status ?? 'open';
   const conds = [eq(receiptScans.companyId, ctx.companyId)];
   if (status === 'open') {
@@ -296,7 +302,7 @@ export async function listReceipts(
 }
 
 export async function getReceipt(ctx: ServiceContext, id: string): Promise<ReceiptView> {
-  requirePermission(ctx, 'lists', 'view');
+  requirePermission(ctx, 'lists.doc_center', 'view');
   return loadView(ctx, id);
 }
 
@@ -320,7 +326,7 @@ function fileError(err: unknown): never {
 /** Add a receipt to the inbox. The file is checked by its bytes; nothing is read yet. */
 export async function uploadReceipt(ctx: ServiceContext, input: UploadReceiptInput): Promise<ReceiptView> {
   assertWrite(ctx);
-  requirePermission(ctx, 'lists', 'create');
+  requirePermission(ctx, 'lists.doc_center', 'create');
   let checked;
   try {
     checked = checkReceiptFile({ filename: input.filename, bytes: input.bytes }, { maxBytes: input.maxBytes ?? RECEIPT_MAX_BYTES });
@@ -495,7 +501,7 @@ export async function extractReceipt(
   id: string,
   opts: { force?: boolean; version?: number } = {},
 ): Promise<ReceiptView> {
-  requirePermission(ctx, 'lists', 'create');
+  requirePermission(ctx, 'lists.doc_center', 'create');
   const current = await loadView(ctx, id);
   if (current.status === 'saved') return current;
   if (opts.force && opts.version !== undefined && opts.version !== current.version) {
@@ -770,8 +776,10 @@ export async function saveReceipt(ctx: ServiceContext, id: string, raw: unknown)
   if (!parsed.success) throw validation(parsed.error.issues[0]?.message ?? 'Invalid receipt.', parsed.error.flatten());
   const input = parsed.data;
   assertWrite(ctx);
-  requirePermission(ctx, input.kind === 'bill' ? 'vendors' : 'banking', 'create');
-  if (input.newVendorName && !input.vendorId) requirePermission(ctx, 'vendors', 'create');
+  // The activity of the form it becomes (Enter Bills / Write Checks & Expenses), not any activity
+  // of the area: Purchase Orders: Create must not post a bill (prefsperms review P1).
+  requirePermission(ctx, input.kind === 'bill' ? 'vendors.bills' : 'banking.write_checks', 'create');
+  if (input.newVendorName && !input.vendorId) requirePermission(ctx, 'vendors.center', 'create');
 
   const total = Money.of(input.total);
   if (!total.gt(0)) throw validation('The total must be more than zero.');
@@ -887,7 +895,7 @@ export async function createUploadToken(
   opts: { minutes?: number; maxUploads?: number; now?: Date } = {},
 ): Promise<UploadTokenView & { token: string }> {
   assertWrite(ctx);
-  requirePermission(ctx, 'lists', 'create');
+  requirePermission(ctx, 'lists.doc_center', 'create');
   const [co] = await ctx.db.select({ settings: companies.settings }).from(companies).where(eq(companies.id, ctx.companyId));
   if (!integratedAppAllowed(co?.settings, 'phoneReceipts')) {
     throw new ServiceError('FORBIDDEN', integratedAppOffMessage('phoneReceipts'));
@@ -920,7 +928,7 @@ export async function createUploadToken(
 
 /** Links of this company that still work. */
 export async function listUploadTokens(ctx: ServiceContext): Promise<UploadTokenView[]> {
-  requirePermission(ctx, 'lists', 'view');
+  requirePermission(ctx, 'lists.doc_center', 'view');
   const rows = await ctx.db
     .select()
     .from(receiptUploadTokens)
@@ -939,7 +947,7 @@ export async function listUploadTokens(ctx: ServiceContext): Promise<UploadToken
 
 export async function revokeUploadToken(ctx: ServiceContext, id: string): Promise<void> {
   assertWrite(ctx);
-  requirePermission(ctx, 'lists', 'create');
+  requirePermission(ctx, 'lists.doc_center', 'create');
   if (!UUID_RE.test(id)) throw notFound('Upload link');
   await inTransaction(ctx, async (tx) => {
     const [r] = await tx.db
@@ -1024,7 +1032,7 @@ async function tokenContext(db: DB, row: TokenRow): Promise<ServiceContext> {
   const settings = company?.settings as { archived?: unknown } | null | undefined;
   if (!company || settings?.archived === true) throw new UploadTokenError('not_allowed');
   const resolved = await resolveAccess(db, row.companyId, row.createdBy);
-  if (!resolved.active || !can(resolved.access, 'lists', 'create')) throw new UploadTokenError('not_allowed');
+  if (!resolved.active || !canActivity(resolved.access, 'lists.doc_center', 'create')) throw new UploadTokenError('not_allowed');
   return { db, companyId: row.companyId, userId: row.createdBy, access: resolved.access, role: legacyRoleFor(resolved.access, resolved.isOwner) };
 }
 

@@ -282,9 +282,34 @@ function cleanInput(input: EmailSetupInput) {
   };
 }
 
+/** The part of a mail server set-up the saved password belongs to. */
+type ServerIdentity = { host: string | null; port: number | null; security: string; username: string | null };
+
+/**
+ * True when `b` is the same mail server and sign-in as `a` (host letter case aside). The saved
+ * password is only ever reused for exactly that: a changed host, port, security or user name could
+ * otherwise carry it to a server someone else controls (prefsperms review P1).
+ */
+export function sameMailServer(a: ServerIdentity, b: ServerIdentity): boolean {
+  return (
+    a.host !== null &&
+    b.host !== null &&
+    a.host.trim().toLowerCase() === b.host.trim().toLowerCase() &&
+    a.port === b.port &&
+    a.security === b.security &&
+    (a.username ?? null) === (b.username ?? null)
+  );
+}
+
+/** QuickBooks-style: the password must be typed again for a different server or sign-in. */
+export const RETYPE_PASSWORD_MESSAGE =
+  'Type the mail server password again: the server, port, security or user name changed, and the saved password is only used for the server it was saved for.';
+
 /**
  * Save the company file's mail server. Needs Send Forms (email set-up): modify. The password is
- * sealed with the file's vault secret; the audit row says only whether it changed.
+ * sealed with the file's vault secret; the audit row says only whether it changed. Saving a
+ * different server, port, security or user name without typing the password is refused (the
+ * saved one is never carried over); with no user name (a relay without sign-in) it is dropped.
  */
 export async function saveEmailSetup(ctx: ServiceContext, input: EmailSetupInput): Promise<EmailSetupView> {
   requireActivity(ctx, 'company.send_forms', 'modify');
@@ -299,6 +324,11 @@ export async function saveEmailSetup(ctx: ServiceContext, input: EmailSetupInput
     } else if (input.password === null || input.password === '') {
       passwordEnc = null;
       passwordChange = before?.passwordEnc ? 'removed' : 'kept';
+    } else if (before?.passwordEnc && !sameMailServer(before, clean)) {
+      if (clean.username) throw validation(RETYPE_PASSWORD_MESSAGE);
+      // No sign-in any more: nothing to send the password with; don't keep it for the new server.
+      passwordEnc = null;
+      passwordChange = 'removed';
     }
     // A changed server or login makes the last test result meaningless.
     const serverChanged =
@@ -495,9 +525,11 @@ export interface TestEmailResult {
 
 /**
  * Send a test email (Preferences > Send Forms > Test). With `draft` (typed, not yet saved
- * settings) it needs Send Forms (email set-up): modify and tests those, using the saved password
- * when none is typed; without it the saved settings are tested and the result is remembered.
- * Someone without the set-up right can test the saved settings, to their own address only.
+ * settings) it needs Send Forms (email set-up): modify and tests those; the saved password is used
+ * when none is typed ONLY for the very server and sign-in it was saved for (otherwise the password
+ * must be typed: a draft must never send the company's password to another server). Without a
+ * draft the saved settings are tested and the result is remembered. Someone without the set-up
+ * right can test the saved settings, sent only to the address they sign in with.
  */
 export async function sendTestEmail(
   ctx: ServiceContext,
@@ -511,12 +543,18 @@ export async function sendTestEmail(
     const clean = cleanInput(input.draft);
     const saved = await storedRow(ctx);
     const typed = typeof input.draft.password === 'string' && input.draft.password !== '' ? input.draft.password : null;
+    let password: string | null = null;
+    if (typed) password = typed;
+    else if (input.draft.password !== null && clean.username && saved?.passwordEnc) {
+      if (!sameMailServer(saved, clean)) throw validation(RETYPE_PASSWORD_MESSAGE);
+      password = await openPassword(ctx, saved);
+    }
     cfg = {
       ...clean,
       fromName: clean.fromName ?? '',
       replyTo: clean.replyTo,
       bcc: parseAddressList(clean.bcc, 'Bcc'),
-      password: input.draft.password === null ? null : typed ?? (await openPassword(ctx, saved)),
+      password,
       source: 'file',
     };
   } else {
@@ -527,9 +565,12 @@ export async function sendTestEmail(
   const sender = await senderFor(ctx, cfg);
   let to = String(input.to ?? '').trim();
   if (!canSetUp) {
-    // Only to yourself: the test must not become a way to send mail to anyone.
-    to = sender.userEmail ?? '';
-    if (!to) throw validation('Add your own email address under My Preferences > Send Forms first; the test is sent to you.');
+    // Only to yourself: the test must not become a way to send mail to anyone. Your own "send
+    // from" address (My Preferences) is free text nobody checked, so it is the sign-in address.
+    to = (await senderPrefs(ctx)).loginEmail;
+    if (!to) {
+      throw validation('The test is sent to the email address you sign in with, and yours is not an email address. Ask an administrator to test the mail server.');
+    }
   }
   if (!to) to = sender.userEmail || sender.from.address;
   if (!EMAIL_RE.test(to)) throw validation('Enter the address to send the test email to.');

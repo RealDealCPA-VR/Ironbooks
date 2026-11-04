@@ -35,7 +35,7 @@ import {
 } from '@/lib/db/schema';
 import type Decimal from 'decimal.js';
 import { Money, formatCurrency, toAmountString } from '@/lib/money';
-import { can, type Action, type Area } from '@/lib/permissions/model';
+import { canRef, refArea, type AccessRef, type Action, type Area } from '@/lib/permissions/model';
 import { searchPages } from '@/lib/nav';
 import { AiError } from '@/lib/ai/types';
 import { parseCommand, cleanCommand } from '@/lib/commands/grammar';
@@ -275,16 +275,29 @@ function serverPeriod(intent: CommandIntent, today: Date, dateOpts: DateRangeOpt
 // Executor
 // ---------------------------------------------------------------------------
 
-function allowed(ctx: ServiceContext, area: Area, action: Action): boolean {
-  return !ctx.access || can(ctx.access, area, action);
+/** prefsperms: an area (the whole area) or one activity (the form's own: Invoices, Enter Bills…). */
+function allowed(ctx: ServiceContext, ref: AccessRef, action: Action): boolean {
+  return !ctx.access || canRef(ctx.access, ref, action);
 }
 
-const FORM_NEEDS: Record<FormKind, { area: Area; action: Action }> = {
-  invoice: { area: 'customers', action: 'create' },
-  estimate: { area: 'customers', action: 'create' },
-  sales_receipt: { area: 'customers', action: 'create' },
-  bill: { area: 'vendors', action: 'create' },
-  expense: { area: 'banking', action: 'create' },
+const FORM_NEEDS: Record<FormKind, { area: AccessRef; action: Action }> = {
+  invoice: { area: 'customers.invoices', action: 'create' },
+  estimate: { area: 'customers.estimates', action: 'create' },
+  sales_receipt: { area: 'customers.sales_receipts', action: 'create' },
+  bill: { area: 'vendors.bills', action: 'create' },
+  expense: { area: 'banking.write_checks', action: 'create' },
+};
+
+/** The activity of each plain-language action's page (lib/commands/actions.ts ACTION_NEEDS names the area). */
+const ACTION_ACTIVITY: Record<keyof typeof ACTION_NEEDS, AccessRef> = {
+  pay_bills: 'vendors.pay_bills',
+  reconcile: 'accounting.reconcile',
+  record_deposit: 'banking.deposits',
+  receive_payment: 'customers.payments',
+  transfer_funds: 'accounting.transfers',
+  journal_entry: 'accounting.journal_entries',
+  run_payroll: 'payroll.paychecks',
+  bank_feeds: 'banking.bank_feeds',
 };
 
 const AREA_WORDS: Record<string, string> = {
@@ -298,7 +311,8 @@ const AREA_WORDS: Record<string, string> = {
   reports_purchases: 'vendor reports',
 };
 
-function denied(area: Area, what: string): CommandOutcome {
+function denied(ref: AccessRef, what: string): CommandOutcome {
+  const area: Area = refArea(ref);
   return {
     type: 'denied',
     message: `Your role can't ${what} (${AREA_WORDS[area] ?? area}). Ask an admin to change your access in Users & Roles.`,
@@ -799,7 +813,7 @@ async function executeReport(ctx: ServiceContext, intent: ReportIntent, hints: R
 
   if (intent.report === 'unpaid_bills' || intent.report === 'unpaid_invoices') {
     const bills = intent.report === 'unpaid_bills';
-    const area: Area = bills ? 'reports_purchases' : 'reports_sales';
+    const area: AccessRef = bills ? 'reports_purchases.payables' : 'reports_sales.receivables';
     if (!allowed(ctx, area, 'view')) return denied(area, `see ${bills ? 'unpaid bills' : 'unpaid invoices'}`);
     const notes: string[] = [];
     let partyId: string | undefined;
@@ -843,7 +857,7 @@ async function executeReport(ctx: ServiceContext, intent: ReportIntent, hints: R
 
   if (intent.report === 'ap_aging' || intent.report === 'ar_aging') {
     const ap = intent.report === 'ap_aging';
-    const area: Area = ap ? 'reports_purchases' : 'reports_sales';
+    const area: AccessRef = ap ? 'reports_purchases.payables' : 'reports_sales.receivables';
     if (!allowed(ctx, area, 'view')) return denied(area, 'see aging reports');
     return {
       type: 'navigate',
@@ -852,7 +866,7 @@ async function executeReport(ctx: ServiceContext, intent: ReportIntent, hints: R
     };
   }
 
-  if (!allowed(ctx, 'reports_financial', 'view')) return denied('reports_financial', 'see financial reports');
+  if (!allowed(ctx, 'reports_financial.company', 'view')) return denied('reports_financial', 'see financial reports');
   if (intent.report === 'balance_sheet') {
     return { type: 'navigate', href: `/reports/balance-sheet${qs({ asOf: range?.to })}`, title: `Balance Sheet${range ? ` as of ${range.to}` : ''}` };
   }
@@ -881,7 +895,7 @@ function withDescendants(rootId: string, all: AccountRow[]): string[] {
 }
 
 async function executeQuestion(ctx: ServiceContext, intent: QuestionIntent, hints: ResolveHints, today: Date): Promise<CommandOutcome> {
-  if (!allowed(ctx, 'reports_financial', 'view')) return denied('reports_financial', 'see what was spent or earned');
+  if (!allowed(ctx, 'reports_financial.company', 'view')) return denied('reports_financial', 'see what was spent or earned');
   const spend = intent.measure === 'spend';
   const range: DateRange =
     (await resolveRange(ctx, { ...intent, period: intent.from && intent.to ? (intent.rangeLabel ?? intent.period) : intent.period }, today)) ??
@@ -991,10 +1005,10 @@ async function executeQuestion(ctx: ServiceContext, intent: QuestionIntent, hint
   if (subject.kind === 'accounts' && subject.ids.length === 1) {
     href = `/reports/std/transaction-detail-by-account${qs({ ...dates, accountId: subject.accountId })}`;
     linkLabel = `See the ${subject.name} transactions`;
-  } else if (subject.kind === 'vendor' && allowed(ctx, 'reports_purchases', 'view')) {
+  } else if (subject.kind === 'vendor' && allowed(ctx, 'reports_purchases.payables', 'view')) {
     href = `/reports/std/expenses-by-vendor-detail${qs({ ...dates, vendorId: subject.id })}`;
     linkLabel = `See what you paid ${subject.name}`;
-  } else if (subject.kind === 'customer' && allowed(ctx, 'reports_sales', 'view')) {
+  } else if (subject.kind === 'customer' && allowed(ctx, 'reports_sales.sales', 'view')) {
     href = `/reports/std/sales-by-customer-detail${qs({ ...dates, customerId: subject.id })}`;
     linkLabel = `See sales to ${subject.name}`;
   } else {
@@ -1097,7 +1111,8 @@ function executeNavigate(ctx: ServiceContext, intent: NavigateIntent): CommandOu
 
 async function executeAction(ctx: ServiceContext, intent: ActionIntent, hints: ResolveHints): Promise<CommandOutcome> {
   const needs = ACTION_NEEDS[intent.action];
-  if (!allowed(ctx, needs.area, needs.action)) return denied(needs.area, ACTION_TITLES[intent.action].toLowerCase());
+  const ref = ACTION_ACTIVITY[intent.action] ?? needs.area;
+  if (!allowed(ctx, ref, needs.action)) return denied(ref, ACTION_TITLES[intent.action].toLowerCase());
   const title = ACTION_TITLES[intent.action];
 
   if (intent.action === 'reconcile' && (intent.target || hints.bankAccountId)) {

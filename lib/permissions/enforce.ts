@@ -11,7 +11,7 @@
 import { headers } from 'next/headers';
 import { ServiceError } from '@/lib/services/_base';
 import { permissionDenied } from '@/lib/services/access';
-import { can, canActivity, canWholeArea, type EffectiveAccess } from './model';
+import { canActivity, canSomeActivity, canWholeArea, type EffectiveAccess } from './model';
 import type { ActivityKey } from './activities';
 import {
   ROUTE_METHOD_HEADER,
@@ -83,7 +83,10 @@ export function authorizeRequest(info: RequestInfo, access: EffectiveAccess): vo
     }
     return;
   }
-  if (!need.areas.some((a) => can(access, a, 'view'))) throw permissionDenied(need.areas[0], 'view');
+  // A page mapped only to AREAS (report hubs: Report Center, QuickZoom, open source form; System
+  // Accounts) is a shell whose data every API checks per activity: View on ANY activity of one of
+  // its areas opens it (round 2 P1). For area-stored roles that is exactly the old area answer.
+  if (!need.areas.some((a) => canSomeActivity(access, a, 'view'))) throw permissionDenied(need.areas[0], 'view');
 }
 
 /** getServerContext hook: authorize the in-flight request (no-op outside a request). */

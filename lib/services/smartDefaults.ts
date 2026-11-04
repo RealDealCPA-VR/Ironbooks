@@ -44,7 +44,7 @@ import {
   vendors,
 } from '@/lib/db/schema';
 import { Money } from '@/lib/money';
-import type { Area } from '@/lib/permissions/model';
+import type { AccessRef } from '@/lib/permissions/model';
 import {
   EMPTY_HEADER,
   FORM_HEADER_FIELDS,
@@ -66,15 +66,16 @@ import { getMyPreferences } from './preferences';
 /** Recalled lines are capped (a 300-line bill is not a template). */
 const MAX_LINES = 50;
 
-const FORM_AREA: Record<SmartForm, Area> = {
-  bill: 'vendors',
-  check: 'banking',
-  expense: 'banking',
-  credit_card: 'banking',
-  invoice: 'customers',
-  sales_receipt: 'customers',
-  estimate: 'customers',
-  sales_order: 'customers',
+/** prefsperms: the form's own activity (its smart defaults show that form's past entries). */
+const FORM_AREA: Record<SmartForm, AccessRef> = {
+  bill: 'vendors.bills',
+  check: 'banking.write_checks',
+  expense: 'banking.write_checks',
+  credit_card: 'banking.write_checks',
+  invoice: 'customers.invoices',
+  sales_receipt: 'customers.sales_receipts',
+  estimate: 'customers.estimates',
+  sales_order: 'customers.sales_orders',
 };
 
 export interface SmartDefaultsInput {

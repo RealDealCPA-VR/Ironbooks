@@ -108,7 +108,8 @@ describe('review5: assistant tools need the report area of their data', () => {
     // No model configured: the offline answer runs the same tools. It says the right is missing
     // (accountant review 5: a plain answer, not a failed request) and carries no aging data.
     const denied = await ask(banking, [], 'Who owes us money?');
-    expect(denied.answer).toMatch(/permission to view Reports — Customers & Sales/);
+    // prefsperms: the message names the report's activity too ("Customers & Receivables (Reports — Customers & Sales)").
+    expect(denied.answer).toMatch(/permission to view .*Reports — Customers & Sales/);
     expect(denied.answer).not.toMatch(/Customers owe/);
     expect(denied.toolCalls).toEqual([]);
     const owner = { db, companyId, userId, access: fullAccess(), role: 'owner' as const };

@@ -128,7 +128,7 @@ export async function setCustomFieldDefinitions(
   input: Partial<Record<CustomFieldEntity, CustomFieldDefinition[]>>,
 ): Promise<CustomFieldDefinitions> {
   // Enterprise roles: Lists / Centers — modify (same rule as PATCH /api/custom-fields).
-  await requireEffectivePermission(ctx, 'lists', 'modify');
+  await requireEffectivePermission(ctx, 'lists.custom_fields', 'modify');
 
   const [company] = await ctx.db
     .select()

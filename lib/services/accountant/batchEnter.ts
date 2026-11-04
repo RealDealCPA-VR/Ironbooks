@@ -26,7 +26,7 @@ import { createBill } from '../bills';
 import { createVendorCredit } from '../vendorCredits';
 import { createManualEntry } from '../journal';
 import { requirePermission } from '../access';
-import type { Area } from '@/lib/permissions/model';
+import type { AccessRef } from '@/lib/permissions/model';
 import { getClosingDateSettings } from '../company';
 import { systemAccountIdOrNull } from '../accountRoles';
 import { BATCH_ENTER_TYPES, type BatchEnterRow, type BatchEnterType } from './batchEnterParse';
@@ -108,7 +108,7 @@ export interface BatchEnterLookups extends BatchLookupLists {
 export async function batchEnterLookups(ctx: ServiceContext): Promise<BatchEnterLookups> {
   // The full customer and vendor lists are only for people who may batch-enter (the same right
   // the POST needs), not for anyone who can merely view the books.
-  requirePermission(ctx, 'accounting', 'create');
+  requirePermission(ctx, 'accounting.accountant_tools', 'create');
   const lists = await loadLists(ctx);
   const closing = await getClosingDateSettings(ctx);
   // The account bills really post to (by role — lib/services/accountRoles.ts).
@@ -218,16 +218,17 @@ function msg(err: unknown): string {
   return err instanceof Error ? err.message : 'Could not save this row.';
 }
 
-const BATCH_ENTER_AREA: Record<BatchEnterType, Area> = {
-  check: 'banking',
-  deposit: 'banking',
-  cc_charge: 'banking',
-  cc_credit: 'banking',
-  invoice: 'customers',
-  credit_memo: 'customers',
-  bill: 'vendors',
-  bill_credit: 'vendors',
-  journal: 'accounting',
+/** prefsperms: each document type's own activity (Write Checks, Make Deposits, Invoices, …). */
+const BATCH_ENTER_AREA: Record<BatchEnterType, AccessRef> = {
+  check: 'banking.write_checks',
+  deposit: 'banking.deposits',
+  cc_charge: 'banking.write_checks',
+  cc_credit: 'banking.write_checks',
+  invoice: 'customers.invoices',
+  credit_memo: 'customers.credit_memos',
+  bill: 'vendors.bills',
+  bill_credit: 'vendors.vendor_credits',
+  journal: 'accounting.journal_entries',
 };
 
 export async function batchEnterTransactions(ctx: ServiceContext, input: BatchEnterInput): Promise<BatchEnterResult> {

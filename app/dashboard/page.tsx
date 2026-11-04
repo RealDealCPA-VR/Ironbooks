@@ -31,7 +31,7 @@ import { Help } from '@/components/Help';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/utils';
 import { Card, PageHeader } from '@/components/ui';
-import { can, canActivity } from '@/lib/permissions/model';
+import { canActivity, canSomeActivity } from '@/lib/permissions/model';
 // team home: "Needs attention" is Home's first tab (Simple mode lands on it).
 import HomeTabs from '@/components/HomeTabs';
 import AttentionInbox from '@/components/AttentionInbox';
@@ -69,7 +69,7 @@ async function allowedWorkflowHrefs(ctx: ServiceContext): Promise<string[]> {
     const need = pageAccessFor(path);
     if (!ctx.access || !need) return true;
     if (need.activities) return need.activities.some((k) => canActivity(ctx.access!, k, 'view'));
-    return need.areas.some((a) => can(ctx.access!, a, 'view'));
+    return need.areas.some((a) => canSomeActivity(ctx.access!, a, 'view')); // as enforce.ts for area-only pages
   });
 }
 
@@ -81,7 +81,8 @@ export default async function DashboardPage({ searchParams }: { searchParams: Pr
   const allowedHrefs = await allowedWorkflowHrefs(ctx);
   // Users & Roles: the financial snapshot needs Reports — Financial (QB Company Snapshot parity).
   // Everyone else gets the Home workflow (only the tasks they can do) and their reminders.
-  if (ctx.access && !can(ctx.access, 'reports_financial', 'view')) {
+  // prefsperms: the same activity GET /api/dashboard needs (Company & Financial reports).
+  if (ctx.access && !canActivity(ctx.access, 'reports_financial.company', 'view')) {
     const myPrefs = await getMyPreferences(ctx);
     return <LimitedHome allowedHrefs={myPrefs.showHomeWorkflow ? allowedHrefs : null} />;
   }

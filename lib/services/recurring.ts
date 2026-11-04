@@ -29,7 +29,7 @@ import {
   writeAudit,
 } from './_base';
 import { requireEffectivePermission } from './access';
-import { can, type Area } from '@/lib/permissions/model';
+import { canRef, type AccessRef } from '@/lib/permissions/model';
 import { createInvoice, type CreateInvoiceInput } from './invoices';
 import { createBill, type CreateBillInput } from './bills';
 import { createManualEntry, type ManualEntryInput } from './journal';
@@ -72,20 +72,21 @@ export type DocType = (typeof DOC_TYPES)[number];
  * document's own create route in lib/permissions/routes.ts). /api/recurring/run only requires
  * Accounting, so Enter Now / Enter Group / Run due must also hold the document's own right.
  */
-const DOC_AREA: Record<DocType, Area> = {
-  invoice: 'customers',
-  estimate: 'customers',
-  sales_order: 'customers',
-  sales_receipt: 'customers',
-  credit_memo: 'customers',
-  bill: 'vendors',
-  purchase_order: 'vendors',
-  vendor_credit: 'vendors',
-  expense: 'banking',
-  check: 'banking',
-  deposit: 'banking',
-  journal_entry: 'accounting',
-  transfer: 'accounting',
+const DOC_AREA: Record<DocType, AccessRef> = {
+  // prefsperms: the document's own activity (Invoices, Enter Bills, Write Checks, …).
+  invoice: 'customers.invoices',
+  estimate: 'customers.estimates',
+  sales_order: 'customers.sales_orders',
+  sales_receipt: 'customers.sales_receipts',
+  credit_memo: 'customers.credit_memos',
+  bill: 'vendors.bills',
+  purchase_order: 'vendors.purchase_orders',
+  vendor_credit: 'vendors.vendor_credits',
+  expense: 'banking.write_checks',
+  check: 'banking.write_checks',
+  deposit: 'banking.deposits',
+  journal_entry: 'accounting.journal_entries',
+  transfer: 'accounting.transfers',
 };
 
 const DOC_LABEL_PLURAL: Record<DocType, string> = {
@@ -433,7 +434,7 @@ function parseRunDate(v: string | Date | null | undefined): Date | null {
  */
 async function assertMayAutomate(ctx: ServiceContext, docType: string): Promise<void> {
   if (!ctx.access) return;
-  await requireEffectivePermission(ctx, 'accounting', 'create');
+  await requireEffectivePermission(ctx, 'accounting.memorized_run', 'create');
   const area = DOC_AREA[docType as DocType];
   if (area) await requireEffectivePermission(ctx, area, 'create');
 }
@@ -642,7 +643,7 @@ async function generateFromTemplate(
   let docId: string;
   // No-op for trusted contexts without `access` (the desktop launch-time / hourly run).
   const area = DOC_AREA[template.docType as DocType];
-  if (area && ctx.access && !can(ctx.access, area, 'create')) {
+  if (area && ctx.access && !canRef(ctx.access, area, 'create')) {
     throw new ServiceError(
       'FORBIDDEN',
       `You don't have permission to create ${DOC_LABEL_PLURAL[template.docType as DocType]}.`,

@@ -46,7 +46,8 @@ import {
 import { type ServiceContext, notFound, validation, writeAudit } from './_base';
 import { assertWrite } from './rbac';
 import { requirePermission } from './access';
-import { can, type Action, type Area } from '@/lib/permissions/model';
+import { canRef, type AccessRef, type Action, type Area } from '@/lib/permissions/model';
+import { recordRef } from '@/lib/permissions/recordActivities';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -266,10 +267,22 @@ export function attachmentArea(entityType: string | null | undefined, action: Ac
   return area;
 }
 
+/**
+ * prefsperms: what a document filed to `entityType` really needs - the record's own ACTIVITY
+ * (Invoices, Receive Payments, Employee Center…; the unfiled inbox: Doc Center & Receipts; form
+ * template logos: Form Templates), not every activity of the area.
+ */
+function attachmentRef(entityType: string | null | undefined, action: Action): AccessRef | null {
+  if (!entityType || !isFilingType(entityType)) return 'lists.doc_center';
+  const area = RECORD_AREAS[entityType];
+  if (area === null) return action === 'view' ? null : 'company.templates';
+  return recordRef(entityType, area);
+}
+
 /** Throw FORBIDDEN unless the caller may `action` documents filed to `entityType`. */
 function requireDocAccess(ctx: ServiceContext, entityType: string | null | undefined, action: Action): void {
-  const area = attachmentArea(entityType, action);
-  if (area) requirePermission(ctx, area, action);
+  const ref = attachmentRef(entityType, action);
+  if (ref) requirePermission(ctx, ref, action);
 }
 
 /**
@@ -277,8 +290,8 @@ function requireDocAccess(ctx: ServiceContext, entityType: string | null | undef
  * so payroll documents don't show up for someone without Payroll access.
  */
 function assertCanSee(ctx: ServiceContext, entityType: string | null): void {
-  const area = attachmentArea(entityType, 'view');
-  if (area && ctx.access && !can(ctx.access, area, 'view')) throw notFound('Attachment');
+  const ref = attachmentRef(entityType, 'view');
+  if (ref && ctx.access && !canRef(ctx.access, ref, 'view')) throw notFound('Attachment');
 }
 
 /**
@@ -289,12 +302,12 @@ function viewableCondition(ctx: ServiceContext): SQL | null {
   if (!ctx.access) return null;
   const filing = Object.keys(FILING_TABLES) as Array<keyof typeof FILING_TABLES>;
   const allowed = filing.filter((t) => {
-    const area = RECORD_AREAS[t];
-    return area === null || can(ctx.access, area, 'view');
+    const ref = attachmentRef(t, 'view');
+    return ref === null || canRef(ctx.access, ref, 'view');
   });
   const parts: SQL[] = [];
   if (allowed.length) parts.push(inArray(attachments.entityType, allowed));
-  if (can(ctx.access, 'lists', 'view')) {
+  if (canRef(ctx.access, 'lists.doc_center', 'view')) {
     parts.push(isNull(attachments.entityType));
     parts.push(notInArray(attachments.entityType, filing));
   }

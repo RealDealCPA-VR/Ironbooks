@@ -11,28 +11,31 @@ import { getServerContext } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
 import { runGlobalSearch } from './queries';
 import { buildResults } from './results';
-import { can, type Area } from '@/lib/permissions/model';
+import { canRef, type AccessRef } from '@/lib/permissions/model';
 import { serviceErrorStatus } from '@/lib/routeErrors';
 
-/** Result type → the area whose 'view' it needs (Users & Roles). Unknown types are dropped. */
-const RESULT_AREA: Record<string, Area> = {
-  Customer: 'customers',
-  Invoice: 'customers',
-  Payment: 'customers',
-  Vendor: 'vendors',
-  Bill: 'vendors',
-  Item: 'lists',
-  Account: 'lists',
-  Employee: 'payroll',
-  'Journal Entry': 'accounting',
-  Expense: 'banking',
+/**
+ * Result type → the ACTIVITY whose 'view' it needs (Users & Roles; prefsperms: Invoices, Receive
+ * Payments… — not any activity of the area). Unknown types are dropped.
+ */
+const RESULT_AREA: Record<string, AccessRef> = {
+  Customer: 'customers.center',
+  Invoice: 'customers.invoices',
+  Payment: 'customers.payments',
+  Vendor: 'vendors.center',
+  Bill: 'vendors.bills',
+  Item: 'lists.items',
+  Account: 'lists.chart_of_accounts',
+  Employee: 'payroll.employees',
+  'Journal Entry': 'accounting.journal_entries',
+  Expense: 'banking.write_checks',
   // Numbered sales / purchase forms found by their typed number (results.ts DOC_KIND_LABEL).
   // Without these every one of them was dropped, for everyone.
-  Estimate: 'customers',
-  'Sales Order': 'customers',
-  'Sales Receipt': 'customers',
-  'Credit Memo': 'customers',
-  'Purchase Order': 'vendors',
+  Estimate: 'customers.estimates',
+  'Sales Order': 'customers.sales_orders',
+  'Sales Receipt': 'customers.sales_receipts',
+  'Credit Memo': 'customers.credit_memos',
+  'Purchase Order': 'vendors.purchase_orders',
 };
 
 export async function GET(req: NextRequest) {
@@ -44,7 +47,7 @@ export async function GET(req: NextRequest) {
     // Only show hits from areas the caller's roles can view.
     const results = buildResults(hits).filter((r) => {
       const area = RESULT_AREA[r.type];
-      return area ? !ctx.access || can(ctx.access, area, 'view') : false;
+      return area ? !ctx.access || canRef(ctx.access, area, 'view') : false;
     });
     return NextResponse.json({ results });
   } catch (err) {

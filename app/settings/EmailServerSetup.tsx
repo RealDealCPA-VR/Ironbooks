@@ -167,7 +167,8 @@ export default function EmailServerSetup({ canEdit = true }: { canEdit?: boolean
     setTesting(true);
     setResult(null);
     try {
-      // Typed but not saved settings are tested as typed (the saved password is reused when none is typed).
+      // Typed but not saved settings are tested as typed (the saved password is reused when none is
+      // typed only for the same server and user name; otherwise the server asks for it).
       const body = canEdit && !forbidden && dirty ? { to: testTo.trim() || null, draft: payloadOf(draft) } : { to: testTo.trim() || null };
       const r = await api.post<TestResult>('/api/email/test', body);
       setResult(r);
@@ -208,6 +209,16 @@ export default function EmailServerSetup({ canEdit = true }: { canEdit?: boolean
   const portNum = Number(draft.port);
   const portOk = Number.isInteger(portNum) && portNum >= 1 && portNum <= 65535;
   const ready = draft.host.trim() !== '' && portOk && draft.fromEmail.trim() !== '';
+  // The saved password is only used for the server and sign-in it was saved for (the server
+  // refuses to carry it to another one): a change there needs it typed again.
+  const serverChanged =
+    !!view &&
+    view.source === 'file' &&
+    (draft.host.trim().toLowerCase() !== view.host.trim().toLowerCase() ||
+      portNum !== view.port ||
+      draft.security !== view.security ||
+      (draft.username.trim() || '') !== (view.username || ''));
+  const retypePassword = !!view?.hasPassword && serverChanged && !draft.password && !draft.removePassword && draft.username.trim() !== '';
 
   return (
     <Card className="p-8">
@@ -341,7 +352,8 @@ export default function EmailServerSetup({ canEdit = true }: { canEdit?: boolean
                 type="password"
                 value={draft.password}
                 autoComplete="new-password"
-                placeholder={view?.hasPassword && !draft.removePassword ? 'Saved (type to replace)' : ''}
+                placeholder={view?.hasPassword && !draft.removePassword ? (retypePassword ? 'Type the password again' : 'Saved (type to replace)') : ''}
+                aria-describedby={retypePassword ? 'mail-pass-retype' : undefined}
                 onChange={(e) => {
                   set('password', e.target.value);
                   if (e.target.value) set('removePassword', false);
@@ -357,6 +369,12 @@ export default function EmailServerSetup({ canEdit = true }: { canEdit?: boolean
                   />
                   Remove the saved password
                 </label>
+              )}
+              {retypePassword && (
+                <p id="mail-pass-retype" className="mt-1 text-xs text-amber-700">
+                  You changed the server, port, security or user name: type the password again. The saved password is only
+                  used for the server it was saved for.
+                </p>
               )}
               <p className="mt-1 text-xs text-navy/50">Gmail, Outlook.com and Yahoo need an &quot;app password&quot; here.</p>
             </div>

@@ -16,7 +16,7 @@ import Decimal from 'decimal.js';
 import { bills, expenses, recurringTemplates, vendors } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, validation } from './_base';
-import { can } from '@/lib/permissions/model';
+import { canRef } from '@/lib/permissions/model';
 import { requirePermission } from './access';
 import { advanceDate, createTemplate, type Frequency } from './recurring';
 import { getBill } from './bills';
@@ -133,11 +133,11 @@ export function detectPatterns(docs: Doc[], asOf: Date): RecurringSuggestion[] {
 }
 
 /** The area a memorized bill / check belongs to (the permission of its own screens). */
-const DOC_AREA = { bill: 'vendors', expense: 'banking' } as const;
+const DOC_AREA = { bill: 'vendors.bills', expense: 'banking.write_checks' } as const;
 
 /** True when the caller may view that kind of document (trusted contexts: yes). */
 function mayView(ctx: ServiceContext, docType: 'bill' | 'expense'): boolean {
-  return !ctx.access || can(ctx.access, DOC_AREA[docType], 'view');
+  return !ctx.access || canRef(ctx.access, DOC_AREA[docType], 'view');
 }
 
 /**

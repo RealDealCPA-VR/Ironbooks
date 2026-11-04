@@ -433,7 +433,7 @@ export async function setClosingDate(
 ): Promise<ClosingDateSettings> {
   // Enterprise roles: Closing Date / Periods — modify (Admin, Accountant, External Accountant,
   // custom roles), same rule as the route map for PATCH /api/company/closing-date.
-  await requireEffectivePermission(ctx, 'closing', 'modify');
+  await requireEffectivePermission(ctx, 'closing.closing_date', 'modify');
 
   if (input.closingDate !== null && !isCalendarDay(input.closingDate)) {
     throw validation('closingDate must be a real date in YYYY-MM-DD format (or null to clear).');
