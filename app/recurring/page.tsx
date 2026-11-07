@@ -1114,7 +1114,7 @@ export default function RecurringPage() {
   return (
     <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader
-        title="Recurring transactions (memorized)"
+        title="Memorized Transaction List"
         icon={Repeat}
         action={
           <div className="flex items-center gap-3">

@@ -107,7 +107,7 @@ function startScreenHtml({ dark, accent, platform, firstRun = false }) {
       <div class="icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/></svg></div>
       <div>${
         firstRun
-          ? '<h1 id="title">Welcome to Ironbooks</h1><p class="sub">Create your first company file, or open one you already have (it can be on this computer, a USB drive or your office file server). Coming from QuickBooks? Create a company, then choose File &gt; Migrate from QuickBooks to bring your lists and history.</p>'
+          ? '<h1 id="title">Welcome to Ironbooks</h1><p class="sub">Create your first company file, or open one you already have (it can be on this computer, a USB drive or your office file server). Coming from QuickBooks Desktop? Choose Convert from QuickBooks to bring over your lists and history.</p>'
           : '<h1 id="title">No company open</h1><p class="sub">Select a company file and press Enter, or create a new one. A company file can be on this computer, a USB drive or your office file server.</p>'
       }</div>
     </div>
@@ -124,6 +124,7 @@ function startScreenHtml({ dark, accent, platform, firstRun = false }) {
   <div class="foot">
     <button id="new"${firstRun ? ' class="primary"' : ''}>Create a new company…</button>
     <button id="browse">Open or restore a company file…</button>
+    <button id="convert">Convert from QuickBooks…</button>
   </div>
   <p class="hint"><kbd>↑</kbd> <kbd>↓</kbd> choose · <kbd>Enter</kbd> open · <kbd>Ctrl</kbd>+<kbd>O</kbd> browse · <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>N</kbd> new company · <kbd>Delete</kbd> remove from list</p>
 </main>
@@ -212,6 +213,7 @@ function startScreenHtml({ dark, accent, platform, firstRun = false }) {
     if (r) api.reveal(r.dir);
   });
   document.getElementById('new').addEventListener('click', function () { api.newCompany(); });
+  document.getElementById('convert').addEventListener('click', function () { api.convert(); });
   document.getElementById('browse').addEventListener('click', function () { api.browse(); });
   load();
   list.focus();

@@ -43,7 +43,7 @@ import {
   shouldRunFormShortcut,
 } from '@/lib/shortcuts';
 import { openDialog } from '@/lib/keyboardTargets';
-import { RecordChangesPrompt, formWasChanged, recordChangesButton } from '@/components/ui';
+import { Button, RecordChangesPrompt, formWasChanged, recordChangesButton } from '@/components/ui';
 
 /** The open modal dialog in use (lib/keyboardTargets.ts). */
 export { openDialog };
@@ -95,6 +95,30 @@ function saveThenNew(saveBtn: HTMLElement, dialog: HTMLElement | null) {
       }
     }, 100);
   });
+}
+
+/**
+ * QuickBooks' "Save & New" button for a transaction form's footer: records the form with its own
+ * Save & Close button, and once that saved (the dialog closed) opens a blank one — exactly what
+ * Alt+S does. Put it just before the form's Save & Close button.
+ */
+export function SaveAndNewButton({ disabled }: { disabled?: boolean }) {
+  return (
+    <Button
+      variant="secondary"
+      data-shortcut="save-new"
+      disabled={disabled}
+      onClick={(e) => {
+        const self = e.currentTarget as HTMLElement;
+        const dialog = openDialog();
+        const scope = dialog ?? (self.closest('form, [data-shortcut-scope]') as HTMLElement | null) ?? document.body;
+        const save = find(scope, 'save');
+        if (save && save !== self) saveThenNew(save, dialog);
+      }}
+    >
+      Save &amp; New
+    </Button>
+  );
 }
 
 /** What a form shortcut would press here. */

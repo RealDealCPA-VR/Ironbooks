@@ -110,3 +110,16 @@ export async function removeFilePasswordWithRecoveryKey(db: DB): Promise<boolean
   await writeLock(db, null);
   return true;
 }
+
+/**
+ * Remove a forgotten file password WITHOUT the current one — only for a user who has just signed
+ * in as an Admin of every company in the file (app/api/unlock/admin). QuickBooks Desktop has no
+ * separate "open file" password (the Admin's password is the gate), so the file's Admin must never
+ * be locked out of their own books by it. Encrypted files use the recovery key instead.
+ */
+export async function removeFilePasswordAsFileAdmin(db: DB): Promise<boolean> {
+  const status = await getFileLockStatus(db);
+  if (!status.enabled) return false;
+  await writeLock(db, null);
+  return true;
+}

@@ -66,6 +66,7 @@ import {
   withShownTaxable,
 } from '@/lib/salesFormListsClient';
 import { usePreferences } from '@/lib/usePreferences';
+import { SaveAndNewButton } from '@/components/FormShortcuts';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -390,8 +391,9 @@ function NewOrderModal({ open, editing, onClose, customers, items, taxRates, onC
           />
           {footerExtra}
           <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
+          <SaveAndNewButton disabled={saving} />
           <Button onClick={handleSubmit} loading={saving}>
-            {editing ? 'Save Changes' : 'Create Sales Order'}
+            Save &amp; Close
           </Button>
         </>
       }

@@ -85,3 +85,35 @@ export function copyOfRow(
   }
   return null;
 }
+
+/** QuickBooks' register Type column codes, by the journal entry's sourceRef prefix. */
+const TYPE_CODES: Record<string, string> = {
+  invoice: 'INV',
+  bill: 'BILL',
+  deposit: 'DEP',
+  expense: 'CHK',
+  expense_report: 'EXP',
+  credit_memo: 'CREDMEM',
+  vendor_credit: 'BILLCRED',
+  salesreceipt: 'RCPT',
+  sales_receipt: 'RCPT',
+  paycheck: 'PAY CHK',
+  bank_transaction: 'BANK',
+  item: 'INV ADJ',
+  fixed_asset: 'GENJRNL',
+  customer: 'PMT',
+  vendor: 'BILLPMT',
+  account: 'GENJRNL',
+  transfer: 'TRANSFR',
+};
+
+/** The register's Type column ("CHK", "DEP", "GENJRNL" …) for a row's sourceRef. */
+export function registerTypeCode(sourceRef: string | null | undefined): string {
+  if (!sourceRef || sourceRef === 'manual') return 'GENJRNL';
+  return TYPE_CODES[sourceRef.split(':')[0]] ?? 'GENJRNL';
+}
+
+/** QuickBooks' ✓ column mark: ✔ reconciled, * cleared in a reconciliation still in progress. */
+export function clearedMark(cleared: 'reconciled' | 'cleared' | null | undefined): string {
+  return cleared === 'reconciled' ? '✔' : cleared === 'cleared' ? '*' : '';
+}

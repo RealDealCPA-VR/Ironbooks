@@ -191,11 +191,32 @@ Company Folder (Older Format)); File > Save as a Single Company File converts on
 - *Backup health counts every computer's backups*: the history travels with the file, so "Last
   backup" and the schedule include backups this computer cannot see. Per-computer versus per-file
   backup semantics is a product decision.
-- *Ironbooks 1.6.0 cannot refuse files from later versions it does not know about* beyond
+- *Ironbooks 1.6.0 and earlier cannot refuse files from later versions it does not know about* beyond
   `formatVersion` (it refuses format 2, so protected and newer files are safe). Update every
   computer of an office together (release notes).
 - *A file key change waits for the next save*: if the app stops between a password change (or a
   deactivated user) and that save, the change is not made; the next secret change makes it.
+
+### Moving files between computers (1.7.0)
+
+- **Where the file is.** Opening a company file from File Explorer or File > Open first checks its
+  folder (`electron/fileLocation.js`, `confirmCompanyFileLocation` in `electron/main.js`). An email
+  attachment opened from Outlook or a download cache (a temporary folder), or a read-only file, is
+  offered "Save a Copy and Open It" in Documents. A file in a OneDrive, Dropbox, Google Drive or
+  iCloud Drive folder is told once (per file, `cloudWarned` in config) not to be opened from two
+  computers at once: sync copies the file between them, so the lock cannot protect it. Shared books
+  belong on the office file server or in multi-user mode.
+- **Backups and portable files on a new computer.** Double-clicking a `.bka` or `.bkp` on a fresh
+  install (or with no company open) restores it as a new company file. A portable file restored from
+  No Company Open runs the restore on a short-lived server (`startScratchServer`). A `.bka`
+  double-clicked while a company is open asks "As a New Company File / Into the Open Company".
+- **Accountant's Copy.** `.ibac` (transfer file) and `.ibcx` (changes) are registered file types and
+  open from File > Open. An `.ibac` becomes the accountant's working copy as one `.ironbooks` file
+  where the accountant chooses (`openAccountantCopyFlow`; no company needs to be open). An `.ibcx`
+  opens the Accountant's Copy page of the open company file with the changes ready to review.
+- **Forgotten file password.** The unlock screen offers "Forgot the file password?": on a file
+  protected with passwords, the recovery key; on any other file an Admin of the file signs in with
+  their own user name and password and the file password is removed (`/api/unlock/admin`).
 
 ## Testing the desktop app
 

@@ -1725,7 +1725,7 @@ export default function EmployeesPage() {
   return (
     <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader
-        title="Employees & Payroll"
+        title="Employee Center"
         icon={UserSquare}
         action={
           <div className="flex items-center gap-3">

@@ -1,7 +1,7 @@
 'use client';
 
-import { Suspense, useEffect, useState } from 'react';
-import { Users, Pencil, UserX, Plus, Download, ListPlus, PlusCircle, MinusCircle } from 'lucide-react';
+import { Fragment, Suspense, useEffect, useState } from 'react';
+import { Users, Pencil, UserX, Plus, Download, ListPlus, PlusCircle, MinusCircle, Briefcase } from 'lucide-react';
 import {
   AmountInput,
   Button,
@@ -534,6 +534,12 @@ function DefineFieldsModal({
 function CustomersPageContent() {
   const prefs = usePreferences();
   const [customers, setCustomers] = useState<Customer[]>([]);
+  /** QuickBooks' Customer:Job list: each customer's jobs, shown indented under it. */
+  const [custJobs, setCustJobs] = useState<Array<{ id: string; name: string; customerId: string | null; status?: string; isActive?: boolean }>>([]);
+  /** Customers > Add Job: the customer the new job is for. */
+  const [jobFor, setJobFor] = useState<Customer | null>(null);
+  const [jobName, setJobName] = useState('');
+  const [jobSaving, setJobSaving] = useState(false);
   const [loading, setLoading] = useState(true);
   const [includeInactive, setIncludeInactive] = useState(false);
 
@@ -610,6 +616,8 @@ function CustomersPageContent() {
         : '/api/customers?withBalances=true';
       const data = await api.get<Customer[]>(url);
       setCustomers(data);
+      // Jobs need Jobs access; without it the list simply shows customers.
+      api.get<typeof custJobs>('/api/jobs').then(setCustJobs, () => setCustJobs([]));
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Failed to load customers', 'danger');
     } finally {
@@ -839,7 +847,7 @@ function CustomersPageContent() {
   return (
     <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader
-        title="Customers"
+        title="Customer Center"
         icon={Users}
         action={
           <div className="flex items-center gap-3">
@@ -943,6 +951,7 @@ function CustomersPageContent() {
             </thead>
             <tbody>
               {customers.map((c) => (
+                <Fragment key={c.id}>
                 <Tr
                   key={c.id}
                   {...{ [CENTER_ROW_ATTR]: c.id }}
@@ -1012,6 +1021,21 @@ function CustomersPageContent() {
                         <Button
                           variant="ghost"
                           size="sm"
+                          onClick={() => {
+                            setJobFor(c);
+                            setJobName('');
+                          }}
+                          title="Add Job (a job for this customer, QuickBooks Customer:Job)"
+                          aria-label={wide ? undefined : 'Add Job'}
+                        >
+                          <Briefcase className="h-3.5 w-3.5" />
+                          {wide && 'Add Job'}
+                        </Button>
+                      )}
+                      {c.isActive && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
                           onClick={() => setDeactivateTarget(c)}
                           title="Deactivate customer"
                           aria-label={wide ? undefined : 'Deactivate customer'}
@@ -1024,6 +1048,28 @@ function CustomersPageContent() {
                     </div>
                   </Td>
                 </Tr>
+                {custJobs
+                  .filter((j) => j.customerId === c.id && (includeInactive || j.isActive !== false))
+                  .map((j) => (
+                    <Tr key={j.id} data-list-label={`${c.displayName}:${j.name}`}>
+                      <Td className="pl-8 text-navy/80">
+                        <span className="mr-1.5 text-navy/40" aria-hidden="true">
+                          {'◆'}
+                        </span>
+                        {j.name}
+                        <span className="sr-only"> (job of {c.displayName})</span>
+                      </Td>
+                      {wide && <Td colSpan={4 + (showCustomCols ? customFieldNames.length : 0)} />}
+                      <Td />
+                      {wide && <Td>{j.isActive === false ? <Badge tone="neutral">Inactive</Badge> : <Badge tone="info">Job</Badge>}</Td>}
+                      <Td className="text-right">
+                        <Link href={`/invoices?new=1&job=${j.id}`} className="text-xs font-semibold text-electric hover:underline">
+                          Invoice
+                        </Link>
+                      </Td>
+                    </Tr>
+                  ))}
+                </Fragment>
               ))}
             </tbody>
           </Table>
@@ -1040,6 +1086,47 @@ function CustomersPageContent() {
         />
       )}
       </div>
+
+      {/* ---- Add Job (QuickBooks Customer:Job) ---- */}
+      <Modal
+        open={jobFor !== null}
+        onClose={() => setJobFor(null)}
+        title={jobFor ? `Add Job for ${jobFor.displayName}` : 'Add Job'}
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setJobFor(null)} disabled={jobSaving}>
+              Cancel
+            </Button>
+            <Button
+              loading={jobSaving}
+              disabled={!jobName.trim()}
+              onClick={async () => {
+                if (!jobFor || !jobName.trim()) return;
+                setJobSaving(true);
+                try {
+                  await api.post('/api/jobs', { name: jobName.trim(), customerId: jobFor.id });
+                  toast(`Job "${jobFor.displayName}:${jobName.trim()}" added.`, 'success');
+                  setJobFor(null);
+                  setCustJobs(await api.get<typeof custJobs>('/api/jobs'));
+                } catch (err) {
+                  toast(err instanceof ApiError ? err.message : 'Could not add the job.', 'danger');
+                } finally {
+                  setJobSaving(false);
+                }
+              }}
+            >
+              OK
+            </Button>
+          </>
+        }
+      >
+        <Label htmlFor="job-name" required>Job name</Label>
+        <Input id="job-name" autoFocus value={jobName} onChange={(e) => setJobName(e.target.value)} placeholder="e.g. Kitchen Remodel" />
+        <p className="mt-2 text-xs text-navy/50">
+          Pick it on invoices as {jobFor ? `${jobFor.displayName}:` : 'Customer:'}
+          {jobName.trim() || 'Job'}. Budgets, dates and job types are on the Jobs list.
+        </p>
+      </Modal>
 
       {/* ---- Add customer modal ---- */}
       <Modal

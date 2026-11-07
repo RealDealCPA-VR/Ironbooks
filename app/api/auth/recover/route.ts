@@ -113,7 +113,7 @@ async function handlePost(req: NextRequest) {
       await storeUserPassword(tx, user.id, password, { mustChange: false });
       const off = await tx
         .update(users)
-        .set({ totpEnabled: false, totpSecret: null, updatedAt: new Date() })
+        .set({ totpEnabled: false, totpSecret: null, totpRecoveryCodes: null, updatedAt: new Date() })
         .where(and(eq(users.id, user.id), eq(users.totpEnabled, true)))
         .returning({ id: users.id });
       twoFactorTurnedOff = off.length > 0;

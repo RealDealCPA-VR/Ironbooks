@@ -52,6 +52,25 @@ const PAGE_MENU_ACTIONS: Record<string, () => void> = {
   ),
 };
 
+/** Press a key combination like "Ctrl+Insert" on the focused element (Edit menu items). */
+function replayKey(combo: string) {
+  const parts = combo.split('+');
+  const name = parts.pop() ?? '';
+  const key = name.length === 1 ? name.toLowerCase() : name;
+  const target = (document.activeElement as HTMLElement | null) ?? document.body;
+  target.dispatchEvent(
+    new KeyboardEvent('keydown', {
+      key,
+      code: name.length === 1 ? `Key${name.toUpperCase()}` : name,
+      ctrlKey: parts.includes('Ctrl'),
+      shiftKey: parts.includes('Shift'),
+      altKey: parts.includes('Alt'),
+      bubbles: true,
+      cancelable: true,
+    }),
+  );
+}
+
 type Unsubscribe = (() => void) | void;
 /** Mirrors updateState in electron/main.js. */
 interface UpdateState {
@@ -172,6 +191,12 @@ export default function DesktopBridge() {
           toastError(err, 'The sandbox copy could not be made.');
           router.push('/sandbox');
         });
+        return;
+      }
+      // Edit > New / Edit / Delete / Memorize / Insert Line …: press the QuickBooks key on the
+      // focused field (or the page), so the menu does exactly what the key does there.
+      if (action.startsWith('key:')) {
+        replayKey(action.slice(4));
         return;
       }
       const pageAction = PAGE_MENU_ACTIONS[action];

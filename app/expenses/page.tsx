@@ -436,8 +436,11 @@ function ExpensesPageContent() {
   const customerChoices: TypeaheadChoice[] = customers.map((c) => ({ id: c.id, label: c.displayName }));
 
   // Ctrl+W (QB Write Checks) / Quick Actions navigate here with ?new=1 — the entry form is always
-  // visible, so jump focus to the start of it (the payee field).
+  // visible, so jump focus to the start of it (the payee field). Banking > Enter Credit Card
+  // Charges adds &type=cc_charge to start on a credit card charge.
   useNewParam(() => {
+    const type = new URLSearchParams(window.location.search).get('type');
+    if (type === 'cc_charge' || type === 'cc_credit' || type === 'check' || type === 'cash') setEntryType(type);
     document.getElementById('exp-payee')?.focus();
   });
 
@@ -808,7 +811,7 @@ function ExpensesPageContent() {
 
   return (
     <main className="min-h-screen bg-offwhite p-8 font-sans">
-      <PageHeader title="Write Checks / Expenses" icon={Banknote} />
+      <PageHeader title={entryType === 'cc_charge' || entryType === 'cc_credit' ? 'Enter Credit Card Charges' : 'Write Checks'} icon={Banknote} />
 
       {/* ------------------------------------------------------------------ */}
       {/* Entry form                                                          */}

@@ -26,6 +26,15 @@ contextBridge.exposeInMainWorld('bookkeeper', {
   backup: {
     takePending: (token) => ipcRenderer.invoke('backup:takePending', String(token)),
   },
+  /**
+   * Accountant's Copy: the accountant's changes file (.ibcx) double-clicked or chosen in File >
+   * Open, handed over once for the token in /accountant/accountants-copy?changes=<token>.
+   */
+  accountantCopy: {
+    takePendingChanges: (token) => ipcRenderer.invoke('accountantCopy:takePendingChanges', String(token)),
+    /** Choose a transfer file (.ibac) and open it as a new company file (main process flow). */
+    open: () => ipcRenderer.invoke('accountantCopy:open'),
+  },
   /** Portable Company File (.bkp): open/restore flow runs in the main process. */
   portable: {
     open: () => ipcRenderer.invoke('portable:open'),

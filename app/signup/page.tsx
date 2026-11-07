@@ -32,6 +32,12 @@ interface FileInfo {
   singleFile?: boolean;
 }
 
+/** Where a new company goes after its Admin is set up ("Convert from QuickBooks" → the import wizard). */
+function afterSetup(): string {
+  if (typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('then') === 'qb-import') return '/qb-import';
+  return '/onboarding?new=1';
+}
+
 export default function SignupPage() {
   const [form, setForm] = useState({
     name: '',
@@ -67,6 +73,9 @@ export default function SignupPage() {
   }, []);
 
   const mismatch = form.confirm.length > 0 && form.confirm !== form.password;
+  // A protected (encrypted) file: the answer must be strong enough to open the file by itself,
+  // or "I forgot my password" stops working once the file is closed (lib/challengeQuestions.ts).
+  const weakAnswer = Boolean(info?.singleFile && protect && form.challengeAnswer.trim() && !challengeAnswerOpensFile(form.challengeAnswer));
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -98,8 +107,9 @@ export default function SignupPage() {
         setBusy(false);
         return;
       }
-      // Every new company goes through the setup interview (it offers Skip).
-      window.location.href = '/onboarding?new=1';
+      // Every new company goes through the setup interview (it offers Skip) — or, when it was
+      // created by "Convert from QuickBooks", straight to the QuickBooks import.
+      window.location.href = afterSetup();
     } catch (err) {
       toast(err instanceof Error ? err.message : 'Setup failed', 'danger');
       setBusy(false);
@@ -113,8 +123,8 @@ export default function SignupPage() {
           <RecoveryKeyPanel
             recoveryKey={recovery.key}
             companyName={recovery.companyName}
-            doneLabel="Continue to the company setup"
-            onDone={() => (window.location.href = '/onboarding?new=1')}
+            doneLabel={afterSetup() === '/qb-import' ? 'Continue to the QuickBooks import' : 'Continue to the company setup'}
+            onDone={() => (window.location.href = afterSetup())}
           />
         </Card>
       </main>
@@ -212,8 +222,10 @@ export default function SignupPage() {
               <Input id="su-answer" value={form.challengeAnswer} onChange={set('challengeAnswer')} required autoComplete="off" />
               <p className="mt-1 text-xs text-navy/50">Not case-sensitive. Write it down somewhere safe.</p>
               {info?.singleFile && protect && (
-                <p className={`mt-1 text-xs ${form.challengeAnswer.trim() && !challengeAnswerOpensFile(form.challengeAnswer) ? 'text-amber-700' : 'text-navy/50'}`}>
-                  {CHALLENGE_SLOT_RULE_TEXT}
+                <p className={`mt-1 text-xs ${weakAnswer ? 'text-red-600' : 'text-navy/50'}`}>
+                  {weakAnswer
+                    ? `Use a longer answer: at least 10 characters, like a short phrase ("pip the grey cat"). Otherwise this answer can't get you back into the protected file if you forget the password.`
+                    : CHALLENGE_SLOT_RULE_TEXT}
                 </p>
               )}
             </div>
@@ -227,7 +239,13 @@ export default function SignupPage() {
               </span>
             </label>
           )}
-          <Button type="submit" className="w-full" loading={busy} disabled={mismatch}>
+          {info?.singleFile && !protect && (
+            <p className="rounded-lg bg-amber-50 px-3 py-2 text-xs text-amber-800">
+              Without protection there is no recovery key. If you forget both this password and the challenge answer, nobody
+              can sign in as Admin. Add a second Admin later in Users &amp; Roles as a backup.
+            </p>
+          )}
+          <Button type="submit" className="w-full" loading={busy} disabled={mismatch || weakAnswer}>
             Create the Admin and continue
           </Button>
         </form>

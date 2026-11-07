@@ -55,7 +55,10 @@ export async function POST(req: NextRequest) {
   const generic = { ok: true, message: 'If that account exists, a reset token has been generated.' };
   if (!email) return NextResponse.json(generic);
 
-  // Rate limit: every reset REQUEST counts (per account, per address, and globally).
+  // Rate limit (per account, per address, and globally): every request that proves nothing counts —
+  // a wrong answer, a refusal, an unknown user, a token from the single-user rule. Asking for a
+  // user's question does not count, and the right answer clears the account's count, so two typos
+  // don't lock a person out of their own books.
   const origin = originFromHeaders(req.headers);
   const limiter = resetLimiter();
   const keys = attemptKeys('reset-request', email, origin.addr);
@@ -65,25 +68,36 @@ export async function POST(req: NextRequest) {
     const { body: tooMany, retryAfter } = tooManyResets(gate.retryAfterMs);
     return NextResponse.json(tooMany, { status: 429, headers: { 'Retry-After': retryAfter } });
   }
-  try {
+  let counted = false; // at most once per request
+  const fail = () => {
+    if (counted) return;
+    counted = true;
     limiter.recordFailure(keys, Date.now(), weights);
+  };
+  try {
     const offlineLocal = process.env.BKA_OFFLINE === '1' && !origin.remote;
     const sealed = sealedMode();
     let db;
     if (sealed === 'extract' || sealed === 'conflict') {
       // Not decrypted yet: the question is in the file's challenge slot, and the answer opens it.
-      if (!offlineLocal) return NextResponse.json(generic);
+      if (!offlineLocal) {
+        fail();
+        return NextResponse.json(generic);
+      }
       const question = sealedChallengeQuestion(email);
       if (!question) {
+        fail();
         await unlockFromFile({ kind: 'challenge', login: email, secret: challengeAnswer || 'x' }); // same work either way
         return NextResponse.json({ error: PROTECTED_NO_CHALLENGE_MESSAGE, code: 'FORBIDDEN' }, { status: 403 });
       }
       if (!challengeAnswer.trim()) return NextResponse.json({ ok: false, challengeQuestion: question });
       const key = await unlockFromFile({ kind: 'challenge', login: email, secret: challengeAnswer });
       if (!key) {
+        fail();
         return NextResponse.json({ error: WRONG_ANSWER_MESSAGE, code: 'FORBIDDEN', challengeQuestion: question }, { status: 403 });
       }
       await unsealCompanyFile(key);
+      limiter.recordSuccess(keys.slice(0, -1));
       db = await getDb();
     } else if (sealed === 'key') {
       db = await withSealedAccess(() => getDb());
@@ -94,6 +108,7 @@ export async function POST(req: NextRequest) {
     // The file password (if set) gates everything in the file, password resets included.
     const lock = await getFileLockStatus(db);
     if (lock.enabled && !(await hasValidUnlockCookie())) {
+      fail();
       return NextResponse.json(
         { error: 'This company file is locked. Unlock it to continue.', code: 'FORBIDDEN' },
         { status: 403 },
@@ -114,6 +129,7 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ ok: false, challengeQuestion: user!.challengeQuestion });
       }
       if (!(await verifyPassword(normalizeChallengeAnswer(challengeAnswer), user!.challengeAnswerHash!))) {
+        fail();
         return NextResponse.json(
           { error: WRONG_ANSWER_MESSAGE, code: 'FORBIDDEN', challengeQuestion: user!.challengeQuestion },
           { status: 403 },
@@ -122,12 +138,15 @@ export async function POST(req: NextRequest) {
       // The working copy already on this computer (sealed 'key'): the answer's slot unlocks the file key.
       if (sealed === 'key') {
         if (!(await loadKeyFromChallenge(db, resolveDataDir(), user!.id, challengeAnswer))) {
+          fail();
           return NextResponse.json({ error: PROTECTED_NO_CHALLENGE_MESSAGE, code: 'FORBIDDEN' }, { status: 403 });
         }
         await finishKeyUnseal(db);
       }
+      limiter.recordSuccess(keys.slice(0, -1));
     } else if (offlineLocal && (sealed === 'key' || (await readProtection(db)))) {
       // A protected file is never reopened by the single-user rule: only a secret that opens it.
+      fail();
       return NextResponse.json({ error: PROTECTED_NO_CHALLENGE_MESSAGE, code: 'FORBIDDEN' }, { status: 403 });
     } else if (offlineLocal) {
       const realUsers = await db
@@ -135,13 +154,17 @@ export async function POST(req: NextRequest) {
         .from(users)
         .where(ne(users.passwordHash, 'dev'))
         .limit(2);
+      fail(); // the single-user rule proves nothing
       if (realUsers.length > 1) {
         return NextResponse.json({ error: MULTI_USER_RESET_MESSAGE, code: 'FORBIDDEN' }, { status: 403 });
       }
     }
 
     // The seeded demo user (sentinel hash 'dev') is not a real account and can't be "recovered".
-    if (!user || user.passwordHash === 'dev') return NextResponse.json(generic);
+    if (!user || user.passwordHash === 'dev') {
+      if (!offlineLocal || !hasChallenge) fail();
+      return NextResponse.json(generic);
+    }
 
     const token = crypto.randomBytes(24).toString('hex');
     await db
@@ -156,6 +179,7 @@ export async function POST(req: NextRequest) {
     // Multi-user hosting: a request relayed from another machine is NOT local, so it never gets
     // the token even in the desktop build (anyone on the tailnet could otherwise take over).
     if (offlineLocal) return NextResponse.json({ ...generic, token });
+    fail();
     return NextResponse.json(generic);
   } finally {
     gate.release();

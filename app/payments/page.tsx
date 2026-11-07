@@ -87,6 +87,7 @@ import {
 } from './creditSplit';
 import { CreditsDialog } from './CreditsDialog';
 import { parseReceivePaymentLink, prefillFromLink } from './deepLink';
+import { SaveAndNewButton } from '@/components/FormShortcuts';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -988,8 +989,9 @@ function ReceivePaymentModal({
           <Button variant="secondary" onClick={onClose} disabled={saving}>
             Cancel
           </Button>
+          <SaveAndNewButton disabled={saving} />
           <Button onClick={handleSubmit} loading={saving}>
-            {editing ? 'Save Changes' : 'Record Payment'}
+            Save &amp; Close
           </Button>
         </>
       }

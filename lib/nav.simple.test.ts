@@ -179,7 +179,8 @@ describe('"What is this page?" help', () => {
 
 describe('Home workflow follows permissions and feature switches', () => {
   it('drops steps a person cannot open and empty sections', () => {
-    const allowed = new Set(['/invoices', '/payments', '/customers', '/deposits']);
+    // Hrefs as the dashboard passes them (allowedWorkflowHrefs): steps open a blank form (?new=1).
+    const allowed = new Set(['/invoices?new=1', '/payments?new=1', '/customers', '/deposits?new=1']);
     const s = filterWorkflow(HOME_WORKFLOW, (h) => allowed.has(h));
     const ids = s.map((x) => x.id);
     expect(ids).toContain('customers');

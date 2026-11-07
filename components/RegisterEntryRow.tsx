@@ -323,7 +323,7 @@ export function RegisterEntryRow({
   if (blocked) {
     return (
       <tr className="bg-slate-50">
-        <td colSpan={7 + colSpanAfter} className="px-4 py-3 text-xs text-navy/50">
+        <td colSpan={8 + colSpanAfter} className="px-4 py-3 text-xs text-navy/50">
           {blocked}
         </td>
       </tr>
@@ -354,6 +354,8 @@ export function RegisterEntryRow({
         <td className={cell}>
           <DocNumberInput aria-label="Number" placeholder={register.subtype === 'checking' || register.subtype === 'savings' ? 'Auto' : ''} value={number} onChange={(e) => setNumber(e.target.value)} className="w-20" />
         </td>
+        {/* The register's Type column: set by what the line becomes when it is recorded. */}
+        <td className={cell} />
         <td className={cell}>
           <Typeahead
             aria-label="Payee"
@@ -433,7 +435,7 @@ export function RegisterEntryRow({
         </td>
       </tr>
       <tr className="bg-electric/5">
-        <td colSpan={7 + colSpanAfter} className="px-3 pb-2 text-xs">
+        <td colSpan={8 + colSpanAfter} className="px-3 pb-2 text-xs">
           {plan && !plan.ok ? (
             <span className="text-red-600">{plan.message}</span>
           ) : plan?.ok ? (

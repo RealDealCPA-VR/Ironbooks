@@ -91,6 +91,7 @@ import {
   taxItemLabel,
   withShownTaxable,
 } from '@/lib/salesFormListsClient';
+import { SaveAndNewButton } from '@/components/FormShortcuts';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -421,6 +422,8 @@ interface InvoiceModalProps {
   prefill?: FormPrefill | null;
   /** QB's Previous / Next / Revert / Journal toolbar (components/TransactionNav.tsx). */
   nav?: React.ReactNode;
+  /** A NEW invoice for this job (Customer Center job row > Invoice): Customer:Job starts on it. */
+  startJobId?: string | null;
 }
 
 function InvoiceModal({
@@ -437,9 +440,20 @@ function InvoiceModal({
   onSaved,
   prefill = null,
   nav = null,
+  startJobId = null,
 }: InvoiceModalProps) {
-  const customerChoices = useMemo(() => customers.map((c) => ({ id: c.id, label: c.displayName })), [customers]);
+  // QuickBooks' Customer:Job: each customer, then its jobs as "Customer:Job" (ids "job:<id>").
+  const customerChoices = useMemo(
+    () =>
+      customers.flatMap((c) => [
+        { id: c.id, label: c.displayName },
+        ...jobs.filter((j) => j.customerId === c.id).map((j) => ({ id: `job:${j.id}`, label: `${c.displayName}:${j.name}` })),
+      ]),
+    [customers, jobs],
+  );
   const [customerId, setCustomerId] = useState('');
+  /** The job picked in the Customer:Job field: new lines (and lines without a job) get it. */
+  const [headerJobId, setHeaderJobId] = useState('');
   const [date, setDate] = useState(() => todayISO());
   const [dueDate, setDueDate] = useState('');
   const [terms, setTerms] = useState('');
@@ -578,8 +592,13 @@ function InvoiceModal({
           billableSource: l.billableSource ?? null,
         })),
       );
+      // Every line on one of this customer's jobs: the header shows "Customer:Job".
+      const lineJobs = new Set(editing.lines.map((l) => l.jobId ?? ''));
+      const onlyJob = lineJobs.size === 1 ? [...lineJobs][0] : '';
+      setHeaderJobId(onlyJob && jobs.some((j) => j.id === onlyJob && j.customerId === editing.customerId) ? onlyJob : '');
     } else {
       setCustomerId('');
+      setHeaderJobId('');
       // My Preferences > General "Default date": today, or the last invoice date entered this session.
       setDate(smart.defaultDate());
       setDueDate('');
@@ -626,6 +645,7 @@ function InvoiceModal({
         }
       }
     }
+    startJobAppliedRef.current = false;
     setRecallText('');
     recalledTaxRef.current = null;
     setBillables(null);
@@ -637,7 +657,20 @@ function InvoiceModal({
     // Preferences > Time & Expenses: default markup on billable costs.
     setMarkupPercent(prefs.company.defaultMarkupPercent > 0 ? String(prefs.company.defaultMarkupPercent) : '');
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, editing, prefill]);
+  }, [open, editing, prefill, startJobId]);
+
+  // Customer Center > a job's Invoice: the new invoice starts on that Customer:Job (once the jobs
+  // list has loaded — it can arrive after the form opens).
+  const startJobAppliedRef = useRef(false);
+  useEffect(() => {
+    if (!open || editing || !startJobId || startJobAppliedRef.current) return;
+    const job = jobs.find((j) => j.id === startJobId);
+    if (!job?.customerId) return;
+    startJobAppliedRef.current = true;
+    setCustomerId(job.customerId);
+    setHeaderJobId(job.id);
+    setLines((prev) => prev.map((l) => (l.jobId ? l : { ...l, jobId: job.id })));
+  }, [open, editing, startJobId, jobs]);
 
   // New invoice: due date follows the customer's terms (else the default terms preference).
   useEffect(() => {
@@ -851,7 +884,7 @@ function InvoiceModal({
   }
 
   function addLine() {
-    setLines((prev) => [...prev, { ...EMPTY_LINE }]);
+    setLines((prev) => [...prev, { ...EMPTY_LINE, jobId: headerJobId }]);
   }
 
   function removeLine(idx: number) {
@@ -872,7 +905,7 @@ function InvoiceModal({
       handleItemInput(emptyIdx, it.name);
       return;
     }
-    setLines((prev) => [...prev, { ...EMPTY_LINE, itemName: it.name }]);
+    setLines((prev) => [...prev, { ...EMPTY_LINE, itemName: it.name, jobId: headerJobId }]);
     setPendingScanIdx(lines.length);
   }
   useEffect(() => {
@@ -1194,8 +1227,9 @@ function InvoiceModal({
             }}
           />
           <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
+          <SaveAndNewButton disabled={saving} />
           <Button onClick={() => handleSubmit()} loading={saving}>
-            {editing ? 'Save Changes' : saveAsPending ? 'Save Pending' : 'Create Invoice'}
+            {saveAsPending && !editing ? 'Save Pending' : 'Save & Close'}
           </Button>
         </>
       }
@@ -1220,13 +1254,27 @@ function InvoiceModal({
 
         {/* Customer */}
         <div>
-          <Label htmlFor="inv-customer" required>Customer</Label>
+          <Label htmlFor="inv-customer" required>Customer:Job</Label>
           <NameField
             id="inv-customer"
             nameType="customer"
-            value={customerId}
+            value={headerJobId ? `job:${headerJobId}` : customerId}
             choices={customerChoices}
-            onChange={setCustomerId}
+            onChange={(v) => {
+              if (v.startsWith('job:')) {
+                const job = jobs.find((j) => `job:${j.id}` === v);
+                if (!job?.customerId) return;
+                setCustomerId(job.customerId);
+                setHeaderJobId(job.id);
+                // QuickBooks: the job is the invoice's — lines without their own job take it.
+                setLines((prev) => prev.map((l) => (l.jobId ? l : { ...l, jobId: job.id })));
+                return;
+              }
+              // Back to the customer alone: lines that only had the header's job lose it.
+              if (headerJobId) setLines((prev) => prev.map((l) => (l.jobId === headerJobId ? { ...l, jobId: '' } : l)));
+              setHeaderJobId('');
+              setCustomerId(v);
+            }}
             onAdded={(n) => onCustomerAdded?.({ id: n.id, displayName: n.label })}
             placeholder="Type a customer name…"
             autoFocus
@@ -1851,8 +1899,11 @@ function InvoicesPageContent() {
   }, [fetchData]);
 
   // Ctrl+I / Quick Actions navigate here with ?new=1 — open the create modal.
+  /** ?new=1&job=<id> (Customer Center job rows): the new invoice starts on that Customer:Job. */
+  const [startJobId, setStartJobId] = useState<string | null>(null);
   useNewParam(() => {
     setEditTarget(null);
+    setStartJobId(new URLSearchParams(window.location.search).get('job'));
     setShowNew(true);
   });
   // cmdbar: the command bar opens a NEW invoice filled in for the user to review and save.
@@ -2180,6 +2231,7 @@ function InvoicesPageContent() {
         key={formKey}
         open={showNew || !!editTarget}
         editing={editTarget}
+        startJobId={startJobId}
         nav={
           <TransactionNav
             sourceRef={editTarget && editTarget.status !== 'draft' ? `invoice:${editTarget.id}` : null}
@@ -2189,7 +2241,7 @@ function InvoicesPageContent() {
             loadKey={`${formKey}:${editTarget?.id ?? 'new'}`}
           />
         }
-        onClose={() => { setShowNew(false); setEditTarget(null); setPrefill(null); }}
+        onClose={() => { setShowNew(false); setEditTarget(null); setPrefill(null); setStartJobId(null); }}
         prefill={editTarget ? null : prefill}
         customers={customers}
         onCustomerAdded={(c) => setCustomers((prev) => [...prev, c])}

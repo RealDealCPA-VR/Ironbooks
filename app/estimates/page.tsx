@@ -24,7 +24,7 @@ import {
   toast,
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
-import { useFocusId } from '@/lib/useFocusParam';
+import { useFocusId, useNewParam } from '@/lib/useFocusParam';
 import { todayISO } from '@/lib/dates';
 import { usePreferences } from '@/lib/usePreferences';
 import { recallNote, useSmartDefaults } from '@/lib/useSmartDefaults';
@@ -70,6 +70,7 @@ import {
   taxItemLabel,
   withShownTaxable,
 } from '@/lib/salesFormListsClient';
+import { SaveAndNewButton } from '@/components/FormShortcuts';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -572,6 +573,8 @@ function EstimatesPageContent() {
 
   // Drill-downs (the transaction log, the Income Tracker) link here with ?focus=<id>.
   useFocusId(true, (id) => void openEditModal({ id } as Estimate));
+  // Customers > Create Estimates opens a blank estimate, as in QuickBooks.
+  useNewParam(() => openAddModal());
 
   /** Edit a saved estimate (allowed until it has been turned into an invoice). */
   async function openEditModal(estimate: Estimate) {
@@ -1021,8 +1024,9 @@ function EstimatesPageContent() {
             <Button variant="secondary" onClick={() => setAddOpen(false)} disabled={addSaving}>
               Cancel
             </Button>
+            <SaveAndNewButton disabled={addSaving} />
             <Button onClick={handleCreate} loading={addSaving}>
-              {editingId ? 'Save Changes' : 'Create Estimate'}
+              Save &amp; Close
             </Button>
           </>
         }

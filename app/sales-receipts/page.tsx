@@ -97,6 +97,7 @@ import {
   taxItemLabel,
   withShownTaxable,
 } from '@/lib/salesFormListsClient';
+import { SaveAndNewButton } from '@/components/FormShortcuts';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -625,8 +626,9 @@ function NewReceiptModal({
             }}
           />
           <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
+          <SaveAndNewButton disabled={saving} />
           <Button onClick={handleSubmit} loading={saving}>
-            {editing ? 'Save Changes' : 'Create Receipt'}
+            Save &amp; Close
           </Button>
         </>
       }

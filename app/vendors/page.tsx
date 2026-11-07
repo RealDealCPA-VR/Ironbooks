@@ -379,7 +379,7 @@ function VendorsPageContent() {
   return (
     <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader
-        title="Vendors"
+        title="Vendor Center"
         icon={Truck}
         action={
           <div className="flex items-center gap-2">

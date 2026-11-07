@@ -177,6 +177,7 @@ describe('API permission map coverage', () => {
         '/api/receipts/mobile/[token]',
         '/api/sandbox/status', // banner flag only (sandbox mode)
         '/api/unlock',
+        '/api/unlock/admin',
       ].sort(),
     );
   });

@@ -47,7 +47,7 @@ import { formatDate } from '@/lib/dates';
 import EntryDetailModal, { sourceRefLink } from '@/components/EntryDetailModal';
 import { RegisterEntryRow } from '@/components/RegisterEntryRow';
 import WhyChanged from '@/components/WhyChanged';
-import { copyOfRow, registerBody, showEntryRow, transferHref } from './registerView';
+import { clearedMark, copyOfRow, registerBody, registerTypeCode, showEntryRow, transferHref } from './registerView';
 
 // ---------------------------------------------------------------------------
 // Types (mirror GET /api/registers/[accountId])
@@ -78,6 +78,8 @@ interface RegisterRow {
   runningBalance: string;
   /** The other account on the entry, or "-split-" (id null) for several. */
   otherAccount?: { id: string | null; label: string } | null;
+  /** The ✓ column: reconciled, cleared in a reconciliation in progress, or not cleared. */
+  cleared?: 'reconciled' | 'cleared' | null;
   /** p1 fx: account-currency columns (foreign-currency bank / card accounts only). */
   foreignDebit?: string | null;
   foreignCredit?: string | null;
@@ -467,6 +469,7 @@ function RegisterPageInner() {
                   <tr>
                     <Th>Date</Th>
                     <Th>Number</Th>
+                    <Th>Type</Th>
                     <Th>Payee / Description</Th>
                     <Th>Account</Th>
                     <Th>Memo</Th>
@@ -479,6 +482,7 @@ function RegisterPageInner() {
                         </span>
                       </Th>
                     ))}
+                    <Th className="text-center" title="Cleared: ✔ reconciled, * cleared in a reconciliation in progress">{'✓'}</Th>
                     <Th numeric>Balance{fxCur ? ` (${fxCur})` : ''}</Th>
                     {fxCur && <Th numeric>Balance ({result.homeCurrency ?? 'home'})</Th>}
                   </tr>
@@ -488,7 +492,9 @@ function RegisterPageInner() {
                     <tr className="bg-slate-50">
                       <Td className="whitespace-nowrap text-navy/60">{formatDate(resultFrom)}</Td>
                       <Td />
+                      <Td />
                       <Td className="italic text-navy/60">Opening Balance</Td>
+                      <Td />
                       <Td />
                       <Td />
                       <Td />
@@ -507,7 +513,7 @@ function RegisterPageInner() {
 
                   {result.rows.length < result.totalRows && (
                     <tr>
-                      <Td colSpan={fxCur ? 9 : 8} className="py-2 text-center text-xs text-navy/60">
+                      <Td colSpan={fxCur ? 11 : 10} className="py-2 text-center text-xs text-navy/60">
                         Showing the latest {result.rows.length.toLocaleString('en-US')} of{' '}
                         {result.totalRows.toLocaleString('en-US')} transactions.{' '}
                         <button
@@ -530,7 +536,7 @@ function RegisterPageInner() {
 
                   {result.rows.length === 0 && (
                     <tr>
-                      <Td colSpan={fxCur ? 9 : 8} className="py-12 text-center text-navy/40">
+                      <Td colSpan={fxCur ? 11 : 10} className="py-12 text-center text-navy/40">
                         No transactions in this register for the selected filters.
                       </Td>
                     </tr>
@@ -556,15 +562,11 @@ function RegisterPageInner() {
                         <Td className="text-navy/60 text-xs font-mono whitespace-nowrap">
                           {row.reference ?? `#${row.entryNumber}`}
                         </Td>
+                        <Td className="text-navy/60 text-xs font-mono whitespace-nowrap">{registerTypeCode(row.sourceRef)}</Td>
                         <Td className="max-w-xs">
                           <span className="block truncate" title={row.description}>
                             {row.description}
                           </span>
-                          {source && (
-                            <span className="text-[10px] uppercase tracking-wide text-electric/80 font-semibold">
-                              {source.label}
-                            </span>
-                          )}
                         </Td>
                         <Td className="text-navy/70 text-xs max-w-[200px] truncate" title={row.otherAccount?.label ?? ''}>
                           {row.otherAccount?.label ?? ''}
@@ -584,6 +586,7 @@ function RegisterPageInner() {
                             </Td>
                           );
                         })}
+                        <Td className="text-center text-navy/70">{clearedMark(row.cleared)}</Td>
                         <Td
                           numeric
                           className={`font-semibold ${
@@ -604,7 +607,7 @@ function RegisterPageInner() {
                     <RegisterEntryRow
                       register={result.account}
                       columns={config.columns}
-                      colSpanAfter={fxCur ? 2 : 1}
+                      colSpanAfter={fxCur ? 3 : 2}
                       onSaved={() => load(resultFrom, resultTo, resultSearch)}
                     />
                   )}

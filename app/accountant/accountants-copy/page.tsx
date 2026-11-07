@@ -191,6 +191,15 @@ export default function AccountantsCopyPage() {
   useEffect(() => {
     void load();
   }, [load]);
+  // A double-clicked changes file only imports into the file its Accountant's Copy was made from.
+  useEffect(() => {
+    if (status && status.mode !== 'client' && pendingChangesToken()) {
+      toast(
+        "This company file has no Accountant's Copy out with an accountant. Open the company file the copy was made from, then open the changes file again.",
+        'danger',
+      );
+    }
+  }, [status]);
 
   return (
     <main className="min-h-screen bg-offwhite p-8 font-sans">
@@ -301,6 +310,20 @@ function ClientStart({ status, onChanged }: { status: Status; onChanged: () => v
 // Client: outstanding (import / cancel)
 // ---------------------------------------------------------------------------
 
+/** The token the desktop shell hands over for a double-clicked .ibcx (?changes=…), once. */
+function pendingChangesToken(): string | null {
+  if (typeof window === 'undefined') return null;
+  return new URLSearchParams(window.location.search).get('changes');
+}
+
+/** The double-clicked .ibcx the shell holds for that token: { name, text } or { name, error }. */
+async function takePendingChanges(token: string): Promise<{ name: string; text?: string; error?: string } | null> {
+  const bridge = (window as unknown as {
+    bookkeeper?: { accountantCopy?: { takePendingChanges?: (t: string) => Promise<{ name: string; text?: string; error?: string } | null> } };
+  }).bookkeeper;
+  return (await bridge?.accountantCopy?.takePendingChanges?.(token)) ?? null;
+}
+
 function ClientOutstanding({ status, onChanged }: { status: Status; onChanged: () => void }) {
   const copy = status.current!;
   const inputRef = useRef<HTMLInputElement>(null);
@@ -319,11 +342,33 @@ function ClientOutstanding({ status, onChanged }: { status: Status; onChanged: (
     const file = e.target.files?.[0];
     e.target.value = '';
     if (!file) return;
+    await reviewChanges(() => file.text());
+  }
+
+  // A changes file double-clicked in File Explorer (or chosen in File > Open): the shell opened
+  // this page with a one-time token for it — review it exactly as if it had been chosen here.
+  useEffect(() => {
+    const token = pendingChangesToken();
+    if (!token) return;
+    window.history.replaceState(null, '', window.location.pathname);
+    void (async () => {
+      const taken = await takePendingChanges(token);
+      if (!taken) return;
+      if (taken.error || taken.text === undefined) {
+        toastError(new Error(taken.error ?? 'Could not read the changes file.'), 'Could not read the changes file.');
+        return;
+      }
+      await reviewChanges(async () => taken.text!);
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function reviewChanges(readText: () => Promise<string>) {
     setBusy('review');
     try {
       let parsed: unknown;
       try {
-        parsed = JSON.parse(await file.text());
+        parsed = JSON.parse(await readText());
       } catch {
         throw new Error("This is not an accountant's changes file (.ibcx).");
       }
@@ -655,7 +700,18 @@ function OpenTransferFile() {
           and add or edit accounts, classes, customers, vendors, items and other names — all dated on or before the dividing date. Then you save a
           changes file for your client.
         </p>
-        <Button className="mt-4" variant="secondary" onClick={() => inputRef.current?.click()} loading={busy === 'inspect'}>
+        <Button
+          className="mt-4"
+          variant="secondary"
+          onClick={() => {
+            // Desktop: the shell opens it as its own company file, where you choose (File > Open does the same).
+            const openInShell = (window as unknown as { bookkeeper?: { accountantCopy?: { open?: () => Promise<unknown> } } }).bookkeeper
+              ?.accountantCopy?.open;
+            if (openInShell) void openInShell();
+            else inputRef.current?.click();
+          }}
+          loading={busy === 'inspect'}
+        >
           <FolderInput className="h-4 w-4" aria-hidden="true" /> Open Accountant&apos;s Copy…
         </Button>
         <input ref={inputRef} type="file" accept=".ibac" className="hidden" aria-label="Accountant's Copy transfer file" onChange={onFile} />

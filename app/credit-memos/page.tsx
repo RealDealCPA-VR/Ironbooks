@@ -78,6 +78,7 @@ import {
   taxItemLabel,
   withShownTaxable,
 } from '@/lib/salesFormListsClient';
+import { SaveAndNewButton } from '@/components/FormShortcuts';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -507,8 +508,9 @@ function NewMemoModal({ open, editing, onClose, customers, onCustomerAdded, item
             }}
           />
           <Button variant="secondary" onClick={onClose} disabled={saving}>Cancel</Button>
+          <SaveAndNewButton disabled={saving} />
           <Button onClick={handleSubmit} loading={saving}>
-            {editing ? 'Save Changes' : 'Create Credit Memo'}
+            Save &amp; Close
           </Button>
         </>
       }

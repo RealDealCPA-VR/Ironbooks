@@ -10,4 +10,6 @@ contextBridge.exposeInMainWorld('startScreen', {
   reveal: (dir) => ipcRenderer.invoke('start:reveal', String(dir)),
   newCompany: () => ipcRenderer.invoke('start:new'),
   browse: () => ipcRenderer.invoke('start:browse'),
+  /** Create a company file, then the QuickBooks import wizard. */
+  convert: () => ipcRenderer.invoke('start:convert'),
 });

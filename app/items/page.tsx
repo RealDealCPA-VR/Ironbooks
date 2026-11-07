@@ -363,7 +363,7 @@ function ItemsPageContent() {
   return (
     <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader
-        title="Products & Services"
+        title="Item List"
         icon={Package}
         action={
           <div className="flex items-center gap-2">

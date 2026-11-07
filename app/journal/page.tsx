@@ -58,6 +58,7 @@ import { applyFixPatch, balanceFixes, formLineUpdates, missingClassCheck, missin
 import { collectErrors, dateMessage, requiredMessage } from '@/lib/fieldValidation';
 import { isJournalScreenEntry } from '@/lib/journalScreen';
 import { TransactionNav, useAdjacentTransactions } from '@/components/TransactionNav';
+import { SaveAndNewButton } from '@/components/FormShortcuts';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -440,6 +441,7 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
           <Button variant="secondary" onClick={onClose} disabled={saving}>
             Cancel
           </Button>
+          <SaveAndNewButton disabled={saving || !canSubmit} />
           <Button
             onClick={handleSubmit}
             disabled={!canSubmit}
@@ -447,7 +449,7 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
             aria-describedby={blocker ? 'je-save-blocker' : undefined}
             title={blocker ?? undefined}
           >
-            {editing ? 'Save Changes' : 'Post Entry'}
+            Save &amp; Close
           </Button>
         </>
       }

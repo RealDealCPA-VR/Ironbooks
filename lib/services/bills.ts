@@ -859,6 +859,16 @@ function billInventoryLines(input: CreateBillInput, prep: PreparedBill): Documen
 }
 
 /** Build the GL posting lines for a prepared bill: Dr per line, Cr A/P total. */
+/**
+ * A bill's journal-entry description (the register's Payee / Description column, GL reports):
+ * "Bill #1042 — Office Supply Co", or "Bill — Office Supply Co" without a bill number — never the
+ * bill's internal id.
+ */
+export function billEntryDescription(billNumber: string | null | undefined, vendorName: string): string {
+  const num = billNumber?.trim();
+  return `Bill${num ? ` #${num}` : ''} — ${vendorName}`;
+}
+
 function buildPostingLines(prep: PreparedBill, billNumber: string | null, billId: string) {
   return [
     // Debit lines (one per bill line; a $0 no-charge line posts nothing)
@@ -876,7 +886,7 @@ function buildPostingLines(prep: PreparedBill, billNumber: string | null, billId
     {
       accountId: prep.apAccountId,
       credit: prep.homeTotalStr,
-      memo: `Bill ${billNumber ?? billId} — ${prep.vendor.name}`,
+      memo: billEntryDescription(billNumber, prep.vendor.name),
       controlLine: true,
     },
   ];
@@ -937,7 +947,7 @@ export async function createBill(ctx: ServiceContext, input: CreateBillInput) {
     // --- Post to the GL ---
     const entry = await postJournalEntry(tx, {
       date: input.date,
-      description: `Bill ${input.billNumber ? `#${input.billNumber}` : bill.id}`,
+      description: billEntryDescription(input.billNumber, prep.vendor.name),
       reference: input.billNumber ?? null,
       sourceRef: `bill:${bill.id}`,
       lines: buildPostingLines(prep, input.billNumber ?? null, bill.id),
@@ -1230,8 +1240,9 @@ async function updateBillHeaderInTx(tx: ServiceContext, id: string, input: Creat
       })
       .where(eq(billLines.id, o.id));
   }
+  const [vendor] = await tx.db.select({ name: vendors.displayName }).from(vendors).where(eq(vendors.id, bill.vendorId));
   await retitleEntry(tx, bill.postedEntryId, {
-    description: `Bill ${input.billNumber ? `#${input.billNumber}` : id}`,
+    description: billEntryDescription(input.billNumber, vendor?.name ?? ''),
     reference: input.billNumber ?? null,
   });
   // The kept entry's line memos follow the edited descriptions (register / report Memo column).
@@ -1459,7 +1470,7 @@ export async function updateBill(ctx: ServiceContext, id: string, input: CreateB
     //    update the header in place — createdAt is intentionally NOT touched.
     const entry = await postJournalEntry(tx, {
       date: input.date,
-      description: `Bill ${input.billNumber ? `#${input.billNumber}` : id}`,
+      description: billEntryDescription(input.billNumber, prep.vendor.name),
       reference: input.billNumber ?? null,
       sourceRef: `bill:${id}`,
       lines: buildPostingLines(prep, input.billNumber ?? null, id),

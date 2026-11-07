@@ -59,6 +59,7 @@ import {
 } from '@/lib/depositEdit';
 // salesar (B7): Payment Method list names and QB's "View payment method type" on Payments to Deposit.
 import { depositMethodLabel, depositMethodViews, matchesDepositMethodView } from '@/lib/salesFormListsClient';
+import { SaveAndNewButton } from '@/components/FormShortcuts';
 
 /** Body sent to /api/deposits (fix patches address its paths, e.g. "paymentIds", "depositAccountId"). */
 type DepositBody = Record<string, unknown> & {
@@ -351,12 +352,14 @@ function MakeDepositModal({
           <Button variant="secondary" onClick={onClose} disabled={saving}>
             Cancel
           </Button>
+          <SaveAndNewButton disabled={saving || (selectedIds.size === 0 && extraLines.length === 0)} />
           <Button
             onClick={handleSubmit}
             loading={saving}
             disabled={selectedIds.size === 0 && extraLines.length === 0}
+            title={`Deposit ${money(netTotal.toFixed(2))}`}
           >
-            {`Deposit ${money(netTotal.toFixed(2))}`}
+            Save &amp; Close
           </Button>
         </>
       }
@@ -792,7 +795,7 @@ function DepositsPageContent() {
   return (
     <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader
-        title="Bank Deposits"
+        title="Make Deposits"
         icon={Landmark}
         action={
           <Button data-shortcut="new" onClick={openModal}>

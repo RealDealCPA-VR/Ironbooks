@@ -29,7 +29,7 @@ import { TypeaheadSelect } from '@/components/TypeaheadSelect';
 import { NameField } from '@/components/NameField';
 import type { TypeaheadChoice } from '@/lib/typeahead';
 import { api } from '@/lib/client';
-import { useFocusId } from '@/lib/useFocusParam';
+import { useFocusId, useNewParam } from '@/lib/useFocusParam';
 import { useOpenParam } from '@/lib/useOpenParam';
 import { todayISO } from '@/lib/dates';
 import { fetchVendorPrefill, PREFILL_SOURCE_LABEL } from '@/lib/aiClient';
@@ -68,6 +68,7 @@ import { billRowFromRecall, lineClassOverride } from '@/lib/smartDefaults';
 import AttachmentPanel from '@/components/AttachmentPanel';
 // cmdbar: forms accept a prefill from the Ctrl+K command bar.
 import { usePrefill } from '@/lib/commands/usePrefill';
+import { SaveAndNewButton } from '@/components/FormShortcuts';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -503,6 +504,8 @@ function BillsPageContent() {
 
   // Drill-downs (Home, the Inventory Center, the transaction log) link here with ?focus=<id>.
   useFocusId(true, (id) => void openEditModal({ id } as Bill));
+  // Vendors > Enter Bills (and Home's Enter Bills) open a blank bill, as in QuickBooks.
+  useNewParam(() => openModal());
 
   /** Prefill the form from a saved bill and open the modal in edit mode. */
   // QuickZoom from a report line (/reports/open → ?open=<id>): open that bill.
@@ -942,8 +945,9 @@ function BillsPageContent() {
             <Button variant="secondary" onClick={closeModal} disabled={submitting}>
               Cancel
             </Button>
+            <SaveAndNewButton disabled={submitting} />
             <Button onClick={handleSubmit} loading={submitting}>
-              {editingId ? 'Save Changes' : 'Save Bill'}
+              Save &amp; Close
             </Button>
           </>
         }

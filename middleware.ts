@@ -51,7 +51,9 @@ export function middleware(req: NextRequest) {
   // send page navigation to /unlock — which auto-passes instantly when no file password is set,
   // and otherwise prompts. This runs before the login gate so the file password comes first.
   // (getServerContext enforces the lock for API routes.)
-  if (pathname !== '/unlock' && !req.cookies.get('bka_unlock')) {
+  // '/reset-password' is exempt too: "Forgot the file password?" leads to its recovery-key form,
+  // and its API routes are public anyway (the page itself shows nothing from the file).
+  if (pathname !== '/unlock' && pathname !== '/reset-password' && !req.cookies.get('bka_unlock')) {
     const url = req.nextUrl.clone();
     url.pathname = '/unlock';
     url.searchParams.set('next', pathname);

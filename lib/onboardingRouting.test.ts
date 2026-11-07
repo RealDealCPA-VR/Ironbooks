@@ -14,7 +14,8 @@ const read = (rel: string) => fs.readFileSync(path.join(ROOT, rel), 'utf8');
 describe('new companies go through the setup interview', () => {
   it('sign-up lands on the interview, not the dashboard', () => {
     const src = read('app/signup/page.tsx');
-    expect(src).toContain("window.location.href = '/onboarding?new=1'");
+    expect(src).toContain("return '/onboarding?new=1';");
+    expect(src).toContain('window.location.href = afterSetup();');
     expect(src).not.toContain("window.location.href = '/dashboard'");
   });
 
@@ -27,10 +28,10 @@ describe('new companies go through the setup interview', () => {
 
   it('the desktop File > New Company flow opens Create Account, which leads to the interview', () => {
     const src = read('electron/main.js');
-    const flow = src.slice(src.indexOf('async function createCompanyFlow()'), src.indexOf('async function openCompanyFlow()'));
+    const flow = src.slice(src.indexOf('async function createCompanyFlow('), src.indexOf('async function openCompanyFlow()'));
     // The start route is saved with the new file's config, which relaunchApp applies once the file
     // open now has closed (openCompany passes its extra settings through).
-    expect(flow).toContain("openCompany(target, { startRoute: '/signup' })");
+    expect(flow).toContain("openCompany(target, { startRoute: convertFromQuickBooks ? '/signup?then=qb-import' : '/signup' })");
     const open = src.slice(src.indexOf('function openCompany(location, extra = {})'), src.indexOf('function lastUserFor('));
     expect(open).toMatch(/relaunchApp\(\{[\s\S]*\.\.\.extra,\s*\}\)/);
     // createWindow consumes the one-shot start route.

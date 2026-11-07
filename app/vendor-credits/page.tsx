@@ -2,7 +2,7 @@
 
 import { isDepositTargetAccount } from '@/lib/accountTypes';
 import { Suspense, useEffect, useState, useCallback } from 'react';
-import { useFocusParam } from '@/lib/useFocusParam';
+import { useFocusParam, useNewParam } from '@/lib/useFocusParam';
 import { RotateCcw, Plus, Trash2, PlusCircle, MinusCircle, CheckCircle, Banknote, Pencil, Printer } from 'lucide-react';
 import {
   Button,
@@ -40,6 +40,7 @@ import {
   useAdvancedInventory,
 } from '@/components/inventory/AdvancedInventory';
 import { creditItems, rowsOf } from './lists';
+import { SaveAndNewButton } from '@/components/FormShortcuts';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -522,8 +523,9 @@ function NewCreditModal({ open, onClose, vendors, accounts, onCreated, editId, n
           <Button variant="secondary" onClick={onClose} disabled={saving}>
             {editId ? 'Cancel edit' : 'Cancel'}
           </Button>
+          <SaveAndNewButton disabled={saving || loadingEdit} />
           <Button onClick={handleSubmit} loading={saving} disabled={loadingEdit}>
-            {editId ? 'Save Changes' : 'Create Credit'}
+            Save &amp; Close
           </Button>
         </>
       }
@@ -1049,6 +1051,8 @@ function VendorCreditsPageContent() {
 
   // Links such as the Inventory Center's item history (/vendor-credits?focus=<id>) open that
   // credit, as double-clicking a transaction does in QB. A void one stays in the list.
+  // Vendors > Vendor Credits > New opens a blank credit.
+  useNewParam(() => setShowNew(true));
   useFocusParam(credits, loading, (c) => {
     if (c.status !== 'void') goTo(c);
   });

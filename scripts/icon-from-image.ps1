@@ -9,8 +9,10 @@ param(
     [string]$PngOutput = "build/icon.png",
     [string]$IcoOutput = "build/icon.ico",
     [int]$Size = 1024,
-    [int]$CornerRadiusPercent = 18,   # corner radius as % of final size
+    [string]$FaviconOutput = "app/icon.png",
+    [int]$CornerRadiusPercent = 22,   # corner radius as % of the artwork box (matches the source tile)
     [int]$PaddingPercent = 8,         # padding around artwork, % of final size
+    [int]$EdgeInsetPx = 3,            # shrink the mask this far inside the artwork box
     [switch]$NoCrop                   # disable the default uniform-background trim
 )
 
@@ -19,6 +21,7 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 if (-not $PSBoundParameters.ContainsKey('SourceImage')) { $SourceImage = Join-Path $repoRoot 'build/icon-source.png' }
 if (-not $PSBoundParameters.ContainsKey('PngOutput'))   { $PngOutput   = Join-Path $repoRoot 'build/icon.png' }
 if (-not $PSBoundParameters.ContainsKey('IcoOutput'))   { $IcoOutput   = Join-Path $repoRoot 'build/icon.ico' }
+if (-not $PSBoundParameters.ContainsKey('FaviconOutput')) { $FaviconOutput = Join-Path $repoRoot 'app/icon.png' }
 
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
@@ -113,9 +116,14 @@ try {
 
         # -----------------------------------------------------------
         # 4. Rounded-corner transparency via anti-aliased GraphicsPath mask.
-        #    Draw the mask at full size, anti-aliased, for soft edges.
+        #    The mask follows the artwork box (inside the padding), not the
+        #    canvas: a canvas-sized mask only rounds the already-transparent
+        #    padding and leaves the source background in the tile's corners.
+        #    Inset by $EdgeInsetPx so no background fringe survives.
         # -----------------------------------------------------------
-        $radius = [int]($Size * $CornerRadiusPercent / 100)
+        $mx = $pad + $EdgeInsetPx
+        $mSide = $inner - 2 * $EdgeInsetPx
+        $radius = [int]($mSide * $CornerRadiusPercent / 100)
         $mask = New-Object System.Drawing.Bitmap($Size, $Size, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
         try {
             $mg = [System.Drawing.Graphics]::FromImage($mask)
@@ -124,10 +132,10 @@ try {
                 $mg.Clear([System.Drawing.Color]::Transparent)
                 $path = New-Object System.Drawing.Drawing2D.GraphicsPath
                 $d = $radius * 2
-                $path.AddArc(0, 0, $d, $d, 180, 90)
-                $path.AddArc($Size - $d - 1, 0, $d, $d, 270, 90)
-                $path.AddArc($Size - $d - 1, $Size - $d - 1, $d, $d, 0, 90)
-                $path.AddArc(0, $Size - $d - 1, $d, $d, 90, 90)
+                $path.AddArc($mx, $mx, $d, $d, 180, 90)
+                $path.AddArc($mx + $mSide - $d, $mx, $d, $d, 270, 90)
+                $path.AddArc($mx + $mSide - $d, $mx + $mSide - $d, $d, $d, 0, 90)
+                $path.AddArc($mx, $mx + $mSide - $d, $d, $d, 90, 90)
                 $path.CloseFigure()
                 $brush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::White)
                 $mg.FillPath($brush, $path)
@@ -191,6 +199,13 @@ try {
             $ms.Dispose()
         }
 
+        # The 256 px frame doubles as the in-app favicon (Next.js app/icon.png).
+        if ($FaviconOutput) {
+            $favFull = Resolve-PathRel $FaviconOutput
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $favFull) | Out-Null
+            [System.IO.File]::WriteAllBytes($favFull, $pngs[0])
+        }
+
         # ICONDIR: reserved(2)=0, type(2)=1, count(2)=n
         $fs = [System.IO.File]::Create($icoFull)
         $bw = New-Object System.IO.BinaryWriter($fs)
@@ -212,7 +227,7 @@ try {
             foreach ($p in $pngs) { $bw.Write($p) }
         } finally { $bw.Dispose(); $fs.Dispose() }
 
-        Write-Host "Wrote $pngFull and $icoFull"
+        Write-Host "Wrote $pngFull, $icoFull and $favFull"
     } finally { $work.Dispose() }
 } finally { $src.Dispose() }
 

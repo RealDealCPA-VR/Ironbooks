@@ -306,6 +306,33 @@ export function linkHref(l: NavLink): string {
   return l.href ?? l.path;
 }
 
+/** `qb` notes that are not a screen name QuickBooks shows in its menus. */
+const QB_NOT_A_MENU_NAME = new Set([
+  'Lists menu',
+  'Company Snapshot alerts',
+  'AI settings',
+  'FIFO cost',
+  'Document numbering',
+  'Estimates follow-up',
+  'Home page',
+  'Multi-user mode',
+  'Privacy',
+  'Security',
+  'Banking',
+]);
+
+/**
+ * The name a menu link shows. With "Use QuickBooks names" (My Preferences, on by default) it is
+ * QuickBooks Desktop's own screen name ("Item List", "Make General Journal Entries") wherever `qb`
+ * holds one; `qb` notes that combine several screens or explain ("Back Up Company / Restore …",
+ * "Edit > Preferences > …") keep the plain label.
+ */
+export function menuLabel(l: Pick<NavLink, 'label' | 'qb'>, quickBooksNames: boolean): string {
+  const qb = l.qb?.trim();
+  if (!quickBooksNames || !qb || /[/>()]/.test(qb) || QB_NOT_A_MENU_NAME.has(qb)) return l.label;
+  return qb;
+}
+
 /**
  * Hide links the signed-in user's roles can't use (Users & Roles). COSMETIC ONLY — every API
  * route is enforced server-side (getServerContext + lib/permissions/routes.ts). A link needs

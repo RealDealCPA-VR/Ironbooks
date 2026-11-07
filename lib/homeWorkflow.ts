@@ -49,9 +49,9 @@ export const HOME_WORKFLOW: WorkflowSection[] = [
     centerIcon: 'vendors',
     flows: [
       [
-        { label: 'Purchase Orders', href: '/purchase-orders', icon: 'purchase-order', hint: 'Order goods from a vendor.' },
+        { label: 'Purchase Orders', href: '/purchase-orders?new=1', icon: 'purchase-order', hint: 'Order goods from a vendor.' },
         { label: 'Receive Inventory', href: '/item-receipts', icon: 'receive-inventory', hint: 'Record items that arrived.' },
-        { label: 'Enter Bills', href: '/bills', icon: 'enter-bills', hint: 'Record a bill you will pay later.' },
+        { label: 'Enter Bills', href: '/bills?new=1', icon: 'enter-bills', hint: 'Record a bill you will pay later.' },
         { label: 'Pay Bills', href: '/pay-bills', icon: 'pay-bills', hint: 'Pay bills you have entered.' },
       ],
     ],
@@ -63,17 +63,17 @@ export const HOME_WORKFLOW: WorkflowSection[] = [
     centerIcon: 'customers',
     flows: [
       [
-        { label: 'Estimates', href: '/estimates', icon: 'estimates', hint: 'Quote a price before the work.' },
-        { label: 'Sales Orders', href: '/sales-orders', icon: 'sales-orders', hint: 'Track an order you will fill later.' },
-        { label: 'Create Invoices', href: '/invoices', icon: 'invoices', hint: 'Bill a customer who will pay later.' },
-        { label: 'Receive Payments', href: '/payments', icon: 'receive-payments', hint: 'Record money a customer paid you.' },
-        { label: 'Record Deposits', href: '/deposits', icon: 'deposits', hint: 'Group payments into a bank deposit.' },
+        { label: 'Estimates', href: '/estimates?new=1', icon: 'estimates', hint: 'Quote a price before the work.' },
+        { label: 'Sales Orders', href: '/sales-orders?new=1', icon: 'sales-orders', hint: 'Track an order you will fill later.' },
+        { label: 'Create Invoices', href: '/invoices?new=1', icon: 'invoices', hint: 'Bill a customer who will pay later.' },
+        { label: 'Receive Payments', href: '/payments?new=1', icon: 'receive-payments', hint: 'Record money a customer paid you.' },
+        { label: 'Record Deposits', href: '/deposits?new=1', icon: 'deposits', hint: 'Group payments into a bank deposit.' },
       ],
     ],
     extras: [
-      { label: 'Sales Receipts', href: '/sales-receipts', icon: 'sales-receipts', hint: 'A sale paid on the spot.' },
+      { label: 'Sales Receipts', href: '/sales-receipts?new=1', icon: 'sales-receipts', hint: 'A sale paid on the spot.' },
       { label: 'Statements', href: '/reports/statements', icon: 'statements', hint: 'Send customers a summary of what they owe.' },
-      { label: 'Refunds & Credits', href: '/credit-memos', icon: 'refunds', hint: 'Give a customer a credit or refund.' },
+      { label: 'Refunds & Credits', href: '/credit-memos?new=1', icon: 'refunds', hint: 'Give a customer a credit or refund.' },
     ],
   },
   {
@@ -110,7 +110,7 @@ export const HOME_WORKFLOW: WorkflowSection[] = [
     centerIcon: 'check-register',
     flows: [],
     extras: [
-      { label: 'Write Checks', href: '/expenses', icon: 'write-checks', hint: 'Pay for something right away.' },
+      { label: 'Write Checks', href: '/expenses?new=1', icon: 'write-checks', hint: 'Pay for something right away.' },
       { label: 'Check Register', href: '/registers', icon: 'check-register', hint: 'See every transaction in an account.' },
       { label: 'Reconcile', href: '/reconcile', icon: 'reconcile', hint: 'Match your books to the bank statement.' },
       { label: 'Bank Feeds', href: '/bank-feeds', icon: 'bank-feeds', hint: 'Import a statement file from your bank.' },

@@ -32,7 +32,7 @@ import {
   useGridKeys,
 } from '@/components/ui';
 import { api } from '@/lib/client';
-import { useFocusParam } from '@/lib/useFocusParam';
+import { useFocusParam, useNewParam } from '@/lib/useFocusParam';
 import { todayISO } from '@/lib/dates';
 // wave2 prefs: Memorize (Ctrl+M)
 import MemorizeButton from '@/components/MemorizeButton';
@@ -49,6 +49,7 @@ import {
 import { TransactionNav, useAdjacentTransactions } from '@/components/TransactionNav';
 import { saveWithDuplicateCheck } from '@/lib/purchasesClient';
 import AttachmentPanel from '@/components/AttachmentPanel'; // J9 Doc Center
+import { SaveAndNewButton } from '@/components/FormShortcuts';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -472,8 +473,9 @@ function NewPoModal({ open, onClose, vendors, accounts, items, onCreated, editId
           <Button variant="secondary" onClick={onClose} disabled={saving}>
             {editId ? 'Cancel edit' : 'Cancel'}
           </Button>
+          <SaveAndNewButton disabled={saving || loadingEdit} />
           <Button onClick={handleSubmit} loading={saving} disabled={loadingEdit}>
-            {editId ? 'Save Changes' : 'Create PO'}
+            Save &amp; Close
           </Button>
         </>
       }
@@ -1077,6 +1079,8 @@ function PurchaseOrdersPageContent() {
   // Links such as the Inventory Center's item history (/purchase-orders?focus=<id>): highlight the
   // PO, and open it when it can still be edited.
   const [focusedId, setFocusedId] = useState<string | null>(null);
+  // Vendors > Create Purchase Orders opens a blank PO, as in QuickBooks.
+  useNewParam(() => setShowNew(true));
   useFocusParam(pos, loading, (po) => {
     setFocusedId(po.id);
     document.getElementById(`po-row-${po.id}`)?.scrollIntoView({ block: 'center', behavior: 'smooth' });

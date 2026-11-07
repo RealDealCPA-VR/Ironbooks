@@ -14,6 +14,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getDb, sealedMode, withDamagedFileAccess, withSealedAccess } from '@/lib/db';
 import { getFileLockStatus, verifyFilePassword } from '@/lib/services/fileLock';
+import { readProtection } from '@/lib/services/fileProtection';
 import { UNLOCK_COOKIE, createUnlockToken } from '@/lib/auth';
 import { cookieSecure, originFromHeaders } from '@/lib/net/requestInfo';
 import { GLOBAL_KEY_WEIGHT, attemptKeys, loginLimiter, tooManyAttempts } from '@/lib/net/rateLimit';
@@ -51,11 +52,14 @@ async function handlePost(req: NextRequest) {
   }
 
   const status = await getFileLockStatus(db);
+  // For "Forgot the file password?": an encrypted file is opened with its recovery key; any other
+  // file by an Admin signing in (/api/unlock/admin).
+  const recovery = status.enabled ? (sealed === 'key' || (await readProtection(db)) ? 'recovery-key' : 'admin') : undefined;
   // The unlock screen asks with an EMPTY password every time it loads (a file without a password
   // opens straight through). On a protected file that probe is not a guess: answer "protected"
   // without counting it, or a few page loads would lock the person out before they typed anything.
   if (status.enabled && !password) {
-    return NextResponse.json({ ok: false, enabled: true, companyName: status.companyName }, { status: 401 });
+    return NextResponse.json({ ok: false, enabled: true, companyName: status.companyName, recovery }, { status: 401 });
   }
   // File-password guessing is rate-limited like sign-in (the file password is one shared secret,
   // so the "account" key is the file itself).
@@ -80,7 +84,7 @@ async function handlePost(req: NextRequest) {
   }
   if (!ok) {
     return NextResponse.json(
-      { ok: false, enabled: true, companyName: status.companyName },
+      { ok: false, enabled: true, companyName: status.companyName, recovery },
       { status: 401 },
     );
   }

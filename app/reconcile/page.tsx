@@ -1036,7 +1036,7 @@ export default function ReconcilePage() {
 
   return (
     <main className="min-h-screen bg-offwhite p-8 font-sans">
-      <PageHeader title="Bank Reconciliation" icon={CheckSquare} />
+      <PageHeader title="Reconcile" icon={CheckSquare} />
 
       {loading ? (
         <div className="py-10 flex justify-center">

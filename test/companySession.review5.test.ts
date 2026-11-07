@@ -134,7 +134,7 @@ describe('switching or closing company files (source pins)', () => {
     const open = main.slice(main.indexOf('function openCompany(location, extra = {})'));
     expect(open.slice(0, 600)).toMatch(/relaunchApp\(\{\s*\.\.\.\(single \? \{ companyFile: location \}/);
     expect(open.slice(0, 600)).not.toMatch(/saveConfig\(/);
-    expect(main).toMatch(/openCompany\(target, \{ startRoute: '\/signup' \}\);/);
+    expect(main).toMatch(/openCompany\(target, \{ startRoute: convertFromQuickBooks \? '\/signup\?then=qb-import' : '\/signup' \}\);/);
     expect(main).not.toMatch(/saveConfig\(\{ startRoute: '\/signup' \}\)/);
     // …which before-quit applies only when the file closed (dropped on Keep Working).
     const quit = main.slice(main.indexOf("app.on('before-quit', (event) => {"));

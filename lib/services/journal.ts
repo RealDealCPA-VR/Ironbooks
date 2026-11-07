@@ -24,6 +24,8 @@ import {
   bills,
   depreciationEntries,
   fixedAssets,
+  reconciliationItems,
+  reconciliations,
 } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import {
@@ -1150,6 +1152,11 @@ export interface RegisterRow {
    * "-split-" (id null) when the entry has several other accounts. Null when there is none.
    */
   otherAccount?: { id: string | null; label: string } | null;
+  /**
+   * QuickBooks' ✓ column: 'reconciled' (✔, in a finished reconciliation) or 'cleared' (*, ticked
+   * in a reconciliation still in progress); null when not cleared.
+   */
+  cleared?: 'reconciled' | 'cleared' | null;
 }
 
 export interface AccountRegisterOptions {
@@ -1307,10 +1314,24 @@ export async function accountRegister(
       others.set(l.entryId, m);
     }
   }
+  // The ✓ column: lines ticked in a reconciliation (finished = reconciled, in progress = cleared).
+  const cleared = new Map<string, 'reconciled' | 'cleared'>();
+  const lineIds = page.map((r) => r.lineId);
+  for (let i = 0; i < lineIds.length; i += 500) {
+    const ticked = await ctx.db
+      .select({ lineId: reconciliationItems.journalEntryLineId, status: reconciliations.status })
+      .from(reconciliationItems)
+      .innerJoin(reconciliations, eq(reconciliationItems.reconciliationId, reconciliations.id))
+      .where(and(inArray(reconciliationItems.journalEntryLineId, lineIds.slice(i, i + 500)), eq(reconciliationItems.isCleared, true)));
+    for (const t of ticked) {
+      if (t.status === 'completed') cleared.set(t.lineId, 'reconciled');
+      else if (t.status === 'in_progress' && !cleared.has(t.lineId)) cleared.set(t.lineId, 'cleared'); // 'undone' no longer counts
+    }
+  }
   const rows = page.map((r) => {
     const m = others.get(r.journalEntryId);
     const otherAccount = !m || m.size === 0 ? null : m.size === 1 ? { id: [...m.keys()][0], label: [...m.values()][0] } : { id: null, label: '-split-' };
-    return { ...r, otherAccount };
+    return { ...r, otherAccount, cleared: cleared.get(r.lineId) ?? null };
   });
 
   return {

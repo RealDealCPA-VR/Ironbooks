@@ -7,6 +7,7 @@ import { AppearanceButton } from './AppearancePicker';
 import AssistantPanel from './AssistantPanel';
 import {
   linkHref,
+  menuLabel,
   paletteDestinations,
   searchPages,
   visibleNavGroups,
@@ -562,12 +563,15 @@ function NavItems({
   collapsible,
   collapsed,
   onToggle,
+  qbNames,
 }: {
   groups: NavGroup[];
   pathname: string;
   collapsible: boolean;
   collapsed: ReadonlySet<string>;
   onToggle: (heading: string) => void;
+  /** My Preferences "Use QuickBooks names in the menu". */
+  qbNames: boolean;
 }) {
   const router = useRouter();
   // A plain click (or Enter) on a menu link asks before leaving a form being typed on the page;
@@ -618,7 +622,13 @@ function NavItems({
                     href={linkHref(nav)}
                     onClick={onLinkClick(linkHref(nav))}
                     prefetch={false}
-                    title={nav.qb && nav.qb !== nav.label ? `${nav.label} (QuickBooks: ${nav.qb})` : nav.label}
+                    title={
+                      menuLabel(nav, qbNames) !== nav.label
+                        ? `${menuLabel(nav, qbNames)} (also called ${nav.label})`
+                        : nav.qb && nav.qb !== nav.label
+                          ? `${nav.label} (QuickBooks: ${nav.qb})`
+                          : nav.label
+                    }
                     aria-current={active ? 'page' : undefined}
                     className={`relative flex items-center justify-center lg:justify-start gap-2.5 px-2 lg:px-2.5 py-1.5 rounded-lg transition-colors cursor-pointer outline-none focus-visible:ring-2 focus-visible:ring-electric/50 ${
                       active
@@ -627,7 +637,7 @@ function NavItems({
                     }`}
                   >
                     <Icon className={`h-[17px] w-[17px] shrink-0 ${active ? '' : 'text-electric/80'}`} />
-                    <span className="hidden lg:inline-block text-sm">{nav.label}</span>
+                    <span className="hidden lg:inline-block text-sm">{menuLabel(nav, qbNames)}</span>
                     {nav.path === '/attention' && <AttentionBadge />}
                   </Link>
                 );
@@ -753,6 +763,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             collapsible={navMode === 'advanced'}
             collapsed={collapsed}
             onToggle={toggleGroup}
+            qbNames={prefs.my.quickBooksNames}
           />
           {navMode === 'simple' && (
             <button

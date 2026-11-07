@@ -136,6 +136,8 @@ export function defaultAccountantCopyDir(companyName: string, activeDataDir?: st
 
 export interface OpenAccountantCopyResult {
   dataDir: string;
+  /** The restored books are protected with passwords and their file key is known here (filecrypto). */
+  protected?: boolean;
   companyName: string;
   dividingDate: string;
   copyId: string;
@@ -209,6 +211,7 @@ export async function openAccountantCopyFile(buffer: Buffer, targetDir: string):
   }
   return {
     dataDir: dir,
+    ...(restored.protected ? { protected: true } : {}),
     companyName: restored.companyName,
     dividingDate: m.dividingDate,
     copyId: m.copyId,

@@ -33,21 +33,18 @@ import path from 'node:path';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
-import { closeDb, resolveDataDir, withDamagedFileAccess } from '@/lib/db';
+import { resolveDataDir, withDamagedFileAccess } from '@/lib/db';
 import {
   defaultPortableRestoreDir,
   readPortableManifest,
   restorePortableCompanyFile,
   unlockPortableBuffer,
-  type PortableRestoreResult,
 } from '@/lib/services/portableFile';
-import { protectionForDir } from '@/lib/services/fileProtection';
+import { packRestoredAsCompanyFile } from '@/lib/services/packCompanyFile';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus } from '@/lib/routeErrors';
 import { filePasswordFrom, withFilePasswordLimit } from '@/lib/net/archiveCredentials';
 import { originFromHeaders } from '@/lib/net/requestInfo';
-import { APP_VERSION } from '@/lib/appVersion';
-import session from '@/electron/companySession';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -77,21 +74,6 @@ function restoredFileNextTo(companyFile: string, companyName: string): string {
   let candidate = path.join(parent, `${safe} (restored ${stamp}).ironbooks`);
   for (let i = 2; fs.existsSync(candidate); i++) candidate = path.join(parent, `${safe} (restored ${stamp} ${i}).ironbooks`);
   return candidate;
-}
-
-/**
- * Write the restored folder out as one company file: encrypted with its own key and slots when the
- * restored books are protected (the key travelled inside the password-protected portable file).
- */
-async function packAsCompanyFile(result: PortableRestoreResult, target: string): Promise<void> {
-  const protection = result.protected ? await protectionForDir(result.dataDir) : null;
-  await closeDb(result.dataDir).catch(() => undefined);
-  await session.writeWorkingCopyAs(path.dirname(result.dataDir), target, {
-    companyName: result.companyName,
-    appVersion: APP_VERSION,
-    dataDir: result.dataDir,
-    protection,
-  });
 }
 
 export async function POST(req: NextRequest) {
@@ -160,7 +142,7 @@ export async function POST(req: NextRequest) {
     const result = await restorePortableCompanyFile(buffer, target);
     if (!packAs) return NextResponse.json(result, { status: 201 });
     try {
-      await packAsCompanyFile(result, packAs);
+      await packRestoredAsCompanyFile(result, packAs);
     } finally {
       if (scratch) fs.rmSync(path.dirname(target), { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
     }

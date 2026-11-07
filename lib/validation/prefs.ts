@@ -55,6 +55,7 @@ export const myPreferencesSchema = z
     bccMe: z.boolean(),
     showHomeWorkflow: z.boolean(),
     navMode: z.enum(['simple', 'advanced']),
+    quickBooksNames: z.boolean(),
     density: z.enum(['comfortable', 'compact']),
     // The Favorites menu: in-app page paths, in order.
     favorites: z

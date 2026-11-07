@@ -394,6 +394,12 @@ export interface MyPreferences {
    */
   navMode: 'simple' | 'advanced';
   /**
+   * Name screens in the menu the way QuickBooks Desktop does ("Item List", "Make General Journal
+   * Entries", "Memorized Transactions"); off = plainer words. On by default: most people moving
+   * here come from QuickBooks Desktop.
+   */
+  quickBooksNames: boolean;
+  /**
    * Screen density: 'compact' fits more rows in lists, registers and forms (closer to the
    * QuickBooks Desktop screens); 'comfortable' is the roomier layout.
    */
@@ -457,6 +463,7 @@ export const DEFAULT_MY_PREFERENCES: MyPreferences = {
   bccMe: false,
   showHomeWorkflow: true,
   navMode: 'advanced',
+  quickBooksNames: true,
   density: 'comfortable',
   favorites: [],
   startPage: 'home',
@@ -532,6 +539,7 @@ export const PREFERENCE_CATEGORIES: Array<{
       'defaultDate',
       'autoRecallLastTransaction',
       'navMode',
+      'quickBooksNames',
       'density',
     ],
   },

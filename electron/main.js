@@ -51,6 +51,7 @@ const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const net = require('node:net');
 const companyFile = require('./companyFile');
+const { classifyCompanyFileLocation } = require('./fileLocation');
 const companyFileFormat = require('./companyFileFormat');
 const companyLock = require('./companyLock');
 const companySession = require('./companySession');
@@ -64,6 +65,9 @@ const fileCrypto = require('./fileCrypto');
 const { pruneLegacyAutoBackups } = require('./legacyBackups');
 
 const isDev = !app.isPackaged;
+// Window / taskbar icon. The packaged Windows .exe already embeds build/icon.ico, but dev runs
+// and Linux window managers show Electron's default icon unless the window names one.
+const APP_ICON = path.join(__dirname, '..', 'build', process.platform === 'win32' ? 'icon.ico' : 'icon.png');
 let mainWindow = null;
 /** File > Close Company: the window shows "No Company Open" and no company file is loaded. */
 let startScreenMode = false;
@@ -99,6 +103,10 @@ function parentWindow() {
 let pendingBkaPath = null;
 /** A .bkp portable company file the OS asked us to open. */
 let pendingBkpPath = null;
+/** An Accountant's Copy transfer file (.ibac) the OS asked us to open. */
+let pendingIbacPath = null;
+/** An accountant's changes file (.ibcx) the OS asked us to open. */
+let pendingIbcxPath = null;
 /**
  * Multi-user: when set, this app is a CLIENT showing a company hosted on another machine
  * (File > Open company on host…) — no local server is started, and local-only chores
@@ -162,11 +170,13 @@ function deliverPendingBka() {
   if (!pendingBkaPath || !mainWindow) return;
   const filePath = pendingBkaPath;
   pendingBkaPath = null;
-  // No company open: there is nothing to restore into, so restore it as a new company file.
-  if (startScreenMode) {
-    restoreBackupAsNewFileFlow(filePath).catch((err) => console.error('[restore] backup:', err));
-    return;
-  }
+  // Same choice as File > Open or Restore Company: as a new company file, or into the open one
+  // (with no company open, straight to a new company file). Never silently into the open one.
+  restoreBackupChoiceFlow(filePath).catch((err) => console.error('[restore] backup:', err));
+}
+
+/** Restore a backup INTO the open company file: the Back Up and Restore page (preview + safety copy). */
+function restoreIntoOpenCompany(filePath) {
   // Only this one file, and only once: the page names it by a token, never by a path.
   backupToRestore = { token: crypto.randomBytes(12).toString('hex'), path: filePath };
   navigate(`/backup?restore=${backupToRestore.token}`);
@@ -206,6 +216,17 @@ function deliverPendingBkp() {
   openPortableFlow(filePath);
 }
 
+/**
+ * A backup or portable file double-clicked on a fresh install (or with no company open) lands on
+ * the No Company Open window: restore it as a new company file there, instead of dropping it.
+ */
+function deliverPendingFilesToStartScreen() {
+  if (pendingBkaPath) setTimeout(deliverPendingBka, 300);
+  if (pendingBkpPath) setTimeout(deliverPendingBkp, 300);
+  if (pendingIbacPath) setTimeout(deliverPendingIbac, 300);
+  if (pendingIbcxPath) setTimeout(deliverPendingIbcx, 300);
+}
+
 pendingBkpPath = extractBkpPath(process.argv);
 
 // .ironbooks (single company file) association: open it as the company file, like double-clicking
@@ -221,8 +242,86 @@ function extractCompanyPath(argv) {
 
 pendingCompanyPath = extractCompanyPath(process.argv);
 
+// Accountant's Copy files (QuickBooks .QBX / .QBY): the accountant double-clicks the transfer file
+// (.ibac) to open it as their working copy; the client double-clicks the changes file (.ibcx) to
+// review and import it into the open company file.
+function extractPathWithExt(argv, ext) {
+  for (const arg of argv.slice(1)) {
+    if (typeof arg === 'string' && !arg.startsWith('-') && arg.toLowerCase().endsWith(ext)) return arg;
+  }
+  return null;
+}
+
+pendingIbacPath = extractPathWithExt(process.argv, '.ibac');
+pendingIbcxPath = extractPathWithExt(process.argv, '.ibcx');
+
+function deliverPendingIbac() {
+  if (!pendingIbacPath || !mainWindow) return;
+  const filePath = pendingIbacPath;
+  pendingIbacPath = null;
+  openAccountantCopyFlow(filePath).catch((err) => console.error('[accountant copy] open:', err));
+}
+
+/** The changes file the Accountant's Copy page takes (once) for the token it was opened with. */
+let changesToImport = null;
+
+function deliverPendingIbcx() {
+  if (!pendingIbcxPath || !mainWindow) return;
+  const filePath = pendingIbcxPath;
+  pendingIbcxPath = null;
+  if (startScreenMode || !serverUrl || remoteHostOrigin) {
+    dialog.showMessageBox(parentWindow(), {
+      noLink: true,
+      type: 'info',
+      message: "Open your company file first",
+      detail:
+        `${path.basename(filePath)} holds your accountant's changes. Open the company file the Accountant's Copy was made from, ` +
+        "then open the changes file again (double-click it, or Accountant > Accountant's Copy > Import Accountant's Changes).",
+    });
+    return;
+  }
+  changesToImport = { token: crypto.randomBytes(12).toString('hex'), path: filePath };
+  navigate(`/accountant/accountants-copy?changes=${changesToImport.token}`);
+}
+
+ipcMain.handle('accountantCopy:open', async (e) => {
+  if (!fromLocalApp(e)) return false;
+  const res = await dialog.showOpenDialog(parentWindow(), {
+    title: "Open Accountant's Copy",
+    filters: [{ name: "Accountant's Copy Transfer File", extensions: ['ibac'] }],
+    properties: ['openFile'],
+    defaultPath: app.getPath('documents'),
+  });
+  if (res.canceled || !res.filePaths[0]) return false;
+  await openAccountantCopyFlow(res.filePaths[0]);
+  return true;
+});
+
+ipcMain.handle('accountantCopy:takePendingChanges', (e, token) => {
+  if (!fromLocalApp(e) || !changesToImport || typeof token !== 'string' || token !== changesToImport.token) return null;
+  const filePath = changesToImport.path;
+  changesToImport = null;
+  try {
+    return { name: path.basename(filePath), text: fs.readFileSync(filePath, 'utf8') };
+  } catch (err) {
+    return { name: path.basename(filePath), error: openErrorText(err) };
+  }
+});
+
 app.on('open-file', (event, filePath) => {
   const lower = (filePath || '').toLowerCase();
+  if (lower.endsWith('.ibac')) {
+    event.preventDefault();
+    pendingIbacPath = filePath;
+    deliverPendingIbac();
+    return;
+  }
+  if (lower.endsWith('.ibcx')) {
+    event.preventDefault();
+    pendingIbcxPath = filePath;
+    deliverPendingIbcx();
+    return;
+  }
   if (lower.endsWith('.ironbooks')) {
     event.preventDefault();
     if (app.isReady() && mainWindow) openCompanyFromOs(filePath);
@@ -257,6 +356,8 @@ app.on('open-file', (event, filePath) => {
 //   recentCompanies      most-recently-opened company files and folders (File menu)
 //   lastUsers            { <company file path>: user name } — the sign-in screen pre-fills the
 //                        user name last used for that file on this computer, like QuickBooks
+//   cloudWarned          company files in a cloud-sync folder already told about sharing them
+//                        (confirmCompanyFileLocation asks once per file)
 //   remotePin / remoteFile  multi-user client of a company file on the shared drive: the host's
 //                        certificate fingerprint and the company file it is hosting
 //   hosting              multi-user hosting { enabled, port, tls, bindAll } — bindAll (listen
@@ -1200,8 +1301,76 @@ async function closeOpenCompanyFile() {
 }
 
 /** The OS asked us to open a .ironbooks file while the app is running. */
+/**
+ * Before opening a company file from File Explorer or File > Open: a file in a temporary folder
+ * (an email attachment opened from Outlook) is offered a copy in Documents first, and a file in a
+ * cloud-sync folder (OneDrive, Dropbox …) gets QuickBooks' advice once. Resolves the path to open
+ * (the copy, when one was made) or null to stop.
+ */
+async function confirmCompanyFileLocation(filePath) {
+  if (!companyFile.isSingleFile(filePath)) return filePath;
+  const where = classifyCompanyFileLocation(filePath, { env: process.env, tmpdir: app.getPath('temp') });
+  let readOnly = false;
+  try {
+    fs.accessSync(filePath, fs.constants.W_OK);
+  } catch {
+    readOnly = fs.existsSync(filePath);
+  }
+  if ((where && where.kind === 'temp') || readOnly) {
+    const { response } = await dialog.showMessageBox(parentWindow(), {
+      noLink: true,
+      type: 'warning',
+      message: readOnly ? `${path.basename(filePath)} is read-only` : `${path.basename(filePath)} is in a temporary folder`,
+      detail: readOnly
+        ? 'Ironbooks saves your work into the company file as you go, so it cannot work on a read-only file. Save a copy in Documents and work on that.'
+        : 'It looks like it was opened straight from an email or a download. Work saved there can disappear when the folder is cleaned up. Save a copy in Documents and work on that.',
+      buttons: readOnly ? ['Save a Copy and Open It', 'Cancel'] : ['Save a Copy and Open It', 'Open It Here Anyway', 'Cancel'],
+      defaultId: 0,
+      cancelId: readOnly ? 1 : 2,
+    });
+    if (response === 0) {
+      const docs = app.getPath('documents');
+      const ext = path.extname(filePath);
+      const stem = path.basename(filePath, ext);
+      let copy = path.join(docs, `${stem}${ext}`);
+      for (let i = 2; fs.existsSync(copy); i++) copy = path.join(docs, `${stem} (${i})${ext}`);
+      try {
+        fs.copyFileSync(filePath, copy);
+        // A copy of a read-only file is read-only too; the copy is the person's own.
+        fs.chmodSync(copy, 0o666);
+      } catch (err) {
+        dialog.showErrorBox('Could not copy the company file', openErrorText(err));
+        return null;
+      }
+      return copy;
+    }
+    return !readOnly && response === 1 ? filePath : null;
+  }
+  if (where && where.kind === 'cloud') {
+    const warned = Array.isArray(loadConfig().cloudWarned) ? loadConfig().cloudWarned : [];
+    if (warned.some((p) => samePath(p, filePath))) return filePath;
+    const { response } = await dialog.showMessageBox(parentWindow(), {
+      noLink: true,
+      type: 'info',
+      message: `${path.basename(filePath)} is in your ${where.service} folder`,
+      detail:
+        `That is fine when only this computer opens it. Don't open it from two computers at the same time: ${where.service} ` +
+        'copies the file between them, and both can end up with different changes. To share the books, put the company file on ' +
+        'the office file server or use File > Switch to Multi-user Mode, as you would with QuickBooks.',
+      buttons: ['Open It', 'Cancel'],
+      defaultId: 0,
+      cancelId: 1,
+    });
+    if (response !== 0) return null;
+    saveConfig({ cloudWarned: [...warned, filePath].slice(-50) });
+  }
+  return filePath;
+}
+
 async function openCompanyFromOs(filePath) {
-  const target = path.resolve(filePath);
+  const checked = await confirmCompanyFileLocation(path.resolve(filePath));
+  if (!checked) return;
+  const target = path.resolve(checked);
   if (openFile && samePath(openFile.path, target)) {
     if (mainWindow) {
       if (mainWindow.isMinimized()) mainWindow.restore();
@@ -1425,7 +1594,7 @@ function waitForServer(port, timeoutMs = 20000) {
 // opens the Admin setup for the new file (/signup — its user name and password live inside the
 // file), then the setup interview (/onboarding). The file can live anywhere: a local folder, a
 // USB drive or the office file server.
-async function createCompanyFlow() {
+async function createCompanyFlow({ convertFromQuickBooks = false } = {}) {
   const res = await dialog.showSaveDialog(mainWindow, {
     title: 'New Company File',
     message: 'Choose a name and location for the new company file',
@@ -1472,7 +1641,9 @@ async function createCompanyFlow() {
   }
   // First page of the new file: set up its Admin user, then the setup interview (only once the
   // file open now has closed — never for that file if the person keeps working in it).
-  openCompany(target, { startRoute: '/signup' });
+  // "Convert from QuickBooks": after the Admin is set up, the QuickBooks import wizard comes next
+  // instead of the setup interview (the import brings the chart of accounts and lists).
+  openCompany(target, { startRoute: convertFromQuickBooks ? '/signup?then=qb-import' : '/signup' });
 }
 
 // Open or Restore Company (QuickBooks File > Open or Restore Company): browse to a company file
@@ -1482,8 +1653,10 @@ async function openCompanyFlow() {
     title: 'Open Company File',
     message: 'Choose the company file to open',
     filters: [
+      { name: 'All Ironbooks Files', extensions: ['ironbooks', 'bka', 'bkp', 'ibac', 'ibcx'] },
       { name: 'Ironbooks Company File', extensions: ['ironbooks'] },
       { name: 'Ironbooks Backup or Portable File', extensions: ['bka', 'bkp'] },
+      { name: "Accountant's Copy Files", extensions: ['ibac', 'ibcx'] },
     ],
     properties: ['openFile'],
     defaultPath: app.getPath('documents'),
@@ -1499,6 +1672,15 @@ async function openCompanyFlow() {
     await restoreBackupChoiceFlow(chosen);
     return;
   }
+  if (lower.endsWith('.ibac')) {
+    await openAccountantCopyFlow(chosen);
+    return;
+  }
+  if (lower.endsWith('.ibcx')) {
+    pendingIbcxPath = chosen;
+    deliverPendingIbcx();
+    return;
+  }
   if (!companyFileFormat.isCompanyFile(chosen)) {
     dialog.showErrorBox(
       'Not a company file',
@@ -1506,7 +1688,8 @@ async function openCompanyFlow() {
     );
     return;
   }
-  openCompany(chosen);
+  const checked = await confirmCompanyFileLocation(chosen);
+  if (checked) openCompany(checked);
 }
 
 /**
@@ -1528,8 +1711,7 @@ async function restoreBackupChoiceFlow(bkaPath) {
       cancelId: 2,
     });
     if (response === 1) {
-      pendingBkaPath = bkaPath;
-      deliverPendingBka();
+      restoreIntoOpenCompany(bkaPath);
       return;
     }
     if (response !== 0) return;
@@ -1685,13 +1867,17 @@ async function openPortableFlow(filePath) {
   // The server restores (and verifies) into a scratch folder on this computer; that folder is then
   // packed into the single company file the person chose.
   const scratch = path.join(workingRoot(), `restore-${crypto.randomBytes(6).toString('hex')}`, 'data');
+  // No Company Open (or a fresh install): no server is running, so a short-lived one on an empty
+  // scratch folder does the restore and is stopped when it is done.
+  let baseUrl = serverUrl;
+  let scratchServer = null;
   // The server restores (and verifies) into the scratch folder and writes the company file itself
   // (packAs): the books of a protected file are written encrypted with the key that travelled
   // inside the password-protected portable file — this shell never has it.
   const restore = async (password) => {
     const headers = { 'x-bka-internal': internalToken, 'content-type': 'application/octet-stream' };
     if (password) headers['x-ironbooks-password'] = Buffer.from(password, 'utf8').toString('base64url');
-    const res = await fetch(`${serverUrl}/api/portable/restore?target=${encodeURIComponent(scratch)}&packAs=${encodeURIComponent(target)}`, {
+    const res = await fetch(`${baseUrl}/api/portable/restore?target=${encodeURIComponent(scratch)}&packAs=${encodeURIComponent(target)}`, {
       method: 'POST',
       headers,
       body: bytes,
@@ -1700,6 +1886,10 @@ async function openPortableFlow(filePath) {
     return { res, data: await res.json().catch(() => ({})) };
   };
   try {
+    if (!baseUrl) {
+      scratchServer = await startScratchServer(path.join(path.dirname(scratch), 'server'));
+      baseUrl = scratchServer.url;
+    }
     let data;
     if (fileCrypto.isPasswordSealed(bytes)) {
       // Protected with a password (filecrypto): ask for it; a wrong one asks again.
@@ -1742,12 +1932,168 @@ Every table, the trial balance, attachments and the transaction log ` +
         'match the original file. Sign in with the user names and passwords from that file.',
     });
     if (choice.response === 0) openCompany(target);
+    else if (startScreenMode) mainWindow?.webContents.reload(); // refresh its Recent list
     else buildMenu(); // refresh Recent Companies
   } catch (e) {
     dialog.showErrorBox('Could not open the portable company file', openErrorText(e));
   } finally {
+    if (scratchServer) await scratchServer.stop();
     fs.rm(path.dirname(scratch), { recursive: true, force: true }, () => {});
   }
+}
+
+/**
+ * Open an Accountant's Copy transfer file (.ibac) — QuickBooks "Open & Convert Transfer File":
+ * the accountant picks where their working copy goes, the server restores and verifies it there
+ * (authenticated with the per-launch internal token, a short-lived server when no company is
+ * open) and writes it out as one company file, which then opens like any other.
+ */
+async function openAccountantCopyFlow(filePath) {
+  if (remoteHostOrigin) {
+    dialog.showErrorBox(
+      'Not available while connected to a host',
+      "Disconnect from the host (File menu) to open an Accountant's Copy on this computer.",
+    );
+    return;
+  }
+  if (isDev) {
+    // `next dev` does not know the internal token — the in-app page opens transfer files instead.
+    navigate('/accountant/accountants-copy');
+    return;
+  }
+  let bytes;
+  try {
+    bytes = fs.readFileSync(filePath);
+  } catch (e) {
+    dialog.showErrorBox("Could not read the Accountant's Copy", openErrorText(e));
+    return;
+  }
+  const base = path.basename(filePath).replace(/\.ibac$/i, '');
+  const save = await dialog.showSaveDialog(parentWindow(), {
+    title: "Open Accountant's Copy",
+    message: "Choose a name and location for your working copy of the client's books",
+    buttonLabel: 'Open',
+    defaultPath: path.join(app.getPath('documents'), `${base} (Accountant's Copy).ironbooks`),
+    filters: [{ name: 'Ironbooks Company File', extensions: ['ironbooks'] }],
+    properties: ['createDirectory', 'showOverwriteConfirmation'],
+  });
+  if (save.canceled || !save.filePath) return;
+  let target = save.filePath;
+  if (!/\.ironbooks$/i.test(target)) target += '.ironbooks';
+  if (fs.existsSync(target)) {
+    dialog.showErrorBox('That name is taken', `${path.basename(target)} already exists there. Choose a new name.`);
+    return;
+  }
+  const scratchWork = path.join(workingRoot(), `accountant-${crypto.randomBytes(6).toString('hex')}`);
+  const scratch = companySession.dataDirOf(scratchWork);
+  let baseUrl = serverUrl;
+  let scratchServer = null;
+  const open = async (password) => {
+    const headers = { 'x-bka-internal': internalToken, 'content-type': 'application/octet-stream' };
+    if (password) headers['x-ironbooks-password'] = Buffer.from(password, 'utf8').toString('base64url');
+    const res = await fetch(`${baseUrl}/api/accountant-copy/open?target=${encodeURIComponent(scratch)}&packAs=${encodeURIComponent(target)}`, {
+      method: 'POST',
+      headers,
+      body: bytes,
+      signal: AbortSignal.timeout(30 * 60 * 1000),
+    });
+    return { res, data: await res.json().catch(() => ({})) };
+  };
+  try {
+    if (!baseUrl) {
+      scratchServer = await startScratchServer(path.join(scratchWork, 'server'));
+      baseUrl = scratchServer.url;
+    }
+    let data;
+    if (fileCrypto.isPasswordSealed(bytes)) {
+      data = await promptForFilePassword(parentWindow(), {
+        title: "Open Accountant's Copy",
+        message: `${path.basename(filePath)} is protected with a password. Enter the password your client gave you for it.`,
+        onSubmit: async (password) => {
+          const r = await open(password);
+          if (r.res.ok) return { ok: true, value: r.data };
+          if (r.data && r.data.details && r.data.details.passwordRequired) return { ok: false, error: r.data.error };
+          return { ok: true, value: { __error: r.data.error || `HTTP ${r.res.status}` } };
+        },
+      });
+      if (!data) return;
+      if (data.__error) {
+        dialog.showErrorBox("Could not open the Accountant's Copy", data.__error);
+        return;
+      }
+    } else {
+      const r = await open(null);
+      if (!r.res.ok) {
+        dialog.showErrorBox("Could not open the Accountant's Copy", r.data.error || `HTTP ${r.res.status}`);
+        return;
+      }
+      data = r.data;
+    }
+    rememberRecentCompany(target);
+    const choice = await dialog.showMessageBox(parentWindow(), {
+      noLink: true,
+      type: 'info',
+      buttons: ['Open it now', 'Later'],
+      defaultId: 0,
+      cancelId: 1,
+      message: `The Accountant's Copy of "${data.companyName}" is ready.`,
+      detail:
+        `Location: ${target}\n\nDividing date: ${data.dividingDate}. Make your changes dated on or before it, then use ` +
+        "Accountant > Accountant's Copy > Export Changes to send them back. Sign in with your user name and password in the client's file.",
+    });
+    if (choice.response === 0) openCompany(target);
+    else if (startScreenMode) mainWindow?.webContents.reload();
+    else buildMenu();
+  } catch (e) {
+    dialog.showErrorBox("Could not open the Accountant's Copy", openErrorText(e));
+  } finally {
+    if (scratchServer) await scratchServer.stop();
+    fs.rm(scratchWork, { recursive: true, force: true }, () => {});
+  }
+}
+
+/**
+ * A Next.js server on an empty scratch folder, for work that needs the server while no company
+ * file is open (restoring a portable company file from No Company Open). Local only, like the
+ * company server; authenticated with the same per-launch internal token. { url, stop() }.
+ */
+async function startScratchServer(dataDir) {
+  fs.mkdirSync(dataDir, { recursive: true });
+  const port = await findFreePort();
+  const child = spawn(process.execPath, [path.join(process.resourcesPath, 'app', 'server.js')], {
+    env: {
+      ...process.env,
+      NODE_ENV: 'production',
+      PORT: String(port),
+      HOSTNAME: '127.0.0.1',
+      BKA_DATA_DIR: dataDir,
+      BKA_COMPANY_FILE: '',
+      BKA_COMPANY_STATE: '',
+      BKA_COMPANY_LOCK: '',
+      BKA_COMPANY_LOCK_TOKEN: '',
+      BKA_COMPANY_SEALED: '',
+      BKA_MIGRATIONS_DIR: migrationsDir(),
+      BKA_OFFLINE: '1',
+      BKA_INTERNAL_TOKEN: internalToken,
+      ELECTRON_RUN_AS_NODE: '1',
+      NEXT_TELEMETRY_DISABLED: '1',
+    },
+    stdio: 'inherit',
+  });
+  const stop = () =>
+    new Promise((resolve) => {
+      if (child.exitCode !== null || child.signalCode !== null) return resolve();
+      child.once('exit', () => resolve());
+      child.kill();
+      setTimeout(resolve, 5000); // never hang the flow on a stuck child
+    });
+  try {
+    await waitForServer(port);
+  } catch (err) {
+    await stop();
+    throw err;
+  }
+  return { url: `http://localhost:${port}`, stop };
 }
 
 // ---------------------------------------------------------------------------
@@ -2072,7 +2418,7 @@ function buildMenu() {
         { type: 'separator' },
         { label: 'Import Bank File…', click: () => mainWindow?.webContents.send('menu', 'import') },
         { label: 'Migrate from QuickBooks…', click: () => navigate('/qb-import') },
-        { label: 'Backup Company…', click: () => mainWindow?.webContents.send('menu', 'backup') },
+        { label: 'Back Up Company…', click: () => mainWindow?.webContents.send('menu', 'backup') },
         { type: 'separator' },
         { label: 'Create Portable Company File…', click: () => mainWindow?.webContents.send('menu', 'portable-create') },
         { label: 'Open/Restore Portable Company File…', enabled: !remoteHostOrigin, click: () => { openPortableFlow(); } },
@@ -2112,11 +2458,28 @@ function buildMenu() {
         { role: 'cut', ...shownKey('Ctrl+X') },
         { role: 'copy', ...shownKey('Ctrl+C') },
         { role: 'paste', ...shownKey('Ctrl+V') },
+        // QuickBooks' Edit menu: the same commands as its keys, acting on the open form, list or
+        // register (the page replays the key — components/DesktopBridge.tsx 'key:' actions).
+        { type: 'separator' },
+        { label: 'New', ...shownKey('Ctrl+N'), click: pageAction('key:Ctrl+N') },
+        { label: 'Edit', ...shownKey('Ctrl+E'), click: pageAction('key:Ctrl+E') },
+        { label: 'Delete', ...shownKey('Ctrl+D'), click: pageAction('key:Ctrl+D') },
+        { label: 'Memorize', ...shownKey('Ctrl+M'), click: pageAction('key:Ctrl+M') },
+        { type: 'separator' },
+        { label: 'Insert Line', ...shownKey('Ctrl+Insert'), click: pageAction('key:Ctrl+Insert') },
+        { label: 'Delete Line', ...shownKey('Ctrl+Delete'), click: pageAction('key:Ctrl+Delete') },
+        { type: 'separator' },
+        { label: 'Go To Transfer', ...shownKey('Ctrl+G'), click: pageAction('key:Ctrl+G') },
+        { label: 'Transaction History', ...shownKey('Ctrl+H'), click: pageAction('key:Ctrl+H') },
+        { label: 'Transaction Journal', ...shownKey('Ctrl+Y'), click: pageAction('key:Ctrl+Y') },
+        { type: 'separator' },
+        { label: 'Find…', ...shownKey('Ctrl+F'), click: () => navigate('/find') },
+        { label: 'Preferences…', click: () => navigate('/settings') },
       ],
     },
     // F5 is QuickBooks' Refresh: the page refreshes its data, asking first over typed work (never
     // the window's own reload, and never Ctrl+R — the QB "Use Register" key).
-    { label: 'View', submenu: [{ label: 'Refresh', ...shownKey('F5'), click: pageAction('refresh') }, { role: 'toggleDevTools' }, { type: 'separator' }, { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' }, { type: 'separator' }, { role: 'togglefullscreen' }] },
+    { label: 'View', submenu: [{ label: 'Refresh', ...shownKey('F5'), click: pageAction('refresh') }, ...(isDev ? [{ role: 'toggleDevTools' }] : []), { type: 'separator' }, { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' }, { type: 'separator' }, { role: 'togglefullscreen' }] },
     // QuickBooks' order: Lists, Favorites, then Company … Reports (electron/menuRoutes.js).
     ...(() => {
       const sections = buildSectionMenus(navigate, process.platform, sendMenuAction);
@@ -2207,6 +2570,7 @@ async function createStartWindow({ firstRun = false } = {}) {
     minWidth: 760,
     minHeight: 560,
     title: 'Ironbooks — No Company Open',
+    icon: APP_ICON,
     ...windowTheme.frameOptions(process.platform, nativeTheme.shouldUseDarkColors),
     webPreferences: {
       preload: path.join(__dirname, 'startPreload.js'),
@@ -2255,7 +2619,7 @@ function buildStartMenu() {
       ],
     },
     { label: 'Edit', submenu: [{ role: 'copy' }, { role: 'selectAll' }] },
-    { label: 'View', submenu: [{ role: 'reload', accelerator: 'F5' }, { role: 'toggleDevTools' }, { type: 'separator' }, { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' }] },
+    { label: 'View', submenu: [{ role: 'reload', accelerator: 'F5' }, ...(isDev ? [{ role: 'toggleDevTools' }] : []), { type: 'separator' }, { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' }] },
     {
       label: 'Help',
       submenu: [
@@ -2365,19 +2729,24 @@ function installPinnedCertificate(origin, pin) {
 async function createWindow() {
   // A company file the OS asked us to open (double-click, Open with) wins over the last one used.
   if (pendingCompanyPath) {
-    const p = pendingCompanyPath;
+    // Opened from an email attachment, a read-only file or a cloud-sync folder: ask first.
+    const p = await confirmCompanyFileLocation(pendingCompanyPath);
     pendingCompanyPath = null;
-    saveConfig({ companyFile: p, remoteHost: null, remotePin: null, remoteFile: null, companyClosed: false, sandbox: null });
-    rememberRecentCompany(p);
+    if (p) {
+      saveConfig({ companyFile: p, remoteHost: null, remotePin: null, remoteFile: null, companyClosed: false, sandbox: null });
+      rememberRecentCompany(p);
+    }
   }
   // File > Close Company: show "No Company Open" instead of loading a file. A scripted launch
   // that names a company folder (BKA_DATA_DIR) always opens it.
   if (loadConfig().companyClosed === true && !process.env.BKA_DATA_DIR) {
     await createStartWindow();
+    deliverPendingFilesToStartScreen();
     return;
   }
   if (isFirstRun()) {
     await createStartWindow({ firstRun: true });
+    deliverPendingFilesToStartScreen();
     return;
   }
   // Client mode: show the company hosted on another machine instead of starting a local server.
@@ -2398,6 +2767,7 @@ async function createWindow() {
       const opened = await openSingleFileForLaunch(cfg.companyFile);
       if (!opened) {
         await createStartWindow();
+        deliverPendingFilesToStartScreen();
         if (pendingAccessRequest) {
           const r = pendingAccessRequest;
           pendingAccessRequest = null;
@@ -2426,6 +2796,7 @@ async function createWindow() {
     minWidth: 1024,
     minHeight: 700,
     title: 'Ironbooks',
+    icon: APP_ICON,
     ...windowTheme.frameOptions(process.platform, nativeTheme.shouldUseDarkColors),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -2556,6 +2927,8 @@ async function createWindow() {
   // DesktopBridge listener (loadURL resolves at load, React hydrates just after).
   if (pendingBkaPath) setTimeout(deliverPendingBka, 1200);
   if (pendingBkpPath) setTimeout(deliverPendingBkp, 1200);
+  if (pendingIbacPath) setTimeout(deliverPendingIbac, 1200);
+  if (pendingIbcxPath) setTimeout(deliverPendingIbcx, 1200);
 }
 
 // Generate any due recurring/memorized transactions on launch (best-effort, but loudly logged).
@@ -2887,6 +3260,10 @@ ipcMain.handle('start:new', (e) => {
   if (fromStartScreen(e)) createCompanyFlow();
   return true;
 });
+ipcMain.handle('start:convert', (e) => {
+  if (fromStartScreen(e)) createCompanyFlow({ convertFromQuickBooks: true });
+  return true;
+});
 ipcMain.handle('start:browse', (e) => {
   if (fromStartScreen(e)) openCompanyFlow();
   return true;
@@ -2935,6 +3312,16 @@ app.on('second-instance', (_event, argv) => {
   if (bkp) {
     pendingBkpPath = bkp;
     deliverPendingBkp();
+  }
+  const ibac = extractPathWithExt(argv || [], '.ibac');
+  if (ibac) {
+    pendingIbacPath = ibac;
+    deliverPendingIbac();
+  }
+  const ibcx = extractPathWithExt(argv || [], '.ibcx');
+  if (ibcx) {
+    pendingIbcxPath = ibcx;
+    deliverPendingIbcx();
   }
   // Double-clicking a company file while Ironbooks is running.
   const company = extractCompanyPath(argv || []);

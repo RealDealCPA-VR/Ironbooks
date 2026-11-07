@@ -79,6 +79,7 @@ export const FIELD_META: Record<string, FieldMeta> = {
   autoRecallLastTransaction: { label: 'Recall the last transaction for a name', help: 'When you pick a name on a new bill, check, expense, card charge, invoice, sales receipt, estimate or sales order, the lines, terms, class, sales rep, tax and memo from the last one for that name are filled in.', type: 'bool' },
   showHomeWorkflow: { label: 'Show the Home page workflow (the task diagram)', help: 'The clickable diagram of everyday tasks on the Home page.', type: 'bool' },
   navMode: { label: 'Menu style', help: 'Advanced shows every screen, as QuickBooks does. Simple shows only everyday tasks. You can also switch at the top of the menu.', type: 'select', options: [['advanced', 'Advanced (every screen)'], ['simple', 'Simple (everyday tasks)']] },
+  quickBooksNames: { label: 'Use QuickBooks names in the menu', help: 'Names screens the way QuickBooks Desktop does, such as "Item List" and "Make General Journal Entries". Off shows plainer words; the other name is always in the tooltip and search.', type: 'bool' },
   density: { label: 'Screen density', help: 'Compact fits more rows in lists, registers and forms, closer to QuickBooks Desktop.', type: 'select', options: [['comfortable', 'Comfortable'], ['compact', 'Compact']] },
   // Jobs & Estimates
   estimatesEnabled: { label: 'Use estimates', type: 'bool' },

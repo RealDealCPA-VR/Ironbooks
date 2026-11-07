@@ -37,7 +37,10 @@ export default function ResetPasswordPage() {
   const policy = usePasswordPolicy();
 
   useEffect(() => {
-    if (new URLSearchParams(window.location.search).get('recovery') === '1') setStep('recovery');
+    const q = new URLSearchParams(window.location.search);
+    if (q.get('recovery') === '1') setStep('recovery');
+    // From the unlock screen's "Forgot the file password?": remove it along with the reset.
+    if (q.get('file') === '1') setClearFilePassword(true);
   }, []);
 
   async function recover() {
