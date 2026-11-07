@@ -172,7 +172,7 @@ function ProposalCard({ p, onChange }: { p: Proposal; onChange: (p: Proposal) =>
     try {
       const r = await api.post<{ proposal: Proposal }>(`/api/ai/proposals/${p.id}`, { action });
       onChange(r.proposal);
-      toast(action === 'approve' ? 'Journal entry posted.' : 'Proposal dismissed.', action === 'approve' ? 'success' : 'info');
+      toast(action === 'approve' ? (p.kind === 'bill' ? 'Bill entered.' : 'Journal entry posted.') : 'Proposal dismissed.', action === 'approve' ? 'success' : 'info');
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Action failed.', 'danger');
     } finally {
@@ -182,7 +182,7 @@ function ProposalCard({ p, onChange }: { p: Proposal; onChange: (p: Proposal) =>
   return (
     <div className="mt-2 rounded-xl border border-gold/40 bg-gold/5 p-3 text-xs">
       <div className="flex items-center justify-between gap-2 mb-2">
-        <span className="font-semibold text-navy">Proposed journal entry · {p.payload.date}</span>
+        <span className="font-semibold text-navy">{p.kind === 'bill' ? 'Proposed bill' : 'Proposed journal entry'} · {p.payload.date}</span>
         <Badge tone={p.status === 'approved' ? 'success' : p.status === 'rejected' ? 'neutral' : 'warning'}>
           {p.status === 'pending' ? 'Needs your approval' : p.status}
         </Badge>
@@ -220,7 +220,10 @@ function ProposalCard({ p, onChange }: { p: Proposal; onChange: (p: Proposal) =>
         </div>
       ) : p.status === 'approved' && p.resultRef ? (
         <div className="mt-2 text-emerald font-semibold">
-          Posted. <Link href="/journal" className="underline">View in Journal</Link>
+          {p.kind === 'bill' ? 'Entered.' : 'Posted.'}{' '}
+          <Link href={p.kind === 'bill' ? '/bills' : '/journal'} className="underline">
+            {p.kind === 'bill' ? 'View in Enter Bills' : 'View in Journal'}
+          </Link>
         </div>
       ) : null}
     </div>

@@ -23,6 +23,7 @@ import { type ServiceContext, ServiceError, inTransaction, notFound, validation,
 import { balanceSheet, profitAndLoss, trialBalance } from './reports';
 import { apAging, arAging } from './reportsExtra';
 import { assertBalanced } from './posting';
+import { createBill } from './bills';
 import { createManualEntry, followMergedNames } from './journal';
 import { buildRouter, type BuildRouterOptions } from './aiSettings';
 import { companyToday } from './preferences';
@@ -318,7 +319,32 @@ interface StoredJournalProposal {
   }[];
   totalDebit: string;
   rationale: string | null;
+  /** kind 'bill': what createBill posts on approval (the lines above are the preview of it). */
+  bill?: StoredBillProposal;
 }
+
+interface StoredBillProposal {
+  vendorId: string;
+  vendorName: string;
+  date: string;
+  dueDate: string | null;
+  billNumber: string | null;
+  memo: string | null;
+  lines: { accountId: string; amount: string; description: string | null }[];
+}
+
+const billProposalSchema = z.object({
+  type: z.literal('bill'),
+  vendorName: z.string().trim().min(1).max(255),
+  date: z.string(),
+  dueDate: z.string().nullish(),
+  billNumber: z.string().max(50).nullish(),
+  memo: z.string().max(500).nullish(),
+  lines: z
+    .array(z.object({ accountCode: z.string().trim().min(1), amount: z.union([z.string(), z.number()]), description: z.string().max(500).nullish() }))
+    .min(1)
+    .max(30),
+});
 
 const MONEY_RE = /^\d+(\.\d{1,2})?$/;
 
@@ -368,6 +394,92 @@ async function resolveProposalName(
     throw validation(`Line ${i + 1}: "${found.entityName}" is inactive. Pick an active name, or make this one active again first.`);
   }
   return { entityType: found.entityType, entityId: found.entityId, entityName: found.entityName };
+}
+
+/**
+ * Validate a model-proposed VENDOR BILL (vendor by name, expense lines by account code) and
+ * store it as a PENDING proposal; approving it runs the normal Enter Bills service, so A/P,
+ * due dates and 1099 tracking all behave as if typed in. Nothing is posted here.
+ */
+export async function createBillProposal(ctx: ServiceContext, input: unknown, rationale?: string | null): Promise<ProposalView> {
+  const parsed = billProposalSchema.safeParse(input);
+  if (!parsed.success) throw validation(`Bill proposal is malformed: ${parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')}`);
+  const p = parsed.data;
+  if (!parseDate(p.date)) throw validation('Bill date is invalid.');
+  if (p.dueDate && !parseDate(p.dueDate)) throw validation('Due date is invalid.');
+
+  const [vendor] = await ctx.db
+    .select({ id: vendors.id, name: vendors.displayName, isActive: vendors.isActive })
+    .from(vendors)
+    .where(and(eq(vendors.companyId, ctx.companyId), sql`lower(${vendors.displayName}) = lower(${p.vendorName})`))
+    .orderBy(desc(vendors.isActive))
+    .limit(1);
+  if (!vendor) {
+    const near = await ctx.db
+      .select({ name: vendors.displayName })
+      .from(vendors)
+      .where(and(eq(vendors.companyId, ctx.companyId), eq(vendors.isActive, true), ilike(vendors.displayName, `%${p.vendorName.split(/\s+/)[0]}%`)))
+      .limit(5);
+    throw validation(
+      `No vendor named "${p.vendorName}" was found.${near.length ? ` Did you mean ${near.map((v) => `"${v.name}"`).join(', ')}?` : ' Add the vendor first (Vendor Center), or give the exact name.'}`,
+    );
+  }
+  if (!vendor.isActive) throw validation(`Vendor "${vendor.name}" is inactive. Make it active again first.`);
+
+  const acctRows = await ctx.db
+    .select({ id: accounts.id, code: accounts.code, name: accounts.name, type: accounts.type, subtype: accounts.subtype, isActive: accounts.isActive })
+    .from(accounts)
+    .where(eq(accounts.companyId, ctx.companyId));
+  const byCode = new Map(acctRows.map((a) => [a.code, a]));
+  const BLOCKED = new Set(['accounts_payable', 'accounts_receivable', 'checking', 'savings', 'credit_card']);
+  const lines: StoredJournalProposal['lines'] = [];
+  const billLines: StoredBillProposal['lines'] = [];
+  let total = Money.of(0);
+  p.lines.forEach((l, i) => {
+    const a = byCode.get(l.accountCode.trim());
+    if (!a) throw validation(`Line ${i + 1}: no account with code ${l.accountCode}.`);
+    if (!a.isActive) throw validation(`Line ${i + 1}: account ${a.code} ${a.name} is inactive.`);
+    if (BLOCKED.has(a.subtype)) throw validation(`Line ${i + 1}: a bill line cannot post to ${a.code} ${a.name}; use the expense or asset account the purchase belongs to.`);
+    const amount = moneyOrNull(l.amount, `Line ${i + 1}`);
+    if (!amount) throw validation(`Line ${i + 1}: the amount must be more than zero.`);
+    total = total.plus(amount);
+    lines.push({ accountId: a.id, accountCode: a.code, accountName: a.name, debit: amount, credit: null, memo: l.description ?? null });
+    billLines.push({ accountId: a.id, amount, description: l.description ?? null });
+  });
+  const totalStr = toAmountString(total);
+  const ap = acctRows.find((a) => a.subtype === 'accounts_payable' && a.isActive);
+  if (ap) lines.push({ accountId: ap.id, accountCode: ap.code, accountName: ap.name, debit: null, credit: totalStr, memo: null, entityType: 'vendor', entityId: vendor.id, entityName: vendor.name });
+
+  const payload: StoredJournalProposal = {
+    date: p.date,
+    description: `Bill from ${vendor.name}${p.billNumber ? ` #${p.billNumber}` : ''}${p.memo ? ` — ${p.memo}` : ''}`,
+    reference: p.billNumber ?? null,
+    lines,
+    totalDebit: totalStr,
+    rationale: rationale ?? null,
+    bill: { vendorId: vendor.id, vendorName: vendor.name, date: p.date, dueDate: p.dueDate ?? null, billNumber: p.billNumber ?? null, memo: p.memo ?? null, lines: billLines },
+  };
+  const summaryText = `Bill from ${vendor.name} ${p.date} (${formatCurrency(totalStr)})`;
+  return inTransaction(ctx, async (tx) => {
+    const [row] = await tx.db
+      .insert(aiProposals)
+      .values({ companyId: tx.companyId, kind: 'bill', summary: summaryText, payload: payload as unknown as Record<string, unknown>, status: 'pending', createdBy: tx.userId })
+      .returning();
+    await writeAudit(tx, {
+      action: 'create',
+      entityType: 'ai_proposal',
+      entityId: row.id,
+      newValues: { kind: row.kind, summary: row.summary, status: row.status },
+      llmReasoning: rationale ?? undefined,
+    });
+    return toView(row);
+  });
+}
+
+/** A model proposal of any kind ("type": "journal_entry" by default, or "bill"). */
+export async function createProposal(ctx: ServiceContext, input: unknown, rationale?: string | null): Promise<ProposalView> {
+  const type = input && typeof input === 'object' ? (input as { type?: unknown }).type : undefined;
+  return type === 'bill' ? createBillProposal(ctx, input, rationale) : createJournalProposal(ctx, input, rationale);
 }
 
 /**
@@ -484,6 +596,34 @@ export async function approveProposal(ctx: ServiceContext, id: string): Promise<
       .for('update');
     if (!row) throw notFound('Proposal');
     if (row.status !== 'pending') throw new ServiceError('CONFLICT', `Proposal is already ${row.status}.`);
+    if (row.kind === 'bill') {
+      const b = (row.payload as unknown as StoredJournalProposal).bill;
+      if (!b) throw validation('This bill proposal is incomplete and cannot be entered.');
+      const billDate = parseDate(b.date);
+      if (!billDate) throw validation(`Bill date ${b.date} is invalid.`);
+      const bill = await createBill(tx, {
+        vendorId: b.vendorId,
+        date: billDate,
+        dueDate: b.dueDate ? parseDate(b.dueDate) ?? null : null,
+        billNumber: b.billNumber,
+        memo: b.memo,
+        lines: b.lines.map((l) => ({ accountId: l.accountId, amount: l.amount, description: l.description })),
+      });
+      const [updated] = await tx.db
+        .update(aiProposals)
+        .set({ status: 'approved', resultRef: `bill:${bill.id}`, decidedBy: tx.userId, decidedAt: new Date() })
+        .where(eq(aiProposals.id, id))
+        .returning();
+      await writeAudit(tx, {
+        action: 'update',
+        entityType: 'ai_proposal',
+        entityId: id,
+        oldValues: { status: 'pending' },
+        newValues: { status: 'approved', billId: bill.id },
+        llmReasoning: (row.payload as { rationale?: string | null }).rationale ?? 'Approved assistant bill proposal.',
+      });
+      return toView(updated);
+    }
     if (row.kind !== 'journal_entry') throw validation(`Unsupported proposal kind: ${row.kind}`);
     const p = row.payload as unknown as StoredJournalProposal;
     const date = parseDate(p.date);
@@ -648,6 +788,9 @@ Rules:
 - If the tools cannot answer, say so.
 - You cannot change any data. If the user asks you to record something (e.g. a journal entry), call list_accounts first, then answer with an explanation AND a "proposal" field:
   {"action":"answer","answer":"...","proposal":{"type":"journal_entry","date":"YYYY-MM-DD","description":"...","lines":[{"accountCode":"6000","debit":"100.00"},{"accountCode":"1000","credit":"100.00"}]}}
+- To record a VENDOR BILL (money owed to a vendor, paid later), propose a bill instead of a journal entry — the vendor's name exactly as the user gave it, expense account codes from list_accounts, positive amounts:
+  {"action":"answer","answer":"...","proposal":{"type":"bill","vendorName":"Office Supply Co","date":"YYYY-MM-DD","dueDate":"YYYY-MM-DD","billNumber":"1042","memo":"...","lines":[{"accountCode":"6000","amount":"125.50","description":"..."}]}}
+  (dueDate, billNumber and memo are optional.) The person approves it; it is then entered exactly as if typed into Enter Bills.
   Debits must equal credits. A line on Accounts Receivable needs "name": "<customer name>" and a line on Accounts Payable needs "name": "<vendor name>". The user reviews and approves proposals; say that it awaits their approval.
 - Keep answers short and clear for a non-accountant. Use YYYY-MM-DD dates in tool args.`;
 }
@@ -747,7 +890,7 @@ export async function ask(
         answer += '\n\n(Your role is view-only, so the proposed entry was not saved for approval.)';
       } else if (s.proposal !== undefined && s.proposal !== null) {
         try {
-          proposals.push(await createJournalProposal(ctx, s.proposal, `Assistant proposal for: "${question.slice(0, 300)}"`));
+          proposals.push(await createProposal(ctx, s.proposal, `Assistant proposal for: "${question.slice(0, 300)}"`));
         } catch (err) {
           answer += `\n\n(The proposed entry could not be prepared: ${err instanceof Error ? err.message : String(err)})`;
         }
