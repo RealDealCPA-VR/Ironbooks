@@ -221,7 +221,7 @@ describe('sealed company file', () => {
     const withBob = { ...prot, slots: [...prot.slots, bobSlot] };
     const file = await writeSealed('Slots', withBob);
     let m = format.readCompanyManifest(file);
-    expect(JSON.stringify(m)).not.toMatch(/bob|mary/i);
+    expect(JSON.stringify(m)).not.toMatch(/\bbob\b|\bmary\b/i); // whole words: random key material can spell "bob"
     expect(await crypto.unlockWith(m.encryption, { kind: 'password', login: 'bob', secret: 'bob-pass-2' })).toEqual(prot.fileKey);
     // Bob removed (deactivated): his slot is left out of the next save.
     const file2 = await writeSealed('Slots', { ...prot, slots: prot.slots });
