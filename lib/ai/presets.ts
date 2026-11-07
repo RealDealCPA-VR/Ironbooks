@@ -150,6 +150,18 @@ export const AI_PRESETS: AiPreset[] = [
     getLabel: 'Get a DeepSeek API key',
   },
   {
+    id: 'azure',
+    name: 'Azure OpenAI',
+    blurb: "Your company's OpenAI deployment on Azure. Server URL: https://<resource>.openai.azure.com — Model: the deployment name.",
+    kind: 'openai-compatible',
+    where: 'cloud',
+    baseUrl: '',
+    defaultModel: '',
+    needsKey: true,
+    getUrl: 'https://portal.azure.com/#view/Microsoft_Azure_ProjectOxford/CognitiveServicesHub/~/OpenAI',
+    getLabel: 'Open Azure OpenAI in the portal',
+  },
+  {
     id: 'custom',
     name: 'Other OpenAI-compatible server',
     blurb: 'vLLM, llama.cpp, a GPU box on your network, or any API that speaks the OpenAI format.',

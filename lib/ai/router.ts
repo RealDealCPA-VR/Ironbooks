@@ -43,6 +43,11 @@ export interface RouterConfig {
   retries?: number;
   /** Injectable for tests. */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Runs before every cloud call (the company's daily cloud-call limit, lib/services/aiSettings.ts
+   * noteCloudCall). Throwing an AiError skips that provider like any other failure.
+   */
+  beforeCloudCall?: (p: AiProvider) => Promise<void>;
 }
 
 export interface Attempt {
@@ -118,6 +123,7 @@ export class AiRouter {
   ): Promise<{ content: string; model: string }> {
     const retries = this.cfg.retries ?? 1;
     const sleep = this.cfg.sleep ?? defaultSleep;
+    if (p.locality === 'cloud' && this.cfg.beforeCloudCall) await this.cfg.beforeCloudCall(p);
     let lastErr: unknown;
     for (let attempt = 0; attempt <= retries; attempt++) {
       const ac = new AbortController();

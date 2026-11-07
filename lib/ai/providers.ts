@@ -215,6 +215,17 @@ export function openAiBase(baseUrl: string): string {
   }
 }
 
+/** Azure OpenAI: deployment-based URLs and an `api-key` header instead of Bearer auth. */
+export function isAzureOpenAiHost(baseUrl: string): boolean {
+  try {
+    return /\.(openai\.azure\.com|cognitiveservices\.azure\.com)$/i.test(new URL(baseUrl).hostname);
+  } catch {
+    return false;
+  }
+}
+const AZURE_API_VERSION = '2024-10-21';
+const AZURE_DEPLOYMENTS_API_VERSION = '2023-03-15-preview';
+
 /** api.openai.com (and its regional hosts): the only service that understands OpenAI's `store`. */
 function isOpenAiHost(base: string): boolean {
   try {
@@ -227,10 +238,20 @@ function isOpenAiHost(base: string): boolean {
 export function createOpenAiCompatibleProvider(cfg: ProviderRuntimeConfig, deps: ProviderDeps = {}): AiProvider {
   const fetchImpl = guardedFetch(deps);
   if (!cfg.baseUrl) throw new AiError('CONFIG', 'OpenAI-compatible provider needs a base URL.');
+  const azure = isAzureOpenAiHost(cfg.baseUrl);
   const base = openAiBase(cfg.baseUrl);
+  // Azure: https://<resource>.openai.azure.com, the model is the deployment name in the path.
+  const azureOrigin = azure ? new URL(cfg.baseUrl).origin : '';
+  const chatUrl = azure
+    ? `${azureOrigin}/openai/deployments/${encodeURIComponent(cfg.model)}/chat/completions?api-version=${AZURE_API_VERSION}`
+    : `${base}/chat/completions`;
+  const modelsUrl = azure ? `${azureOrigin}/openai/deployments?api-version=${AZURE_DEPLOYMENTS_API_VERSION}` : `${base}/models`;
   const locality = localityOf(cfg);
   const headers: Record<string, string> = { 'content-type': 'application/json' };
-  if (cfg.apiKey) headers.authorization = `Bearer ${cfg.apiKey}`;
+  if (cfg.apiKey) {
+    if (azure) headers['api-key'] = cfg.apiKey;
+    else headers.authorization = `Bearer ${cfg.apiKey}`;
+  }
 
   async function complete(messages: ChatMessage[], opts: ChatOptions, withSchema: boolean) {
     const body: Record<string, unknown> = {
@@ -248,11 +269,12 @@ export function createOpenAiCompatibleProvider(cfg: ProviderRuntimeConfig, deps:
         json_schema: { name: 'response', schema: opts.jsonSchema, strict: false },
       };
     }
-    return httpJson<{ choices?: { message?: { content?: string } }[]; model?: string }>(
-      fetchImpl,
-      `${base}/chat/completions`,
-      { method: 'POST', headers, body: JSON.stringify(body), signal: opts.signal },
-    );
+    return httpJson<{ choices?: { message?: { content?: string } }[]; model?: string }>(fetchImpl, chatUrl, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal: opts.signal,
+    });
   }
 
   return {
@@ -277,15 +299,16 @@ export function createOpenAiCompatibleProvider(cfg: ProviderRuntimeConfig, deps:
       return { content, model: data.model ?? cfg.model, providerId: cfg.id };
     },
     async listModels(o = {}) {
-      const data = await httpJson<{ data?: { id: string }[] }>(fetchImpl, `${base}/models`, {
+      const data = await httpJson<{ data?: { id: string; model?: string }[] }>(fetchImpl, modelsUrl, {
         method: 'GET',
         headers,
         signal: o.signal,
       });
-      return (data.data ?? []).map((m) => ({ id: m.id }));
+      // Azure lists deployments (id = deployment name, model = the underlying model).
+      return (data.data ?? []).map((m) => ({ id: m.id, ...(azure && m.model ? { label: m.model } : {}) }));
     },
     health(o = {}) {
-      return timeHealth(() => httpJson(fetchImpl, `${base}/models`, { method: 'GET', headers, signal: o.signal }));
+      return timeHealth(() => httpJson(fetchImpl, modelsUrl, { method: 'GET', headers, signal: o.signal }));
     },
   };
 }

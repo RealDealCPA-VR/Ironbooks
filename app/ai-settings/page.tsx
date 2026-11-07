@@ -68,6 +68,8 @@ interface Settings {
   providers: PublicProvider[];
   taskPolicies: Record<Task, Policy>;
   cloudEnabled: boolean;
+  cloudDailyCap: number;
+  cloudCallsToday: number;
   autoApplyEnabled: boolean;
   autoApplyThreshold: string;
   llmSuggestEnabled: boolean;
@@ -221,6 +223,7 @@ export default function AiSettingsPage() {
     'error-correction': 'local-only',
   });
   const [cloudEnabled, setCloudEnabled] = useState(false);
+  const [cloudDailyCap, setCloudDailyCap] = useState(500);
   const [autoApplyEnabled, setAutoApplyEnabled] = useState(false);
   const [threshold, setThreshold] = useState(95);
   const [llmSuggestEnabled, setLlmSuggestEnabled] = useState(true);
@@ -263,6 +266,7 @@ export default function AiSettingsPage() {
     setDrafts(s.providers.map(toDraft));
     setPolicies(s.taskPolicies);
     setCloudEnabled(s.cloudEnabled);
+    setCloudDailyCap(s.cloudDailyCap);
     setAutoApplyEnabled(s.autoApplyEnabled);
     setThreshold(Math.round(Number(s.autoApplyThreshold) * 100));
     setLlmSuggestEnabled(s.llmSuggestEnabled);
@@ -326,6 +330,7 @@ export default function AiSettingsPage() {
         providers: drafts.map(draftBody),
         taskPolicies: policies,
         cloudEnabled,
+        cloudDailyCap,
         autoApplyEnabled,
         autoApplyThreshold: (threshold / 100).toFixed(2),
         llmSuggestEnabled,
@@ -388,6 +393,7 @@ export default function AiSettingsPage() {
     JSON.stringify(drafts.map(draftBody)) !== JSON.stringify(settings.providers.map((p) => draftBody(toDraft(p)))) ||
     JSON.stringify(policies) !== JSON.stringify(settings.taskPolicies) ||
     cloudEnabled !== settings.cloudEnabled ||
+    cloudDailyCap !== settings.cloudDailyCap ||
     autoApplyEnabled !== settings.autoApplyEnabled ||
     threshold !== Math.round(Number(settings.autoApplyThreshold) * 100) ||
     llmSuggestEnabled !== settings.llmSuggestEnabled;
@@ -682,6 +688,22 @@ export default function AiSettingsPage() {
             )}
           </span>
         </label>
+        <div className="mb-5 flex flex-wrap items-center gap-3 text-sm">
+          <Label className="mb-0 whitespace-nowrap">Daily limit on cloud AI calls</Label>
+          <Input
+            type="number"
+            min={0}
+            step={50}
+            value={cloudDailyCap}
+            onChange={(e) => setCloudDailyCap(Math.max(0, Math.floor(Number(e.target.value) || 0)))}
+            className="w-28"
+            aria-label="Daily limit on cloud AI calls"
+          />
+          <span className="text-xs text-navy/50">
+            0 = no limit · Used today: <strong className="text-navy">{settings.cloudCallsToday}</strong>. A spend guard: when the
+            limit is reached, cloud AI pauses until tomorrow and local models and built-in behavior carry on.
+          </span>
+        </div>
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           {(Object.keys(TASK_LABELS) as Task[]).map((task) => (
             <div key={task}>

@@ -10,9 +10,9 @@
  *    with a company-aware Redactor built from the customer/vendor/employee lists.
  */
 import crypto from 'node:crypto';
-import { eq } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import { z } from 'zod';
-import { aiSettings, bankAccounts, customers, employees, jobs, leads, otherNames, salesReps, vendors } from '@/lib/db/schema';
+import { aiSettings, bankAccounts, companies, customers, employees, jobs, leads, otherNames, salesReps, vendors } from '@/lib/db/schema';
 import { type ServiceContext, validation, writeAudit, inTransaction } from './_base';
 import { requireRole } from './rbac';
 import { AiRouter } from '@/lib/ai/router';
@@ -23,6 +23,7 @@ import { isLegacyBlob, migrateLegacySecrets, openStoredSecret, readVaultSecret, 
 import { Redactor, addressEntities, type KnownEntity } from '@/lib/ai/redact';
 import {
   AI_TASKS,
+  AiError,
   DEFAULT_ANTHROPIC_MODEL,
   DEFAULT_POLICY,
   PROVIDER_KINDS,
@@ -40,6 +41,10 @@ export interface AiSettingsView {
   providers: PublicProviderConfig[];
   taskPolicies: Record<AiTask, RoutingPolicy>;
   cloudEnabled: boolean;
+  /** Cloud AI calls allowed per day for this company (0 = no limit). A spend guard. */
+  cloudDailyCap: number;
+  /** Cloud AI calls made today (UTC day). */
+  cloudCallsToday: number;
   autoApplyEnabled: boolean;
   /** 0..1 as a decimal string, e.g. "0.9500". */
   autoApplyThreshold: string;
@@ -50,15 +55,20 @@ interface SettingsRecord {
   providers: StoredProviderConfig[];
   taskPolicies: Record<AiTask, RoutingPolicy>;
   cloudEnabled: boolean;
+  cloudDailyCap: number;
   autoApplyEnabled: boolean;
   autoApplyThreshold: string;
   llmSuggestEnabled: boolean;
 }
 
+/** Default daily cloud-call limit: generous for a small business, a hard stop for a runaway loop. */
+export const DEFAULT_CLOUD_DAILY_CAP = 500;
+
 const DEFAULTS: SettingsRecord = {
   providers: [],
   taskPolicies: { categorize: DEFAULT_POLICY, assistant: DEFAULT_POLICY, 'error-correction': DEFAULT_POLICY },
   cloudEnabled: false,
+  cloudDailyCap: DEFAULT_CLOUD_DAILY_CAP,
   autoApplyEnabled: false,
   autoApplyThreshold: '0.9500',
   llmSuggestEnabled: true,
@@ -91,9 +101,58 @@ function openKey(p: StoredProviderConfig, companyId: string): string | null {
  * keys saved by an older version (encrypted with this computer's own key, which never travels
  * with the company file) to the company file's key — lib/ai/keyVault.ts migrateLegacySecrets.
  */
+// The daily cap and today's count live in companies.settings (no schema change): keys
+// `aiCloudCap` (number) and `aiCloudUsage` ({ day: 'YYYY-MM-DD', calls }), merged one key at a time.
+const CAP_KEY = 'aiCloudCap';
+const USAGE_KEY = 'aiCloudUsage';
+
+async function readCompanyAiSettings(ctx: Pick<ServiceContext, 'db' | 'companyId'>): Promise<{ cap: number; usage: { day: string; calls: number } }> {
+  const [row] = await ctx.db.select({ settings: companies.settings }).from(companies).where(eq(companies.id, ctx.companyId));
+  const s = (row?.settings ?? {}) as Record<string, unknown>;
+  const capRaw = s[CAP_KEY];
+  const cap = typeof capRaw === 'number' && Number.isInteger(capRaw) && capRaw >= 0 ? capRaw : DEFAULT_CLOUD_DAILY_CAP;
+  const u = s[USAGE_KEY] as { day?: unknown; calls?: unknown } | undefined;
+  const usage = u && typeof u.day === 'string' && typeof u.calls === 'number' ? { day: u.day, calls: u.calls } : { day: '', calls: 0 };
+  return { cap, usage };
+}
+
+function utcDay(now = new Date()): string {
+  return now.toISOString().slice(0, 10);
+}
+
+/** Today's cloud-call count (0 when none today). */
+export async function cloudCallsToday(ctx: Pick<ServiceContext, 'db' | 'companyId'>): Promise<number> {
+  const { usage } = await readCompanyAiSettings(ctx);
+  return usage.day === utcDay() ? usage.calls : 0;
+}
+
+/**
+ * Before each cloud AI call: refuse when the company's daily limit is reached, else count it.
+ * The count is one merged key in companies.settings, so it survives restarts and travels with
+ * the company file; a limit of 0 means no limit.
+ */
+export async function noteCloudCall(ctx: Pick<ServiceContext, 'db' | 'companyId'>): Promise<void> {
+  const { cap, usage } = await readCompanyAiSettings(ctx);
+  const day = utcDay();
+  const calls = usage.day === day ? usage.calls : 0;
+  if (cap > 0 && calls >= cap) {
+    throw new AiError(
+      'POLICY',
+      `This company's daily limit of ${cap} cloud AI calls is reached. Raise or remove the limit under AI & Automation, or wait until tomorrow (UTC).`,
+    );
+  }
+  await ctx.db
+    .update(companies)
+    .set({
+      settings: sql`coalesce(${companies.settings}, '{}'::jsonb) || jsonb_build_object(${USAGE_KEY}::text, ${JSON.stringify({ day, calls: calls + 1 })}::jsonb)`,
+    })
+    .where(eq(companies.id, ctx.companyId));
+}
+
 export async function loadSettings(ctx: ServiceContext): Promise<SettingsRecord> {
+  const { cap } = await readCompanyAiSettings(ctx);
   let [row] = await ctx.db.select().from(aiSettings).where(eq(aiSettings.companyId, ctx.companyId));
-  if (!row) return { ...DEFAULTS, taskPolicies: { ...DEFAULTS.taskPolicies } };
+  if (!row) return { ...DEFAULTS, taskPolicies: { ...DEFAULTS.taskPolicies }, cloudDailyCap: cap };
   const stored = (row.providers as unknown as StoredProviderConfig[]) ?? [];
   if (
     stored.some((p) => isLegacyBlob(p?.apiKeyEnc)) &&
@@ -111,6 +170,7 @@ export async function loadSettings(ctx: ServiceContext): Promise<SettingsRecord>
     providers,
     taskPolicies: normalizePolicies(row.taskPolicies),
     cloudEnabled: row.cloudEnabled,
+    cloudDailyCap: cap,
     autoApplyEnabled: row.autoApplyEnabled,
     autoApplyThreshold: row.autoApplyThreshold,
     llmSuggestEnabled: row.llmSuggestEnabled,
@@ -138,6 +198,8 @@ export async function getPublicSettings(ctx: ServiceContext): Promise<AiSettings
     providers: s.providers.map((p) => toPublic(p, ctx.companyId)),
     taskPolicies: s.taskPolicies,
     cloudEnabled: s.cloudEnabled,
+    cloudDailyCap: s.cloudDailyCap,
+    cloudCallsToday: await cloudCallsToday(ctx),
     autoApplyEnabled: s.autoApplyEnabled,
     autoApplyThreshold: s.autoApplyThreshold,
     llmSuggestEnabled: s.llmSuggestEnabled,
@@ -168,6 +230,8 @@ export const updateSettingsSchema = z.object({
   providers: z.array(providerInputSchema).max(20).optional(),
   taskPolicies: z.record(z.enum(ROUTING_POLICIES as [string, ...string[]])).optional(),
   cloudEnabled: z.boolean().optional(),
+  /** Cloud AI calls per day, 0 = no limit. */
+  cloudDailyCap: z.number().int().min(0).max(1_000_000).optional(),
   autoApplyEnabled: z.boolean().optional(),
   autoApplyThreshold: z
     .union([z.string(), z.number()])
@@ -236,6 +300,7 @@ export async function updateSettings(ctx: ServiceContext, input: UpdateSettingsI
   }
   if (body.taskPolicies) next.taskPolicies = normalizePolicies({ ...current.taskPolicies, ...body.taskPolicies });
   if (body.cloudEnabled !== undefined) next.cloudEnabled = body.cloudEnabled;
+  if (body.cloudDailyCap !== undefined) next.cloudDailyCap = body.cloudDailyCap;
   if (body.autoApplyEnabled !== undefined) next.autoApplyEnabled = body.autoApplyEnabled;
   if (body.autoApplyThreshold !== undefined) next.autoApplyThreshold = body.autoApplyThreshold.toFixed(4);
   if (body.llmSuggestEnabled !== undefined) next.llmSuggestEnabled = body.llmSuggestEnabled;
@@ -244,6 +309,7 @@ export async function updateSettings(ctx: ServiceContext, input: UpdateSettingsI
     providers: s.providers.map((p) => ({ id: p.id, kind: p.kind, label: p.label, baseUrl: p.baseUrl, model: p.model, enabled: p.enabled, hasApiKey: !!p.apiKeyEnc })),
     taskPolicies: s.taskPolicies,
     cloudEnabled: s.cloudEnabled,
+    cloudDailyCap: s.cloudDailyCap,
     autoApplyEnabled: s.autoApplyEnabled,
     autoApplyThreshold: s.autoApplyThreshold,
     llmSuggestEnabled: s.llmSuggestEnabled,
@@ -269,6 +335,12 @@ export async function updateSettings(ctx: ServiceContext, input: UpdateSettingsI
       llmSuggestEnabled: next.llmSuggestEnabled,
       updatedAt: new Date(),
     };
+    if (next.cloudDailyCap !== current.cloudDailyCap) {
+      await tx.db
+        .update(companies)
+        .set({ settings: sql`coalesce(${companies.settings}, '{}'::jsonb) || jsonb_build_object(${CAP_KEY}::text, ${next.cloudDailyCap}::int)` })
+        .where(eq(companies.id, tx.companyId));
+    }
     const [existing] = await tx.db.select({ id: aiSettings.id }).from(aiSettings).where(eq(aiSettings.companyId, tx.companyId));
     if (existing) {
       await tx.db.update(aiSettings).set(values).where(eq(aiSettings.id, existing.id));
@@ -439,6 +511,7 @@ export async function buildRouter(ctx: ServiceContext, opts: BuildRouterOptions 
     redactorFactory: () => (redactor ??= buildCompanyRedactor(ctx)),
     retries: opts.retries,
     sleep: opts.sleep,
+    beforeCloudCall: () => noteCloudCall(ctx),
   });
 }
 

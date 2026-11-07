@@ -100,6 +100,24 @@ describe('OpenAI-compatible provider', () => {
     expect(f.calls[0].body.store).toBe(false);
   });
 
+  it('Azure OpenAI: deployment URL, api-version and api-key header', async () => {
+    const f = mockFetch((url) =>
+      url.includes('/deployments?')
+        ? jsonResponse({ data: [{ id: 'books-gpt', model: 'gpt-4o' }] })
+        : jsonResponse({ choices: [{ message: { content: 'ok' } }] }),
+    );
+    const p = createOpenAiCompatibleProvider({ id: 'az', kind: 'openai-compatible', label: 'Azure', baseUrl: 'https://acme.openai.azure.com', model: 'books-gpt', apiKey: 'azkey', enabled: true }, { fetch: f.fn });
+    expect(p.locality).toBe('cloud');
+    expect(await p.listModels()).toEqual([{ id: 'books-gpt', label: 'gpt-4o' }]);
+    expect(f.calls[0].url).toBe('https://acme.openai.azure.com/openai/deployments?api-version=2023-03-15-preview');
+    await p.chat([{ role: 'user', content: 'x' }]);
+    expect(f.calls[1].url).toBe('https://acme.openai.azure.com/openai/deployments/books-gpt/chat/completions?api-version=2024-10-21');
+    const h = f.calls[1].init.headers as Record<string, string>;
+    expect(h['api-key']).toBe('azkey');
+    expect(h.authorization).toBeUndefined();
+    expect(f.calls[1].body.store).toBeUndefined();
+  });
+
   it('other cloud services that speak the OpenAI format are not sent OpenAI-only fields', async () => {
     const f = mockFetch(() => jsonResponse({ choices: [{ message: { content: 'ok' } }] }));
     const p = createOpenAiCompatibleProvider({ id: 'g', kind: 'openai-compatible', label: 'Gemini', baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-2.5-flash', apiKey: 'k', enabled: true }, { fetch: f.fn });
