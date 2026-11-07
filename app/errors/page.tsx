@@ -101,8 +101,11 @@ const ERROR_TYPE_LABELS: Record<ErrorType, string> = {
 function parseSuggestion(correction: Correction): Suggestion | null {
   if (!correction.correctionData) return null;
   const cd = correction.correctionData;
+  const raw = cd.reasoning ?? correction.llmReasoning ?? '';
   return {
-    analysis: cd.reasoning ?? correction.llmReasoning ?? '',
+    analysis: raw.startsWith('Offline stub:')
+      ? 'No AI connected, so this is the rules-based suggestion. Connect your AI under Company > AI & Automation for a real analysis of this entry.'
+      : raw,
     action: cd.action,
     steps: cd.changes?.steps ?? [],
     impact: '',
@@ -184,8 +187,8 @@ function InsightPanel({ detectionId, onApplied }: InsightPanelProps) {
       {!correction && (
         <div className="flex flex-col items-center gap-3 py-4">
           <p className="text-sm text-navy/60 text-center max-w-sm">
-            Run an AI-powered analysis to get a structured correction suggestion
-            with step-by-step guidance.
+            Ask your AI for a structured correction suggestion with step-by-step guidance (with no AI
+            connected, you get the rules-based suggestion only).
           </p>
           <Button onClick={handleAnalyze} loading={analyzing} size="sm">
             {!analyzing && <Sparkles className="h-3.5 w-3.5" />}
@@ -352,7 +355,7 @@ export default function ErrorsPage() {
       );
       toast(
         res.count > 0
-          ? `AI Review found ${res.count} new issue${res.count > 1 ? 's' : ''}`
+          ? `Checks found ${res.count} new issue${res.count > 1 ? 's' : ''}`
           : 'No new issues detected — books look clean!',
         res.count > 0 ? 'danger' : 'success',
       );
@@ -379,12 +382,12 @@ export default function ErrorsPage() {
   return (
     <main className="min-h-screen bg-offwhite p-8 font-sans">
       <PageHeader
-        title="AI Review"
+        title="Error Review"
         icon={ShieldAlert}
         action={
           <Button onClick={handleRunReview} loading={running}>
             {!running && <ScanSearch className="h-4 w-4" />}
-            Run AI Review
+            Run Checks
           </Button>
         }
       />
@@ -470,7 +473,7 @@ export default function ErrorsPage() {
               <p className="font-semibold text-navy/60">No issues found</p>
               <p className="text-sm mt-1">
                 {filter === 'all'
-                  ? 'Run AI Review to scan your journal for errors.'
+                  ? 'Run Checks to scan your journal for errors.'
                   : `No ${filter} issues to display.`}
               </p>
             </div>

@@ -232,6 +232,21 @@ export default function AiSettingsPage() {
   const [retraining, setRetraining] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [cloudVerdict, setCloudVerdict] = useState<CloudVerdict | null>(null);
+  /** Local presets (Ollama, LM Studio): whether their server answers on this computer right now. */
+  const [localStatus, setLocalStatus] = useState<Record<string, { running: boolean; models: number } | 'checking'>>({});
+
+  /** Opening the picker pings the local servers, so the cards say "Running" or "Not running". */
+  function openPicker() {
+    setPickerOpen(true);
+    for (const pr of AI_PRESETS) {
+      if (pr.where !== 'this computer' || !pr.baseUrl) continue;
+      setLocalStatus((m) => ({ ...m, [pr.id]: 'checking' }));
+      api
+        .post<TestResult>('/api/ai/test', { kind: pr.kind, label: pr.name, baseUrl: pr.baseUrl, model: '', enabled: true, timeoutMs: 3000 })
+        .then((r) => setLocalStatus((m) => ({ ...m, [pr.id]: { running: r.ok, models: r.models.length } })))
+        .catch(() => setLocalStatus((m) => ({ ...m, [pr.id]: { running: false, models: 0 } })));
+    }
+  }
 
   const loadCloudVerdict = useCallback(async () => {
     try {
@@ -276,11 +291,14 @@ export default function AiSettingsPage() {
    * dropdowns below would otherwise stay "Local only" and the new AI would never be used.
    */
   function addPreset(preset: AiPreset) {
-    setDrafts((prev) => [
-      ...prev,
-      newDraft({ kind: preset.kind, label: preset.name, baseUrl: preset.baseUrl, model: preset.defaultModel }),
-    ]);
+    const draft = newDraft({ kind: preset.kind, label: preset.name, baseUrl: preset.baseUrl, model: preset.defaultModel });
+    setDrafts((prev) => [...prev, draft]);
     setPickerOpen(false);
+    // A local server that is already running: list its models straight away (no key to paste first).
+    if (preset.where === 'this computer' && preset.baseUrl) {
+      const st = localStatus[preset.id];
+      if (st && st !== 'checking' && st.running) void test(draft);
+    }
     if (preset.where === 'cloud') {
       setCloudEnabled(true);
       const hasLocalNow = drafts.some((d) => d.enabled && d.kind !== 'anthropic' && (presetOf(d)?.where ?? 'this computer') !== 'cloud');
@@ -406,7 +424,7 @@ export default function AiSettingsPage() {
             <Button variant="secondary" size="sm" onClick={discover} loading={discovering}>
               <Network className="h-4 w-4" /> Find models on other computers (Tailscale)
             </Button>
-            <Button size="sm" onClick={() => setPickerOpen(true)}>
+            <Button size="sm" onClick={openPicker}>
               <Plus className="h-4 w-4" /> Add AI…
             </Button>
           </div>
@@ -432,6 +450,19 @@ export default function AiSettingsPage() {
                   <span className="mt-1 block text-[11px] text-navy/40">
                     {pr.where === 'cloud' ? 'Cloud · needs an API key · names and numbers are hidden before sending' : 'Runs on this computer · free · nothing leaves your PC'}
                   </span>
+                  {pr.where === 'this computer' && pr.baseUrl && localStatus[pr.id] && (
+                    <span className="mt-1 block text-[11px]">
+                      {localStatus[pr.id] === 'checking' ? (
+                        <span className="text-navy/40">Checking…</span>
+                      ) : (localStatus[pr.id] as { running: boolean; models: number }).running ? (
+                        <span className="text-emerald">Running on this computer · {(localStatus[pr.id] as { models: number }).models} model(s) ready</span>
+                      ) : (
+                        <span className="text-yellow-800">
+                          Not running. {pr.getLabel ? `${pr.getLabel} ↗ (opens the download page after you add it)` : ''}
+                        </span>
+                      )}
+                    </span>
+                  )}
                 </span>
               </button>
             ))}
@@ -485,7 +516,7 @@ export default function AiSettingsPage() {
             <p className="mt-1 text-sm text-navy/60">
               Connect ChatGPT, Claude, Gemini or a free model on this computer for smarter help.
             </p>
-            <Button className="mt-4" onClick={() => setPickerOpen(true)}>
+            <Button className="mt-4" onClick={openPicker}>
               <Plus className="h-4 w-4" /> Add AI…
             </Button>
           </div>

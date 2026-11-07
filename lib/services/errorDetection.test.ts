@@ -222,7 +222,7 @@ describe('AI Error Detection + LLM Corrector', () => {
     const correction = await analyzeError(ctx, detection.id);
 
     expect(correction.errorDetectionId).toBe(detection.id);
-    expect(correction.suggestedBy).toBe('llm');
+    expect(correction.suggestedBy).toBe('system'); // no model: the rules-based stub, labeled as such
     expect(correction.status).toBe('pending');
     expect(correction.correctionType).toBeTruthy();
     expect(correction.llmReasoning).toMatch(/offline stub/i);

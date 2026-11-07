@@ -203,7 +203,8 @@ ${lines
     .insert(errorCorrections)
     .values({
       errorDetectionId: detection.id,
-      suggestedBy: 'llm',
+      // Honest labeling: with no model, the suggestion is the rules-based stub, not AI.
+      suggestedBy: llmReasoningText.startsWith('Offline stub:') ? 'system' : 'llm',
       correctionType: suggestion.action,
       correctionData: {
         action: suggestion.action,

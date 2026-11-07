@@ -167,7 +167,7 @@ export const navGroups: NavGroup[] = [
       { icon: LineChart, label: 'Graphs', path: '/reports/graphs', qb: 'Graphs', keywords: 'chart' },
       { icon: Grid3x3, label: 'Advanced Reporting', path: '/reports/pivot', qb: 'Advanced Reporting', keywords: 'pivot' },
       { icon: Search, label: 'Find Transactions', path: '/find', qb: 'Find', keywords: 'search lookup' },
-      { icon: AlertTriangle, label: 'AI Review', path: '/errors', qb: 'Client Data Review', keywords: 'errors mistakes problems' },
+      { icon: AlertTriangle, label: 'Error Review', path: '/errors', qb: 'Client Data Review', keywords: 'errors mistakes problems ai review checks' },
     ],
   },
   {

@@ -680,6 +680,8 @@ export function findUnverifiedNumbers(answer: string, toolResults: unknown[], ex
 
 export interface AskOptions extends BuildRouterOptions {
   today?: Date;
+  /** Called before each report tool runs, so the UI can show "Looking at Profit & Loss…". */
+  onStep?: (step: { tool: string; args: Record<string, unknown> }) => void;
 }
 
 /** Answer one user message given prior turns. */
@@ -722,6 +724,7 @@ export async function ask(
 
       if (s.action === 'tool' && !forceAnswer) {
         const call: ToolCallRecord = { tool: s.tool!, args: s.args ?? {} };
+        opts.onStep?.({ tool: call.tool, args: call.args });
         try {
           call.result = await runTool(ctx, s.tool!, s.args ?? {});
         } catch (err) {
@@ -764,7 +767,9 @@ export async function ask(
     if (!(err instanceof AiError)) throw err;
     // Model failed mid-conversation — fall back to the deterministic answer.
     const reply = await offlineAnswer(ctx, question, todayDate);
-    return { ...reply, notice: `AI model unavailable (${err.message}). Showing a basic answer instead.` };
+    // The notice is read by a person: the gist of the failure, not a provider's JSON error body.
+    const gist = err.message.split(/:\s*\{/)[0].replace(/\s+/g, ' ').trim().slice(0, 160);
+    return { ...reply, notice: `AI model unavailable (${gist}). Showing a basic answer instead — check the model under AI & Automation.` };
   }
   throw new ServiceError('INTERNAL', 'Assistant did not produce an answer.');
 }

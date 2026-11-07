@@ -4,6 +4,10 @@
  *
  * The model can only call read-only report tools computed locally; proposed writes come back
  * as pending proposals (approve/reject via /api/ai/proposals/:id).
+ *
+ * ?stream=1: newline-delimited JSON instead — one {"type":"step","tool","args"} line per report
+ * the model reads (the panel shows "Looking at Profit & Loss…" instead of one long spinner),
+ * then {"type":"reply", ...AssistantReply} or {"type":"error","error","code"}.
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
@@ -25,7 +29,27 @@ export async function POST(req: NextRequest) {
     const ctx = await getServerContext();
     const parsed = bodySchema.safeParse(await req.json().catch(() => ({})));
     if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
-    return NextResponse.json(await ask(ctx, parsed.data.history, parsed.data.message));
+    if (req.nextUrl.searchParams.get('stream') !== '1') {
+      return NextResponse.json(await ask(ctx, parsed.data.history, parsed.data.message));
+    }
+    const { history, message } = parsed.data;
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        const line = (obj: unknown) => controller.enqueue(encoder.encode(`${JSON.stringify(obj)}\n`));
+        try {
+          const reply = await ask(ctx, history, message, { onStep: (step) => line({ type: 'step', ...step }) });
+          line({ type: 'reply', ...reply });
+        } catch (err) {
+          const res = aiErrorResponse(err, 'POST /api/ai/assistant');
+          const body = await res.json().catch(() => ({ error: 'The assistant could not answer.' }));
+          line({ type: 'error', status: res.status, ...body });
+        } finally {
+          controller.close();
+        }
+      },
+    });
+    return new Response(stream, { headers: { 'content-type': 'application/x-ndjson; charset=utf-8', 'cache-control': 'no-store' } });
   } catch (err) {
     return aiErrorResponse(err, 'POST /api/ai/assistant');
   }

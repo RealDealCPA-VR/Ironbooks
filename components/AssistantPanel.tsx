@@ -52,6 +52,70 @@ interface Reply {
 
 type Msg = { role: 'user'; content: string } | { role: 'assistant'; content: string; reply: Reply };
 
+/** The last conversation, kept on this computer so closing the panel does not lose it. */
+const THREAD_KEY = 'ironbooks.assistant.thread';
+const MAX_SAVED = 40;
+
+function loadThread(): Msg[] {
+  try {
+    const raw = window.localStorage.getItem(THREAD_KEY);
+    const parsed = raw ? (JSON.parse(raw) as Msg[]) : [];
+    return Array.isArray(parsed) ? parsed.slice(-MAX_SAVED) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveThread(msgs: Msg[]) {
+  try {
+    if (msgs.length === 0) window.localStorage.removeItem(THREAD_KEY);
+    else window.localStorage.setItem(THREAD_KEY, JSON.stringify(msgs.slice(-MAX_SAVED)));
+  } catch {
+    /* private window, blocked storage: the thread just is not kept */
+  }
+}
+
+/**
+ * Send a question and read the streamed reply (app/api/ai/assistant?stream=1): tool steps arrive
+ * as the model reads reports, then the reply. Falls back to the plain JSON route when the
+ * stream cannot be read.
+ */
+async function askStreaming(
+  body: { message: string; history: { role: string; content: string }[] },
+  onStep: (label: string) => void,
+): Promise<Reply> {
+  const res = await fetch('/api/ai/assistant?stream=1', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok || !res.body) {
+    const data = await res.json().catch(() => ({}));
+    throw new ApiError(res.status, typeof data.error === 'string' ? data.error : 'The assistant could not answer.', typeof data.code === 'string' ? data.code : undefined, data);
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let reply: Reply | null = null;
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let nl: number;
+    while ((nl = buffer.indexOf('\n')) >= 0) {
+      const lineText = buffer.slice(0, nl).trim();
+      buffer = buffer.slice(nl + 1);
+      if (!lineText) continue;
+      const ev = JSON.parse(lineText) as { type: string } & Record<string, unknown>;
+      if (ev.type === 'step') onStep(TOOL_LABELS[String(ev.tool)] ?? String(ev.tool));
+      else if (ev.type === 'reply') reply = ev as unknown as Reply;
+      else if (ev.type === 'error') throw new ApiError(Number(ev.status ?? 500), String(ev.error ?? 'The assistant could not answer.'), typeof ev.code === 'string' ? ev.code : undefined, ev);
+    }
+  }
+  if (!reply) throw new ApiError(500, 'The assistant did not answer.');
+  return reply;
+}
+
 const STARTERS = [
   'How did we do this month?',
   'Who owes us money?',
@@ -167,6 +231,11 @@ export default function AssistantPanel({ open, onClose }: { open: boolean; onClo
   const [messages, setMessages] = React.useState<Msg[]>([]);
   const [input, setInput] = React.useState('');
   const [busy, setBusy] = React.useState(false);
+  /** What the model is reading right now ("Looking at Profit & Loss…"). */
+  const [stepLabel, setStepLabel] = React.useState<string | null>(null);
+  /** Proposals from earlier conversations still waiting for an answer. */
+  const [pending, setPending] = React.useState<Proposal[]>([]);
+  const restored = React.useRef(false);
   const endRef = React.useRef<HTMLDivElement>(null);
   const inputRef = React.useRef<HTMLTextAreaElement>(null);
 
@@ -176,6 +245,15 @@ export default function AssistantPanel({ open, onClose }: { open: boolean; onClo
 
   React.useEffect(() => {
     if (!open) return;
+    if (!restored.current) {
+      restored.current = true;
+      setMessages(loadThread());
+    }
+    // Proposals the model made earlier (this or another session) that nobody has answered yet.
+    api
+      .get<{ proposals: Proposal[] }>('/api/ai/proposals?status=pending')
+      .then((r) => setPending(r.proposals))
+      .catch(() => setPending([]));
     inputRef.current?.focus();
     function onKey(e: KeyboardEvent) {
       if (e.key === 'Escape') onClose();
@@ -191,16 +269,28 @@ export default function AssistantPanel({ open, onClose }: { open: boolean; onClo
     setMessages((prev) => [...prev, { role: 'user', content: message }]);
     setInput('');
     setBusy(true);
+    setStepLabel(null);
     try {
-      const reply = await api.post<Reply>('/api/ai/assistant', { message, history });
-      setMessages((prev) => [...prev, { role: 'assistant', content: reply.answer, reply }]);
+      const reply = await askStreaming({ message, history }, (label) => setStepLabel(label));
+      setMessages((prev) => {
+        const next: Msg[] = [...prev, { role: 'assistant', content: reply.answer, reply }];
+        saveThread(next);
+        return next;
+      });
+      if (reply.proposals.length) setPending((p) => p.filter((x) => !reply.proposals.some((n) => n.id === x.id)));
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'The assistant could not answer.', 'danger');
       setMessages((prev) => prev.slice(0, -1));
       setInput(message);
     } finally {
       setBusy(false);
+      setStepLabel(null);
     }
+  }
+
+  function clearThread() {
+    setMessages([]);
+    saveThread([]);
   }
 
   function updateProposal(msgIdx: number, p: Proposal) {
@@ -228,12 +318,27 @@ export default function AssistantPanel({ open, onClose }: { open: boolean; onClo
               <div className="text-[11px] text-navy/40">Answers come from your own reports</div>
             </div>
           </div>
-          <button onClick={onClose} aria-label="Close assistant" className="text-navy/40 hover:text-navy">
-            <X className="h-5 w-5" />
-          </button>
+          <div className="flex items-center gap-3">
+            {messages.length > 0 && (
+              <button type="button" onClick={clearThread} className="text-xs text-navy/40 hover:text-navy" title="Start a new conversation">
+                New chat
+              </button>
+            )}
+            <button onClick={onClose} aria-label="Close assistant" className="text-navy/40 hover:text-navy">
+              <X className="h-5 w-5" />
+            </button>
+          </div>
         </div>
 
         <div className="flex-1 overflow-y-auto px-5 py-4 space-y-4">
+          {pending.length > 0 && (
+            <div>
+              <div className="text-xs font-semibold text-navy/60">Waiting for your approval ({pending.length})</div>
+              {pending.map((p) => (
+                <ProposalCard key={p.id} p={p} onChange={(np) => setPending((prev) => (np.status === 'pending' ? prev.map((x) => (x.id === np.id ? np : x)) : prev.filter((x) => x.id !== np.id)))} />
+              ))}
+            </div>
+          )}
           {messages.length === 0 && (
             <div className="text-sm text-navy/60">
               <p className="mb-3">
@@ -306,8 +411,8 @@ export default function AssistantPanel({ open, onClose }: { open: boolean; onClo
             ),
           )}
           {busy && (
-            <div className="flex items-center gap-2 text-sm text-navy/50">
-              <Spinner className="h-4 w-4" /> Looking at your books…
+            <div className="flex items-center gap-2 text-sm text-navy/50" role="status">
+              <Spinner className="h-4 w-4" /> {stepLabel ? `Looking at ${stepLabel}…` : 'Thinking…'}
             </div>
           )}
           <div ref={endRef} />
