@@ -31,6 +31,7 @@ import {
   Card,
   Input,
   Label,
+  Modal,
   PageHeader,
   PageSkeleton,
   Select,
@@ -38,6 +39,7 @@ import {
 } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatDate } from '@/lib/dates';
+import { AI_PRESETS, presetOf, type AiPreset } from '@/lib/ai/presets';
 
 // ---------------------------------------------------------------------------
 // Types (mirror lib/services/aiSettings.ts views)
@@ -69,6 +71,14 @@ interface Settings {
   autoApplyEnabled: boolean;
   autoApplyThreshold: string;
   llmSuggestEnabled: boolean;
+  /** PUT only: why cloud AI is still blocked by Privacy & Network (offline mode, a machine ceiling). */
+  networkNotice?: string | null;
+}
+
+/** Privacy & Network's verdict for cloud AI (GET /api/network-policy, purposes[ai].cloud). */
+interface CloudVerdict {
+  allowed: boolean;
+  reason: string;
 }
 
 /** Editable row: saved providers + new drafts (no id yet). */
@@ -134,8 +144,8 @@ const POLICY_LABELS: Record<Policy, string> = {
 
 const KIND_LABELS: Record<Kind, string> = {
   ollama: 'Ollama',
-  'openai-compatible': 'OpenAI-compatible (LM Studio, vLLM, llama.cpp, cloud APIs)',
-  anthropic: 'Anthropic Claude (cloud)',
+  'openai-compatible': 'OpenAI-compatible API (OpenAI, Gemini, Groq, OpenRouter, Mistral, xAI, DeepSeek, LM Studio, vLLM…)',
+  anthropic: 'Anthropic Claude',
 };
 
 let draftSeq = 0;
@@ -220,6 +230,18 @@ export default function AiSettingsPage() {
   const [discovering, setDiscovering] = useState(false);
   const [cat, setCat] = useState<CategorizerInfo | null>(null);
   const [retraining, setRetraining] = useState(false);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [cloudVerdict, setCloudVerdict] = useState<CloudVerdict | null>(null);
+
+  const loadCloudVerdict = useCallback(async () => {
+    try {
+      const d = await api.get<{ purposes: { purpose: string; cloud: CloudVerdict }[] }>('/api/network-policy');
+      const ai = d.purposes.find((x) => x.purpose === 'ai');
+      setCloudVerdict(ai ? ai.cloud : null);
+    } catch {
+      /* non-critical */
+    }
+  }, []);
 
   const apply = useCallback((s: Settings) => {
     setSettings(s);
@@ -245,7 +267,35 @@ export default function AiSettingsPage() {
       .then(apply)
       .catch((err) => toast(err instanceof ApiError ? err.message : 'Failed to load AI settings.', 'danger'));
     loadCategorizer();
-  }, [apply, loadCategorizer]);
+    loadCloudVerdict();
+  }, [apply, loadCategorizer, loadCloudVerdict]);
+
+  /**
+   * "Add AI": a preset becomes a provider row ready to test. A cloud AI also turns cloud on and,
+   * when there is no local model to try first, points every task at the cloud — the three
+   * dropdowns below would otherwise stay "Local only" and the new AI would never be used.
+   */
+  function addPreset(preset: AiPreset) {
+    setDrafts((prev) => [
+      ...prev,
+      newDraft({ kind: preset.kind, label: preset.name, baseUrl: preset.baseUrl, model: preset.defaultModel }),
+    ]);
+    setPickerOpen(false);
+    if (preset.where === 'cloud') {
+      setCloudEnabled(true);
+      const hasLocalNow = drafts.some((d) => d.enabled && d.kind !== 'anthropic' && (presetOf(d)?.where ?? 'this computer') !== 'cloud');
+      if (!hasLocalNow) {
+        setPolicies((p) => {
+          const next = { ...p };
+          for (const t of Object.keys(next) as Task[]) if (next[t] === 'local-only') next[t] = 'local-then-cloud';
+          return next;
+        });
+      }
+      toast(`${preset.name} added. Paste your API key, Test connection, then Save changes.`, 'info');
+    } else {
+      toast(`${preset.name} added. Test connection to pick a model, then Save changes.`, 'info');
+    }
+  }
 
   function patchDraft(key: string, patch: Partial<Draft>) {
     setDrafts((prev) => prev.map((d) => (d.key === key ? { ...d, ...patch } : d)));
@@ -264,6 +314,8 @@ export default function AiSettingsPage() {
       });
       apply(s);
       toast('AI settings saved.', 'success');
+      if (s.networkNotice) toast(s.networkNotice, 'danger');
+      loadCloudVerdict();
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Save failed.', 'danger');
     } finally {
@@ -336,11 +388,11 @@ export default function AiSettingsPage() {
 
       <Card className="p-6 mb-6 bg-navy/[0.03]">
         <p className="text-sm text-navy/80 leading-relaxed">
-          <strong>Your books stay on your computers.</strong> AI runs on a model server you control — this PC,
-          your office network, or any machine on your Tailscale network (for example{' '}
-          <code className="text-xs bg-white px-1 rounded">http://gpu-box.tail1234.ts.net:11434</code>). Cloud
-          models are optional and off unless you turn them on below; before anything is sent to a cloud model, names,
-          emails, phone numbers, tax IDs, account numbers and addresses are replaced with placeholders.
+          <strong>Use the AI you already have.</strong> Add ChatGPT, Claude, Gemini and others with your own API key,
+          or a free model that runs on this computer (Ollama, LM Studio) so nothing leaves your PC. Before anything is
+          sent to a cloud AI, names, emails, phone numbers, tax IDs, account numbers and addresses are replaced with
+          placeholders — and cloud AI is off until you allow it below. A model on another computer in your office or
+          on your Tailscale network works too.
         </p>
       </Card>
 
@@ -352,24 +404,39 @@ export default function AiSettingsPage() {
           </h2>
           <div className="flex flex-wrap gap-2">
             <Button variant="secondary" size="sm" onClick={discover} loading={discovering}>
-              <Network className="h-4 w-4" /> Find models on my tailnet
+              <Network className="h-4 w-4" /> Find models on other computers (Tailscale)
             </Button>
-            <Button
-              variant="secondary"
-              size="sm"
-              onClick={() => setDrafts((p) => [...p, newDraft({ kind: 'ollama', label: 'Local model', baseUrl: 'http://localhost:11434' })])}
-            >
-              <Plus className="h-4 w-4" /> Local model
-            </Button>
-            <Button
-              variant="secondary"
-              size="sm"
-              onClick={() => setDrafts((p) => [...p, newDraft({ kind: 'anthropic', label: 'Claude (cloud)', model: 'claude-sonnet-5-5' })])}
-            >
-              <Plus className="h-4 w-4" /> Cloud model
+            <Button size="sm" onClick={() => setPickerOpen(true)}>
+              <Plus className="h-4 w-4" /> Add AI…
             </Button>
           </div>
         </div>
+
+        <Modal open={pickerOpen} onClose={() => setPickerOpen(false)} title="Which AI do you use?" size="lg">
+          <p className="mb-4 text-sm text-navy/60">
+            Pick the one you already have an account for, or a free model that runs on this computer. You can add more
+            than one.
+          </p>
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+            {AI_PRESETS.map((pr) => (
+              <button
+                key={pr.id}
+                type="button"
+                onClick={() => addPreset(pr)}
+                className="flex items-start gap-3 rounded-xl border border-slate-200 p-3 text-left hover:border-electric hover:bg-electric/5 focus-visible:ring-2 focus-visible:ring-electric outline-none"
+              >
+                <span className="mt-0.5 shrink-0 text-electric">{pr.where === 'cloud' ? <Cloud className="h-4 w-4" /> : <Cpu className="h-4 w-4" />}</span>
+                <span>
+                  <span className="block text-sm font-semibold text-navy">{pr.name}</span>
+                  <span className="block text-xs text-navy/55">{pr.blurb}</span>
+                  <span className="mt-1 block text-[11px] text-navy/40">
+                    {pr.where === 'cloud' ? 'Cloud · needs an API key · names and numbers are hidden before sending' : 'Runs on this computer · free · nothing leaves your PC'}
+                  </span>
+                </span>
+              </button>
+            ))}
+          </div>
+        </Modal>
 
         {peers && (
           <div className="mb-5 rounded-xl border border-slate-200 p-4">
@@ -410,10 +477,18 @@ export default function AiSettingsPage() {
         )}
 
         {drafts.length === 0 ? (
-          <p className="text-sm text-navy/50 py-6 text-center">
-            No AI model yet. Everything still works — suggestions come from the built-in learned categorizer, and the
-            assistant answers basic questions from your reports. Add a local model for smarter help.
-          </p>
+          <div className="py-6 text-center">
+            <p className="text-sm text-navy/60">
+              No AI connected yet. Everything still works — suggestions come from the built-in learned categorizer, and
+              the assistant answers basic questions from your reports.
+            </p>
+            <p className="mt-1 text-sm text-navy/60">
+              Connect ChatGPT, Claude, Gemini or a free model on this computer for smarter help.
+            </p>
+            <Button className="mt-4" onClick={() => setPickerOpen(true)}>
+              <Plus className="h-4 w-4" /> Add AI…
+            </Button>
+          </div>
         ) : (
           <div className="space-y-4">
             {drafts.map((d) => {
@@ -472,7 +547,7 @@ export default function AiSettingsPage() {
                       )}
                     </div>
                     <div className="md:col-span-4">
-                      <Label>API key {d.kind === 'anthropic' ? '' : '(optional)'}</Label>
+                      <Label>API key {d.kind === 'anthropic' || presetOf(d)?.needsKey ? '' : '(optional)'}</Label>
                       <Input
                         type="password"
                         autoComplete="off"
@@ -491,6 +566,15 @@ export default function AiSettingsPage() {
                           Remove saved key
                         </button>
                       )}
+                      {(() => {
+                        const pr = presetOf(d);
+                        if (!pr?.getUrl) return null;
+                        return (
+                          <a href={pr.getUrl} target="_blank" rel="noreferrer" className="mt-1 block text-xs text-electric hover:underline">
+                            {pr.getLabel} ↗
+                          </a>
+                        );
+                      })()}
                     </div>
                     <div className="md:col-span-4 flex items-center gap-2 justify-end">
                       <label className="flex items-center gap-2 text-sm text-navy/70 mr-auto">
@@ -558,8 +642,13 @@ export default function AiSettingsPage() {
             <span className="block text-xs text-navy/60">
               Off by default. When on, tasks set to use the cloud send REDACTED text (no names, contact details, tax IDs,
               account numbers or addresses). Cloud providers are asked not to store requests; nothing is saved by
-              Ironbooks outside this computer.
+              Ironbooks outside this computer. Saving with this on also allows AI under Privacy &amp; Network.
             </span>
+            {cloudVerdict && (
+              <span className={`mt-1 block text-xs ${cloudVerdict.allowed ? 'text-emerald' : 'text-navy/50'}`}>
+                Privacy &amp; Network: {cloudVerdict.allowed ? 'cloud AI is allowed.' : cloudVerdict.reason}
+              </span>
+            )}
           </span>
         </label>
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">

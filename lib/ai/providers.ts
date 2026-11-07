@@ -200,10 +200,28 @@ export function createOllamaProvider(cfg: ProviderRuntimeConfig, deps: ProviderD
 // OpenAI-compatible — POST /v1/chat/completions, GET /v1/models
 // ---------------------------------------------------------------------------
 
-/** Accept both "http://host:1234" and "http://host:1234/v1" as base URLs. */
+/**
+ * Accept "http://host:1234" (gets /v1) and any URL that already names its path — "…/v1",
+ * Gemini's "…/v1beta/openai", OpenRouter's "…/api/v1", Groq's "…/openai/v1".
+ */
 export function openAiBase(baseUrl: string): string {
   const b = trimSlash(baseUrl);
-  return /\/v\d+$/.test(b) ? b : `${b}/v1`;
+  try {
+    const u = new URL(b);
+    if (u.pathname === '' || u.pathname === '/') return `${b}/v1`;
+    return b;
+  } catch {
+    return /\/v\d+$/.test(b) ? b : `${b}/v1`;
+  }
+}
+
+/** api.openai.com (and its regional hosts): the only service that understands OpenAI's `store`. */
+function isOpenAiHost(base: string): boolean {
+  try {
+    return /(^|\.)api\.openai\.com$/i.test(new URL(base).hostname);
+  } catch {
+    return false;
+  }
 }
 
 export function createOpenAiCompatibleProvider(cfg: ProviderRuntimeConfig, deps: ProviderDeps = {}): AiProvider {
@@ -220,8 +238,9 @@ export function createOpenAiCompatibleProvider(cfg: ProviderRuntimeConfig, deps:
       messages,
       temperature: opts.temperature ?? 0.1,
       ...(opts.maxTokens ? { max_tokens: opts.maxTokens } : {}),
-      // Cloud APIs: ask the provider not to retain the conversation (OpenAI `store`).
-      ...(locality === 'cloud' ? { store: false } : {}),
+      // OpenAI itself: ask it not to retain the conversation (`store`). Other services that speak
+      // the OpenAI format may reject fields they do not know, so only OpenAI gets it.
+      ...(isOpenAiHost(base) ? { store: false } : {}),
     };
     if (withSchema && opts.jsonSchema) {
       body.response_format = {
@@ -363,7 +382,8 @@ export function createAnthropicProvider(cfg: ProviderRuntimeConfig, deps: Provid
             model,
             max_tokens: opts.maxTokens ?? 1024,
             ...(system.length ? { system: system.join('\n\n') } : {}),
-            temperature: opts.temperature ?? 0.1,
+            // No `temperature`: current Claude models reject any value but the default (the SDK
+            // marks it deprecated: a 400 on every call), and the router validates JSON output anyway.
             messages: turns,
           },
           { signal: opts.signal },

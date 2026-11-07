@@ -76,6 +76,10 @@ describe('OpenAI-compatible provider', () => {
   it('normalizes base URLs', () => {
     expect(openAiBase('http://h:1234')).toBe('http://h:1234/v1');
     expect(openAiBase('http://h:1234/v1/')).toBe('http://h:1234/v1');
+    // Services whose OpenAI-compatible endpoint is not at /v1 keep their path.
+    expect(openAiBase('https://generativelanguage.googleapis.com/v1beta/openai')).toBe('https://generativelanguage.googleapis.com/v1beta/openai');
+    expect(openAiBase('https://openrouter.ai/api/v1')).toBe('https://openrouter.ai/api/v1');
+    expect(openAiBase('https://api.groq.com/openai/v1/')).toBe('https://api.groq.com/openai/v1');
   });
 
   it('sends response_format + bearer key; local servers get no store flag', async () => {
@@ -94,6 +98,15 @@ describe('OpenAI-compatible provider', () => {
     expect(p.locality).toBe('cloud');
     await p.chat([{ role: 'user', content: 'x' }]);
     expect(f.calls[0].body.store).toBe(false);
+  });
+
+  it('other cloud services that speak the OpenAI format are not sent OpenAI-only fields', async () => {
+    const f = mockFetch(() => jsonResponse({ choices: [{ message: { content: 'ok' } }] }));
+    const p = createOpenAiCompatibleProvider({ id: 'g', kind: 'openai-compatible', label: 'Gemini', baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-2.5-flash', apiKey: 'k', enabled: true }, { fetch: f.fn });
+    expect(p.locality).toBe('cloud');
+    await p.chat([{ role: 'user', content: 'x' }]);
+    expect(f.calls[0].url).toBe('https://generativelanguage.googleapis.com/v1beta/openai/chat/completions');
+    expect(f.calls[0].body.store).toBeUndefined();
   });
 
   it('retries once without response_format when the server rejects it', async () => {

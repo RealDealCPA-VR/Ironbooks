@@ -469,6 +469,36 @@ function sameEndpoint(saved: StoredProviderConfig, draft: { kind: string; baseUr
   return saved.kind === draft.kind && normUrl(saved.baseUrl) === normUrl(draft.baseUrl);
 }
 
+/**
+ * What the settings page shows when a test fails: the usual mistakes in plain words (a key that
+ * was not accepted, a server that is not running, a wrong URL), with the raw detail after it.
+ */
+export function friendlyTestError(error: string, kind: string, baseUrl: string | null | undefined): string {
+  const raw = error.trim();
+  if (/^Blocked by network policy/i.test(raw)) return raw;
+  if (/HTTP 401|HTTP 403|invalid[_ ]api[_ ]key|authentication|unauthorized/i.test(raw)) {
+    return `The API key was not accepted. Check it (and that it has credit or access) and try again. (${raw})`;
+  }
+  if (/HTTP 404/i.test(raw)) {
+    return `Nothing answered at that address. Check the server URL${kind === 'openai-compatible' ? " — it usually ends in /v1" : ''}. (${raw})`;
+  }
+  if (/^Could not reach|ECONNREFUSED|ENOTFOUND|fetch failed/i.test(raw)) {
+    const host = (() => {
+      try {
+        return baseUrl ? new URL(baseUrl).host : null;
+      } catch {
+        return null;
+      }
+    })();
+    const local = host && /^(localhost|127\.0\.0\.1|\[::1\])/i.test(host);
+    return local
+      ? `Nothing is listening at ${host}. Start ${kind === 'ollama' ? 'Ollama' : 'the local server (LM Studio: turn on its server)'} and test again. (${raw})`
+      : `Could not reach ${host ?? 'the server'}. Check the address and your connection. (${raw})`;
+  }
+  if (/timed out/i.test(raw)) return `No answer in time. The server may be busy or asleep — try again. (${raw})`;
+  return raw;
+}
+
 export async function testConnection(
   ctx: ServiceContext,
   input: ProviderInput,
@@ -506,7 +536,7 @@ export async function testConnection(
   const timer = setTimeout(() => ac.abort(), p.timeoutMs ?? 15_000);
   try {
     const health = await provider.health({ signal: ac.signal });
-    if (!health.ok) return { ...health, models: [], ...base };
+    if (!health.ok) return { ...health, error: friendlyTestError(health.error ?? 'Failed.', p.kind, p.baseUrl), models: [], ...base };
     let models: ModelInfo[] = [];
     try {
       models = await provider.listModels({ signal: ac.signal });

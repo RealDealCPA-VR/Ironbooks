@@ -240,6 +240,13 @@ export default function AssistantPanel({ open, onClose }: { open: boolean; onClo
                 Ask a question in plain English. I can read your reports but I can’t change anything — if you ask me to
                 record something, I’ll prepare it for you to approve.
               </p>
+              <p className="mb-3 text-xs text-navy/50">
+                Works with ChatGPT, Claude, Gemini or a free model on this computer — set up once in{' '}
+                <Link href="/ai-settings" onClick={onClose} className="text-electric underline">
+                  AI &amp; Automation
+                </Link>
+                .
+              </p>
               <div className="flex flex-wrap gap-2">
                 {STARTERS.map((s) => (
                   <button
@@ -266,7 +273,12 @@ export default function AssistantPanel({ open, onClose }: { open: boolean; onClo
                 </div>
                 <div className="mt-1 flex flex-wrap items-center gap-1.5">
                   {m.reply.mode === 'offline' ? (
-                    <Badge tone="neutral">Basic answer (no AI model)</Badge>
+                    <>
+                      <Badge tone="neutral">Basic answer (no AI model)</Badge>
+                      <Link href="/ai-settings" onClick={onClose} className="text-[11px] text-electric underline">
+                        Connect your AI for full answers
+                      </Link>
+                    </>
                   ) : m.reply.redacted ? (
                     <Badge tone="warning">
                       <Cloud className="inline h-3 w-3 mr-1" />

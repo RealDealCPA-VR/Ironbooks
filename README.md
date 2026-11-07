@@ -198,6 +198,13 @@ Want out again? Lists and transactions export to **IIF, CSV and Excel**.
 | Your LAN or **Tailscale tailnet** | ✅ | Nothing beyond your own network |
 | A cloud provider (e.g. Claude) | Opt-in per company | Only the prompt, with **SSNs, TINs and account numbers redacted** |
 
+**Bring your own AI.** Company > AI & Automation > **Add AI…** lists the ones people already
+have: OpenAI (ChatGPT), Anthropic (Claude), Google Gemini, Groq, OpenRouter, Mistral, xAI (Grok),
+DeepSeek, plus Ollama and LM Studio on this computer and any OpenAI-compatible server. Pick one,
+paste its API key (cloud) or press Test connection (local), Save — done. Keys are stored encrypted
+inside the company file, so they travel with it. One switch allows cloud AI; it also opens the
+company's network policy for AI, so there is no second page to find.
+
 The AI learns your categorization the way QuickBooks does, suggests journal entries for **your
 approval**, and reviews the books for unbalanced, duplicate or miscategorized entries and
 outliers. Every network call goes through one policy guard. [`PRIVACY.md`](./PRIVACY.md) lists

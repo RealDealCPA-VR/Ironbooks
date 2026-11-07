@@ -678,6 +678,11 @@ export function buildSetupPlan(
     nextSteps.push({ label: 'Add your employees', href: '/employees', why: 'Payroll needs pay rates and tax details.' });
   }
   nextSteps.push({ label: 'Import bank transactions', href: '/bank-feeds', why: 'Saves typing — review and categorize instead.' });
+  nextSteps.push({
+    label: 'Connect your AI',
+    href: '/ai-settings',
+    why: 'Use ChatGPT, Claude, Gemini or a free model on this computer to categorize, answer questions about your books and catch mistakes.',
+  });
 
   return {
     settings,

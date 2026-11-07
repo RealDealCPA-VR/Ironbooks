@@ -44,6 +44,17 @@ const PAGE_MENU_ACTIONS: Record<string, () => void> = {
   'product-info': () => window.dispatchEvent(new Event(OPEN_PRODUCT_INFO_EVENT)),
   'window-list': () => window.dispatchEvent(new Event(OPEN_WINDOW_LIST_EVENT)),
   'customize-favorites': () => window.dispatchEvent(new Event(CUSTOMIZE_FAVORITES_EVENT)),
+  // Edit > New / Edit / Delete / Memorize / Insert Line …: press the QuickBooks key on the focused
+  // field (or the page), so the menu does exactly what the key does there.
+  'edit-new': () => replayKey('Ctrl+N'),
+  'edit-edit': () => replayKey('Ctrl+E'),
+  'edit-delete': () => replayKey('Ctrl+D'),
+  'edit-memorize': () => replayKey('Ctrl+M'),
+  'edit-insert-line': () => replayKey('Ctrl+Insert'),
+  'edit-delete-line': () => replayKey('Ctrl+Delete'),
+  'edit-go-to-transfer': () => replayKey('Ctrl+G'),
+  'edit-history': () => replayKey('Ctrl+H'),
+  'edit-journal': () => replayKey('Ctrl+Y'),
   ...Object.fromEntries(
     (['close', 'next', 'prev'] as WindowCommand[]).map((action) => [
       `window-${action}`,
@@ -191,12 +202,6 @@ export default function DesktopBridge() {
           toastError(err, 'The sandbox copy could not be made.');
           router.push('/sandbox');
         });
-        return;
-      }
-      // Edit > New / Edit / Delete / Memorize / Insert Line …: press the QuickBooks key on the
-      // focused field (or the page), so the menu does exactly what the key does there.
-      if (action.startsWith('key:')) {
-        replayKey(action.slice(4));
         return;
       }
       const pageAction = PAGE_MENU_ACTIONS[action];

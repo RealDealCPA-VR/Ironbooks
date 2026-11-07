@@ -12,9 +12,11 @@ import {
   DEFAULT_NETWORK_POLICY,
   NETWORK_MODES,
   OUTBOUND_PURPOSES,
+  envModeCeiling,
   normalizeLookupUrl,
   normalizePolicy,
   type NetworkPolicy,
+  type OutboundPurpose,
 } from '@/lib/net/policy';
 import { type ServiceContext, ServiceError, inTransaction, notFound, writeAudit } from './_base';
 
@@ -69,6 +71,36 @@ function assertCanManage(ctx: ServiceContext): void {
   if (ctx.role && ctx.role !== 'owner' && ctx.role !== 'admin') {
     throw new ServiceError('FORBIDDEN', 'Only an owner or admin can change privacy and network settings.');
   }
+}
+
+/**
+ * Let one cloud service through — what "Allow cloud AI" on the AI page does, so a person who
+ * adds Claude or ChatGPT there never has to find Privacy & Network as well. Moves the mode up
+ * to 'allow-cloud' (never out of 'offline': that choice is deliberate, so it is reported
+ * instead) and turns the purpose on. Returns what changed, and a note when it could not.
+ */
+export async function allowCloudPurpose(
+  ctx: ServiceContext,
+  purpose: OutboundPurpose,
+): Promise<{ changed: boolean; notice: string | null }> {
+  const current = await getNetworkPolicy(ctx);
+  const ceiling = envModeCeiling();
+  if (ceiling && ceiling !== 'allow-cloud') {
+    return { changed: false, notice: `This computer is limited to "${ceiling}" network mode (BKA_NETWORK_MODE), so cloud AI cannot be used here.` };
+  }
+  if (current.mode === 'offline') {
+    return {
+      changed: false,
+      notice: 'This company is in Offline mode, so cloud AI stays blocked. Choose "Allow cloud services I choose" in Settings → Privacy & Network to use it.',
+    };
+  }
+  if (current.mode === 'allow-cloud' && current.cloudOptIn[purpose]) return { changed: false, notice: null };
+  await setNetworkPolicy(ctx, {
+    mode: 'allow-cloud',
+    cloudOptIn: { ...current.cloudOptIn, [purpose]: true },
+    vendorLookupUrl: current.vendorLookupUrl,
+  });
+  return { changed: true, notice: null };
 }
 
 /**
