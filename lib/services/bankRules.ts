@@ -37,6 +37,7 @@ import {
   validation,
   writeAudit,
 } from './_base';
+import { glHistoryPatterns } from './historyPatterns';
 import {
   LEARN_THRESHOLD,
   RULE_DIRECTIONS,
@@ -579,6 +580,22 @@ export async function ruleOffers(ctx: ServiceContext, opts: { pattern?: string }
     learningOnly: true,
     ...(opts.pattern ? { patterns: [opts.pattern] } : {}),
   });
+  // Imported QuickBooks history (lib/services/historyPatterns.ts): years of "Shell Oil → Fuel"
+  // count exactly like choices made here, so rules are offered the moment the books are moved.
+  for (const h of await glHistoryPatterns(ctx)) {
+    if (opts.pattern && h.pattern !== opts.pattern) continue;
+    history.push({
+      pattern: h.pattern,
+      bankAccountId: h.bankAccountId,
+      direction: h.direction,
+      accountId: h.accountId,
+      classId: h.classId,
+      payee: h.payee,
+      split: false,
+      source: 'qb_history',
+      createdAt: h.createdAt,
+    });
+  }
   if (history.length === 0) return [];
 
   const rules = await activeBankRules(ctx);
@@ -602,7 +619,7 @@ export async function ruleOffers(ctx: ServiceContext, opts: { pattern?: string }
     return hit;
   };
 
-  type Group = { pattern: string; direction: 'in' | 'out'; accountId: string; classId: string | null; payees: Set<string | null>; count: number };
+  type Group = { pattern: string; direction: 'in' | 'out'; accountId: string; classId: string | null; payees: Set<string | null>; count: number; fromHistory: number };
   const groups = new Map<string, Group>();
   for (const h of history) {
     if (h.split || !h.pattern) continue;
@@ -617,8 +634,10 @@ export async function ruleOffers(ctx: ServiceContext, opts: { pattern?: string }
       classId: h.classId,
       payees: new Set<string | null>(),
       count: 0,
+      fromHistory: 0,
     };
     g.count += 1;
+    if (h.source === 'qb_history') g.fromHistory += 1;
     g.payees.add(h.payee?.trim() || null);
     groups.set(key, g);
   }
@@ -667,7 +686,10 @@ export async function ruleOffers(ctx: ServiceContext, opts: { pattern?: string }
       className,
       payee,
       count: g.count,
-      question: `Always categorize ${g.pattern} as ${acct.name}${className ? ` (${className})` : ''}?`,
+      question:
+        g.fromHistory > 0 && g.fromHistory === g.count
+          ? `Your QuickBooks history put ${g.pattern} under ${acct.name}${className ? ` (${className})` : ''} ${g.count} times. Always categorize it that way?`
+          : `Always categorize ${g.pattern} as ${acct.name}${className ? ` (${className})` : ''}?`,
       rule: {
         name: `${g.pattern} → ${acct.name}`.slice(0, MAX_TEXT),
         matchField: 'any',

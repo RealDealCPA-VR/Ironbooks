@@ -40,6 +40,7 @@ import { BUSINESS_TYPES, ENTITY_TYPES } from '@/lib/onboarding';
 import { lookupVendor } from './vendorLookup';
 import { type ServiceContext, ServiceError, inTransaction, notFound, writeAudit } from './_base';
 import { categorize } from './bankCategorize';
+import { glHistoryPatterns } from './historyPatterns';
 import { buildRouter, loadSettings, type BuildRouterOptions } from './aiSettings';
 import {
   NONE,
@@ -188,6 +189,20 @@ async function collectExamples(ctx: ServiceContext, since: Date | null): Promise
       amount: r.amount,
       direction: Money.isNegative(r.amount) ? 'out' : 'in',
       labels: { account: r.offsetAccountId },
+    });
+  }
+
+  // Imported QuickBooks history (lib/services/historyPatterns.ts): the previous bookkeeper's
+  // choices, so a freshly moved company gets suggestions from its first bank feed.
+  for (const h of await glHistoryPatterns(ctx, { since })) {
+    out.push({
+      key: `qbgl_entry:${h.entryId}`,
+      createdAt: h.createdAt,
+      payee: h.payee,
+      memo: h.memo,
+      amount: h.amount,
+      direction: h.direction,
+      labels: { account: h.accountId },
     });
   }
 

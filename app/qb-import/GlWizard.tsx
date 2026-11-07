@@ -765,6 +765,11 @@ function Counts({ result }: { result: GlImportResult }) {
         ))}
       {c.openingEntryPosted && <Badge tone="info">opening balances</Badge>}
       {result.variancePosted && <Badge tone="warning">{formatCurrency(result.variancePosted)} to suspense</Badge>}
+      {c.payeePatterns > 0 && (
+        <a href="/bank-rules" className="inline-flex items-center rounded-full bg-electric/10 px-2.5 py-0.5 text-xs font-semibold text-electric hover:underline">
+          {c.payeePatterns} payee pattern{c.payeePatterns === 1 ? '' : 's'} learned — review suggested rules →
+        </a>
+      )}
     </div>
   );
 }

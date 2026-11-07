@@ -36,6 +36,8 @@ import {
 import { Money, toAmountString } from '@/lib/money';
 import { withPlannerStats } from '@/lib/db/plannerStats';
 import { type ServiceContext, ServiceError, inTransaction, validation, writeAudit } from './_base';
+import { retrainModel } from './aiCategorizer';
+import { ruleOffers } from './bankRules';
 import { createAccount } from './accounts';
 import { createCustomer } from './customers';
 import { createClass } from './dimensions';
@@ -380,6 +382,8 @@ export interface GlImportResult {
     entriesAlreadyImported: number;
     openingEntryPosted: boolean;
     reviewItems: number;
+    /** Payee → account patterns found in the imported history, offered as bank rules. */
+    payeePatterns: number;
   };
   review: GlReviewItem[];
   /** Amount moved to 'QB Import Suspense' (absolute total of the variance lines), if any. */
@@ -529,7 +533,7 @@ async function runGlImportUnanalyzed(
   if (!periodEnd) throw validation('The report period end date is unknown. Enter it and try again.');
 
   try {
-    return await inTransaction(ctx, async (tx) => {
+    const done = await inTransaction(ctx, async (tx) => {
       const warnings = [...analysis.warnings];
       const counts: GlImportResult['counts'] = {
         accountsCreated: 0,
@@ -542,6 +546,7 @@ async function runGlImportUnanalyzed(
         entriesAlreadyImported: 0,
         openingEntryPosted: false,
         reviewItems: analysis.review.length,
+        payeePatterns: 0,
       };
 
       // ---- 1. Chart of accounts ------------------------------------------------
@@ -1020,6 +1025,8 @@ async function runGlImportUnanalyzed(
       result.importId = rec.id;
       return result;
     });
+    if (!done.dryRun && done.ok && done.counts.entriesPosted > 0) await learnFromImport(ctx, done);
+    return done;
   } catch (err) {
     if (err instanceof Rollback) return err.result;
     // A value the books cannot hold (a 300-character account or class name, an amount past the
@@ -1028,6 +1035,24 @@ async function runGlImportUnanalyzed(
       throw validation(`Nothing was saved: ${dataExceptionMessage(err)} Check the account, class and name columns of the report.`);
     }
     throw err;
+  }
+}
+
+/**
+ * After an import: the learned categorizer trains on the imported history and the bank-rule
+ * offers it produces are counted for the result (lib/services/historyPatterns.ts). Best effort —
+ * the books are already saved; a hiccup here must not turn a finished import into an error.
+ */
+async function learnFromImport(ctx: ServiceContext, done: GlImportResult): Promise<void> {
+  try {
+    await retrainModel(ctx);
+  } catch (err) {
+    console.warn('[qb-import] categorizer retrain after import failed:', err instanceof Error ? err.message : err);
+  }
+  try {
+    done.counts.payeePatterns = (await ruleOffers(ctx)).length;
+  } catch (err) {
+    console.warn('[qb-import] rule offers after import failed:', err instanceof Error ? err.message : err);
   }
 }
 
