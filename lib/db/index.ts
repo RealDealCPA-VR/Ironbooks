@@ -115,6 +115,18 @@ export class NewerCompanyFileError extends ServiceError {
   }
 }
 
+/**
+ * The database in a company folder would not START (PGlite aborted while Postgres was starting:
+ * typically "could not locate a valid checkpoint record"), as opposed to a statement or migration
+ * that failed once it was running. getDb hands it to lib/services/workingCopyRecovery.ts.
+ */
+export class DatabaseWouldNotStartError extends Error {
+  constructor(public dir: string, public cause: unknown) {
+    super(`The database in ${dir} would not start: ${(cause as Error)?.message ?? String(cause)}`);
+    this.name = 'DatabaseWouldNotStartError';
+  }
+}
+
 /** The newest migration this app ships (`when` in the drizzle journal); null without a journal. */
 export function latestShippedMigrationAt(migrationsFolder: string = MIGRATIONS_FOLDER): number | null {
   try {
@@ -151,16 +163,29 @@ export function withDamagedFileAccess<T>(fn: () => Promise<T>): Promise<T> {
   return damagedFileAccess.run(true, fn);
 }
 
-const handles = new Map<string, DbHandle>();
+/**
+ * The open databases of this PROCESS, by data directory — kept on globalThis, not in this module.
+ * Next.js can load this module more than once in one server process (`next dev` builds every route
+ * on its own, and rebuilds them after an edit), and a second copy with its own map would start a
+ * second Postgres on a folder that is already open. Two Postgres instances writing one folder
+ * destroy it: one recycles the write-ahead log segment the other's next checkpoint is written
+ * into, and after the process stops the folder no longer starts at all ("could not locate a valid
+ * checkpoint record"). The folder lock (dirLock.ts) cannot tell the two apart: same process.
+ */
+const processState = globalThis as typeof globalThis & {
+  __ironbooksDbHandles?: Map<string, DbHandle>;
+  __ironbooksDbOpenHolds?: Map<string, Promise<void>>;
+};
+const handles: Map<string, DbHandle> = (processState.__ironbooksDbHandles ??= new Map());
 
 /**
  * Company files that must not be (re)opened right now: the sandbox switch (lib/services/sandbox.ts)
  * holds the REAL file from just before it closes its handle until the server points at the copy,
  * so no request that slips in between can open a fresh handle to the real file and keep writing
  * to it while the server is in the sandbox. getDb() waits for the hold to end and then opens
- * whichever file is active by then; the synchronous openDb() refuses instead.
+ * whichever file is active by then; the synchronous openDb() refuses instead. Process-wide too.
  */
-const openHolds = new Map<string, Promise<void>>();
+const openHolds: Map<string, Promise<void>> = (processState.__ironbooksDbOpenHolds ??= new Map());
 
 /** Keep `dataDir` from being opened until the returned release function is called. */
 export function holdDbOpen(dataDir: string): () => void {
@@ -249,6 +274,12 @@ export function openDb(dataDir?: string): DbHandle {
   const opened: DbHandle = { client, db, migrated: Promise.resolve(), damage: null, lost: null };
   handle = opened;
   opened.migrated = (async () => {
+    // Postgres starts (and replays its write-ahead log after a crash) before the first statement.
+    try {
+      await client.waitReady;
+    } catch (err) {
+      throw new DatabaseWouldNotStartError(dir, err);
+    }
     // PGlite's session time zone follows the host (e.g. Etc/GMT+5), so now() / defaultNow()
     // wrote local wall-clock time into `timestamp` columns, which drizzle reads back as UTC —
     // every DB-stamped time came back hours early (and a day early just after midnight).
@@ -339,7 +370,14 @@ export async function getLedgerDamage(dataDir?: string): Promise<LedgerProblem[]
   // Only a held file costs an extra tick: otherwise the file is resolved at call time, as before.
   if (openHoldFor(dataDir)) await waitForOpenHold(dataDir);
   const handle = openDb(dataDir);
-  await handle.migrated;
+  try {
+    await handle.migrated;
+  } catch (err) {
+    if (!(err instanceof DatabaseWouldNotStartError)) throw err;
+    // Would not start: getDb reopens the last save (or says why it can't), as for any request.
+    await withDamagedFileAccess(() => getDb(dataDir));
+    return openDb(dataDir).damage;
+  }
   return handle.damage;
 }
 
@@ -350,8 +388,29 @@ export async function getLedgerDamage(dataDir?: string): Promise<LedgerProblem[]
 export async function getDb(dataDir?: string): Promise<DB> {
   // Only a held file costs an extra tick: otherwise the file is resolved at call time, as before.
   if (openHoldFor(dataDir)) await waitForOpenHold(dataDir);
-  const handle = openDb(dataDir);
-  await handle.migrated;
+  let handle = openDb(dataDir);
+  try {
+    await handle.migrated;
+  } catch (err) {
+    if (!(err instanceof DatabaseWouldNotStartError)) throw err;
+    // The books on this computer would not start: reopen the company file's last save instead of
+    // locking the person out (lib/services/workingCopyRecovery.ts), then try once more.
+    const recovery = await import('@/lib/services/workingCopyRecovery');
+    const outcome = await recovery.recoverUnstartableWorkingCopy(err.dir);
+    if (outcome === 'resealed') {
+      throw new ServiceError('FORBIDDEN', 'Authentication required.', { sealed: true, resealed: true });
+    }
+    if (outcome !== 'replaced') {
+      throw new recovery.BooksWontOpenError(recovery.dataDirProblem(err.dir), Boolean(process.env.BKA_COMPANY_FILE));
+    }
+    handle = openDb(dataDir);
+    try {
+      await handle.migrated;
+    } catch (again) {
+      if (again instanceof DatabaseWouldNotStartError) throw new recovery.BooksWontOpenError(recovery.dataDirProblem(again.dir), true);
+      throw again;
+    }
+  }
   // Taken over by another process while it was opening (dirLock.ts): never hand it out.
   if (handle.lost) throw handle.lost;
   if (handle.damage && !damagedFileAccess.getStore()) throw new LedgerDamagedError(handle.damage);

@@ -53,6 +53,15 @@ function desktop(): DesktopCompanyBridge | undefined {
 
 const lastUserKey = (fileId: string) => `ib:last-user:${fileId}`;
 
+/** A recovery notice already shown on this computer (components/CompanyFileStatus.tsx shares the key). */
+function seenRecovery(id: string): boolean {
+  try {
+    return localStorage.getItem(`ib:recovery-seen:${id}`) === '1';
+  } catch {
+    return false;
+  }
+}
+
 export default function LoginPage() {
   const [info, setInfo] = useState<FileInfo | null>(null);
   const [userName, setUserName] = useState('');
@@ -66,6 +75,8 @@ export default function LoginPage() {
   const [filePassword, setFilePassword] = useState('');
   // An "unsaved changes" copy kept when the file was opened: shown before continuing.
   const [keptCopy, setKeptCopy] = useState<{ path: string; next: string } | null>(null);
+  // The books on this computer were damaged and reopened from the last save (lib/services/workingCopyRecovery.ts).
+  const [recovered, setRecovered] = useState<{ id: string; message: string; next: string | null } | null>(null);
   const userRef = useRef<HTMLInputElement>(null);
   const passRef = useRef<HTMLInputElement>(null);
   const filePassRef = useRef<HTMLInputElement>(null);
@@ -123,6 +134,7 @@ export default function LoginPage() {
         challengeMissing?: boolean;
         offerProtection?: boolean;
         conflictCopy?: string;
+        recovery?: { id: string; message: string };
         recoveryCodeUsed?: boolean;
         recoveryCodesLeft?: number;
       }>('/api/auth/login', {
@@ -192,6 +204,13 @@ export default function LoginPage() {
           return;
         }
       }
+      if (res?.recovery && !seenRecovery(res.recovery.id)) {
+        // The books on this computer were damaged and reopened from the last save: say so first.
+        setRecovered({ id: res.recovery.id, message: res.recovery.message, next: res.conflictCopy ? null : next });
+        if (res.conflictCopy) setKeptCopy({ path: res.conflictCopy, next });
+        setBusy(false);
+        return;
+      }
       if (res?.conflictCopy) {
         setKeptCopy({ path: res.conflictCopy, next });
         setBusy(false);
@@ -231,6 +250,29 @@ export default function LoginPage() {
   }
 
   const company = info?.companyName || info?.fileName?.replace(/\.(ironbooks|bookkeeper)$/i, '') || 'Company file';
+
+  if (recovered) {
+    const done = () => {
+      try {
+        localStorage.setItem(`ib:recovery-seen:${recovered.id}`, '1');
+      } catch {
+        /* shown again in the title bar: harmless */
+      }
+      if (recovered.next) window.location.href = recovered.next;
+      else setRecovered(null);
+    };
+    return (
+      <main className="min-h-screen flex items-center justify-center bg-offwhite p-4 font-sans">
+        <Card className="w-full max-w-md p-8 space-y-4">
+          <h1 className="text-lg font-bold text-navy">Your company file was reopened from its last save</h1>
+          <p className="text-sm text-navy/70 break-words select-text">{recovered.message}</p>
+          <Button className="w-full" autoFocus onClick={done}>
+            Continue
+          </Button>
+        </Card>
+      </main>
+    );
+  }
 
   if (keptCopy) {
     return (

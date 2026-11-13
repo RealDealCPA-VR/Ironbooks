@@ -43,6 +43,7 @@ import { BACKUP_HISTORY_FILE } from './backupHistory';
 import { isRestoreInProgress, whenRestoreDone } from './restoreState';
 import { KEY_MISSING_MESSAGE, applyPendingKeyRotation, cachedSealProtection, fileKeyRotationPending, sealProtectionFor, type SealProtection } from './fileProtection';
 import { APP_VERSION } from '@/lib/appVersion';
+import { UnstartableBooksError, snapshotProblem } from './workingCopyRecovery';
 
 /** How often the autosave timer looks for changes. */
 export const AUTOSAVE_TICK_MS = 2_000;
@@ -317,6 +318,7 @@ function readOwner(lockDir: string): { token?: string; computer?: string; appUse
 }
 
 function friendlyIoError(err: unknown, file: string): string {
+  if (err instanceof UnstartableBooksError) return err.message;
   // A protected file whose key is not known here (lib/services/fileProtection.ts): never saved in plain text.
   if ((err as { details?: { fileKeyMissing?: boolean } })?.details?.fileKeyMissing) return `${KEY_MISSING_MESSAGE} Your changes are kept on this computer.`;
   const code = (err as NodeJS.ErrnoException)?.code;
@@ -461,6 +463,14 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
     // A copy kept apart is a separate company file: it never carries this file's backup history
     // (its own rotation would delete this file's backup versions).
     const entries = conflict ? withoutBackupHistory(format.snapshotDir(dataDir)) : format.snapshotDir(dataDir);
+    // Never write books that would not start over the company file (or its "unsaved changes"
+    // copy): the last good save is what a damaged working copy is reopened from
+    // (lib/services/workingCopyRecovery.ts). The changes stay counted as unsaved (catch below).
+    const damaged = snapshotProblem(entries);
+    if (damaged) {
+      console.error(`[company-file] not saving ${dataDir}: ${damaged}.`);
+      throw new UnstartableBooksError(damaged, 'save');
+    }
     const savedAt = new Date().toISOString();
     const saveId = randomUUID();
     const companyName = companyNameFor(s, dataDir);
@@ -885,6 +895,8 @@ export async function saveCopyAs(
   // Nor its backup history: the copy's rotation would otherwise delete this file's backup versions.
   // Converting a company folder into a single file continues the same company, so it keeps it.
   const snapshot = format.snapshotDir(dataDir).filter((e: { name: string }) => e.name !== '.file-id');
+  const damaged = snapshotProblem(snapshot);
+  if (damaged) throw new UnstartableBooksError(damaged, 'save');
   const entries = [
     ...(opts.keepBackupHistory ? snapshot : withoutBackupHistory(snapshot)),
     { name: '.file-id', data: Buffer.from(fileId) },

@@ -58,6 +58,7 @@ import {
   unsealCompanyFile,
   takeUnsealedConflictCopy,
 } from '@/lib/services/fileProtection';
+import { recoveryNotice, settleSealedWorkingCopy } from '@/lib/services/workingCopyRecovery';
 import { cookieSecure, originFromHeaders, type RequestOrigin } from '@/lib/net/requestInfo';
 import { GLOBAL_KEY_WEIGHT, attemptKeys, loginLimiter, tooManyAttempts } from '@/lib/net/rateLimit';
 
@@ -138,6 +139,9 @@ async function handlePost(req: NextRequest) {
   }
   const { email, password, totp, filePassword } = parsed.data;
   const origin = originFromHeaders(req.headers);
+  // A working copy on this computer that would not start is set aside first: the sign-in then
+  // decrypts the company file's last save instead (lib/services/workingCopyRecovery.ts).
+  await settleSealedWorkingCopy();
   const sealed = sealedMode();
 
   // The company-file password gates the file BEFORE any user login (QB order) — whenever it can be
@@ -292,6 +296,8 @@ async function handlePost(req: NextRequest) {
       }
     }
     const conflictCopy = origin.remote ? null : takeUnsealedConflictCopy();
+    // The books on this computer were damaged and reopened from the last save: say so, and what was lost.
+    const recovery = origin.remote ? null : recoveryNotice();
 
     const res = NextResponse.json({
       id: user.id,
@@ -304,6 +310,7 @@ async function handlePost(req: NextRequest) {
       ...(challengeSlotMissing ? { challengeSlotMissing: true } : {}),
       ...(offerProtection ? { offerProtection: true } : {}),
       ...(conflictCopy ? { conflictCopy } : {}),
+      ...(recovery ? { recovery } : {}),
       // A recovery code was used: the sign-in screen sends the person to Security (2FA) to set
       // up their new authenticator and get new codes.
       ...(recoveryCodeUsed ? { recoveryCodeUsed: true, recoveryCodesLeft: await recoveryCodesLeft(db, user.id) } : {}),

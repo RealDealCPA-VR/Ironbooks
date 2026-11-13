@@ -48,8 +48,14 @@ interface HeldLock {
   onLost?: (host: string) => void;
 }
 
-/** Locks this process holds, by resolved data directory. */
-const held = new Map<string, HeldLock>();
+/**
+ * Locks this process holds, by resolved data directory — process-wide on globalThis, like the open
+ * databases themselves (lib/db/index.ts): a second copy of this module in the same server process
+ * (Next.js loads a module once per route bundle in `next dev`) must see, renew and release the
+ * same locks.
+ */
+const processState = globalThis as typeof globalThis & { __ironbooksDirLocks?: Map<string, HeldLock>; __ironbooksDirLockExitHook?: boolean };
+const held: Map<string, HeldLock> = (processState.__ironbooksDirLocks ??= new Map());
 
 export class CompanyFileInUseError extends ServiceError {
   constructor(public host: string) {
@@ -117,10 +123,9 @@ function isStale(dir: string, lock: { info: LockInfo | null; mtimeMs: number }):
   return folderNow(dir) - lock.mtimeMs > STALE_MS;
 }
 
-let exitHookInstalled = false;
 function installExitHook() {
-  if (exitHookInstalled) return;
-  exitHookInstalled = true;
+  if (processState.__ironbooksDirLockExitHook) return;
+  processState.__ironbooksDirLockExitHook = true;
   process.on('exit', () => {
     for (const dir of [...held.keys()]) releaseDirLock(dir);
   });
