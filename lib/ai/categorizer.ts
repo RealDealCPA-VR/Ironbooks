@@ -185,6 +185,19 @@ function calibrate(state: CategorizerState, raw: number): number {
   return raw * (1 - w) + empirical * w;
 }
 
+/**
+ * First words of a bank line that name the PAYMENT CHANNEL, not the payee: "PAYPAL *ACME",
+ * "SQ *JOES COFFEE", "ZELLE TO MARIA", "POS PURCHASE …". Hundreds of different payees share them,
+ * so "p1:paypal" seen 19 times proves nothing about the next PayPal payee: a payee is only
+ * recognised by its first two words when it starts with one of these.
+ */
+const CHANNEL_PREFIXES = new Set([
+  'paypal', 'pp', 'sq', 'square', 'zelle', 'venmo', 'cashapp', 'cash', 'stripe', 'tst', 'toast',
+  'pos', 'ach', 'debit', 'credit', 'card', 'purchase', 'checkcard', 'chk', 'check', 'wire', 'transfer',
+  'online', 'recurring', 'payment', 'pmt', 'bill', 'web', 'mobile', 'withdrawal', 'deposit', 'dda',
+  'visa', 'mc', 'mastercard', 'amex', 'apple', 'google', 'goog', 'sp', 'eb', 'ebay', 'amzn',
+]);
+
 /** Raw (pre-calibration) confidence for one head. */
 function predictRaw(
   state: CategorizerState,
@@ -195,15 +208,16 @@ function predictRaw(
   const ranked = scoreHead(state, head, feats, allowed);
   if (ranked.length === 0) return null;
   const hs = state.heads[head];
-  // Most specific payee feature the model has seen (two-token, then first token).
+  // Most specific payee feature the model has seen (two-token, then first token — but never a
+  // payment-channel word alone, CHANNEL_PREFIXES).
   const pFeat =
     feats.find((f) => f.startsWith('p2:') && state.vocab[f] !== undefined) ??
-    feats.find((f) => f.startsWith('p1:') && state.vocab[f] !== undefined);
+    feats.find((f) => f.startsWith('p1:') && state.vocab[f] !== undefined && !CHANNEL_PREFIXES.has(f.slice(3)));
   const evidence = (label: string) => {
     if (pFeat) return hs.features[pFeat]?.[label] ?? 0;
     // Unknown payee: weak token-level evidence only.
     let best = 0;
-    for (const f of feats) if (f.startsWith('w:')) best = Math.max(best, hs.features[f]?.[label] ?? 0);
+    for (const f of feats) if (f.startsWith('w:') && !CHANNEL_PREFIXES.has(f.slice(2))) best = Math.max(best, hs.features[f]?.[label] ?? 0);
     return best * 0.5;
   };
   const withConf = ranked.map((r) => {

@@ -150,3 +150,20 @@ describe('keyVault (AES-GCM)', () => {
     expect(decryptSecret(null, company, secret)).toBeNull();
   });
 });
+
+describe('payment-channel prefixes', () => {
+  it('19 PayPal lines to Office Supplies do not make a new PayPal payee confident', () => {
+    const st = emptyState();
+    for (let i = 0; i < 19; i++) {
+      learn(st, { payee: 'PAYPAL *STAPLES', memo: null, amount: `-${20 + i}.00`, direction: 'out', labels: { account: 'office' } });
+    }
+    learn(st, { payee: 'SHELL OIL', memo: null, amount: '-40.00', direction: 'out', labels: { account: 'fuel' } });
+    // A PayPal payee never seen before: no payee evidence, so no confident (auto-postable) guess.
+    const fresh = predict(st, { payee: 'PAYPAL *JOES GARAGE', memo: null, amount: '-80.00', direction: 'out' }).account;
+    expect(fresh === null || fresh.confidence < 0.6).toBe(true);
+    // The same PayPal payee as before is still recognised by its first two words.
+    const known = predict(st, { payee: 'PAYPAL *STAPLES', memo: null, amount: '-25.00', direction: 'out' }).account;
+    expect(known?.label).toBe('office');
+    expect(known!.confidence).toBeGreaterThan(0.8);
+  });
+});

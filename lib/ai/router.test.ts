@@ -145,10 +145,16 @@ describe('OpenAI-compatible provider', () => {
   });
 
   it('downloads a starter model into a local Ollama only', async () => {
-    const f = mockFetch(() => jsonResponse({ status: 'success' }));
-    await pullOllamaModel({ kind: 'ollama', baseUrl: 'http://localhost:11434', apiKey: null }, 'llama3.2', { fetch: f.fn });
+    const ndjson = ['{"status":"pulling manifest"}', '{"status":"downloading","completed":10,"total":100}', '{"status":"success"}'].join('\n');
+    const f = mockFetch(() => new Response(ndjson, { status: 200, headers: { 'content-type': 'application/x-ndjson' } }));
+    const steps: string[] = [];
+    await pullOllamaModel({ kind: 'ollama', baseUrl: 'http://localhost:11434', apiKey: null }, 'llama3.2', { fetch: f.fn }, undefined, (p) => steps.push(p.status));
     expect(f.calls[0].url).toBe('http://localhost:11434/api/pull');
-    expect(f.calls[0].body).toEqual({ model: 'llama3.2', stream: false });
+    expect(f.calls[0].body).toEqual({ model: 'llama3.2', stream: true });
+    expect(steps).toEqual(['pulling manifest', 'downloading', 'success']);
+    // A stream that ends without "success" is a failed download, not a silent one.
+    const cut = mockFetch(() => new Response('{"status":"downloading","completed":10,"total":100}\n', { status: 200 }));
+    await expect(pullOllamaModel({ kind: 'ollama', baseUrl: 'http://localhost:11434', apiKey: null }, 'llama3.2', { fetch: cut.fn })).rejects.toThrow(/stopped before/);
     await expect(pullOllamaModel({ kind: 'ollama', baseUrl: 'https://ollama.example.com', apiKey: null }, 'llama3.2', { fetch: f.fn })).rejects.toMatchObject({ code: 'POLICY' });
     expect(f.calls).toHaveLength(1);
   });

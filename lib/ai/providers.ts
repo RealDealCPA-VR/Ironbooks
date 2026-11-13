@@ -206,18 +206,61 @@ export async function pullOllamaModel(
   model: string,
   deps: ProviderDeps = {},
   signal?: AbortSignal,
+  onProgress?: (p: { status: string; completed?: number; total?: number }) => void,
 ): Promise<void> {
   if (cfg.kind !== 'ollama' || !cfg.baseUrl) throw new AiError('CONFIG', 'Only an Ollama server can download models.');
   if (localityOf(cfg) !== 'local') throw new AiError('POLICY', 'Models are only downloaded into an Ollama server on this computer or your network.');
   const headers: Record<string, string> = { 'content-type': 'application/json' };
   if (cfg.apiKey) headers.authorization = `Bearer ${cfg.apiKey}`;
-  const res = await httpJson<{ status?: string; error?: string }>(guardedFetch(deps), `${trimSlash(cfg.baseUrl)}/api/pull`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({ model, stream: false }),
-    signal,
-  });
-  if (res.error) throw new AiError('HTTP', `Ollama could not download ${model}: ${res.error}`);
+  const url = `${trimSlash(cfg.baseUrl)}/api/pull`;
+  // Streamed: Ollama sends a progress line every moment, so a multi-gigabyte download on a slow
+  // connection never hits an idle/header timeout (a non-streamed pull answers only at the end).
+  let res: Response;
+  try {
+    res = await guardedFetch(deps)(url, { method: 'POST', headers, body: JSON.stringify({ model, stream: true }), signal });
+  } catch (err) {
+    if (err instanceof AiError) throw err;
+    throw new AiError('NETWORK', `Could not reach Ollama at ${new URL(url).host}: ${(err as Error)?.message ?? err}`);
+  }
+  if (!res.ok) {
+    const detail = await res.text().catch(() => '');
+    throw new AiError('HTTP', `HTTP ${res.status} from Ollama${detail ? `: ${detail.slice(0, 300)}` : ''}`, undefined, res.status);
+  }
+  let last = '';
+  let buffer = '';
+  const handle = (lineText: string) => {
+    const t = lineText.trim();
+    if (!t) return;
+    let ev: { status?: string; error?: string; completed?: number; total?: number };
+    try {
+      ev = JSON.parse(t);
+    } catch {
+      return;
+    }
+    if (ev.error) throw new AiError('HTTP', `Ollama could not download ${model}: ${ev.error}`);
+    if (ev.status) {
+      last = ev.status;
+      onProgress?.({ status: ev.status, completed: ev.completed, total: ev.total });
+    }
+  };
+  if (res.body) {
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let nl: number;
+      while ((nl = buffer.indexOf('\n')) >= 0) {
+        handle(buffer.slice(0, nl));
+        buffer = buffer.slice(nl + 1);
+      }
+    }
+    handle(buffer);
+  } else {
+    for (const l of (await res.text()).split('\n')) handle(l);
+  }
+  if (last !== 'success') throw new AiError('HTTP', `Ollama stopped before ${model} finished downloading${last ? ` (last step: ${last})` : ''}.`);
 }
 
 // ---------------------------------------------------------------------------
