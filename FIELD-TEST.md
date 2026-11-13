@@ -1,6 +1,6 @@
 # Ironbooks Two-PC Field Test
 
-Run this once on two office computers and a shared folder to confirm Ironbooks 1.7.2 handles a
+Run this once on two office computers and a shared folder to confirm Ironbooks 1.7.3 handles a
 company file on a file server the way QuickBooks Desktop does. It takes about 45 minutes. Tick
 each box when the result matches; write down anything that doesn't.
 
@@ -10,7 +10,7 @@ You need two Windows computers on the same office network (called **PC A** and *
 and a shared folder both can open, such as `\\SERVER\Books` or a mapped `S:` drive. Use a new
 test company, not your real books.
 
-- [ ] Ironbooks 1.7.2 is installed on both PCs (Help > About shows 1.7.2).
+- [ ] Ironbooks 1.7.3 is installed on both PCs (Help > About shows 1.7.3).
 - [ ] Both PCs can open the shared folder in File Explorer and create a file in it.
 - [ ] On PC A: File > New Company, save it in the shared folder as **Field Test.ironbooks**.
 - [ ] Set up the Admin user name, password and challenge question when asked. Write the password down.
@@ -107,7 +107,7 @@ Do this section without touching the mouse.
 
 Use a PC that has never had Ironbooks, if you have one.
 
-- [ ] In Edge, download **Ironbooks-Setup-1.7.2.exe** from
+- [ ] In Edge, download **Ironbooks-Setup-1.7.3.exe** from
   [the latest release](https://github.com/RealDealCPA-VR/Ironbooks/releases/latest). Note exactly
   what the browser and Windows say. Until signing is set up, Windows shows "Windows protected your
   PC": choose **More info**, then **Run anyway**.
