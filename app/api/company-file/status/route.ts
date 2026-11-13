@@ -14,6 +14,7 @@ import { users } from '@/lib/db/schema';
 import { isInternalRequest } from '@/lib/net/internalToken';
 import { getRequestOrigin } from '@/lib/net/requestInfo';
 import { ensureAutosave, getCompanyFileSaveStatus } from '@/lib/services/companyFileSave';
+import { recoveryNotice } from '@/lib/services/workingCopyRecovery';
 import { routeError } from '@/lib/routeErrors';
 
 export async function GET(req: NextRequest) {
@@ -28,9 +29,11 @@ export async function GET(req: NextRequest) {
       await getServerContext();
     }
     ensureAutosave();
-    const status = getCompanyFileSaveStatus();
+    // `recovery`: the books on this computer were damaged and reopened from the last save
+    // (lib/services/workingCopyRecovery.ts) — shown once in the title bar (components/CompanyFileStatus.tsx).
+    const status = { ...getCompanyFileSaveStatus(), recovery: recoveryNotice() };
     const { remote } = await getRequestOrigin();
-    return NextResponse.json(remote ? { ...status, path: null, conflictCopy: null } : status);
+    return NextResponse.json(remote ? { ...status, path: null, conflictCopy: null, recovery: null } : status);
   } catch (err) {
     return routeError(err, 'company-file/status');
   }

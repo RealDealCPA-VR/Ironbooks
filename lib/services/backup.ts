@@ -96,6 +96,7 @@ import {
 import { backupManifestOf, sealedHeadOf, unsealArchive, writeUnsealedEntries, type ArchiveCredentials } from './sealedArchives';
 import { currentFingerprint } from './backupFingerprint';
 import { APP_VERSION } from '@/lib/appVersion';
+import { UnstartableBooksError, dataDirProblem } from './workingCopyRecovery';
 import type { EffectiveAccess } from '@/lib/permissions/model';
 import { isMaskedValue, isSensitiveKey, maskSensitive } from '@/lib/permissions/mask';
 
@@ -193,6 +194,10 @@ export function createBackup(companyName?: string, dataDir?: string, opts: { pro
   if (!fs.existsSync(dir)) {
     throw new Error(`Data directory not found: ${dir}`);
   }
+  // A backup of books that would not start could never be restored — and the automatic ones
+  // would rotate good older backups out. Refused (lib/services/workingCopyRecovery.ts).
+  const damaged = dataDirProblem(dir);
+  if (damaged) throw new UnstartableBooksError(damaged, 'backup');
 
   const protection = opts.protection !== undefined ? opts.protection : cachedSealProtection(dir);
   if (protection) {

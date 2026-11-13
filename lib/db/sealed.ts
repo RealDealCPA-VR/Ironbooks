@@ -15,11 +15,12 @@ import { ServiceError } from '@/lib/services/errors';
 
 export type SealedMode = 'extract' | 'conflict' | 'key';
 
-const g = globalThis as typeof globalThis & { __ironbooksUnsealed?: boolean };
+const g = globalThis as typeof globalThis & { __ironbooksUnsealed?: boolean; __ironbooksSealedOverride?: SealedMode };
 
 /** What the sign-in must do before the company file can be used, or null when it can be used. */
 export function sealedMode(): SealedMode | null {
   if (g.__ironbooksUnsealed) return null;
+  if (g.__ironbooksSealedOverride) return g.__ironbooksSealedOverride;
   const m = process.env.BKA_COMPANY_SEALED;
   return m === 'extract' || m === 'conflict' || m === 'key' ? m : null;
 }
@@ -49,9 +50,19 @@ export function markUnsealed(): void {
   g.__ironbooksUnsealed = true;
 }
 
+/**
+ * The sign-in must do something else than the shell planned: a working copy already on this
+ * computer ('key') that would not start was set aside, so the sign-in decrypts the company file
+ * instead ('extract') — lib/services/workingCopyRecovery.ts.
+ */
+export function overrideSealedMode(mode: SealedMode): void {
+  g.__ironbooksSealedOverride = mode;
+}
+
 /** Tests: back to the state the shell started the server in. */
 export function resetSealedState(): void {
   g.__ironbooksUnsealed = false;
+  g.__ironbooksSealedOverride = undefined;
 }
 
 /**

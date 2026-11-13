@@ -81,6 +81,17 @@ the previous save or the new one. Before writing, the server checks it still hol
 the file is still the save it started from; otherwise the changes go to a separate copy. The title
 bar shows Saved / Saving… / Not saved (`components/CompanyFileStatus.tsx`).
 
+**When the working copy will not start** (`lib/services/workingCopyRecovery.ts`). PGlite's file layer
+does not flush to disk, so a power cut can occasionally leave a working copy whose control file names
+a checkpoint its write-ahead log no longer holds; Postgres then refuses to start ("Aborted()"). So
+can two Postgres instances on one folder, which `lib/db` prevents (one database per folder per
+process, even when `next dev` loads the module once per route). A quick check
+(`electron/pgDataCheck.js`) keeps such books from ever being saved over the company file or written
+as a backup. On the next open the server keeps the damaged copy aside (`damaged copy <date>` in the
+working folder), reopens the company file as last saved — for a protected file the sign-in decrypts
+it — and tells the person, on the sign-in screen and in the title bar, when that save was made and
+that later changes could not be recovered.
+
 **Someone else has it open.** Opening a locked file shows who has it and offers *Ask to Come In*. The
 request appears on the holder's screen: *Let Them In* (multi-user mode: the holder's Ironbooks serves
 the file over the office network with HTTPS and its own certificate, which the requester pins — the

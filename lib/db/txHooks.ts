@@ -32,7 +32,14 @@ interface HookState {
 
 type Hook = () => void | Promise<void>;
 
-const states = new WeakMap<object, HookState>();
+/**
+ * Process-wide (globalThis), like the open databases themselves (lib/db/index.ts): a database
+ * handle is instrumented by whichever copy of this module opened it, and services bundled with
+ * another route (Next.js loads a module once per route bundle in `next dev`) must find its
+ * transaction queues — or their after-commit work (the transaction log) would silently not run.
+ */
+const processState = globalThis as typeof globalThis & { __ironbooksTxHookStates?: WeakMap<object, HookState> };
+const states: WeakMap<object, HookState> = (processState.__ironbooksTxHookStates ??= new WeakMap());
 
 type TxFn = (fn: (tx: unknown) => Promise<unknown>, config?: unknown) => Promise<unknown>;
 

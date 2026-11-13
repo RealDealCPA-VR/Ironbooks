@@ -18,6 +18,25 @@ interface Status {
   unsavedSince: string | null;
   error: string | null;
   conflictCopy: string | null;
+  /** The books on this computer were damaged and reopened from the last save (lib/services/workingCopyRecovery.ts). */
+  recovery?: { id: string; message: string } | null;
+}
+
+/** A recovery notice is shown until the person has closed it once (per notice, on this computer). */
+function recoverySeen(id: string): boolean {
+  try {
+    return localStorage.getItem(`ib:recovery-seen:${id}`) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function markRecoverySeen(id: string): void {
+  try {
+    localStorage.setItem(`ib:recovery-seen:${id}`, '1');
+  } catch {
+    /* private mode: shown again next time */
+  }
 }
 
 const POLL_MS = 4000;
@@ -32,6 +51,7 @@ export function CompanyFileStatus({ className }: { className?: string }) {
   const [s, setS] = React.useState<Status | null>(null);
   const [open, setOpen] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
+  const [recoveryOpen, setRecoveryOpen] = React.useState(false);
 
   const load = React.useCallback(async () => {
     try {
@@ -53,7 +73,21 @@ export function CompanyFileStatus({ className }: { className?: string }) {
     };
   }, [load]);
 
+  const recoveryId = s?.recovery?.id ?? null;
+  React.useEffect(() => {
+    if (recoveryId && !recoverySeen(recoveryId)) {
+      setRecoveryOpen(true);
+      setOpen(true);
+    }
+  }, [recoveryId]);
+
   if (!s?.singleFile) return null;
+
+  function close() {
+    setOpen(false);
+    if (recoveryOpen && recoveryId) markRecoverySeen(recoveryId);
+    setRecoveryOpen(false);
+  }
 
   async function saveNow() {
     setSaving(true);
@@ -102,7 +136,7 @@ export function CompanyFileStatus({ className }: { className?: string }) {
     <div className={cn('relative app-no-drag', className)}>
       <button
         type="button"
-        onClick={() => setOpen((o) => !o)}
+        onClick={() => (open ? close() : setOpen(true))}
         className={cn(
           'flex h-6 items-center gap-1.5 rounded-md px-2 text-xs outline-none hover:bg-navy/[.06] focus-visible:ring-2 focus-visible:ring-electric/50',
           tone,
@@ -120,13 +154,19 @@ export function CompanyFileStatus({ className }: { className?: string }) {
           aria-label="Company file"
           className="absolute right-0 top-8 z-[90] w-80 rounded-xl border border-slate-200 bg-white p-4 text-sm text-navy shadow-xl"
           onKeyDown={(e) => {
-            if (e.key === 'Escape') setOpen(false);
+            if (e.key === 'Escape') close();
           }}
         >
           <p className="font-semibold">{label}</p>
           <p className="mt-1 break-all font-mono text-[11px] text-navy/50">{s.path}</p>
           <p className="mt-2 text-navy/70">{title}</p>
           {s.conflictCopy && <p className="mt-2 break-all text-xs text-navy/60">Separate copy: {s.conflictCopy}</p>}
+          {recoveryOpen && s.recovery && (
+            <div role="alert" className="mt-3 rounded-md border border-amber-200 bg-amber-50 p-2 text-xs text-amber-900">
+              <p className="font-semibold">Reopened from your last save</p>
+              <p className="mt-1 break-words">{s.recovery.message}</p>
+            </div>
+          )}
           <div className="mt-3 flex gap-2">
             {s.status !== 'lost' && (
               <button
@@ -138,7 +178,7 @@ export function CompanyFileStatus({ className }: { className?: string }) {
                 {saving ? 'Saving…' : 'Save now'}
               </button>
             )}
-            <button type="button" onClick={() => setOpen(false)} className="rounded-md border border-slate-200 px-3 py-1.5 text-xs">
+            <button type="button" onClick={close} className="rounded-md border border-slate-200 px-3 py-1.5 text-xs">
               Close
             </button>
           </div>
