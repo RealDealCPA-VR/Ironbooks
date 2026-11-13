@@ -58,6 +58,7 @@ export const ROUTE_ACTIVITIES: Record<string, ActivityRef> = {
   '/api/ai/settings': 'company.ai',
   '/api/ai/tailnet': 'company.ai',
   '/api/ai/test': 'company.ai',
+  '/api/ai/pull': 'company.ai',
   '/api/pricing/settings': 'company.preferences',
   '/api/receiving/settings': 'company.preferences',
   '/api/form-templates': 'company.templates',
