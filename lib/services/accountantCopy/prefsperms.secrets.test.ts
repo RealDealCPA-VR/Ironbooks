@@ -50,7 +50,11 @@ beforeAll(async () => {
   const company = await createCompany(db, { name: 'Secrets Client Co', ownerId: user.id });
   ctx = { db, companyId: company.id, userId: user.id };
   blob = await sealForFile(db, API_KEY, company.id);
-  await db.insert(aiSettings).values({ companyId: company.id, providers: [{ id: 'p1', kind: 'anthropic', apiKeyEnc: blob }] });
+  // New companies already have an AI settings row (auto-posting default): set its providers.
+  await db
+    .insert(aiSettings)
+    .values({ companyId: company.id, providers: [{ id: 'p1', kind: 'anthropic', apiKeyEnc: blob }] })
+    .onConflictDoUpdate({ target: aiSettings.companyId, set: { providers: [{ id: 'p1', kind: 'anthropic', apiKeyEnc: blob }] } });
 });
 
 afterAll(async () => {
