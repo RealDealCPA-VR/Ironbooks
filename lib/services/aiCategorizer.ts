@@ -384,7 +384,7 @@ export interface AutoApplyResult {
 export async function autoApplyBankSuggestions(ctx: ServiceContext, bankAccountId: string): Promise<AutoApplyResult> {
   const settings = await loadSettings(ctx);
   if (!settings.autoApplyEnabled) {
-    throw new ServiceError('VALIDATION', 'Auto-apply is turned off. Enable it in Settings → AI & Automation.');
+    throw new ServiceError('VALIDATION', 'Auto-apply is turned off. Turn it on under Company > AI & Automation.');
   }
   const threshold = Number(settings.autoApplyThreshold);
   const { suggestions } = await suggestBankCategories(ctx, bankAccountId);

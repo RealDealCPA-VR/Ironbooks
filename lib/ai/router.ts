@@ -101,7 +101,7 @@ export class AiRouter {
     if (policy === 'local-only' && hasCloud && this.cfg.providers.every((p) => p.locality === 'cloud')) {
       return 'Only cloud providers are configured, but this task is set to local-only.';
     }
-    return 'No AI model is configured. Add a local model in Settings → AI & Automation.';
+    return 'No AI is connected. Connect ChatGPT, Claude, Gemini or a free model on this computer under Company > AI & Automation.';
   }
 
   isAvailable(task: AiTask): boolean {

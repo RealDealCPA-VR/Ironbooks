@@ -1085,7 +1085,7 @@ export default function BankReviewPage() {
               loading={askingAll}
               disabled={bulkRunning || !selectedBankAccountId}
               onClick={handleAskAiAll}
-              title="Ask the AI model you set up (Settings → AI & Automation) about the least certain lines"
+              title="Ask the AI you connected (Company > AI & Automation) about the least certain lines"
             >
               <Sparkles className="h-4 w-4" /> Ask AI about unsure lines
             </Button>

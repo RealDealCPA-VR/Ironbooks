@@ -85,6 +85,7 @@ const MENU_SECTIONS = [
       { separator: true },
       { label: 'Company Information…', route: '/settings' },
       { label: 'Preferences…', route: '/settings' },
+      { label: 'AI & Automation…', route: '/ai-settings' },
       { label: 'Setup Interview…', route: '/onboarding' },
       { label: 'Form Templates', route: '/templates' },
       { label: 'Users and Roles', route: '/users' },

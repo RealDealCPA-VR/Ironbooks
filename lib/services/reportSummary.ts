@@ -230,7 +230,7 @@ export async function reportSummary(
   result.aiAvailable = !!router?.isAvailable('assistant');
   if (!opts.ai) return result;
   if (!router || !result.aiAvailable) {
-    result.aiNotice = router?.unavailableReason('assistant') ?? 'No AI model is configured.';
+    result.aiNotice = router?.unavailableReason('assistant') ?? 'No AI is connected (Company > AI & Automation).';
     return result;
   }
   try {
