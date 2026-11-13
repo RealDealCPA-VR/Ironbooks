@@ -12,6 +12,12 @@ export type ChatRole = 'system' | 'user' | 'assistant';
 export interface ChatMessage {
   role: ChatRole;
   content: string;
+  /**
+   * Base64 images for a LOCAL vision model (receipts, lib/services/receipts.ts). Ollama takes them
+   * on the message as is; OpenAI-compatible servers get them as image_url content parts. Never
+   * sent to a cloud provider (images cannot be redacted).
+   */
+  images?: string[];
 }
 
 export interface ChatOptions {

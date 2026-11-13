@@ -719,6 +719,15 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   );
   const blockedGate = prefs.loaded ? blockingFeatureGate(pathname, prefs.company) : null;
   const [assistantOpen, setAssistantOpen] = React.useState(false);
+  // ?assistant=1 (the Home AI card's "waiting for your approval" link) opens Ask AI once.
+  React.useEffect(() => {
+    const q = new URLSearchParams(window.location.search);
+    if (q.get('assistant') !== '1') return;
+    setAssistantOpen(true);
+    q.delete('assistant');
+    const rest = q.toString();
+    window.history.replaceState(null, '', `${window.location.pathname}${rest ? `?${rest}` : ''}`);
+  }, [pathname]);
   const closeAssistant = React.useCallback(() => setAssistantOpen(false), []);
   // prefsperms K: QB Enterprise activities in the screens (components/ActivityGuard.tsx).
   useActivityButtons(pathname, me?.permissions);

@@ -17,13 +17,14 @@
  */
 import { and, desc, eq, gte, ilike, inArray, lte, or, sql } from 'drizzle-orm';
 import { z } from 'zod';
-import { accounts, aiProposals, customers, journalEntries, journalEntryLines, vendors } from '@/lib/db/schema';
+import { accounts, aiProposals, customers, items, journalEntries, journalEntryLines, vendors } from '@/lib/db/schema';
 import { Money, toAmountString, formatCurrency } from '@/lib/money';
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
 import { balanceSheet, profitAndLoss, trialBalance } from './reports';
 import { apAging, arAging } from './reportsExtra';
 import { assertBalanced } from './posting';
 import { createBill } from './bills';
+import { createInvoice } from './invoices';
 import { createManualEntry, followMergedNames } from './journal';
 import { buildRouter, type BuildRouterOptions } from './aiSettings';
 import { companyToday } from './preferences';
@@ -321,7 +322,38 @@ interface StoredJournalProposal {
   rationale: string | null;
   /** kind 'bill': what createBill posts on approval (the lines above are the preview of it). */
   bill?: StoredBillProposal;
+  /** kind 'invoice': what createInvoice posts on approval (sales tax is worked out then). */
+  invoice?: StoredInvoiceProposal;
 }
+
+interface StoredInvoiceProposal {
+  customerId: string;
+  customerName: string;
+  date: string;
+  dueDate: string | null;
+  memo: string | null;
+  lines: { itemId: string | null; accountId: string | null; description: string | null; quantity: string; rate: string }[];
+}
+
+const invoiceProposalSchema = z.object({
+  type: z.literal('invoice'),
+  customerName: z.string().trim().min(1).max(255),
+  date: z.string(),
+  dueDate: z.string().nullish(),
+  memo: z.string().max(500).nullish(),
+  lines: z
+    .array(
+      z.object({
+        itemName: z.string().trim().max(255).nullish(),
+        accountCode: z.string().trim().max(50).nullish(),
+        description: z.string().max(500).nullish(),
+        quantity: z.union([z.string(), z.number()]).default(1),
+        rate: z.union([z.string(), z.number()]),
+      }),
+    )
+    .min(1)
+    .max(30),
+});
 
 interface StoredBillProposal {
   vendorId: string;
@@ -476,10 +508,112 @@ export async function createBillProposal(ctx: ServiceContext, input: unknown, ra
   });
 }
 
-/** A model proposal of any kind ("type": "journal_entry" by default, or "bill"). */
+/**
+ * Validate a model-proposed CUSTOMER INVOICE (customer by name; lines by item name or income
+ * account code, quantity and rate) and store it PENDING. Approving it runs the normal Create
+ * Invoices service, so sales tax, terms and A/R behave as if typed in. Nothing is posted here.
+ */
+export async function createInvoiceProposal(ctx: ServiceContext, input: unknown, rationale?: string | null): Promise<ProposalView> {
+  const parsed = invoiceProposalSchema.safeParse(input);
+  if (!parsed.success) throw validation(`Invoice proposal is malformed: ${parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')}`);
+  const p = parsed.data;
+  if (!parseDate(p.date)) throw validation('Invoice date is invalid.');
+  if (p.dueDate && !parseDate(p.dueDate)) throw validation('Due date is invalid.');
+
+  const [customer] = await ctx.db
+    .select({ id: customers.id, name: customers.displayName, isActive: customers.isActive })
+    .from(customers)
+    .where(and(eq(customers.companyId, ctx.companyId), sql`lower(${customers.displayName}) = lower(${p.customerName})`))
+    .orderBy(desc(customers.isActive))
+    .limit(1);
+  if (!customer) {
+    const near = await ctx.db
+      .select({ name: customers.displayName })
+      .from(customers)
+      .where(and(eq(customers.companyId, ctx.companyId), eq(customers.isActive, true), ilike(customers.displayName, `%${p.customerName.split(/\s+/)[0]}%`)))
+      .limit(5);
+    throw validation(
+      `No customer named "${p.customerName}" was found.${near.length ? ` Did you mean ${near.map((c) => `"${c.name}"`).join(', ')}?` : ' Add the customer first (Customer Center), or give the exact name.'}`,
+    );
+  }
+  if (!customer.isActive) throw validation(`Customer "${customer.name}" is inactive. Make it active again first.`);
+
+  const acctRows = await ctx.db
+    .select({ id: accounts.id, code: accounts.code, name: accounts.name, type: accounts.type, subtype: accounts.subtype, isActive: accounts.isActive })
+    .from(accounts)
+    .where(eq(accounts.companyId, ctx.companyId));
+  const acctById = new Map(acctRows.map((a) => [a.id, a]));
+  const acctByCode = new Map(acctRows.map((a) => [a.code, a]));
+  const itemRows = await ctx.db
+    .select({ id: items.id, name: items.name, isActive: items.isActive, incomeAccountId: items.incomeAccountId })
+    .from(items)
+    .where(eq(items.companyId, ctx.companyId));
+
+  const lines: StoredJournalProposal['lines'] = [];
+  const invLines: StoredInvoiceProposal['lines'] = [];
+  let total = Money.of(0);
+  p.lines.forEach((l, i) => {
+    let itemId: string | null = null;
+    let incomeAcct: (typeof acctRows)[number] | undefined;
+    if (l.itemName) {
+      const it = itemRows.find((x) => x.name.toLowerCase() === l.itemName!.toLowerCase());
+      if (!it) throw validation(`Line ${i + 1}: no item named "${l.itemName}". Use an item from the Item List, or an income account code instead.`);
+      if (!it.isActive) throw validation(`Line ${i + 1}: item "${it.name}" is inactive.`);
+      itemId = it.id;
+      incomeAcct = it.incomeAccountId ? acctById.get(it.incomeAccountId) : undefined;
+    }
+    if (l.accountCode) {
+      const a = acctByCode.get(l.accountCode);
+      if (!a) throw validation(`Line ${i + 1}: no account with code ${l.accountCode}.`);
+      if (!a.isActive) throw validation(`Line ${i + 1}: account ${a.code} ${a.name} is inactive.`);
+      if (a.type !== 'revenue') throw validation(`Line ${i + 1}: ${a.code} ${a.name} is not an income account.`);
+      incomeAcct = a;
+    }
+    if (!itemId && !incomeAcct) throw validation(`Line ${i + 1}: give an item name or an income account code.`);
+    const qty = moneyOrNull(l.quantity, `Line ${i + 1} quantity`) ?? '1.00';
+    const rate = moneyOrNull(l.rate, `Line ${i + 1} rate`);
+    if (!rate) throw validation(`Line ${i + 1}: the rate must be more than zero.`);
+    const amount = toAmountString(Money.of(qty).times(rate));
+    total = total.plus(amount);
+    if (incomeAcct) lines.push({ accountId: incomeAcct.id, accountCode: incomeAcct.code, accountName: incomeAcct.name, debit: null, credit: amount, memo: l.description ?? null });
+    invLines.push({ itemId, accountId: l.accountCode ? incomeAcct!.id : null, description: l.description ?? null, quantity: qty, rate });
+  });
+  const totalStr = toAmountString(total);
+  const ar = acctRows.find((a) => a.subtype === 'accounts_receivable' && a.isActive);
+  if (ar) lines.unshift({ accountId: ar.id, accountCode: ar.code, accountName: ar.name, debit: totalStr, credit: null, memo: null, entityType: 'customer', entityId: customer.id, entityName: customer.name });
+
+  const payload: StoredJournalProposal = {
+    date: p.date,
+    description: `Invoice to ${customer.name}${p.memo ? ` — ${p.memo}` : ''} (before any sales tax)`,
+    reference: null,
+    lines,
+    totalDebit: totalStr,
+    rationale: rationale ?? null,
+    invoice: { customerId: customer.id, customerName: customer.name, date: p.date, dueDate: p.dueDate ?? null, memo: p.memo ?? null, lines: invLines },
+  };
+  const summaryText = `Invoice to ${customer.name} ${p.date} (${formatCurrency(totalStr)} before tax)`;
+  return inTransaction(ctx, async (tx) => {
+    const [row] = await tx.db
+      .insert(aiProposals)
+      .values({ companyId: tx.companyId, kind: 'invoice', summary: summaryText, payload: payload as unknown as Record<string, unknown>, status: 'pending', createdBy: tx.userId })
+      .returning();
+    await writeAudit(tx, {
+      action: 'create',
+      entityType: 'ai_proposal',
+      entityId: row.id,
+      newValues: { kind: row.kind, summary: row.summary, status: row.status },
+      llmReasoning: rationale ?? undefined,
+    });
+    return toView(row);
+  });
+}
+
+/** A model proposal of any kind ("type": "journal_entry" by default, "bill" or "invoice"). */
 export async function createProposal(ctx: ServiceContext, input: unknown, rationale?: string | null): Promise<ProposalView> {
   const type = input && typeof input === 'object' ? (input as { type?: unknown }).type : undefined;
-  return type === 'bill' ? createBillProposal(ctx, input, rationale) : createJournalProposal(ctx, input, rationale);
+  if (type === 'bill') return createBillProposal(ctx, input, rationale);
+  if (type === 'invoice') return createInvoiceProposal(ctx, input, rationale);
+  return createJournalProposal(ctx, input, rationale);
 }
 
 /**
@@ -621,6 +755,33 @@ export async function approveProposal(ctx: ServiceContext, id: string): Promise<
         oldValues: { status: 'pending' },
         newValues: { status: 'approved', billId: bill.id },
         llmReasoning: (row.payload as { rationale?: string | null }).rationale ?? 'Approved assistant bill proposal.',
+      });
+      return toView(updated);
+    }
+    if (row.kind === 'invoice') {
+      const v = (row.payload as unknown as StoredJournalProposal).invoice;
+      if (!v) throw validation('This invoice proposal is incomplete and cannot be created.');
+      const invDate = parseDate(v.date);
+      if (!invDate) throw validation(`Invoice date ${v.date} is invalid.`);
+      const inv = await createInvoice(tx, {
+        customerId: v.customerId,
+        date: invDate,
+        dueDate: v.dueDate ? parseDate(v.dueDate) ?? null : null,
+        memo: v.memo,
+        lines: v.lines.map((l) => ({ itemId: l.itemId, accountId: l.accountId, description: l.description, quantity: l.quantity, rate: l.rate })),
+      });
+      const [updated] = await tx.db
+        .update(aiProposals)
+        .set({ status: 'approved', resultRef: `invoice:${inv.id}`, decidedBy: tx.userId, decidedAt: new Date() })
+        .where(eq(aiProposals.id, id))
+        .returning();
+      await writeAudit(tx, {
+        action: 'update',
+        entityType: 'ai_proposal',
+        entityId: id,
+        oldValues: { status: 'pending' },
+        newValues: { status: 'approved', invoiceId: inv.id },
+        llmReasoning: (row.payload as { rationale?: string | null }).rationale ?? 'Approved assistant invoice proposal.',
       });
       return toView(updated);
     }
@@ -791,6 +952,9 @@ Rules:
 - To record a VENDOR BILL (money owed to a vendor, paid later), propose a bill instead of a journal entry — the vendor's name exactly as the user gave it, expense account codes from list_accounts, positive amounts:
   {"action":"answer","answer":"...","proposal":{"type":"bill","vendorName":"Office Supply Co","date":"YYYY-MM-DD","dueDate":"YYYY-MM-DD","billNumber":"1042","memo":"...","lines":[{"accountCode":"6000","amount":"125.50","description":"..."}]}}
   (dueDate, billNumber and memo are optional.) The person approves it; it is then entered exactly as if typed into Enter Bills.
+- To INVOICE A CUSTOMER, propose an invoice — the customer's name exactly as given, each line with an "itemName" from the Item List or an income "accountCode" from list_accounts, a quantity and a rate:
+  {"action":"answer","answer":"...","proposal":{"type":"invoice","customerName":"Smith Family","date":"YYYY-MM-DD","dueDate":"YYYY-MM-DD","memo":"...","lines":[{"itemName":"Consulting","description":"...","quantity":3,"rate":"150.00"}]}}
+  Sales tax and terms are applied when the person approves it in Create Invoices.
   Debits must equal credits. A line on Accounts Receivable needs "name": "<customer name>" and a line on Accounts Payable needs "name": "<vendor name>". The user reviews and approves proposals; say that it awaits their approval.
 - Keep answers short and clear for a non-accountant. Use YYYY-MM-DD dates in tool args.`;
 }

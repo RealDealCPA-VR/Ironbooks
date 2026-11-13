@@ -37,6 +37,8 @@ import HomeTabs from '@/components/HomeTabs';
 import AttentionInbox from '@/components/AttentionInbox';
 import { getAttention } from '@/lib/services/attention';
 import { homeTabFor } from '@/lib/homeTabs';
+import { aiActivity } from '@/lib/services/aiActivity';
+import AiActivityCard from '@/components/AiActivityCard';
 
 export const dynamic = 'force-dynamic';
 
@@ -88,11 +90,13 @@ export default async function DashboardPage({ searchParams }: { searchParams: Pr
   }
   // Single aggregated read model (also served as GET /api/dashboard). KPI cards keep
   // the fiscal-YTD scoping from lib/ytd.ts (settings.fiscalYearEnd; defaults Jan 1).
-  const [d, accountRows, tb, myPrefs] = await Promise.all([
+  const [d, accountRows, tb, myPrefs, ai] = await Promise.all([
     getDashboardInsights(ctx),
     listAccounts(ctx),
     trialBalance(ctx),
     getMyPreferences(ctx),
+    // The AI card never blocks Home: a failure just leaves it out.
+    aiActivity(ctx).catch(() => null),
   ]);
   // prefsperms: QB "View Balance" on Bank Accounts decides whether the balances show.
   const showBalances = !ctx.access || canActivity(ctx.access, 'banking.bank_accounts', 'view_balance');
@@ -117,6 +121,9 @@ export default async function DashboardPage({ searchParams }: { searchParams: Pr
       {myPrefs.showHomeWorkflow && (
         <HomeWorkflow balances={balances} allowedHrefs={allowedHrefs} showBalances={showBalances} />
       )}
+
+      {/* What the AI did and what it needs from you (lib/services/aiActivity.ts). */}
+      {ai && <AiActivityCard a={ai} />}
 
       {/* Reminders (Preferences > Reminders decides what shows). */}
       <Card className="mt-8 p-6 max-w-3xl">

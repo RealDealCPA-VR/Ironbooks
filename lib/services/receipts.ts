@@ -9,7 +9,8 @@
  *  2. extractReceipt — reads the text LOCALLY: PDFs through pdfjs-dist (scanned PDFs: their page
  *     images through OCR), photos through offline OCR (tesseract.js, bundled engine + language
  *     data, lib/receipts/ocr.ts). A company may instead pick a local vision model on its LAN /
- *     tailnet (an Ollama provider from AI & Automation); it is called through lib/ai/router.ts
+ *     tailnet (an Ollama, LM Studio or other OpenAI-compatible server from AI & Automation); it is
+ *     called through lib/ai/router.ts
  *     with cloud providers excluded, so a photo never leaves the local network — images cannot
  *     be redacted, so the cloud is never an option here. The text is parsed by
  *     lib/receipts/parse.ts. Nothing needs AI: with no OCR and no model the person types the
@@ -126,7 +127,7 @@ const MAX_RAW_TEXT = 20_000;
 export const RECEIPT_SETTINGS_KEY = 'receiptCapture';
 
 export interface ReceiptSettings {
-  /** Local vision model (an enabled Ollama provider on this machine / LAN / tailnet), or null. */
+  /** Local vision model (an enabled Ollama or OpenAI-compatible server on this machine / LAN / tailnet), or null. */
   visionProviderId: string | null;
   /** Read photos with the vision model first (offline OCR stays the fallback). */
   preferVision: boolean;
@@ -157,10 +158,13 @@ export async function getReceiptSettings(ctx: Pick<ServiceContext, 'db' | 'compa
   return normalizeSettings((row.settings as Record<string, unknown> | null)?.[RECEIPT_SETTINGS_KEY]);
 }
 
-/** Local vision models the company could use: enabled Ollama providers that are not in the cloud. */
+/**
+ * Local vision models the company could use: enabled Ollama or OpenAI-compatible servers (LM
+ * Studio, vLLM, llama.cpp) that are not in the cloud.
+ */
 export function visionCandidates(providers: StoredProviderConfig[]): Array<{ id: string; label: string; model: string }> {
   return providers
-    .filter((p) => p.enabled && p.kind === 'ollama' && localityOf(p) === 'local')
+    .filter((p) => p.enabled && (p.kind === 'ollama' || p.kind === 'openai-compatible') && localityOf(p) === 'local')
     .map((p) => ({ id: p.id, label: p.label, model: p.model }));
 }
 
@@ -417,7 +421,7 @@ async function readWithVision(ctx: ServiceContext, image: Buffer, settings: Rece
       'This image is a receipt or bill. Transcribe all of its printed text exactly, line by line, top to bottom. ' +
       'Keep amounts, dates and card digits exactly as printed. Reply with the text only.',
     images: [image.toString('base64')],
-  } as ChatMessage; // Ollama's chat API takes base64 images on the message.
+  } satisfies ChatMessage; // base64 image: Ollama takes it on the message, OpenAI-compatible as a content part.
   const res = await router.chat('categorize', [message], { temperature: 0, maxTokens: 1500 });
   return res.content;
 }

@@ -100,6 +100,20 @@ describe('OpenAI-compatible provider', () => {
     expect(f.calls[0].body.store).toBe(false);
   });
 
+  it('a local OpenAI-compatible server gets images as image_url content parts; a cloud one never does', async () => {
+    const f = mockFetch(() => jsonResponse({ choices: [{ message: { content: 'TOTAL 12.00' } }] }));
+    const local = createOpenAiCompatibleProvider({ id: 'lm', kind: 'openai-compatible', label: 'LM Studio', baseUrl: 'http://localhost:1234/v1', model: 'qwen2.5-vl', enabled: true }, { fetch: f.fn });
+    const png = 'iVBORw0KGgoAAAANSUhEUg';
+    await local.chat([{ role: 'user', content: 'Read this receipt', images: [png] }]);
+    expect(f.calls[0].body.messages[0].content).toEqual([
+      { type: 'text', text: 'Read this receipt' },
+      { type: 'image_url', image_url: { url: `data:image/png;base64,${png}` } },
+    ]);
+    const cloud = createOpenAiCompatibleProvider({ id: 'oa', kind: 'openai-compatible', label: 'OpenAI', baseUrl: 'https://api.openai.com/v1', model: 'gpt-5', apiKey: 'k', enabled: true }, { fetch: f.fn });
+    await expect(cloud.chat([{ role: 'user', content: 'x', images: [png] }])).rejects.toMatchObject({ code: 'POLICY' });
+    expect(f.calls).toHaveLength(1);
+  });
+
   it('Azure OpenAI: deployment URL, api-version and api-key header', async () => {
     const f = mockFetch((url) =>
       url.includes('/deployments?')

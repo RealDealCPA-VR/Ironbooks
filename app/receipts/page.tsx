@@ -320,7 +320,7 @@ export default function ReceiptsPage() {
                   {settings.visionModels.length === 0 && (
                     <p className="mt-1 text-xs text-navy/50">
                       No local model yet. <Link href="/ai-settings" className="text-electric hover:underline">Add one</Link> (a vision
-                      model such as llava in Ollama).
+                      model such as llava or qwen2.5-vl in Ollama or LM Studio). Photos never go to a cloud AI.
                     </p>
                   )}
                 </div>

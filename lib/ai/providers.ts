@@ -226,6 +226,32 @@ export function isAzureOpenAiHost(baseUrl: string): boolean {
 const AZURE_API_VERSION = '2024-10-21';
 const AZURE_DEPLOYMENTS_API_VERSION = '2023-03-15-preview';
 
+/** The image type of base64 bytes (PNG / JPEG / WebP / GIF by their first bytes), JPEG otherwise. */
+function imageMime(b64: string): string {
+  if (b64.startsWith('iVBOR')) return 'image/png';
+  if (b64.startsWith('UklGR')) return 'image/webp';
+  if (b64.startsWith('R0lGOD')) return 'image/gif';
+  return 'image/jpeg';
+}
+
+/**
+ * OpenAI's message shape: a message with images becomes content parts (text + image_url data
+ * URLs), which LM Studio, vLLM and llama.cpp servers accept for vision models.
+ */
+function toOpenAiMessages(messages: ChatMessage[]) {
+  return messages.map((m) =>
+    m.images && m.images.length
+      ? {
+          role: m.role,
+          content: [
+            { type: 'text', text: m.content },
+            ...m.images.map((img) => ({ type: 'image_url', image_url: { url: `data:${imageMime(img)};base64,${img}` } })),
+          ],
+        }
+      : { role: m.role, content: m.content },
+  );
+}
+
 /** api.openai.com (and its regional hosts): the only service that understands OpenAI's `store`. */
 function isOpenAiHost(base: string): boolean {
   try {
@@ -254,9 +280,13 @@ export function createOpenAiCompatibleProvider(cfg: ProviderRuntimeConfig, deps:
   }
 
   async function complete(messages: ChatMessage[], opts: ChatOptions, withSchema: boolean) {
+    // A cloud endpoint never receives images (they cannot be redacted); local servers get them.
+    if (locality === 'cloud' && messages.some((m) => m.images?.length)) {
+      throw new AiError('POLICY', 'Images are only sent to a local model.');
+    }
     const body: Record<string, unknown> = {
       model: cfg.model,
-      messages,
+      messages: toOpenAiMessages(messages),
       temperature: opts.temperature ?? 0.1,
       ...(opts.maxTokens ? { max_tokens: opts.maxTokens } : {}),
       // OpenAI itself: ask it not to retain the conversation (`store`). Other services that speak
