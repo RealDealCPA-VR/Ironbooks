@@ -396,7 +396,7 @@ export default function AssistantPanel({ open, onClose }: { open: boolean; onClo
                 record something, I’ll prepare it for you to approve.
               </p>
               <p className="mb-3 text-xs text-navy/50">
-                Works with ChatGPT, Claude, Gemini or a free model on this computer — set up once in{' '}
+                Works with your ChatGPT plan (just sign in) or a free model on this computer — set up once in{' '}
                 <Link href="/ai-settings" onClick={onClose} className="text-electric underline">
                   AI &amp; Automation
                 </Link>

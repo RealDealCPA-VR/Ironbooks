@@ -20,6 +20,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import { assertOutboundAllowed, policyFetch, type PolicyCtx } from '@/lib/net/guard';
 import { ServiceError } from '@/lib/services/_base';
 import { classifyEndpoint } from './tailnet';
+import { createChatGptProvider, type ChatGptCredentials } from './chatgpt';
 import {
   AiError,
   DEFAULT_ANTHROPIC_MODEL,
@@ -60,6 +61,8 @@ export interface ProviderDeps {
    * transport underneath the policy check.
    */
   policyCtx?: PolicyCtx;
+  /** ChatGPT plan connections: save rotated sign-in credentials (lib/services/chatgptSignIn.ts). */
+  persistChatGpt?: (providerId: string, creds: ChatGptCredentials) => Promise<void>;
 }
 
 /** Turn a network-policy refusal into a typed AI error the router can fall back on. */
@@ -95,7 +98,7 @@ function guardedFetch(deps: ProviderDeps): FetchLike {
 }
 
 export function localityOf(cfg: Pick<ProviderRuntimeConfig, 'kind' | 'baseUrl'>): Locality {
-  if (cfg.kind === 'anthropic') return 'cloud';
+  if (cfg.kind === 'anthropic' || cfg.kind === 'chatgpt') return 'cloud';
   return classifyEndpoint(cfg.baseUrl).isPrivate ? 'local' : 'cloud';
 }
 
@@ -584,6 +587,8 @@ export function createProvider(cfg: ProviderRuntimeConfig, deps: ProviderDeps = 
       return createOpenAiCompatibleProvider(cfg, deps);
     case 'anthropic':
       return createAnthropicProvider(cfg, deps);
+    case 'chatgpt':
+      return createChatGptProvider(cfg, { fetch: guardedFetch(deps), persist: deps.persistChatGpt });
     default:
       throw new AiError('CONFIG', `Unknown provider kind: ${(cfg as { kind: string }).kind}`);
   }

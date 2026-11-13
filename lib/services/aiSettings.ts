@@ -21,6 +21,7 @@ import { classifyEndpoint } from '@/lib/ai/tailnet';
 import { verifyTailnetUrls } from '@/lib/net/tailnetVerify';
 import { isLegacyBlob, migrateLegacySecrets, openStoredSecret, readVaultSecret, sealForFile } from '@/lib/ai/keyVault';
 import { Redactor, addressEntities, type KnownEntity } from '@/lib/ai/redact';
+import { parseCredentials } from '@/lib/ai/chatgpt';
 import {
   AI_TASKS,
   AiError,
@@ -177,10 +178,16 @@ export async function loadSettings(ctx: ServiceContext): Promise<SettingsRecord>
   };
 }
 
+/** Providers with no server address of their own: Anthropic's default endpoint, the ChatGPT plan. */
+function noEndpoint(p: { kind: string; baseUrl?: string | null }): boolean {
+  return p.kind === 'chatgpt' || (p.kind === 'anthropic' && !p.baseUrl);
+}
+
 function toPublic(p: StoredProviderConfig, companyId: string): PublicProviderConfig {
   const { apiKeyEnc, ...rest } = p;
-  const ep = p.kind === 'anthropic' && !p.baseUrl ? null : classifyEndpoint(p.baseUrl);
-  const unreadable = !!apiKeyEnc && openKey(p, companyId) === null;
+  const ep = noEndpoint(p) ? null : classifyEndpoint(p.baseUrl);
+  const plain = apiKeyEnc ? openKey(p, companyId) : null;
+  const unreadable = !!apiKeyEnc && plain === null;
   return {
     ...rest,
     hasApiKey: !!apiKeyEnc && !unreadable,
@@ -188,6 +195,7 @@ function toPublic(p: StoredProviderConfig, companyId: string): PublicProviderCon
     locality: localityOf(p),
     hostClass: ep?.hostClass ?? null,
     warning: ep?.warning ?? null,
+    ...(p.kind === 'chatgpt' ? { account: parseCredentials(plain)?.email ?? null } : {}),
   };
 }
 
@@ -243,7 +251,11 @@ export const updateSettingsSchema = z.object({
 export type UpdateSettingsInput = z.input<typeof updateSettingsSchema>;
 
 function validateProvider(p: ProviderInput): void {
-  if (p.kind !== 'anthropic') {
+  if (p.kind === 'chatgpt') {
+    // Credentials only ever come from "Continue with ChatGPT" (lib/services/chatgptSignIn.ts).
+    if (p.apiKey && p.apiKey.trim()) throw validation(`${p.label}: use "Continue with ChatGPT" to connect your plan.`);
+    if (p.baseUrl) throw validation(`${p.label}: a ChatGPT plan connection has no server address.`);
+  } else if (p.kind !== 'anthropic') {
     if (!p.baseUrl) throw validation(`${p.label}: a base URL is required (e.g. http://gpu-box.tail1234.ts.net:11434).`);
     const ep = classifyEndpoint(p.baseUrl);
     if (ep.hostClass === 'invalid' || !ep.protocol) throw validation(`${p.label}: ${ep.warning ?? 'invalid URL'}`);
@@ -282,6 +294,9 @@ export async function updateSettings(ctx: ServiceContext, input: UpdateSettingsI
       if (p.apiKey !== undefined && p.apiKey.trim() !== '') {
         newKeys.set(id, p.apiKey.trim());
         apiKeyEnc = null; // sealed below with the company file's own key
+      }
+      if (p.kind === 'chatgpt' && !apiKeyEnc && p.enabled) {
+        throw validation(`${p.label}: click "Continue with ChatGPT" to sign in first.`);
       }
       if (p.kind === 'anthropic' && !apiKeyEnc && !newKeys.has(id) && p.enabled) {
         throw validation(`${p.label}: an Anthropic API key is required.`);
@@ -379,7 +394,14 @@ export function buildProviders(
 ): AiProvider[] {
   const out: AiProvider[] = [];
   // Every provider call is checked against this company's network policy (purpose 'ai').
-  const withPolicy: ProviderDeps = { ...deps, policyCtx: { db: ctx.db, companyId: ctx.companyId } };
+  const withPolicy: ProviderDeps = {
+    ...deps,
+    policyCtx: { db: ctx.db, companyId: ctx.companyId },
+    // A refreshed ChatGPT sign-in is saved back (its refresh token rotates).
+    persistChatGpt:
+      deps.persistChatGpt ??
+      (async (providerId, creds) => (await import('./chatgptSignIn')).persistChatGptCredentials(ctx, providerId, creds)),
+  };
   for (const p of stored) {
     if (!p.enabled) continue;
     try {
@@ -609,9 +631,9 @@ export async function testConnection(
   await verifyTailnetUrls([p.baseUrl]);
   const saved = p.id ? s.providers.find((x) => x.id === p.id) : undefined;
   // Reuse the saved key only for the endpoint it was saved for (see sameEndpoint).
-  const apiKey =
-    p.apiKey?.trim() ||
-    (saved?.apiKeyEnc && sameEndpoint(saved, p) ? openKey(saved, ctx.companyId) : null);
+  const savedKey = saved?.apiKeyEnc && sameEndpoint(saved, p) ? openKey(saved, ctx.companyId) : null;
+  // A ChatGPT plan connection only ever uses its saved sign-in.
+  const apiKey = p.kind === 'chatgpt' ? savedKey : p.apiKey?.trim() || savedKey;
   const cfg: ProviderRuntimeConfig = {
     id: p.id ?? 'draft',
     kind: p.kind as ProviderRuntimeConfig['kind'],
@@ -621,7 +643,7 @@ export async function testConnection(
     enabled: true,
     apiKey,
   };
-  const ep = p.kind === 'anthropic' && !p.baseUrl ? null : classifyEndpoint(p.baseUrl);
+  const ep = noEndpoint(p) ? null : classifyEndpoint(p.baseUrl);
   const base = { locality: localityOf(cfg), hostClass: ep?.hostClass ?? null, warning: ep?.warning ?? null };
   // "Allow cloud AI" is ticked on the page: testing a cloud AI is the person's first use of it,
   // so its Privacy & Network permission is given now (the same one switch Save gives), instead of

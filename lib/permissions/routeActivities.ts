@@ -59,6 +59,7 @@ export const ROUTE_ACTIVITIES: Record<string, ActivityRef> = {
   '/api/ai/tailnet': 'company.ai',
   '/api/ai/test': 'company.ai',
   '/api/ai/pull': 'company.ai',
+  '/api/ai/chatgpt': 'company.ai',
   '/api/pricing/settings': 'company.preferences',
   '/api/receiving/settings': 'company.preferences',
   '/api/form-templates': 'company.templates',
@@ -176,6 +177,7 @@ export const ROUTE_ACTIVITIES: Record<string, ActivityRef> = {
   // ---- Banking ----
   '/api/bank-accounts': 'banking.bank_accounts',
   '/api/bank-transactions': 'banking.bank_feeds',
+  '/api/ai/posts': 'banking.bank_feeds',
   '/api/rules': 'banking.bank_rules',
   '/api/bank-rules': 'banking.bank_rules',
   '/api/ai/bank-suggestions': 'banking.bank_feeds',
@@ -346,6 +348,7 @@ export const PAGE_ACTIVITIES: Record<string, ActivityKey | ActivityKey[]> = {
   '/registers': 'banking.registers',
   '/bank-feeds': 'banking.bank_feeds',
   '/bank-review': 'banking.bank_feeds',
+  '/ai-posts': 'banking.bank_feeds',
   '/transactions': 'banking.bank_feeds',
   '/bank-rules': 'banking.bank_rules',
   '/deposits': 'banking.deposits',

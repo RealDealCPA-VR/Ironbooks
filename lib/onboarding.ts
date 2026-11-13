@@ -681,7 +681,7 @@ export function buildSetupPlan(
   nextSteps.push({
     label: 'Connect your AI',
     href: '/ai-settings',
-    why: 'Use ChatGPT, Claude, Gemini or a free model on this computer to categorize, answer questions about your books and catch mistakes.',
+    why: 'Sign in with your ChatGPT plan or use a free model on this computer to categorize, answer questions about your books and catch mistakes.',
   });
 
   return {

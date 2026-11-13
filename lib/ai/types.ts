@@ -58,10 +58,11 @@ export interface AiProvider {
   health(opts?: { signal?: AbortSignal }): Promise<HealthResult>;
 }
 
-export type ProviderKind = 'ollama' | 'openai-compatible' | 'anthropic';
+/** 'chatgpt' = the person's own ChatGPT Plus/Pro plan via Sign in with ChatGPT (lib/ai/chatgpt.ts). */
+export type ProviderKind = 'ollama' | 'openai-compatible' | 'anthropic' | 'chatgpt';
 export type Locality = 'local' | 'cloud';
 
-export const PROVIDER_KINDS: ProviderKind[] = ['ollama', 'openai-compatible', 'anthropic'];
+export const PROVIDER_KINDS: ProviderKind[] = ['ollama', 'openai-compatible', 'anthropic', 'chatgpt'];
 
 /** Tasks the router knows about; each can have its own routing policy. */
 export type AiTask = 'categorize' | 'assistant' | 'error-correction';
@@ -112,6 +113,8 @@ export interface PublicProviderConfig extends Omit<StoredProviderConfig, 'apiKey
   locality: Locality;
   hostClass: HostClass | null;
   warning: string | null;
+  /** ChatGPT plan connections: the signed-in account's email (no credentials). */
+  account?: string | null;
 }
 
 export type HostClass = 'loopback' | 'lan' | 'tailnet' | 'public' | 'invalid';

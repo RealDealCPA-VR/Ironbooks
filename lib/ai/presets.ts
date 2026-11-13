@@ -55,8 +55,8 @@ export const AI_PRESETS: AiPreset[] = [
   },
   {
     id: 'openai',
-    name: 'OpenAI (ChatGPT)',
-    blurb: 'GPT models from your OpenAI account.',
+    name: 'OpenAI API',
+    blurb: 'GPT models with an OpenAI API key (billed per use; separate from a ChatGPT plan).',
     kind: 'openai-compatible',
     where: 'cloud',
     baseUrl: 'https://api.openai.com/v1',

@@ -21,7 +21,7 @@ import { accounts, aiProposals, customers, invoices, items, journalEntries, jour
 import { Money, toAmountString, formatCurrency } from '@/lib/money';
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
 import { balanceSheet, profitAndLoss, trialBalance } from './reports';
-import { apAging, arAging } from './reportsExtra';
+import { apAging, arAging, cashFlow, expensesByVendor, openInvoices, salesByCustomer } from './reportsExtra';
 import { assertBalanced } from './posting';
 import { createBill } from './bills';
 import { createInvoice } from './invoices';
@@ -131,6 +131,56 @@ export const TOOLS: Record<string, ToolDef> = {
       const rows = [...r.rows].sort((x, y) => Money.of(y.total).comparedTo(Money.of(x.total)));
       const c = cap(rows.map(({ id: _id, ...rest }) => rest));
       return { asOf: r.asOf, vendors: c.rows, truncated: c.truncated, totals: r.totals };
+    },
+  },
+  open_invoices: {
+    area: 'reports_sales.receivables',
+    description: 'Unpaid invoices one by one (number, customer, due date, days overdue, balance due), most overdue first.',
+    argsHelp: '{"customer"?: "text matching the customer name"}',
+    args: z.object({ customer: z.string().max(100).optional() }),
+    async run(ctx, a) {
+      const r = await openInvoices(ctx);
+      const q = (a.customer as string | undefined)?.toLowerCase().trim();
+      const rows = r.rows
+        .filter((x) => !q || x.customerName.toLowerCase().includes(q))
+        .sort((x, y) => y.daysOverdue - x.daysOverdue)
+        .map((x) => ({ invoice: x.refNumber, customer: x.customerName, date: x.date, dueDate: x.dueDate, daysOverdue: x.daysOverdue, total: x.total, balanceDue: x.balanceDue }));
+      const c = cap(rows);
+      return { asOf: r.asOf, invoices: c.rows, truncated: c.truncated, count: rows.length, totalOpen: q ? toAmountString(Money.add(...rows.map((x) => x.balanceDue))) : r.totalOpen };
+    },
+  },
+  sales_by_customer: {
+    area: 'reports_sales.sales',
+    description: 'Sales by customer for a date range (who buys the most), largest first.',
+    argsHelp: '{"from"?: "YYYY-MM-DD", "to"?: "YYYY-MM-DD"}',
+    args: z.object({ from: zDateStr.optional(), to: zDateStr.optional() }),
+    async run(ctx, a) {
+      const rows = await salesByCustomer(ctx, { from: parseDate(a.from as string), to: parseDate(a.to as string, true) });
+      const sorted = [...rows].sort((x, y) => Money.of(y.totalSales).comparedTo(Money.of(x.totalSales)));
+      const c = cap(sorted.map((x) => ({ customer: x.customerName, sales: x.totalSales, invoices: x.invoiceCount })));
+      return { from: a.from ?? null, to: a.to ?? null, customers: c.rows, truncated: c.truncated, total: toAmountString(Money.add(...rows.map((x) => x.totalSales))) };
+    },
+  },
+  expenses_by_vendor: {
+    area: 'reports_purchases.purchases',
+    description: 'Spending by vendor for a date range (who we pay the most), largest first.',
+    argsHelp: '{"from"?: "YYYY-MM-DD", "to"?: "YYYY-MM-DD"}',
+    args: z.object({ from: zDateStr.optional(), to: zDateStr.optional() }),
+    async run(ctx, a) {
+      const rows = await expensesByVendor(ctx, { from: parseDate(a.from as string), to: parseDate(a.to as string, true) });
+      const sorted = [...rows].sort((x, y) => Money.of(y.totalExpenses).comparedTo(Money.of(x.totalExpenses)));
+      const c = cap(sorted.map((x) => ({ vendor: x.vendorName, spent: x.totalExpenses, bills: x.billCount })));
+      return { from: a.from ?? null, to: a.to ?? null, vendors: c.rows, truncated: c.truncated, total: toAmountString(Money.add(...rows.map((x) => x.totalExpenses))) };
+    },
+  },
+  cash_flow: {
+    area: 'reports_financial.company',
+    description: 'Statement of cash flows for a date range: operating, investing and financing activities and the net change in cash.',
+    argsHelp: '{"from"?: "YYYY-MM-DD", "to"?: "YYYY-MM-DD"}',
+    args: z.object({ from: zDateStr.optional(), to: zDateStr.optional() }),
+    async run(ctx, a) {
+      const r = await cashFlow(ctx, { from: parseDate(a.from as string), to: parseDate(a.to as string, true) });
+      return { from: a.from ?? null, to: a.to ?? null, operating: r.operating, investing: r.investing, financing: r.financing, netCashChange: r.netCashChange };
     },
   },
   account_balances: {
@@ -1301,7 +1351,29 @@ async function offlineAnswerInner(ctx: ServiceContext, q: string, today: Date): 
   const fc = (v: string) => formatCurrency(v);
   let answer: string;
 
-  if (/receivable|\bar\b|owe[s]? (us|me)|outstanding invoices|overdue invoices/.test(t)) {
+  if (/cash ?flow|statement of cash/.test(t)) {
+    const p = periodFromText(t, today);
+    const r = (await call('cash_flow', { from: p.from, to: p.to })) as {
+      operating: { total: string }; investing: { total: string }; financing: { total: string }; netCashChange: string;
+    };
+    answer =
+      `Cash flow for ${p.label} (${p.from} to ${p.to}): operating ${fc(r.operating.total)}, investing ${fc(r.investing.total)}, ` +
+      `financing ${fc(r.financing.total)}; net change in cash ${fc(r.netCashChange)} [cash_flow].`;
+  } else if (/(open|unpaid) invoices|invoices? (that are )?(open|unpaid)|list (of )?invoices/.test(t)) {
+    const r = (await call('open_invoices', {})) as { invoices: { invoice: string; customer: string; daysOverdue: number; balanceDue: string }[]; count: number; totalOpen: string };
+    const top = r.invoices.slice(0, 5).map((i) => `#${i.invoice} ${i.customer} ${fc(i.balanceDue)}${i.daysOverdue > 0 ? ` (${i.daysOverdue} days overdue)` : ''}`).join('; ');
+    answer = r.count ? `${r.count} open invoice(s), ${fc(r.totalOpen)} in total [open_invoices]. Most overdue: ${top}.` : 'No open invoices [open_invoices].';
+  } else if (/(top|best|biggest|largest) customers|sales by customer|who (buys|bought|spends?) (the )?most/.test(t)) {
+    const p = periodFromText(t, today);
+    const r = (await call('sales_by_customer', { from: p.from, to: p.to })) as { customers: { customer: string; sales: string }[]; total: string };
+    const top = r.customers.slice(0, 5).map((c) => `${c.customer} ${fc(c.sales)}`).join(', ');
+    answer = top ? `Top customers for ${p.label} (${p.from} to ${p.to}): ${top}; ${fc(r.total)} in all [sales_by_customer].` : `No sales for ${p.label} [sales_by_customer].`;
+  } else if (/(top|biggest|largest) vendors|(spend(ing)?|expenses?) by vendor|who do (we|i) (pay|spend)/.test(t)) {
+    const p = periodFromText(t, today);
+    const r = (await call('expenses_by_vendor', { from: p.from, to: p.to })) as { vendors: { vendor: string; spent: string }[]; total: string };
+    const top = r.vendors.slice(0, 5).map((v) => `${v.vendor} ${fc(v.spent)}`).join(', ');
+    answer = top ? `Top vendors for ${p.label} (${p.from} to ${p.to}): ${top}; ${fc(r.total)} in all [expenses_by_vendor].` : `No vendor spending for ${p.label} [expenses_by_vendor].`;
+  } else if (/receivable|\bar\b|owe[s]? (us|me)|outstanding invoices|overdue invoices/.test(t)) {
     const r = (await call('ar_aging', {})) as { customers: { name: string; total: string }[]; totals: { total: string; current: string } };
     const top = r.customers.slice(0, 5).map((c) => `${c.name} ${fc(c.total)}`).join(', ');
     answer = `Customers owe ${fc(r.totals.total)} in total (${fc(r.totals.current)} not yet due) [ar_aging].${top ? ` Largest balances: ${top}.` : ''}`;

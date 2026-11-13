@@ -162,6 +162,7 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/ai/tailnet': r('company', 'GET:modify'),
   '/api/ai/test': r('company', 'POST:modify'),
   '/api/ai/pull': r('company', 'POST:modify'), // download a starter model into local Ollama
+  '/api/ai/chatgpt': r('company', 'GET:modify POST:modify'), // Continue with ChatGPT (sign in / status / disconnect)
   // Advanced pricing / receiving preferences (team pricing).
   '/api/pricing/settings': r('company', 'GET PATCH'),
   '/api/receiving/settings': r('company', 'GET PATCH'),
@@ -441,6 +442,7 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/bank-transactions/exclude': r('banking', 'POST:modify'),
   '/api/bank-transactions/match': r('banking', 'POST:modify'),
   '/api/bank-transactions/unmatch': r('banking', 'POST:modify'),
+  '/api/ai/posts': r('banking', 'GET POST:modify'), // What the AI posted: list + Undo (= Unmatch)
   '/api/rules': r('banking', 'GET POST'),
   // bankrules: self-learning bank feed rules, suggestions with confidence, bulk accept.
   '/api/bank-rules': r('banking', 'GET POST'),
@@ -759,6 +761,7 @@ export const PAGE_AREAS: Record<string, Area | Area[]> = {
   '/registers': 'banking',
   '/bank-feeds': 'banking',
   '/bank-review': 'banking',
+  '/ai-posts': 'banking',
   '/bank-rules': 'banking',
   '/deposits': 'banking',
   '/transactions': 'banking',

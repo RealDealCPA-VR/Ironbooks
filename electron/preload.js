@@ -52,6 +52,15 @@ contextBridge.exposeInMainWorld('bookkeeper', {
     ipcRenderer.on('navigate', handler);
     return () => ipcRenderer.removeListener('navigate', handler);
   },
+  /** "Set up free AI": install Ollama (asks first; Windows runs its signed installer). */
+  ollama: {
+    install: () => ipcRenderer.invoke('ollama:install'),
+    onProgress: (cb) => {
+      const handler = (_e, p) => cb(p);
+      ipcRenderer.on('ollama:progress', handler);
+      return () => ipcRenderer.removeListener('ollama:progress', handler);
+    },
+  },
   /** App updates: current state, subscribe to changes, and the user's choices. */
   updates: {
     status: () => ipcRenderer.invoke('app:updateStatus'),

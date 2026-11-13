@@ -3142,6 +3142,68 @@ ipcMain.handle('portable:open', (e) => { if (fromLocalApp(e)) openPortableFlow()
 
 ipcMain.handle('app:dataDir', (e) => (fromLocalApp(e) ? currentCompanyLocation() : null));
 
+/**
+ * AI & Automation → "Set up free AI": install Ollama (electron/ollamaSetup.js). Asks first,
+ * follows the company's Privacy & Network policy (it downloads software from the internet, like
+ * an app update), and only runs an installer signed by Ollama. Resolves { ok, done?, error? }.
+ */
+let ollamaInstalling = false;
+ipcMain.handle('ollama:install', async (e) => {
+  if (!fromLocalApp(e)) return { ok: false, error: 'Not available here.' };
+  if (ollamaInstalling) return { ok: false, error: 'Ollama is already being installed.' };
+  const win = BrowserWindow.fromWebContents(e.sender) ?? mainWindow;
+  const isWin = process.platform === 'win32';
+  const { response } = await dialog.showMessageBox(win, {
+    type: 'question',
+    buttons: [isWin ? 'Download and install' : 'Open the download page', 'Cancel'],
+    defaultId: 0,
+    cancelId: 1,
+    title: 'Set up free AI',
+    message: isWin ? 'Install Ollama, the free AI that runs on this computer?' : 'Get Ollama, the free AI that runs on this computer?',
+    detail: isWin
+      ? 'Ironbooks downloads Ollama’s official installer from ollama.com (about 1 GB), checks that it is signed by Ollama, and starts it. Your books never leave this computer.'
+      : 'Ironbooks opens ollama.com/download in your browser. Install it, then come back to AI & Automation.',
+  });
+  if (response !== 0) return { ok: false, cancelled: true };
+  try {
+    const q = new URLSearchParams({ purpose: 'updates', url: 'https://ollama.com/download' });
+    const res = await fetch(`${serverUrl}/api/network-policy/check?${q}`, {
+      headers: { 'x-bka-internal': internalToken },
+      signal: AbortSignal.timeout(5000),
+    });
+    const d = res.ok ? await res.json() : null;
+    if (!d || d.allowed !== true) {
+      return { ok: false, error: (d && d.reason) || 'Privacy & Network does not allow downloads from the internet right now.' };
+    }
+  } catch {
+    return { ok: false, error: 'Could not read the Privacy & Network settings.' };
+  }
+  ollamaInstalling = true;
+  try {
+    const { installOllama } = require('./ollamaSetup');
+    let last = 0;
+    const r = await installOllama({
+      tmpDir: path.join(app.getPath('temp'), 'ironbooks-ollama'),
+      openPage: (url) => shell.openExternal(url),
+      launch: async (file) => {
+        const err = await shell.openPath(file);
+        if (err) throw new Error(`Could not start the Ollama installer: ${err}`);
+      },
+      onProgress: (p) => {
+        const now = Date.now();
+        if (now - last < 250 && p.received !== p.total) return;
+        last = now;
+        if (!e.sender.isDestroyed()) e.sender.send('ollama:progress', p);
+      },
+    });
+    return { ok: true, done: r.done };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  } finally {
+    ollamaInstalling = false;
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Company-file management (drives the in-app "Company File" screen)
 // ---------------------------------------------------------------------------

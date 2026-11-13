@@ -29,8 +29,8 @@ export default function AiActivityCard({ a }: { a: AiActivity }) {
         <div className="flex items-center gap-3">
           <Sparkles className="h-5 w-5 text-electric" aria-hidden="true" />
           <p className="text-sm text-navy/70">
-            Connect ChatGPT, Claude, Gemini or a free model on this computer to categorize bank lines, answer questions and
-            draft entries for your approval.
+            Sign in with your ChatGPT plan or add a free model on this computer to categorize bank lines, answer questions
+            and draft entries for your approval.
           </p>
         </div>
         <Link href="/ai-settings" className="rounded-lg bg-electric px-3 py-1.5 text-sm font-semibold text-white hover:brightness-110">
@@ -41,7 +41,7 @@ export default function AiActivityCard({ a }: { a: AiActivity }) {
   }
   const rows: Array<{ href: string; n: number; text: string; tone?: 'navy' | 'electric' }> = [];
   if (a.autoPostedLast7Days > 0) {
-    rows.push({ href: '/bank-review?tab=matched', n: a.autoPostedLast7Days, text: 'bank lines posted automatically this week (undo any with Unmatch in Bank Review)' });
+    rows.push({ href: '/ai-posts', n: a.autoPostedLast7Days, text: 'bank lines the AI posted this week (see them and undo any in one click)' });
   }
   if (a.bankLinesToReview > 0) {
     rows.push({
@@ -77,7 +77,8 @@ export default function AiActivityCard({ a }: { a: AiActivity }) {
           <Link href="/ai-settings" className="font-semibold text-electric hover:underline">
             Connect your AI
           </Link>{' '}
-          (ChatGPT, Claude, Gemini or a free model on this computer) to answer questions and draft entries for your approval.
+          (sign in with your ChatGPT plan, or a free model on this computer) to answer questions and draft entries for your
+          approval.
         </p>
       )}
       <p className="mt-3 text-xs text-navy/45">

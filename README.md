@@ -198,12 +198,22 @@ Want out again? Lists and transactions export to **IIF, CSV and Excel**.
 | Your LAN or **Tailscale tailnet** | ✅ | Nothing beyond your own network |
 | A cloud provider (e.g. Claude) | Opt-in per company | Only the prompt, with **SSNs, TINs and account numbers redacted** |
 
-**Bring your own AI.** Company > AI & Automation > **Add AI…** lists the ones people already
-have: OpenAI (ChatGPT), Anthropic (Claude), Google Gemini, Groq, OpenRouter, Mistral, xAI (Grok),
-DeepSeek, plus Ollama and LM Studio on this computer and any OpenAI-compatible server. Pick one,
-paste its API key (cloud) or press Test connection (local), Save — done. Keys are stored encrypted
-inside the company file, so they travel with it. One switch allows cloud AI; it also opens the
-company's network policy for AI, so there is no second page to find.
+**Bring your own AI — no API key needed.** Company > AI & Automation offers two choices up front:
+
+- **Continue with ChatGPT** — sign in with your ChatGPT Plus or Pro plan in your browser (OpenAI's
+  "Sign in with ChatGPT"). Ironbooks uses your plan's included usage: no API key, no extra bill, and
+  you can cap it at chatgpt.com > Settings > Usage. Ironbooks never sees your password; the sign-in
+  is sealed inside the company file.
+- **Set up free AI on this computer** — one click: on Windows the desktop app downloads Ollama's
+  official installer (and only runs it if it is signed by Ollama), waits for it to start,
+  downloads a starter model and connects it; on macOS and Linux it opens Ollama's download page
+  and carries on once Ollama is running. LM Studio works too. Nothing leaves your PC.
+
+Use both and the local model answers first, with ChatGPT taking over when it can't. Claude, Gemini
+and other services do not let apps use their subscriptions, so they are available under "Other AI
+services with an API key" (Anthropic, Google Gemini, Groq, OpenRouter, Mistral, xAI, DeepSeek,
+Azure OpenAI, any OpenAI-compatible server), billed by the service per use. Connecting a cloud AI
+also opens the company's network policy for AI, so there is no second page to find.
 
 The AI learns your categorization the way QuickBooks does, suggests journal entries for **your
 approval**, and reviews the books for unbalanced, duplicate or miscategorized entries and

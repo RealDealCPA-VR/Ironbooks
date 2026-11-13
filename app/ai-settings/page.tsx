@@ -45,7 +45,7 @@ import { AI_PRESETS, presetOf, type AiPreset } from '@/lib/ai/presets';
 // Types (mirror lib/services/aiSettings.ts views)
 // ---------------------------------------------------------------------------
 
-type Kind = 'ollama' | 'openai-compatible' | 'anthropic';
+type Kind = 'ollama' | 'openai-compatible' | 'anthropic' | 'chatgpt';
 type Policy = 'local-only' | 'local-then-cloud' | 'cloud-only';
 type Task = 'categorize' | 'assistant' | 'error-correction';
 
@@ -62,6 +62,8 @@ interface PublicProvider {
   locality: 'local' | 'cloud';
   hostClass: string | null;
   warning: string | null;
+  /** ChatGPT plan: the signed-in account. */
+  account?: string | null;
 }
 
 interface Settings {
@@ -96,6 +98,7 @@ interface Draft {
   apiKeyUnreadable?: boolean;
   apiKey: string;
   clearApiKey: boolean;
+  account?: string | null;
 }
 
 interface TestResult {
@@ -148,7 +151,16 @@ const KIND_LABELS: Record<Kind, string> = {
   ollama: 'Ollama',
   'openai-compatible': 'OpenAI-compatible API (OpenAI, Gemini, Groq, OpenRouter, Mistral, xAI, DeepSeek, LM Studio, vLLM…)',
   anthropic: 'Anthropic Claude',
+  chatgpt: 'ChatGPT plan (signed in)',
 };
+
+/** Rows a person can switch between by hand (the ChatGPT plan only comes from signing in). */
+const MANUAL_KINDS: Kind[] = ['ollama', 'openai-compatible', 'anthropic'];
+
+type SignIn =
+  | { status: 'pending' }
+  | { status: 'done'; providerId: string; account: string | null; model: string }
+  | { status: 'error'; error: string };
 
 let draftSeq = 0;
 function newDraft(partial: Partial<Draft>): Draft {
@@ -176,6 +188,7 @@ function toDraft(p: PublicProvider): Draft {
     enabled: p.enabled,
     hasApiKey: p.hasApiKey,
     apiKeyUnreadable: p.apiKeyUnreadable,
+    account: p.account,
   });
 }
 
@@ -239,6 +252,60 @@ export default function AiSettingsPage() {
   const [localStatus, setLocalStatus] = useState<Record<string, { running: boolean; models: number } | 'checking'>>({});
 
   const [pulling, setPulling] = useState(false);
+  /** "Continue with ChatGPT" in progress: the attempt being waited on. */
+  const [chatgptAttempt, setChatgptAttempt] = useState<string | null>(null);
+
+  /**
+   * Continue with ChatGPT: open OpenAI's sign-in in the person's browser, then wait for it to
+   * come back (the server saves the connection and turns it on). Uses their Plus/Pro plan.
+   */
+  async function connectChatGpt() {
+    setPickerOpen(false);
+    try {
+      const { attemptId, url } = await api.post<{ attemptId: string; url: string }>('/api/ai/chatgpt', { action: 'start' });
+      setChatgptAttempt(attemptId);
+      window.open(url, '_blank', 'noopener');
+      toast('Finish signing in to ChatGPT in your browser, then come back here.', 'info');
+      const until = Date.now() + 10 * 60 * 1000;
+      while (Date.now() < until) {
+        await new Promise((r) => setTimeout(r, 1500));
+        const s = await api.get<SignIn>(`/api/ai/chatgpt?attempt=${encodeURIComponent(attemptId)}`);
+        if (s.status === 'pending') continue;
+        if (s.status === 'done') {
+          apply(await api.get<Settings>('/api/ai/settings'));
+          loadCloudVerdict();
+          toast(`Connected to your ChatGPT plan${s.account ? ` (${s.account})` : ''}. The AI is ready to use.`, 'success');
+        } else {
+          toast(s.error, 'danger');
+        }
+        return;
+      }
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Could not start ChatGPT sign-in.', 'danger');
+    } finally {
+      setChatgptAttempt(null);
+    }
+  }
+
+  async function cancelChatGpt() {
+    if (chatgptAttempt) await api.post('/api/ai/chatgpt', { action: 'cancel', attemptId: chatgptAttempt }).catch(() => undefined);
+  }
+
+  async function disconnectChatGpt() {
+    if (!window.confirm('Disconnect your ChatGPT plan from this company? You can sign in again any time.')) return;
+    try {
+      const r = await api.post<{ revoked: boolean }>('/api/ai/chatgpt', { action: 'disconnect' });
+      apply(await api.get<Settings>('/api/ai/settings'));
+      toast(
+        r.revoked
+          ? 'ChatGPT disconnected.'
+          : 'ChatGPT disconnected here. To be thorough, also remove Ironbooks under ChatGPT → Settings → Security.',
+        'success',
+      );
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Could not disconnect.', 'danger');
+    }
+  }
 
   /** Ollama is running but has no model: download a small starter one (no command line). */
   async function downloadStarter() {
@@ -252,6 +319,98 @@ export default function AiSettingsPage() {
       toast(err instanceof ApiError ? err.message : 'The download did not finish.', 'danger');
     } finally {
       setPulling(false);
+    }
+  }
+
+  /** "Set up free AI" in progress: what is happening now (null when idle). */
+  const [freeAiStep, setFreeAiStep] = useState<string | null>(null);
+
+  /**
+   * One click to a free AI on this computer: install Ollama if it is missing (desktop app: its
+   * signed installer; elsewhere: the download page), wait for it to start, download a starter
+   * model if it has none, then add and save the connection. Local only: nothing leaves the PC.
+   */
+  async function setupFreeAi() {
+    setPickerOpen(false);
+    const OLLAMA = 'http://localhost:11434';
+    const ping = () =>
+      api
+        .post<TestResult>('/api/ai/test', { kind: 'ollama', label: 'Ollama', baseUrl: OLLAMA, model: '', enabled: true, timeoutMs: 3000 })
+        .catch(() => null);
+    const bridge = (
+      window as unknown as {
+        bookkeeper?: {
+          ollama?: {
+            install: () => Promise<{ ok: boolean; done?: string; error?: string; cancelled?: boolean }>;
+            onProgress: (cb: (p: { received: number; total: number }) => void) => () => void;
+          };
+        };
+      }
+    ).bookkeeper?.ollama;
+    try {
+      setFreeAiStep('Looking for Ollama on this computer…');
+      let status = await ping();
+      if (!status?.ok) {
+        if (bridge) {
+          const off = bridge.onProgress((p) =>
+            setFreeAiStep(`Downloading Ollama… ${p.total ? `${Math.round((p.received / p.total) * 100)}%` : `${Math.round(p.received / 1e6)} MB`}`),
+          );
+          let r;
+          try {
+            r = await bridge.install();
+          } finally {
+            off();
+          }
+          if (!r.ok) {
+            if (!r.cancelled) toast(r.error ?? 'Ollama could not be installed.', 'danger');
+            return;
+          }
+          setFreeAiStep(
+            r.done === 'installer-started'
+              ? 'Finish Ollama’s installer — Ironbooks carries on when Ollama is running…'
+              : 'Install Ollama from the page that just opened — Ironbooks carries on when it is running…',
+          );
+        } else {
+          window.open('https://ollama.com/download', '_blank', 'noopener');
+          setFreeAiStep('Install Ollama from the page that just opened — Ironbooks carries on when it is running…');
+        }
+        const until = Date.now() + 20 * 60 * 1000;
+        while (!status?.ok && Date.now() < until) {
+          await new Promise((res) => setTimeout(res, 4000));
+          status = await ping();
+        }
+        if (!status?.ok) {
+          toast('Ollama is not running yet. Start it, then click “Set up free AI” again.', 'danger');
+          return;
+        }
+      }
+      const chat = status.models.find((m) => !/embed|whisper|tts|rerank/i.test(m.id));
+      let model = chat?.id;
+      if (!model) {
+        setFreeAiStep('Downloading a starter model (llama3.2, about 2 GB)…');
+        model = (await api.post<{ model: string }>('/api/ai/pull', { baseUrl: OLLAMA })).model;
+      }
+      setFreeAiStep('Connecting…');
+      const current = await api.get<Settings>('/api/ai/settings');
+      const already = current.providers.some((p) => p.kind === 'ollama' && /localhost:11434|127\.0\.0\.1:11434/.test(p.baseUrl ?? ''));
+      if (!already) {
+        apply(
+          await api.put<Settings>('/api/ai/settings', {
+            providers: [
+              ...current.providers.map((p) => draftBody(toDraft(p))),
+              { kind: 'ollama', label: 'Ollama (this computer)', baseUrl: OLLAMA, model, enabled: true },
+            ],
+          }),
+        );
+      } else {
+        apply(current);
+      }
+      setLocalStatus((m) => ({ ...m, ollama: { running: true, models: Math.max(1, status?.models.length ?? 0) } }));
+      toast(`Free AI is ready: ${model} on this computer. Nothing leaves your PC.`, 'success');
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Setting up the free AI did not finish.', 'danger');
+    } finally {
+      setFreeAiStep(null);
     }
   }
 
@@ -407,7 +566,12 @@ export default function AiSettingsPage() {
 
   if (!settings) return <PageSkeleton />;
 
-  const hasLocal = drafts.some((d) => d.enabled && d.kind !== 'anthropic');
+  const hasLocal = drafts.some((d) => d.enabled && d.kind !== 'anthropic' && d.kind !== 'chatgpt');
+  /** A saved, enabled model on this computer / the local network (the free path is done). */
+  const freeAiReady = settings.providers.some((p) => p.enabled && p.locality === 'local');
+  const chatgptRow = drafts.find((d) => d.kind === 'chatgpt');
+  const localPresets = AI_PRESETS.filter((pr) => pr.where === 'this computer');
+  const keyPresets = AI_PRESETS.filter((pr) => pr.where === 'cloud');
   const dirty =
     JSON.stringify(drafts.map(draftBody)) !== JSON.stringify(settings.providers.map((p) => draftBody(toDraft(p)))) ||
     JSON.stringify(policies) !== JSON.stringify(settings.taskPolicies) ||
@@ -431,13 +595,59 @@ export default function AiSettingsPage() {
 
       <Card className="p-6 mb-6 bg-navy/[0.03]">
         <p className="text-sm text-navy/80 leading-relaxed">
-          <strong>Use the AI you already have.</strong> Add ChatGPT, Claude, Gemini and others with your own API key,
-          or a free model that runs on this computer (Ollama, LM Studio) so nothing leaves your PC. Cloud AI is off until
-          you allow it below. When it is on, the question and the report figures it needs are sent; before that, the
-          names on your customer, vendor and employee lists, emails, phone numbers, tax IDs, account numbers and
-          addresses are replaced with placeholders (other free text, such as a bank line&apos;s description, is sent as
-          is). A model on another computer in your office or on your Tailscale network works too.
+          <strong>Use the AI you already have.</strong> Sign in with your ChatGPT Plus or Pro plan (no API key, no
+          extra bill), or run a free model on this computer so nothing leaves your PC. When a cloud AI is used, the
+          question and the report figures it needs are sent; before that, the names on your customer, vendor and
+          employee lists, emails, phone numbers, tax IDs, account numbers and addresses are replaced with placeholders
+          (other free text, such as a bank line&apos;s description, is sent as is).
         </p>
+        <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <button
+            type="button"
+            onClick={connectChatGpt}
+            disabled={!!chatgptAttempt || !!chatgptRow}
+            className="flex items-start gap-3 rounded-xl border border-slate-200 bg-white p-4 text-left hover:border-electric hover:bg-electric/5 disabled:cursor-default disabled:hover:border-slate-200 disabled:hover:bg-white focus-visible:ring-2 focus-visible:ring-electric outline-none"
+          >
+            <Cloud className="mt-0.5 h-5 w-5 shrink-0 text-electric" />
+            <span>
+              <span className="block text-sm font-semibold text-navy">
+                {chatgptRow ? 'ChatGPT plan connected' : chatgptAttempt ? 'Waiting for ChatGPT sign-in…' : 'Continue with ChatGPT'}
+              </span>
+              <span className="block text-xs text-navy/55">
+                {chatgptRow
+                  ? `Signed in${chatgptRow.account ? ` as ${chatgptRow.account}` : ''}. Uses your plan's included usage.`
+                  : 'Uses your ChatGPT Plus or Pro plan. You sign in in your browser — Ironbooks never sees your password.'}
+              </span>
+            </span>
+          </button>
+          <button
+            type="button"
+            onClick={setupFreeAi}
+            disabled={!!freeAiStep || freeAiReady}
+            className="flex items-start gap-3 rounded-xl border border-slate-200 bg-white p-4 text-left hover:border-electric hover:bg-electric/5 disabled:cursor-default disabled:hover:border-slate-200 disabled:hover:bg-white focus-visible:ring-2 focus-visible:ring-electric outline-none"
+          >
+            <Cpu className="mt-0.5 h-5 w-5 shrink-0 text-electric" />
+            <span>
+              <span className="block text-sm font-semibold text-navy">
+                {freeAiReady ? 'Free AI on this computer is set up' : freeAiStep ? 'Setting up free AI…' : 'Set up free AI on this computer'}
+              </span>
+              <span className="block text-xs text-navy/55">
+                {freeAiReady
+                  ? 'A local model answers first. Nothing leaves your PC.'
+                  : 'One click: installs Ollama if needed and a starter model. Private: nothing leaves your PC.'}
+              </span>
+            </span>
+          </button>
+        </div>
+        {freeAiStep && <p className="mt-2 text-xs text-navy/60" role="status">{freeAiStep}</p>}
+        {chatgptAttempt && (
+          <p className="mt-2 text-xs text-navy/60">
+            Finish signing in in your browser.{' '}
+            <button type="button" className="text-red-500 hover:underline" onClick={() => void cancelChatGpt()}>
+              Cancel sign-in
+            </button>
+          </p>
+        )}
       </Card>
 
       {/* ------------------------------------------------------------ Models */}
@@ -458,11 +668,26 @@ export default function AiSettingsPage() {
 
         <Modal open={pickerOpen} onClose={() => setPickerOpen(false)} title="Which AI do you use?" size="lg">
           <p className="mb-4 text-sm text-navy/60">
-            Pick the one you already have an account for, or a free model that runs on this computer. You can add more
-            than one.
+            Use the ChatGPT plan you already pay for, or a free model that runs on this computer. You can have both: a
+            local model answers first and ChatGPT takes over when it can&apos;t.
           </p>
-          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-            {AI_PRESETS.map((pr) => (
+          <div className="mb-2 text-xs font-bold uppercase tracking-wider text-navy/40">Your subscription</div>
+          <button
+            type="button"
+            onClick={connectChatGpt}
+            disabled={!!chatgptAttempt || !!chatgptRow}
+            className="mb-4 flex w-full items-start gap-3 rounded-xl border border-electric/40 bg-electric/5 p-3 text-left hover:border-electric disabled:opacity-60 focus-visible:ring-2 focus-visible:ring-electric outline-none"
+          >
+            <Cloud className="mt-0.5 h-4 w-4 shrink-0 text-electric" />
+            <span>
+              <span className="block text-sm font-semibold text-navy">{chatgptRow ? 'ChatGPT plan (connected)' : 'Continue with ChatGPT'}</span>
+              <span className="block text-xs text-navy/55">ChatGPT Plus or Pro. Sign in in your browser — no API key, no extra bill.</span>
+              <span className="mt-1 block text-[11px] text-navy/40">Cloud · names and numbers are hidden before sending</span>
+            </span>
+          </button>
+          <div className="mb-2 text-xs font-bold uppercase tracking-wider text-navy/40">Free, on this computer</div>
+          <div className="mb-4 grid grid-cols-1 gap-2 sm:grid-cols-2">
+            {localPresets.map((pr) => (
               <button
                 key={pr.id}
                 type="button"
@@ -517,6 +742,29 @@ export default function AiSettingsPage() {
               </button>
             ))}
           </div>
+          <details className="rounded-xl border border-slate-200 p-3">
+            <summary className="cursor-pointer text-sm font-semibold text-navy">Other AI services with an API key (pay per use)</summary>
+            <p className="mt-2 mb-3 text-xs text-navy/55">
+              Claude, Gemini and the others do not let apps use their subscriptions, so these need an API key from the
+              service, billed by the service per use.
+            </p>
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+              {keyPresets.map((pr) => (
+                <button
+                  key={pr.id}
+                  type="button"
+                  onClick={() => addPreset(pr)}
+                  className="flex items-start gap-3 rounded-xl border border-slate-200 p-3 text-left hover:border-electric hover:bg-electric/5 focus-visible:ring-2 focus-visible:ring-electric outline-none"
+                >
+                  <Cloud className="mt-0.5 h-4 w-4 shrink-0 text-electric" />
+                  <span>
+                    <span className="block text-sm font-semibold text-navy">{pr.name}</span>
+                    <span className="block text-xs text-navy/55">{pr.blurb}</span>
+                  </span>
+                </button>
+              ))}
+            </div>
+          </details>
         </Modal>
 
         {peers && (
@@ -564,11 +812,16 @@ export default function AiSettingsPage() {
               the assistant answers basic questions from your reports.
             </p>
             <p className="mt-1 text-sm text-navy/60">
-              Connect ChatGPT, Claude, Gemini or a free model on this computer for smarter help.
+              Sign in with your ChatGPT plan or add a free model on this computer for smarter help.
             </p>
-            <Button className="mt-4" onClick={openPicker}>
-              <Plus className="h-4 w-4" /> Add AI…
-            </Button>
+            <div className="mt-4 flex flex-wrap justify-center gap-2">
+              <Button onClick={connectChatGpt} loading={!!chatgptAttempt}>
+                <Cloud className="h-4 w-4" /> Continue with ChatGPT
+              </Button>
+              <Button variant="secondary" onClick={setupFreeAi} loading={!!freeAiStep}>
+                <Cpu className="h-4 w-4" /> Set up free AI on this computer
+              </Button>
+            </div>
           </div>
         ) : (
           <div className="space-y-4">
@@ -576,13 +829,81 @@ export default function AiSettingsPage() {
               const t = tests[d.key];
               const saved = settings.providers.find((p) => p.id === d.id);
               const isCloud = d.kind === 'anthropic' || (t && t !== 'running' ? t.locality === 'cloud' : saved?.locality === 'cloud');
+              if (d.kind === 'chatgpt') {
+                return (
+                  <div key={d.key} className="rounded-xl border border-electric/30 bg-electric/[0.03] p-4">
+                    <div className="grid grid-cols-1 md:grid-cols-12 gap-3 items-end">
+                      <div className="md:col-span-4">
+                        <Label>ChatGPT plan</Label>
+                        <div className="text-sm text-navy">
+                          {d.apiKeyUnreadable ? (
+                            'Sign-in unreadable on this computer — sign in again'
+                          ) : d.account ? (
+                            <>
+                              Signed in as <strong>{d.account}</strong>
+                            </>
+                          ) : (
+                            'Signed in'
+                          )}
+                        </div>
+                      </div>
+                      <div className="md:col-span-4">
+                        <Label>Model</Label>
+                        {t && t !== 'running' && t.models.length > 0 ? (
+                          <Select value={d.model} onChange={(e) => patchDraft(d.key, { model: e.target.value })}>
+                            {!t.models.some((m) => m.id === d.model) && <option value={d.model}>{d.model || 'Pick a model…'}</option>}
+                            {t.models.map((m) => (
+                              <option key={m.id} value={m.id}>
+                                {m.label ?? m.id}
+                              </option>
+                            ))}
+                          </Select>
+                        ) : (
+                          <div className="flex items-center gap-2 text-sm text-navy">
+                            <span>{d.model || 'Not chosen'}</span>
+                            <button type="button" className="text-xs text-electric hover:underline" onClick={() => test(d)}>
+                              Change…
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                      <div className="md:col-span-4 flex items-center gap-2 justify-end">
+                        <label className="flex items-center gap-2 text-sm text-navy/70 mr-auto">
+                          <input type="checkbox" checked={d.enabled} onChange={(e) => patchDraft(d.key, { enabled: e.target.checked })} />
+                          Enabled
+                        </label>
+                        <Button variant="secondary" size="sm" loading={t === 'running'} onClick={() => test(d)}>
+                          Test connection
+                        </Button>
+                        {d.apiKeyUnreadable ? (
+                          <Button size="sm" onClick={connectChatGpt}>
+                            Sign in again
+                          </Button>
+                        ) : (
+                          <Button variant="ghost" size="sm" onClick={disconnectChatGpt}>
+                            Disconnect
+                          </Button>
+                        )}
+                      </div>
+                    </div>
+                    <div className="mt-3 flex flex-wrap items-center gap-2 text-sm">
+                      <HostBadge hostClass={null} locality="cloud" />
+                      {t && t !== 'running' && (t.ok ? <Badge tone="success">Connected · {t.latencyMs} ms</Badge> : <Badge tone="danger">Failed: {t.error}</Badge>)}
+                      <a href="https://chatgpt.com/settings/usage" target="_blank" rel="noreferrer" className="text-xs text-electric hover:underline">
+                        Manage usage ↗
+                      </a>
+                      {!cloudEnabled && <span className="text-xs text-navy/50">Not used until “Allow cloud AI” is on.</span>}
+                    </div>
+                  </div>
+                );
+              }
               return (
                 <div key={d.key} className="rounded-xl border border-slate-200 p-4">
                   <div className="grid grid-cols-1 md:grid-cols-12 gap-3 items-end">
                     <div className="md:col-span-3">
                       <Label>Type</Label>
                       <Select value={d.kind} onChange={(e) => patchDraft(d.key, { kind: e.target.value as Kind })}>
-                        {(Object.keys(KIND_LABELS) as Kind[]).map((k) => (
+                        {MANUAL_KINDS.map((k) => (
                           <option key={k} value={k}>
                             {KIND_LABELS[k]}
                           </option>
@@ -823,7 +1144,10 @@ export default function AiSettingsPage() {
         </div>
         <p className="text-sm text-navy/60 mb-4">
           Learns from how you categorize bills, checks, expenses and bank transactions — entirely on this computer. It
-          updates automatically every time you categorize something.
+          updates automatically every time you categorize something.{' '}
+          <a href="/ai-posts" className="text-electric hover:underline">
+            See what the AI posted (and undo any) →
+          </a>
         </p>
         {cat ? (
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">

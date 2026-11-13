@@ -53,8 +53,19 @@ of that cap and the company setting. A value that is set but not recognised coun
   `lib/net/policy.ts`. A blocked call fails with a plain-English message and never opens a
   connection. Redirects are checked hop by hop, so an allowed host cannot bounce a request to a
   disallowed one. Today that covers SMTP (email) and every AI provider
-  configured in AI & Automation (Ollama / OpenAI-compatible / Anthropic, see
-  `lib/ai/providers.ts`); new integrations must use the same gate.
+  configured in AI & Automation (Ollama / OpenAI-compatible / Anthropic / your ChatGPT plan, see
+  `lib/ai/providers.ts` and `lib/ai/chatgpt.ts`); new integrations must use the same gate.
+- **Set up free AI (desktop app):** after you confirm, the app downloads Ollama's installer from
+  `ollama.com` (which may hand off to GitHub), checks it is signed by Ollama, and starts it. This
+  follows the *App updates* purpose (blocked in Offline mode or when updates are turned off). Your
+  books are not sent anywhere; the model then runs on this computer.
+- **Continue with ChatGPT:** you sign in on OpenAI's own page in your web browser; Ironbooks never
+  sees your password. For the sign-in, Ironbooks listens on `127.0.0.1` (this computer only) for
+  OpenAI to hand back a one-time code, then stops listening. The resulting sign-in (an access and
+  refresh token, plus your ChatGPT account email) is sealed inside the company file like an API
+  key. Requests go to `api.openai.com` with `store: false`, redacted like every cloud AI call, and
+  count against your ChatGPT plan's usage. **Disconnect** on the AI page removes the sign-in and
+  signs Ironbooks out at OpenAI.
 - **Recent network activity:** the Privacy & Network page lists every outbound attempt since the
   app started: destination host, purpose and whether it was allowed. It never records the
   content, headers or query strings.
