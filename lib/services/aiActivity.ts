@@ -9,7 +9,7 @@
  * Every count links to the screen where the person finishes the job.
  */
 import { and, count, eq, gte, isNotNull } from 'drizzle-orm';
-import { aiAutoApplied, aiProposals, bankTransactions } from '@/lib/db/schema';
+import { aiAutoApplied, aiProposals, bankTransactions, journalEntries } from '@/lib/db/schema';
 import { localityOf } from '@/lib/ai/providers';
 import type { ServiceContext } from './_base';
 import { cloudCallsToday, loadSettings } from './aiSettings';
@@ -37,7 +37,11 @@ export async function aiActivity(ctx: ServiceContext, now = new Date()): Promise
   const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
   const open = and(eq(bankTransactions.companyId, ctx.companyId), eq(bankTransactions.matched, false), eq(bankTransactions.excluded, false));
   const [[auto], [toReview], [suggested], [proposals], offers, calls] = await Promise.all([
-    ctx.db.select({ n: count() }).from(aiAutoApplied).where(and(eq(aiAutoApplied.companyId, ctx.companyId), gte(aiAutoApplied.createdAt, weekAgo))),
+    ctx.db
+      .select({ n: count() })
+      .from(aiAutoApplied)
+      .innerJoin(journalEntries, eq(journalEntries.id, aiAutoApplied.journalEntryId))
+      .where(and(eq(aiAutoApplied.companyId, ctx.companyId), gte(aiAutoApplied.createdAt, weekAgo), eq(journalEntries.status, 'posted'))),
     ctx.db.select({ n: count() }).from(bankTransactions).where(open),
     ctx.db.select({ n: count() }).from(bankTransactions).where(and(open, isNotNull(bankTransactions.suggestedAccountId))),
     ctx.db.select({ n: count() }).from(aiProposals).where(and(eq(aiProposals.companyId, ctx.companyId), eq(aiProposals.status, 'pending'))),

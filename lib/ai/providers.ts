@@ -290,7 +290,23 @@ export function isAzureOpenAiHost(baseUrl: string): boolean {
     return false;
   }
 }
-const AZURE_API_VERSION = '2024-10-21';
+// Chat on Azure: a version that takes max_completion_tokens (o-series, GPT-5 deployments).
+const AZURE_API_VERSION = '2025-04-01-preview';
+
+/**
+ * Endpoints (base URL + model) found to be reasoning models by a 400 — remembered for this
+ * process, so a provider rebuilt for the next request does not fail its first call again.
+ */
+const learnedReasoning = new Set<string>();
+
+/** OpenAI-family hosts, where a 400 about temperature / max_tokens means "reasoning model". */
+function isOpenAiFamilyHost(baseUrl: string): boolean {
+  try {
+    return /(^|\.)(api\.openai\.com|openai\.azure\.com|cognitiveservices\.azure\.com|openrouter\.ai)$/i.test(new URL(baseUrl).hostname);
+  } catch {
+    return false;
+  }
+}
 const AZURE_DEPLOYMENTS_API_VERSION = '2023-03-15-preview';
 
 /** The image type of base64 bytes (PNG / JPEG / WebP / GIF by their first bytes), JPEG otherwise. */
@@ -356,7 +372,8 @@ export function createOpenAiCompatibleProvider(cfg: ProviderRuntimeConfig, deps:
   // deployments) reject `temperature` and `max_tokens`: they take `max_completion_tokens`, and
   // their hidden reasoning counts against it, so they get a larger budget. Set once a 400 says so
   // too (an Azure deployment name says nothing about its model).
-  let reasoning = isReasoningModel(cfg.model);
+  const reasoningKey = `${trimSlash(cfg.baseUrl)}|${cfg.model}`;
+  let reasoning = isReasoningModel(cfg.model) || learnedReasoning.has(reasoningKey);
 
   async function complete(messages: ChatMessage[], opts: ChatOptions, withSchema: boolean) {
     // A cloud endpoint never receives images (they cannot be redacted); local servers get them.
@@ -396,16 +413,28 @@ export function createOpenAiCompatibleProvider(cfg: ProviderRuntimeConfig, deps:
     kind: 'openai-compatible',
     locality,
     async chat(messages, opts = {}) {
+      const isBad = (e: unknown) => e instanceof AiError && e.code === 'HTTP' && (e.status === 400 || e.status === 422);
       let data;
       try {
         data = await complete(messages, opts, true);
       } catch (err) {
-        const bad = err instanceof AiError && err.code === 'HTTP' && (err.status === 400 || err.status === 422);
-        if (bad && !reasoning && /temperature|max_tokens|max_completion_tokens/i.test((err as AiError).message)) {
-          // A reasoning model the name didn't reveal: retry with its parameters.
+        if (
+          isBad(err) &&
+          !reasoning &&
+          isOpenAiFamilyHost(cfg.baseUrl!) &&
+          /temperature|max_tokens|max_completion_tokens/i.test((err as AiError).message)
+        ) {
+          // An OpenAI reasoning model the name didn't reveal (an Azure deployment, say): retry
+          // with its parameters, and remember it for the next request.
           reasoning = true;
-          data = await complete(messages, opts, true);
-        } else if (bad && opts.jsonSchema) {
+          learnedReasoning.add(reasoningKey);
+          try {
+            data = await complete(messages, opts, true);
+          } catch (err2) {
+            if (!(isBad(err2) && opts.jsonSchema)) throw err2;
+            data = await complete(messages, opts, false);
+          }
+        } else if (isBad(err) && opts.jsonSchema) {
           // Some servers reject response_format/json_schema — retry once without it; the
           // router still validates the JSON with zod.
           data = await complete(messages, opts, false);

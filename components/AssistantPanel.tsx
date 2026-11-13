@@ -437,7 +437,7 @@ export default function AssistantPanel({ open, onClose }: { open: boolean; onClo
                   ) : m.reply.redacted ? (
                     <Badge tone="warning">
                       <Cloud className="inline h-3 w-3 mr-1" />
-                      Cloud · names hidden
+                      Cloud · listed names hidden
                     </Badge>
                   ) : (
                     <Badge tone="success">

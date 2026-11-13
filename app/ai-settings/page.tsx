@@ -8,7 +8,7 @@
  *    Test Connection probes the server and fills the model picker. API keys are write-only:
  *    the server stores them encrypted and only ever reports "saved".
  *  - Routing: cloud is OFF by default; each task can be local-only (default),
- *    local-then-cloud or cloud-only. Cloud calls are always redacted.
+ *    local-then-cloud or cloud-only. Listed names and identifiers are replaced in cloud calls.
  *  - Automation: learned bank-feed auto-apply threshold and LLM second opinions.
  *  - Learned categorizer status + retrain.
  */

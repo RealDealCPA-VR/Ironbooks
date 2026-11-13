@@ -170,7 +170,7 @@ describe('OpenAI-compatible provider', () => {
     expect(await p.listModels()).toEqual([{ id: 'books-gpt', label: 'gpt-4o' }]);
     expect(f.calls[0].url).toBe('https://acme.openai.azure.com/openai/deployments?api-version=2023-03-15-preview');
     await p.chat([{ role: 'user', content: 'x' }]);
-    expect(f.calls[1].url).toBe('https://acme.openai.azure.com/openai/deployments/books-gpt/chat/completions?api-version=2024-10-21');
+    expect(f.calls[1].url).toBe('https://acme.openai.azure.com/openai/deployments/books-gpt/chat/completions?api-version=2025-04-01-preview');
     const h = f.calls[1].init.headers as Record<string, string>;
     expect(h['api-key']).toBe('azkey');
     expect(h.authorization).toBeUndefined();

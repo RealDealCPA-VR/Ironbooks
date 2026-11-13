@@ -178,11 +178,12 @@ export default function BankReviewPage() {
   const [allAccounts, setAllAccounts] = useState<Account[]>([]);
   const [selectedBankAccountId, setSelectedBankAccountId] = useState('');
   const [transactions, setTransactions] = useState<BankTransaction[]>([]);
-  const [tab, setTab] = useState<ReviewTab>(() => {
-    if (typeof window === 'undefined') return 'unreviewed';
+  const [tab, setTab] = useState<ReviewTab>('unreviewed');
+  // ?tab=matched (the Home AI card's "undo with Unmatch" link) opens that tab, after the first render.
+  useEffect(() => {
     const t = new URLSearchParams(window.location.search).get('tab');
-    return t === 'matched' || t === 'excluded' ? t : 'unreviewed';
-  });
+    if (t === 'matched' || t === 'excluded') setTab(t);
+  }, []);
 
   // Per-row state
   const [rowAccountId, setRowAccountId] = useState<Record<string, string>>({});

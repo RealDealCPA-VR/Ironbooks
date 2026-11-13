@@ -14,6 +14,7 @@ import type { ServiceContext } from './_base';
 import { createCompany } from './company';
 import { approveProposal, createBillProposal, createProposal } from './aiAssistant';
 import { trialBalance } from './reports';
+import { unionRoles } from '@/lib/permissions/model';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-ai-bill-proposal');
 let db: DB;
@@ -66,5 +67,25 @@ describe('assistant bill proposals', () => {
     expect(Number(bill.total)).toBe(125.5);
     const tb = await trialBalance(ctx);
     expect(tb.totalDebit).toBe(tb.totalCredit);
+  });
+
+  it('approving a bill needs Vendors - Enter Bills create, not just a journal-entry right', async () => {
+    const p = await createProposal(ctx, { type: 'bill', vendorName: 'Office Supply Co', date: '2026-03-02', lines: [{ accountCode: expenseCode, amount: '10.00' }] });
+    const journalOnly = {
+      ...ctx,
+      role: 'admin' as const,
+      access: unionRoles([
+        {
+          key: 'je_only',
+          name: 'Journal entries only',
+          description: '',
+          builtin: false,
+          permissions: { accounting: ['view', 'create', 'modify', 'print'], reports_financial: ['view'] },
+          flags: {},
+        } as never,
+      ]),
+    };
+    await expect(approveProposal(journalOnly as never, p.id)).rejects.toMatchObject({ code: 'FORBIDDEN' });
+    expect(await db.select().from(bills).where(eq(bills.companyId, ctx.companyId))).toHaveLength(1); // only the earlier bill
   });
 });

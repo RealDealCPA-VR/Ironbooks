@@ -856,6 +856,12 @@ export async function approveProposal(ctx: ServiceContext, id: string): Promise<
       .for('update');
     if (!row) throw notFound('Proposal');
     if (row.status !== 'pending') throw new ServiceError('CONFLICT', `Proposal is already ${row.status}.`);
+    // The approver needs the same right the screen would need (Users & Roles), checked before any
+    // kind is entered: a journal-entry right alone does not let someone enter bills, invoices or
+    // customer payments.
+    if (row.kind === 'bill') requirePermission(tx, 'vendors.bills', 'create');
+    if (row.kind === 'invoice') requirePermission(tx, 'customers.invoices', 'create');
+    if (row.kind === 'payment') requirePermission(tx, 'customers.payments', 'create');
     if (row.kind === 'bill') {
       const b = (row.payload as unknown as StoredJournalProposal).bill;
       if (!b) throw validation('This bill proposal is incomplete and cannot be entered.');
@@ -884,11 +890,6 @@ export async function approveProposal(ctx: ServiceContext, id: string): Promise<
       });
       return toView(updated);
     }
-    // The approver needs the same right the screen would need (Users & Roles): a journal-entry
-    // right alone does not let someone enter bills, invoices or customer payments.
-    if (row.kind === 'bill') requirePermission(tx, 'vendors.bills', 'create');
-    if (row.kind === 'invoice') requirePermission(tx, 'customers.invoices', 'create');
-    if (row.kind === 'payment') requirePermission(tx, 'customers.payments', 'create');
     if (row.kind === 'payment') {
       const v = (row.payload as unknown as StoredJournalProposal).payment;
       if (!v) throw validation('This payment proposal is incomplete and cannot be recorded.');

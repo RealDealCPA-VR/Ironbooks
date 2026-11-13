@@ -420,8 +420,18 @@ export async function autoApplyBankSuggestions(
   const [cut] = await ctx.db
     .select({ last: sql<Date | null>`max(${journalEntries.date})` })
     .from(journalEntries)
-    .where(and(eq(journalEntries.companyId, ctx.companyId), like(journalEntries.sourceRef, 'qbgl:%')));
-  const cutover = cut?.last ? new Date(cut.last) : null;
+    .where(
+      and(
+        eq(journalEntries.companyId, ctx.companyId),
+        eq(journalEntries.status, 'posted'),
+        like(journalEntries.sourceRef, 'qbgl:%'),
+        // The import's variance / suspense entry is dated at the report's period end, which can
+        // be after the last real transaction (or in the future): it is not history.
+        sql`${journalEntries.sourceRef} NOT LIKE 'qbgl:variance%'`,
+      ),
+    );
+  // Never later than today: a future-dated entry must not stop auto-posting for months.
+  const cutover = cut?.last ? new Date(Math.min(new Date(cut.last).getTime(), Date.now())) : null;
   const matches = await suggestMatchesForAccount(ctx, bankAccountId, { bankTransactionIds: ids });
 
   for (const s of suggestions) {

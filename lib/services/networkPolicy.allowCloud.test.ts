@@ -12,6 +12,7 @@ import { decideOutbound } from '@/lib/net/policy';
 import type { ServiceContext } from './_base';
 import { createCompany } from './company';
 import { allowCloudPurpose, getNetworkPolicy, setNetworkPolicy } from './networkPolicy';
+import { testConnection } from './aiSettings';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-allow-cloud-ai');
 let db: DB;
@@ -52,5 +53,22 @@ describe('allowCloudPurpose', () => {
     expect(r.changed).toBe(false);
     expect(r.notice).toMatch(/Offline mode/);
     expect((await getNetworkPolicy(ctx)).mode).toBe('offline');
+  });
+
+  it('Test connection on a cloud AI keeps the permission only when the test succeeds', async () => {
+    await setNetworkPolicy(ctx, { mode: 'tailnet-only' });
+    const draft = { kind: 'openai-compatible', label: 'OpenAI', baseUrl: 'https://api.openai.com/v1', model: 'gpt-5', apiKey: 'sk-test', enabled: true };
+    const rejected = async () => new Response(JSON.stringify({ error: { message: 'Incorrect API key' } }), { status: 401 });
+    const failed = await testConnection(ctx, draft, { fetch: rejected }, { allowCloud: true });
+    expect(failed.ok).toBe(false);
+    expect(failed.error).toMatch(/API key was not accepted/);
+    expect((await getNetworkPolicy(ctx)).mode).toBe('tailnet-only');
+
+    const accepted = async () => new Response(JSON.stringify({ data: [{ id: 'gpt-5' }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    const ok = await testConnection(ctx, draft, { fetch: accepted }, { allowCloud: true });
+    expect(ok.ok).toBe(true);
+    const after = await getNetworkPolicy(ctx);
+    expect(after.mode).toBe('allow-cloud');
+    expect(after.cloudOptIn.ai).toBe(true);
   });
 });

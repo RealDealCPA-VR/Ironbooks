@@ -32,7 +32,7 @@ puts your clients' books on someone else's server. Ironbooks is the third option
   triggers**. An unbalanced entry, a hand-edited balance, or a change to a posted line is
   rejected at commit, whatever code path tries it.
 - 🤖 **AI that works for you, on your hardware.** Local models on your PC or Tailscale tailnet do
-  the categorizing, suggest entries and catch mistakes. Cloud AI is opt-in and redacted.
+  the categorizing, suggest entries and catch mistakes. Cloud AI is opt-in; listed names and identifiers are replaced before anything is sent.
 - 🧾 **Built by working through QuickBooks Desktop Enterprise screen by screen**, from account
   types to the Accountant Center. If your bookkeeper knows QB, they already know the workflow.
 

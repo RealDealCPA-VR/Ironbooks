@@ -626,10 +626,15 @@ export async function testConnection(
   // "Allow cloud AI" is ticked on the page: testing a cloud AI is the person's first use of it,
   // so its Privacy & Network permission is given now (the same one switch Save gives), instead of
   // failing the test until Save. Offline mode / a machine limit is reported, never overridden.
+  // The permission is only KEPT when the test succeeds: a failed test (wrong key, typo in the
+  // address) leaves Privacy & Network as it was.
+  let undoCloud: (() => Promise<void>) | null = null;
   if (base.locality === 'cloud' && opts.allowCloud) {
-    const { allowCloudPurpose } = await import('./networkPolicy');
+    const { allowCloudPurpose, getNetworkPolicy, setNetworkPolicy } = await import('./networkPolicy');
+    const before = await getNetworkPolicy(ctx);
     const r = await allowCloudPurpose(ctx, 'ai');
     if (r.notice) return { ok: false, latencyMs: 0, error: r.notice, models: [], ...base };
+    if (r.changed) undoCloud = async () => void (await setNetworkPolicy(ctx, before));
   }
   let provider: AiProvider;
   try {
@@ -641,7 +646,10 @@ export async function testConnection(
   const timer = setTimeout(() => ac.abort(), p.timeoutMs ?? 15_000);
   try {
     const health = await provider.health({ signal: ac.signal });
-    if (!health.ok) return { ...health, error: friendlyTestError(health.error ?? 'Failed.', p.kind, p.baseUrl), models: [], ...base };
+    if (!health.ok) {
+      if (undoCloud) await undoCloud().catch(() => undefined);
+      return { ...health, error: friendlyTestError(health.error ?? 'Failed.', p.kind, p.baseUrl), models: [], ...base };
+    }
     let models: ModelInfo[] = [];
     try {
       models = await provider.listModels({ signal: ac.signal });
