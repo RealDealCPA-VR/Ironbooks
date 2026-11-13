@@ -31,8 +31,9 @@ export interface AiActivity {
 export async function aiActivity(ctx: ServiceContext, now = new Date()): Promise<AiActivity> {
   const s = await loadSettings(ctx);
   const enabled = s.providers.filter((p) => p.enabled);
-  const connected: AiActivity['connected'] =
-    enabled.length === 0 ? 'none' : enabled.some((p) => localityOf(p) === 'cloud') && s.cloudEnabled ? 'cloud' : 'local';
+  const hasCloud = s.cloudEnabled && enabled.some((p) => localityOf(p) === 'cloud');
+  const hasLocal = enabled.some((p) => localityOf(p) === 'local');
+  const connected: AiActivity['connected'] = hasCloud ? 'cloud' : hasLocal ? 'local' : 'none';
   const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
   const open = and(eq(bankTransactions.companyId, ctx.companyId), eq(bankTransactions.matched, false), eq(bankTransactions.excluded, false));
   const [[auto], [toReview], [suggested], [proposals], offers, calls] = await Promise.all([

@@ -286,6 +286,9 @@ export async function updateSettings(ctx: ServiceContext, input: UpdateSettingsI
       if (p.kind === 'anthropic' && !apiKeyEnc && !newKeys.has(id) && p.enabled) {
         throw validation(`${p.label}: an Anthropic API key is required.`);
       }
+      if (p.kind === 'openai-compatible' && p.enabled && !apiKeyEnc && !newKeys.has(id) && localityOf({ kind: 'openai-compatible', baseUrl: p.baseUrl ?? null }) === 'cloud') {
+        throw validation(`${p.label}: paste the API key from your account (cloud AI services need one).`);
+      }
       return {
         id,
         kind: p.kind as StoredProviderConfig['kind'],
@@ -596,6 +599,7 @@ export async function testConnection(
   ctx: ServiceContext,
   input: ProviderInput,
   deps: ProviderDeps = {},
+  opts: { allowCloud?: boolean } = {},
 ): Promise<TestConnectionResult> {
   await requireRole(ctx, 'admin');
   const parsed = providerInputSchema.safeParse(input);
@@ -619,6 +623,14 @@ export async function testConnection(
   };
   const ep = p.kind === 'anthropic' && !p.baseUrl ? null : classifyEndpoint(p.baseUrl);
   const base = { locality: localityOf(cfg), hostClass: ep?.hostClass ?? null, warning: ep?.warning ?? null };
+  // "Allow cloud AI" is ticked on the page: testing a cloud AI is the person's first use of it,
+  // so its Privacy & Network permission is given now (the same one switch Save gives), instead of
+  // failing the test until Save. Offline mode / a machine limit is reported, never overridden.
+  if (base.locality === 'cloud' && opts.allowCloud) {
+    const { allowCloudPurpose } = await import('./networkPolicy');
+    const r = await allowCloudPurpose(ctx, 'ai');
+    if (r.notice) return { ok: false, latencyMs: 0, error: r.notice, models: [], ...base };
+  }
   let provider: AiProvider;
   try {
     provider = createProvider(cfg, { ...deps, policyCtx: { db: ctx.db, companyId: ctx.companyId } });

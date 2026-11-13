@@ -19,7 +19,7 @@
  * the next suggestion). A 10-minute overlap window plus a "seen" key set guards against rows
  * whose created_at predates the watermark because their transaction committed late.
  */
-import { and, desc, eq, gt, isNull, like, ne, sql } from 'drizzle-orm';
+import { and, desc, eq, gt, inArray, isNull, like, ne, sql } from 'drizzle-orm';
 import { z } from 'zod';
 import {
   accounts,
@@ -39,7 +39,7 @@ import { Money, toAmountString } from '@/lib/money';
 import { BUSINESS_TYPES, ENTITY_TYPES } from '@/lib/onboarding';
 import { lookupVendor } from './vendorLookup';
 import { type ServiceContext, ServiceError, inTransaction, notFound, writeAudit } from './_base';
-import { categorize } from './bankCategorize';
+import { categorize, suggestMatchesForAccount } from './bankCategorize';
 import { glHistoryPatterns } from './historyPatterns';
 import { buildRouter, loadSettings, type BuildRouterOptions } from './aiSettings';
 import {
@@ -381,7 +381,11 @@ export interface AutoApplyResult {
  * bankCategorize.categorize (→ postJournalEntry) inside one transaction together with its
  * ai_auto_applied log row and an audit entry explaining the AI decision.
  */
-export async function autoApplyBankSuggestions(ctx: ServiceContext, bankAccountId: string): Promise<AutoApplyResult> {
+export async function autoApplyBankSuggestions(
+  ctx: ServiceContext,
+  bankAccountId: string,
+  opts: { fileImportId?: string } = {},
+): Promise<AutoApplyResult> {
   const settings = await loadSettings(ctx);
   if (!settings.autoApplyEnabled) {
     throw new ServiceError('VALIDATION', 'Auto-apply is turned off. Turn it on under Company > AI & Automation.');
@@ -389,8 +393,50 @@ export async function autoApplyBankSuggestions(ctx: ServiceContext, bankAccountI
   const threshold = Number(settings.autoApplyThreshold);
   const { suggestions } = await suggestBankCategories(ctx, bankAccountId);
   const result: AutoApplyResult = { applied: [], skipped: [] };
+
+  // Safety: the AI never posts a line that may already be in the books. Before anything posts:
+  //  - only the lines of this import, when called after one (never older lines left for review);
+  //  - never a line the AI posted before (an Unmatch is the person's "no" — it must stick);
+  //  - never a line dated on or before the last imported QuickBooks history (the cutover: those
+  //    transactions are already in the ledger from the GL import);
+  //  - never a line with a match candidate (an entered check, deposit or bill payment it should
+  //    MATCH, not duplicate) — Bank Review offers the match instead.
+  const candidates = suggestions.filter((s) => s.source === 'model' && s.accountId && s.confidence >= threshold);
+  if (candidates.length === 0) return result;
+  const ids = candidates.map((s) => s.bankTransactionId);
+  const lines = await ctx.db
+    .select({ id: bankTransactions.id, date: bankTransactions.date, fileImportId: bankTransactions.fileImportId })
+    .from(bankTransactions)
+    .where(and(eq(bankTransactions.companyId, ctx.companyId), inArray(bankTransactions.id, ids)));
+  const lineById = new Map(lines.map((l) => [l.id, l]));
+  const postedBefore = new Set(
+    (
+      await ctx.db
+        .select({ id: aiAutoApplied.bankTransactionId })
+        .from(aiAutoApplied)
+        .where(and(eq(aiAutoApplied.companyId, ctx.companyId), inArray(aiAutoApplied.bankTransactionId, ids)))
+    ).map((r) => r.id),
+  );
+  const [cut] = await ctx.db
+    .select({ last: sql<Date | null>`max(${journalEntries.date})` })
+    .from(journalEntries)
+    .where(and(eq(journalEntries.companyId, ctx.companyId), like(journalEntries.sourceRef, 'qbgl:%')));
+  const cutover = cut?.last ? new Date(cut.last) : null;
+  const matches = await suggestMatchesForAccount(ctx, bankAccountId, { bankTransactionIds: ids });
+
   for (const s of suggestions) {
     if (s.source !== 'model' || !s.accountId || s.confidence < threshold) continue;
+    const line = lineById.get(s.bankTransactionId);
+    if (!line) continue;
+    if (opts.fileImportId && line.fileImportId !== opts.fileImportId) continue;
+    let why: string | null = null;
+    if (postedBefore.has(s.bankTransactionId)) why = 'The AI posted this line before and it was undone; it waits for you.';
+    else if (cutover && line.date.getTime() <= cutover.getTime()) why = 'Dated on or before your imported QuickBooks history; it may already be in the books.';
+    else if ((matches[s.bankTransactionId] ?? []).length > 0) why = 'It may match a transaction already entered; review the match in Bank Review.';
+    if (why) {
+      result.skipped.push({ bankTransactionId: s.bankTransactionId, reason: why });
+      continue;
+    }
     try {
       const { entry } = await inTransaction(ctx, async (tx) => {
         const r = await categorize(tx, { bankTransactionId: s.bankTransactionId, accountId: s.accountId!, source: 'ai' });

@@ -654,6 +654,7 @@ export async function createPaymentProposal(ctx: ServiceContext, input: unknown,
     .orderBy(desc(customers.isActive))
     .limit(1);
   if (!customer) throw validation(`No customer named "${p.customerName}" was found. Give the exact name from the Customer Center.`);
+  if (!customer.isActive) throw validation(`Customer "${customer.name}" is inactive. Make it active again first.`);
 
   const open = await ctx.db
     .select({ id: invoices.id, number: invoices.invoiceNumber, ref: invoices.refNumber, date: invoices.date, balanceDue: invoices.balanceDue })
@@ -883,6 +884,11 @@ export async function approveProposal(ctx: ServiceContext, id: string): Promise<
       });
       return toView(updated);
     }
+    // The approver needs the same right the screen would need (Users & Roles): a journal-entry
+    // right alone does not let someone enter bills, invoices or customer payments.
+    if (row.kind === 'bill') requirePermission(tx, 'vendors.bills', 'create');
+    if (row.kind === 'invoice') requirePermission(tx, 'customers.invoices', 'create');
+    if (row.kind === 'payment') requirePermission(tx, 'customers.payments', 'create');
     if (row.kind === 'payment') {
       const v = (row.payload as unknown as StoredJournalProposal).payment;
       if (!v) throw validation('This payment proposal is incomplete and cannot be recorded.');

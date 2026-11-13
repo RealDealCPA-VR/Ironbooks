@@ -20,7 +20,10 @@ function Row({ href, n, text, tone = 'navy' }: { href: string; n: number; text: 
 }
 
 export default function AiActivityCard({ a }: { a: AiActivity }) {
-  if (a.connected === 'none') {
+  // Auto-posting runs on the learned categorizer, with or without an AI connected: what it did
+  // is always shown; the invitation alone only when there is nothing to report.
+  const activity = a.autoPostedLast7Days + a.bankLinesToReview + a.pendingProposals + a.ruleOffers;
+  if (a.connected === 'none' && activity === 0) {
     return (
       <Card className="mt-8 flex max-w-3xl flex-wrap items-center justify-between gap-3 p-5">
         <div className="flex items-center gap-3">
@@ -37,7 +40,9 @@ export default function AiActivityCard({ a }: { a: AiActivity }) {
     );
   }
   const rows: Array<{ href: string; n: number; text: string; tone?: 'navy' | 'electric' }> = [];
-  if (a.autoPostedLast7Days > 0) rows.push({ href: '/ai-settings', n: a.autoPostedLast7Days, text: 'bank lines the AI posted on its own this week (each can be undone)' });
+  if (a.autoPostedLast7Days > 0) {
+    rows.push({ href: '/bank-review?tab=matched', n: a.autoPostedLast7Days, text: 'bank lines posted automatically this week (undo any with Unmatch in Bank Review)' });
+  }
   if (a.bankLinesToReview > 0) {
     rows.push({
       href: '/bank-review',
@@ -67,8 +72,16 @@ export default function AiActivityCard({ a }: { a: AiActivity }) {
       ) : (
         <p className="text-sm text-navy/60">Nothing waiting for you. New bank lines will be categorized as they come in.</p>
       )}
+      {a.connected === 'none' && (
+        <p className="mt-3 text-sm text-navy/70">
+          <Link href="/ai-settings" className="font-semibold text-electric hover:underline">
+            Connect your AI
+          </Link>{' '}
+          (ChatGPT, Claude, Gemini or a free model on this computer) to answer questions and draft entries for your approval.
+        </p>
+      )}
       <p className="mt-3 text-xs text-navy/45">
-        {a.connected === 'cloud' ? 'Cloud AI' : 'AI on your own computers'}
+        {a.connected === 'cloud' ? 'Cloud AI' : a.connected === 'local' ? 'AI on your own computers' : 'Learned categorizer on this computer'}
         {a.connected === 'cloud' ? ` · ${a.cloudCallsToday}${a.cloudDailyCap > 0 ? ` of ${a.cloudDailyCap}` : ''} cloud calls today` : ''}
         {a.autoApplyEnabled ? ' · auto-posting confident bank lines is on' : ' · auto-posting is off (turn it on in AI & Automation)'}
       </p>

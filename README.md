@@ -208,7 +208,7 @@ company's network policy for AI, so there is no second page to find.
 The AI learns your categorization the way QuickBooks does, suggests journal entries for **your
 approval**, and reviews the books for unbalanced, duplicate or miscategorized entries and
 outliers. Every network call goes through one policy guard. [`PRIVACY.md`](./PRIVACY.md) lists
-exactly what can leave the machine, and it's never your books.
+exactly what can leave the machine: with cloud AI on, the question and the report figures it needs, with listed names and identifiers replaced; never the company file itself.
 
 ## ⚡ Quick start
 

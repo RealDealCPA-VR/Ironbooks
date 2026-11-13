@@ -1042,7 +1042,7 @@ export async function importTransactions(
       const { loadSettings } = await import('./aiSettings');
       if ((await loadSettings(ctx)).autoApplyEnabled) {
         const { autoApplyBankSuggestions } = await import('./aiCategorizer');
-        autoPosted = (await autoApplyBankSuggestions(ctx, input.bankAccountId)).applied.length;
+        autoPosted = (await autoApplyBankSuggestions(ctx, input.bankAccountId, { fileImportId: importRow.id })).applied.length;
       }
     } catch (err) {
       console.warn('[bank import] auto-posting after import failed:', err instanceof Error ? err.message : err);

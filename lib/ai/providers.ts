@@ -276,6 +276,12 @@ function toOpenAiMessages(messages: ChatMessage[]) {
   );
 }
 
+/** GPT-5 and the o-series (directly, "openai/…" on OpenRouter): reasoning models with their own parameters. */
+export function isReasoningModel(model: string | null | undefined): boolean {
+  const m = (model ?? '').toLowerCase().replace(/^openai\//, '');
+  return /^(gpt-5|o\d)(\b|[-.:]|$)/.test(m);
+}
+
 /** api.openai.com (and its regional hosts): the only service that understands OpenAI's `store`. */
 function isOpenAiHost(base: string): boolean {
   try {
@@ -303,16 +309,27 @@ export function createOpenAiCompatibleProvider(cfg: ProviderRuntimeConfig, deps:
     else headers.authorization = `Bearer ${cfg.apiKey}`;
   }
 
+  // OpenAI reasoning models (GPT-5, o1/o3/o4…, also via OpenRouter "openai/…" and Azure
+  // deployments) reject `temperature` and `max_tokens`: they take `max_completion_tokens`, and
+  // their hidden reasoning counts against it, so they get a larger budget. Set once a 400 says so
+  // too (an Azure deployment name says nothing about its model).
+  let reasoning = isReasoningModel(cfg.model);
+
   async function complete(messages: ChatMessage[], opts: ChatOptions, withSchema: boolean) {
     // A cloud endpoint never receives images (they cannot be redacted); local servers get them.
     if (locality === 'cloud' && messages.some((m) => m.images?.length)) {
       throw new AiError('POLICY', 'Images are only sent to a local model.');
     }
+    const tokens = reasoning
+      ? { max_completion_tokens: Math.max(4000, (opts.maxTokens ?? 1000) * 4) }
+      : opts.maxTokens
+        ? { max_tokens: /gemini-2\.5/i.test(cfg.model) ? Math.max(opts.maxTokens, 4000) : opts.maxTokens }
+        : {};
     const body: Record<string, unknown> = {
       model: cfg.model,
       messages: toOpenAiMessages(messages),
-      temperature: opts.temperature ?? 0.1,
-      ...(opts.maxTokens ? { max_tokens: opts.maxTokens } : {}),
+      ...(reasoning ? {} : { temperature: opts.temperature ?? 0.1 }),
+      ...tokens,
       // OpenAI itself: ask it not to retain the conversation (`store`). Other services that speak
       // the OpenAI format may reject fields they do not know, so only OpenAI gets it.
       ...(isOpenAiHost(base) ? { store: false } : {}),
@@ -340,9 +357,14 @@ export function createOpenAiCompatibleProvider(cfg: ProviderRuntimeConfig, deps:
       try {
         data = await complete(messages, opts, true);
       } catch (err) {
-        // Some servers reject response_format/json_schema — retry once without it; the
-        // router still validates the JSON with zod.
-        if (opts.jsonSchema && err instanceof AiError && err.code === 'HTTP' && (err.status === 400 || err.status === 422)) {
+        const bad = err instanceof AiError && err.code === 'HTTP' && (err.status === 400 || err.status === 422);
+        if (bad && !reasoning && /temperature|max_tokens|max_completion_tokens/i.test((err as AiError).message)) {
+          // A reasoning model the name didn't reveal: retry with its parameters.
+          reasoning = true;
+          data = await complete(messages, opts, true);
+        } else if (bad && opts.jsonSchema) {
+          // Some servers reject response_format/json_schema — retry once without it; the
+          // router still validates the JSON with zod.
           data = await complete(messages, opts, false);
         } else {
           throw err;

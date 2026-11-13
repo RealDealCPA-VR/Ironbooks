@@ -12,8 +12,10 @@ import { aiErrorResponse } from '../_errors';
 export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    const body = await req.json().catch(() => ({}));
-    return NextResponse.json(await testConnection(ctx, body ?? {}));
+    const body = (await req.json().catch(() => ({}))) as Record<string, unknown> | null;
+    const allowCloud = body?.allowCloud === true;
+    if (body) delete body.allowCloud;
+    return NextResponse.json(await testConnection(ctx, (body ?? {}) as never, {}, { allowCloud }));
   } catch (err) {
     return aiErrorResponse(err, 'POST /api/ai/test');
   }

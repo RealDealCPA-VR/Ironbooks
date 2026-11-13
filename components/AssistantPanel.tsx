@@ -52,13 +52,24 @@ interface Reply {
 
 type Msg = { role: 'user'; content: string } | { role: 'assistant'; content: string; reply: Reply };
 
-/** The last conversation, kept on this computer so closing the panel does not lose it. */
-const THREAD_KEY = 'ironbooks.assistant.thread';
+/**
+ * The last conversation, kept on this computer so closing the panel does not lose it — one per
+ * company AND user (it holds report figures and names: never shown to another person or sent
+ * as history to another company's AI). The key is null until the signed-in person is known.
+ */
+const THREAD_PREFIX = 'ironbooks.assistant.thread';
+const LEGACY_THREAD_KEY = THREAD_PREFIX; // 1.7.1 kept one thread for everyone: dropped
 const MAX_SAVED = 40;
 
-function loadThread(): Msg[] {
+function threadKey(me: { id?: string | null; companyId?: string | null } | null): string | null {
+  return me?.id && me.companyId ? `${THREAD_PREFIX}:${me.companyId}:${me.id}` : null;
+}
+
+function loadThread(key: string | null): Msg[] {
+  if (!key) return [];
   try {
-    const raw = window.localStorage.getItem(THREAD_KEY);
+    window.localStorage.removeItem(LEGACY_THREAD_KEY);
+    const raw = window.localStorage.getItem(key);
     const parsed = raw ? (JSON.parse(raw) as Msg[]) : [];
     return Array.isArray(parsed) ? parsed.slice(-MAX_SAVED) : [];
   } catch {
@@ -66,10 +77,11 @@ function loadThread(): Msg[] {
   }
 }
 
-function saveThread(msgs: Msg[]) {
+function saveThread(key: string | null, msgs: Msg[]) {
+  if (!key) return;
   try {
-    if (msgs.length === 0) window.localStorage.removeItem(THREAD_KEY);
-    else window.localStorage.setItem(THREAD_KEY, JSON.stringify(msgs.slice(-MAX_SAVED)));
+    if (msgs.length === 0) window.localStorage.removeItem(key);
+    else window.localStorage.setItem(key, JSON.stringify(msgs.slice(-MAX_SAVED)));
   } catch {
     /* private window, blocked storage: the thread just is not kept */
   }
@@ -261,7 +273,8 @@ export default function AssistantPanel({ open, onClose }: { open: boolean; onClo
   const [stepLabel, setStepLabel] = React.useState<string | null>(null);
   /** Proposals from earlier conversations still waiting for an answer. */
   const [pending, setPending] = React.useState<Proposal[]>([]);
-  const restored = React.useRef(false);
+  /** Where this person's thread for this company is kept (null until known). */
+  const keyRef = React.useRef<string | null>(null);
   const endRef = React.useRef<HTMLDivElement>(null);
   const inputRef = React.useRef<HTMLTextAreaElement>(null);
 
@@ -271,10 +284,21 @@ export default function AssistantPanel({ open, onClose }: { open: boolean; onClo
 
   React.useEffect(() => {
     if (!open) return;
-    if (!restored.current) {
-      restored.current = true;
-      setMessages(loadThread());
-    }
+    // Whose thread: the signed-in person in the open company. A different person or company on
+    // this computer gets their own (or none).
+    api
+      .get<{ id?: string; companyId?: string } | null>('/api/auth/me')
+      .then((me) => {
+        const key = threadKey(me);
+        if (key !== keyRef.current) {
+          keyRef.current = key;
+          setMessages(loadThread(key));
+        }
+      })
+      .catch(() => {
+        keyRef.current = null;
+        setMessages([]);
+      });
     // Proposals the model made earlier (this or another session) that nobody has answered yet.
     api
       .get<{ proposals: Proposal[] }>('/api/ai/proposals?status=pending')
@@ -300,7 +324,7 @@ export default function AssistantPanel({ open, onClose }: { open: boolean; onClo
       const reply = await askStreaming({ message, history }, (label) => setStepLabel(label));
       setMessages((prev) => {
         const next: Msg[] = [...prev, { role: 'assistant', content: reply.answer, reply }];
-        saveThread(next);
+        saveThread(keyRef.current, next);
         return next;
       });
       if (reply.proposals.length) setPending((p) => p.filter((x) => !reply.proposals.some((n) => n.id === x.id)));
@@ -316,7 +340,7 @@ export default function AssistantPanel({ open, onClose }: { open: boolean; onClo
 
   function clearThread() {
     setMessages([]);
-    saveThread([]);
+    saveThread(keyRef.current, []);
   }
 
   function updateProposal(msgIdx: number, p: Proposal) {

@@ -10,6 +10,7 @@ import {
   localityOf,
   openAiBase,
   pullOllamaModel,
+  isReasoningModel,
   type AnthropicLike,
   type FetchLike,
 } from './providers';
@@ -113,6 +114,34 @@ describe('OpenAI-compatible provider', () => {
     const cloud = createOpenAiCompatibleProvider({ id: 'oa', kind: 'openai-compatible', label: 'OpenAI', baseUrl: 'https://api.openai.com/v1', model: 'gpt-5', apiKey: 'k', enabled: true }, { fetch: f.fn });
     await expect(cloud.chat([{ role: 'user', content: 'x', images: [png] }])).rejects.toMatchObject({ code: 'POLICY' });
     expect(f.calls).toHaveLength(1);
+  });
+
+  it('OpenAI reasoning models get max_completion_tokens and no temperature; others are unchanged', async () => {
+    expect(isReasoningModel('gpt-5')).toBe(true);
+    expect(isReasoningModel('gpt-5-mini')).toBe(true);
+    expect(isReasoningModel('openai/gpt-5')).toBe(true);
+    expect(isReasoningModel('o3-mini')).toBe(true);
+    expect(isReasoningModel('gpt-4o')).toBe(false);
+    expect(isReasoningModel('llama-3.3-70b-versatile')).toBe(false);
+    const f = mockFetch(() => jsonResponse({ choices: [{ message: { content: 'ok' } }] }));
+    const p = createOpenAiCompatibleProvider({ id: 'oa', kind: 'openai-compatible', label: 'OpenAI', baseUrl: 'https://api.openai.com/v1', model: 'gpt-5', apiKey: 'k', enabled: true }, { fetch: f.fn });
+    await p.chat([{ role: 'user', content: 'x' }], { maxTokens: 300, temperature: 0 });
+    expect(f.calls[0].body.temperature).toBeUndefined();
+    expect(f.calls[0].body.max_tokens).toBeUndefined();
+    expect(f.calls[0].body.max_completion_tokens).toBe(4000);
+  });
+
+  it('a 400 about temperature (e.g. an Azure deployment of GPT-5) is retried with reasoning parameters', async () => {
+    let n = 0;
+    const f = mockFetch(() =>
+      ++n === 1
+        ? jsonResponse({ error: { message: "Unsupported parameter: 'max_tokens' is not supported with this model." } }, 400)
+        : jsonResponse({ choices: [{ message: { content: 'ok' } }] }),
+    );
+    const p = createOpenAiCompatibleProvider({ id: 'az', kind: 'openai-compatible', label: 'Azure', baseUrl: 'https://acme.openai.azure.com', model: 'books', apiKey: 'k', enabled: true }, { fetch: f.fn });
+    expect((await p.chat([{ role: 'user', content: 'x' }], { maxTokens: 300 })).content).toBe('ok');
+    expect(f.calls[1].body.max_completion_tokens).toBe(4000);
+    expect(f.calls[1].body.temperature).toBeUndefined();
   });
 
   it('downloads a starter model into a local Ollama only', async () => {

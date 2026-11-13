@@ -322,15 +322,14 @@ export default function AiSettingsPage() {
     }
     if (preset.where === 'cloud') {
       setCloudEnabled(true);
-      const hasLocalNow = drafts.some((d) => d.enabled && d.kind !== 'anthropic' && (presetOf(d)?.where ?? 'this computer') !== 'cloud');
-      if (!hasLocalNow) {
-        setPolicies((p) => {
-          const next = { ...p };
-          for (const t of Object.keys(next) as Task[]) if (next[t] === 'local-only') next[t] = 'local-then-cloud';
-          return next;
-        });
-      }
-      toast(`${preset.name} added. Paste your API key, Test connection, then Save changes.`, 'info');
+      // Tasks still "Local only" would never use the AI just added: local first (when there is a
+      // local model), then this cloud AI.
+      setPolicies((p) => {
+        const next = { ...p };
+        for (const t of Object.keys(next) as Task[]) if (next[t] === 'local-only') next[t] = 'local-then-cloud';
+        return next;
+      });
+      toast(`${preset.name} added. Paste your API key, then Test connection and Save changes.`, 'info');
     } else {
       toast(`${preset.name} added. Test connection to pick a model, then Save changes.`, 'info');
     }
@@ -366,9 +365,12 @@ export default function AiSettingsPage() {
   async function test(d: Draft) {
     setTests((t) => ({ ...t, [d.key]: 'running' }));
     try {
-      const r = await api.post<TestResult>('/api/ai/test', draftBody(d));
+      // With "Allow cloud AI" ticked, testing a cloud AI also allows it under Privacy & Network.
+      const r = await api.post<TestResult>('/api/ai/test', { ...draftBody(d), allowCloud: cloudEnabled });
+      if (r.ok && r.locality === 'cloud') loadCloudVerdict();
       setTests((t) => ({ ...t, [d.key]: r }));
-      if (r.ok && !d.model && r.models[0]) patchDraft(d.key, { model: r.models[0].id });
+      const chatModel = r.models.find((m) => !/embed|whisper|tts|dall-e|moderation|rerank|audio|image/i.test(m.id)) ?? r.models[0];
+      if (r.ok && !d.model && chatModel) patchDraft(d.key, { model: chatModel.id });
     } catch (err) {
       setTests((t) => {
         const next = { ...t };
@@ -430,10 +432,11 @@ export default function AiSettingsPage() {
       <Card className="p-6 mb-6 bg-navy/[0.03]">
         <p className="text-sm text-navy/80 leading-relaxed">
           <strong>Use the AI you already have.</strong> Add ChatGPT, Claude, Gemini and others with your own API key,
-          or a free model that runs on this computer (Ollama, LM Studio) so nothing leaves your PC. Before anything is
-          sent to a cloud AI, names, emails, phone numbers, tax IDs, account numbers and addresses are replaced with
-          placeholders — and cloud AI is off until you allow it below. A model on another computer in your office or
-          on your Tailscale network works too.
+          or a free model that runs on this computer (Ollama, LM Studio) so nothing leaves your PC. Cloud AI is off until
+          you allow it below. When it is on, the question and the report figures it needs are sent; before that, the
+          names on your customer, vendor and employee lists, emails, phone numbers, tax IDs, account numbers and
+          addresses are replaced with placeholders (other free text, such as a bank line&apos;s description, is sent as
+          is). A model on another computer in your office or on your Tailscale network works too.
         </p>
       </Card>
 
@@ -718,9 +721,10 @@ export default function AiSettingsPage() {
           <span>
             <span className="font-semibold text-navy text-sm">Allow cloud AI for this company</span>
             <span className="block text-xs text-navy/60">
-              Off by default. When on, tasks set to use the cloud send REDACTED text (no names, contact details, tax IDs,
-              account numbers or addresses). Cloud providers are asked not to store requests; nothing is saved by
-              Ironbooks outside this computer. Saving with this on also allows AI under Privacy &amp; Network.
+              Off by default. When on, tasks set to use the cloud send text with listed names, contact details, tax IDs,
+              account numbers and addresses replaced by placeholders. OpenAI is asked not to store requests; other
+              services keep requests under their own terms. Ironbooks saves nothing outside this computer. Saving (or
+              testing a cloud AI) with this on also allows AI under Privacy &amp; Network.
             </span>
             {cloudVerdict && (
               <span className={`mt-1 block text-xs ${cloudVerdict.allowed ? 'text-emerald' : 'text-navy/50'}`}>
