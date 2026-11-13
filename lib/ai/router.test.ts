@@ -9,6 +9,7 @@ import {
   createOpenAiCompatibleProvider,
   localityOf,
   openAiBase,
+  pullOllamaModel,
   type AnthropicLike,
   type FetchLike,
 } from './providers';
@@ -111,6 +112,15 @@ describe('OpenAI-compatible provider', () => {
     ]);
     const cloud = createOpenAiCompatibleProvider({ id: 'oa', kind: 'openai-compatible', label: 'OpenAI', baseUrl: 'https://api.openai.com/v1', model: 'gpt-5', apiKey: 'k', enabled: true }, { fetch: f.fn });
     await expect(cloud.chat([{ role: 'user', content: 'x', images: [png] }])).rejects.toMatchObject({ code: 'POLICY' });
+    expect(f.calls).toHaveLength(1);
+  });
+
+  it('downloads a starter model into a local Ollama only', async () => {
+    const f = mockFetch(() => jsonResponse({ status: 'success' }));
+    await pullOllamaModel({ kind: 'ollama', baseUrl: 'http://localhost:11434', apiKey: null }, 'llama3.2', { fetch: f.fn });
+    expect(f.calls[0].url).toBe('http://localhost:11434/api/pull');
+    expect(f.calls[0].body).toEqual({ model: 'llama3.2', stream: false });
+    await expect(pullOllamaModel({ kind: 'ollama', baseUrl: 'https://ollama.example.com', apiKey: null }, 'llama3.2', { fetch: f.fn })).rejects.toMatchObject({ code: 'POLICY' });
     expect(f.calls).toHaveLength(1);
   });
 

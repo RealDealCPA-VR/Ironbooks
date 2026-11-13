@@ -196,6 +196,30 @@ export function createOllamaProvider(cfg: ProviderRuntimeConfig, deps: ProviderD
   };
 }
 
+/**
+ * Download a model into a LOCAL Ollama server (POST /api/pull, non-streaming) — "Download a
+ * starter model" on the AI page, so a free model needs no command line. Policy-checked like
+ * every other call; refused for anything that is not on this computer or the local network.
+ */
+export async function pullOllamaModel(
+  cfg: Pick<ProviderRuntimeConfig, 'kind' | 'baseUrl' | 'apiKey'>,
+  model: string,
+  deps: ProviderDeps = {},
+  signal?: AbortSignal,
+): Promise<void> {
+  if (cfg.kind !== 'ollama' || !cfg.baseUrl) throw new AiError('CONFIG', 'Only an Ollama server can download models.');
+  if (localityOf(cfg) !== 'local') throw new AiError('POLICY', 'Models are only downloaded into an Ollama server on this computer or your network.');
+  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  if (cfg.apiKey) headers.authorization = `Bearer ${cfg.apiKey}`;
+  const res = await httpJson<{ status?: string; error?: string }>(guardedFetch(deps), `${trimSlash(cfg.baseUrl)}/api/pull`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ model, stream: false }),
+    signal,
+  });
+  if (res.error) throw new AiError('HTTP', `Ollama could not download ${model}: ${res.error}`);
+}
+
 // ---------------------------------------------------------------------------
 // OpenAI-compatible — POST /v1/chat/completions, GET /v1/models
 // ---------------------------------------------------------------------------

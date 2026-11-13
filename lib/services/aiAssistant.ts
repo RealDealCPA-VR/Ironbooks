@@ -17,7 +17,7 @@
  */
 import { and, desc, eq, gte, ilike, inArray, lte, or, sql } from 'drizzle-orm';
 import { z } from 'zod';
-import { accounts, aiProposals, customers, items, journalEntries, journalEntryLines, vendors } from '@/lib/db/schema';
+import { accounts, aiProposals, customers, invoices, items, journalEntries, journalEntryLines, vendors } from '@/lib/db/schema';
 import { Money, toAmountString, formatCurrency } from '@/lib/money';
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
 import { balanceSheet, profitAndLoss, trialBalance } from './reports';
@@ -25,6 +25,7 @@ import { apAging, arAging } from './reportsExtra';
 import { assertBalanced } from './posting';
 import { createBill } from './bills';
 import { createInvoice } from './invoices';
+import { receivePayment } from './payments';
 import { createManualEntry, followMergedNames } from './journal';
 import { buildRouter, type BuildRouterOptions } from './aiSettings';
 import { companyToday } from './preferences';
@@ -324,7 +325,32 @@ interface StoredJournalProposal {
   bill?: StoredBillProposal;
   /** kind 'invoice': what createInvoice posts on approval (sales tax is worked out then). */
   invoice?: StoredInvoiceProposal;
+  /** kind 'payment': what receivePayment records on approval (into Undeposited Funds). */
+  payment?: StoredPaymentProposal;
 }
+
+interface StoredPaymentProposal {
+  customerId: string;
+  customerName: string;
+  date: string;
+  amount: string;
+  method: 'cash' | 'check' | 'credit_card' | 'ach' | 'bank_transfer' | 'other';
+  reference: string | null;
+  memo: string | null;
+  applications: { invoiceId: string; invoiceLabel: string; amountApplied: string }[];
+}
+
+const paymentProposalSchema = z.object({
+  type: z.literal('payment'),
+  customerName: z.string().trim().min(1).max(255),
+  date: z.string(),
+  amount: z.union([z.string(), z.number()]),
+  method: z.enum(['cash', 'check', 'credit_card', 'ach', 'bank_transfer', 'other']).default('check'),
+  reference: z.string().max(100).nullish(),
+  memo: z.string().max(500).nullish(),
+  /** Invoice numbers to pay; omitted = the customer's oldest open invoices first (QB's auto-apply). */
+  invoiceNumbers: z.array(z.union([z.string(), z.number()])).max(30).nullish(),
+});
 
 interface StoredInvoiceProposal {
   customerId: string;
@@ -608,11 +634,110 @@ export async function createInvoiceProposal(ctx: ServiceContext, input: unknown,
   });
 }
 
-/** A model proposal of any kind ("type": "journal_entry" by default, "bill" or "invoice"). */
+/**
+ * Validate a model-proposed CUSTOMER PAYMENT (Receive Payments): customer by name, the amount,
+ * and the invoices it pays (named, or the oldest open ones first). Stored PENDING; approving it
+ * runs receivePayment, into Undeposited Funds like the Receive Payments screen.
+ */
+export async function createPaymentProposal(ctx: ServiceContext, input: unknown, rationale?: string | null): Promise<ProposalView> {
+  const parsed = paymentProposalSchema.safeParse(input);
+  if (!parsed.success) throw validation(`Payment proposal is malformed: ${parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')}`);
+  const p = parsed.data;
+  if (!parseDate(p.date)) throw validation('Payment date is invalid.');
+  const amount = moneyOrNull(p.amount, 'Amount');
+  if (!amount) throw validation('The payment amount must be more than zero.');
+
+  const [customer] = await ctx.db
+    .select({ id: customers.id, name: customers.displayName, isActive: customers.isActive })
+    .from(customers)
+    .where(and(eq(customers.companyId, ctx.companyId), sql`lower(${customers.displayName}) = lower(${p.customerName})`))
+    .orderBy(desc(customers.isActive))
+    .limit(1);
+  if (!customer) throw validation(`No customer named "${p.customerName}" was found. Give the exact name from the Customer Center.`);
+
+  const open = await ctx.db
+    .select({ id: invoices.id, number: invoices.invoiceNumber, ref: invoices.refNumber, date: invoices.date, balanceDue: invoices.balanceDue })
+    .from(invoices)
+    .where(and(eq(invoices.companyId, ctx.companyId), eq(invoices.customerId, customer.id), inArray(invoices.status, ['open', 'partial'])))
+    .orderBy(invoices.date, invoices.invoiceNumber);
+  const label = (i: (typeof open)[number]) => `#${i.ref || i.number}`;
+  let targets = open;
+  if (p.invoiceNumbers && p.invoiceNumbers.length) {
+    const wanted = p.invoiceNumbers.map((n) => String(n).replace(/^#/, '').trim().toLowerCase());
+    targets = wanted.map((w) => {
+      const hit = open.find((i) => String(i.number) === w || (i.ref ?? '').toLowerCase() === w);
+      if (!hit) throw validation(`${customer.name} has no open invoice #${w}.${open.length ? ` Open: ${open.map(label).join(', ')}.` : ''}`);
+      return hit;
+    });
+  }
+  if (!targets.length) throw validation(`${customer.name} has no open invoices to apply a payment to.`);
+  let left = Money.of(amount);
+  const applications: StoredPaymentProposal['applications'] = [];
+  for (const inv of targets) {
+    if (left.isZero() || left.isNegative()) break;
+    const bal = Money.of(inv.balanceDue);
+    const apply = left.lessThan(bal) ? left : bal;
+    if (apply.isZero()) continue;
+    applications.push({ invoiceId: inv.id, invoiceLabel: label(inv), amountApplied: toAmountString(apply) });
+    left = left.minus(apply);
+  }
+  if (left.greaterThan(0)) {
+    throw validation(
+      `The payment (${formatCurrency(amount)}) is more than ${customer.name}'s open balance on those invoices. Record the overpayment yourself in Receive Payments.`,
+    );
+  }
+
+  const acctRows = await ctx.db
+    .select({ id: accounts.id, code: accounts.code, name: accounts.name, subtype: accounts.subtype, isActive: accounts.isActive })
+    .from(accounts)
+    .where(eq(accounts.companyId, ctx.companyId));
+  const ar = acctRows.find((a) => a.subtype === 'accounts_receivable' && a.isActive);
+  const und = acctRows.find((a) => /undeposited/i.test(a.name) && a.isActive);
+  const lines: StoredJournalProposal['lines'] = [];
+  if (und) lines.push({ accountId: und.id, accountCode: und.code, accountName: und.name, debit: amount, credit: null, memo: null });
+  if (ar) lines.push({ accountId: ar.id, accountCode: ar.code, accountName: ar.name, debit: null, credit: amount, memo: applications.map((a) => a.invoiceLabel).join(', '), entityType: 'customer', entityId: customer.id, entityName: customer.name });
+
+  const payload: StoredJournalProposal = {
+    date: p.date,
+    description: `Payment from ${customer.name} for ${applications.map((a) => a.invoiceLabel).join(', ')}`,
+    reference: p.reference ?? null,
+    lines,
+    totalDebit: amount,
+    rationale: rationale ?? null,
+    payment: {
+      customerId: customer.id,
+      customerName: customer.name,
+      date: p.date,
+      amount,
+      method: p.method,
+      reference: p.reference ?? null,
+      memo: p.memo ?? null,
+      applications,
+    },
+  };
+  const summaryText = `Payment from ${customer.name} ${p.date} (${formatCurrency(amount)})`;
+  return inTransaction(ctx, async (tx) => {
+    const [row] = await tx.db
+      .insert(aiProposals)
+      .values({ companyId: tx.companyId, kind: 'payment', summary: summaryText, payload: payload as unknown as Record<string, unknown>, status: 'pending', createdBy: tx.userId })
+      .returning();
+    await writeAudit(tx, {
+      action: 'create',
+      entityType: 'ai_proposal',
+      entityId: row.id,
+      newValues: { kind: row.kind, summary: row.summary, status: row.status },
+      llmReasoning: rationale ?? undefined,
+    });
+    return toView(row);
+  });
+}
+
+/** A model proposal of any kind ("type": "journal_entry" by default, "bill", "invoice" or "payment"). */
 export async function createProposal(ctx: ServiceContext, input: unknown, rationale?: string | null): Promise<ProposalView> {
   const type = input && typeof input === 'object' ? (input as { type?: unknown }).type : undefined;
   if (type === 'bill') return createBillProposal(ctx, input, rationale);
   if (type === 'invoice') return createInvoiceProposal(ctx, input, rationale);
+  if (type === 'payment') return createPaymentProposal(ctx, input, rationale);
   return createJournalProposal(ctx, input, rationale);
 }
 
@@ -755,6 +880,36 @@ export async function approveProposal(ctx: ServiceContext, id: string): Promise<
         oldValues: { status: 'pending' },
         newValues: { status: 'approved', billId: bill.id },
         llmReasoning: (row.payload as { rationale?: string | null }).rationale ?? 'Approved assistant bill proposal.',
+      });
+      return toView(updated);
+    }
+    if (row.kind === 'payment') {
+      const v = (row.payload as unknown as StoredJournalProposal).payment;
+      if (!v) throw validation('This payment proposal is incomplete and cannot be recorded.');
+      const payDate = parseDate(v.date);
+      if (!payDate) throw validation(`Payment date ${v.date} is invalid.`);
+      const pay = await receivePayment(tx, {
+        customerId: v.customerId,
+        date: payDate,
+        method: v.method,
+        reference: v.reference,
+        amount: v.amount,
+        memo: v.memo,
+        applications: v.applications.map((a) => ({ invoiceId: a.invoiceId, amountApplied: a.amountApplied })),
+      });
+      const payId = (pay as { id?: string; payment?: { id: string } }).id ?? (pay as { payment?: { id: string } }).payment?.id ?? '';
+      const [updated] = await tx.db
+        .update(aiProposals)
+        .set({ status: 'approved', resultRef: `payment:${payId}`, decidedBy: tx.userId, decidedAt: new Date() })
+        .where(eq(aiProposals.id, id))
+        .returning();
+      await writeAudit(tx, {
+        action: 'update',
+        entityType: 'ai_proposal',
+        entityId: id,
+        oldValues: { status: 'pending' },
+        newValues: { status: 'approved', paymentId: payId },
+        llmReasoning: (row.payload as { rationale?: string | null }).rationale ?? 'Approved assistant payment proposal.',
       });
       return toView(updated);
     }
@@ -955,6 +1110,8 @@ Rules:
 - To INVOICE A CUSTOMER, propose an invoice — the customer's name exactly as given, each line with an "itemName" from the Item List or an income "accountCode" from list_accounts, a quantity and a rate:
   {"action":"answer","answer":"...","proposal":{"type":"invoice","customerName":"Smith Family","date":"YYYY-MM-DD","dueDate":"YYYY-MM-DD","memo":"...","lines":[{"itemName":"Consulting","description":"...","quantity":3,"rate":"150.00"}]}}
   Sales tax and terms are applied when the person approves it in Create Invoices.
+- To RECORD A PAYMENT a customer sent, propose a payment — the customer's name, the amount, and the invoice numbers it pays if the user said (otherwise omit them: the oldest open invoices are paid first):
+  {"action":"answer","answer":"...","proposal":{"type":"payment","customerName":"Smith Family","date":"YYYY-MM-DD","amount":"450.00","method":"check","reference":"1187","invoiceNumbers":["1003"]}}
   Debits must equal credits. A line on Accounts Receivable needs "name": "<customer name>" and a line on Accounts Payable needs "name": "<vendor name>". The user reviews and approves proposals; say that it awaits their approval.
 - Keep answers short and clear for a non-accountant. Use YYYY-MM-DD dates in tool args.`;
 }

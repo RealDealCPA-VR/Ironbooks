@@ -161,6 +161,7 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/ai/settings': r('company', 'GET PUT:modify'),
   '/api/ai/tailnet': r('company', 'GET:modify'),
   '/api/ai/test': r('company', 'POST:modify'),
+  '/api/ai/pull': r('company', 'POST:modify'), // download a starter model into local Ollama
   // Advanced pricing / receiving preferences (team pricing).
   '/api/pricing/settings': r('company', 'GET PATCH'),
   '/api/receiving/settings': r('company', 'GET PATCH'),

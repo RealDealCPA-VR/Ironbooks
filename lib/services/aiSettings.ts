@@ -16,7 +16,7 @@ import { aiSettings, bankAccounts, companies, customers, employees, jobs, leads,
 import { type ServiceContext, validation, writeAudit, inTransaction } from './_base';
 import { requireRole } from './rbac';
 import { AiRouter } from '@/lib/ai/router';
-import { createProvider, localityOf, type ProviderDeps } from '@/lib/ai/providers';
+import { createProvider, localityOf, type ProviderDeps, pullOllamaModel } from '@/lib/ai/providers';
 import { classifyEndpoint } from '@/lib/ai/tailnet';
 import { verifyTailnetUrls } from '@/lib/net/tailnetVerify';
 import { isLegacyBlob, migrateLegacySecrets, openStoredSecret, readVaultSecret, sealForFile } from '@/lib/ai/keyVault';
@@ -570,6 +570,26 @@ export function friendlyTestError(error: string, kind: string, baseUrl: string |
   }
   if (/timed out/i.test(raw)) return `No answer in time. The server may be busy or asleep — try again. (${raw})`;
   return raw;
+}
+
+/** The model "Download a starter model" pulls into Ollama: small, capable, runs on a laptop. */
+export const OLLAMA_STARTER_MODEL = 'llama3.2';
+
+/** Download a model into a local Ollama server (admin; up to 30 minutes for a large model). */
+export async function pullStarterModel(ctx: ServiceContext, input: { baseUrl?: string; model?: string }): Promise<{ model: string }> {
+  await requireRole(ctx, 'admin');
+  const baseUrl = (input.baseUrl ?? 'http://localhost:11434').trim();
+  const model = (input.model ?? OLLAMA_STARTER_MODEL).trim();
+  if (!/^[a-z0-9][a-z0-9._:/-]{0,100}$/i.test(model)) throw validation('That is not a model name Ollama knows.');
+  await verifyTailnetUrls([baseUrl]);
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 30 * 60 * 1000);
+  try {
+    await pullOllamaModel({ kind: 'ollama', baseUrl, apiKey: null }, model, { policyCtx: { db: ctx.db, companyId: ctx.companyId } }, ac.signal);
+  } finally {
+    clearTimeout(timer);
+  }
+  return { model };
 }
 
 export async function testConnection(

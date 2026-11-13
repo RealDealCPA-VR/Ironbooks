@@ -238,6 +238,23 @@ export default function AiSettingsPage() {
   /** Local presets (Ollama, LM Studio): whether their server answers on this computer right now. */
   const [localStatus, setLocalStatus] = useState<Record<string, { running: boolean; models: number } | 'checking'>>({});
 
+  const [pulling, setPulling] = useState(false);
+
+  /** Ollama is running but has no model: download a small starter one (no command line). */
+  async function downloadStarter() {
+    setPulling(true);
+    toast('Downloading llama3.2 into Ollama (about 2 GB) — this can take a few minutes.', 'info');
+    try {
+      const r = await api.post<{ model: string }>('/api/ai/pull', { baseUrl: 'http://localhost:11434' });
+      toast(`${r.model} is ready. Add Ollama and Save changes.`, 'success');
+      setLocalStatus((m) => ({ ...m, ollama: { running: true, models: 1 } }));
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'The download did not finish.', 'danger');
+    } finally {
+      setPulling(false);
+    }
+  }
+
   /** Opening the picker pings the local servers, so the cards say "Running" or "Not running". */
   function openPicker() {
     setPickerOpen(true);
@@ -456,6 +473,30 @@ export default function AiSettingsPage() {
                   <span className="mt-1 block text-[11px] text-navy/40">
                     {pr.where === 'cloud' ? 'Cloud · needs an API key · names and numbers are hidden before sending' : 'Runs on this computer · free · nothing leaves your PC'}
                   </span>
+                  {pr.id === 'ollama' &&
+                    localStatus.ollama &&
+                    localStatus.ollama !== 'checking' &&
+                    localStatus.ollama.running &&
+                    localStatus.ollama.models === 0 && (
+                      <span
+                        role="button"
+                        tabIndex={0}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if (!pulling) void downloadStarter();
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            if (!pulling) void downloadStarter();
+                          }
+                        }}
+                        className="mt-1 inline-block rounded-full border border-electric/40 px-2 py-0.5 text-[11px] font-semibold text-electric hover:bg-electric/5"
+                      >
+                        {pulling ? 'Downloading llama3.2…' : 'Download a starter model (llama3.2, ~2 GB)'}
+                      </span>
+                    )}
                   {pr.where === 'this computer' && pr.baseUrl && localStatus[pr.id] && (
                     <span className="mt-1 block text-[11px]">
                       {localStatus[pr.id] === 'checking' ? (
