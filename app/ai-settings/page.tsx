@@ -776,8 +776,9 @@ export default function AiSettingsPage() {
           <span>
             <span className="font-semibold text-navy text-sm">Auto-categorize confident bank-feed transactions</span>
             <span className="block text-xs text-navy/60">
-              On the Bank Review screen, “Auto-apply confident” posts lines the learned categorizer is at least this sure
-              about. Each one is logged in the audit trail and can be undone with Unmatch.
+              Right after a bank file is imported (and from “Auto-apply confident” on Bank Review), lines the learned
+              categorizer is at least this sure about are posted for you. Each one is logged in the audit trail and can be
+              undone with Unmatch. On by default at 95% for new companies.
             </span>
           </span>
         </label>

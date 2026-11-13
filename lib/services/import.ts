@@ -93,6 +93,8 @@ export interface ImportSummary {
   imported: number;
   skippedDupes: number;
   errors: number;
+  /** Lines the AI posted by itself right after the import (auto-posting on, confidence at/above the bar). */
+  autoPosted?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -793,6 +795,8 @@ export interface ImportTransactionsInput {
   csvMapping?: CsvMapping;
   /** Optional filename for audit purposes. */
   filename?: string;
+  /** Leave every line for review even when auto-posting is on (tests, scripted loads). */
+  skipAutoPost?: boolean;
 }
 
 /**
@@ -1029,11 +1033,28 @@ export async function importTransactions(
   // A bulk load: give the planner fresh statistics (PGlite has no autovacuum; best-effort).
   if (importedCount > 0) await refreshPlannerStats(ctx.db, 'bank import');
 
+  // Auto-posting (AI & Automation, on by default for new companies): the lines the learned
+  // categorizer is sure enough about are posted now, each logged and undoable. Best effort — the
+  // import itself is done; the rest wait in Bank Review as usual.
+  let autoPosted = 0;
+  if (importedCount > 0 && !input.skipAutoPost) {
+    try {
+      const { loadSettings } = await import('./aiSettings');
+      if ((await loadSettings(ctx)).autoApplyEnabled) {
+        const { autoApplyBankSuggestions } = await import('./aiCategorizer');
+        autoPosted = (await autoApplyBankSuggestions(ctx, input.bankAccountId)).applied.length;
+      }
+    } catch (err) {
+      console.warn('[bank import] auto-posting after import failed:', err instanceof Error ? err.message : err);
+    }
+  }
+
   return {
     fileImportId: importRow.id,
     parsed: parsed.length,
     imported: importedCount,
     skippedDupes,
     errors: errorLog.length,
+    ...(autoPosted ? { autoPosted } : {}),
   };
 }

@@ -65,6 +65,13 @@ interface ImportSummary {
   imported: number;
   skippedDupes: number;
   errors: number;
+  /** Lines the AI posted by itself (auto-posting on, AI & Automation). */
+  autoPosted?: number;
+}
+
+/** "…, 12 posted by the AI" when auto-posting took some lines. */
+function autoPostedText(s: ImportSummary): string {
+  return s.autoPosted ? `, ${s.autoPosted} posted by the AI (undo with Unmatch)` : '';
 }
 
 interface CsvPreviewRow {
@@ -671,7 +678,7 @@ export default function BankingPage() {
       });
       setImportSummary(summary);
       setStatementExtract(null);
-      toast(`Import complete: ${summary.imported} imported, ${summary.skippedDupes} duplicates skipped. Review them in Review bank transactions.`, 'success');
+      toast(`Import complete: ${summary.imported} imported${autoPostedText(summary)}, ${summary.skippedDupes} duplicates skipped. Review the rest in Review bank transactions.`, 'success');
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Import failed.', 'danger');
     } finally {
@@ -758,7 +765,7 @@ export default function BankingPage() {
       const summary = await api.post<ImportSummary>('/api/import', body);
       setImportSummary(summary);
       toast(
-        `Import complete: ${summary.imported} imported, ${summary.skippedDupes} duplicates skipped.`,
+        `Import complete: ${summary.imported} imported${autoPostedText(summary)}, ${summary.skippedDupes} duplicates skipped.`,
         'success',
       );
     } catch (err) {
@@ -1177,6 +1184,7 @@ export default function BankingPage() {
             {importSummary && (
               <div className="flex gap-3 text-sm">
                 <Badge tone="success">{importSummary.imported} imported</Badge>
+                {importSummary.autoPosted ? <Badge tone="info">{importSummary.autoPosted} posted by the AI</Badge> : null}
                 <Badge tone="neutral">{importSummary.skippedDupes} duplicates</Badge>
                 <Badge tone="info">{importSummary.parsed} total parsed</Badge>
                 {importSummary.errors > 0 && (

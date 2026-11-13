@@ -4,7 +4,7 @@
  * active database; multi-file management is layered on in the Electron shell.
  */
 import { and, eq, sql } from 'drizzle-orm';
-import { accounts, companies, currencies, users, userCompanies } from '@/lib/db/schema';
+import { accounts, aiSettings, companies, currencies, users, userCompanies } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
 import { inTransaction, notFound, validation, writeAudit } from './_base';
 import { hashPassword, verifyPassword } from '@/lib/auth';
@@ -98,6 +98,11 @@ export async function createCompany(
   await db
     .insert(userCompanies)
     .values({ userId: input.ownerId, companyId: company.id, role: 'owner' });
+
+  // New companies: the AI posts bank-feed lines it is at least 95% sure of by itself (each is
+  // logged and can be undone with Unmatch); AI & Automation turns it off or changes the bar.
+  // Companies made before this keep their own setting (no row = off, lib/services/aiSettings.ts).
+  await db.insert(aiSettings).values({ companyId: company.id, autoApplyEnabled: true, autoApplyThreshold: '0.9500' }).onConflictDoNothing();
 
   if (input.seedCoa !== false) {
     await db.insert(accounts).values(
