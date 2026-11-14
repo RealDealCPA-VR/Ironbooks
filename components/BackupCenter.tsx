@@ -42,6 +42,8 @@ interface BackupsResponse {
   /** Absolute folder paths are only sent to an Admin of every company in the file. */
   folder: string | null;
   defaultFolder: string | null;
+  /** The folder set in the company file was chosen on another computer: not used here until confirmed. */
+  folderIgnoredHere?: boolean;
   canManage: boolean;
   status: BackupStatusDto;
   history: BackupHistoryRow[];
@@ -60,6 +62,9 @@ export function BackupCenter({ onPreviewVersion }: { onPreviewVersion: (row: Bac
   const [loadError, setLoadError] = React.useState<string | null>(null);
   const [running, setRunning] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
+  // The folder is only sent when the person changed it: saving the schedule never approves a folder
+  // that came in with the company file (lib/services/backupHistory.ts saveBackupSettings).
+  const [folderEdited, setFolderEdited] = React.useState(false);
   const [form, setForm] = React.useState<{ schedule: BackupSettingsDto['schedule']; everyHours: string; keep: string; folder: string }>({
     schedule: 'daily',
     everyHours: '24',
@@ -85,6 +90,7 @@ export function BackupCenter({ onPreviewVersion }: { onPreviewVersion: (row: Bac
         keep: String(res.settings.keep),
         folder: res.settings.folder ?? '',
       });
+      setFolderEdited(false);
     } catch (err) {
       setLoadError(err instanceof ApiError ? err.message : 'Backup history could not be loaded.');
     }
@@ -118,12 +124,27 @@ export function BackupCenter({ onPreviewVersion }: { onPreviewVersion: (row: Bac
         schedule: form.schedule,
         everyHours: Number(form.everyHours),
         keep: Number(form.keep),
-        folder: form.folder.trim() || null,
+        ...(folderEdited ? { folder: form.folder.trim() || null } : {}),
       });
       toast('Automatic backup settings saved.', 'success');
       notifyBackupChanged();
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Settings could not be saved.', 'danger');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  /** Use the folder set in the company file on this computer too (the person confirms it here). */
+  async function useFolderHere() {
+    if (!data?.settings.folder) return;
+    setSaving(true);
+    try {
+      await api.put('/api/backups', { folder: data.settings.folder });
+      toast('Backups from this computer now go to that folder too.', 'success');
+      notifyBackupChanged();
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'That folder could not be used.', 'danger');
     } finally {
       setSaving(false);
     }
@@ -243,9 +264,23 @@ export function BackupCenter({ onPreviewVersion }: { onPreviewVersion: (row: Bac
               id="backup-folder"
               value={form.folder}
               placeholder={data?.defaultFolder ?? ''}
-              onChange={(e) => setForm((f) => ({ ...f, folder: e.target.value }))}
+              onChange={(e) => {
+                setFolderEdited(true);
+                setForm((f) => ({ ...f, folder: e.target.value }));
+              }}
               aria-describedby="backup-folder-hint"
             />
+            {data?.folderIgnoredHere && !folderEdited && (
+              <div role="status" className="mt-2 rounded-md border border-amber-200 bg-amber-50 p-2 text-xs text-amber-900">
+                <p>
+                  This folder was chosen on another computer, so backups made on this computer go to{' '}
+                  <span className="font-mono break-all">{data.folder}</span> instead. Use it here too only if you know it.
+                </p>
+                <Button type="button" variant="secondary" className="mt-2" onClick={useFolderHere} loading={saving}>
+                  Use this folder on this computer
+                </Button>
+              </div>
+            )}
             <p id="backup-folder-hint" className="mt-1 text-xs text-navy/50">
               Tip: choose a folder on a different drive or a synced folder so a copy survives if this computer fails.
             </p>

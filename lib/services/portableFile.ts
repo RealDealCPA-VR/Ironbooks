@@ -50,6 +50,7 @@ import { trialBalance } from './reports';
 import { TRANSACTION_LOG_FILE, transactionLogPath, readAllTransactionLog } from './transactionLog';
 import { adoptCarriedKey, adoptCopyKey, copyKeyFor, type CarriedCopyKey } from './fileProtection';
 import fileCrypto from '@/electron/fileCrypto';
+import format from '@/electron/companyFileFormat';
 import pkg from '@/package.json';
 
 export const PORTABLE_EXTENSION = 'bkp';
@@ -431,6 +432,13 @@ export function openPortableFile(buffer: Buffer): OpenedPortable {
   } catch {
     throw notPortable('could not read the file');
   }
+  // A small crafted file must not unpack into gigabytes: every entry's declared size is capped
+  // (adm-zip stops inflating at it), and so is their total (electron/companyFileFormat.js).
+  try {
+    format.checkSizes(zip.getEntries().map((e) => ({ name: e.entryName, size: e.header.size })));
+  } catch {
+    throw notPortable('it unpacks to more than any company file can hold');
+  }
   const manifestEntry = zip.getEntry(PORTABLE_MANIFEST_ENTRY);
   const sumsEntry = zip.getEntry(PORTABLE_CHECKSUMS_ENTRY);
   if (!manifestEntry || !sumsEntry) {
@@ -547,6 +555,16 @@ async function stagingAtLayout(dir: string, lastMigrationAt: number): Promise<PG
   }
 }
 
+/** Is `lastMigrationAt` exactly one of this app's migrations (`when` in its drizzle journal)? */
+function knownLayout(lastMigrationAt: number): boolean {
+  try {
+    const journal = JSON.parse(fs.readFileSync(path.join(MIGRATIONS_FOLDER, 'meta', '_journal.json'), 'utf8')) as { entries?: Array<{ when?: unknown }> };
+    return (journal.entries ?? []).some((e) => Number(e.when) === lastMigrationAt);
+  } catch {
+    return false;
+  }
+}
+
 function isEmptyDir(dir: string): boolean {
   try {
     return fs.readdirSync(dir).length === 0;
@@ -627,6 +645,13 @@ export async function restorePortableCompanyFile(
   }
   // Made by an older version: load it at its own layout, migrate it forward afterwards.
   const older = fileAt != null && shipped != null && fileAt < shipped;
+  // That layout must be one this app knows (a step of its own migrations): anything else (a test
+  // or custom build) can't be rebuilt here, and is said so plainly.
+  if (older && !knownLayout(fileAt)) {
+    return fail(
+      'This portable company file uses a database layout this version of Ironbooks does not know (it may come from a test or custom build). Open it with the version of Ironbooks that made it, or ask for a new copy made with an official version.',
+    );
+  }
 
   let db: DB | null = null;
   let client: PGlite;

@@ -1517,6 +1517,10 @@ function unsealArchiveSync(buffer, fileKey) {
   const index = readSealedIndexSync(reader, list, head.manifest, fileKey, head.name);
   const key = entriesKeyOf(head.manifest, fileKey);
   const byZ = new Map(list.map((e) => [e.name, e]));
+  // Every entry is inflated into memory: none, and not all together, may claim more than a company
+  // file can hold (the index's own sizes, and the sealed entries that carry them).
+  checkSizes(list);
+  checkSizes(index.entries.filter((r) => r && typeof r.name === 'string' && !r.dir).map((r) => ({ name: r.name, size: r.size })));
   const entries = [];
   for (const row of index.entries) {
     if (!row || typeof row.name !== 'string') continue;
@@ -1560,6 +1564,8 @@ async function sealedBackupAsCompanyFile(bkaPath, target, { manifest, knownSchem
       encryption: head.manifest.encryption,
     };
     const entries = [{ name: COMPANY_MANIFEST_ENTRY, data: Buffer.from(JSON.stringify(plain, null, 2), 'utf8'), store: true }];
+    // Copied through memory: capped like any unpacking.
+    checkSizes(list.filter((e) => e.name.startsWith(SEALED_PREFIX)));
     for (const e of list) {
       if (!e.name.startsWith(SEALED_PREFIX)) continue;
       entries.push({ name: e.name, data: await inflateBytes(await readEntryBytes(reader, e), e), store: true });

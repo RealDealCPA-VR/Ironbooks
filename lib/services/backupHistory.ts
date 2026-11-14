@@ -22,6 +22,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { resolveDataDir } from '@/lib/db';
 import { ServiceError } from './errors';
 
@@ -124,9 +125,38 @@ export function backupFolderIgnoredHere(settings: BackupSettings, dataDir?: stri
   return Boolean(settings.folder) && !folderChosenHere(settings.folder as string, dataDir);
 }
 
-/** A network path (\\server\share\…): never taken on trust. */
+let mappedDrives: { at: number; letters: Set<string> } | null = null;
+
+/** Drive letters mapped to network shares on this computer (`net use`), cached for a minute. */
+function mappedDriveLetters(): Set<string> {
+  if (process.platform !== 'win32') return new Set();
+  if (mappedDrives && Date.now() - mappedDrives.at < 60_000) return mappedDrives.letters;
+  const letters = new Set<string>();
+  try {
+    // Lists this user's network connections without connecting to them.
+    const out = execFileSync('net', ['use'], { encoding: 'utf8', timeout: 3000, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
+    for (const m of out.matchAll(/(?:^|\s)([A-Za-z]):\s+\\\\/gm)) letters.add(m[1].toUpperCase());
+  } catch {
+    /* no network client: nothing mapped */
+  }
+  mappedDrives = { at: Date.now(), letters };
+  return letters;
+}
+
+/** Tests: the mapped drive letters to assume (null: ask `net use` again). */
+export function setMappedDrivesForTests(letters: string[] | null): void {
+  mappedDrives = letters ? { at: Number.MAX_SAFE_INTEGER, letters: new Set(letters.map((l) => l.toUpperCase())) } : null;
+}
+
+/**
+ * A network path (\\server\share\…, or a drive letter mapped to a share): never taken on trust,
+ * and never touched before it is (merely looking at one makes Windows offer it the person's
+ * credentials).
+ */
 export function isNetworkPath(p: string): boolean {
-  return /^[\\/]{2}/.test(p);
+  if (/^[\\/]{2}/.test(p)) return true;
+  const drive = /^([A-Za-z]):/.exec(p);
+  return Boolean(drive && mappedDriveLetters().has(drive[1].toUpperCase()));
 }
 
 /**
@@ -144,13 +174,25 @@ function folderKey(p: string): string {
   return process.platform === 'win32' ? abs.toLowerCase() : abs;
 }
 
-function readChosenFolders(dataDir?: string): { folders: string[] } | null {
+/** The list; 'missing' when this computer has none yet; 'unreadable' for anything else (busy, …). */
+function readChosenFolders(dataDir?: string): { folders: string[] } | 'missing' | 'unreadable' {
+  let text: string;
   try {
-    const raw = JSON.parse(fs.readFileSync(chosenFoldersPath(dataDir), 'utf8')) as { folders?: unknown };
+    text = fs.readFileSync(chosenFoldersPath(dataDir), 'utf8');
+  } catch (err) {
+    return (err as NodeJS.ErrnoException)?.code === 'ENOENT' ? 'missing' : 'unreadable';
+  }
+  try {
+    const raw = JSON.parse(text) as { folders?: unknown };
     return { folders: Array.isArray(raw.folders) ? raw.folders.filter((f): f is string => typeof f === 'string') : [] };
   } catch {
-    return null;
+    return 'unreadable';
   }
+}
+
+function chosenFolderList(dataDir?: string): string[] {
+  const list = readChosenFolders(dataDir);
+  return typeof list === 'object' ? list.folders : [];
 }
 
 function writeChosenFolders(folders: string[], dataDir?: string): void {
@@ -164,7 +206,52 @@ function writeChosenFolders(folders: string[], dataDir?: string): void {
 
 /** Remember a backup folder the person chose on this computer (saveBackupSettings). */
 export function rememberChosenFolder(folder: string, dataDir?: string): void {
-  writeChosenFolders([...(readChosenFolders(dataDir)?.folders ?? []), folder], dataDir);
+  let list = readChosenFolders(dataDir);
+  // Busy for a moment (another company file is writing it): try again rather than lose the others.
+  for (let i = 0; list === 'unreadable' && i < 5; i++) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    list = readChosenFolders(dataDir);
+  }
+  if (list === 'unreadable') {
+    // Unparseable for good: rewritten with this choice. Still busy: the choice is not recorded now.
+    try {
+      JSON.parse(fs.readFileSync(chosenFoldersPath(dataDir), 'utf8'));
+      console.warn('[backup] could not record the backup folder chosen on this computer (the list is busy)');
+      return;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code) {
+        console.warn('[backup] could not record the backup folder chosen on this computer:', (err as Error).message);
+        return;
+      }
+    }
+  }
+  writeChosenFolders([...(typeof list === 'object' ? list.folders : []), folder], dataDir);
+}
+
+/**
+ * This company file's own versioned backups are already in `folder` on this computer: files named
+ * like them, with the recorded name and size, directly in it. Proof the folder was used here (the
+ * version before the list was kept). Local folders only: a network one is never touched first.
+ */
+function folderHoldsOwnBackups(folder: string, dataDir?: string): boolean {
+  if (isNetworkPath(folder)) return false;
+  let realFolder: string;
+  try {
+    realFolder = folderKey(fs.realpathSync(folder));
+  } catch {
+    return false;
+  }
+  return readBackupHistory(dataDir).some((r) => {
+    if (!r.path || r.prunedAt || r.kind !== 'full' || !VERSION_FILE_NAME.test(r.filename) || path.basename(r.path) !== r.filename) return false;
+    try {
+      const real = fs.realpathSync(r.path);
+      if (folderKey(path.dirname(real)) !== realFolder) return false;
+      const st = fs.statSync(real);
+      return st.isFile() && (typeof r.sizeBytes !== 'number' || st.size === r.sizeBytes);
+    } catch {
+      return false;
+    }
+  });
 }
 
 /**
@@ -174,10 +261,25 @@ export function rememberChosenFolder(folder: string, dataDir?: string): void {
  */
 export function folderChosenHere(folder: string, dataDir?: string): boolean {
   const list = readChosenFolders(dataDir);
-  if (list) return list.folders.includes(folderKey(folder));
+  // Busy or unreadable right now: not trusted for this call, and the list is left as it is.
+  if (list === 'unreadable') return false;
+  if (list !== 'missing' && list.folders.includes(folderKey(folder))) return true;
+  // A network folder is only ever used once it is confirmed on this computer (Back Up settings).
+  if (isNetworkPath(folder)) {
+    if (list === 'missing') writeChosenFolders([], dataDir);
+    return false;
+  }
+  // This file's own backups are already there: it was this computer's folder before the list.
+  if (folderHoldsOwnBackups(folder, dataDir)) {
+    rememberChosenFolder(folder, dataDir);
+    return true;
+  }
+  if (list !== 'missing') return false;
+  // The first look on this computer (the version that started keeping the list): a local folder
+  // that already exists is taken as chosen here, so an upgrade keeps backing up where it did.
   let grandfathered = false;
   try {
-    grandfathered = !isNetworkPath(folder) && fs.statSync(folder).isDirectory();
+    grandfathered = fs.statSync(folder).isDirectory();
   } catch {
     grandfathered = false;
   }
@@ -187,7 +289,7 @@ export function folderChosenHere(folder: string, dataDir?: string): boolean {
 
 /** Every folder this computer writes versioned backups to: the default one and those chosen here. */
 export function backupFoldersHere(dataDir?: string): string[] {
-  return [defaultBackupFolder(dataDir), ...(readChosenFolders(dataDir)?.folders ?? [])];
+  return [defaultBackupFolder(dataDir), ...chosenFolderList(dataDir)];
 }
 
 /** The file names Ironbooks gives versioned backups (backupSchedule.ts versionFilename). */
@@ -422,7 +524,10 @@ export function saveBackupSettings(
 ): BackupSettings {
   const dir = resolveDataDir(dataDir);
   const next = normalizeBackupSettings(patch, readBackupSettings(dir));
-  if (next.folder) {
+  // The folder is checked and taken as chosen on this computer only when the person set it now:
+  // saving the schedule must never approve a folder that came in with the company file.
+  const folderSetNow = patch.folder !== undefined && Boolean(next.folder);
+  if (folderSetNow && next.folder) {
     // Check BEFORE creating anything: a folder made inside the data directory would travel inside
     // every backup.
     const inside = path.relative(dir, next.folder);
@@ -440,7 +545,7 @@ export function saveBackupSettings(
   }
   writeJsonAtomic(settingsPath(dir), next);
   // Chosen on this computer: from now on versioned backups go there here (backupFolder).
-  if (next.folder) rememberChosenFolder(next.folder, dir);
+  if (folderSetNow && next.folder) rememberChosenFolder(next.folder, dir);
   return next;
 }
 

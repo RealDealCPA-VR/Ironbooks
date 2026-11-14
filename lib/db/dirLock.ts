@@ -165,11 +165,34 @@ function removeStaleLock(file: string, stale: { raw: string; mtimeMs: number }):
   // meanwhile): put it back without replacing a lock created since, and leave the folder to it.
   try {
     fs.linkSync(aside, file);
-  } catch {
-    /* a newer lock is in place: it stands */
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    // No hard links here (exFAT, some NAS shares): an exclusive create puts the same lock back.
+    if (code !== 'EEXIST' && moved !== null) {
+      try {
+        fs.writeFileSync(file, moved, { flag: 'wx' });
+      } catch {
+        /* a newer lock is in place: it stands */
+      }
+    }
   }
   fs.rmSync(aside, { force: true });
   return false;
+}
+
+/** How long a lock that is not there is waited for before it counts as gone (see readLockSettled). */
+export const LOCK_SETTLE_MS = 250;
+
+/**
+ * The lock as it stands, read once more after a short pause when it is not there: another process
+ * judging it stale moves it aside for a moment and puts a fresh one back (removeStaleLock), and the
+ * holder must not take that moment for "taken over".
+ */
+function readLockSettled(file: string): ReturnType<typeof readLock> {
+  const first = readLock(file);
+  if (first) return first;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, LOCK_SETTLE_MS);
+  return readLock(file);
 }
 
 /**
@@ -236,7 +259,7 @@ function startHeartbeat(dir: string, file: string, info: LockInfo, onLost?: (hos
   const lock: HeldLock = { file, info, timer: undefined as unknown as ReturnType<typeof setInterval>, onLost };
   lock.timer = setInterval(() => {
     try {
-      const current = readLock(file);
+      const current = readLockSettled(file);
       // Someone else took it over (we were judged stale), or took it over and has closed the file
       // again (its lock, which replaced ours, is gone): stop claiming it, stop using the file.
       // Re-creating a vanished lock would let this process write over changes the other
@@ -267,7 +290,7 @@ export function assertDirLockHeld(dir: string): void {
   if (!lock) return;
   let current: ReturnType<typeof readLock>;
   try {
-    current = readLock(lock.file);
+    current = readLockSettled(lock.file);
   } catch {
     return;
   }
