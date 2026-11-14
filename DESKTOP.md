@@ -55,6 +55,11 @@ copy it like any file, back it up, hand it to your accountant. It is a standard 
 (`electron/companyFileFormat.js`): the manifest first (stored, so lists can read the company name
 from the first few KB), a `.bka`-compatible backup manifest (a company file restores like a
 backup), then the embedded database folder with its attachments and transaction log.
+Nothing that comes in with a file is trusted to act on this computer: its backup history only
+lets a rotation delete files named like this file's backups, with the recorded name and size, in a
+folder this computer backs up to; a backup folder set in it is used only once it has been chosen on
+this computer (a per-computer list in the default backup folder); and unpacking stops at each
+entry's declared size, with every entry and the total capped (`electron/companyFileFormat.js`).
 
 **Opening** (`electron/main.js` `openSingleFileForLaunch`):
 

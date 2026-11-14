@@ -66,7 +66,7 @@ export class CompanyFileInUseError extends ServiceError {
   }
 }
 
-function readLock(file: string): { info: LockInfo | null; mtimeMs: number } | null {
+function readLock(file: string): { info: LockInfo | null; mtimeMs: number; raw: string } | null {
   let raw: string;
   let mtimeMs: number;
   try {
@@ -79,12 +79,12 @@ function readLock(file: string): { info: LockInfo | null; mtimeMs: number } | nu
   try {
     const parsed = JSON.parse(raw) as Partial<LockInfo>;
     if (typeof parsed.pid === 'number' && typeof parsed.hostname === 'string') {
-      return { info: parsed as LockInfo, mtimeMs };
+      return { info: parsed as LockInfo, mtimeMs, raw };
     }
   } catch {
     /* half-written or foreign content: judged by its age alone */
   }
-  return { info: null, mtimeMs };
+  return { info: null, mtimeMs, raw };
 }
 
 function pidAlive(pid: number): boolean {
@@ -131,6 +131,47 @@ function installExitHook() {
   });
 }
 
+/** Tests only: runs between judging a lock stale and taking it over (another process acts now). */
+export const dirLockTestHooks: { afterStaleCheck?: () => void } = {};
+
+/**
+ * Remove a lock judged stale — only if it is still exactly that lock. Two processes may judge the
+ * same lock stale at the same moment: removing it after the check (unlink) could remove the lock
+ * the OTHER one has just created, and both would hold the folder. Instead the lock is moved aside
+ * with one atomic rename and then compared with what was judged stale: only a process that moved
+ * the stale lock goes on (to the exclusive create); one that moved a fresh lock puts it back
+ * (never over a lock created meanwhile) and reports it held. Returns true when it was removed.
+ */
+function removeStaleLock(file: string, stale: { raw: string; mtimeMs: number }): boolean {
+  const aside = `${file}.takeover-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  try {
+    fs.renameSync(file, aside);
+  } catch (err) {
+    // Gone already (the other process moved it first): whoever creates it first wins.
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return true;
+    throw err;
+  }
+  let moved: string | null = null;
+  try {
+    moved = fs.readFileSync(aside, 'utf8');
+  } catch {
+    moved = null;
+  }
+  if (moved === stale.raw) {
+    fs.rmSync(aside, { force: true });
+    return true;
+  }
+  // Not the lock that was judged stale (its holder renewed it, or another process took it over
+  // meanwhile): put it back without replacing a lock created since, and leave the folder to it.
+  try {
+    fs.linkSync(aside, file);
+  } catch {
+    /* a newer lock is in place: it stands */
+  }
+  fs.rmSync(aside, { force: true });
+  return false;
+}
+
 /**
  * Take the lock on `dir` (already resolved and created) for this process. Throws
  * CompanyFileInUseError when another live process holds it. A folder where no lock file can be
@@ -159,10 +200,10 @@ export function acquireDirLock(dir: string, onLost?: (host: string) => void): vo
     if (!lock) continue; // released meanwhile: try again
     holder = lock.info?.hostname ?? holder;
     if (!isStale(dir, lock)) throw new CompanyFileInUseError(holder ?? 'another computer');
-    try {
-      fs.unlinkSync(file);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    dirLockTestHooks.afterStaleCheck?.();
+    if (!removeStaleLock(file, lock)) {
+      const now = readLock(file);
+      throw new CompanyFileInUseError(now?.info?.hostname ?? holder ?? 'another computer');
     }
   }
   throw new CompanyFileInUseError(holder ?? 'another computer');

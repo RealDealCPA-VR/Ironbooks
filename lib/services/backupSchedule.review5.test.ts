@@ -50,7 +50,17 @@ describe('rotating the versions of a company file opened on several computers', 
       version('2026-10-04T10:00:00.000Z', HERE, 'auto-backup-acme-d.bka', true),
       version('2026-10-05T10:00:00.000Z', HERE, 'auto-backup-acme-e.bka', true),
     ];
-    const pruned = rotateVersions(2, DATA, new Date('2026-10-05T11:00:00.000Z'));
+    // HERE is this computer's backup folder (only files in a folder this computer backs up to are
+    // ever deleted by a rotation: the history travels with the company file).
+    const prev = process.env.BKA_BACKUP_DIR;
+    process.env.BKA_BACKUP_DIR = HERE;
+    let pruned: number;
+    try {
+      pruned = rotateVersions(2, DATA, new Date('2026-10-05T11:00:00.000Z'));
+    } finally {
+      if (prev === undefined) delete process.env.BKA_BACKUP_DIR;
+      else process.env.BKA_BACKUP_DIR = prev;
+    }
     const after = new Map(readBackupHistory(DATA).map((r) => [r.id, r]));
     // Keep 2 of the versions on this computer: the oldest one here goes.
     expect(pruned).toBe(1);
@@ -82,7 +92,9 @@ describe('the backup folder chosen on another computer', () => {
       if (r.status !== 'created') return;
       expect(path.dirname(r.record.path!)).toBe(fallback);
       expect(fs.existsSync(r.record.path!)).toBe(true);
-      expect(r.record.note).toMatch(/could not be reached/);
+      // Chosen on FRONT-DESK, never here: not even tried on this computer (a folder that came in
+      // with the file is never taken on trust), so it says so.
+      expect(r.record.note).toMatch(/chosen on another computer/);
     } finally {
       if (prev === undefined) delete process.env.BKA_BACKUP_DIR;
       else process.env.BKA_BACKUP_DIR = prev;

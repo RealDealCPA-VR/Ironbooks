@@ -519,9 +519,9 @@ function freePath(base, ext = '') {
  * state (damagedPlain): sealDamagedCopies encrypts them once someone has signed in, and
  * pruneWorkingCopies removes any left after DAMAGED_PLAIN_MAX_AGE_MS. Returns where it went.
  */
-async function keepDamagedCopy(workDir, dataDir, { protection, companyName, appVersion } = {}) {
-  const base = path.join(workDir, `${DAMAGED_PREFIX}${stampOf(new Date())}`);
-  const label = companyName ? `${companyName} (damaged copy)` : undefined;
+async function keepDamagedCopy(workDir, dataDir, { protection, companyName, appVersion, prefix, what } = {}) {
+  const base = path.join(workDir, `${prefix || DAMAGED_PREFIX}${stampOf(new Date())}`);
+  const label = companyName ? `${companyName} (${what || 'damaged copy'})` : undefined;
   if (protection) {
     const target = freePath(base, format.COMPANY_FILE_EXT);
     await writeWorkingCopyAs(workDir, target, { dataDir, protection, companyName: label, appVersion, allowDamaged: true });

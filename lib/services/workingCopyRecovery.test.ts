@@ -50,6 +50,7 @@ let lock: { token: string; dir: string } | null = null;
 
 /** What the desktop shell does to open the company file (electron/main.js). */
 async function open() {
+  if (lock) lockMod.release(lock);
   lock = lockMod.acquire(FILE, { appUser: 'Mary' }).lock;
   const prep = await sessionMod.prepareWorkingCopy(FILE, { root: WORKING });
   workDir = prep.workDir;
@@ -68,6 +69,15 @@ async function crash() {
   await closeDb().catch(() => undefined);
   if (lock) lockMod.release(lock);
   lock = null;
+  resetCompanyFileSaveState();
+}
+
+/** This computer holds the lock again (the save checks it before anything else). */
+function relock() {
+  if (lock) lockMod.release(lock);
+  lock = lockMod.acquire(FILE, { appUser: 'Mary' }).lock;
+  process.env.BKA_COMPANY_LOCK = lock!.dir;
+  process.env.BKA_COMPANY_LOCK_TOKEN = lock!.token;
   resetCompanyFileSaveState();
 }
 
@@ -112,6 +122,7 @@ describe('a working copy that will not start after a crash', () => {
     savedId = format.readCompanyManifest(FILE).saveId;
     await crash();
     damageCheckpoint(process.env.BKA_DATA_DIR!);
+    relock();
 
     // Whatever tries to save it (the autosave, the close-time save) is refused, in plain words.
     await expect(saveCompanyFile({ force: true })).rejects.toBeInstanceOf(UnstartableBooksError);
@@ -260,6 +271,7 @@ describe('a working copy that will not start after a crash', () => {
     await expect(getDb()).rejects.toThrow(/copy of your books on this computer is missing/);
     expect(fs.existsSync(path.join(dir, 'PG_VERSION'))).toBe(false);
     // Nothing to save either: an empty snapshot never replaces the company file.
+    relock();
     const savedBefore = format.readCompanyManifest(FILE).saveId;
     await expect(saveCompanyFile({ force: true })).rejects.toBeInstanceOf(UnstartableBooksError);
     expect(format.readCompanyManifest(FILE).saveId).toBe(savedBefore);

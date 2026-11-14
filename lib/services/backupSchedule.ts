@@ -34,10 +34,12 @@ import { currentFingerprint } from './backupFingerprint';
 import { readSandboxMarker, sandboxBlockedError } from './sandboxState';
 import {
   backupFolder,
+  backupFolderIgnoredHere,
   backupHealth,
   defaultBackupFolder,
   findBackupRecord,
   isBackupDue,
+  isOwnBackupFile,
   markPruned,
   nextBackupDueAt,
   planRotation,
@@ -120,12 +122,15 @@ export function rotateVersions(keep: number, dataDir?: string, now: Date = new D
   // every computer that opens it, and each backs up into its own folder: another computer's
   // versions are neither deleted nor marked deleted here (that hid them from the list on the
   // computer that has them, where they were then never rotated again).
-  const visible = readBackupHistory(dir).filter((r) => !r.path || fs.existsSync(r.path));
+  // And only records that really are this file's backups here (isOwnBackupFile): the history
+  // travels inside the company file, so a crafted one could otherwise name any file on this
+  // computer to delete. Records that are not are left out of the rotation altogether.
+  const visible = readBackupHistory(dir).filter((r) => !r.path || (fs.existsSync(r.path) && isOwnBackupFile(r, dir)));
   const stale = planRotation(visible, keep);
   const pruned: string[] = [];
   for (const rec of stale) {
     try {
-      if (rec.path && fs.existsSync(rec.path)) fs.rmSync(rec.path, { force: true });
+      if (rec.path && fs.existsSync(rec.path) && isOwnBackupFile(rec, dir)) fs.rmSync(rec.path, { force: true });
       pruned.push(rec.id);
     } catch (err) {
       console.warn('[backup] could not delete old version (will retry next time):', err);
@@ -155,6 +160,8 @@ async function doVersionedBackup(source: VersionedSource, opts: VersionedBackupO
   }
 
   let folder = backupFolder(settings, dir);
+  // A folder that came in with the company file and was never chosen on this computer.
+  const ignoredFolder = backupFolderIgnoredHere(settings, dir);
   let unreachable = false;
   try {
     fs.mkdirSync(folder, { recursive: true });
@@ -163,7 +170,7 @@ async function doVersionedBackup(source: VersionedSource, opts: VersionedBackupO
     // user profile only the computer that chose it has (or a share that is offline right now).
     // An automatic backup then goes to this computer's default folder rather than not at all;
     // "Back up now" still reports the problem.
-    if (!settings.folder || source === 'manual') throw err;
+    if (!settings.folder || ignoredFolder || source === 'manual') throw err;
     console.warn(`[backup] the backup folder ${folder} cannot be reached from this computer; using the default folder:`, (err as Error).message);
     folder = defaultBackupFolder(dir);
     fs.mkdirSync(folder, { recursive: true });
@@ -194,7 +201,8 @@ async function doVersionedBackup(source: VersionedSource, opts: VersionedBackupO
           : source === 'quit'
             ? 'Automatic backup when the app closed'
             : 'Backed up now') +
-        (unreachable ? ' (the chosen backup folder could not be reached from this computer, so it went to the default folder)' : ''),
+        (unreachable ? ' (the chosen backup folder could not be reached from this computer, so it went to the default folder)' : '') +
+        (ignoredFolder ? ' (the backup folder set in this company file was chosen on another computer, so it went to this computer\'s default folder; choose a folder here in Back Up settings to use one)' : ''),
     },
     dir,
   );

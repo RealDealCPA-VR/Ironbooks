@@ -20,6 +20,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import format from '@/electron/companyFileFormat';
+import session from '@/electron/companySession';
 import { eq, getTableColumns, getTableName } from 'drizzle-orm';
 import {
   resolveDataDir,
@@ -405,6 +406,23 @@ export function ensurePreOpBackup(
 // restoreBackup
 // ---------------------------------------------------------------------------
 
+/**
+ * Keep the books a restore replaced when no safety backup of them could be made: in the working
+ * folder of the open company file (an encrypted company file when they are protected), else next
+ * to the company folder. Returns where they went.
+ */
+async function keepReplacedBooks(dir: string, from: string, protection: SealProtection | null): Promise<string> {
+  const st = process.env.BKA_COMPANY_STATE ? path.resolve(path.dirname(process.env.BKA_COMPANY_STATE)) : null;
+  const same = (a: string, b: string) => (process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b);
+  if (st && same(path.resolve(path.join(st, 'data')), path.resolve(dir))) {
+    return session.keepDamagedCopy(st, from, { protection: protection ?? undefined, prefix: 'books before restore ', what: 'before restore' });
+  }
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const target = `${dir} before restore ${stamp}`;
+  await format.renameWithRetry(from, target);
+  return target;
+}
+
 export interface RestoreResult {
   restored: true;
   /**
@@ -499,6 +517,13 @@ export function validateBackupZip(buffer: Buffer): AdmZip {
     entryNames = zip.getEntries().map((e) => e.entryName.replace(/\\/g, '/'));
   } catch {
     throw notABackup('could not read zip archive');
+  }
+  // A small crafted archive must not unpack into gigabytes: every entry's declared size is capped
+  // (adm-zip stops inflating at it), and so is their total (electron/companyFileFormat.js).
+  try {
+    format.checkSizes(zip.getEntries().map((e) => ({ name: e.entryName, size: e.header.size })));
+  } catch {
+    throw notABackup('it unpacks to more than any company file can hold');
   }
   if (!entryNames.length) throw notABackup('archive is empty');
 
@@ -653,10 +678,12 @@ async function restoreBackupInto(dir: string, buffer: Buffer, opts: { credential
   // pre-op .bka so a bad restore is recoverable after the fact. Best-effort —
   // an unreadable live dir must not block restoring a known-good backup (the
   // rename-aside in step 4 still provides in-flight rollback).
+  // Without it, the books the restore replaces are KEPT (keepReplacedBooks) instead of deleted.
+  let safetyCopyMade = false;
   try {
-    ensurePreOpBackup(null, 'restore', dir, protection);
+    safetyCopyMade = Boolean(ensurePreOpBackup(null, 'restore', dir, protection));
   } catch (err) {
-    console.warn('[backup] pre-op backup before restore failed (continuing):', err);
+    console.warn('[backup] pre-op backup before restore failed (continuing; the replaced books are kept instead):', err);
   }
 
   // (2) Extract to a sibling temp dir.
@@ -769,12 +796,26 @@ async function restoreBackupInto(dir: string, buffer: Buffer, opts: { credential
     // getDb(), which re-asserts the guards again on open.
     await closeDb(dir);
 
-    if (preRestoreDir) {
-      // Best-effort cleanup of the safety copy; a leftover dir is harmless.
+    if (preRestoreDir && safetyCopyMade) {
+      // The safety backup holds them: best-effort cleanup of the rollback folder.
       try {
         fs.rmSync(preRestoreDir, { recursive: true, force: true });
       } catch {
         /* ignore */
+      }
+    } else if (preRestoreDir) {
+      // No safety backup could be made: the rollback folder is the only copy of the replaced
+      // books left, so it is kept (encrypted when they are protected) and the person is told.
+      try {
+        const kept = await keepReplacedBooks(dir, preRestoreDir, protection ?? null);
+        notices.push(
+          `Ironbooks could not make its usual safety backup of the books this restore replaced, so it kept them instead: ${kept}. Once you are sure the restored books are right, you can delete it.`,
+        );
+      } catch (err) {
+        console.error('[backup] could not file away the books the restore replaced (left at their temporary name):', err);
+        notices.push(
+          `Ironbooks could not make its usual safety backup of the books this restore replaced, so it kept them instead: ${preRestoreDir}. Once you are sure the restored books are right, you can delete it.`,
+        );
       }
     }
 

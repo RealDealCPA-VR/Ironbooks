@@ -309,6 +309,35 @@ function companyNameFor(s: SaveState, dataDir: string): string {
   return format.companyFileBaseName(s.file);
 }
 
+/**
+ * This computer must still hold the company file's lock (electron/companyLock.js owner.json).
+ * Someone else's token: the file was taken over, nothing is saved here again (status 'lost'). No
+ * readable owner at all while the folder can be reached (removed, replaced, half-written): taken
+ * as lost too, never as "still ours". A folder that cannot be reached right now: this save fails
+ * and the autosave tries again.
+ */
+async function assertLockStillOurs(s: SaveState): Promise<void> {
+  if (!s.lockDir || !s.lockToken) return;
+  const owner = readOwner(s.lockDir);
+  if (owner && owner.token === s.lockToken) return;
+  if (!owner && !fs.existsSync(path.dirname(s.file))) {
+    throw Object.assign(new Error(`Ironbooks can't reach ${path.dirname(s.file)} to check that this computer still has the company file open.`), { code: 'ENOENT' });
+  }
+  s.status = 'lost';
+  const who = owner ? owner.appUser || owner.osUser : null;
+  s.error = owner
+    ? `${who ? `${who} on ` : ''}${owner.computer ?? 'another computer'} has opened this company file since this computer last saved it, so Ironbooks stopped saving here to protect their work. Your changes are kept on this computer.`
+    : 'Ironbooks can no longer confirm that this computer has the company file open (its "in use" record is gone or unreadable), so it stopped saving here to protect anyone else\'s work. Your changes are kept on this computer.';
+  // What is here and not in the company file stays recorded as unsaved — also changes no autosave
+  // check has seen yet (the close-time save) — so the next open here keeps them apart.
+  const fp = currentFingerprint(s.dataDir);
+  const lsn = await currentLsn(s);
+  if (fp !== s.savedFingerprint || s.unsavedSince !== null || (lsn !== null && lsn !== baselineLsn(s))) {
+    noteUnsaved(s, Date.now(), fp !== s.savedFingerprint);
+  }
+  throw Object.assign(new Error(s.error), { code: 'LOCK_LOST' });
+}
+
 function readOwner(lockDir: string): { token?: string; computer?: string; appUser?: string; osUser?: string } | null {
   try {
     return JSON.parse(fs.readFileSync(path.join(lockDir, 'owner.json'), 'utf8'));
@@ -386,22 +415,7 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
   }
 
   // Still ours? (A computer that slept past the lock's stale time may have lost it.)
-  if (s.lockDir && s.lockToken) {
-    const owner = readOwner(s.lockDir);
-    if (owner && owner.token !== s.lockToken) {
-      s.status = 'lost';
-      const who = owner.appUser || owner.osUser;
-      s.error = `${who ? `${who} on ` : ''}${owner.computer ?? 'another computer'} has opened this company file since this computer last saved it, so Ironbooks stopped saving here to protect their work. Your changes are kept on this computer.`;
-      // What is here and not in the company file stays recorded as unsaved — also changes no
-      // autosave check has seen yet (the close-time save) — so the next open here keeps them apart.
-      const fp = currentFingerprint(dataDir);
-      const lsn = await currentLsn(s);
-      if (fp !== s.savedFingerprint || s.unsavedSince !== null || (lsn !== null && lsn !== baselineLsn(s))) {
-        noteUnsaved(s, Date.now(), fp !== s.savedFingerprint);
-      }
-      throw Object.assign(new Error(s.error), { code: 'LOCK_LOST' });
-    }
-  }
+  await assertLockStillOurs(s);
 
   // Nothing to do? Only when it is certain: the database was never opened in this process, or its
   // write position is exactly where the last save left it (an unknown position counts as changed,
@@ -513,6 +527,7 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
     // Read AFTER the snapshot: protection is only ever added, so a snapshot that holds anything
     // written together with it (a new file's first Admin) is always sealed.
     const protection = await saveProtection(s);
+    const startedFromSaveId = onDisk?.saveId ?? null;
     const result = await format.writeCompanyFile(target, {
       manifest: {
         formatVersion: format.COMPANY_FILE_FORMAT_VERSION,
@@ -544,6 +559,22 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
       entries,
       cache: s.cache,
       protection,
+      // Writing a big file over a slow network takes a while: just before it replaces the company
+      // file, this computer must still hold the lock, and nobody may have saved the file meanwhile.
+      beforeRename: async () => {
+        await assertLockStillOurs(s);
+        if (conflict) return;
+        const now = format.readCompanyManifest(s.file) as { saveId?: string } | null;
+        if (!now && fs.existsSync(s.file)) {
+          throw Object.assign(new Error('The company file on disk can no longer be read (it may have been replaced by another program).'), { code: 'UNREADABLE' });
+        }
+        if ((now?.saveId ?? null) !== startedFromSaveId) {
+          throw Object.assign(
+            new Error('Someone else saved the company file while this computer was saving it, so this save was not written over theirs. Your changes are kept on this computer and are saved to a separate copy next.'),
+            { code: 'SAVED_ELSEWHERE' },
+          );
+        }
+      },
     });
     s.lastSealed = Boolean(protection);
 
@@ -598,8 +629,10 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
   } catch (err) {
     s.lastSaveEndedAt = Date.now();
     noteUnsaved(s, Date.now(), true);
+    // Taken over while this save was being written (assertLockStillOurs): it stays 'lost'.
+    if ((err as { code?: string })?.code === 'LOCK_LOST') throw err;
     s.status = 'error';
-    s.error = friendlyIoError(err, s.file);
+    s.error = (err as { code?: string })?.code === 'SAVED_ELSEWHERE' ? (err as Error).message : friendlyIoError(err, s.file);
     throw err;
   }
 }
