@@ -523,12 +523,16 @@ export function needsSignInToRecover(err: unknown): boolean {
  * mode to continue with — 'extract' when the copy was set aside, still 'key' when it started after all.
  */
 export async function recoverSealedWorkingCopy(fileKey: Buffer | null = null): Promise<SealedMode | null> {
+  // Another sign-in's recovery is running: wait for it, then go on in the mode it left.
+  await whenRecoveryDone();
   // Another sign-in already set the copy aside (the mode is 'extract' now): go on with that.
   if (sealedMode() !== 'key') return sealedMode();
   try {
     await withRecoveryAllowed(() => withSealedAccess(() => getDb()), fileKey);
   } catch (err) {
-    if (!(err as { details?: { resealed?: boolean } })?.details?.resealed) throw err;
+    const details = (err as { details?: { resealed?: boolean; sealed?: boolean } })?.details;
+    // The mode moved on while this sign-in waited (a recovery that finished meanwhile): go on.
+    if (!details?.resealed && !(details?.sealed && sealedMode() !== 'key')) throw err;
   }
   return sealedMode();
 }

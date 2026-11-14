@@ -269,11 +269,11 @@ export function folderChosenHere(folder: string, dataDir?: string): boolean {
     if (list === 'missing') writeChosenFolders([], dataDir);
     return false;
   }
-  // This file's own backups are already there: it was this computer's folder before the list.
-  if (folderHoldsOwnBackups(folder, dataDir)) {
-    rememberChosenFolder(folder, dataDir);
-    return true;
-  }
+  // This file's own backups are already there: it was this computer's folder before the list. For
+  // THIS file only, judged again each time — never added to the list every company file on this
+  // computer trusts: the history that shows it travels inside the company file, so a crafted file
+  // could otherwise point at a shared folder holding a backup of known size and get it trusted.
+  if (folderHoldsOwnBackups(folder, dataDir)) return true;
   if (list !== 'missing') return false;
   // The first look on this computer (the version that started keeping the list): a local folder
   // that already exists is taken as chosen here, so an upgrade keeps backing up where it did.

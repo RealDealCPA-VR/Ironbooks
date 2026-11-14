@@ -121,6 +121,10 @@ interface SaveState {
   inflight: Promise<SaveResult> | null;
   /** The running save is waiting for a working-copy recovery to finish (it never holds one up). */
   waitingForRecovery?: boolean;
+  /** The running save has taken its snapshot and is writing it out (a recovery waits for that). */
+  snapshotTaken?: boolean;
+  /** Saves in a row that could not read the lock record (a persistent problem gets plain words). */
+  lockUnconfirmed?: number;
   status: SaveStatusKind;
   error: string | null;
   conflictCopy: string | null;
@@ -325,10 +329,21 @@ async function assertLockStillOurs(s: SaveState): Promise<void> {
     await new Promise((r) => setTimeout(r, LOCK_REREAD_MS));
     owner = readOwner(s.lockDir);
   }
-  if (owner && owner.token === s.lockToken) return;
+  if (owner && owner.token === s.lockToken) {
+    s.lockUnconfirmed = 0;
+    return;
+  }
   if (!owner) {
+    // Several saves in a row: it is not a passing hiccup (a damaged lock record after a file-server
+    // power cut, say), and nothing repairs it by itself — say so instead of "just now".
+    s.lockUnconfirmed = (s.lockUnconfirmed ?? 0) + 1;
+    const where = path.dirname(s.file);
     throw Object.assign(
-      new Error(`Ironbooks could not confirm just now that this computer still has the company file open (${path.dirname(s.file)}), so this save waits. Your changes are kept on this computer and saved as soon as it can.`),
+      new Error(
+        s.lockUnconfirmed >= 3
+          ? `Ironbooks still cannot read the company file's lock record on ${where}, so it is not saving there. Your changes are kept on this computer. Close the company file and open it again (File → Close Company); if that keeps happening, check that folder on the shared drive.`
+          : `Ironbooks could not confirm just now that this computer still has the company file open (${where}), so this save waits. Your changes are kept on this computer and saved as soon as it can.`,
+      ),
       { code: 'LOCK_UNCONFIRMED' },
     );
   }
@@ -385,23 +400,28 @@ export async function saveCompanyFile(opts: { force?: boolean; final?: boolean; 
     await s.inflight.catch(() => undefined);
     if (!opts.final && !opts.force) return { saved: false, outcome: 'unchanged' };
   }
+  s.snapshotTaken = false;
   const run = doSave(s, opts);
   s.inflight = run;
   try {
     return await run;
   } finally {
-    if (s.inflight === run) s.inflight = null;
+    if (s.inflight === run) {
+      s.inflight = null;
+      s.snapshotTaken = false;
+    }
   }
 }
 
 /**
  * Resolves once no save is writing out of the working copy (lib/services/workingCopyRecovery.ts
- * waits for it before it judges the folder). A save that is itself waiting for a recovery does not
- * count: it snapshots nothing until the recovery is done.
+ * waits for it before it judges the folder). Only a save that has TAKEN its snapshot counts: one
+ * still on its way may be opening the database — and so waiting for this very recovery (a wait on
+ * it would never end, holding every request). It sees the recovery when it snapshots, and stops.
  */
 export async function whenNoSaveWriting(): Promise<void> {
   const s = g.__ironbooksCompanyFileSave;
-  while (s?.inflight && !s.waitingForRecovery) await s.inflight.catch(() => undefined);
+  while (s?.inflight && s.snapshotTaken && !s.waitingForRecovery) await s.inflight.catch(() => undefined);
 }
 
 /**
@@ -541,6 +561,8 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
       console.error(`[company-file] not saving ${dataDir}: ${damaged}.`);
       throw new UnstartableBooksError(damaged, 'save');
     }
+    // From here the save writes this snapshot out: a recovery starting now waits for it.
+    s.snapshotTaken = true;
     const savedAt = new Date().toISOString();
     const saveId = randomUUID();
     const companyName = companyNameFor(s, dataDir);

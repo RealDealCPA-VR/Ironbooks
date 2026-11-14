@@ -820,19 +820,16 @@ async function restoreBackupInto(dir: string, buffer: Buffer, opts: { credential
         try {
           fs.renameSync(preRestoreDir, keepName);
           where = keepName;
-          // Protected books left in plain text in a working folder: recorded for the cleanup.
-          if (protection && process.env.BKA_COMPANY_STATE) {
-            try {
-              session.recordDamagedPlain(path.dirname(path.resolve(process.env.BKA_COMPANY_STATE)), keepName);
-            } catch {
-              /* the state file is busy */
-            }
-          }
+          // Not handed to the timed clean-up of plain-text copies: this is the ONLY copy of the
+          // replaced books (encrypting it just failed), so it stays until the person deletes it —
+          // the notice says it is not encrypted.
         } catch (renameErr) {
           console.error('[backup] could not rename them either (left at their temporary name):', renameErr);
         }
         notices.push(
-          `Ironbooks could not make its usual safety backup of the books this restore replaced, so it kept them instead: ${where}. Once you are sure the restored books are right, you can delete it.`,
+          `Ironbooks could not make its usual safety backup of the books this restore replaced, so it kept them instead: ${where}.` +
+            (protection ? ' This copy is NOT encrypted; keep it private, and delete it' : ' Delete it') +
+            ' once you are sure the restored books are right.',
         );
       }
     }
