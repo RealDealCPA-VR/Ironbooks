@@ -160,7 +160,8 @@ export async function discoverTailnetPeers(
 ): Promise<DiscoveryResult> {
   const candidates =
     process.platform === 'win32'
-      ? ['tailscale', 'C:\\Program Files\\Tailscale\\tailscale.exe']
+      ? // Full path only: a bare name is looked up in the current folder first on Windows.
+        [`${process.env.ProgramFiles || 'C:\\Program Files'}\\Tailscale\\tailscale.exe`]
       : process.platform === 'darwin'
         ? ['tailscale', '/Applications/Tailscale.app/Contents/MacOS/Tailscale']
         : ['tailscale'];

@@ -131,7 +131,7 @@ describe('Users & Roles — fix round', () => {
       const z = await addUser(adminA, { name: 'Zoe', login: 'zoe', password: 'zoepass123', roleKeys: ['sales'] });
       await updateUser(adminA, z.userId, { isActive: false });
       as(z.userId, 'POST', '/api/auth/2fa/setup');
-      const res = await twoFaSetupPOST();
+      const res = await twoFaSetupPOST(new NextRequest('http://localhost/api/auth/2fa/setup', { method: 'POST', body: JSON.stringify({ currentPassword: 'x' }) }));
       expect(res.status).toBe(403);
     });
 

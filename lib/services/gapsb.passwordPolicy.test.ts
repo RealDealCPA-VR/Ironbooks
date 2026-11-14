@@ -309,7 +309,7 @@ describe('existing users and expiry', () => {
     // The 'self' routes (getSessionGate) are refused too — 2FA setup / disable, company select ...
     as(dana.id, 'POST', '/api/auth/2fa/setup');
     await expect(getSessionGate()).rejects.toMatchObject({ code: 'FORBIDDEN', message: PASSWORD_CHANGE_REQUIRED_MESSAGE });
-    const setup = await twoFaSetupPOST();
+    const setup = await twoFaSetupPOST(new NextRequest('http://localhost/api/auth/2fa/setup', { method: 'POST', body: JSON.stringify({ currentPassword: 'x' }) }));
     expect(setup.status).toBe(403);
     expect((await setup.json()).error).toBe(PASSWORD_CHANGE_REQUIRED_MESSAGE);
     expect((await userRow(dana.id)).totpSecret).toBeNull();

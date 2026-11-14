@@ -188,7 +188,7 @@ describe('Users & Roles — re-test round 1', () => {
       try {
         h.cookies.delete(UNLOCK_COOKIE);
         as(ownerA, 'POST', '/api/auth/2fa/setup');
-        const setup = await twoFaSetupPOST();
+        const setup = await twoFaSetupPOST(new NextRequest('http://localhost/api/auth/2fa/setup', { method: 'POST', body: JSON.stringify({ currentPassword: 'x' }) }));
         expect(setup.status, '2FA secret issued while the file is locked').toBe(403);
         const [row] = await db.select().from(users).where(eq(users.id, ownerA));
         expect(row.totpSecret ?? null).toBeNull();

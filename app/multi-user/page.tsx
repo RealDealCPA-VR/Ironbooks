@@ -37,6 +37,8 @@ interface HostingStatus {
   available: boolean;
   hosting: boolean;
   urls: string[];
+  /** Short code teammates check before joining (the start of this computer's certificate fingerprint). */
+  connectionCode?: string | null;
   tls: boolean;
   dnsName: string | null;
   tailnetIp: string | null;
@@ -200,6 +202,12 @@ export default function MultiUserPage() {
                   ? 'Teammates just open the company file from the shared drive; Ironbooks connects them to this computer at'
                   : 'On each teammate’s computer: File → Open company on host…, then enter'}
               </p>
+              {hosting.lan && hosting.connectionCode && (
+                <p className="text-sm text-navy mb-2">
+                  Connection code: <code className="font-semibold">{hosting.connectionCode}</code>{' '}
+                  <span className="text-xs text-navy/50">— teammates are asked to check this code the first time they join.</span>
+                </p>
+              )}
               {hosting.urls.map((u) => (
                 <div key={u} className="flex items-center gap-2">
                   <code className="text-sm text-navy">{u}</code>

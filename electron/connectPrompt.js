@@ -39,7 +39,15 @@ const PAGE = `<!doctype html><html><head><meta charset="utf-8">
  * Show the prompt. `onSubmit(value)` resolves { ok: true } to close the prompt or
  * { ok: false, error } to show a message. Resolves when the window closes.
  */
+let openPrompt = null;
+
 function promptForHost(parent, { initial, onSubmit }) {
+  // One at a time: a second call (menu, or a host page asking again) focuses the open prompt
+  // instead of registering its IPC channels twice (which threw and left an orphan window).
+  if (openPrompt && !openPrompt.isDestroyed()) {
+    openPrompt.focus();
+    return Promise.resolve();
+  }
   return new Promise((resolve) => {
     const win = new BrowserWindow({
       parent: parent || undefined,
@@ -73,8 +81,13 @@ function promptForHost(parent, { initial, onSubmit }) {
         return result;
       },
     };
-    for (const [ch, fn] of Object.entries(handlers)) ipcMain.handle(ch, fn);
+    openPrompt = win;
+    for (const [ch, fn] of Object.entries(handlers)) {
+      ipcMain.removeHandler(ch);
+      ipcMain.handle(ch, fn);
+    }
     win.on('closed', () => {
+      if (openPrompt === win) openPrompt = null;
       for (const ch of Object.keys(handlers)) ipcMain.removeHandler(ch);
       resolve();
     });

@@ -27,6 +27,8 @@ interface Me {
 export default function SecurityPage() {
   // After sign-in, someone without a challenge question is sent here once (app/login).
   const [prompt, setPrompt] = useState<{ next: string } | null>(null);
+  /** Two-factor setup asks for the current password first. */
+  const [setupPassword, setSetupPassword] = useState('');
   const [protectPrompt, setProtectPrompt] = useState<{ next: string } | null>(null);
   // prefsperms: signed in with a one-time recovery code (app/login) - how many are left.
   const [recovered, setRecovered] = useState<{ left: number; next: string } | null>(null);
@@ -74,7 +76,8 @@ export default function SecurityPage() {
   async function setup() {
     setBusy(true);
     try {
-      const r = await api.post<{ secret: string; otpauthUrl: string }>('/api/auth/2fa/setup');
+      const r = await api.post<{ secret: string; otpauthUrl: string }>('/api/auth/2fa/setup', { currentPassword: setupPassword });
+      setSetupPassword('');
       setSecret(r.secret);
       setOtpUrl(r.otpauthUrl);
       toast('Scan or enter the secret in your authenticator app, then enter a code.', 'info');
@@ -192,7 +195,22 @@ export default function SecurityPage() {
         ) : (
           <>
             {!secret && !enabled && (
-              <Button onClick={setup} loading={busy}>Set up authenticator</Button>
+              <div className="flex flex-wrap items-end gap-2">
+                <div>
+                  <Label htmlFor="setup-password">Your current password</Label>
+                  <Input
+                    id="setup-password"
+                    type="password"
+                    autoComplete="current-password"
+                    value={setupPassword}
+                    onChange={(e) => setSetupPassword(e.target.value)}
+                    className="w-64"
+                  />
+                </div>
+                <Button onClick={setup} loading={busy} disabled={!setupPassword}>
+                  Set up authenticator
+                </Button>
+              </div>
             )}
 
             {secret && !enabled && (

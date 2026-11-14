@@ -94,7 +94,10 @@ function pidAlive(pid) {
 function hideOnWindows(dir) {
   if (process.platform !== 'win32') return;
   try {
-    execFile('attrib', ['+h', dir], { windowsHide: true }, () => {});
+    // By full path: a bare name is looked up in the CURRENT folder first on Windows — the folder of
+    // a company file double-clicked on a share, where anyone with write access could plant one.
+    const attrib = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'attrib.exe');
+    execFile(attrib, ['+h', dir], { windowsHide: true }, () => {});
   } catch {
     /* not important */
   }

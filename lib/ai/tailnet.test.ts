@@ -98,7 +98,11 @@ describe('tailscale discovery', () => {
       calls.push([cmd, ...args]);
       return STATUS;
     });
-    expect(calls[0]).toEqual(['tailscale', 'status', '--json']);
+    // Windows: the installed copy by full path only (never a bare name, which Windows looks up in
+    // the current folder first); elsewhere the CLI on PATH.
+    expect(calls[0].slice(1)).toEqual(['status', '--json']);
+    if (process.platform === 'win32') expect(calls[0][0]).toMatch(/^[A-Za-z]:\\.*\\Tailscale\\tailscale\.exe$/);
+    else expect(calls[0][0]).toBe('tailscale');
     expect(r.peers).toHaveLength(3);
   });
 

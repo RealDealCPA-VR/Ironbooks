@@ -46,10 +46,13 @@ const STRIP_REQUEST_HEADERS = [
 ];
 
 function tailscaleCandidates() {
-  const list = ['tailscale'];
+  // Windows: the installed copy by full path only (a bare name is looked up in the current
+  // folder first — a planted tailscale.exe next to a shared company file would run).
   if (process.platform === 'win32') {
-    list.push(path.join(process.env.ProgramFiles || 'C:\\Program Files', 'Tailscale', 'tailscale.exe'));
-  } else if (process.platform === 'darwin') {
+    return [path.join(process.env.ProgramFiles || 'C:\\Program Files', 'Tailscale', 'tailscale.exe')];
+  }
+  const list = ['tailscale'];
+  if (process.platform === 'darwin') {
     list.push('/Applications/Tailscale.app/Contents/MacOS/Tailscale', '/usr/local/bin/tailscale');
   } else {
     list.push('/usr/bin/tailscale', '/usr/local/bin/tailscale');

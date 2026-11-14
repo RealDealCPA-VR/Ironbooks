@@ -195,7 +195,9 @@ export function classifyHost(rawHost: string): HostClass {
   if (!rawHost || typeof rawHost !== 'string') return 'invalid';
   const host = normalizeHost(rawHost);
   if (!host) return 'invalid';
-  if (host === 'localhost' || host.endsWith('.localhost')) return 'loopback';
+  // Only "localhost" itself: Windows (and Node's resolver) send "x.localhost" to DNS like any
+  // name, so a hostile network's DNS could point it anywhere while it was trusted as this computer.
+  if (host === 'localhost') return 'loopback';
   if (parseIPv4(host) !== null) return classifyIPv4(host);
   const v6 = parseIPv6(host);
   if (v6) return classifyIPv6(v6);

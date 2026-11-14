@@ -24,11 +24,35 @@ function pass(req: NextRequest) {
   return NextResponse.next({ request: { headers: h } });
 }
 
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);
+const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+
+function refuse(message: string) {
+  return NextResponse.json({ error: message, code: 'FORBIDDEN' }, { status: 403 });
+}
+
 export function middleware(req: NextRequest) {
   const { pathname } = req.nextUrl;
 
+  // DNS rebinding: the app server only listens on this computer, so a request naming any other
+  // host either came through the multi-user proxy (which always stamps x-bka-remote-addr — and a
+  // request carrying it is treated as REMOTE, with less trust) or from a web page that rebound its
+  // own name to 127.0.0.1 to reach the books as if it were the app. Refuse the latter.
+  if (!LOOPBACK_HOSTS.has(req.nextUrl.hostname.toLowerCase()) && !req.headers.get('x-bka-remote-addr')) {
+    return refuse('This address is not the Ironbooks app on this computer.');
+  }
+
   // API routes: no redirects (handlers answer with JSON 401/403); just stamp for getServerContext.
-  if (pathname === '/api' || pathname.startsWith('/api/')) return pass(req);
+  if (pathname === '/api' || pathname.startsWith('/api/')) {
+    // CSRF: SameSite=Lax cookies still go along with a POST from ANOTHER port on localhost (another
+    // local tool's web page) — same site, different origin. The app's own pages are same-origin;
+    // non-browser callers (the desktop shell) send no Sec-Fetch-Site at all.
+    const site = req.headers.get('sec-fetch-site');
+    if (!SAFE_METHODS.has(req.method) && (site === 'cross-site' || site === 'same-site')) {
+      return refuse('Requests from other web pages are not accepted.');
+    }
+    return pass(req);
+  }
 
   // Employee self-service portal has its own session (bka_portal) and is exempt from the
   // company-file lock (employees authenticate with their own portal login).

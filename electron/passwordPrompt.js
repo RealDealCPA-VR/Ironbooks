@@ -9,6 +9,9 @@
 const path = require('node:path');
 const { BrowserWindow, ipcMain } = require('electron');
 
+/** The window that currently owns the prompt's IPC channels. */
+let owner = null;
+
 function escapeHtml(s) {
   return String(s || '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 }
@@ -93,8 +96,14 @@ function promptForFilePassword(parent, { title, message, onSubmit }) {
       ipcMain.removeHandler(ch);
       ipcMain.handle(ch, fn);
     }
+    owner = win;
     win.on('closed', () => {
-      for (const ch of Object.keys(handlers)) ipcMain.removeHandler(ch);
+      // Only if no newer prompt took the channels over: closing this one must not leave that one
+      // without its handlers.
+      if (owner === win) {
+        owner = null;
+        for (const ch of Object.keys(handlers)) ipcMain.removeHandler(ch);
+      }
       resolve(outcome);
     });
     win.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(page({ title, message })));

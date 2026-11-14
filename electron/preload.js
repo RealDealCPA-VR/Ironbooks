@@ -15,8 +15,6 @@ try {
 contextBridge.exposeInMainWorld('bookkeeper', {
   /** Open a native file picker; returns { filePath, content } or null. */
   openFile: (filters) => ipcRenderer.invoke('dialog:openFile', filters),
-  /** Save content to a user-chosen path; returns the path or null. */
-  saveFile: (opts) => ipcRenderer.invoke('dialog:saveFile', opts),
   /** Save binary data (ArrayBuffer) to a user-chosen path; returns the path or null. */
   saveBytes: (opts) => ipcRenderer.invoke('file:saveBytes', opts),
   /**

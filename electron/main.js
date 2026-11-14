@@ -1107,9 +1107,47 @@ function probePinnedHost(origin, pin) {
 }
 
 /** Connect to the computer hosting `filePath` (multi-user mode) and relaunch as its client. */
+/** The short code both computers show for a host certificate (the start of its fingerprint). */
+function connectionCode(pin) {
+  const hex = String(pin || '').replace(/[^0-9a-f]/gi, '').toUpperCase().slice(0, 12);
+  return hex.match(/.{1,4}/g)?.join('-') || '';
+}
+
+/**
+ * The host address and certificate pin come from the lock folder on the SHARED drive, which anyone
+ * who can write there could forge (their own computer and certificate). The first time this
+ * computer joins this file — or when the host's certificate changed — show the connection code and
+ * ask the person to check it with the host's screen (Company → Multi-user). Remembered per file.
+ */
+async function confirmHostPin(filePath, pin) {
+  const known = loadConfig().hostPins;
+  const pins = known && typeof known === 'object' ? known : {};
+  if (pins[filePath] === pin) return true;
+  const changed = typeof pins[filePath] === 'string';
+  const { response } = await dialog.showMessageBox(parentWindow(), {
+    noLink: true,
+    type: changed ? 'warning' : 'question',
+    message: changed ? 'The computer hosting this company file has changed' : 'Check the host computer before joining',
+    detail:
+      `Connection code: ${connectionCode(pin)}\n\n` +
+      'On the computer that has the company file open, go to Company → Multi-user and check that it shows the same code. ' +
+      'Only join if it matches — otherwise someone else may be pretending to be that computer, and would see your sign-in.',
+    buttons: ['The code matches — Join', 'Cancel'],
+    defaultId: 1,
+    cancelId: 1,
+  });
+  if (response !== 0) return false;
+  const next = { ...pins, [filePath]: pin };
+  const keys = Object.keys(next);
+  for (const k of keys.slice(0, Math.max(0, keys.length - 24))) delete next[k];
+  saveConfig({ hostPins: next });
+  return true;
+}
+
 async function joinHostedFile(filePath, host) {
   const urls = (host && Array.isArray(host.urls) ? host.urls : []).filter((u) => typeof u === 'string');
   const pin = host && typeof host.fingerprint === 'string' ? host.fingerprint.toLowerCase() : '';
+  if (pin && !(await confirmHostPin(filePath, pin))) return false;
   for (const url of urls) {
     const n = hostingCore.normalizeHostAddress(url);
     if (!n.ok || !pin) continue;
@@ -2118,6 +2156,7 @@ function hostingStatus() {
     lan: Boolean(hostingState && hostingState.lan),
     companyFile: Boolean(openFile),
     fingerprint: hostingState ? hostingState.fingerprint || null : null,
+    connectionCode: hostingState && hostingState.fingerprint ? connectionCode(hostingState.fingerprint) : null,
     urls: hostingState ? hostingState.urls : [],
     tls: hostingState ? hostingState.tls : false,
     dnsName: hostingState ? hostingState.dnsName : null,
@@ -3116,23 +3155,32 @@ function decodeTextFile(buf) {
   }
 }
 
-ipcMain.handle('dialog:saveFile', async (e, { defaultName, content }) => {
-  if (!fromAppOrigin(e)) return null;
-  const res = await dialog.showSaveDialog(mainWindow, { defaultPath: defaultName });
-  if (res.canceled || !res.filePath) return null;
-  fs.writeFileSync(res.filePath, content);
-  return res.filePath;
-});
 
 // Binary save (portable company file, shareable ledger): native Save dialog with a file-type
 // filter; the renderer fetched the bytes from the local server with its session.
 ipcMain.handle('file:saveBytes', async (e, opts) => {
   if (!fromAppOrigin(e)) return null;
   const { defaultName, filters, data } = opts || {};
+  // The page names the file and its type, but only from the kinds of file Ironbooks exports (a
+  // host's page in client mode must not offer "Invoice.exe" under a "PDF Document" filter).
+  const SAVE_TYPES = new Set(['bkp', 'csv', 'ibac', 'ibcx', 'ofx', 'qfx', 'pdf', 'qbo', 'txt', 'xlsx', 'iif', 'json', 'zip', 'xml', 'html']);
+  const safeFilters = (Array.isArray(filters) ? filters : [])
+    .map((f) => ({
+      name: String((f && f.name) || 'File').slice(0, 80),
+      extensions: (Array.isArray(f && f.extensions) ? f.extensions : []).map((x) => String(x).toLowerCase()).filter((x) => SAVE_TYPES.has(x)),
+    }))
+    .filter((f) => f.extensions.length > 0);
+  let base = path.basename(String(defaultName || 'export'));
+  const ext = path.extname(base).slice(1).toLowerCase();
+  if (ext && !SAVE_TYPES.has(ext)) base = base.slice(0, -(ext.length + 1));
   const res = await dialog.showSaveDialog(mainWindow, {
-    defaultPath: path.join(app.getPath('documents'), path.basename(String(defaultName || 'export'))),
-    filters: Array.isArray(filters) ? filters : [],
+    defaultPath: path.join(app.getPath('documents'), base),
+    filters: safeFilters,
   });
+  if (!res.canceled && res.filePath && safeFilters.length) {
+    const chosen = path.extname(res.filePath).slice(1).toLowerCase();
+    if (!safeFilters.some((f) => f.extensions.includes(chosen))) res.filePath = `${res.filePath}.${safeFilters[0].extensions[0]}`;
+  }
   if (res.canceled || !res.filePath) return null;
   fs.writeFileSync(res.filePath, Buffer.from(new Uint8Array(data)));
   return res.filePath;

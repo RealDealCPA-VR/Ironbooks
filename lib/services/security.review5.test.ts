@@ -43,6 +43,7 @@ import { generateSecret } from '@/lib/totp';
 import { createCompany } from './company';
 import { addUser } from './users';
 import { POST as setup2faPOST } from '@/app/api/auth/2fa/setup/route';
+import { POST as enable2faPOST } from '@/app/api/auth/2fa/enable/route';
 import { GET as registersGET } from '@/app/api/registers/route';
 import { GET as registerGET } from '@/app/api/registers/[accountId]/route';
 import { POST as attachmentsPOST } from '@/app/api/attachments/route';
@@ -117,7 +118,7 @@ describe('review5: two-factor setup never replaces a live secret', () => {
     const live = generateSecret();
     await db.update(users).set({ totpSecret: live, totpEnabled: true }).where(eq(users.id, owner));
     as(owner, 'POST', '/api/auth/2fa/setup');
-    const res = await setup2faPOST();
+    const res = await setup2faPOST(new NextRequest('http://localhost/api/auth/2fa/setup', { method: 'POST', body: JSON.stringify({ currentPassword: 'ownerPass123' }) }));
     expect(res.status).toBe(409);
     const body = await res.json();
     expect(body.secret).toBeUndefined();
@@ -126,10 +127,28 @@ describe('review5: two-factor setup never replaces a live secret', () => {
     expect(row.totpEnabled).toBe(true);
   });
 
+  it('setup needs the current password', async () => {
+    await db.update(users).set({ totpSecret: null, totpEnabled: false }).where(eq(users.id, owner));
+    as(owner, 'POST', '/api/auth/2fa/setup');
+    const res = await setup2faPOST(new NextRequest('http://localhost/api/auth/2fa/setup', { method: 'POST', body: JSON.stringify({ currentPassword: 'wrong-password' }) }));
+    expect(res.status).toBe(403);
+    const [row] = await db.select().from(users).where(eq(users.id, owner));
+    expect(row.totpSecret).toBeNull();
+  });
+
+  it('enable cannot be re-run while 2FA is on (no new recovery codes from a guessed code)', async () => {
+    const live = generateSecret();
+    await db.update(users).set({ totpSecret: live, totpEnabled: true }).where(eq(users.id, owner));
+    as(owner, 'POST', '/api/auth/2fa/enable');
+    const res = await enable2faPOST(new NextRequest('http://localhost/api/auth/2fa/enable', { method: 'POST', body: JSON.stringify({ token: '000000' }) }));
+    expect(res.status).toBe(409);
+    expect((await res.json()).recoveryCodes).toBeUndefined();
+  });
+
   it('still sets up a new authenticator while 2FA is off', async () => {
     await db.update(users).set({ totpSecret: null, totpEnabled: false }).where(eq(users.id, owner));
     as(owner, 'POST', '/api/auth/2fa/setup');
-    const res = await setup2faPOST();
+    const res = await setup2faPOST(new NextRequest('http://localhost/api/auth/2fa/setup', { method: 'POST', body: JSON.stringify({ currentPassword: 'ownerPass123' }) }));
     expect(res.status).toBe(200);
     const body = await res.json();
     const [row] = await db.select().from(users).where(eq(users.id, owner));
