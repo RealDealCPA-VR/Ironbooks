@@ -309,14 +309,19 @@ describe('Users & Roles — adversarial', () => {
     });
 
     it('… so the backup must not contain the .auth-secret used to sign Admin sessions', () => {
-      fs.rmSync(BACKUP_DIR, { recursive: true, force: true });
-      fs.mkdirSync(BACKUP_DIR, { recursive: true });
-      fs.writeFileSync(path.join(BACKUP_DIR, '.auth-secret'), 'super-secret-hmac-key');
-      fs.writeFileSync(path.join(BACKUP_DIR, 'PG_VERSION'), '16');
-      const { buffer } = createBackup('Alpha', BACKUP_DIR);
-      const names = new AdmZip(buffer).getEntries().map((e) => e.entryName);
-      expect(names).toContain('PG_VERSION');
-      expect(names, 'backup ships the session signing secret → forge an Admin session').not.toContain('.auth-secret');
+      // A real company database (a backup now refuses a folder that is not one — no control
+      // file — so a fake folder with only PG_VERSION is refused before the exclusion is reached).
+      const secret = path.join(TEST_DIR, '.auth-secret');
+      const made = !fs.existsSync(secret);
+      if (made) fs.writeFileSync(secret, 'super-secret-hmac-key');
+      try {
+        const { buffer } = createBackup('Alpha', TEST_DIR);
+        const names = new AdmZip(buffer).getEntries().map((e) => e.entryName);
+        expect(names).toContain('PG_VERSION');
+        expect(names, 'backup ships the session signing secret → forge an Admin session').not.toContain('.auth-secret');
+      } finally {
+        if (made) fs.rmSync(secret, { force: true });
+      }
     });
   });
 
