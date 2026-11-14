@@ -327,8 +327,20 @@ function pickStatement(
   accountNumber: string | null | undefined,
 ): OFXNode | null {
   if (statements.length === 0) return null;
-  if (statements.length === 1) return statements[0].tranList;
   const want = digitsOf(accountNumber);
+  if (statements.length === 1) {
+    // One account in the file: still refuse it when it is clearly ANOTHER account (the Checking
+    // download picked onto Savings stages every line in the wrong register, and re-importing it
+    // into the right one later would stage them twice — duplicates are found per bank account).
+    const got = digitsOf(statements[0].acctId);
+    if (want.length >= 4 && got.length >= 4 && got !== want && got.slice(-4) !== want.slice(-4)) {
+      throw new ServiceError(
+        'VALIDATION',
+        `This file is for account …${got.slice(-4)}, not this bank account (…${want.slice(-4)}). Pick the matching bank account, or correct the account number on this one.`,
+      );
+    }
+    return statements[0].tranList;
+  }
   if (want) {
     const exact = statements.filter((st) => digitsOf(st.acctId) === want);
     if (exact.length === 1) return exact[0].tranList;
@@ -548,6 +560,26 @@ function writtenDayParts(s: string): { y?: number; m: number; d: number } | null
   return null;
 }
 
+/**
+ * For a date column of numeric a/b/yyyy (or a-b-yyyy, a.b.yyyy) values: 'DD/MM/YYYY' when some
+ * first part is over 12, 'MM/DD/YYYY' otherwise (some second part over 12, or undecidable: the US
+ * reading, as before), null when the column is not of that shape or mixes both orders.
+ */
+export function detectNumericDateOrder(values: string[]): string | null {
+  const re = /^(\d{1,2})([/.\-])(\d{1,2})\2(\d{4})$/;
+  const parsed = values.filter(Boolean).map((v) => re.exec(v));
+  if (parsed.length === 0 || parsed.some((m) => !m)) return null;
+  const sep = parsed[0]![2];
+  const dayFirst = parsed.some((m) => Number(m![1]) > 12);
+  const monthFirst = parsed.some((m) => Number(m![3]) > 12);
+  if (dayFirst && monthFirst) return null; // inconsistent column: each row is checked on its own
+  if (dayFirst) return `DD${sep}MM${sep}YYYY`;
+  if (monthFirst) return `MM${sep}DD${sep}YYYY`;
+  // Undecidable from the column (every day 12 or under): the US reading, as before. A day-first
+  // file like that needs the date format chosen on the import screen.
+  return `MM${sep}DD${sep}YYYY`;
+}
+
 /** Drop the first `skipRows` physical lines (bank-export preamble before the header). */
 function applySkipRows(content: string, skipRows?: number): string {
   if (!skipRows || skipRows <= 0) return content;
@@ -563,6 +595,21 @@ export function parseCSV(content: string, mapping: CsvMapping): ParsedTransactio
 
   if (result.errors.length) {
     // Non-fatal parse warnings — log but continue.
+  }
+
+  // "Auto-detect" with numeric day/month dates (03/04/2026): decide day-first or month-first from
+  // the WHOLE column. Read one cell at a time, a day-first file whose days are all 12 or under was
+  // imported with month and day swapped, without a word.
+  const userFormat = mapping.dateFormat;
+  if (!mapping.dateFormat) {
+    const autoFormat = detectNumericDateOrder(
+      result.data.map((row) => {
+        const key = mapping.dateCol;
+        const v = typeof key === 'number' ? Object.values(row)[key] : row[key];
+        return String(v ?? '').trim();
+      }),
+    );
+    if (autoFormat) mapping = { ...mapping, dateFormat: autoFormat };
   }
 
   return result.data.map((row, i) => {
@@ -641,7 +688,8 @@ export function parseCSV(content: string, mapping: CsvMapping): ParsedTransactio
 
     // Earlier versions stored a format-less date as the engine parsed it (local midnight), and the
     // description / fitId cells with the formula-guard apostrophe still on.
-    const legacyDate = mapping.dateFormat ? undefined : legacyIfDifferent(date, new Date(rawDate));
+    // Keyed to the format the PERSON chose: an auto-detected format keeps the legacy form too.
+    const legacyDate = userFormat ? undefined : legacyIfDifferent(date, new Date(rawDate));
     const rawDescription = rawCol(mapping.descriptionCol) || 'Imported transaction';
     // Only plain description mappings existed before; folded columns have no legacy form.
     const folded = Boolean(checkNo || (memo && memo !== baseDescription));

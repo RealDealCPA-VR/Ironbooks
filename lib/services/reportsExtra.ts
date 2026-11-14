@@ -1683,6 +1683,9 @@ export interface CollectionsReport {
  */
 export async function collectionsReport(ctx: ServiceContext, asOf?: Date): Promise<CollectionsReport> {
   const cutoff = endOfAsOfDay(asOf ?? endOfLocalToday());
+  // A past as-of date: balances as they stood then (A/R aging detail), not today's live balances
+  // (an invoice paid since would drop out; a partly paid one would show its smaller amount).
+  if (asOf && cutoff.getTime() < endOfLocalToday().getTime()) return collectionsAsOf(ctx, cutoff);
   const rows = await ctx.db
     .select({
       invoiceId: invoices.id,
@@ -1749,6 +1752,51 @@ export async function collectionsReport(ctx: ServiceContext, asOf?: Date): Promi
     customers: [...byCustomer.values()],
     totalDue: toAmountString(totalDue),
   };
+}
+
+/** Collections as of a past date, from the A/R aging detail (open balance on that date). */
+async function collectionsAsOf(ctx: ServiceContext, cutoff: Date): Promise<CollectionsReport> {
+  const detail = await arAgingDetail(ctx, cutoff);
+  const overdue = detail.rows.filter((r) => r.docType === 'invoice' && r.daysPastDue > 0 && Money.of(r.openBalance).greaterThan(0));
+  const invIds = [...new Set(overdue.map((r) => r.docId))];
+  const custIds = [...new Set(overdue.map((r) => r.entityId))];
+  const invRows = invIds.length
+    ? await ctx.db
+        .select({ id: invoices.id, invoiceNumber: invoices.invoiceNumber, refNumber: invoices.refNumber })
+        .from(invoices)
+        .where(and(eq(invoices.companyId, ctx.companyId), inArray(invoices.id, invIds)))
+    : [];
+  const custRows = custIds.length
+    ? await ctx.db
+        .select({ id: customers.id, email: customers.email, phone: customers.phone })
+        .from(customers)
+        .where(and(eq(customers.companyId, ctx.companyId), inArray(customers.id, custIds)))
+    : [];
+  const invById = new Map(invRows.map((i) => [i.id, i]));
+  const custById = new Map(custRows.map((c) => [c.id, c]));
+  const byCustomer = new Map<string, CollectionsCustomer>();
+  let totalDue = Money.zero();
+  for (const r of overdue) {
+    const c = custById.get(r.entityId);
+    if (!byCustomer.has(r.entityId)) {
+      byCustomer.set(r.entityId, { customerId: r.entityId, customerName: r.entityName, email: c?.email ?? null, phone: c?.phone ?? null, totalDue: '0.00', invoices: [] });
+    }
+    const cust = byCustomer.get(r.entityId)!;
+    const inv = invById.get(r.docId);
+    cust.invoices.push({
+      invoiceId: r.docId,
+      invoiceNumber: inv?.invoiceNumber ?? 0,
+      refNumber: inv ? docRef(inv.refNumber, inv.invoiceNumber) : r.docNumber,
+      date: r.date,
+      dueDate: r.dueDate,
+      daysOverdue: r.daysPastDue,
+      // Each invoice in its own currency; totals in home currency (as the live report does).
+      balanceDue: toAmountString(r.foreignOpenBalance ?? r.openBalance),
+    });
+    cust.totalDue = toAmountString(Money.of(cust.totalDue).plus(r.openBalance));
+    totalDue = totalDue.plus(r.openBalance);
+  }
+  return { asOf: cutoff.toISOString(), customers: [...byCustomer.values()], totalDue: toAmountString(totalDue) };
 }
 
 // ---------------------------------------------------------------------------

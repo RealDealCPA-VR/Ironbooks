@@ -568,6 +568,9 @@ function entryInput(s: Snap): UpdateEntryInput {
       ...(l.entityType && l.entityId
         ? { entityType: l.entityType as 'customer' | 'vendor' | 'employee' | 'other', entityId: String(l.entityId) }
         : {}),
+      // p1 fx: a foreign bank / card line comes back with its own foreign amount, not a fresh
+      // list-rate conversion of the home amount.
+      ...(l.foreignAmount != null && String(l.foreignAmount).trim() !== '' ? { foreignAmount: String(l.foreignAmount) } : {}),
     })),
   };
 }

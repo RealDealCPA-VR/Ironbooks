@@ -370,6 +370,8 @@ export async function listUndepositedPayments(
     eq(paymentsReceived.companyId, ctx.companyId),
     eq(paymentsReceived.depositAccountId, ufId),
     isNull(paymentsReceived.voidedAt),
+    // A bounced check is worthless: it is never offered for (re-)deposit.
+    isNull(paymentsReceived.bouncedAt),
     ...(asOf ? [lte(paymentsReceived.date, asOf)] : []),
     notExists(depositedSql(ctx, eq(depositLines.paymentId, paymentsReceived.id), asOf)),
   ];
@@ -601,6 +603,12 @@ async function prepareDeposit(
   if (payRows.length !== paymentIds.length) {
     throw notFound('One or more payments');
   }
+  // Payments the deposit being edited already holds (a bounced one may stay where it is).
+  const keptInThis = new Set(
+    excludeDepositId
+      ? (await ctx.db.select({ id: depositLines.paymentId }).from(depositLines).where(eq(depositLines.depositId, excludeDepositId))).map((r) => r.id)
+      : [],
+  );
   for (const p of payRows) {
     if (p.voidedAt) {
       throw validation(
@@ -608,6 +616,10 @@ async function prepareDeposit(
         undefined,
         depositMismatchFixes({ paymentIds: [p.id], reason: 'voided' }),
       );
+    }
+    // Kept in the deposit it was already in (an edit) is fine; adding a bounced check is not.
+    if (p.bouncedAt && !keptInThis.has(p.id)) {
+      throw validation(`Payment ${p.id} is a bounced check and cannot be deposited.`);
     }
     if (p.depositAccountId !== ufId) {
       throw validation(
@@ -1057,6 +1069,25 @@ export async function updateDeposit(ctx: ServiceContext, id: string, input: Crea
     .where(and(eq(deposits.id, id), eq(deposits.companyId, ctx.companyId)));
   if (!existing) throw notFound('Deposit');
   if (existing.voidedAt) throw new ServiceError('CONFLICT', 'This deposit is void and cannot be edited.');
+  // wave2 sales (F2) for edits: a bounced check already took its money back out of THIS bank
+  // account on the deposit's terms. Dropping it from the deposit, or moving the deposit to another
+  // account or date, would leave that bounce with no deposit behind it (bank short, Undeposited
+  // Funds over) — the same reason voidDeposit refuses.
+  const bouncedHere = await ctx.db
+    .select({ paymentId: bouncedChecks.paymentId })
+    .from(bouncedChecks)
+    .innerJoin(depositLines, eq(depositLines.paymentId, bouncedChecks.paymentId))
+    .where(and(eq(bouncedChecks.companyId, ctx.companyId), eq(depositLines.depositId, id)));
+  if (bouncedHere.length) {
+    const keptIds = new Set(input.paymentIds ?? []);
+    const sameDay = new Date(input.date).toISOString().slice(0, 10) === new Date(existing.date).toISOString().slice(0, 10);
+    if (bouncedHere.some((b) => !keptIds.has(b.paymentId)) || input.depositAccountId !== existing.depositAccountId || !sameDay) {
+      throw new ServiceError(
+        'CONFLICT',
+        'A check in this deposit was recorded as bounced, and the bank already took that money back. That check must stay in this deposit, and the deposit keeps its bank account and date.',
+      );
+    }
+  }
   // p1 fx / review5 fx: an edit that states no rate keeps the deposit's OWN rate while the deposit stays in the
   // same currency (QB keeps a transaction's exchange rate when it is edited). The Make Deposits
   // form opens with the rate box blank, so a memo-only edit used to re-price a foreign deposit at

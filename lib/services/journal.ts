@@ -512,6 +512,10 @@ export async function getEntry(ctx: ServiceContext, id: string): Promise<Journal
       className: classes.name,
       entityType: journalEntryLines.entityType,
       entityId: journalEntryLines.entityId,
+      // p1 fx: so an edit / undo keeps a foreign bank or card line's own amount and rate.
+      currency: journalEntryLines.currency,
+      foreignAmount: journalEntryLines.foreignAmount,
+      exchangeRate: journalEntryLines.exchangeRate,
     })
     .from(journalEntryLines)
     .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
@@ -552,6 +556,35 @@ export async function getEntry(ctx: ServiceContext, id: string): Promise<Journal
 // ---------------------------------------------------------------------------
 // updateEntry — QB "edit a saved journal entry"
 // ---------------------------------------------------------------------------
+
+type FxLine = { accountId: string; debit: string | null; credit: string | null; currency?: string | null; foreignAmount?: string | null; exchangeRate?: string | null };
+
+function amountKey(accountId: string, debit: unknown, credit: unknown): string {
+  const a = (v: unknown) => (v == null || String(v).trim() === '' ? '0.00' : toAmountString(Money.round2(v as string)));
+  return `${accountId}|${a(debit)}|${a(credit)}`;
+}
+
+/** Each submitted line that equals a stored foreign-currency line keeps that line's foreign amount. */
+export function keepForeignAmounts(old: ReadonlyArray<FxLine>, lines: PostingLine[]): PostingLine[] {
+  const pool = new Map<string, FxLine[]>();
+  for (const l of old) {
+    if (!l.currency || l.foreignAmount == null) continue;
+    const k = amountKey(l.accountId, l.debit, l.credit);
+    pool.set(k, [...(pool.get(k) ?? []), l]);
+  }
+  return lines.map((l) => {
+    if (l.foreignAmount != null && String(l.foreignAmount).trim() !== '') return l;
+    const o = pool.get(amountKey(l.accountId, l.debit, l.credit))?.shift();
+    return o ? { ...l, foreignAmount: o.foreignAmount } : l;
+  });
+}
+
+/** The entry's own rate (one foreign currency), so changed foreign lines convert at it. */
+export function bookedRate(old: ReadonlyArray<FxLine>): { currency?: string; exchangeRate?: string } {
+  const fx = old.filter((l) => l.currency && l.exchangeRate && Money.of(l.exchangeRate).greaterThan(0));
+  const curs = new Set(fx.map((l) => l.currency));
+  return curs.size === 1 ? { currency: fx[0].currency!, exchangeRate: fx[0].exchangeRate! } : {};
+}
 
 export interface UpdateEntryInput {
   date: Date;
@@ -736,13 +769,17 @@ async function updateEntryInner(ctx: ServiceContext, id: string, input: UpdateEn
     });
     await voidJournalEntry(tx, id);
 
-    // 2. Re-post the edited version as a fresh manual entry.
+    // 2. Re-post the edited version as a fresh manual entry — at the entry's OWN booked rate, with
+    //    each unchanged foreign-currency line keeping its foreign amount (as reverseEntry does). A
+    //    re-post used to convert every foreign bank / card line again at today's list rate, so a
+    //    class-only edit moved the foreign register and its reconciliation.
     const replacement = await postJournalEntry(tx, {
       date: input.date,
       description: input.description.trim(),
       reference: input.reference === undefined ? before.reference : input.reference,
       status: 'posted',
-      lines: input.lines,
+      lines: keepForeignAmounts(before.lines, input.lines),
+      ...bookedRate(before.lines),
       sourceRef: 'manual',
       isAdjusting,
     });

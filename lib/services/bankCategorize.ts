@@ -470,9 +470,12 @@ export async function categorizeSuggested(
   // edited since must not keep posting. These posts are the rule's doing, not a person's choice,
   // so they are recorded as source 'rule' (never counted towards learning offers).
   const rules = await activeBankRules(ctx);
+  // A bulk post: never double-book or redo an Unmatch (lib/services/autoPostGuard.ts).
+  const { autoPostBlockers } = await import('./autoPostGuard');
+  const blockers = await autoPostBlockers(ctx, bankAccountId, candidates.map((t) => t.id));
   let count = 0;
   for (const txn of candidates) {
-    if (!txn.suggestedAccountId) continue;
+    if (!txn.suggestedAccountId || blockers.has(txn.id)) continue;
     const rule = pickRule(rules, txn);
     if (!rule || rule.setAccountId !== txn.suggestedAccountId || (rule.splits && rule.splits.length > 0)) {
       // Stale import-time suggestion: bring it in line with the live rules and skip the line.

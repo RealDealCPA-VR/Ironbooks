@@ -28,6 +28,7 @@ import { buildXlsxWorkbook, type XlsxCell, type XlsxSheetInput } from '@/lib/exp
 import { buildReportPdf } from '@/lib/export/reportPdf';
 import { notFound, type ServiceContext } from './_base';
 import { balanceSheet, trialBalance } from './reports';
+import { endOfToday } from './reportEngine';
 import { generalLedger } from './journal';
 
 const iso = (d: Date | null | undefined) => (d ? d.toISOString().slice(0, 10) : '');
@@ -272,7 +273,8 @@ export async function buildShareableLedgerXlsx(ctx: ServiceContext): Promise<Sha
 /** The shareable ledger PDF summary: company info + counts, Trial Balance, Balance Sheet. */
 export async function buildShareableLedgerPdf(ctx: ServiceContext): Promise<ShareableFile> {
   const data = await collect(ctx);
-  const bs = await balanceSheet(ctx);
+  // As of today (end of day), like the Balance Sheet report: never post-dated entries.
+  const bs = await balanceSheet(ctx, endOfToday());
   const subtitle = `Shareable ledger summary · exported ${iso(data.exportedAt)}`;
 
   const parts: Uint8Array[] = [];

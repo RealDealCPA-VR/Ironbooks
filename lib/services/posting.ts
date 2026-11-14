@@ -454,7 +454,9 @@ export async function postJournalEntry(ctx: ServiceContext, input: PostJournalEn
       newValues: {
         entryNumber,
         description: input.description,
-        lines: input.lines,
+        // What was STORED (2-decimal amounts, foreign amount / rate), not the caller's raw input:
+        // the Audit Trail and the transaction log must agree with the ledger to the cent.
+        lines: normalizedLines,
         ...(input.isAdjusting ? { isAdjusting: true } : {}),
       },
     });

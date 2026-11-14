@@ -19,7 +19,7 @@
  * the next suggestion). A 10-minute overlap window plus a "seen" key set guards against rows
  * whose created_at predates the watermark because their transaction committed late.
  */
-import { and, desc, eq, gt, inArray, isNull, like, ne, sql } from 'drizzle-orm';
+import { and, desc, eq, gt, inArray, isNull, like, lte, ne, sql } from 'drizzle-orm';
 import { z } from 'zod';
 import {
   accounts,
@@ -39,7 +39,10 @@ import { Money, toAmountString } from '@/lib/money';
 import { BUSINESS_TYPES, ENTITY_TYPES } from '@/lib/onboarding';
 import { lookupVendor } from './vendorLookup';
 import { type ServiceContext, ServiceError, inTransaction, notFound, writeAudit } from './_base';
-import { categorize, suggestMatchesForAccount } from './bankCategorize';
+import { categorize } from './bankCategorize';
+import { autoPostBlockers } from './autoPostGuard';
+import { activeBankRules } from './bankRules';
+import { pickRule } from '@/lib/bankRules/core';
 import { glHistoryPatterns } from './historyPatterns';
 import { buildRouter, loadSettings, type BuildRouterOptions } from './aiSettings';
 import {
@@ -234,6 +237,24 @@ export async function syncModel(
       .from(aiCategorizerModels)
       .where(eq(aiCategorizerModels.companyId, ctx.companyId))
       .for('update');
+    // An entry the model learned from was voided since (an Unmatch, a voided expense or bill, a
+    // mistaken categorization taken back): learning only ever adds, so rebuild from what is in the
+    // books now — otherwise the model stays sure of the mistake and auto-posts it again.
+    if (row && !opts.full && row.watermark) {
+      const [voided] = await tx
+        .select({ id: journalEntries.id })
+        .from(journalEntries)
+        .where(
+          and(
+            eq(journalEntries.companyId, ctx.companyId),
+            eq(journalEntries.status, 'void'),
+            gt(journalEntries.voidedAt, row.watermark),
+            lte(journalEntries.createdAt, row.watermark),
+          ),
+        )
+        .limit(1);
+      if (voided) opts = { ...opts, full: true };
+    }
     const stored: StoredModel = row && !opts.full ? parseStored(row.model) : { state: emptyState(), seen: {} };
     const watermark = row && !opts.full ? row.watermark : null;
     const since = watermark ? new Date(watermark.getTime() - OVERLAP_MS) : null;
@@ -341,10 +362,14 @@ export async function suggestBankCategories(
     )
     .orderBy(desc(bankTransactions.date));
 
+  // User-defined rules win (QB applies bank rules before learned suggestions) — the rules as they
+  // are NOW, so a rule made after the import is honored and a deleted one is not.
+  const rules = await activeBankRules(ctx);
   const suggestions = txns.map((t): BankSuggestion => {
-    // User-defined rules win (QB applies bank rules before learned suggestions).
-    if (t.suggestedAccountId && allowed.has(t.suggestedAccountId)) {
-      return { bankTransactionId: t.id, accountId: t.suggestedAccountId, confidence: 1, source: 'rule', alternatives: [], autoApplyEligible: false };
+    const rule = pickRule(rules, { description: t.description, payee: t.payee, amount: t.amount, bankAccountId: t.bankAccountId });
+    const ruleAccount = rule ? rule.setAccountId ?? rule.splits?.[0]?.accountId ?? null : null;
+    if (ruleAccount && allowed.has(ruleAccount)) {
+      return { bankTransactionId: t.id, accountId: ruleAccount, confidence: 1, source: 'rule', alternatives: [], autoApplyEligible: false };
     }
     if (Money.isZero(t.amount)) {
       return { bankTransactionId: t.id, accountId: null, confidence: 0, source: null, alternatives: [], autoApplyEligible: false };
@@ -409,40 +434,15 @@ export async function autoApplyBankSuggestions(
     .from(bankTransactions)
     .where(and(eq(bankTransactions.companyId, ctx.companyId), inArray(bankTransactions.id, ids)));
   const lineById = new Map(lines.map((l) => [l.id, l]));
-  const postedBefore = new Set(
-    (
-      await ctx.db
-        .select({ id: aiAutoApplied.bankTransactionId })
-        .from(aiAutoApplied)
-        .where(and(eq(aiAutoApplied.companyId, ctx.companyId), inArray(aiAutoApplied.bankTransactionId, ids)))
-    ).map((r) => r.id),
-  );
-  const [cut] = await ctx.db
-    .select({ last: sql<Date | null>`max(${journalEntries.date})` })
-    .from(journalEntries)
-    .where(
-      and(
-        eq(journalEntries.companyId, ctx.companyId),
-        eq(journalEntries.status, 'posted'),
-        like(journalEntries.sourceRef, 'qbgl:%'),
-        // The import's variance / suspense entry is dated at the report's period end, which can
-        // be after the last real transaction (or in the future): it is not history.
-        sql`${journalEntries.sourceRef} NOT LIKE 'qbgl:variance%'`,
-      ),
-    );
-  // Never later than today: a future-dated entry must not stop auto-posting for months.
-  const cutover = cut?.last ? new Date(Math.min(new Date(cut.last).getTime(), Date.now())) : null;
-  const matches = await suggestMatchesForAccount(ctx, bankAccountId, { bankTransactionIds: ids });
+  // The same check every automatic posting path uses (lib/services/autoPostGuard.ts).
+  const blockers = await autoPostBlockers(ctx, bankAccountId, ids);
 
   for (const s of suggestions) {
     if (s.source !== 'model' || !s.accountId || s.confidence < threshold) continue;
     const line = lineById.get(s.bankTransactionId);
     if (!line) continue;
     if (opts.fileImportId && line.fileImportId !== opts.fileImportId) continue;
-    let why: string | null = null;
-    if (postedBefore.has(s.bankTransactionId)) why = 'The AI posted this line before and it was undone; it waits for you.';
-    else if (cutover && line.date.getTime() <= cutover.getTime()) why = 'Dated on or before your imported QuickBooks history; it may already be in the books.';
-    else if ((matches[s.bankTransactionId] ?? []).length > 0) why = 'It may match a transaction already entered; review the match in Bank Review.';
+    const why = blockers.get(s.bankTransactionId) ?? null;
     if (why) {
       result.skipped.push({ bankTransactionId: s.bankTransactionId, reason: why });
       continue;

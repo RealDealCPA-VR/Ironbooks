@@ -2278,6 +2278,9 @@ async function applyPaymentInTx(ctx: ServiceContext, input: ApplyPaymentInput, o
   for (const app of input.applications) {
     const applied = Money.of(app.amountApplied);
     if (!applied.greaterThan(0)) throw validation('Each applied amount must be greater than zero.');
+    // Dollars and cents only: a 3-decimal amount was rounded when written to the invoice but not
+    // in the payment's own unapplied credit, so each such apply made (or lost) a cent of A/R.
+    if (!applied.equals(Money.round2(applied))) throw validation('Each applied amount must be in dollars and cents (at most 2 decimals).');
     sumApplied = sumApplied.plus(applied);
   }
   const unapplied = Money.of(payment.unapplied);

@@ -37,6 +37,7 @@ import {
 } from '@/lib/bankRules/core';
 import { predict, type CategorizerState } from '@/lib/ai/categorizer';
 import { llmSuggestBankCategory, syncModel } from './aiCategorizer';
+import { autoPostBlockers } from './autoPostGuard';
 import { buildRouter, loadSettings } from './aiSettings';
 import { subledgerAccountReason } from '@/lib/registerEntryPlan';
 
@@ -312,8 +313,16 @@ export async function bulkAccept(
   if ('allHighConfidence' in input) {
     const min = Math.min(Math.max(input.minConfidence ?? HIGH_CONFIDENCE, 50), 100);
     const suggestions = await suggestForAccount(ctx, input.bankAccountId, suggestOpts);
-    for (const s of suggestions) {
-      if (!s.accountId || s.confidence < min) continue;
+    const picked = suggestions.filter((s) => s.accountId && s.confidence >= min);
+    // "Accept all high-confidence" is a bulk post: lines that may already be in the books (or that
+    // were posted and undone) are left for one-by-one review (lib/services/autoPostGuard.ts).
+    const blockers = await autoPostBlockers(ctx, input.bankAccountId, picked.map((s) => s.bankTransactionId));
+    for (const s of picked) {
+      const why = blockers.get(s.bankTransactionId);
+      if (why) {
+        result.failed.push({ bankTransactionId: s.bankTransactionId, reason: why, code: 'CONFLICT' });
+        continue;
+      }
       plans.push({ item: { bankTransactionId: s.bankTransactionId, exchangeRate: input.exchangeRate ?? null }, suggestion: s, known: true });
     }
   } else {
@@ -436,11 +445,22 @@ export async function runAutoRules(ctx: ServiceContext, bankAccountId: string): 
       ),
     )
     .orderBy(bankTransactions.date);
-  for (const t of txns) {
+  const autoLines = txns.filter((t) => {
+    const rule = pickRule(rules, { description: t.description, payee: t.payee, amount: t.amount, bankAccountId: t.bankAccountId });
+    return rule?.mode === 'auto';
+  });
+  // Never double-book, never undo the person's Unmatch (lib/services/autoPostGuard.ts).
+  const blockers = await autoPostBlockers(ctx, bankAccountId, autoLines.map((t) => t.id));
+  for (const t of autoLines) {
     const rule = pickRule(rules, { description: t.description, payee: t.payee, amount: t.amount, bankAccountId: t.bankAccountId });
     if (!rule || rule.mode !== 'auto') continue;
     const accountId = rule.setAccountId ?? rule.splits?.[0]?.accountId ?? null;
     if (!accountId) continue;
+    const why = blockers.get(t.id);
+    if (why) {
+      result.skipped.push({ bankTransactionId: t.id, ruleName: rule.name, reason: why });
+      continue;
+    }
     try {
       const r = await inTransaction(ctx, async (tx) => {
         const res = await categorize(tx, {
