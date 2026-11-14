@@ -14,6 +14,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
+import { makeStartableFolder } from '@/lib/db/damage.fixture';
 
 const require = createRequire(import.meta.url);
 const session = require('../electron/companySession.js');
@@ -193,8 +194,7 @@ describe('a crash before the first autosave check', () => {
   it('still keeps the work that only the working copy has (its transaction log moved on since the last save)', async () => {
     const format = require('../electron/companyFileFormat.js');
     const src = path.join(root, 'crash-src');
-    fs.mkdirSync(src, { recursive: true });
-    fs.writeFileSync(path.join(src, 'PG_VERSION'), '17\n');
+    await makeStartableFolder(src);
     fs.writeFileSync(path.join(src, 'transactions.bktlg'), JSON.stringify({ seq: 1, hash: 'h1' }) + '\n');
     const cf = path.join(root, 'Crashed.ironbooks');
     const manifest = { formatVersion: 1, fileId: 'c', companyName: 'Crashed Co', saveId: 's1', savedAt: 'x', fingerprint: 'log:1:h1' };
@@ -244,8 +244,7 @@ describe('a crash after unsaved changes went into a separate copy', () => {
   it('opening the file again starts with no copy recorded', async () => {
     const format = require('../electron/companyFileFormat.js');
     const src = path.join(root, 'copy-src');
-    fs.mkdirSync(src, { recursive: true });
-    fs.writeFileSync(path.join(src, 'PG_VERSION'), '17\n');
+    await makeStartableFolder(src);
     fs.writeFileSync(path.join(src, 'transactions.bktlg'), JSON.stringify({ seq: 1, hash: 'h1' }) + '\n');
     const cf = path.join(root, 'Copied.ironbooks');
     const manifest = { formatVersion: 1, fileId: 'k', companyName: 'Copied Co', saveId: 's1', savedAt: 'x', fingerprint: 'log:1:h1' };

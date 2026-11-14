@@ -27,6 +27,7 @@ vi.mock('next/headers', () => ({
 process.env.BKA_TEST_FAST_KDF = '1';
 delete process.env.BKA_AUTH_SECRET; // the working copy's own session-signing key
 process.env.BKA_OFFLINE = '1';
+process.env.BKA_RECOVERY_RETRY_MS = '50';
 
 const require = createRequire(import.meta.url);
 const format = require('../../electron/companyFileFormat.js');
@@ -49,7 +50,7 @@ import { POST as loginPOST } from '@/app/api/auth/login/route';
 import { resetCompanyFileSaveState, saveCompanyFile } from './companyFileSave';
 import { forgetFileKeys } from './fileProtection';
 import { createCustomer } from './customers';
-import { resetRecoveryState } from './workingCopyRecovery';
+import { dataDirProblem, resetRecoveryState } from './workingCopyRecovery';
 
 let lock: { token: string; dir: string } | null = null;
 
@@ -147,10 +148,25 @@ describe('a protected company file whose working copy will not start after a cra
     damageCheckpoint(prep.dataDir);
   }, 180_000);
 
-  it('the next sign-in reopens the company file as last saved and says what was lost', async () => {
+  it('a sign-in with a wrong password changes nothing: only someone who can open the file triggers a recovery', async () => {
     const prep = await open('launch-2');
     expect(prep.plan).toBe('recover');
     expect(prep.sealed).toBe('key'); // the shell plans to reuse the (damaged) working copy
+
+    const wrong = await loginPOST(req('/api/auth/login', { email: 'pat', password: 'not-the-password' }));
+    expect(wrong.status).toBe(401);
+    const nobody = await loginPOST(req('/api/auth/login', { email: 'nobody', password: 'Bakery-Pass-2026' }));
+    expect(nobody.status).toBe(401);
+    expect((await wrong.json()).error).toBe((await nobody.json()).error);
+    // Untouched: still the damaged working copy, nothing set aside, still waiting for a sign-in.
+    expect(sealedMode()).toBe('key');
+    expect(dataDirProblem(prep.dataDir)).toMatch(/missing/);
+    expect(fs.readdirSync(workDir).filter((n) => n.startsWith(sessionMod.DAMAGED_PREFIX))).toEqual([]);
+    await expect(getDb()).rejects.toThrow(/Authentication required/);
+  }, 120_000);
+
+  it('the next sign-in reopens the company file as last saved and says what was lost', async () => {
+    const prep = { dataDir: process.env.BKA_DATA_DIR! };
 
     const res = await loginPOST(req('/api/auth/login', { email: 'pat', password: 'Bakery-Pass-2026' }));
     expect(res.status).toBe(200);
@@ -163,9 +179,16 @@ describe('a protected company file whose working copy will not start after a cra
     const names = (await db.select({ name: customers.displayName }).from(customers)).map((c) => c.name);
     expect(names).toContain('Saved Customer');
     expect(names).not.toContain('Unsaved Customer');
-    // The damaged copy is kept next to the working copy; this computer's session key stays.
-    expect(fs.existsSync(path.join(body.recovery.keptAt, 'PG_VERSION'))).toBe(true);
+    // The damaged copy is kept next to the working copy, ENCRYPTED like the company file (the same
+    // passwords open it): no plain-text copy of protected books is left behind.
     expect(path.dirname(body.recovery.keptAt)).toBe(workDir);
+    expect(body.recovery.keptAt).toMatch(/\.ironbooks$/);
+    expect(format.isSealedManifest(format.readCompanyManifest(body.recovery.keptAt))).toBe(true);
+    expect(fs.readFileSync(body.recovery.keptAt).includes(Buffer.from('Unsaved Customer'))).toBe(false);
+    const kept = fs.readdirSync(workDir).filter((n) => n.startsWith(sessionMod.DAMAGED_PREFIX));
+    expect(kept).toEqual([path.basename(body.recovery.keptAt)]);
+    expect(sessionMod.readState(workDir).damagedPlain ?? null).toBeNull();
+    // This computer's session key stays.
     expect(fs.readFileSync(path.join(prep.dataDir, '.auth-secret'), 'utf8')).toBe(secretBefore);
   }, 180_000);
 

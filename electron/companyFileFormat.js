@@ -79,6 +79,8 @@ function isExcludedPath(rel) {
     return true;
   }
   if (base.startsWith('.ironbooks-clock-')) return true;
+  // A lock moved aside during a takeover (lib/db/dirLock.ts) that a crash left behind.
+  if (p.startsWith('ironbooks.lock.takeover-')) return true;
   if (p.startsWith('pg_stat_tmp/')) return true;
   return false;
 }
@@ -619,9 +621,12 @@ const SEALED_PLAIN_FIELDS = ['formatVersion', 'fileId', 'companyName', 'saveId',
  * manifest's private details (transaction-log head, who saved it) included, is encrypted.
  *
  * @param {string} filePath
- * @param {{ manifest: Record<string, unknown>, backupManifest?: Record<string, unknown> | null, entries: Array<Record<string, any>>, cache?: Map<string, any>, protection?: Record<string, any> | null }} opts
+ * `beforeRename()` runs once the new file is fully written, just before it replaces the company
+ * file: throwing there leaves the company file untouched (the save re-checks it still may).
+ *
+ * @param {{ manifest: Record<string, unknown>, backupManifest?: Record<string, unknown> | null, entries: Array<Record<string, any>>, cache?: Map<string, any>, protection?: Record<string, any> | null, beforeRename?: () => void | Promise<void> }} opts
  */
-async function writeCompanyFile(filePath, { manifest, backupManifest, entries, cache, protection }) {
+async function writeCompanyFile(filePath, { manifest, backupManifest, entries, cache, protection, beforeRename }) {
   const dir = path.dirname(filePath);
   const tmp = path.join(dir, `.${path.basename(filePath)}.saving-${crypto.randomBytes(4).toString('hex')}`);
   const prot = checkProtection(protection);
@@ -657,6 +662,7 @@ async function writeCompanyFile(filePath, { manifest, backupManifest, entries, c
       [...head, ...entries.filter((e) => e.name !== COMPANY_MANIFEST_ENTRY && e.name !== BACKUP_MANIFEST_ENTRY)],
       { cache, seal },
     );
+    if (beforeRename) await beforeRename();
     await renameWithRetry(tmp, filePath);
     removeStaleSaves(filePath);
     return result;
@@ -918,19 +924,75 @@ function checkInflated(data, e) {
   return data;
 }
 
-async function inflateBytes(bytes, e) {
+// ---------------------------------------------------------------------------
+// Size limits when unpacking (a small crafted file must never inflate into gigabytes in memory)
+// ---------------------------------------------------------------------------
+
+/** Largest single entry: a Postgres table segment is at most 1 GB; attachments are far smaller. */
+const MAX_ENTRY_BYTES = 1.25 * 1024 * 1024 * 1024;
+/** Largest company file / backup unpacked in total. */
+const DEFAULT_MAX_TOTAL_BYTES = 64 * 1024 * 1024 * 1024;
+/** The plain manifests and the encrypted index are small lists. */
+const MAX_LISTING_BYTES = 64 * 1024 * 1024;
+
+function maxTotalBytes() {
+  const v = Number(process.env.BKA_MAX_UNPACKED_BYTES);
+  return Number.isFinite(v) && v > 0 ? v : DEFAULT_MAX_TOTAL_BYTES;
+}
+
+function tooBigError(what) {
+  return new NotACompanyFileError(`${what} is larger than any company file can be — the file is damaged or was made to look like one`);
+}
+
+/** Refuse entries (and a whole set of them) that claim more than a company file can hold. */
+function checkSizes(entries, limit = MAX_ENTRY_BYTES) {
+  let total = 0;
+  for (const e of entries) {
+    const size = Number(e && e.size) || 0;
+    if (size < 0 || size > limit) throw tooBigError(e.name || 'An entry');
+    total += size;
+  }
+  if (total > maxTotalBytes()) throw tooBigError('What it unpacks to');
+  return total;
+}
+
+/** Inflate output is capped at the entry's declared size: a bomb that lies about it stops there. */
+function inflateOptions(e, limit) {
+  const size = Number(e.size) || 0;
+  if (size < 0 || size > limit) throw tooBigError(e.name || 'An entry');
+  return { maxOutputLength: Math.max(1, size) };
+}
+
+function inflateFailed(err, e) {
+  if (err && (err.code === 'ERR_BUFFER_TOO_LARGE' || err instanceof RangeError)) return tooBigError(e.name || 'An entry');
+  return new NotACompanyFileError(`${e.name} could not be unpacked — the file is damaged`);
+}
+
+async function inflateBytes(bytes, e, limit = MAX_ENTRY_BYTES) {
   let data;
   if (e.method === 0) data = bytes;
-  else if (e.method === 8) data = await inflateRaw(bytes);
-  else throw new NotACompanyFileError(`unsupported compression in ${e.name}`);
+  else if (e.method === 8) {
+    const options = inflateOptions(e, limit);
+    try {
+      data = await inflateRaw(bytes, options);
+    } catch (err) {
+      throw inflateFailed(err, e);
+    }
+  } else throw new NotACompanyFileError(`unsupported compression in ${e.name}`);
   return checkInflated(data, e);
 }
 
-function inflateBytesSync(bytes, e) {
+function inflateBytesSync(bytes, e, limit = MAX_ENTRY_BYTES) {
   let data;
   if (e.method === 0) data = bytes;
-  else if (e.method === 8) data = zlib.inflateRawSync(bytes);
-  else throw new NotACompanyFileError(`unsupported compression in ${e.name}`);
+  else if (e.method === 8) {
+    const options = inflateOptions(e, limit);
+    try {
+      data = zlib.inflateRawSync(bytes, options);
+    } catch (err) {
+      throw inflateFailed(err, e);
+    }
+  } else throw new NotACompanyFileError(`unsupported compression in ${e.name}`);
   return checkInflated(data, e);
 }
 
@@ -1137,7 +1199,7 @@ async function readSealedIndex(reader, list, manifest, fileKey, headName) {
   const sealId = sealIdOf(manifest);
   const e = list.find((x) => x.name === SEALED_INDEX_ENTRY);
   if (!e) throw new NotACompanyFileError('its encrypted contents are missing');
-  const sealed = await inflateBytes(await readEntryBytes(reader, e), e);
+  const sealed = await inflateBytes(await readEntryBytes(reader, e), e, MAX_LISTING_BYTES);
   const plain = fileCrypto.openBytes(entriesKeyOf(manifest, fileKey), sealed, fileCrypto.entryAad(sealId, SEALED_INDEX_ENTRY, SEALED_INDEX_ENTRY), 'The list of what is in the company file');
   const index = parseIndex(plain, sealId);
   checkListingBinding(manifest, index, headName);
@@ -1148,7 +1210,7 @@ function readSealedIndexSync(reader, list, manifest, fileKey, headName) {
   const sealId = sealIdOf(manifest);
   const e = list.find((x) => x.name === SEALED_INDEX_ENTRY);
   if (!e) throw new NotACompanyFileError('its encrypted contents are missing');
-  const sealed = inflateBytesSync(readEntryBytesSync(reader, e), e);
+  const sealed = inflateBytesSync(readEntryBytesSync(reader, e), e, MAX_LISTING_BYTES);
   const plain = fileCrypto.openBytes(entriesKeyOf(manifest, fileKey), sealed, fileCrypto.entryAad(sealId, SEALED_INDEX_ENTRY, SEALED_INDEX_ENTRY), 'The list of what is in the company file');
   const index = parseIndex(plain, sealId);
   checkListingBinding(manifest, index, headName);
@@ -1197,6 +1259,9 @@ function sealedPlan(index, list, root) {
  * damaged file never leaves a half-extracted folder behind. `decode(f)` returns an entry's bytes.
  */
 async function extractInto(reader, files, root, notEmptyMessage, decode) {
+  // Before anything is written: no entry, and not all of them together, may claim more than a
+  // company file can hold (a sealed row's own size, and the encrypted entry that carries it).
+  checkSizes(files.filter((f) => !f.name.endsWith('/')).map((f) => (f.row ? { name: f.name, size: Math.max(Number(f.row.size) || 0, Number(f.e && f.e.size) || 0) } : f.e)));
   const existed = fs.existsSync(root);
   fs.mkdirSync(root, { recursive: true });
   if (fs.readdirSync(root).length) throw new Error(`${notEmptyMessage}: ${root}`);
@@ -1259,7 +1324,7 @@ async function extractCompanyFile(filePath, destDir, { fileKey } = {}) {
     const list = await readDirectory(reader);
     const manifestEntry = list.find((e) => e.name === COMPANY_MANIFEST_ENTRY);
     if (!manifestEntry) throw new NotACompanyFileError('no company manifest');
-    const manifest = parseManifest(await inflateBytes(await readEntryBytes(reader, manifestEntry), manifestEntry));
+    const manifest = parseManifest(await inflateBytes(await readEntryBytes(reader, manifestEntry), manifestEntry, MAX_LISTING_BYTES));
     if (!manifest) throw new NotACompanyFileError('unreadable company manifest');
     if (Number(manifest.formatVersion) > COMPANY_FILE_FORMAT_VERSION) throw newerFormatError('file');
     const root = path.resolve(destDir);
@@ -1288,7 +1353,7 @@ async function verifySealedCompanyFile(filePath, fileKey) {
     const list = await readDirectory(reader);
     const manifestEntry = list.find((e) => e.name === COMPANY_MANIFEST_ENTRY);
     if (!manifestEntry) throw new NotACompanyFileError('no company manifest');
-    const manifest = parseManifest(await inflateBytes(await readEntryBytes(reader, manifestEntry), manifestEntry));
+    const manifest = parseManifest(await inflateBytes(await readEntryBytes(reader, manifestEntry), manifestEntry, MAX_LISTING_BYTES));
     if (!manifest || !isSealedManifest(manifest)) return null;
     if (manifest.encryption.keyCheck && manifest.encryption.keyCheck !== fileCrypto.keyCheckOf(fileKey)) return null;
     const index = await readSealedIndex(reader, list, manifest, fileKey, COMPANY_MANIFEST_ENTRY);
@@ -1361,7 +1426,7 @@ async function extractBackupArchive(filePath, destDir, { knownSchemaAt, fileKey 
     let manifest = null;
     if (manifestEntry) {
       try {
-        manifest = JSON.parse((await inflateBytes(await readEntryBytes(reader, manifestEntry), manifestEntry)).toString('utf8'));
+        manifest = JSON.parse((await inflateBytes(await readEntryBytes(reader, manifestEntry), manifestEntry, MAX_LISTING_BYTES)).toString('utf8'));
       } catch {
         throw new NotACompanyFileError('the backup information in it is unreadable');
       }
@@ -1493,6 +1558,8 @@ function companyFileBaseName(filePath) {
 }
 
 module.exports = {
+  MAX_ENTRY_BYTES,
+  checkSizes,
   COMPANY_FILE_EXT,
   COMPANY_MANIFEST_ENTRY,
   BACKUP_MANIFEST_ENTRY,

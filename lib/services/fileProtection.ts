@@ -1077,12 +1077,28 @@ async function doUnseal(fileKey: Buffer): Promise<void> {
   };
   if (mode === 'conflict' && session.hasData(workDir)) {
     const target = session.conflictCopyPath(file, os.hostname());
-    await session.writeWorkingCopyAs(workDir, target, {
-      companyName: `${m.companyName || format.companyFileBaseName(file)} (unsaved changes)`,
-      appVersion: APP_VERSION,
-      protection,
-    });
-    keyState().conflictCopy = target;
+    try {
+      await session.writeWorkingCopyAs(workDir, target, {
+        companyName: `${m.companyName || format.companyFileBaseName(file)} (unsaved changes)`,
+        appVersion: APP_VERSION,
+        protection,
+      });
+      keyState().conflictCopy = target;
+    } catch (err) {
+      if ((err as { code?: string })?.code !== 'DAMAGED') throw err;
+      // The unsaved changes are in books that would not start: no "(unsaved changes)" file that
+      // will not open either. Kept on this computer for support, encrypted like the file.
+      const secretFile = path.join(dataDir, '.auth-secret');
+      const secret = fs.existsSync(secretFile) ? fs.readFileSync(secretFile) : null;
+      const kept = await session.keepDamagedCopy(workDir, dataDir, { protection, companyName: m.companyName, appVersion: APP_VERSION });
+      if (secret) {
+        // This computer's session-signing key stays with the working copy (copied in below).
+        fs.mkdirSync(dataDir, { recursive: true });
+        fs.writeFileSync(secretFile, secret);
+      }
+      const { noteDamagedUnsavedChanges } = await import('./workingCopyRecovery');
+      noteDamagedUnsavedChanges(m.savedAt ?? null, kept);
+    }
   }
   if (mode === 'extract' || mode === 'conflict') {
     const tmp = `${dataDir}.unseal-${Date.now()}`;
@@ -1130,6 +1146,10 @@ async function doUnseal(fileKey: Buffer): Promise<void> {
   const db = await getDb(dataDir);
   await adoptManifestProtection(db, protection);
   await sealProtectionFor(db, dataDir).catch(() => null);
+  // Damaged copies of these books that had to be kept in plain text (nobody had signed in yet):
+  // encrypted now that the key is known (lib/services/workingCopyRecovery.ts).
+  const { sealKeptDamagedCopies } = await import('./workingCopyRecovery');
+  await sealKeptDamagedCopies(dataDir, protection, m.companyName);
 }
 
 /**

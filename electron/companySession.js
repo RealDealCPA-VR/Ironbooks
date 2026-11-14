@@ -28,6 +28,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const format = require('./companyFileFormat');
+const pgData = require('./pgDataCheck');
 
 const STATE_FILE = 'state.json';
 /** lib/services/backupHistory.ts BACKUP_HISTORY_FILE. */
@@ -239,7 +240,7 @@ function conflictCopyPath(companyFile, computer, when = new Date()) {
  * folder (`dataDir`) — out as a single company file at `target`. Used to keep unsaved changes
  * that can't be merged, and to pack a restored portable company file.
  */
-async function writeWorkingCopyAs(workDir, target, { companyName, appVersion, fileId, dataDir, protection } = {}) {
+async function writeWorkingCopyAs(workDir, target, { companyName, appVersion, fileId, dataDir, protection, allowDamaged } = {}) {
   // Books protected with passwords are only ever written encrypted (with their own key and slots).
   if (!protection && isProtectedData(dataDir || dataDirOf(workDir))) {
     const err = new Error('These books are protected with passwords; they can only be copied by the app after someone signs in.');
@@ -251,6 +252,17 @@ async function writeWorkingCopyAs(workDir, target, { companyName, appVersion, fi
   const entries = format
     .snapshotDir(dataDir || dataDirOf(workDir), { lazyPrefixes: [] })
     .filter((e) => e.name !== BACKUP_HISTORY_FILE);
+  // Books that would not start are never written out as a company file someone would then try to
+  // open (electron/pgDataCheck.js) — except a damaged copy kept on purpose (keepDamagedCopy).
+  if (!allowDamaged) {
+    const check = pgData.checkSnapshot(entries);
+    if (check.ok === false) {
+      const err = new Error(`These books are damaged (${check.reason}), so they were not written out as a company file.`);
+      err.code = 'DAMAGED';
+      err.reason = check.reason;
+      throw err;
+    }
+  }
   const now = new Date().toISOString();
   const saveId = crypto.randomUUID();
   await format.writeCompanyFile(target, {
@@ -340,6 +352,7 @@ async function prepareWorkingCopy(companyFile, { root, onConflict, appVersion, k
   if (format.isSealedManifest(manifest)) return { ...(await prepareSealed(companyFile, { workDir, state, manifest, plan, onConflict })), ...otherPaths };
   let conflictCopy = null;
   let keptOnThisComputer = null;
+  let damagedCopy = null;
   if (plan === 'conflict') {
     const keep = onConflict ? await onConflict({ state, manifest, workDir }) : true;
     if (!keep) return { workDir, dataDir: dataDirOf(workDir), plan: 'cancelled', manifest };
@@ -351,10 +364,18 @@ async function prepareWorkingCopy(companyFile, { root, onConflict, appVersion, k
       fs.renameSync(dataDirOf(workDir), keptOnThisComputer);
     } else {
       conflictCopy = conflictCopyPath(companyFile, require('node:os').hostname());
-      await writeWorkingCopyAs(workDir, conflictCopy, {
-        companyName: `${manifest.companyName || format.companyFileBaseName(companyFile)} (unsaved changes)`,
-        appVersion,
-      });
+      try {
+        await writeWorkingCopyAs(workDir, conflictCopy, {
+          companyName: `${manifest.companyName || format.companyFileBaseName(companyFile)} (unsaved changes)`,
+          appVersion,
+        });
+      } catch (err) {
+        if (!err || err.code !== 'DAMAGED') throw err;
+        // The unsaved changes are in books that would not start: no "(unsaved changes)" file that
+        // will not open either. The damaged copy is set aside on this computer for support.
+        conflictCopy = null;
+        damagedCopy = await keepDamagedCopy(workDir, dataDirOf(workDir));
+      }
     }
   }
   if (plan === 'extract' || plan === 'conflict') {
@@ -381,7 +402,7 @@ async function prepareWorkingCopy(companyFile, { root, onConflict, appVersion, k
     lastUsedAt: now,
     closedCleanly: false,
   });
-  return { workDir, dataDir: dataDirOf(workDir), plan, manifest, conflictCopy, keptOnThisComputer, sealed: null, ...otherPaths };
+  return { workDir, dataDir: dataDirOf(workDir), plan, manifest, conflictCopy, keptOnThisComputer, damagedCopy, sealed: null, ...otherPaths };
 }
 
 /**
@@ -478,6 +499,95 @@ function stampOf(when) {
   return `${when.getFullYear()}-${pad(when.getMonth() + 1)}-${pad(when.getDate())} ${pad(when.getHours())}${pad(when.getMinutes())}`;
 }
 
+/** Books that would not start, kept in the working folder for support: "damaged copy <date>". */
+const DAMAGED_PREFIX = 'damaged copy ';
+/** A damaged copy of PROTECTED books left in plain text (no key was known) is removed after this. */
+const DAMAGED_PLAIN_MAX_AGE_MS = 14 * 24 * 3600 * 1000;
+
+function freePath(base, ext = '') {
+  let candidate = `${base}${ext}`;
+  for (let i = 2; fs.existsSync(candidate); i++) candidate = `${base} ${i}${ext}`;
+  return candidate;
+}
+
+/**
+ * Keep a data folder whose books would not start (electron/pgDataCheck.js) in the working folder
+ * instead of deleting it, so support can try to salvage it, and never in plain text when its books
+ * are protected and their key is known: with `protection` it is written as an encrypted company
+ * file ("damaged copy <date>.ironbooks", the same passwords open it) and the folder is removed.
+ * Protected books without a known key are moved aside as they are and recorded in the working
+ * state (damagedPlain): sealDamagedCopies encrypts them once someone has signed in, and
+ * pruneWorkingCopies removes any left after DAMAGED_PLAIN_MAX_AGE_MS. Returns where it went.
+ */
+async function keepDamagedCopy(workDir, dataDir, { protection, companyName, appVersion, prefix, what } = {}) {
+  const base = path.join(workDir, `${prefix || DAMAGED_PREFIX}${stampOf(new Date())}`);
+  const label = companyName ? `${companyName} (${what || 'damaged copy'})` : undefined;
+  if (protection) {
+    const target = freePath(base, format.COMPANY_FILE_EXT);
+    await writeWorkingCopyAs(workDir, target, { dataDir, protection, companyName: label, appVersion, allowDamaged: true });
+    fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    return target;
+  }
+  const target = freePath(base);
+  const plainProtected = isProtectedData(dataDir);
+  await format.renameWithRetry(dataDir, target);
+  if (plainProtected) {
+    const st = readState(workDir) || {};
+    const list = Array.isArray(st.damagedPlain) ? st.damagedPlain : [];
+    writeState(workDir, { damagedPlain: [...list, { path: target, at: new Date().toISOString() }] });
+  }
+  return target;
+}
+
+/**
+ * Encrypt the plain-text damaged copies of protected books kept in `workDir` (keepDamagedCopy)
+ * now that their key is known. Returns [{ from, to }] for each one written; a copy that fails
+ * stays listed (and is removed by pruneWorkingCopies in time).
+ */
+async function sealDamagedCopies(workDir, protection, { companyName, appVersion } = {}) {
+  const st = readState(workDir);
+  const list = st && Array.isArray(st.damagedPlain) ? st.damagedPlain : [];
+  if (!list.length || !protection) return [];
+  const label = companyName ? `${companyName} (damaged copy)` : undefined;
+  const done = [];
+  const left = [];
+  for (const item of list) {
+    try {
+      if (!item || !item.path || !fs.existsSync(item.path)) continue;
+      const target = freePath(item.path, format.COMPANY_FILE_EXT);
+      await writeWorkingCopyAs(workDir, target, { dataDir: item.path, protection, companyName: label, appVersion, allowDamaged: true });
+      fs.rmSync(item.path, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      done.push({ from: item.path, to: target });
+    } catch {
+      left.push(item);
+    }
+  }
+  writeState(workDir, { damagedPlain: left.length ? left : null });
+  return done;
+}
+
+/** Remove plain-text damaged copies of protected books older than DAMAGED_PLAIN_MAX_AGE_MS (best effort). */
+function pruneDamagedPlain(workDir, now = Date.now()) {
+  const st = readState(workDir);
+  const list = st && Array.isArray(st.damagedPlain) ? st.damagedPlain : [];
+  if (!list.length) return;
+  const left = [];
+  for (const item of list) {
+    if (!item || !item.path) continue;
+    const at = Date.parse(item.at || '') || 0;
+    if (now - at >= DAMAGED_PLAIN_MAX_AGE_MS) {
+      try {
+        fs.rmSync(item.path, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+        continue;
+      } catch {
+        /* busy: next time */
+      }
+    }
+    if (fs.existsSync(item.path)) left.push(item);
+  }
+  writeState(workDir, { damagedPlain: left.length ? left : null });
+}
+
 /**
  * prepareWorkingCopy for a sealed (password-protected) company file. Nothing is extracted and no
  * copy is written here (both need the file key). The state keeps its old base until the server
@@ -547,7 +657,7 @@ function discardProtectedWorkingData(workDir, companyFile) {
  * copies made before a restore, scheduled report exports — and is never deleted with the cache.
  */
 function isCacheEntry(name) {
-  return name === 'data' || name === STATE_FILE || (name.startsWith(`${STATE_FILE}.`) && name.endsWith('.tmp')) || /^data\.(restore-tmp|pre-restore|refused-restore|unseal|period-copy)-\d+$/.test(name);
+  return name === 'data' || name === STATE_FILE || (name.startsWith(`${STATE_FILE}.`) && name.endsWith('.tmp')) || /^data\.(restore-tmp|pre-restore|refused-restore|unseal|period-copy|recover)-\d+$/.test(name);
 }
 
 /** Remove the cache of working copies not used for a long time, except `keep` (best effort). */
@@ -564,6 +674,8 @@ function pruneWorkingCopies(root, keep = [], now = Date.now()) {
     const dir = path.join(root, n);
     if (keepKeys.has(pathKey(dir))) continue;
     const st = readState(dir);
+    // Plain-text damaged copies of protected books never outstay their welcome (keepDamagedCopy).
+    if (st && Array.isArray(st.damagedPlain) && st.damagedPlain.length) pruneDamagedPlain(dir, now);
     // Never throw away unsaved work, whatever its age.
     if (!st || st.unsavedSince) continue;
     // A protected file's plain-text books the app server could not remove right after a clean
@@ -609,6 +721,10 @@ module.exports = {
   planOpen,
   conflictCopyPath,
   writeWorkingCopyAs,
+  keepDamagedCopy,
+  sealDamagedCopies,
+  DAMAGED_PREFIX,
+  DAMAGED_PLAIN_MAX_AGE_MS,
   prepareWorkingCopy,
   discardProtectedWorkingData,
   pruneWorkingCopies,

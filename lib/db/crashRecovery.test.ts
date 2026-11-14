@@ -142,10 +142,44 @@ describe('the quick start check', () => {
     expect(pgData.checkDataDir(dir)).toMatchObject({ ok: false, reason: 'its write-ahead log is missing' });
   }, 60_000);
 
-  it('answers "unknown" for anything that is not a database folder it recognises', () => {
+  it('flags a folder whose checkpoint is there but whose redo point lies in a segment that is gone', async () => {
+    const dir = path.join(ROOT, 'redo');
+    const pg = new PGlite(dir);
+    await pg.exec('create table t (id int); insert into t values (1); checkpoint;');
+    await pg.close();
+    expect(pgData.checkDataDir(dir).ok).toBe(true);
+    // Crash recovery starts at the redo point: put it one segment before the oldest one kept
+    // (what a recycled segment leaves). The checkpoint record itself is untouched.
+    const control = path.join(dir, 'global', 'pg_control');
+    const buf = fs.readFileSync(control);
+    const segs = fs.readdirSync(path.join(dir, 'pg_wal')).filter((n) => /^[0-9A-F]{24}$/.test(n)).sort();
+    const segSize = BigInt(fs.statSync(path.join(dir, 'pg_wal', segs[0])).size);
+    const oldest = BigInt(parseInt(segs[0].slice(16), 16));
+    buf.writeBigUInt64LE((oldest - BigInt(1)) * segSize + BigInt(0x28), 40);
+    fs.writeFileSync(control, buf);
+    const result = pgData.checkDataDir(dir);
+    expect(result.ok).toBe(false);
+    expect(result.reason).toMatch(/redo point of its last checkpoint .* is missing/);
+  }, 60_000);
+
+  it('flags nothing at all, and a database missing PG_VERSION or its control file', async () => {
     const empty = path.join(ROOT, 'empty');
     fs.mkdirSync(empty, { recursive: true });
-    expect(pgData.checkDataDir(empty).ok).toBeNull();
-    expect(pgData.checkSnapshot([{ name: 'bookkeeper-company.json', data: Buffer.from('{}') }]).ok).toBeNull();
+    expect(pgData.checkDataDir(empty)).toMatchObject({ ok: false, reason: 'there is nothing in it' });
+    expect(pgData.checkSnapshot([]).ok).toBe(false);
+
+    const dir = path.join(ROOT, 'partial');
+    const pg = new PGlite(dir);
+    await pg.exec('create table t (id int);');
+    await pg.close();
+    const format = require('../../electron/companyFileFormat.js');
+    const snap = format.snapshotDir(dir) as Array<{ name: string }>;
+    expect(pgData.checkSnapshot(snap.filter((e) => e.name !== 'PG_VERSION'))).toMatchObject({ ok: false, reason: expect.stringMatching(/PG_VERSION is missing/) });
+    expect(pgData.checkSnapshot(snap.filter((e) => e.name !== 'global/pg_control'))).toMatchObject({ ok: false, reason: expect.stringMatching(/control file is missing/) });
+  }, 60_000);
+
+  it('answers "unknown" for a company that has no database yet', () => {
+    // A brand-new company file: its listing and file id, no books yet.
+    expect(pgData.checkSnapshot([{ name: 'bookkeeper-company.json', data: Buffer.from('{}') }, { name: '.file-id', data: Buffer.from('x') }]).ok).toBeNull();
   });
 });

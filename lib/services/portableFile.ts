@@ -36,9 +36,12 @@ import AdmZip from 'adm-zip';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import type { PGlite, Transaction } from '@electric-sql/pglite';
+import os from 'node:os';
+import { PGlite, type Transaction } from '@electric-sql/pglite';
 import { asc, eq } from 'drizzle-orm';
-import { closeDb, getDb, resolveDataDir, type DB } from '@/lib/db';
+import { drizzle } from 'drizzle-orm/pglite';
+import { migrate } from 'drizzle-orm/pglite/migrator';
+import { MIGRATIONS_FOLDER, closeDb, getDb, latestShippedMigrationAt, resolveDataDir, withDamagedFileAccess, type DB } from '@/lib/db';
 import { accounts, companies } from '@/lib/db/schema';
 import { Money } from '@/lib/money';
 import { ServiceError, type ServiceContext } from './_base';
@@ -512,6 +515,38 @@ export interface PortableRestoreResult {
   };
 }
 
+/**
+ * A database at the layout of an OLDER file: only the migrations up to the one the file was made
+ * with (its manifest's schemaVersion), so its rows load exactly as they were, and the newer
+ * migrations then run over them on the first normal open (getDb). Building it at this app's layout
+ * instead would skip the newer migrations' data steps for those rows (0066_r5_banking links old
+ * transfers to their entries, …) and wipe the defaults they seed for existing companies.
+ */
+async function stagingAtLayout(dir: string, lastMigrationAt: number): Promise<PGlite> {
+  const journal = JSON.parse(fs.readFileSync(path.join(MIGRATIONS_FOLDER, 'meta', '_journal.json'), 'utf8')) as {
+    entries: Array<{ tag: string; when: number }>;
+  };
+  const upTo = journal.entries.filter((e) => Number(e.when) <= lastMigrationAt);
+  const subset = fs.mkdtempSync(path.join(os.tmpdir(), 'ib-layout-'));
+  try {
+    fs.mkdirSync(path.join(subset, 'meta'), { recursive: true });
+    fs.writeFileSync(path.join(subset, 'meta', '_journal.json'), JSON.stringify({ ...journal, entries: upTo }));
+    for (const e of upTo) fs.copyFileSync(path.join(MIGRATIONS_FOLDER, `${e.tag}.sql`), path.join(subset, `${e.tag}.sql`));
+    fs.mkdirSync(dir, { recursive: true });
+    const client = new PGlite(dir);
+    try {
+      await client.exec("SET TIME ZONE 'UTC'");
+      await migrate(drizzle(client), { migrationsFolder: subset });
+    } catch (err) {
+      await client.close().catch(() => undefined);
+      throw err;
+    }
+    return client;
+  } finally {
+    fs.rmSync(subset, { recursive: true, force: true });
+  }
+}
+
 function isEmptyDir(dir: string): boolean {
   try {
     return fs.readdirSync(dir).length === 0;
@@ -563,7 +598,13 @@ export async function restorePortableCompanyFile(
   }
   const createdDir = !fs.existsSync(dir);
 
+  // An older file is loaded into a database at its own layout first (stagingAtLayout).
+  let staging: PGlite | null = null;
   const cleanup = async () => {
+    if (staging) {
+      await staging.close().catch(() => undefined);
+      staging = null;
+    }
     await closeDb(dir).catch(() => undefined);
     try {
       if (createdDir) fs.rmSync(dir, { recursive: true, force: true });
@@ -577,20 +618,33 @@ export async function restorePortableCompanyFile(
     throw new ServiceError('VALIDATION', message);
   };
 
-  let db: DB;
+  const shipped = latestShippedMigrationAt();
+  const fileAt = manifest.schemaVersion?.lastMigrationAt ?? null;
+  if (fileAt != null && shipped != null && fileAt > shipped) {
+    return fail(
+      'This portable company file was created by a newer version of Ironbooks (its database layout is newer than this app). Update the app, then open it.',
+    );
+  }
+  // Made by an older version: load it at its own layout, migrate it forward afterwards.
+  const older = fileAt != null && shipped != null && fileAt < shipped;
+
+  let db: DB | null = null;
+  let client: PGlite;
   try {
-    db = await getDb(dir); // creates the database and applies this app's migrations
+    if (older) {
+      staging = await stagingAtLayout(dir, fileAt);
+      client = staging;
+    } else {
+      db = await getDb(dir); // creates the database and applies this app's migrations
+      client = rawClient(db);
+    }
   } catch (err) {
     return fail(`Could not create the company database: ${(err as Error).message}`);
   }
 
   try {
-    const client = rawClient(db);
     const target = await migrationInfo(client);
-    if (
-      manifest.schemaVersion?.lastMigrationAt != null &&
-      (target.lastMigrationAt == null || manifest.schemaVersion.lastMigrationAt > target.lastMigrationAt)
-    ) {
+    if (fileAt != null && (target.lastMigrationAt == null || fileAt > target.lastMigrationAt)) {
       return await fail(
         'This portable company file was created by a newer version of Ironbooks (its database layout is newer than this app). Update the app, then open it.',
       );
@@ -701,6 +755,17 @@ export async function restorePortableCompanyFile(
       return null;
     });
     if (verifyError) return await fail(`Restore refused — verification failed: ${verifyError}. Nothing was kept.`);
+
+    // An older file, loaded and proven exact at its own layout: now the newer migrations run over
+    // its rows (their data steps included), exactly as on a file that was opened every day since.
+    if (staging) {
+      const st = staging as PGlite;
+      staging = null;
+      await st.close();
+      db = await withDamagedFileAccess(() => getDb(dir));
+      client = rawClient(db);
+    }
+    if (!db) throw new ServiceError('INTERNAL', 'Portable file: database unavailable.');
 
     const ledger = await computeLedgerChecksums(db);
     for (const [companyId, expected] of Object.entries(manifest.ledger ?? {})) {

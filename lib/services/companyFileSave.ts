@@ -43,7 +43,7 @@ import { BACKUP_HISTORY_FILE } from './backupHistory';
 import { isRestoreInProgress, whenRestoreDone } from './restoreState';
 import { KEY_MISSING_MESSAGE, applyPendingKeyRotation, cachedSealProtection, fileKeyRotationPending, sealProtectionFor, type SealProtection } from './fileProtection';
 import { APP_VERSION } from '@/lib/appVersion';
-import { UnstartableBooksError, snapshotProblem } from './workingCopyRecovery';
+import { UnstartableBooksError, isRecoveryInProgress, snapshotProblem, whenRecoveryDone } from './workingCopyRecovery';
 
 /** How often the autosave timer looks for changes. */
 export const AUTOSAVE_TICK_MS = 2_000;
@@ -309,6 +309,35 @@ function companyNameFor(s: SaveState, dataDir: string): string {
   return format.companyFileBaseName(s.file);
 }
 
+/**
+ * This computer must still hold the company file's lock (electron/companyLock.js owner.json).
+ * Someone else's token: the file was taken over, nothing is saved here again (status 'lost'). No
+ * readable owner at all while the folder can be reached (removed, replaced, half-written): taken
+ * as lost too, never as "still ours". A folder that cannot be reached right now: this save fails
+ * and the autosave tries again.
+ */
+async function assertLockStillOurs(s: SaveState): Promise<void> {
+  if (!s.lockDir || !s.lockToken) return;
+  const owner = readOwner(s.lockDir);
+  if (owner && owner.token === s.lockToken) return;
+  if (!owner && !fs.existsSync(path.dirname(s.file))) {
+    throw Object.assign(new Error(`Ironbooks can't reach ${path.dirname(s.file)} to check that this computer still has the company file open.`), { code: 'ENOENT' });
+  }
+  s.status = 'lost';
+  const who = owner ? owner.appUser || owner.osUser : null;
+  s.error = owner
+    ? `${who ? `${who} on ` : ''}${owner.computer ?? 'another computer'} has opened this company file since this computer last saved it, so Ironbooks stopped saving here to protect their work. Your changes are kept on this computer.`
+    : 'Ironbooks can no longer confirm that this computer has the company file open (its "in use" record is gone or unreadable), so it stopped saving here to protect anyone else\'s work. Your changes are kept on this computer.';
+  // What is here and not in the company file stays recorded as unsaved — also changes no autosave
+  // check has seen yet (the close-time save) — so the next open here keeps them apart.
+  const fp = currentFingerprint(s.dataDir);
+  const lsn = await currentLsn(s);
+  if (fp !== s.savedFingerprint || s.unsavedSince !== null || (lsn !== null && lsn !== baselineLsn(s))) {
+    noteUnsaved(s, Date.now(), fp !== s.savedFingerprint);
+  }
+  throw Object.assign(new Error(s.error), { code: 'LOCK_LOST' });
+}
+
 function readOwner(lockDir: string): { token?: string; computer?: string; appUser?: string; osUser?: string } | null {
   try {
     return JSON.parse(fs.readFileSync(path.join(lockDir, 'owner.json'), 'utf8'));
@@ -378,24 +407,15 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
   // and rolled back if they fail): nothing is saved out of it until the restore has finished.
   // The close-time save (quit, Close Company, handing the file over) waits for it.
   await waitOutRestore(dataDir, opts);
+  // The working copy is being reopened from the company file (lib/services/workingCopyRecovery.ts):
+  // nothing is saved out of it meanwhile; the close-time save waits for it.
+  if (isRecoveryInProgress()) {
+    if (!opts.final) return { saved: false, outcome: 'unchanged' };
+    await whenRecoveryDone();
+  }
 
   // Still ours? (A computer that slept past the lock's stale time may have lost it.)
-  if (s.lockDir && s.lockToken) {
-    const owner = readOwner(s.lockDir);
-    if (owner && owner.token !== s.lockToken) {
-      s.status = 'lost';
-      const who = owner.appUser || owner.osUser;
-      s.error = `${who ? `${who} on ` : ''}${owner.computer ?? 'another computer'} has opened this company file since this computer last saved it, so Ironbooks stopped saving here to protect their work. Your changes are kept on this computer.`;
-      // What is here and not in the company file stays recorded as unsaved — also changes no
-      // autosave check has seen yet (the close-time save) — so the next open here keeps them apart.
-      const fp = currentFingerprint(dataDir);
-      const lsn = await currentLsn(s);
-      if (fp !== s.savedFingerprint || s.unsavedSince !== null || (lsn !== null && lsn !== baselineLsn(s))) {
-        noteUnsaved(s, Date.now(), fp !== s.savedFingerprint);
-      }
-      throw Object.assign(new Error(s.error), { code: 'LOCK_LOST' });
-    }
-  }
+  await assertLockStillOurs(s);
 
   // Nothing to do? Only when it is certain: the database was never opened in this process, or its
   // write position is exactly where the last save left it (an unknown position counts as changed,
@@ -454,20 +474,38 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
 
     // Consistent snapshot: the LSN first, then the files in this same synchronous turn — never
     // while a restore that started during this save is replacing them (this save waits for it).
-    let lsn = await currentLsn(s);
-    while (isRestoreInProgress(dataDir)) {
-      await whenRestoreDone(dataDir);
+    let lsn: string | null = null;
+    let fingerprint: string | null = null;
+    let entries: ReturnType<typeof format.snapshotDir> = [];
+    for (let attempt = 0; ; attempt++) {
       lsn = await currentLsn(s);
-    }
-    const fingerprint = currentFingerprint(dataDir);
-    // A copy kept apart is a separate company file: it never carries this file's backup history
-    // (its own rotation would delete this file's backup versions).
-    const entries = conflict ? withoutBackupHistory(format.snapshotDir(dataDir)) : format.snapshotDir(dataDir);
-    // Never write books that would not start over the company file (or its "unsaved changes"
-    // copy): the last good save is what a damaged working copy is reopened from
-    // (lib/services/workingCopyRecovery.ts). The changes stay counted as unsaved (catch below).
-    const damaged = snapshotProblem(entries);
-    if (damaged) {
+      while (isRestoreInProgress(dataDir)) {
+        await whenRestoreDone(dataDir);
+        lsn = await currentLsn(s);
+      }
+      fingerprint = currentFingerprint(dataDir);
+      // A copy kept apart is a separate company file: it never carries this file's backup history
+      // (its own rotation would delete this file's backup versions).
+      entries = conflict ? withoutBackupHistory(format.snapshotDir(dataDir)) : format.snapshotDir(dataDir);
+      // Never write books that would not start over the company file (or its "unsaved changes"
+      // copy) — nor no books at all over a file that has some: the last good save is what a
+      // damaged working copy is reopened from (lib/services/workingCopyRecovery.ts).
+      const hasDatabase = entries.some((e: { name: string }) => e.name === 'PG_VERSION');
+      const damaged = snapshotProblem(entries) ?? (!hasDatabase && onDisk?.dbSchema ? 'its database is missing' : null);
+      if (!damaged) break;
+      // The database is open and running fine in memory: a checkpoint writes it all out afresh
+      // (control file included), which usually puts the files on disk right. Then once more.
+      if (attempt === 0 && hasDatabase && workingCopyActive(s) && isDbOpen(dataDir)) {
+        try {
+          const db = await withDamagedFileAccess(() => getDb(dataDir));
+          await db.execute(sql`checkpoint`);
+          s.lastCheckpointAt = Date.now();
+          continue;
+        } catch (err) {
+          console.warn('[company-file] checkpoint after a failed start check failed:', (err as Error).message);
+        }
+      }
+      // The changes stay counted as unsaved (catch below); the autosave tries again later.
       console.error(`[company-file] not saving ${dataDir}: ${damaged}.`);
       throw new UnstartableBooksError(damaged, 'save');
     }
@@ -489,6 +527,7 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
     // Read AFTER the snapshot: protection is only ever added, so a snapshot that holds anything
     // written together with it (a new file's first Admin) is always sealed.
     const protection = await saveProtection(s);
+    const startedFromSaveId = onDisk?.saveId ?? null;
     const result = await format.writeCompanyFile(target, {
       manifest: {
         formatVersion: format.COMPANY_FILE_FORMAT_VERSION,
@@ -520,6 +559,22 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
       entries,
       cache: s.cache,
       protection,
+      // Writing a big file over a slow network takes a while: just before it replaces the company
+      // file, this computer must still hold the lock, and nobody may have saved the file meanwhile.
+      beforeRename: async () => {
+        await assertLockStillOurs(s);
+        if (conflict) return;
+        const now = format.readCompanyManifest(s.file) as { saveId?: string } | null;
+        if (!now && fs.existsSync(s.file)) {
+          throw Object.assign(new Error('The company file on disk can no longer be read (it may have been replaced by another program).'), { code: 'UNREADABLE' });
+        }
+        if ((now?.saveId ?? null) !== startedFromSaveId) {
+          throw Object.assign(
+            new Error('Someone else saved the company file while this computer was saving it, so this save was not written over theirs. Your changes are kept on this computer and are saved to a separate copy next.'),
+            { code: 'SAVED_ELSEWHERE' },
+          );
+        }
+      },
     });
     s.lastSealed = Boolean(protection);
 
@@ -574,8 +629,10 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
   } catch (err) {
     s.lastSaveEndedAt = Date.now();
     noteUnsaved(s, Date.now(), true);
+    // Taken over while this save was being written (assertLockStillOurs): it stays 'lost'.
+    if ((err as { code?: string })?.code === 'LOCK_LOST') throw err;
     s.status = 'error';
-    s.error = friendlyIoError(err, s.file);
+    s.error = (err as { code?: string })?.code === 'SAVED_ELSEWHERE' ? (err as Error).message : friendlyIoError(err, s.file);
     throw err;
   }
 }
@@ -643,6 +700,8 @@ export async function autosaveTick(now = Date.now()): Promise<'idle' | 'waiting'
   // A restore is replacing the working copy: its books are verified only after they are swapped
   // in (and rolled back if they fail), so nothing is saved until it has finished.
   if (isRestoreInProgress(s.dataDir)) return 'busy';
+  // The working copy is being reopened from the company file (workingCopyRecovery.ts).
+  if (isRecoveryInProgress()) return 'busy';
   const dataDir = s.dataDir;
   const fp = currentFingerprint(dataDir);
   if (fp !== s.lastSeenFingerprint) {

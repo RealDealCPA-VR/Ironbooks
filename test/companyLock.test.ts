@@ -9,6 +9,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
+import { makeStartableFolder } from '@/lib/db/damage.fixture';
 
 const require = createRequire(import.meta.url);
 const lock = require('../electron/companyLock.js');
@@ -188,8 +189,7 @@ describe('working copy decisions', () => {
 
   it('prepares, reuses, recovers and keeps conflicting changes as a separate copy', async () => {
     const src = path.join(root, 'prep-src');
-    fs.mkdirSync(path.join(src, 'base'), { recursive: true });
-    fs.writeFileSync(path.join(src, 'PG_VERSION'), '17\n');
+    await makeStartableFolder(src);
     fs.writeFileSync(path.join(src, 'base', 'rows'), 'v1');
     const cf = path.join(root, 'Prep.ironbooks');
     await format.writeCompanyFile(cf, {
@@ -234,8 +234,7 @@ describe('working copy decisions', () => {
     // Review round 5 leftover: working copies are keyed by path, so unsaved work made through
     // S:\Books\X.ironbooks stayed invisible when the file was opened as \\SERVER\Books\X.ironbooks.
     const src = path.join(root, 'two-src');
-    fs.mkdirSync(path.join(src, 'base'), { recursive: true });
-    fs.writeFileSync(path.join(src, 'PG_VERSION'), '17\n');
+    await makeStartableFolder(src);
     fs.writeFileSync(path.join(src, 'base', 'rows'), 'v1');
     const share = path.join(root, 'two-share');
     fs.mkdirSync(share, { recursive: true });

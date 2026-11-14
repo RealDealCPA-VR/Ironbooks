@@ -108,8 +108,117 @@ export function defaultBackupFolder(dataDir?: string): string {
   return path.join(path.dirname(resolveDataDir(dataDir)), 'backups');
 }
 
+/**
+ * The folder versioned backups go to on THIS computer: the chosen folder only when it was chosen
+ * on this computer (folderChosenHere), else the default folder. The settings travel inside every
+ * company file, so a folder that came in with an opened file is never used by itself: a crafted
+ * file could otherwise send the books to someone else's network share (and make Windows offer it
+ * the person's credentials just by creating the folder).
+ */
 export function backupFolder(settings: BackupSettings, dataDir?: string): string {
-  return settings.folder ? path.resolve(settings.folder) : defaultBackupFolder(dataDir);
+  return settings.folder && folderChosenHere(settings.folder, dataDir) ? path.resolve(settings.folder) : defaultBackupFolder(dataDir);
+}
+
+/** The chosen folder came with the company file and is not used on this computer (it was not chosen here). */
+export function backupFolderIgnoredHere(settings: BackupSettings, dataDir?: string): boolean {
+  return Boolean(settings.folder) && !folderChosenHere(settings.folder as string, dataDir);
+}
+
+/** A network path (\\server\share\…): never taken on trust. */
+export function isNetworkPath(p: string): boolean {
+  return /^[\\/]{2}/.test(p);
+}
+
+/**
+ * Backup folders chosen on this computer, kept in its default backup folder — this computer's
+ * own folder, which never travels inside a company file (unlike .backup-settings.json).
+ */
+const CHOSEN_FOLDERS_FILE = '.ironbooks-backup-folders.json';
+
+function chosenFoldersPath(dataDir?: string): string {
+  return path.join(defaultBackupFolder(dataDir), CHOSEN_FOLDERS_FILE);
+}
+
+function folderKey(p: string): string {
+  const abs = path.resolve(p);
+  return process.platform === 'win32' ? abs.toLowerCase() : abs;
+}
+
+function readChosenFolders(dataDir?: string): { folders: string[] } | null {
+  try {
+    const raw = JSON.parse(fs.readFileSync(chosenFoldersPath(dataDir), 'utf8')) as { folders?: unknown };
+    return { folders: Array.isArray(raw.folders) ? raw.folders.filter((f): f is string => typeof f === 'string') : [] };
+  } catch {
+    return null;
+  }
+}
+
+function writeChosenFolders(folders: string[], dataDir?: string): void {
+  try {
+    fs.mkdirSync(defaultBackupFolder(dataDir), { recursive: true });
+    writeJsonAtomic(chosenFoldersPath(dataDir), { folders: [...new Set(folders.map(folderKey))] });
+  } catch (err) {
+    console.warn('[backup] could not record the backup folder chosen on this computer:', (err as Error).message);
+  }
+}
+
+/** Remember a backup folder the person chose on this computer (saveBackupSettings). */
+export function rememberChosenFolder(folder: string, dataDir?: string): void {
+  writeChosenFolders([...(readChosenFolders(dataDir)?.folders ?? []), folder], dataDir);
+}
+
+/**
+ * Was `folder` chosen on this computer? The first time this computer looks (no list yet: the
+ * version that started keeping it), a folder already set that exists on a LOCAL drive is taken as
+ * chosen here, so an upgrade keeps backing up where it did; a network path never is.
+ */
+export function folderChosenHere(folder: string, dataDir?: string): boolean {
+  const list = readChosenFolders(dataDir);
+  if (list) return list.folders.includes(folderKey(folder));
+  let grandfathered = false;
+  try {
+    grandfathered = !isNetworkPath(folder) && fs.statSync(folder).isDirectory();
+  } catch {
+    grandfathered = false;
+  }
+  writeChosenFolders(grandfathered ? [folder] : [], dataDir);
+  return grandfathered;
+}
+
+/** Every folder this computer writes versioned backups to: the default one and those chosen here. */
+export function backupFoldersHere(dataDir?: string): string[] {
+  return [defaultBackupFolder(dataDir), ...(readChosenFolders(dataDir)?.folders ?? [])];
+}
+
+/** The file names Ironbooks gives versioned backups (backupSchedule.ts versionFilename). */
+export const VERSION_FILE_NAME = /^(auto-)?backup-.*\.bka$/;
+
+/**
+ * Is the file a record points at really one of this company file's versioned backups on this
+ * computer? The history travels inside the company file, so a record is only trusted to delete a
+ * file that is named like a backup, has exactly the recorded name, sits directly in a folder this
+ * computer backs up to (its real path: no links out), and has the recorded size.
+ */
+export function isOwnBackupFile(rec: BackupRecord, dataDir?: string): boolean {
+  if (!rec.path || !VERSION_FILE_NAME.test(rec.filename) || path.basename(rec.path) !== rec.filename) return false;
+  let real: string;
+  let st: fs.Stats;
+  try {
+    real = fs.realpathSync(rec.path);
+    st = fs.statSync(real);
+  } catch {
+    return false;
+  }
+  if (!st.isFile() || path.basename(real) !== rec.filename) return false;
+  if (typeof rec.sizeBytes === 'number' && st.size !== rec.sizeBytes) return false;
+  const parent = folderKey(path.dirname(real));
+  return backupFoldersHere(dataDir).some((f) => {
+    try {
+      return folderKey(fs.realpathSync(f)) === parent;
+    } catch {
+      return false;
+    }
+  });
 }
 
 /** Write JSON atomically (temp file + rename) so a crash never leaves half a file. */
@@ -330,6 +439,8 @@ export function saveBackupSettings(
     }
   }
   writeJsonAtomic(settingsPath(dir), next);
+  // Chosen on this computer: from now on versioned backups go there here (backupFolder).
+  if (next.folder) rememberChosenFolder(next.folder, dir);
   return next;
 }
 
