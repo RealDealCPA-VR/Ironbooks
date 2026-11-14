@@ -14,6 +14,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { recordBackup, readBackupHistory } from './backupHistory';
 import { rotateVersions } from './backupSchedule';
+import { makeStartableFolder } from '@/lib/db/damage.fixture';
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'ib-rot5-'));
 const DATA = path.join(ROOT, 'data');
@@ -65,8 +66,7 @@ describe('the backup folder chosen on another computer', () => {
   it('when it cannot be reached here, the backup goes to this computer\'s default folder instead of failing', async () => {
     const { runVersionedBackup } = await import('./backupSchedule');
     const data = path.join(ROOT, 'data-moved');
-    fs.mkdirSync(data, { recursive: true });
-    fs.writeFileSync(path.join(data, 'PG_VERSION'), '17\n');
+    await makeStartableFolder(data);
     // Chosen on FRONT-DESK: a folder that cannot exist here (its parent is a file on this disk,
     // like a drive letter or user profile this computer does not have).
     const blocker = path.join(ROOT, 'blocker');
@@ -94,8 +94,7 @@ describe('a versioned backup cut short by a crash', () => {
   it('leaves a .partial file that the next backup clears away', async () => {
     const { runVersionedBackup } = await import('./backupSchedule');
     const data = path.join(ROOT, 'data-partial');
-    fs.mkdirSync(data, { recursive: true });
-    fs.writeFileSync(path.join(data, 'PG_VERSION'), '17\n');
+    await makeStartableFolder(data);
     const folder = path.join(ROOT, 'partial-backups');
     fs.mkdirSync(folder, { recursive: true });
     const stale = path.join(folder, 'auto-backup-partial-co-2026-10-01T10-00-00-000.bka.partial');

@@ -58,7 +58,7 @@ import {
   unsealCompanyFile,
   takeUnsealedConflictCopy,
 } from '@/lib/services/fileProtection';
-import { recoveryNotice, settleSealedWorkingCopy } from '@/lib/services/workingCopyRecovery';
+import { needsSignInToRecover, recoverSealedWorkingCopy, recoveryNotice } from '@/lib/services/workingCopyRecovery';
 import { cookieSecure, originFromHeaders, type RequestOrigin } from '@/lib/net/requestInfo';
 import { GLOBAL_KEY_WEIGHT, attemptKeys, loginLimiter, tooManyAttempts } from '@/lib/net/rateLimit';
 
@@ -139,19 +139,27 @@ async function handlePost(req: NextRequest) {
   }
   const { email, password, totp, filePassword } = parsed.data;
   const origin = originFromHeaders(req.headers);
-  // A working copy on this computer that would not start is set aside first: the sign-in then
-  // decrypts the company file's last save instead (lib/services/workingCopyRecovery.ts).
-  await settleSealedWorkingCopy();
-  const sealed = sealedMode();
+  let sealed = sealedMode();
 
   // The company-file password gates the file BEFORE any user login (QB order) — whenever it can be
   // read: a protected file that still has to be decrypted asks for it after the sign-in below.
   let unlocked = false;
+  // A protected file's working copy on this computer that will not start ('key'): only this
+  // sign-in, once its password has opened the company file, may set it aside (below).
+  let brokenCopy = false;
   if (sealed !== 'extract' && sealed !== 'conflict') {
-    const db = sealed === 'key' ? await withSealedAccess(() => getDb()) : await getDb();
-    const lockGate = await fileLockGate(db, filePassword || undefined, origin);
-    if (lockGate.response) return lockGate.response;
-    unlocked = Boolean(lockGate.unlocked);
+    let db: DB | null = null;
+    try {
+      db = sealed === 'key' ? await withSealedAccess(() => getDb()) : await getDb();
+    } catch (err) {
+      if (sealed !== 'key' || !needsSignInToRecover(err)) throw err;
+      brokenCopy = true;
+    }
+    if (db) {
+      const lockGate = await fileLockGate(db, filePassword || undefined, origin);
+      if (lockGate.response) return lockGate.response;
+      unlocked = Boolean(lockGate.unlocked);
+    }
   }
 
   const limiter = loginLimiter();
@@ -164,6 +172,23 @@ async function handlePost(req: NextRequest) {
     return NextResponse.json(body, { status: 429, headers: { 'Retry-After': retryAfter } });
   }
   try {
+    if (brokenCopy) {
+      // The password must open the company file itself (its key slots) before anything is set
+      // aside: an unknown user name costs the same derivation as a wrong password.
+      const key = await unlockFromFile({ kind: 'password', login: email, secret: password });
+      if (!key) {
+        limiter.recordFailure(keys, Date.now(), weights);
+        return NextResponse.json({ error: 'Invalid email or password.', code: 'FORBIDDEN' }, { status: 401 });
+      }
+      // Reopen the company file's last save (lib/services/workingCopyRecovery.ts): the sign-in
+      // then decrypts it ('extract'), or uses the working copy if it started after all ('key').
+      sealed = await recoverSealedWorkingCopy();
+      if (sealed === 'key') {
+        const lockGate = await fileLockGate(await withSealedAccess(() => getDb()), filePassword || undefined, origin);
+        if (lockGate.response) return lockGate.response;
+        unlocked = Boolean(lockGate.unlocked);
+      }
+    }
     return await signIn();
   } catch (err) {
     if (err instanceof ServiceError) {

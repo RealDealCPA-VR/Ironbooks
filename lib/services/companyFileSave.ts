@@ -43,7 +43,7 @@ import { BACKUP_HISTORY_FILE } from './backupHistory';
 import { isRestoreInProgress, whenRestoreDone } from './restoreState';
 import { KEY_MISSING_MESSAGE, applyPendingKeyRotation, cachedSealProtection, fileKeyRotationPending, sealProtectionFor, type SealProtection } from './fileProtection';
 import { APP_VERSION } from '@/lib/appVersion';
-import { UnstartableBooksError, snapshotProblem } from './workingCopyRecovery';
+import { UnstartableBooksError, isRecoveryInProgress, snapshotProblem, whenRecoveryDone } from './workingCopyRecovery';
 
 /** How often the autosave timer looks for changes. */
 export const AUTOSAVE_TICK_MS = 2_000;
@@ -378,6 +378,12 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
   // and rolled back if they fail): nothing is saved out of it until the restore has finished.
   // The close-time save (quit, Close Company, handing the file over) waits for it.
   await waitOutRestore(dataDir, opts);
+  // The working copy is being reopened from the company file (lib/services/workingCopyRecovery.ts):
+  // nothing is saved out of it meanwhile; the close-time save waits for it.
+  if (isRecoveryInProgress()) {
+    if (!opts.final) return { saved: false, outcome: 'unchanged' };
+    await whenRecoveryDone();
+  }
 
   // Still ours? (A computer that slept past the lock's stale time may have lost it.)
   if (s.lockDir && s.lockToken) {
@@ -454,20 +460,38 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
 
     // Consistent snapshot: the LSN first, then the files in this same synchronous turn — never
     // while a restore that started during this save is replacing them (this save waits for it).
-    let lsn = await currentLsn(s);
-    while (isRestoreInProgress(dataDir)) {
-      await whenRestoreDone(dataDir);
+    let lsn: string | null = null;
+    let fingerprint: string | null = null;
+    let entries: ReturnType<typeof format.snapshotDir> = [];
+    for (let attempt = 0; ; attempt++) {
       lsn = await currentLsn(s);
-    }
-    const fingerprint = currentFingerprint(dataDir);
-    // A copy kept apart is a separate company file: it never carries this file's backup history
-    // (its own rotation would delete this file's backup versions).
-    const entries = conflict ? withoutBackupHistory(format.snapshotDir(dataDir)) : format.snapshotDir(dataDir);
-    // Never write books that would not start over the company file (or its "unsaved changes"
-    // copy): the last good save is what a damaged working copy is reopened from
-    // (lib/services/workingCopyRecovery.ts). The changes stay counted as unsaved (catch below).
-    const damaged = snapshotProblem(entries);
-    if (damaged) {
+      while (isRestoreInProgress(dataDir)) {
+        await whenRestoreDone(dataDir);
+        lsn = await currentLsn(s);
+      }
+      fingerprint = currentFingerprint(dataDir);
+      // A copy kept apart is a separate company file: it never carries this file's backup history
+      // (its own rotation would delete this file's backup versions).
+      entries = conflict ? withoutBackupHistory(format.snapshotDir(dataDir)) : format.snapshotDir(dataDir);
+      // Never write books that would not start over the company file (or its "unsaved changes"
+      // copy) — nor no books at all over a file that has some: the last good save is what a
+      // damaged working copy is reopened from (lib/services/workingCopyRecovery.ts).
+      const hasDatabase = entries.some((e: { name: string }) => e.name === 'PG_VERSION');
+      const damaged = snapshotProblem(entries) ?? (!hasDatabase && onDisk?.dbSchema ? 'its database is missing' : null);
+      if (!damaged) break;
+      // The database is open and running fine in memory: a checkpoint writes it all out afresh
+      // (control file included), which usually puts the files on disk right. Then once more.
+      if (attempt === 0 && hasDatabase && workingCopyActive(s) && isDbOpen(dataDir)) {
+        try {
+          const db = await withDamagedFileAccess(() => getDb(dataDir));
+          await db.execute(sql`checkpoint`);
+          s.lastCheckpointAt = Date.now();
+          continue;
+        } catch (err) {
+          console.warn('[company-file] checkpoint after a failed start check failed:', (err as Error).message);
+        }
+      }
+      // The changes stay counted as unsaved (catch below); the autosave tries again later.
       console.error(`[company-file] not saving ${dataDir}: ${damaged}.`);
       throw new UnstartableBooksError(damaged, 'save');
     }
@@ -643,6 +667,8 @@ export async function autosaveTick(now = Date.now()): Promise<'idle' | 'waiting'
   // A restore is replacing the working copy: its books are verified only after they are swapped
   // in (and rolled back if they fail), so nothing is saved until it has finished.
   if (isRestoreInProgress(s.dataDir)) return 'busy';
+  // The working copy is being reopened from the company file (workingCopyRecovery.ts).
+  if (isRecoveryInProgress()) return 'busy';
   const dataDir = s.dataDir;
   const fp = currentFingerprint(dataDir);
   if (fp !== s.lastSeenFingerprint) {

@@ -87,10 +87,15 @@ a checkpoint its write-ahead log no longer holds; Postgres then refuses to start
 can two Postgres instances on one folder, which `lib/db` prevents (one database per folder per
 process, even when `next dev` loads the module once per route). A quick check
 (`electron/pgDataCheck.js`) keeps such books from ever being saved over the company file or written
-as a backup. On the next open the server keeps the damaged copy aside (`damaged copy <date>` in the
-working folder), reopens the company file as last saved — for a protected file the sign-in decrypts
-it — and tells the person, on the sign-in screen and in the title bar, when that save was made and
-that later changes could not be recovered.
+as a backup (nor a snapshot with no database at all). On the next open the server first makes sure
+the copy is really damaged (the check finds damage, or a second start after a short pause fails
+too: a start that fails because a file was busy is simply tried again). Then, while every other
+request waits, it reopens the company file as last saved (unpacked and started once before it
+replaces anything; the swap is undone if it fails half way), keeps the damaged copy in the working
+folder (`damaged copy <date>`, encrypted as a `.ironbooks` file when the books are protected), and
+tells the person, on the sign-in screen and in the title bar, when that save was made and whether
+later changes could not be recovered. For a protected file only a sign-in whose password opens the
+company file can start this; that sign-in then decrypts the company file.
 
 **Someone else has it open.** Opening a locked file shows who has it and offers *Ask to Come In*. The
 request appears on the holder's screen: *Let Them In* (multi-user mode: the holder's Ironbooks serves

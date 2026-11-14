@@ -23,6 +23,7 @@ import { OPEN_BLOCKING, checkLedgerHealth, ensureLedgerGuards, type LedgerProble
 import { CompanyFileInUseError, acquireDirLock, assertDirLockHeld, releaseDirLock } from './dirLock';
 import { refreshPlannerStats } from './plannerStats';
 import { assertNotSealed } from './sealed';
+import format from '@/electron/companyFileFormat';
 
 export { CompanyFileInUseError, LOCK_FILE } from './dirLock';
 export { isSealedDir, sealedMode, withSealedAccess } from './sealed';
@@ -218,6 +219,22 @@ export function isDbOpen(dataDir?: string): boolean {
   return handles.has(resolveDataDir(dataDir));
 }
 
+/**
+ * How the open of `dataDir` in this process ends: true when it opened, false when it failed (its
+ * handle is gone by then), null when nothing is open (lib/services/workingCopyRecovery.ts waits
+ * for a handle another request is still opening before it judges the folder).
+ */
+export async function openSettled(dataDir?: string): Promise<boolean | null> {
+  const handle = handles.get(resolveDataDir(dataDir));
+  if (!handle) return null;
+  try {
+    await handle.migrated;
+    return !handle.lost;
+  } catch {
+    return false;
+  }
+}
+
 /** Resolve the data directory for the active (or a named) company file. */
 export function resolveDataDir(dataDir?: string): string {
   if (dataDir) return path.resolve(dataDir);
@@ -231,6 +248,26 @@ export const MIGRATIONS_FOLDER = process.env.BKA_MIGRATIONS_DIR
   ? path.resolve(process.env.BKA_MIGRATIONS_DIR)
   : path.resolve(process.cwd(), 'drizzle');
 
+/**
+ * `dir` is the working copy of the open single company file (BKA_COMPANY_FILE), and that file's
+ * last save holds books (its listing records their database layout): a missing database there is
+ * a lost working copy, not a brand-new company.
+ */
+function savedBooksExpectedIn(dir: string): boolean {
+  const file = process.env.BKA_COMPANY_FILE;
+  if (!file) return false;
+  const st = process.env.BKA_COMPANY_STATE;
+  const work = st ? path.resolve(path.dirname(st), 'data') : resolveDataDir();
+  const same = process.platform === 'win32' ? work.toLowerCase() === dir.toLowerCase() : work === dir;
+  if (!same) return false;
+  try {
+    const m = format.readCompanyManifest(path.resolve(file)) as { dbSchema?: unknown } | null;
+    return Boolean(m && m.dbSchema);
+  } catch {
+    return false;
+  }
+}
+
 /** Open (or reuse) a database handle for a given company data directory. */
 export function openDb(dataDir?: string): DbHandle {
   const dir = resolveDataDir(dataDir);
@@ -242,6 +279,15 @@ export function openDb(dataDir?: string): DbHandle {
     throw new ServiceError('CONFLICT', 'The company file is being switched. Try again in a moment.');
   }
 
+  // The working copy of a company file whose saves hold books, with no database in it: never let
+  // Postgres make a NEW, empty one there (it would be saved over the company file).
+  if (!fs.existsSync(path.join(dir, 'PG_VERSION')) && savedBooksExpectedIn(dir)) {
+    throw new ServiceError(
+      'CONFLICT',
+      'The copy of your books on this computer is missing. Close the company file and open it again; your company file itself was not changed.',
+      { booksMissing: true },
+    );
+  }
   fs.mkdirSync(dir, { recursive: true });
   // Refuse a company file another process has open (PGlite has no lock of its own, so two
   // writers on one folder silently lose each other's transactions) — lib/db/dirLock.ts.
@@ -400,9 +446,15 @@ export async function getDb(dataDir?: string): Promise<DB> {
     if (outcome === 'resealed') {
       throw new ServiceError('FORBIDDEN', 'Authentication required.', { sealed: true, resealed: true });
     }
-    if (outcome !== 'replaced') {
+    if (outcome === 'needs-sign-in') {
+      throw new ServiceError('FORBIDDEN', 'Authentication required.', { sealed: true, needsSignIn: true });
+    }
+    if (outcome === 'busy') throw new recovery.BooksBusyError();
+    if (outcome !== 'replaced' && outcome !== 'retry') {
       throw new recovery.BooksWontOpenError(recovery.dataDirProblem(err.dir), Boolean(process.env.BKA_COMPANY_FILE));
     }
+    // A request that came in during the recovery may have opened it already (it waited for it).
+    if (openHoldFor(dataDir)) await waitForOpenHold(dataDir);
     handle = openDb(dataDir);
     try {
       await handle.migrated;

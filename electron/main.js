@@ -907,6 +907,8 @@ async function openSingleFileForLaunch(filePath) {
     sealed: prep.sealed || null,
     training: Boolean(prep.manifest && prep.manifest.training),
     keptOnThisComputer: prep.keptOnThisComputer || null,
+    // Unsaved changes in books that would not start: set aside on this computer, not copied out.
+    damagedCopy: prep.damagedCopy || null,
     // Unsaved work made through another path to this same file (mapped drive vs UNC path).
     otherPathCopies: prep.otherPathCopies || [],
     otherPathUnsaved: prep.otherPathUnsaved || [],
@@ -2681,6 +2683,20 @@ function noteRecoveredWork() {
         message: 'Your unsaved changes were kept on this computer.',
         detail:
           `${kept}\n\nThey are protected with passwords, so Ironbooks never copies them next to the company file in plain text. Open them with File > Open Company Folder (Older Format) and sign in with your user name and password, then compare them with ${name} and re-enter anything that is missing.`,
+        buttons: ['OK', 'Show in Folder'],
+      })
+      .then(({ response }) => {
+        if (response === 1) shell.showItemInFolder(kept);
+      });
+  } else if (openFile.damagedCopy) {
+    const kept = openFile.damagedCopy;
+    dialog
+      .showMessageBox(mainWindow, {
+        noLink: true,
+        type: 'warning',
+        message: 'Your unsaved changes on this computer could not be kept.',
+        detail:
+          `The copy of ${name} on this computer had changes that never reached the company file, but that copy was damaged (Ironbooks or the computer stopped unexpectedly), so it could not be opened or saved. ${name} was opened as it was last saved; please re-enter your most recent work. The damaged copy was kept here in case support can recover it:\n\n${kept}`,
         buttons: ['OK', 'Show in Folder'],
       })
       .then(({ response }) => {

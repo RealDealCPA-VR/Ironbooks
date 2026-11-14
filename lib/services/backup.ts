@@ -196,7 +196,7 @@ export function createBackup(companyName?: string, dataDir?: string, opts: { pro
   }
   // A backup of books that would not start could never be restored — and the automatic ones
   // would rotate good older backups out. Refused (lib/services/workingCopyRecovery.ts).
-  const damaged = dataDirProblem(dir);
+  const damaged = dataDirProblem(dir) ?? (fs.existsSync(path.join(dir, 'PG_VERSION')) ? null : 'it has no database');
   if (damaged) throw new UnstartableBooksError(damaged, 'backup');
 
   const protection = opts.protection !== undefined ? opts.protection : cachedSealProtection(dir);

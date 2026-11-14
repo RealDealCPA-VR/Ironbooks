@@ -11,28 +11,34 @@
  * write ordering does not survive one), and two Postgres instances on one folder (see
  * lib/db/index.ts).
  *
- * Instead of locking the person out, the first request that finds the working copy unable to
- * start (lib/db getDb):
- *  1. keeps the damaged copy aside, next to the working copy ("damaged copy <date>"), never
- *     deleted here, so nothing is destroyed;
- *  2. reopens the company file as it was last saved: its books are unpacked into a fresh folder and
- *     STARTED once before they replace anything; a protected file whose key is not known yet
- *     (nobody has signed in) switches the sign-in to decrypting the company file instead;
- *  3. tells the person in plain words what happened and what, if anything, was lost
+ * Instead of locking the person out, a request that finds the working copy unable to start
+ * (lib/db getDb) runs ONE recovery, while every other request waits (holdDbOpen):
+ *  1. Is it really damaged? Only when the start check (electron/pgDataCheck.js) finds damage, or
+ *     a second start after a short pause fails too. A start that fails for a passing reason (an
+ *     antivirus scan holding a file, memory) is simply tried again, never "repaired".
+ *  2. The company file's last save is unpacked into a fresh folder and STARTED once before it
+ *     replaces anything; the damaged copy is swapped out (put back if the swap fails half way)
+ *     and kept on this computer for support — encrypted when its books are protected.
+ *  3. A protected file nobody has signed in to yet: only a sign-in whose password opens the
+ *     company file may do this (withRecoveryAllowed, app/api/auth/login); the sign-in then
+ *     decrypts the company file instead of reusing the working copy.
+ *  4. The person is told in plain words what happened and what, if anything, was lost
  *     (recoveryNotice(): the sign-in answer and the title-bar status show it).
  *
  * The company file itself can only be replaced by a save whose snapshot passes the same start
- * check (electron/pgDataCheck.js), so the last save is good to reopen from.
+ * check, so the last save is good to reopen from. Nothing is saved while a recovery runs.
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { PGlite } from '@electric-sql/pglite';
 import format from '@/electron/companyFileFormat';
 import session from '@/electron/companySession';
 import pgData from '@/electron/pgDataCheck';
-import { getDb, isDbOpen, resolveDataDir, withSealedAccess } from '@/lib/db';
-import { overrideSealedMode, sealedMode } from '@/lib/db/sealed';
+import { getDb, holdDbOpen, isDbOpen, openSettled, resolveDataDir, withSealedAccess } from '@/lib/db';
+import { overrideSealedMode, sealedMode, type SealedMode } from '@/lib/db/sealed';
+import { APP_VERSION } from '@/lib/appVersion';
 import { ServiceError } from './errors';
 import { isRestoreInProgress } from './restoreState';
 
@@ -43,22 +49,47 @@ export interface RecoveryNotice {
   message: string;
   /** When the save the books were reopened from was made (null: not known / not reopened yet). */
   savedAt: string | null;
-  /** True when the damaged copy held changes the company file does not have (they are lost). */
+  /** True when the damaged copy may have held changes the company file does not have. */
   changesLost: boolean;
   /** Where the damaged copy was kept (on this computer). */
   keptAt: string | null;
 }
 
-type Outcome = 'replaced' | 'resealed' | null;
+/**
+ * 'replaced'      the working copy now holds the company file's last save: open it again;
+ * 'retry'         it was not damaged after all (it started on a second try): open it again;
+ * 'resealed'      a protected file nobody has signed in to: the sign-in decrypts the company file;
+ * 'needs-sign-in' a protected file: only a sign-in that opens the company file may recover it;
+ * 'busy'          the swap could not be completed (a file was busy): nothing changed, try again;
+ * null            nothing could be done here (not a company file's working copy, or its last save
+ *                 does not start either).
+ */
+export type RecoveryOutcome = 'replaced' | 'retry' | 'resealed' | 'needs-sign-in' | 'busy' | null;
 
 const g = globalThis as typeof globalThis & {
   __ironbooksRecoveryNotice?: RecoveryNotice | null;
-  __ironbooksRecovery?: Promise<Outcome> | null;
+  __ironbooksRecovery?: Promise<RecoveryOutcome> | null;
 };
+
+/** Pause before a working copy that failed to start (but shows no damage) is tried a second time. */
+function retryDelayMs(): number {
+  const v = Number(process.env.BKA_RECOVERY_RETRY_MS);
+  return Number.isFinite(v) && v >= 0 ? v : 1500;
+}
 
 /** The notice of a recovery made by this server process (null when none was needed). */
 export function recoveryNotice(): RecoveryNotice | null {
   return g.__ironbooksRecoveryNotice ?? null;
+}
+
+/** A recovery is running in this process: nothing may be saved meanwhile (companyFileSave.ts). */
+export function isRecoveryInProgress(): boolean {
+  return Boolean(g.__ironbooksRecovery);
+}
+
+/** Resolves once no recovery is running. */
+export async function whenRecoveryDone(): Promise<void> {
+  while (g.__ironbooksRecovery) await g.__ironbooksRecovery.catch(() => null);
 }
 
 /** Tests. */
@@ -67,12 +98,13 @@ export function resetRecoveryState(): void {
   g.__ironbooksRecovery = null;
 }
 
-/** Why a data folder (or a snapshot of one) would not start, or null when it looks fine / unknown. */
+/** Why a data folder would not start, or null when it looks fine / unknown (pgDataCheck.js). */
 export function dataDirProblem(dir: string): string | null {
   const r = pgData.checkDataDir(dir) as { ok: boolean | null; reason: string | null };
   return r.ok === false ? r.reason : null;
 }
 
+/** The same for a snapshot of a data folder about to be saved. */
 export function snapshotProblem(entries: Array<{ name: string; data?: Buffer; dir?: boolean; file?: string }>): string | null {
   const r = pgData.checkSnapshot(entries) as { ok: boolean | null; reason: string | null };
   return r.ok === false ? r.reason : null;
@@ -84,7 +116,7 @@ export class UnstartableBooksError extends ServiceError {
     super(
       'CONFLICT',
       what === 'save'
-        ? `The copy of your books on this computer is damaged (${reason}), so Ironbooks did not save it over your company file, which still holds your last good save. Close the company file and open it again: Ironbooks then reopens it from that save.`
+        ? `Ironbooks found a problem with the copy of your books on this computer (${reason}), so it did not save it over your company file, which still holds your last good save. Your work stays open here and Ironbooks tries again in a moment. If this message does not go away, close the company file and open it again.`
         : `The books in this company file are damaged (${reason}), so no backup was made from them (it could not be restored). Your earlier backups are untouched.`,
       { unstartable: true, reason },
     );
@@ -108,6 +140,29 @@ export class BooksWontOpenError extends ServiceError {
   }
 }
 
+/** Reopening the company file could not be finished just now; nothing was changed. */
+export class BooksBusyError extends ServiceError {
+  constructor() {
+    super(
+      'CONFLICT',
+      'Ironbooks could not open your company file just now because a file on this computer was busy (often antivirus or a backup program). Nothing was changed. Try again in a moment, or close the company file and open it again.',
+      { retry: true },
+    );
+    this.name = 'BooksBusyError';
+  }
+}
+
+/**
+ * A protected file's sign-in whose password opened the company file may recover a working copy
+ * that will not start ('key' mode); nobody else may (an unauthenticated request must never make the
+ * app set the working copy aside).
+ */
+const recoveryAllowed = new AsyncLocalStorage<true>();
+
+export function withRecoveryAllowed<T>(fn: () => Promise<T>): Promise<T> {
+  return recoveryAllowed.run(true, fn);
+}
+
 function samePath(a: string, b: string): boolean {
   const na = path.resolve(a);
   const nb = path.resolve(b);
@@ -115,15 +170,10 @@ function samePath(a: string, b: string): boolean {
 }
 
 /** The working copy of the open single company file (null when the server runs on a company folder). */
-function workingCopyDir(): string | null {
+export function workingCopyDir(): string | null {
   if (!process.env.BKA_COMPANY_FILE) return null;
   const st = process.env.BKA_COMPANY_STATE;
   return st ? path.resolve(path.dirname(st), 'data') : resolveDataDir();
-}
-
-function stamp(when: Date): string {
-  const p = (n: number) => String(n).padStart(2, '0');
-  return `${when.getFullYear()}-${p(when.getMonth() + 1)}-${p(when.getDate())} ${p(when.getHours())}${p(when.getMinutes())}${p(when.getSeconds())}`;
 }
 
 function whenText(iso: string | null): string {
@@ -132,6 +182,8 @@ function whenText(iso: string | null): string {
   if (Number.isNaN(d.getTime())) return '';
   return ` (saved ${d.toLocaleString('en-US', { dateStyle: 'medium', timeStyle: 'short' })})`;
 }
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** Does this folder start? Opens it once with PGlite and closes it again (a clean shutdown). */
 async function starts(dir: string): Promise<boolean> {
@@ -162,85 +214,160 @@ function heldUnsavedChanges(dir: string): boolean {
   if (st.unsavedSince) return true;
   const base = st.base;
   if (!base || !Object.prototype.hasOwnProperty.call(base, 'fingerprint')) return true;
-  return session.logFingerprint(dir) !== (base.fingerprint ?? null);
+  if (session.logFingerprint(dir) !== (base.fingerprint ?? null)) return true;
+  // A change the autosave had not noticed yet leaves neither of those behind: the database files
+  // themselves say whether anything was written after the last save.
+  const savedAt = Date.parse(st.lastSavedAt || base.savedAt || '');
+  if (!Number.isFinite(savedAt)) return true;
+  // (A save snapshots the files before it records savedAt: anything written later is newer.)
+  return newestDbWrite(dir) > savedAt;
 }
 
-function noticeFor(opts: { savedAt: string | null; changesLost: boolean; keptAt: string }): RecoveryNotice {
-  const lost = opts.changesLost
-    ? 'Changes made after that save could not be recovered. Please check your most recent work and enter again anything that is missing.'
+/** The newest modification time of the write-ahead log and table files of a data folder (0: none). */
+function newestDbWrite(dir: string): number {
+  let newest = 0;
+  const walk = (d: string) => {
+    let names: fs.Dirent[];
+    try {
+      names = fs.readdirSync(d, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of names) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) walk(p);
+      else {
+        try {
+          newest = Math.max(newest, fs.statSync(p).mtimeMs);
+        } catch {
+          /* gone */
+        }
+      }
+    }
+  };
+  walk(path.join(dir, 'pg_wal'));
+  walk(path.join(dir, 'base'));
+  return newest;
+}
+
+function messageFor(savedAt: string | null, changesLost: boolean, keptAt: string): string {
+  const lost = changesLost
+    ? 'Anything entered after that save could not be recovered. Please check your most recent work and enter again anything that is missing.'
     : 'Nothing was lost: everything had already been saved to the company file.';
-  const message = `The copy of your books on this computer was damaged, most likely because Ironbooks or the computer stopped unexpectedly. Ironbooks reopened your company file as it was last saved${whenText(opts.savedAt)}. ${lost} The damaged copy was kept at ${opts.keptAt}.`;
-  return { id: randomUUID(), at: new Date().toISOString(), message, savedAt: opts.savedAt, changesLost: opts.changesLost, keptAt: opts.keptAt };
+  return `The copy of your books on this computer was damaged, most likely because Ironbooks or the computer stopped unexpectedly. Ironbooks reopened your company file as it was last saved${whenText(savedAt)}. ${lost} The damaged copy was kept at ${keptAt}.`;
+}
+
+function setNotice(savedAt: string | null, changesLost: boolean, keptAt: string): void {
+  g.__ironbooksRecoveryNotice = { id: randomUUID(), at: new Date().toISOString(), message: messageFor(savedAt, changesLost, keptAt), savedAt, changesLost, keptAt };
+}
+
+/** The damaged copy named in the notice moved (it was encrypted once the file key was known). */
+function noticeKeptMoved(from: string, to: string): void {
+  const n = g.__ironbooksRecoveryNotice;
+  if (!n || !n.keptAt || !samePath(n.keptAt, from)) return;
+  g.__ironbooksRecoveryNotice = { ...n, keptAt: to, message: messageFor(n.savedAt, n.changesLost, to) };
 }
 
 /**
- * Called by lib/db getDb when the database in `dir` would not start. Returns 'replaced' (open it
- * again: the working copy now holds the company file's last save), 'resealed' (a protected file
- * nobody has signed in to yet: the sign-in will decrypt the company file) or null (nothing could
- * be done here: not the working copy of a company file, or its last save does not start either).
- * One recovery at a time; concurrent callers share it.
+ * Called by lib/db getDb when the database in `dir` would not start. One recovery at a time;
+ * concurrent callers share it, and nothing opens `dir` while it runs (holdDbOpen: getDb waits).
  */
-export function recoverUnstartableWorkingCopy(dir: string): Promise<Outcome> {
+export function recoverUnstartableWorkingCopy(dir: string): Promise<RecoveryOutcome> {
+  const abs = path.resolve(dir);
+  // A protected file nobody has signed in to: never on behalf of an unauthenticated request — and
+  // without side effects, so it never hands its answer to a sign-in that may recover it.
+  if (sealedMode() === 'key' && !recoveryAllowed.getStore() && !g.__ironbooksRecovery) return Promise.resolve('needs-sign-in');
   if (g.__ironbooksRecovery) return g.__ironbooksRecovery;
-  g.__ironbooksRecovery = doRecover(path.resolve(dir)).finally(() => {
+  const release = holdDbOpen(abs);
+  g.__ironbooksRecovery = doRecover(abs).finally(() => {
     g.__ironbooksRecovery = null;
+    release();
   });
   return g.__ironbooksRecovery;
 }
 
-async function doRecover(dir: string): Promise<Outcome> {
+async function doRecover(dir: string): Promise<RecoveryOutcome> {
   const work = workingCopyDir();
   const file = process.env.BKA_COMPANY_FILE ? path.resolve(process.env.BKA_COMPANY_FILE) : null;
   if (!work || !file || !samePath(work, dir)) return null;
   // A restore is putting other books in place and checks them itself: books it swapped in that do
   // not start are rolled back by the restore (lib/services/backup.ts), never replaced from here.
   if (isRestoreInProgress(dir)) return null;
-  // Another request already put it right and the books are open again: nothing more to do. (Never
-  // test-start a folder that may be open: a second Postgres on it is what damages it.)
-  if (isDbOpen(dir)) return 'replaced';
-  const manifest = format.readCompanyManifest(file) as Record<string, any> | null;
-  if (!manifest) return null;
+  // A request that started before this recovery (it holds new opens off) may be opening it right
+  // now: wait for that. Opened: it is fine. Failed: its handle is gone, go on. Never test-start a
+  // folder that is open: a second Postgres on it is what damages it.
+  if ((await openSettled(dir)) === true) return 'retry';
+  if (isDbOpen(dir)) return 'retry';
   const mode = sealedMode();
-  // A protected file being decrypted from the company file right now ('extract' / 'conflict'):
-  // these books ARE its last save, so there is nothing better to reopen from.
+  // A protected file being decrypted from the company file ('extract' / 'conflict'): these books
+  // ARE its last save, so there is nothing better to reopen from.
   if (mode === 'extract' || mode === 'conflict') return null;
-  const sealed = format.isSealedManifest(manifest);
-  let fileKey: Buffer | null = null;
-  if (sealed && mode !== 'key') {
-    const { fileKeyFor } = await import('./fileProtection');
-    fileKey = fileKeyFor(dir);
-    if (!fileKey) return null; // signed in without the key: nothing here can decrypt the file
+  // What the damaged copy may hold that the company file does not: judged before anything starts it.
+  const changesLost = heldUnsavedChanges(dir);
+
+  // 1. Really damaged? Without damage the check can see, a second start decides: a folder that
+  //    starts now (an antivirus scan let go of a file, another request's recovery already put it
+  //    right) is used as it is — unsaved work in it is never thrown away for a passing failure.
+  if (dataDirProblem(dir) === null) {
+    await sleep(retryDelayMs());
+    if (await starts(dir)) return 'retry';
   }
 
-  const changesLost = heldUnsavedChanges(dir);
+  const manifest = format.readCompanyManifest(file) as Record<string, any> | null;
+  if (!manifest) return null;
+  const sealed = format.isSealedManifest(manifest);
   const workDir = path.dirname(dir);
-  const keptAt = path.join(workDir, `damaged copy ${stamp(new Date())}`);
+  const companyName = typeof manifest.companyName === 'string' ? manifest.companyName : undefined;
 
   if (sealed && mode === 'key') {
     // Nobody has signed in yet, and the sign-in of a working copy on this computer reads its users
-    // from that copy. Keep it aside and let the sign-in decrypt the company file instead (its key
-    // slots are in the file's own listing), like opening the file on a new computer.
-    await format.renameWithRetry(dir, keptAt);
-    keepSessionSecret(keptAt, dir);
+    // from that copy. Set it aside and let the sign-in decrypt the company file instead (its key
+    // slots are in the file's own listing), like opening the file on a new computer. The damaged
+    // copy is encrypted once the sign-in knows the key (sealKeptDamagedCopies).
+    const aside = `${dir}.damaged-${Date.now()}`;
+    try {
+      await format.renameWithRetry(dir, aside);
+    } catch {
+      return 'busy';
+    }
+    keepSessionSecret(aside, dir);
+    const kept = await session.keepDamagedCopy(workDir, aside, { companyName, appVersion: APP_VERSION });
     overrideSealedMode('extract');
-    g.__ironbooksRecoveryNotice = noticeFor({ savedAt: manifest.savedAt ?? null, changesLost, keptAt });
-    console.error(`[company-file] the working copy ${dir} would not start; kept at ${keptAt}. The sign-in reopens the company file.`);
+    setNotice(manifest.savedAt ?? null, changesLost, kept);
+    console.error(`[company-file] the working copy ${dir} would not start; kept at ${kept}. The sign-in reopens the company file.`);
     return 'resealed';
   }
 
-  // Unpack the last save next to the working copy and start it once before it replaces anything.
+  let protection: { fileKey: Buffer; keyCheck: string; lookupSalt: string; slots: unknown[] } | null = null;
+  if (sealed) {
+    const { fileKeyFor } = await import('./fileProtection');
+    const fileKey = fileKeyFor(dir);
+    if (!fileKey) return null; // signed in without the key: nothing here can decrypt the file
+    const enc = manifest.encryption ?? {};
+    protection = { fileKey, keyCheck: enc.keyCheck, lookupSalt: enc.lookupSalt, slots: Array.isArray(enc.slots) ? enc.slots : [] };
+  }
+
+  // 2. Unpack the last save next to the working copy and start it once before it replaces anything.
   const tmp = `${dir}.recover-${Date.now()}`;
-  fs.rmSync(tmp, { recursive: true, force: true });
+  const dropTmp = () => {
+    try {
+      fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    } catch {
+      /* a leftover data.recover-<time> is removed with the working copy's cache */
+    }
+  };
+  dropTmp();
   let opened: Record<string, any>;
   try {
-    opened = await format.extractCompanyFile(file, tmp, fileKey ? { fileKey } : {});
+    opened = await format.extractCompanyFile(file, tmp, protection ? { fileKey: protection.fileKey } : {});
   } catch (err) {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    dropTmp();
     console.error('[company-file] the company file could not be unpacked to replace a damaged working copy:', (err as Error)?.message ?? err);
     return null;
   }
-  if (dataDirProblem(tmp) !== null || !(await starts(tmp))) {
-    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  // Books, not an empty folder Postgres would happily make a NEW database in.
+  if (!fs.existsSync(path.join(tmp, 'PG_VERSION')) || dataDirProblem(tmp) !== null || !(await starts(tmp))) {
+    dropTmp();
     console.error(`[company-file] the working copy ${dir} would not start, and neither does the last save of ${file}.`);
     return null;
   }
@@ -250,14 +377,39 @@ async function doRecover(dir: string): Promise<Outcome> {
     const from = path.join(dir, name);
     if (fs.existsSync(from) && !fs.existsSync(path.join(tmp, name))) fs.copyFileSync(from, path.join(tmp, name));
   }
-  // Protected or not as the reopened save is — never as the damaged copy was (a folder marked
+  // Protected or not as the reopened save is, never as the damaged copy was (a folder marked
   // protected whose books are not refuses every save): the marker comes from the file's own key.
   fs.rmSync(path.join(tmp, session.PROTECTED_MARKER), { force: true });
-  if (sealed && manifest.encryption?.keyCheck) {
-    fs.writeFileSync(path.join(tmp, session.PROTECTED_MARKER), JSON.stringify({ keyCheck: manifest.encryption.keyCheck }) + '\n');
+  if (protection?.keyCheck) fs.writeFileSync(path.join(tmp, session.PROTECTED_MARKER), JSON.stringify({ keyCheck: protection.keyCheck }) + '\n');
+
+  // 3. Swap: the damaged copy out, the last save in — and back again if the second step fails, so
+  //    the working copy is never left missing (an empty folder would become a NEW, empty database).
+  const aside = `${dir}.damaged-${Date.now()}`;
+  try {
+    await format.renameWithRetry(dir, aside);
+  } catch {
+    dropTmp();
+    return 'busy';
   }
-  await format.renameWithRetry(dir, keptAt);
-  await format.renameWithRetry(tmp, dir);
+  try {
+    await format.renameWithRetry(tmp, dir);
+  } catch (err) {
+    console.error('[company-file] could not put the reopened save in place; the working copy is back as it was:', (err as Error)?.message ?? err);
+    try {
+      await format.renameWithRetry(aside, dir);
+    } catch (back) {
+      console.error(`[company-file] could not put the working copy back from ${aside}:`, (back as Error)?.message ?? back);
+    }
+    dropTmp();
+    return 'busy';
+  }
+  // Kept for support: an encrypted company file when the books are protected, else the folder.
+  let kept = aside;
+  try {
+    kept = await session.keepDamagedCopy(workDir, aside, { protection, companyName, appVersion: APP_VERSION });
+  } catch (err) {
+    console.error('[company-file] could not file away the damaged copy (left at its temporary name):', (err as Error)?.message ?? err);
+  }
   if (process.env.BKA_COMPANY_STATE) {
     session.writeState(path.dirname(path.resolve(process.env.BKA_COMPANY_STATE)), {
       base: { saveId: opened.saveId ?? manifest.saveId ?? null, savedAt: opened.savedAt ?? manifest.savedAt ?? null, fingerprint: opened.fingerprint ?? null },
@@ -273,8 +425,8 @@ async function doRecover(dir: string): Promise<Outcome> {
   } catch {
     /* not loaded */
   }
-  g.__ironbooksRecoveryNotice = noticeFor({ savedAt: opened.savedAt ?? manifest.savedAt ?? null, changesLost, keptAt });
-  console.error(`[company-file] the working copy ${dir} would not start; kept at ${keptAt} and reopened from ${file}.`);
+  setNotice(opened.savedAt ?? manifest.savedAt ?? null, changesLost, kept);
+  console.error(`[company-file] the working copy ${dir} would not start; kept at ${kept} and reopened from ${file}.`);
   return 'replaced';
 }
 
@@ -287,16 +439,43 @@ function keepSessionSecret(from: string, to: string): void {
 }
 
 /**
- * Sign-in of a protected file whose working copy is already here ('key'): try the working copy
- * first, so one that would not start is set aside BEFORE the sign-in decides how to unlock the
- * file (lib/db getDb runs the recovery; afterwards sealedMode() says 'extract').
+ * The sign-in has the file key now (lib/services/fileProtection.ts doUnseal): encrypt the damaged
+ * copies of protected books that had to be kept in plain text (electron/companySession.js
+ * keepDamagedCopy). Best effort; one that fails is removed by the shell's cleanup in time.
  */
-export async function settleSealedWorkingCopy(): Promise<void> {
-  if (sealedMode() !== 'key') return;
+export async function sealKeptDamagedCopies(dataDir: string, protection: unknown, companyName?: string): Promise<void> {
   try {
-    await withSealedAccess(() => getDb());
+    const done = (await session.sealDamagedCopies(path.dirname(path.resolve(dataDir)), protection, { companyName, appVersion: APP_VERSION })) as Array<{ from: string; to: string }>;
+    for (const d of done) noticeKeptMoved(d.from, d.to);
   } catch (err) {
-    if ((err as ServiceError)?.details && (err as { details: { resealed?: boolean } }).details.resealed) return;
-    throw err;
+    console.warn('[company-file] could not encrypt the damaged copy kept on this computer:', (err as Error)?.message ?? err);
   }
+}
+
+/**
+ * Opening a protected file found unsaved changes here, but in books that would not start
+ * (lib/services/fileProtection.ts doUnseal, 'conflict'): they were kept, encrypted, at `keptAt`
+ * instead of being written out as an "(unsaved changes)" file that would not open either.
+ */
+export function noteDamagedUnsavedChanges(savedAt: string | null, keptAt: string): void {
+  setNotice(savedAt, true, keptAt);
+}
+
+/** Whether an error says the working copy will not start and only a sign-in may recover it. */
+export function needsSignInToRecover(err: unknown): boolean {
+  return Boolean((err as { details?: { needsSignIn?: boolean } })?.details?.needsSignIn);
+}
+
+/**
+ * Sign-in of a protected file whose working copy will not start ('key'), once the typed password
+ * has opened the company file: recover it (lib/db getDb, allowed here only) and return the sign-in
+ * mode to continue with — 'extract' when the copy was set aside, still 'key' when it started after all.
+ */
+export async function recoverSealedWorkingCopy(): Promise<SealedMode | null> {
+  try {
+    await withRecoveryAllowed(() => withSealedAccess(() => getDb()));
+  } catch (err) {
+    if (!(err as { details?: { resealed?: boolean } })?.details?.resealed) throw err;
+  }
+  return sealedMode();
 }
