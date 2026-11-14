@@ -240,7 +240,7 @@ function conflictCopyPath(companyFile, computer, when = new Date()) {
  * folder (`dataDir`) — out as a single company file at `target`. Used to keep unsaved changes
  * that can't be merged, and to pack a restored portable company file.
  */
-async function writeWorkingCopyAs(workDir, target, { companyName, appVersion, fileId, dataDir, protection, allowDamaged } = {}) {
+async function writeWorkingCopyAs(workDir, target, { companyName, appVersion, fileId, dataDir, protection, allowDamaged, dbSchema } = {}) {
   // Books protected with passwords are only ever written encrypted (with their own key and slots).
   if (!protection && isProtectedData(dataDir || dataDirOf(workDir))) {
     const err = new Error('These books are protected with passwords; they can only be copied by the app after someone signs in.');
@@ -274,6 +274,9 @@ async function writeWorkingCopyAs(workDir, target, { companyName, appVersion, fi
       previousSaveId: null,
       savedAt: now,
       appVersion: appVersion || null,
+      // The database layout it holds, when the caller knows it (an older Ironbooks then refuses a
+      // newer one, and the server knows a file with books from one without — lib/db openDb).
+      ...(dbSchema && Number.isFinite(Number(dbSchema.lastMigrationAt)) ? { dbSchema } : {}),
     },
     backupManifest: {
       app: 'bookkeeper-ai',
@@ -302,6 +305,15 @@ function latestMigrationAt(migrationsDir) {
   } catch {
     return null;
   }
+}
+
+/**
+ * The layout stamp of books written out by this app (the newest migration it ships): never lower
+ * than the books' own, so an older Ironbooks refuses rather than downgrades them. Null if unknown.
+ */
+function schemaStampOf(knownSchemaAt) {
+  const at = Number(knownSchemaAt);
+  return Number.isFinite(at) && at > 0 ? { lastMigrationAt: at } : null;
 }
 
 /** The company file's last save was made by a newer Ironbooks (its database layout is newer). */
@@ -347,7 +359,7 @@ async function prepareWorkingCopy(companyFile, { root, onConflict, appVersion, k
     workingFingerprint: dataExists ? logFingerprint(dataDirOf(workDir)) : undefined,
   });
   // Unsaved work made through another path to this same file (mapped drive vs UNC): kept apart.
-  const others = await keepWorkThroughOtherPaths(companyFile, root, manifest, appVersion);
+  const others = await keepWorkThroughOtherPaths(companyFile, root, manifest, appVersion, knownSchemaAt);
   const otherPaths = { otherPathCopies: others.copies, otherPathUnsaved: others.protectedLeft };
   if (format.isSealedManifest(manifest)) return { ...(await prepareSealed(companyFile, { workDir, state, manifest, plan, onConflict })), ...otherPaths };
   let conflictCopy = null;
@@ -368,6 +380,7 @@ async function prepareWorkingCopy(companyFile, { root, onConflict, appVersion, k
         await writeWorkingCopyAs(workDir, conflictCopy, {
           companyName: `${manifest.companyName || format.companyFileBaseName(companyFile)} (unsaved changes)`,
           appVersion,
+          dbSchema: schemaStampOf(knownSchemaAt),
         });
       } catch (err) {
         if (!err || err.code !== 'DAMAGED') throw err;
@@ -456,7 +469,7 @@ function workThroughOtherPaths(companyFile, root, manifest) {
  * protected with passwords are never written out here in plain text (this shell has no key): they
  * are reported instead, and stay where they are. Returns { copies, protectedLeft }.
  */
-async function keepWorkThroughOtherPaths(companyFile, root, manifest, appVersion) {
+async function keepWorkThroughOtherPaths(companyFile, root, manifest, appVersion, knownSchemaAt) {
   const copies = [];
   const protectedLeft = [];
   for (const w of workThroughOtherPaths(companyFile, root, manifest)) {
@@ -469,6 +482,7 @@ async function keepWorkThroughOtherPaths(companyFile, root, manifest, appVersion
       await writeWorkingCopyAs(w.workDir, target, {
         companyName: `${manifest.companyName || format.companyFileBaseName(companyFile)} (unsaved changes)`,
         appVersion,
+        dbSchema: schemaStampOf(knownSchemaAt),
       });
       // Kept once: that working copy no longer counts as unsaved, and is refreshed from the file
       // the next time it is used (base: null) instead of saving the same work a second time.
@@ -525,18 +539,31 @@ async function keepDamagedCopy(workDir, dataDir, { protection, companyName, appV
   if (protection) {
     const target = freePath(base, format.COMPANY_FILE_EXT);
     await writeWorkingCopyAs(workDir, target, { dataDir, protection, companyName: label, appVersion, allowDamaged: true });
-    fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    try {
+      fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    } catch {
+      // The encrypted copy is written, but the plain-text folder is still there (a file was busy):
+      // recorded, so the cleanup removes it in time.
+      recordDamagedPlain(workDir, dataDir);
+    }
     return target;
   }
   const target = freePath(base);
   const plainProtected = isProtectedData(dataDir);
   await format.renameWithRetry(dataDir, target);
-  if (plainProtected) {
-    const st = readState(workDir) || {};
-    const list = Array.isArray(st.damagedPlain) ? st.damagedPlain : [];
-    writeState(workDir, { damagedPlain: [...list, { path: target, at: new Date().toISOString() }] });
-  }
+  if (plainProtected) recordDamagedPlain(workDir, target);
   return target;
+}
+
+/**
+ * Record a plain-text copy of protected books left in `workDir` (keepDamagedCopy): encrypted once
+ * the key is known (sealDamagedCopies), removed after DAMAGED_PLAIN_MAX_AGE_MS otherwise.
+ */
+function recordDamagedPlain(workDir, folder) {
+  const st = readState(workDir) || {};
+  const list = Array.isArray(st.damagedPlain) ? st.damagedPlain : [];
+  if (list.some((i) => i && i.path && pathKey(i.path) === pathKey(folder))) return;
+  writeState(workDir, { damagedPlain: [...list, { path: folder, at: new Date().toISOString() }] });
 }
 
 /**
@@ -672,10 +699,11 @@ function pruneWorkingCopies(root, keep = [], now = Date.now()) {
   const removed = [];
   for (const n of names) {
     const dir = path.join(root, n);
-    if (keepKeys.has(pathKey(dir))) continue;
     const st = readState(dir);
-    // Plain-text damaged copies of protected books never outstay their welcome (keepDamagedCopy).
+    // Plain-text damaged copies of protected books never outstay their welcome (keepDamagedCopy),
+    // in the working folder of the file being opened too.
     if (st && Array.isArray(st.damagedPlain) && st.damagedPlain.length) pruneDamagedPlain(dir, now);
+    if (keepKeys.has(pathKey(dir))) continue;
     // Never throw away unsaved work, whatever its age.
     if (!st || st.unsavedSince) continue;
     // A protected file's plain-text books the app server could not remove right after a clean
@@ -722,6 +750,7 @@ module.exports = {
   conflictCopyPath,
   writeWorkingCopyAs,
   keepDamagedCopy,
+  recordDamagedPlain,
   sealDamagedCopies,
   DAMAGED_PREFIX,
   DAMAGED_PLAIN_MAX_AGE_MS,

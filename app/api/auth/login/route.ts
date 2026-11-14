@@ -152,8 +152,11 @@ async function handlePost(req: NextRequest) {
     try {
       db = sealed === 'key' ? await withSealedAccess(() => getDb()) : await getDb();
     } catch (err) {
-      if (sealed !== 'key' || !needsSignInToRecover(err)) throw err;
-      brokenCopy = true;
+      if (sealed === 'key' && needsSignInToRecover(err)) brokenCopy = true;
+      // A file that cannot be opened right now (busy, missing, damaged): its own plain answer.
+      else if (err instanceof ServiceError) {
+        return NextResponse.json({ error: err.message, code: err.code }, { status: err.code === 'CONFLICT' ? 409 : 403 });
+      } else throw err;
     }
     if (db) {
       const lockGate = await fileLockGate(db, filePassword || undefined, origin);
@@ -182,7 +185,7 @@ async function handlePost(req: NextRequest) {
       }
       // Reopen the company file's last save (lib/services/workingCopyRecovery.ts): the sign-in
       // then decrypts it ('extract'), or uses the working copy if it started after all ('key').
-      sealed = await recoverSealedWorkingCopy();
+      sealed = await recoverSealedWorkingCopy(key);
       if (sealed === 'key') {
         const lockGate = await fileLockGate(await withSealedAccess(() => getDb()), filePassword || undefined, origin);
         if (lockGate.response) return lockGate.response;

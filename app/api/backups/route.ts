@@ -19,6 +19,7 @@ import { withDamagedFileAccess } from '@/lib/db';
 import { requireFileAdmin } from '@/lib/services/access';
 import { ServiceError } from '@/lib/services/errors';
 import {
+  backupFolderIgnoredHere,
   backupFolder,
   defaultBackupFolder,
   readBackupSettings,
@@ -44,6 +45,9 @@ export async function GET() {
         settings: canManage ? settings : { ...settings, folder: null },
         folder: canManage ? backupFolder(settings) : null,
         defaultFolder: canManage ? defaultBackupFolder() : null,
+        // The folder set in the company file was not chosen on this computer, so it is not used here
+        // (lib/services/backupHistory.ts backupFolder) until it is confirmed.
+        folderIgnoredHere: canManage ? backupFolderIgnoredHere(settings) : false,
         canManage,
         status: getBackupStatus(),
         history: canManage ? history : history.map((r) => ({ ...r, path: r.path ? r.filename : null })),
@@ -72,6 +76,7 @@ export async function PUT(req: NextRequest) {
         settings,
         folder: backupFolder(settings),
         defaultFolder: defaultBackupFolder(),
+        folderIgnoredHere: backupFolderIgnoredHere(settings),
         status: getBackupStatus(),
       });
     } catch (err) {

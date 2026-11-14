@@ -119,6 +119,8 @@ interface SaveState {
   lastSaveMs: number;
   lastSaveEndedAt: number;
   inflight: Promise<SaveResult> | null;
+  /** The running save is waiting for a working-copy recovery to finish (it never holds one up). */
+  waitingForRecovery?: boolean;
   status: SaveStatusKind;
   error: string | null;
   conflictCopy: string | null;
@@ -312,22 +314,27 @@ function companyNameFor(s: SaveState, dataDir: string): string {
 /**
  * This computer must still hold the company file's lock (electron/companyLock.js owner.json).
  * Someone else's token: the file was taken over, nothing is saved here again (status 'lost'). No
- * readable owner at all while the folder can be reached (removed, replaced, half-written): taken
- * as lost too, never as "still ours". A folder that cannot be reached right now: this save fails
- * and the autosave tries again.
+ * readable record (it is being replaced through a temporary file and a rename, or the share
+ * hiccupped): read again for a moment, then only THIS save fails (LOCK_UNCONFIRMED) and the
+ * autosave tries again — as the shell's own heartbeat treats it (electron/companyLock.js).
  */
 async function assertLockStillOurs(s: SaveState): Promise<void> {
   if (!s.lockDir || !s.lockToken) return;
-  const owner = readOwner(s.lockDir);
+  let owner = readOwner(s.lockDir);
+  for (let i = 0; !owner && i < LOCK_REREAD_TRIES; i++) {
+    await new Promise((r) => setTimeout(r, LOCK_REREAD_MS));
+    owner = readOwner(s.lockDir);
+  }
   if (owner && owner.token === s.lockToken) return;
-  if (!owner && !fs.existsSync(path.dirname(s.file))) {
-    throw Object.assign(new Error(`Ironbooks can't reach ${path.dirname(s.file)} to check that this computer still has the company file open.`), { code: 'ENOENT' });
+  if (!owner) {
+    throw Object.assign(
+      new Error(`Ironbooks could not confirm just now that this computer still has the company file open (${path.dirname(s.file)}), so this save waits. Your changes are kept on this computer and saved as soon as it can.`),
+      { code: 'LOCK_UNCONFIRMED' },
+    );
   }
   s.status = 'lost';
-  const who = owner ? owner.appUser || owner.osUser : null;
-  s.error = owner
-    ? `${who ? `${who} on ` : ''}${owner.computer ?? 'another computer'} has opened this company file since this computer last saved it, so Ironbooks stopped saving here to protect their work. Your changes are kept on this computer.`
-    : 'Ironbooks can no longer confirm that this computer has the company file open (its "in use" record is gone or unreadable), so it stopped saving here to protect anyone else\'s work. Your changes are kept on this computer.';
+  const who = owner.appUser || owner.osUser;
+  s.error = `${who ? `${who} on ` : ''}${owner.computer ?? 'another computer'} has opened this company file since this computer last saved it, so Ironbooks stopped saving here to protect their work. Your changes are kept on this computer.`;
   // What is here and not in the company file stays recorded as unsaved — also changes no autosave
   // check has seen yet (the close-time save) — so the next open here keeps them apart.
   const fp = currentFingerprint(s.dataDir);
@@ -337,6 +344,10 @@ async function assertLockStillOurs(s: SaveState): Promise<void> {
   }
   throw Object.assign(new Error(s.error), { code: 'LOCK_LOST' });
 }
+
+/** A missing or unreadable lock record is read again this often before a save gives up for now. */
+const LOCK_REREAD_TRIES = 5;
+const LOCK_REREAD_MS = 100;
 
 function readOwner(lockDir: string): { token?: string; computer?: string; appUser?: string; osUser?: string } | null {
   try {
@@ -384,6 +395,16 @@ export async function saveCompanyFile(opts: { force?: boolean; final?: boolean; 
 }
 
 /**
+ * Resolves once no save is writing out of the working copy (lib/services/workingCopyRecovery.ts
+ * waits for it before it judges the folder). A save that is itself waiting for a recovery does not
+ * count: it snapshots nothing until the recovery is done.
+ */
+export async function whenNoSaveWriting(): Promise<void> {
+  const s = g.__ironbooksCompanyFileSave;
+  while (s?.inflight && !s.waitingForRecovery) await s.inflight.catch(() => undefined);
+}
+
+/**
  * What a save of the working copy is sealed with: the file key and the current key slots of a
  * protected company file, or null for a file without passwords. Read from the open database; a
  * closed one (the close-time save after the database was closed, a sandbox) uses the slots of the
@@ -411,7 +432,12 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
   // nothing is saved out of it meanwhile; the close-time save waits for it.
   if (isRecoveryInProgress()) {
     if (!opts.final) return { saved: false, outcome: 'unchanged' };
-    await whenRecoveryDone();
+    s.waitingForRecovery = true;
+    try {
+      await whenRecoveryDone();
+    } finally {
+      s.waitingForRecovery = false;
+    }
   }
 
   // Still ours? (A computer that slept past the lock's stale time may have lost it.)
@@ -486,6 +512,12 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
       fingerprint = currentFingerprint(dataDir);
       // A copy kept apart is a separate company file: it never carries this file's backup history
       // (its own rotation would delete this file's backup versions).
+      // A recovery that started while this save was on its way (it checks before judging the
+      // folder, and waits for a save that is already writing): never a snapshot of what it is
+      // replacing. Checked in the same synchronous turn as the snapshot itself.
+      if (isRecoveryInProgress()) {
+        throw Object.assign(new Error('Ironbooks is reopening the company file; this save waits for it.'), { code: 'RECOVERING' });
+      }
       entries = conflict ? withoutBackupHistory(format.snapshotDir(dataDir)) : format.snapshotDir(dataDir);
       // Never write books that would not start over the company file (or its "unsaved changes"
       // copy) — nor no books at all over a file that has some: the last good save is what a
@@ -631,8 +663,14 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
     noteUnsaved(s, Date.now(), true);
     // Taken over while this save was being written (assertLockStillOurs): it stays 'lost'.
     if ((err as { code?: string })?.code === 'LOCK_LOST') throw err;
+    // A recovery is reopening the working copy: nothing went wrong, the changes stay unsaved.
+    if ((err as { code?: string })?.code === 'RECOVERING') {
+      s.status = 'unsaved';
+      throw err;
+    }
     s.status = 'error';
-    s.error = (err as { code?: string })?.code === 'SAVED_ELSEWHERE' ? (err as Error).message : friendlyIoError(err, s.file);
+    const code = (err as { code?: string })?.code;
+    s.error = code === 'SAVED_ELSEWHERE' || code === 'LOCK_UNCONFIRMED' ? (err as Error).message : friendlyIoError(err, s.file);
     throw err;
   }
 }

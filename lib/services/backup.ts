@@ -812,9 +812,27 @@ async function restoreBackupInto(dir: string, buffer: Buffer, opts: { credential
           `Ironbooks could not make its usual safety backup of the books this restore replaced, so it kept them instead: ${kept}. Once you are sure the restored books are right, you can delete it.`,
         );
       } catch (err) {
-        console.error('[backup] could not file away the books the restore replaced (left at their temporary name):', err);
+        console.error('[backup] could not file away the books the restore replaced:', err);
+        // At least a name the working-copy cleanup never removes (data.pre-restore-<time> is one it
+        // does, electron/companySession.js isCacheEntry): they are the only copy left.
+        let where = preRestoreDir;
+        const keepName = `${dir} kept before restore ${Date.now()}`;
+        try {
+          fs.renameSync(preRestoreDir, keepName);
+          where = keepName;
+          // Protected books left in plain text in a working folder: recorded for the cleanup.
+          if (protection && process.env.BKA_COMPANY_STATE) {
+            try {
+              session.recordDamagedPlain(path.dirname(path.resolve(process.env.BKA_COMPANY_STATE)), keepName);
+            } catch {
+              /* the state file is busy */
+            }
+          }
+        } catch (renameErr) {
+          console.error('[backup] could not rename them either (left at their temporary name):', renameErr);
+        }
         notices.push(
-          `Ironbooks could not make its usual safety backup of the books this restore replaced, so it kept them instead: ${preRestoreDir}. Once you are sure the restored books are right, you can delete it.`,
+          `Ironbooks could not make its usual safety backup of the books this restore replaced, so it kept them instead: ${where}. Once you are sure the restored books are right, you can delete it.`,
         );
       }
     }

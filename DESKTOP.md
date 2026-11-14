@@ -58,7 +58,10 @@ backup), then the embedded database folder with its attachments and transaction 
 Nothing that comes in with a file is trusted to act on this computer: its backup history only
 lets a rotation delete files named like this file's backups, with the recorded name and size, in a
 folder this computer backs up to; a backup folder set in it is used only once it has been chosen on
-this computer (a per-computer list in the default backup folder); and unpacking stops at each
+this computer (a per-computer list in the default backup folder) or, for a local folder, when this
+file's own backups are already in it — a network folder (UNC or a mapped drive) is never looked at
+before it is confirmed in Back Up and Restore, and the attention list says when one is being
+ignored; and unpacking stops at each
 entry's declared size, with every entry and the total capped (`electron/companyFileFormat.js`).
 
 **Opening** (`electron/main.js` `openSingleFileForLaunch`):

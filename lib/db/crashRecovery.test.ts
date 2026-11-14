@@ -183,3 +183,43 @@ describe('the quick start check', () => {
     expect(pgData.checkSnapshot([{ name: 'bookkeeper-company.json', data: Buffer.from('{}') }, { name: '.file-id', data: Buffer.from('x') }]).ok).toBeNull();
   });
 });
+
+describe('a working copy whose database is gone', () => {
+  it('is never replaced by a new, empty database when the company file holds books, recorded layout or not', async () => {
+    const format = require('../../electron/companyFileFormat.js');
+    const session = require('../../electron/companySession.js');
+    const books = path.join(ROOT, 'books-src');
+    const pg = new PGlite(books);
+    await pg.exec('create table t (id int); insert into t values (1);');
+    await pg.close();
+    // Written out without a recorded layout (a restored backup, a portable pack, an older version).
+    const file = path.join(ROOT, 'No Stamp.ironbooks');
+    await session.writeWorkingCopyAs(path.join(ROOT, 'no-stamp-work'), file, { dataDir: books, companyName: 'No Stamp' });
+    expect(format.readCompanyManifest(file).dbSchema).toBeUndefined();
+    expect(format.companyFileHoldsBooks(file)).toBe(true);
+    // With the layout known, it is recorded.
+    const stamped = path.join(ROOT, 'Stamped.ironbooks');
+    await session.writeWorkingCopyAs(path.join(ROOT, 'stamped-work'), stamped, { dataDir: books, dbSchema: { migrations: 3, lastMigrationAt: 1781400066000 } });
+    expect(format.readCompanyManifest(stamped).dbSchema).toEqual({ migrations: 3, lastMigrationAt: 1781400066000 });
+    // A brand-new company file has no books yet.
+    const fresh = path.join(ROOT, 'Fresh.ironbooks');
+    await format.writeCompanyFile(fresh, { manifest: { formatVersion: 1, fileId: 'f', companyName: 'Fresh', saveId: 'new', savedAt: 'x' }, entries: [{ name: '.file-id', data: Buffer.from('f') }] });
+    expect(format.companyFileHoldsBooks(fresh)).toBe(false);
+
+    const empty = path.join(ROOT, 'lost-working-copy');
+    fs.mkdirSync(empty, { recursive: true });
+    const prev = { file: process.env.BKA_COMPANY_FILE, data: process.env.BKA_DATA_DIR, state: process.env.BKA_COMPANY_STATE };
+    process.env.BKA_COMPANY_FILE = file;
+    process.env.BKA_DATA_DIR = empty;
+    delete process.env.BKA_COMPANY_STATE;
+    try {
+      await expect(getDb()).rejects.toThrow(/copy of your books on this computer is missing/);
+      expect(fs.existsSync(path.join(empty, 'PG_VERSION'))).toBe(false);
+    } finally {
+      for (const [k, v] of [['BKA_COMPANY_FILE', prev.file], ['BKA_DATA_DIR', prev.data], ['BKA_COMPANY_STATE', prev.state]] as const) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  }, 120_000);
+});

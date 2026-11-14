@@ -1026,6 +1026,33 @@ function firstStoredEntry(head, n) {
   return { name, data: head.subarray(start, start + csize) };
 }
 
+/**
+ * Does a company file hold books (a database)? A protected one always does (its protection lives
+ * in the database); a plain one when its listing has PG_VERSION or its manifest records a layout.
+ * lib/db openDb: a working copy without a database is then a lost copy, never a new company.
+ */
+function companyFileHoldsBooks(filePath) {
+  const m = readCompanyManifest(filePath);
+  if (!m) return false;
+  if (isSealedManifest(m) || m.dbSchema) return true;
+  let fd;
+  try {
+    fd = fs.openSync(filePath, 'r');
+    const reader = syncFileReader(fd, fs.fstatSync(fd).size);
+    return readDirectorySync(reader).some((e) => e.name === 'PG_VERSION');
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
 /** Read a plain (stored) manifest entry by name, through a synchronous reader; null if absent. */
 function readStoredEntrySync(reader, list, name) {
   const e = list.find((x) => x.name === name);
@@ -1490,6 +1517,10 @@ function unsealArchiveSync(buffer, fileKey) {
   const index = readSealedIndexSync(reader, list, head.manifest, fileKey, head.name);
   const key = entriesKeyOf(head.manifest, fileKey);
   const byZ = new Map(list.map((e) => [e.name, e]));
+  // Every entry is inflated into memory: none, and not all together, may claim more than a company
+  // file can hold (the index's own sizes, and the sealed entries that carry them).
+  checkSizes(list);
+  checkSizes(index.entries.filter((r) => r && typeof r.name === 'string' && !r.dir).map((r) => ({ name: r.name, size: r.size })));
   const entries = [];
   for (const row of index.entries) {
     if (!row || typeof row.name !== 'string') continue;
@@ -1533,6 +1564,8 @@ async function sealedBackupAsCompanyFile(bkaPath, target, { manifest, knownSchem
       encryption: head.manifest.encryption,
     };
     const entries = [{ name: COMPANY_MANIFEST_ENTRY, data: Buffer.from(JSON.stringify(plain, null, 2), 'utf8'), store: true }];
+    // Copied through memory: capped like any unpacking.
+    checkSizes(list.filter((e) => e.name.startsWith(SEALED_PREFIX)));
     for (const e of list) {
       if (!e.name.startsWith(SEALED_PREFIX)) continue;
       entries.push({ name: e.name, data: await inflateBytes(await readEntryBytes(reader, e), e), store: true });
@@ -1580,6 +1613,7 @@ module.exports = {
   renameWithRetry,
   readCentralDirectory,
   readCompanyManifest,
+  companyFileHoldsBooks,
   readArchiveHead,
   isSealedManifest,
   isCompanyFile,

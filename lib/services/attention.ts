@@ -55,7 +55,7 @@ import { canSeeTodoLink } from './todos';
 import { requireFileAdmin, requirePermission } from './access';
 import { isConfigured as emailIsConfigured, sendMail } from './email';
 import { EMAIL_NOT_SET_UP_MESSAGE, senderMergeFields } from './emailSettings';
-import { lastFullBackup, readBackupHistory } from './backupHistory';
+import { backupFolderIgnoredHere, lastFullBackup, readBackupHistory, readBackupSettings } from './backupHistory';
 import { runVersionedBackup } from './backupSchedule';
 import { buildInvoicePdf } from '@/lib/pdf/forms';
 import { ATTENTION_KINDS, UUID_RE, parseAttentionKey, type AttentionKind } from '@/lib/attentionKinds';
@@ -806,9 +806,30 @@ const backupSource: Source = async ({ ctx, today, companyCreatedAt, dataDir, tim
   const last = instantDay(newestFull?.at ?? null, timeZone);
   const since = last ?? instantDay(companyCreatedAt, timeZone) ?? today;
   const age = daysBetween(since, today);
-  if (age <= BACKUP_STALE_DAYS) return { items: [] };
+  // The backup folder set in this company file was chosen on another computer, so this computer's
+  // backups go to its default folder until someone confirms it here (backupHistory.ts backupFolder).
+  const settings = readBackupSettings(dataDir);
+  const ignored = settings.folder && backupFolderIgnoredHere(settings, dataDir) ? settings.folder : null;
+  const folderItems = ignored
+    ? [
+        item({
+          key: `backup_folder:${ignored}`,
+          kind: 'backup',
+          title: 'Check where backups go on this computer',
+          detail: `This company file names a backup folder (${ignored}) that was not chosen on this computer, so backups made here go to this computer's usual backup folder instead. Open Back Up and Restore to use that folder here too, or choose another.`,
+          amount: null,
+          date: null,
+          urgency: 1,
+          href: '/backup',
+          action: { type: 'open', label: 'Backup settings', href: '/backup' },
+          data: { folder: ignored },
+        }),
+      ]
+    : [];
+  if (age <= BACKUP_STALE_DAYS) return { items: folderItems };
   return {
     items: [
+      ...folderItems,
       item({
         key: `backup:${last ?? 'never'}`,
         kind: 'backup',

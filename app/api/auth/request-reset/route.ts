@@ -22,6 +22,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import crypto from 'node:crypto';
 import { eq, ne } from 'drizzle-orm';
+import { needsSignInToRecover, recoverSealedWorkingCopy } from '@/lib/services/workingCopyRecovery';
 import { getDb, resolveDataDir, sealedMode, withSealedAccess } from '@/lib/db';
 import { users } from '@/lib/db/schema';
 import { hasValidUnlockCookie, verifyPassword } from '@/lib/auth';
@@ -76,31 +77,56 @@ export async function POST(req: NextRequest) {
   };
   try {
     const offlineLocal = process.env.BKA_OFFLINE === '1' && !origin.remote;
-    const sealed = sealedMode();
+    let sealed = sealedMode();
     let db;
-    if (sealed === 'extract' || sealed === 'conflict') {
-      // Not decrypted yet: the question is in the file's challenge slot, and the answer opens it.
+    /**
+     * Not decrypted yet (or the working copy here will not start): the question is in the file's
+     * challenge slot, and only the answer that opens the company file goes on. Returns the key, or
+     * the answer to send back.
+     */
+    const keyFromFileChallenge = async (): Promise<{ key: Buffer } | { response: NextResponse }> => {
       if (!offlineLocal) {
         fail();
-        return NextResponse.json(generic);
+        return { response: NextResponse.json(generic) };
       }
       const question = sealedChallengeQuestion(email);
       if (!question) {
         fail();
         await unlockFromFile({ kind: 'challenge', login: email, secret: challengeAnswer || 'x' }); // same work either way
-        return NextResponse.json({ error: PROTECTED_NO_CHALLENGE_MESSAGE, code: 'FORBIDDEN' }, { status: 403 });
+        return { response: NextResponse.json({ error: PROTECTED_NO_CHALLENGE_MESSAGE, code: 'FORBIDDEN' }, { status: 403 }) };
       }
-      if (!challengeAnswer.trim()) return NextResponse.json({ ok: false, challengeQuestion: question });
+      if (!challengeAnswer.trim()) return { response: NextResponse.json({ ok: false, challengeQuestion: question }) };
       const key = await unlockFromFile({ kind: 'challenge', login: email, secret: challengeAnswer });
       if (!key) {
         fail();
-        return NextResponse.json({ error: WRONG_ANSWER_MESSAGE, code: 'FORBIDDEN', challengeQuestion: question }, { status: 403 });
+        return { response: NextResponse.json({ error: WRONG_ANSWER_MESSAGE, code: 'FORBIDDEN', challengeQuestion: question }, { status: 403 }) };
       }
-      await unsealCompanyFile(key);
+      return { key };
+    };
+    if (sealed === 'key') {
+      try {
+        db = await withSealedAccess(() => getDb());
+      } catch (err) {
+        if (!needsSignInToRecover(err)) throw err;
+        // The working copy here will not start: once the answer has opened the company file, set
+        // the copy aside and reopen the file's last save (lib/services/workingCopyRecovery.ts).
+        const got = await keyFromFileChallenge();
+        if ('response' in got) return got.response;
+        sealed = await recoverSealedWorkingCopy(got.key);
+        if (sealed === 'extract' || sealed === 'conflict') {
+          await unsealCompanyFile(got.key);
+          limiter.recordSuccess(keys.slice(0, -1));
+          db = await getDb();
+        } else {
+          db = await withSealedAccess(() => getDb()); // it started after all
+        }
+      }
+    } else if (sealed === 'extract' || sealed === 'conflict') {
+      const got = await keyFromFileChallenge();
+      if ('response' in got) return got.response;
+      await unsealCompanyFile(got.key);
       limiter.recordSuccess(keys.slice(0, -1));
       db = await getDb();
-    } else if (sealed === 'key') {
-      db = await withSealedAccess(() => getDb());
     } else {
       db = await getDb();
     }

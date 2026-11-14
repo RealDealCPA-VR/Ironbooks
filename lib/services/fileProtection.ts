@@ -48,7 +48,7 @@ import { and, eq } from 'drizzle-orm';
 import fileCrypto from '@/electron/fileCrypto';
 import format from '@/electron/companyFileFormat';
 import session from '@/electron/companySession';
-import { getDb, resolveDataDir, withDamagedFileAccess, type DB } from '@/lib/db';
+import { getDb, resolveDataDir, shippedSchemaStamp, withDamagedFileAccess, type DB } from '@/lib/db';
 import { markUnsealed, sealedDataDir, sealedMode } from '@/lib/db/sealed';
 import { companies, fileKeySlots, fileProtection, userCompanies, users } from '@/lib/db/schema';
 import { verifyPassword } from '@/lib/auth';
@@ -1082,6 +1082,7 @@ async function doUnseal(fileKey: Buffer): Promise<void> {
         companyName: `${m.companyName || format.companyFileBaseName(file)} (unsaved changes)`,
         appVersion: APP_VERSION,
         protection,
+        dbSchema: shippedSchemaStamp(),
       });
       keyState().conflictCopy = target;
     } catch (err) {

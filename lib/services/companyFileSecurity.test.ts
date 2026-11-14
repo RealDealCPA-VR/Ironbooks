@@ -308,21 +308,36 @@ describe('6. a save overtaken while it was being written', () => {
     expect(fmt.readCompanyManifest(FILE).saveId).toBe(theirs);
   }, 120_000);
 
-  it('the lock was taken over meanwhile, or its record vanished: nothing replaces the company file', async () => {
-    for (const scenario of ['taken-over', 'vanished'] as const) {
-      const before = fmt.readCompanyManifest(FILE).saveId;
-      const ownerFile = path.join(lock!.dir, 'owner.json');
-      const original = fs.readFileSync(ownerFile, 'utf8');
-      await expect(
-        saveWhile(() => {
-          if (scenario === 'taken-over') fs.writeFileSync(ownerFile, JSON.stringify({ ...JSON.parse(original), token: 'someone-else', computer: 'FRONT-DESK' }));
-          else fs.rmSync(ownerFile);
-        }),
-      ).rejects.toMatchObject({ code: 'LOCK_LOST' });
-      expect(fmt.readCompanyManifest(FILE).saveId).toBe(before);
-      expect(getCompanyFileSaveStatus().status).toBe('lost');
-      fs.writeFileSync(ownerFile, original);
-      resetCompanyFileSaveState();
-    }
+  it('the lock was taken over meanwhile: nothing replaces the company file, and nothing is saved here again', async () => {
+    const before = fmt.readCompanyManifest(FILE).saveId;
+    const ownerFile = path.join(lock!.dir, 'owner.json');
+    const original = fs.readFileSync(ownerFile, 'utf8');
+    await expect(
+      saveWhile(() => {
+        fs.writeFileSync(ownerFile, JSON.stringify({ ...JSON.parse(original), token: 'someone-else', computer: 'FRONT-DESK' }));
+      }),
+    ).rejects.toMatchObject({ code: 'LOCK_LOST' });
+    expect(fmt.readCompanyManifest(FILE).saveId).toBe(before);
+    expect(getCompanyFileSaveStatus().status).toBe('lost');
+    fs.writeFileSync(ownerFile, original);
+    resetCompanyFileSaveState();
+  }, 120_000);
+
+  it('a lock record unreadable for a moment is read again; one gone for longer fails only that save', async () => {
+    const ownerFile = path.join(lock!.dir, 'owner.json');
+    const original = fs.readFileSync(ownerFile, 'utf8');
+    // Replaced through a temporary file and a rename by the shell's heartbeat: back 150 ms later.
+    const back = await saveWhile(() => {
+      fs.rmSync(ownerFile);
+      setTimeout(() => fs.writeFileSync(ownerFile, original), 150);
+    });
+    expect(back).toMatchObject({ saved: true }); // (into the separate copy since the save above)
+    // Gone for longer: this save waits (nothing replaced), the status is not "lost", the next one saves.
+    const before = fmt.readCompanyManifest(FILE).saveId;
+    await expect(saveWhile(() => fs.rmSync(ownerFile))).rejects.toMatchObject({ code: 'LOCK_UNCONFIRMED' });
+    expect(fmt.readCompanyManifest(FILE).saveId).toBe(before);
+    expect(getCompanyFileSaveStatus().status).not.toBe('lost');
+    fs.writeFileSync(ownerFile, original);
+    expect(await saveCompanyFile({ force: true })).toMatchObject({ saved: true });
   }, 120_000);
 });
