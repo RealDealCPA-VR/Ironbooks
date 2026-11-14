@@ -46,6 +46,7 @@ import {
   writeAudit,
 } from './_base';
 import { postJournalEntry, voidJournalEntry } from './posting';
+import { assertListDeleteAllowed } from './accountantCopy/guard';
 import { maskForContext } from './access';
 import {
   computeEmployerTaxes,
@@ -399,6 +400,8 @@ export async function updateEmployee(
 ) {
   const existing = await getEmployee(ctx, id);
 
+  // Accountant's Copy: list entries can't be made inactive while a copy is out (guard.ts).
+  if (input.isActive === false && existing.isActive) await assertListDeleteAllowed(ctx, 'delete', 'employees');
   const updates: Partial<typeof employees.$inferInsert> = {};
 
   if (input.firstName !== undefined) {

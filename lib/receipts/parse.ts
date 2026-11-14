@@ -51,8 +51,11 @@ export interface ParseOptions {
  * Money tokens: $1,234.56 · 1234.56 · 1 234,56 € · (12.50) · 12.50- · USD 9.99 · 9,99.
  * Requires exactly two decimals so quantities, store numbers and phone numbers never match.
  */
+// Thousands grouping must differ from the decimal mark, and a SPACE groups thousands only with a
+// decimal comma ("1 234,56"): with a decimal point, "TOTAL 2 125.00" is a count of 2 then 125.00,
+// not 2125.00 (OCR text is single-spaced).
 const MONEY_RE =
-  /(?:^|[^\d.,])(\(?-?)\s*(?:[$€£¥]|USD|CAD|EUR|GBP|AUD)?\s*(\d{1,3}(?:[,. \u00a0]\d{3})+|\d+)([.,])(\d{2})(?!\d)(?:\s*(\)|-|CR\b))?/gi;
+  /(?:^|[^\d.,])(\(?-?)\s*(?:[$€£¥]|USD|CAD|EUR|GBP|AUD)?\s*(\d{1,3}(?:,\d{3})+(?=\.\d{2})|\d{1,3}(?:[. \u00a0]\d{3})+(?=,\d{2})|\d+)([.,])(\d{2})(?!\d)(?:\s*(\)|-|CR\b))?/gi;
 
 /** Every money amount on a line, left to right, as 2dp strings (negative when shown so). */
 export function amountsInLine(line: string): string[] {
@@ -258,7 +261,8 @@ const BRANDS: Array<[RegExp, string]> = [
 function findCard(lines: string[]): { last4: string | null; brand: string | null; confidence: number } {
   const patterns: Array<[RegExp, number]> = [
     // ************4417 · XXXX XXXX XXXX 4417 · ....4417 · •••• 4417
-    [/(?:[*xX•.#]{2,}[\s-]*){1,4}(\d{4})(?!\d)/, 0.95],
+    // (Not an amount after a dot leader: "Total ........ 1045.00".)
+    [/(?:[*xX•.#]{2,}[\s-]*){1,4}(\d{4})(?!\d)(?![.,]\d{2})/, 0.95],
     // ending in 4417 · ends with 4417 · last 4: 4417 · last four digits 4417
     [/(?:ending\s*(?:in|with)?|ends\s*(?:in|with)|last\s*(?:4|four)(?:\s*digits)?)\s*[:#]?\s*(\d{4})(?!\d)/i, 0.9],
     // Card # 4417 · Acct: 4417 · VISA 4417 · AMEX x1234

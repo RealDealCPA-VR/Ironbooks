@@ -27,6 +27,7 @@
  * company already has any payroll items.
  */
 import { systemAccountIdByCodeOrNull } from './accountRoles';
+import { assertListDeleteAllowed } from './accountantCopy/guard';
 import { and, asc, eq, inArray } from 'drizzle-orm';
 import { Money } from '@/lib/money';
 import { accounts, payrollItems } from '@/lib/db/schema';
@@ -293,6 +294,8 @@ export async function updatePayrollItem(
   input: UpdatePayrollItemInput,
 ) {
   const existing = await getPayrollItem(ctx, id);
+  // Accountant's Copy: list entries can't be made inactive while a copy is out (guard.ts).
+  if (input.isActive === false && existing.isActive) await assertListDeleteAllowed(ctx, 'delete', "payroll items");
 
   const updates: Partial<typeof payrollItems.$inferInsert> = {};
 

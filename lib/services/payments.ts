@@ -46,7 +46,7 @@ import {
   validation,
   writeAudit,
 } from './_base';
-import { assertNotControlAccount, postJournalEntry, postPaymentCreditFxPlugs, voidJournalEntry } from './posting';
+import { assertNotControlAccount, postJournalEntry, postPaymentCreditFxPlugs, voidJournalEntry, type PostingLine } from './posting';
 import { armReconciledRepost, confirmReconciledRepost } from './reconciledEdits';
 import { paymentCreditEvents, unappliedAsOf } from './customerCredits'; // p1 fx
 import { assertPeriodOpen, recordClosingDateException } from './fiscalPeriods';
@@ -56,6 +56,7 @@ import { docRef } from './docNumbers';
 import { removePaymentFromDeposit } from './deposits';
 import { assertForeignCurrencyAllowed, effectiveHomeCurrency } from './multiCurrency';
 import { foreignCode } from './fxLines';
+import { currencyRate, exchangeGainLossLine, toHome } from './exchangeRates';
 import { computeDiscount, findTermsRef, type TermsLike, type TermsRow } from './lists/terms';
 import { getOrCreateExchangeGainLossAccount } from './currencies';
 import {
@@ -1746,7 +1747,10 @@ export async function updatePayment(ctx: ServiceContext, id: string, input: Rece
   // moved since, which would change the home amount the deposit took out of Undeposited Funds).
   const typedInput = input;
   const rateTyped = !(input.exchangeRate === undefined || input.exchangeRate === null || String(input.exchangeRate).trim() === '');
-  if (deposit && !takeOut && !rateTyped) {
+  // Any foreign payment edited without a rate (same customer, so same currency) keeps its booked
+  // rate, as invoices, deposits and vendor credits do — re-pricing at today's list rate silently
+  // changed its realized gain / loss and bank value.
+  if (!rateTyped && ((deposit && !takeOut) || (payment.currency && input.customerId === payment.customerId))) {
     input = { ...input, exchangeRate: payment.exchangeRate };
   }
   if (deposit && !takeOut) await assertDepositedEditAllowed(ctx, payment, deposit, input);
@@ -2432,6 +2436,8 @@ export interface RefundPaymentInput {
   amount: string | number;
   date?: Date | null;
   memo?: string | null;
+  /** Foreign payment: the rate the refund is paid at (blank = the payment's own rate). */
+  exchangeRate?: string | number | null;
 }
 
 /**
@@ -2445,7 +2451,9 @@ export interface RefundPaymentInput {
  *
  * The unapplied remainder was credited to A/R at the settlement rate when the
  * payment was received, so debiting A/R at the same rate clears it exactly:
- * A/R control stays equal to the open-invoice / open-credit subledger.
+ * A/R control stays equal to the open-invoice / open-credit subledger. With a typed refund rate
+ * the bank pays at THAT rate (what it actually cost in home currency) and the difference is a
+ * realized exchange gain / loss, as for a vendor credit refund (vendorCreditsFx).
  */
 export async function refundPayment(ctx: ServiceContext, input: RefundPaymentInput) {
   // Load + validate in the same transaction as the write (no double refund of one overpayment).
@@ -2521,26 +2529,37 @@ async function refundPaymentInTx(ctx: ServiceContext, input: RefundPaymentInput)
     }
   }
 
+  // A foreign refund paid at a typed rate (what the bank actually paid out): the bank is credited
+  // at that rate and the difference is a realized exchange gain / loss. Without one it is paid at
+  // the payment's own rate (the credit's booked value, telescoped as above).
+  const typedRate = input.exchangeRate != null && String(input.exchangeRate).trim() !== '' ? input.exchangeRate : null;
+  const fx = typedRate != null && payment.currency ? await currencyRate(ctx, payment.currency, typedRate) : null;
+  const bankHome = fx?.currency && !fx.rate.equals(rate) ? toHome(amount, fx.rate) : baseAmount;
+  if (!bankHome.greaterThan(0)) throw validation('This refund is too small to convert to your home currency.');
+
   return inTransaction(ctx, async (tx) => {
+    const lines: PostingLine[] = [
+      {
+        accountId: arAccountId,
+        debit: toAmountString(baseAmount),
+        memo: 'Customer overpayment refunded',
+        controlLine: true,
+      },
+      {
+        accountId: input.bankAccountId,
+        credit: toAmountString(bankHome),
+        memo: 'Refund paid to customer',
+        // p1 fx: refunded from a bank in the payment's currency -> register shows the foreign amount.
+        ...(payment.currency && bankAcct.currency === payment.currency ? { foreignAmount: toAmountString(amount) } : {}),
+      },
+    ];
+    const fxLine = await exchangeGainLossLine(tx, baseAmount.minus(bankHome));
+    if (fxLine) lines.push(fxLine);
     const entry = await postJournalEntry(tx, {
       date: refundDate,
       description: input.memo ?? 'Refund of unapplied customer payment',
       sourceRef: `refund:${input.paymentId}`,
-      lines: [
-        {
-          accountId: arAccountId,
-          debit: toAmountString(baseAmount),
-          memo: 'Customer overpayment refunded',
-          controlLine: true,
-        },
-        {
-          accountId: input.bankAccountId,
-          credit: toAmountString(baseAmount),
-          memo: 'Refund paid to customer',
-          // p1 fx: refunded from a bank in the payment's currency -> register shows the foreign amount.
-          ...(payment.currency && bankAcct.currency === payment.currency ? { foreignAmount: toAmountString(amount) } : {}),
-        },
-      ],
+      lines,
     });
 
     const newUnapplied = Money.round2(unapplied.minus(amount));

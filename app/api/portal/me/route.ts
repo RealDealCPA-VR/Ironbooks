@@ -33,6 +33,14 @@ export async function GET() {
     .orderBy(desc(paychecks.payDate));
   return NextResponse.json({
     employee: { id: emp.id, name: `${emp.firstName} ${emp.lastName}`, email: emp.email, payType: emp.payType },
-    paychecks: rows.map((r) => r.paycheck),
+    // Only what the portal shows: the employer's memo, check number, run and ledger ids stay internal.
+    paychecks: rows.map(({ paycheck: c }) => ({
+      id: c.id,
+      payDate: c.payDate,
+      periodStart: c.periodStart,
+      periodEnd: c.periodEnd,
+      grossPay: c.grossPay,
+      netPay: c.netPay,
+    })),
   });
 }

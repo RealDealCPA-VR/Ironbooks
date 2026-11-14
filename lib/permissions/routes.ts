@@ -605,7 +605,7 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   // ---- Employees & payroll ----
   '/api/employees': r('payroll', 'GET POST'),
   '/api/employees/[id]': r('payroll', 'GET PATCH'),
-  '/api/employees/[id]/portal-password': r('payroll', 'POST:modify'),
+  '/api/employees/[id]/portal-password': r('payroll', 'POST:modify DELETE:modify'),
   '/api/payroll-items': r('payroll', 'GET POST'),
   '/api/payroll-items/[id]': r('payroll', 'GET PATCH'),
   '/api/payroll': r('payroll', 'GET POST'),

@@ -18,7 +18,7 @@
  * `mode` is authoritative (migration 0031 back-filled it).
  */
 
-import { and, eq, lte } from 'drizzle-orm';
+import { and, eq, inArray, lte } from 'drizzle-orm';
 import { recurringTemplates, customers, vendors, items, accounts, salesTaxCodes, classes } from '@/lib/db/schema';
 import {
   type ServiceContext,
@@ -206,11 +206,13 @@ function payloadOf(template: Record<string, unknown>): Record<string, unknown> {
 
 /**
  * Add calendar months keeping the day of the month, clamped to the month's last day (Jan 31 +
- * 1 month = Feb 28/29, never Mar 3 — a plain setMonth overflows into the next month).
+ * 1 month = Feb 28/29, never Mar 3 — a plain setMonth overflows into the next month). With the
+ * template's day of the month (`anchorDay`) a clamped date returns to it: Jan 31 → Feb 28 →
+ * Mar 31, not Mar 28 and the 28th for ever after.
  */
-function addMonthsClamped(date: Date, months: number): Date {
+function addMonthsClamped(date: Date, months: number, anchorDay?: number | null): Date {
   const d = new Date(date);
-  const dayOfMonth = d.getUTCDate();
+  const dayOfMonth = monthDayAnchor(d, anchorDay);
   d.setUTCDate(1);
   d.setUTCMonth(d.getUTCMonth() + months);
   const lastDay = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
@@ -220,6 +222,19 @@ function addMonthsClamped(date: Date, months: number): Date {
 
 function lastDayOfMonth(y: number, m: number): number {
   return new Date(Date.UTC(y, m + 1, 0)).getUTCDate();
+}
+
+/** Schedules that step by whole months (and keep a day of the month). */
+const MONTHLY_FREQUENCIES = new Set<string>(['monthly', 'bimonthly', 'quarterly', 'semiannually', 'yearly']);
+
+/**
+ * The day of the month a monthly-type schedule keeps: the stored day (1-31) while `date` is that
+ * day or its month-end clamp (Feb 28 for the 31st), else the date's own day.
+ */
+function monthDayAnchor(date: Date, anchorDay: number | null | undefined): number {
+  const day = date.getUTCDate();
+  if (anchorDay == null || !Number.isInteger(anchorDay) || anchorDay < 1 || anchorDay > 31) return day;
+  return Math.min(anchorDay, lastDayOfMonth(date.getUTCFullYear(), date.getUTCMonth())) === day ? anchorDay : day;
 }
 
 function validAnchor(anchorDay: number | null | undefined): number | null {
@@ -256,8 +271,23 @@ function anchorFor(date: Date, stored: number | null | undefined): number {
 }
 
 /**
- * Next occurrence after `date` for a frequency ('never' returns null). `anchorDay` (semimonthly
- * only) is the pair's first-half day; without it the anchor is derived from the date.
+ * The anchor to store for a schedule starting on `date`: the day of the month for monthly-type
+ * schedules (kept through month-end clamps), the twice-a-month pair's first day otherwise.
+ */
+function storedAnchorFor(date: Date, frequency: string, stored: number | null | undefined): number {
+  return MONTHLY_FREQUENCIES.has(frequency) ? monthDayAnchor(date, stored) : anchorFor(date, stored);
+}
+
+/** The anchor advanceDate takes for a template row (see storedAnchorFor). */
+function scheduleAnchor(frequency: string, anchorDay: number | null | undefined, date: Date): number | null {
+  if (frequency === 'semimonthly') return validAnchor(anchorDay) ?? semimonthlyAnchor(date);
+  return anchorDay ?? null;
+}
+
+/**
+ * Next occurrence after `date` for a frequency ('never' returns null). `anchorDay` is the
+ * twice-a-month pair's first-half day (semimonthly) or the day of the month a monthly-type
+ * schedule keeps; without it the anchor is derived from the date.
  */
 export function advanceDate(date: Date, frequency: Frequency, anchorDay?: number | null): Date | null {
   const d = new Date(date);
@@ -288,15 +318,15 @@ export function advanceDate(date: Date, frequency: Frequency, anchorDay?: number
       return new Date(Date.UTC(y, m + 1, anchor));
     }
     case 'monthly':
-      return addMonthsClamped(d, 1);
+      return addMonthsClamped(d, 1, anchorDay);
     case 'bimonthly':
-      return addMonthsClamped(d, 2);
+      return addMonthsClamped(d, 2, anchorDay);
     case 'quarterly':
-      return addMonthsClamped(d, 3);
+      return addMonthsClamped(d, 3, anchorDay);
     case 'semiannually':
-      return addMonthsClamped(d, 6);
+      return addMonthsClamped(d, 6, anchorDay);
     case 'yearly':
-      return addMonthsClamped(d, 12);
+      return addMonthsClamped(d, 12, anchorDay);
   }
   return d;
 }
@@ -319,7 +349,7 @@ export function projectOccurrences(
   anchorDay?: number | null,
 ): Date[] {
   if (!start) return [];
-  const anchor = validAnchor(anchorDay) ?? semimonthlyAnchor(start);
+  const anchor = scheduleAnchor(frequency, anchorDay, start);
   const out: Date[] = [];
   let d: Date | null = new Date(start);
   while (d && d.getTime() <= to.getTime() && out.length < limit) {
@@ -513,7 +543,7 @@ export async function createTemplate(ctx: ServiceContext, input: CreateTemplateI
         docType: input.docType,
         frequency: input.frequency,
         nextRunDate,
-        anchorDay: nextRunDate ? semimonthlyAnchor(nextRunDate) : null,
+        anchorDay: nextRunDate ? storedAnchorFor(nextRunDate, input.frequency, null) : null,
         template,
         isActive: true,
         mode,
@@ -536,6 +566,9 @@ export async function createTemplate(ctx: ServiceContext, input: CreateTemplateI
         groupName: row.groupName,
         remaining: row.remaining,
         daysInAdvance: row.daysInAdvance,
+        nextRunDate: row.nextRunDate,
+        // What is memorized (to post automatically): reconstructable from the audit trail.
+        template: payloadOf(row.template as Record<string, unknown>),
       },
     });
 
@@ -560,9 +593,14 @@ export async function updateTemplate(ctx: ServiceContext, id: string, input: Upd
       // so keep the stored twice-a-month pair whenever the (new or current) date is still one of its
       // days (a 14th/29th pair saved on Feb 28 stays 14th/29th); otherwise pair on that date.
       const nextDate = input.nextRunDate !== undefined ? patch.nextRunDate ?? null : before.nextRunDate;
-      patch.anchorDay = nextDate ? anchorFor(nextDate, before.anchorDay) : null;
+      patch.anchorDay = nextDate ? storedAnchorFor(nextDate, patch.frequency ?? before.frequency, before.anchorDay) : null;
     }
     if (input.groupName !== undefined) patch.groupName = input.groupName?.trim() || null;
+    // Saving the template (the cause fixed, or switched to remind-only) clears the last failure.
+    if (before.lastError) {
+      patch.lastError = null;
+      patch.lastErrorAt = null;
+    }
     if (input.remaining !== undefined) patch.remaining = input.remaining;
     if (input.daysInAdvance !== undefined) patch.daysInAdvance = input.daysInAdvance;
     if (input.isActive !== undefined) patch.isActive = input.isActive;
@@ -583,7 +621,7 @@ export async function updateTemplate(ctx: ServiceContext, id: string, input: Upd
     if (Object.keys(patch).length === 0) return before;
     // Anything that changes what, when or how often an AUTOMATIC template posts (payload, schedule,
     // remaining, re-activation, switching to automatic) needs Accounting. Rename/regroup is a list edit.
-    const touchesPosting = Object.keys(patch).some((k) => k !== 'name' && k !== 'groupName');
+    const touchesPosting = Object.keys(patch).some((k) => !['name', 'groupName', 'lastError', 'lastErrorAt'].includes(k));
     if (mode === 'automatic' && touchesPosting) await assertMayAutomate(tx, before.docType);
     const [row] = await tx.db
       .update(recurringTemplates)
@@ -632,7 +670,14 @@ export async function deleteTemplate(ctx: ServiceContext, id: string): Promise<v
       action: 'delete',
       entityType: 'recurring_template',
       entityId: id,
-      oldValues: { name: before.name, docType: before.docType, frequency: before.frequency },
+      oldValues: {
+        name: before.name,
+        docType: before.docType,
+        frequency: before.frequency,
+        mode: before.mode,
+        nextRunDate: before.nextRunDate,
+        template: payloadOf(before.template as Record<string, unknown>),
+      },
     });
   });
 }
@@ -640,6 +685,40 @@ export async function deleteTemplate(ctx: ServiceContext, id: string): Promise<v
 // ---------------------------------------------------------------------------
 // generateFromTemplate — internal
 // ---------------------------------------------------------------------------
+
+/**
+ * A memorized entry never posts for a customer, vendor or item that was made inactive (how QB
+ * retires a name): an automatic retainer invoice kept billing a client who had left. The run
+ * reports it (and keeps the reason on the template) instead.
+ */
+async function assertNamesActive(ctx: ServiceContext, payload: Record<string, unknown>): Promise<void> {
+  const customerId = typeof payload.customerId === 'string' ? payload.customerId : null;
+  const vendorId = typeof payload.vendorId === 'string' ? payload.vendorId : null;
+  if (customerId) {
+    const [c] = await ctx.db
+      .select({ name: customers.displayName, isActive: customers.isActive })
+      .from(customers)
+      .where(and(eq(customers.id, customerId), eq(customers.companyId, ctx.companyId)));
+    if (c && !c.isActive) throw validation(`Customer "${c.name}" is inactive. Make it active, or make this memorized transaction inactive.`);
+  }
+  if (vendorId) {
+    const [v] = await ctx.db
+      .select({ name: vendors.displayName, isActive: vendors.isActive })
+      .from(vendors)
+      .where(and(eq(vendors.id, vendorId), eq(vendors.companyId, ctx.companyId)));
+    if (v && !v.isActive) throw validation(`Vendor "${v.name}" is inactive. Make it active, or make this memorized transaction inactive.`);
+  }
+  const lines = Array.isArray(payload.lines) ? (payload.lines as Array<Record<string, unknown>>) : [];
+  const itemIds = [...new Set(lines.map((l) => l?.itemId).filter((x): x is string => typeof x === 'string' && x.length > 0))];
+  if (itemIds.length) {
+    const rows = await ctx.db
+      .select({ name: items.name, isActive: items.isActive })
+      .from(items)
+      .where(and(eq(items.companyId, ctx.companyId), inArray(items.id, itemIds)));
+    const off = rows.find((r) => !r.isActive);
+    if (off) throw validation(`Item "${off.name}" is inactive. Make it active, or make this memorized transaction inactive.`);
+  }
+}
 
 async function generateFromTemplate(
   ctx: ServiceContext,
@@ -657,6 +736,8 @@ async function generateFromTemplate(
       { area, action: 'create', docPermission: true },
     );
   }
+
+  await assertNamesActive(ctx, payload);
 
   // review5 fx: a memorized foreign-currency invoice / bill / check / deposit / transfer is entered
   // at the exchange rate of the day it is entered (the currency list's), as QB does — not the rate
@@ -809,21 +890,26 @@ async function generateFromTemplate(
   };
 }
 
-/** After an entry: next date (caught up past `now`), remaining count, deactivate when done. */
+/**
+ * After an entry: the next date, remaining count, deactivate when done. Clears the last failure.
+ * A template several periods overdue fires once and skips ahead (QB asks before entering a
+ * backlog; posting it unattended — a template reactivated after a year — is not done) — but only
+ * past days BEFORE today: today's occurrence stays due (it was skipped when compared with the
+ * current moment, and in a US evening the UTC clock skipped tomorrow's too).
+ */
 async function recordRun(
   ctx: ServiceContext,
   template: TemplateRow,
   fromDate: Date,
   now: Date,
   docId: string,
+  /** Today's calendar date at UTC midnight (the stored dates' convention). */
+  today: Date,
 ): Promise<void> {
   const frequency = template.frequency as Frequency;
-  // Catch up so a template several periods overdue fires once, not on every subsequent run.
-  const anchor = validAnchor(template.anchorDay) ?? semimonthlyAnchor(fromDate);
+  const anchor = scheduleAnchor(frequency, template.anchorDay, fromDate);
   let nextRun = advanceDate(fromDate, frequency, anchor);
-  while (nextRun && nextRun.getTime() <= now.getTime()) {
-    nextRun = advanceDate(nextRun, frequency, anchor);
-  }
+  while (nextRun && nextRun.getTime() < today.getTime()) nextRun = advanceDate(nextRun, frequency, anchor);
   const remaining = template.remaining === null ? null : Math.max(0, template.remaining - 1);
   const finished = remaining === 0;
   await ctx.db
@@ -832,6 +918,8 @@ async function recordRun(
       nextRunDate: nextRun,
       remaining,
       lastRunAt: now,
+      lastError: null,
+      lastErrorAt: null,
       ...(finished ? { isActive: false } : {}),
     })
     .where(eq(recurringTemplates.id, template.id));
@@ -857,15 +945,31 @@ async function enterLocked(
   id: string,
   now: Date,
   decide: (row: TemplateRow) => { runDate: Date; fromDate: Date } | null,
+  today: Date = todayUtcMidnight(now),
 ): Promise<GeneratedDoc | null> {
   return inTransaction(ctx, async (tx) => {
     const row = await lockTemplate(tx, id);
     const plan = decide(row);
     if (!plan) return null;
     const doc = await generateFromTemplate(tx, row, plan.runDate);
-    await recordRun(tx, row, plan.fromDate, now, doc.docId);
+    await recordRun(tx, row, plan.fromDate, now, doc.docId, today);
     return doc;
   });
+}
+
+/** Occurrences one template may enter in one run (a long-overdue one catches up over runs). */
+const MAX_ENTRIES_PER_RUN = 60;
+
+/** Keep why an automatic entry failed on the template (shown on the list and in Reminders). */
+async function recordFailure(ctx: ServiceContext, id: string, message: string): Promise<void> {
+  try {
+    await ctx.db
+      .update(recurringTemplates)
+      .set({ lastError: message.slice(0, 500), lastErrorAt: new Date() })
+      .where(and(eq(recurringTemplates.id, id), eq(recurringTemplates.companyId, ctx.companyId)));
+  } catch (err) {
+    console.error('[recurring] could not record the failure:', err);
+  }
 }
 
 /** A "feature turned off" refusal (lib/featureGate.ts): skip that template, keep running the rest. */
@@ -894,8 +998,8 @@ function errMessage(err: unknown): string {
  * Run every active, scheduled template due on or before `asOf` (+ its days in advance).
  * Automatic templates are entered (dated on their scheduled date) and advanced; remind-only
  * templates come back as reminders without posting; 'never' templates are skipped. A template
- * whose document fails to post (e.g. closed period) is reported in `failed` and left due —
- * it never blocks the others.
+ * whose document fails to post (e.g. closed period) is reported in `failed`, keeps the reason
+ * (lastError) and is left due — it never blocks the others.
  */
 export async function runDue(
   ctx: ServiceContext,
@@ -903,9 +1007,8 @@ export async function runDue(
 ): Promise<{ generated: GeneratedDoc[]; reminders: TemplateReminder[]; failed: RunFailure[] }> {
   // "Due on or before asOf" is a whole calendar day: anything dated during asOf's (UTC) day is
   // due, so a date stored with a time-of-day (e.g. local midnight) is not skipped.
-  const dueBy = new Date(
-    Date.UTC(asOf.getUTCFullYear(), asOf.getUTCMonth(), asOf.getUTCDate()) + 86_400_000 - 1,
-  );
+  const asOfDay = new Date(Date.UTC(asOf.getUTCFullYear(), asOf.getUTCMonth(), asOf.getUTCDate()));
+  const dueBy = new Date(asOfDay.getTime() + 86_400_000 - 1);
   const candidates = await ctx.db
     .select()
     .from(recurringTemplates)
@@ -926,34 +1029,49 @@ export async function runDue(
     if (!template.nextRunDate) continue;
     if (template.mode === 'never' || template.frequency === 'never') continue;
     if (template.remaining === 0) continue;
-    const runDate = template.nextRunDate;
-    if (daysBefore(runDate, template.daysInAdvance ?? 0).getTime() > dueBy.getTime()) continue;
+    const advance = template.daysInAdvance ?? 0;
+    if (daysBefore(template.nextRunDate, advance).getTime() > dueBy.getTime()) continue;
 
-    const remind = template.mode === 'remind';
-    if (remind) {
+    if (template.mode === 'remind') {
       reminders.push({
         templateId: template.id,
         templateName: template.name,
         docType: template.docType as DocType,
-        dueDate: runDate,
+        dueDate: template.nextRunDate,
       });
       continue;
     }
-    try {
-      const doc = await enterLocked(ctx, template.id, asOf, (cur) =>
-        cur.isActive &&
-        cur.mode === 'automatic' &&
-        cur.frequency !== 'never' &&
-        cur.remaining !== 0 &&
-        cur.nextRunDate !== null &&
-        cur.nextRunDate.getTime() === runDate.getTime()
-          ? { runDate, fromDate: runDate }
-          : null, // already entered (or changed) by an overlapping run
-      );
-      if (doc) generated.push(doc);
-    } catch (err) {
-      if (err instanceof ServiceError && err.code === 'FORBIDDEN' && !skipsTemplate(err)) throw err;
-      failed.push({ templateId: template.id, templateName: template.name, error: errMessage(err) });
+    // Each occurrence due by asOf (its days in advance included) is entered in turn, each in its own
+    // locked transaction; an overdue backlog is not (recordRun skips past days before today).
+    let runDate: Date | null = template.nextRunDate;
+    for (let n = 0; n < MAX_ENTRIES_PER_RUN && runDate && daysBefore(runDate, advance).getTime() <= dueBy.getTime(); n++) {
+      const expected: Date = runDate;
+      let doc: GeneratedDoc | null;
+      try {
+        doc = await enterLocked(ctx, template.id, asOf, (cur) =>
+          cur.isActive &&
+          cur.mode === 'automatic' &&
+          cur.frequency !== 'never' &&
+          cur.remaining !== 0 &&
+          cur.nextRunDate !== null &&
+          cur.nextRunDate.getTime() === expected.getTime()
+            ? { runDate: expected, fromDate: expected }
+            : null, // already entered (or changed) by an overlapping run
+          asOfDay,
+        );
+      } catch (err) {
+        if (err instanceof ServiceError && err.code === 'FORBIDDEN' && !skipsTemplate(err)) throw err;
+        failed.push({ templateId: template.id, templateName: template.name, error: errMessage(err) });
+        await recordFailure(ctx, template.id, errMessage(err));
+        break;
+      }
+      if (!doc) break;
+      generated.push(doc);
+      const [after] = await ctx.db
+        .select({ nextRunDate: recurringTemplates.nextRunDate, remaining: recurringTemplates.remaining, isActive: recurringTemplates.isActive })
+        .from(recurringTemplates)
+        .where(and(eq(recurringTemplates.id, template.id), eq(recurringTemplates.companyId, ctx.companyId)));
+      runDate = after && after.isActive && after.remaining !== 0 ? after.nextRunDate : null;
     }
   }
 
@@ -965,19 +1083,30 @@ export async function runDue(
 // ---------------------------------------------------------------------------
 
 /**
- * Enter a single template now (QB "Enter Transaction"). Dated today unless `date` is given;
- * advances the schedule as if it ran on time and counts toward "number remaining".
+ * Enter a single template now (QB "Enter Transaction"). Dated `date` when given, else its
+ * scheduled date when that is still ahead but within its days in advance (December's rent entered
+ * from the November 26 reminder is dated December 1, not in November), else today. Advances the
+ * schedule one period and counts toward "number remaining".
  */
+export function enterNowDate(
+  row: { nextRunDate: Date | null; frequency: string; daysInAdvance: number | null },
+  today: Date,
+): Date {
+  if (!row.nextRunDate || row.frequency === 'never') return today;
+  const ahead = row.nextRunDate.getTime() > today.getTime();
+  return ahead && daysBefore(row.nextRunDate, row.daysInAdvance ?? 0).getTime() <= today.getTime() ? row.nextRunDate : today;
+}
+
 export async function runTemplateNow(
   ctx: ServiceContext,
   id: string,
   date?: Date,
 ): Promise<GeneratedDoc> {
   const now = new Date();
-  const runDate = date ?? todayUtcMidnight(now);
   const doc = await enterLocked(ctx, id, now, (cur) => {
     if (!cur.isActive) throw validation('This memorized transaction is inactive. Make it active to enter it.');
     if (cur.remaining === 0) throw validation('No entries remain for this memorized transaction.');
+    const runDate = date ?? enterNowDate(cur, todayUtcMidnight(now));
     return { runDate, fromDate: cur.nextRunDate ?? runDate };
   });
   if (!doc) throw validation('This memorized transaction could not be entered.');

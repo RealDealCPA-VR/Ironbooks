@@ -41,6 +41,8 @@ interface Suggestions {
   accountSource: 'vendor-default' | 'last-used' | 'learned' | 'none';
   paymentAccountId: string | null;
   kind: Kind;
+  /** Expenses / bills already booked for this amount around this date. */
+  possibleDuplicates?: Array<{ txnType: 'expense' | 'bill'; txnId: string; date: string; amount: string; payee: string | null }>;
 }
 
 interface Vendor {
@@ -352,6 +354,23 @@ export default function ReviewReceiptPage() {
                 <p role="status" className="mb-4 rounded-lg bg-gold/15 px-3 py-2 text-sm text-yellow-900">
                   {receipt.message}
                 </p>
+              )}
+              {(suggestions?.possibleDuplicates?.length ?? 0) > 0 && (
+                <div role="alert" className="mb-4 rounded-lg bg-gold/15 px-3 py-2 text-sm text-yellow-900">
+                  <p className="font-semibold">This purchase may already be in your books:</p>
+                  <ul className="mt-1 list-disc pl-5">
+                    {suggestions!.possibleDuplicates!.map((d) => (
+                      <li key={d.txnId}>
+                        {d.txnType === 'bill' ? 'Bill' : 'Expense'} {d.date}
+                        {d.payee ? ` · ${d.payee}` : ''} · {formatCurrency(d.amount)}{' '}
+                        <Link href={txnHref(d)} className="font-semibold text-electric hover:underline">
+                          Open
+                        </Link>
+                      </li>
+                    ))}
+                  </ul>
+                  <p className="mt-1">If it is the same purchase, attach this receipt to it from the Doc Center instead of saving it again.</p>
+                </div>
               )}
               <form
                 className="space-y-4"

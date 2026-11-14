@@ -1371,6 +1371,21 @@ export default function EmployeesPage() {
     }
   }
 
+  /** Remove the employee's portal access (also signs out any portal session). */
+  async function handleRemovePortalAccess() {
+    if (!portalTarget) return;
+    setPortalSaving(true);
+    try {
+      await api.del(`/api/employees/${portalTarget.id}/portal-password`);
+      toast('Portal access removed', 'success');
+      setPortalTarget(null);
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Failed to remove access', 'danger');
+    } finally {
+      setPortalSaving(false);
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Run payroll
   // ---------------------------------------------------------------------------
@@ -2609,6 +2624,9 @@ export default function EmployeesPage() {
         }
         footer={
           <>
+            <Button variant="secondary" onClick={handleRemovePortalAccess} disabled={portalSaving}>
+              Remove Access
+            </Button>
             <Button
               variant="secondary"
               onClick={() => setPortalTarget(null)}

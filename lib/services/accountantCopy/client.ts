@@ -885,6 +885,25 @@ async function assertChangesWithinDividingDate(
   }
 }
 
+/**
+ * The number an accountant's new account is added under: its own, or — when the client added an
+ * account with that number meanwhile (both sides take the next free number by default) — the next
+ * free one after it. Refusing it blocked the import for good (numbers can't be changed, and the
+ * only way out, Cancel, throws away the accountant's work).
+ */
+export function freeAccountCode(code: string, taken: Set<string>): string {
+  if (!taken.has(code)) return code;
+  if (/^\d+$/.test(code)) {
+    let n = Number(code) + 1;
+    for (let i = 0; i < 100_000 && taken.has(String(n).padStart(code.length, '0')); i++) n++;
+    return String(n).padStart(code.length, '0');
+  }
+  let k = 2;
+  const base = code.slice(0, 44); // account numbers are varchar(50)
+  while (taken.has(`${base}-${k}`)) k++;
+  return `${base}-${k}`;
+}
+
 const sameVersion = (a: Date | null | undefined, b: string | null) =>
   !b || (a ? a.getTime() : null) === new Date(b).getTime();
 
@@ -1208,12 +1227,15 @@ export async function reviewChangesFile(ctx: ServiceContext, buffer: Buffer): Pr
         op: 'add',
         kind: 'Account',
         date: null,
-        title: `New account ${a.after.code} · ${a.after.name}`,
+        title: existingCodes.has(a.after.code)
+          ? `New account ${freeAccountCode(a.after.code, existingCodes)} · ${a.after.name} (your file already has a ${a.after.code}, so it is added under the next free number)`
+          : `New account ${a.after.code} · ${a.after.name}`,
         amount: null,
         before: null,
         after: [`${a.after.code} · ${a.after.name}`, `Type: ${a.after.qbType.replace(/_/g, ' ')}`, ...(a.after.description ? [a.after.description] : [])],
-        problem: existingCodes.has(a.after.code) ? `Your file already has an account numbered ${a.after.code}.` : null,
+        problem: null,
       });
+      existingCodes.add(freeAccountCode(a.after.code, existingCodes));
     } else {
       const [cur] = await ctx.db.select().from(accounts).where(and(eq(accounts.id, a.id), eq(accounts.companyId, ctx.companyId)));
       const before = cur ? [`${cur.code} · ${cur.name}`, `Active: ${cur.isActive ? 'yes' : 'no'}`, ...(cur.description ? [cur.description] : [])] : null;
@@ -1232,6 +1254,8 @@ export async function reviewChangesFile(ctx: ServiceContext, buffer: Buffer): Pr
           : !sameVersion(cur.editedAt, a.baseVersion)
             ? changedElsewhere
             : await accountTypeBlocker(ctx, cur, a.after),
+        // Both sides changed it: you may keep your version (the accountant's entries still post to it).
+        ...(cur && !sameVersion(cur.editedAt, a.baseVersion) ? { keepable: true } : {}),
       });
     }
   }
@@ -1746,8 +1770,11 @@ export async function importChangesFile(ctx: ServiceContext, buffer: Buffer, opt
             label: `new account ${a.after.code} · ${a.after.name}`,
             count: 'accounts',
             run: async (c) => {
+              const taken = new Set(
+                (await c.db.select({ code: accounts.code }).from(accounts).where(eq(accounts.companyId, c.companyId))).map((r) => r.code),
+              );
               const created = await createAccount(c, {
-                code: a.after.code,
+                code: freeAccountCode(a.after.code, taken),
                 name: a.after.name,
                 qbType: a.after.qbType,
                 subtype: a.after.subtype,
@@ -1764,6 +1791,16 @@ export async function importChangesFile(ctx: ServiceContext, buffer: Buffer, opt
             label: `change to account ${a.after.code} · ${a.after.name}`,
             count: 'accounts',
             run: async (c) => {
+              if (keepMine.has(`account:${a.id}`)) {
+                const [cur] = await c.db
+                  .select({ editedAt: accounts.editedAt })
+                  .from(accounts)
+                  .where(and(eq(accounts.id, a.id), eq(accounts.companyId, c.companyId)));
+                if (cur && !sameVersion(cur.editedAt, a.baseVersion)) {
+                  keptYours.push(`Account ${a.after.code} · ${a.after.name}: kept your version`);
+                  return 'skipped';
+                }
+              }
               await withVersionCheck(c, 'account', a.id, a.baseVersion, (cc) =>
                 updateAccount(cc, a.id, {
                   name: a.after.name,
@@ -1784,6 +1821,19 @@ export async function importChangesFile(ctx: ServiceContext, buffer: Buffer, opt
           label: `new class ${k.name}`,
           count: 'classes',
           run: async (c) => {
+            // The client added the same class meanwhile: the accountant's lines use it (two
+            // "Marketing" classes otherwise, which can't be merged until the import is done).
+            const parentId = mapId(k.parentId) ?? null;
+            const same = (
+              await c.db
+                .select({ id: classes.id, name: classes.name, parentId: classes.parentId, isActive: classes.isActive })
+                .from(classes)
+                .where(eq(classes.companyId, c.companyId))
+            ).find((r) => r.isActive && r.name.trim().toLowerCase() === k.name.trim().toLowerCase() && (r.parentId ?? null) === parentId);
+            if (same) {
+              idMap.set(k.id, same.id);
+              return 'skipped';
+            }
             const row = await createClass(c, { name: k.name, parentId: mapId(k.parentId) });
             idMap.set(k.id, row.id);
           },

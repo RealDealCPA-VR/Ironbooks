@@ -271,16 +271,33 @@ export async function pivotReport(ctx: ServiceContext, input: PivotInput): Promi
   ];
   const colTotals = colList.map(() => Money.zero());
   let grand = Money.zero();
-  const drill = (dim: PivotDimension, key: string): Record<string, string | undefined> => {
-    if (input.source !== 'gl' || !key) return {};
+  // QuickZoom filters for a cell; null when the cell's lines can't be filtered to exactly (no
+  // class / customer / vendor, ...) — then the cell gets no link rather than one that opens every
+  // line in the range.
+  const drill = (dim: PivotDimension, key: string): Record<string, string | undefined> | null => {
+    if (input.source !== 'gl' || !key) return null;
     if (dim === 'account') return { accountId: key };
+    if (dim === 'accountType') return { section: key };
     if (dim === 'class') return { classId: key };
     if (dim === 'customer') return { customerId: key };
     if (dim === 'vendor') return { vendorId: key };
+    if (dim === 'name') return { nameId: key };
     if (dim === 'txnType') return { txnType: key };
     if (dim === 'month') return { from: `${key}-01`, to: dayStr(new Date(Date.UTC(Number(key.slice(0, 4)), Number(key.slice(5, 7)), 0))) };
-    return {};
+    if (dim === 'quarter') {
+      const y = Number(key.slice(0, 4));
+      const q = Number(key.slice(6));
+      return { from: dayStr(new Date(Date.UTC(y, (q - 1) * 3, 1))), to: dayStr(new Date(Date.UTC(y, q * 3, 0))) };
+    }
+    if (dim === 'year') return { from: `${key}-01-01`, to: `${key}-12-31` };
+    return null;
   };
+  /** A cell's range: the report's, narrowed to the period dimension (never wider than the report). */
+  const within = (f: Record<string, string | undefined>) => ({
+    ...f,
+    ...(f.from && f.from < dayStr(from) ? { from: dayStr(from) } : {}),
+    ...(f.to && f.to > dayStr(to) ? { to: dayStr(to) } : {}),
+  });
   const rows: StdRow[] = sortVals(rowVals).map(([rk, rv]) => {
     const cells: Record<string, CellValue> = { label: rv.label };
     let rowTotal = Money.zero();
@@ -290,8 +307,13 @@ export async function pivotReport(ctx: ServiceContext, input: PivotInput): Promi
       const v = cellsMap.get(`${rk}\u0000${ck}`);
       if (input.cols) cells[`c${i}`] = v ? fmt(v) : null;
       if (v) colTotals[i] = colTotals[i].plus(v);
-      if (v && input.source === 'gl' && input.cols) {
-        hrefs[`c${i}`] = stdHref('transaction-detail-by-account', { from: dayStr(from), to: dayStr(to), ...drill(input.rows, rk), ...drill(input.cols, ck) });
+      const zr = drill(input.rows, rk);
+      const zc = input.cols ? drill(input.cols, ck) : null;
+      if (v && input.source === 'gl' && input.cols && zr && zc) {
+        hrefs[`c${i}`] = stdHref(
+          'transaction-detail-by-account',
+          within({ from: dayStr(from), to: dayStr(to), ...(input.section && !zr.section && !zc.section ? { section: input.section } : {}), ...zr, ...zc }),
+        );
       }
     });
     cells.total = fmt(rowTotal);
@@ -302,7 +324,12 @@ export async function pivotReport(ctx: ServiceContext, input: PivotInput): Promi
       kind: 'data',
       cells,
       hrefs,
-      href: input.source === 'gl' ? stdHref('transaction-detail-by-account', { from: dayStr(from), to: dayStr(to), ...drill(input.rows, rk) }) : null,
+      href: (() => {
+        const z = drill(input.rows, rk);
+        return z
+          ? stdHref('transaction-detail-by-account', within({ from: dayStr(from), to: dayStr(to), ...(input.section && !z.section ? { section: input.section } : {}), ...z }))
+          : null;
+      })(),
     };
   });
   const totalCells: Record<string, CellValue> = { label: 'TOTAL', total: fmt(grand) };

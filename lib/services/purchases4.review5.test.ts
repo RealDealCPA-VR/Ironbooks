@@ -352,6 +352,9 @@ describe('review5 purchases (fourth pass)', { timeout: 180_000 }, () => {
         'vendor_credit_lines.vendor_credit_lines_credit_idx(vendor_credit_id)',
         'purchase_order_lines.purchase_order_lines_po_idx(purchase_order_id)',
         'item_receipt_lines.item_receipt_lines_receipt_idx(item_receipt_id)',
+        // 0093 (review loop 6): unbilled billable costs by customer.
+        'bill_lines.bill_lines_billable_idx(customer_id)',
+        'expense_lines.expense_lines_billable_idx(customer_id)',
       ].sort(),
     );
     const res = (await db.execute(

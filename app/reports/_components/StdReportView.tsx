@@ -11,7 +11,7 @@
  *  - Comment on Report (QB): click amounts to comment on them, then save the report with its
  *    comments as a Commented Report (app/reports/commented; lib/services/commentedReports.ts).
  */
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import { BarChart2, Bookmark, ChevronsDownUp, ChevronsUpDown, Filter, MessageSquare, Type } from 'lucide-react';
@@ -36,7 +36,7 @@ interface MemorizedRow {
   name: string;
   reportType: string;
   groupId: string | null;
-  config: { params?: Params; display?: { numberFormat?: unknown; title?: string } };
+  config: { params?: Params; display?: { numberFormat?: unknown; title?: string; collapsed?: boolean; hiddenColumns?: string[] } };
 }
 
 interface Group {
@@ -53,6 +53,8 @@ const PARAM_KEYS = [
   'overDays',
   // Report gaps round: Sales by Rep, inventory sites, Cash Flow Forecast periods.
   'repId', 'siteId', 'period',
+  // Review loop 6: the type filters the report form offers (dropped from the URL, so ignored).
+  'customerTypeId', 'vendorTypeId', 'jobTypeId',
 ];
 
 function paramsFromSearch(sp: URLSearchParams | null): Params {
@@ -100,6 +102,15 @@ export default function StdReportView({
   const commentEdit = useCommentEditing(comments, setComments);
   const marks = useMemo(() => commentMarks(comments), [comments]);
   const { collapsed, setCollapsed, toggle, collapsible, allCollapsed, collapseAll, expandAll } = useCollapse(report);
+  // A memorized report opens as it was saved: its hidden columns and collapsed rows.
+  const restoredFor = useRef<string | null>(null);
+  useEffect(() => {
+    if (!memorized || !report || restoredFor.current === memorized.id) return;
+    restoredFor.current = memorized.id;
+    const d = memorized.config.display;
+    if (Array.isArray(d?.hiddenColumns)) setHidden(new Set(d.hiddenColumns.filter((x): x is string => typeof x === 'string')));
+    if (d?.collapsed === true) collapseAll();
+  }, [memorized, report, collapseAll]);
 
   // Re-read params when the URL changes (QuickZoom Back / Forward).
   const searchKey = search?.toString() ?? '';
@@ -455,13 +466,14 @@ export default function StdReportView({
         defaultName={title}
         existing={memorized}
         config={{
-          // Memorized reports keep the basis they ran on (QB saves it with the report).
-          params: entry.basis && !params.basis && report?.basis ? { ...params, basis: report.basis } : params,
-          display: { numberFormat: format, collapsed: allCollapsed },
+          // The report on screen (ranParams), not the form's unapplied edits; memorized reports keep
+          // the basis they ran on (QB saves it with the report), and the columns shown.
+          params: entry.basis && !ranParams.basis && report?.basis ? { ...ranParams, basis: report.basis } : ranParams,
+          display: { numberFormat: format, collapsed: allCollapsed, ...(hidden.size ? { hiddenColumns: [...hidden] } : {}) },
         }}
         onSaved={(row) => {
           setMemorized(row);
-          if (!memorizedId) router.replace(`${pathname}?${new URLSearchParams({ ...params, mem: row.id }).toString()}`);
+          if (!memorizedId) router.replace(`${pathname}?${new URLSearchParams({ ...ranParams, mem: row.id }).toString()}`);
         }}
       />
     </main>

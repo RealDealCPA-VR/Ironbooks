@@ -73,6 +73,21 @@ interface RecurringTemplate {
   remaining?: number | null;
   daysInAdvance?: number;
   lastRunAt?: string | null;
+  /** Why the last automatic entry failed (cleared when an entry succeeds). */
+  lastError?: string | null;
+}
+
+/**
+ * The date Enter Now gives the entry (the server's enterNowDate rule): the scheduled date when it
+ * is still ahead but inside its days in advance, else today.
+ */
+function enterNowDateIso(tpl: RecurringTemplate): string {
+  const today = todayISO();
+  const next = tpl.nextRunDate ? String(tpl.nextRunDate).slice(0, 10) : null;
+  if (!next || tpl.frequency === 'never' || next <= today) return today;
+  const start = new Date(`${next}T00:00:00.000Z`);
+  start.setUTCDate(start.getUTCDate() - (tpl.daysInAdvance ?? 0));
+  return start.toISOString().slice(0, 10) <= today ? next : today;
 }
 
 interface GeneratedDoc {
@@ -982,6 +997,7 @@ export default function RecurringPage() {
     if (!runNowTarget) return;
     setRunNowLoading(true);
     try {
+      // No date: the server dates it from the row as it is then (an overlapping run may have moved it).
       await api.post('/api/recurring/run', { id: runNowTarget.id });
       toast(`Generated 1 ${docNoun(runNowTarget.docType)} from "${runNowTarget.name}"`, 'success');
       setRunNowTarget(null);
@@ -1221,6 +1237,11 @@ export default function RecurringPage() {
                           <span className="ml-1 text-xs">{auto ? '(due)' : '(reminder)'}</span>
                         )}
                       </span>
+                      {tpl.lastError && tpl.isActive && (
+                        <div className="text-xs text-red-600 mt-0.5" role="alert">
+                          Could not be entered: {tpl.lastError}
+                        </div>
+                      )}
                     </Td>
                     <Td>
                       <Badge tone={auto ? 'info' : mode === 'remind' ? 'warning' : 'neutral'}>
@@ -1396,7 +1417,8 @@ export default function RecurringPage() {
               {docNoun(runNowTarget?.docType)}
             </strong>{' '}
             from template{' '}
-            <strong className="text-navy">&quot;{runNowTarget?.name}&quot;</strong> immediately?
+            <strong className="text-navy">&quot;{runNowTarget?.name}&quot;</strong>, dated{' '}
+            <strong className="text-navy">{runNowTarget ? formatDate(enterNowDateIso(runNowTarget)) : ''}</strong>?
             The next date moves ahead one period
             {runNowTarget ? ` (${FREQUENCY_LABEL[runNowTarget.frequency] ?? runNowTarget.frequency})` : ''}.
           </>

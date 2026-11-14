@@ -3004,6 +3004,10 @@ function runDueRecurring(url) {
           const result = await res.json().catch(() => null);
           const n = result?.generated?.length ?? 0;
           if (n > 0) console.log(`[recurring] launch-time run generated ${n} document(s)`);
+          // Failures are kept on each template (shown on Memorized Transactions and in Reminders).
+          for (const f of result?.failed ?? []) {
+            console.warn(`[recurring] "${f.templateName}" could not be entered: ${f.error}`);
+          }
         }
       })
       .catch((err) => console.error('[recurring] launch-time run failed:', err));

@@ -1280,6 +1280,11 @@ export async function updateBill(ctx: ServiceContext, id: string, input: CreateB
     .from(bills)
     .where(and(eq(bills.id, id), eq(bills.companyId, ctx.companyId)));
   if (!existing) throw notFound('Bill');
+  // A foreign bill edited without a rate (same vendor, so same currency) keeps its booked rate,
+  // not today's list rate.
+  if (existing.currency && existing.vendorId === input.vendorId && (input.exchangeRate == null || String(input.exchangeRate).trim() === '')) {
+    input = { ...input, exchangeRate: existing.exchangeRate };
+  }
   if (existing.status === 'void') {
     throw new ServiceError('CONFLICT', 'Cannot edit a voided bill.');
   }
@@ -1788,6 +1793,8 @@ async function voidBillInTx(ctx: ServiceContext, id: string) {
       .set({ status: 'void', balanceDue: '0.00', updatedAt: new Date() })
       .where(eq(bills.id, id))
       .returning();
+    // A receipt saved as this bill goes back to the receipt inbox.
+    await (await import('./attachments')).releaseReceiptsOfVoidedTxn(tx, 'bill', id);
 
     await writeAudit(tx, {
       action: 'void',

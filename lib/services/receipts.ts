@@ -39,7 +39,9 @@ import {
   accounts,
   attachments,
   bankAccounts,
+  bills,
   companies,
+  expenses,
   receiptScans,
   receiptUploadTokens,
   vendors,
@@ -656,6 +658,42 @@ export interface ReceiptSuggestions {
   paymentAccountId: string | null;
   /** The kind of transaction that fits best. */
   kind: ReceiptTxnKind;
+  /**
+   * Expenses / bills already in the books for the same amount within 3 days of the receipt (the
+   * card charge added from the bank feed, or the same receipt sent twice): saving would book the
+   * purchase twice.
+   */
+  possibleDuplicates: Array<{ txnType: 'expense' | 'bill'; txnId: string; date: string; amount: string; payee: string | null }>;
+}
+
+/** Non-void expenses and bills for `total` dated within 3 days of `date` (see possibleDuplicates). */
+async function possibleDuplicates(
+  ctx: ServiceContext,
+  total: string | null,
+  date: string | null,
+): Promise<ReceiptSuggestions['possibleDuplicates']> {
+  if (!total || !date || !/^\d{4}-\d{2}-\d{2}/.test(date)) return [];
+  const amount = Money.of(total);
+  if (!amount.greaterThan(0)) return [];
+  const at = new Date(`${date.slice(0, 10)}T00:00:00.000Z`).getTime();
+  const from = new Date(at - 3 * 86_400_000);
+  const to = new Date(at + 4 * 86_400_000);
+  const exp = await ctx.db
+    .select({ id: expenses.id, date: expenses.date, total: expenses.total, payee: expenses.payeeName, vendor: vendors.displayName })
+    .from(expenses)
+    .leftJoin(vendors, eq(vendors.id, expenses.vendorId))
+    .where(and(eq(expenses.companyId, ctx.companyId), isNull(expenses.voidedAt), eq(expenses.total, toAmountString(amount)), gt(expenses.date, new Date(from.getTime() - 1)), lt(expenses.date, to)))
+    .limit(5);
+  const bl = await ctx.db
+    .select({ id: bills.id, date: bills.date, total: bills.total, vendor: vendors.displayName })
+    .from(bills)
+    .leftJoin(vendors, eq(vendors.id, bills.vendorId))
+    .where(and(eq(bills.companyId, ctx.companyId), sql`${bills.status} <> 'void'`, eq(bills.total, toAmountString(amount)), gt(bills.date, new Date(from.getTime() - 1)), lt(bills.date, to)))
+    .limit(5);
+  return [
+    ...exp.map((e) => ({ txnType: 'expense' as const, txnId: e.id, date: e.date.toISOString().slice(0, 10), amount: toAmountString(e.total), payee: e.vendor ?? e.payee ?? null })),
+    ...bl.map((b) => ({ txnType: 'bill' as const, txnId: b.id, date: b.date.toISOString().slice(0, 10), amount: toAmountString(b.total), payee: b.vendor ?? null })),
+  ];
 }
 
 /** Card/bank account whose number (or name) ends with the card's last 4 digits. */
@@ -707,7 +745,8 @@ export async function receiptSuggestions(ctx: ServiceContext, id: string): Promi
   if (pay?.subtype === 'credit_card') kind = 'credit_card';
   else if (!pay && view.cardBrand && view.cardBrand !== 'Debit') kind = 'credit_card';
   else if (!view.cardLast4 && /\b(invoice|balance\s*due|amount\s*due|due\s*date)\b/i.test(view.rawText ?? '')) kind = 'bill';
-  return { vendor, accountId, accountSource, paymentAccountId: pay?.accountId ?? null, kind };
+  const dups = view.status === 'saved' ? [] : await possibleDuplicates(ctx, view.total, view.date);
+  return { vendor, accountId, accountSource, paymentAccountId: pay?.accountId ?? null, kind, possibleDuplicates: dups };
 }
 
 // ---------------------------------------------------------------------------

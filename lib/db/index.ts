@@ -117,6 +117,43 @@ export class NewerCompanyFileError extends ServiceError {
 }
 
 /**
+ * Upgrading the company file to this version's layout failed (a step that rewrites data met rows
+ * it could not handle). Drizzle runs every pending step in one transaction, so nothing was changed
+ * — said plainly, instead of a 500 on every request (or a 400 "too long" that looked like input).
+ */
+export class CompanyFileUpgradeError extends ServiceError {
+  constructor(cause: unknown) {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    super(
+      'CONFLICT',
+      `Ironbooks could not upgrade this company file to the new version, so it was left exactly as it was (the upgrade was rolled back). Open it with the version you used before, or contact support with this message: ${detail}`,
+      { upgradeFailed: true },
+    );
+    this.name = 'CompanyFileUpgradeError';
+  }
+}
+
+/** Steps of this version not yet applied to the file (0 for a brand-new database). */
+async function pendingMigrationCount(client: PGlite, migrationsFolder: string): Promise<number> {
+  let newest: number | null = null;
+  try {
+    const res = await client.query<{ last: string | number | null }>('SELECT MAX(created_at) AS last FROM drizzle.__drizzle_migrations');
+    newest = res.rows[0]?.last == null ? null : Number(res.rows[0].last);
+  } catch {
+    return 0; // never migrated: a brand-new database, nothing to protect
+  }
+  if (newest === null) return 0;
+  try {
+    const journal = JSON.parse(fs.readFileSync(path.join(migrationsFolder, 'meta', '_journal.json'), 'utf8')) as {
+      entries?: Array<{ when?: unknown }>;
+    };
+    return (journal.entries ?? []).filter((e) => Number(e.when) > newest!).length;
+  } catch {
+    return 0;
+  }
+}
+
+/**
  * The database in a company folder would not START (PGlite aborted while Postgres was starting:
  * typically "could not locate a valid checkpoint record"), as opposed to a statement or migration
  * that failed once it was running. getDb hands it to lib/services/workingCopyRecovery.ts.
@@ -347,11 +384,32 @@ export function openDb(dataDir?: string): DbHandle {
     // PGlite is a single session, so this holds for every query on the handle.
     await client.exec("SET TIME ZONE 'UTC'");
     // Only migrate if a migrations folder has been generated. In early dev before
-    // `db:generate`, callers can use db:push instead.
+    // `db:generate`, callers can use db:push instead. An installed app (BKA_MIGRATIONS_DIR set)
+    // without its migrations is broken: refuse, rather than run unmigrated / unguarded books.
+    if (!fs.existsSync(MIGRATIONS_FOLDER) && process.env.BKA_MIGRATIONS_DIR) {
+      throw new Error(`Ironbooks is missing its database upgrade files (${MIGRATIONS_FOLDER}). Reinstall Ironbooks.`);
+    }
     if (fs.existsSync(MIGRATIONS_FOLDER)) {
       // Before anything writes to it: a file upgraded by a newer version is refused untouched.
       await refuseNewerFile(client, MIGRATIONS_FOLDER);
-      await migrate(db, { migrationsFolder: MIGRATIONS_FOLDER });
+      // A file from an earlier version is about to be upgraded (some steps rewrite data in place,
+      // and an older app refuses the upgraded file): keep a safety copy first, as QuickBooks backs
+      // up before upgrading a company file. Best-effort — it never blocks the open.
+      if ((await pendingMigrationCount(client, MIGRATIONS_FOLDER)) > 0) {
+        try {
+          await client.exec('CHECKPOINT');
+          const { ensurePreOpBackup } = await import('@/lib/services/backup');
+          ensurePreOpBackup(null, 'upgrade', dir);
+        } catch (err) {
+          console.warn('[db] could not make a safety copy before upgrading the company file:', (err as Error)?.message ?? err);
+        }
+      }
+      try {
+        await migrate(db, { migrationsFolder: MIGRATIONS_FOLDER });
+      } catch (err) {
+        console.error('[db] company file upgrade failed (rolled back):', err);
+        throw new CompanyFileUpgradeError(err);
+      }
       // Migrations already recorded are never re-run, so a file whose ledger guards were turned
       // off or replaced outside the app would stay unguarded. Re-install them on every open,
       // then refuse a file whose ledger is already damaged.

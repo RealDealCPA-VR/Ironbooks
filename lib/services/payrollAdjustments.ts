@@ -30,6 +30,7 @@
  * enter a new one, so the audit trail keeps both.
  */
 import { and, asc, desc, eq, inArray, ne } from 'drizzle-orm';
+import { assertListDeleteAllowed } from './accountantCopy/guard';
 import {
   accounts,
   employees,
@@ -675,6 +676,8 @@ export async function updateWorkersCompCode(ctx: ServiceContext, id: string, inp
     .from(workersCompCodes)
     .where(and(eq(workersCompCodes.id, id), eq(workersCompCodes.companyId, ctx.companyId)));
   if (!existing) throw notFound('Workers comp code');
+  // Accountant's Copy: list entries can't be made inactive while a copy is out (guard.ts).
+  if (input.isActive === false && existing.isActive) await assertListDeleteAllowed(ctx, 'delete', "workers' comp codes");
   const v = wcValues(input);
   if (v.code && v.code !== existing.code) {
     const [dup] = await ctx.db

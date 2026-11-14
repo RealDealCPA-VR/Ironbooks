@@ -16,6 +16,7 @@
  *     totalDebits(revenue zeroing) + 3900 debit = totalCredits(expense zeroing)  [loss]
  */
 import { and, eq, gte, lt, sql } from 'drizzle-orm';
+import { pickRetainedEarnings } from './retainedEarnings';
 import { accounts, companies, journalEntries, journalEntryLines } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError, inTransaction } from './_base';
@@ -88,16 +89,9 @@ async function findRetainedEarningsAccount(
     .select({ id: accounts.id, code: accounts.code, name: accounts.name, subtype: accounts.subtype, isActive: accounts.isActive })
     .from(accounts)
     .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.type, 'equity')));
-  const byCode = (a: { code: string }, b: { code: string }) =>
-    a.code === '3900' ? -1 : b.code === '3900' ? 1 : a.code.localeCompare(b.code, undefined, { numeric: true });
-  const pick = (list: typeof rows) =>
-    [...list].sort((a, b) => Number(b.isActive) - Number(a.isActive) || byCode(a, b))[0] ?? null;
-  const typed = rows.filter((r) => r.subtype === 'retained_earnings');
-  if (typed.length) return pick(typed);
-  const legacy = rows.filter(
-    (r) => (r.code === '3900' || /^retained earnings$/i.test(r.name.trim())) && !/opening balance equity/i.test(r.name),
-  );
-  return pick(legacy);
+  // The same choice as every report (retainedEarnings.ts).
+  const re = pickRetainedEarnings(rows.map((r) => ({ ...r, equity: true })));
+  return re ? { id: re.id, code: re.code, name: re.name } : null;
 }
 
 export interface YearEndCloseResult {

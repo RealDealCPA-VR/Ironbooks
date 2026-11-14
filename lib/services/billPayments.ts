@@ -809,6 +809,11 @@ export async function updateBillPayment(ctx: ServiceContext, id: string, input: 
     if (input.journalOffsets === undefined) {
       input = { ...input, journalOffsets: await journalOffsetsOf(tx, { billPaymentId: id }) };
     }
+    // A foreign payment edited without a rate (same vendor, so same currency) keeps its booked rate
+    // (as vendor credits do), not today's list rate.
+    if (cur.currency && cur.vendorId === input.vendorId && (input.exchangeRate == null || String(input.exchangeRate).trim() === '')) {
+      input = { ...input, exchangeRate: cur.exchangeRate };
+    }
 
     // Header-only edit? Compare the financial shape (discounts live in the GL, so any
     // discount on the old payment forces the full path — it cannot be compared cheaply).

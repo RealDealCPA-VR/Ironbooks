@@ -1157,9 +1157,11 @@ async function setUpLoanPaymentInTx(ctx: ServiceContext, loanId: string, input: 
       // review5 fx: the payment that pays the loan off takes off what is left of its home value
       // (round2(original x rate) - what earlier payments took), so no rounding cents stay on the
       // liability once nothing is owed (QB clears it on the final payment).
+      // From the balance the Loan Manager started tracking (a loan in progress was booked at what
+      // was left then, not its original amount — that posted the earlier payments as a "gain").
       const bookedHome = principal.equals(Money.of(loan.balance))
         ? Money.round2(
-            toHome(loan.originalAmount, bookedRate).minus(
+            toHome(scheduledBalanceBefore(loan, Math.max(1, loan.scheduleStartNumber ?? 1)), bookedRate).minus(
               loan.payments
                 .filter((p) => p.active)
                 .reduce((s, p) => s.plus(toHome(p.principal, bookedRate)), Money.zero()),

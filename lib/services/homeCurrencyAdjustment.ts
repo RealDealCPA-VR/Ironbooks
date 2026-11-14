@@ -18,7 +18,7 @@
  * Every line is posted through postJournalEntry (balanced, closing date respected, audited).
  * Voiding an adjustment voids both entries.
  */
-import { and, asc, desc, eq, inArray, isNull } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNull, lte } from 'drizzle-orm';
 import Decimal from 'decimal.js';
 import { accounts, currencies, homeCurrencyAdjustments, loans } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
@@ -28,7 +28,7 @@ import { getOrCreateExchangeGainLossAccount } from './currencies';
 import { foreignCode, homeCode, parseRate } from './exchangeRates';
 import { foreignAccountBalances } from './fxLedger';
 import { foreignOpenPayables, foreignOpenReceivables } from './fxSubledger';
-import { getLoan, voidOrphanLoanFx } from './loans';
+import { getLoan, scheduledBalanceBefore, voidOrphanLoanFx } from './loans';
 import { assertListRatesKeepHomeCurrency } from './multiCurrency';
 import { systemAccountIdOrNull } from './accountRoles';
 
@@ -222,13 +222,17 @@ export async function previewHomeCurrencyAdjustment(ctx: ServiceContext, input: 
     .select({ loan: loans, accountName: accounts.name, accountCode: accounts.code })
     .from(loans)
     .innerJoin(accounts, eq(loans.liabilityAccountId, accounts.id))
-    .where(and(eq(loans.companyId, ctx.companyId), eq(loans.isActive, true)));
+    // Loans in the Loan Manager (a removed one is gone from it, as liabilityAccountBalance treats
+    // it) made by the date — one made later had no balance yet; revaluing it posted a gain/loss on
+    // nothing.
+    .where(and(eq(loans.companyId, ctx.companyId), eq(loans.isActive, true), lte(loans.originDate, asOf)));
   for (const { loan, accountName, accountCode } of loanRows) {
     const cur = foreignCode(loan.currency, home);
     if (!cur) continue;
     const rate = need(cur);
     const { activePrincipal } = await loanPrincipalPaid(ctx, loan.id, asOf);
-    const balance = Money.round2(Money.of(loan.originalAmount).minus(activePrincipal));
+    // A loan in progress: what was left when the Loan Manager started tracking it, less its payments.
+    const balance = Money.round2(scheduledBalanceBefore(loan, Math.max(1, loan.scheduleStartNumber ?? 1)).minus(activePrincipal));
     if (balance.isZero()) continue;
     const carried = Money.round2(balance.times(Money.of(loan.exchangeRate ?? rate)));
     push(

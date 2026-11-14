@@ -1,5 +1,5 @@
 import { pgTable, uuid, varchar, text, timestamp, boolean, decimal, integer, jsonb, pgEnum, index } from 'drizzle-orm/pg-core';
-import { relations } from 'drizzle-orm';
+import { relations, sql } from 'drizzle-orm';
 
 // Enums
 export const accountTypeEnum = pgEnum('account_type', ['asset', 'liability', 'equity', 'revenue', 'expense']);
@@ -798,7 +798,10 @@ export const billLines = pgTable('bill_lines', {
   /** Set when this billable line has been pulled onto a customer invoice. */
   billedInvoiceId: uuid('billed_invoice_id').references(() => invoices.id),
   lineOrder: integer('line_order').notNull().default(0),
-}, (t) => [index('bill_lines_bill_idx').on(t.billId)]);
+}, (t) => [
+  index('bill_lines_bill_idx').on(t.billId),
+  index('bill_lines_billable_idx').on(t.customerId).where(sql`${t.customerId} IS NOT NULL AND ${t.billedInvoiceId} IS NULL`),
+]);
 
 // ---- Bill payments (A/P) ----
 export const billPayments = pgTable('bill_payments', {
@@ -872,7 +875,10 @@ export const expenseLines = pgTable('expense_lines', {
   itemId: uuid('item_id').references(() => items.id),
   quantity: decimal('quantity', { precision: 15, scale: 4 }),
   unitCost: decimal('unit_cost', { precision: 15, scale: 4 }),
-}, (t) => [index('expense_lines_expense_idx').on(t.expenseId)]);
+}, (t) => [
+  index('expense_lines_expense_idx').on(t.expenseId),
+  index('expense_lines_billable_idx').on(t.customerId).where(sql`${t.customerId} IS NOT NULL AND ${t.billedInvoiceId} IS NULL`),
+]);
 
 // ---- Bank transfers ----
 export const transfers = pgTable('transfers', {
@@ -1054,7 +1060,7 @@ export const paycheckLines = pgTable('paycheck_lines', {
   payrollItemId: uuid('payroll_item_id').references(() => payrollItems.id),
   /** Tax tracking type (lib/services/payrollTaxTracking.ts) — drives W-2/941/940 aggregation. */
   taxTracking: varchar('tax_tracking', { length: 40 }),
-});
+}, (t) => [index('paycheck_lines_paycheck_idx').on(t.paycheckId)]);
 
 /** Payroll item definitions — QB-style earnings/taxes/deductions with GL mapping. */
 export const payrollItems = pgTable('payroll_items', {
@@ -1133,6 +1139,9 @@ export const recurringTemplates = pgTable('recurring_templates', {
   /** Enter (or remind) this many days before the scheduled date. */
   daysInAdvance: integer('days_in_advance').notNull().default(0),
   lastRunAt: timestamp('last_run_at'),
+  /** Review loop 5: why the last automatic entry failed (cleared on success; 0092). */
+  lastError: text('last_error'),
+  lastErrorAt: timestamp('last_error_at'),
   /** Twice-a-month schedules: the pair's first-half day (1-15), so 15th/30th survives February. */
   anchorDay: integer('anchor_day'),
 });
@@ -1346,7 +1355,10 @@ export const inventoryLayers = pgTable('inventory_layers', {
   /** Originating document (e.g. "item_receipt:<id>") — lets landed cost find the receipt's layers. */
   sourceRef: varchar('source_ref', { length: 100 }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
-});
+}, (t) => [
+  index('inventory_layers_item_idx').on(t.companyId, t.itemId, t.date),
+  index('inventory_layers_source_idx').on(t.companyId, t.sourceRef),
+]);
 
 // ---- Customer-specific pricing (price levels) ----
 export const customerPrices = pgTable('customer_prices', {
@@ -1637,7 +1649,7 @@ export const timeEntries = pgTable('time_entries', {
   description: text('description'),
   invoicedInvoiceId: uuid('invoiced_invoice_id').references((): any => invoices.id),
   createdAt: timestamp('created_at').defaultNow().notNull(),
-});
+}, (t) => [index('time_entries_customer_idx').on(t.companyId, t.customerId).where(sql`${t.invoicedInvoiceId} IS NULL`)]);
 
 // ---- Fixed assets + depreciation ----
 export const fixedAssets = pgTable('fixed_assets', {
@@ -2388,8 +2400,8 @@ export const journalItemApplications = pgTable('journal_item_applications', {
   companyId: uuid('company_id').references(() => companies.id).notNull(),
   side: varchar('side', { length: 2 }).notNull(),
   kind: varchar('kind', { length: 20 }).notNull(),
-  journalEntryId: uuid('journal_entry_id').references(() => journalEntries.id).notNull(),
-  journalLineId: uuid('journal_line_id').references(() => journalEntryLines.id).notNull(),
+  journalEntryId: uuid('journal_entry_id').references(() => journalEntries.id, { onDelete: 'cascade' }).notNull(),
+  journalLineId: uuid('journal_line_id').references(() => journalEntryLines.id, { onDelete: 'cascade' }).notNull(),
   paymentId: uuid('payment_id').references(() => paymentsReceived.id),
   billPaymentId: uuid('bill_payment_id').references(() => billPayments.id),
   invoiceId: uuid('invoice_id').references(() => invoices.id),
@@ -2561,7 +2573,7 @@ export const loanPayments = pgTable('loan_payments', {
 export const salesTaxLineLinks = pgTable('sales_tax_line_links', {
   id: uuid('id').primaryKey().defaultRandom(),
   companyId: uuid('company_id').references(() => companies.id).notNull(),
-  journalEntryLineId: uuid('journal_entry_line_id').references(() => journalEntryLines.id).notNull(),
+  journalEntryLineId: uuid('journal_entry_line_id').references(() => journalEntryLines.id, { onDelete: 'cascade' }).notNull(),
   agencyId: uuid('agency_id').references(() => taxAgencies.id),
   /** 'payment' | 'adjustment' | 'collected' */
   kind: varchar('kind', { length: 20 }).notNull(),
@@ -2574,7 +2586,7 @@ export const salesTaxLineLinks = pgTable('sales_tax_line_links', {
 export const workingTbNotes = pgTable('working_tb_notes', {
   id: uuid('id').primaryKey().defaultRandom(),
   companyId: uuid('company_id').references(() => companies.id).notNull(),
-  accountId: uuid('account_id').references(() => accounts.id).notNull(),
+  accountId: uuid('account_id').references(() => accounts.id, { onDelete: 'cascade' }).notNull(),
   /** 'YYYY-MM-DD' period end the note belongs to. */
   periodEnd: varchar('period_end', { length: 10 }).notNull(),
   workpaperRef: varchar('workpaper_ref', { length: 100 }),
@@ -2587,7 +2599,7 @@ export const workingTbNotes = pgTable('working_tb_notes', {
 export const listChangeReviews = pgTable('list_change_reviews', {
   id: uuid('id').primaryKey().defaultRandom(),
   companyId: uuid('company_id').references(() => companies.id).notNull(),
-  auditLogId: uuid('audit_log_id').references(() => auditLogs.id).notNull(),
+  auditLogId: uuid('audit_log_id').references(() => auditLogs.id, { onDelete: 'cascade' }).notNull(),
   reviewedBy: uuid('reviewed_by').references(() => users.id),
   reviewedAt: timestamp('reviewed_at').defaultNow().notNull(),
 });

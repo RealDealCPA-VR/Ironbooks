@@ -399,7 +399,10 @@ const SOURCES: Record<ReminderKey, Source> = {
       .filter((r) => (isoDay(r.nextRunDate) ?? '9999') <= addDaysIso(today, days + (r.daysInAdvance ?? 0)))
       .map((r) => ({
         id: r.id,
-        label: `${r.name}${r.mode === 'automatic' ? ' (enters automatically)' : ''}`,
+        // An automatic entry that failed says so (it stays due until fixed) — not "enters automatically".
+        label: r.lastError
+          ? `${r.name} (could not be entered: ${r.lastError})`
+          : `${r.name}${r.mode === 'automatic' ? ' (enters automatically)' : ''}`,
         date: isoDay(r.nextRunDate),
         amount: null,
         href: '/recurring',

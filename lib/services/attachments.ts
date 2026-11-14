@@ -42,6 +42,7 @@ import {
   salesReceipts,
   vendorCredits,
   vendors,
+  receiptScans,
 } from '@/lib/db/schema';
 import { type ServiceContext, notFound, validation, writeAudit } from './_base';
 import { assertWrite } from './rbac';
@@ -515,7 +516,61 @@ export async function updateAttachment(
     oldValues: { entityType: row.entityType, entityId: row.entityId, description: row.description },
     newValues: { entityType: updated.entityType, entityId: updated.entityId, description: updated.description },
   });
+  if (patch.entityType !== undefined) await syncReceiptScanLink(ctx, id, updated.entityType, updated.entityId);
   return updated as AttachmentRow;
+}
+
+/**
+ * A saved receipt's file was moved in the Doc Center: its scan follows the file. Moved onto
+ * another expense / bill, the receipt is that one's; unfiled (or moved to a record that is not a
+ * transaction), it goes back to the receipt inbox to be booked again — instead of saying "saved
+ * to" a transaction that no longer has it.
+ */
+async function syncReceiptScanLink(ctx: ServiceContext, attachmentId: string, entityType: string | null, entityId: string | null) {
+  const [scan] = await ctx.db
+    .select({ id: receiptScans.id, status: receiptScans.status, txnType: receiptScans.txnType, txnId: receiptScans.txnId, version: receiptScans.version })
+    .from(receiptScans)
+    .where(and(eq(receiptScans.companyId, ctx.companyId), eq(receiptScans.attachmentId, attachmentId)));
+  if (!scan || scan.status !== 'saved') return;
+  if (scan.txnType === entityType && scan.txnId === entityId) return;
+  const toTxn = (entityType === 'expense' || entityType === 'bill') && entityId;
+  await ctx.db
+    .update(receiptScans)
+    .set(
+      toTxn
+        ? { txnType: entityType, txnId: entityId, version: scan.version + 1, updatedAt: new Date() }
+        : { status: 'ready', txnType: null, txnId: null, version: scan.version + 1, updatedAt: new Date() },
+    )
+    .where(eq(receiptScans.id, scan.id));
+}
+
+/**
+ * The expense / bill a receipt was saved as was voided: the receipt goes back to the inbox (its
+ * file unfiled from the void transaction) so it can be booked again. It was stuck as "saved" to a
+ * void transaction — it could not be saved, read again or deleted.
+ */
+export async function releaseReceiptsOfVoidedTxn(ctx: ServiceContext, txnType: 'expense' | 'bill', txnId: string): Promise<void> {
+  const scans = await ctx.db
+    .select({ id: receiptScans.id, attachmentId: receiptScans.attachmentId, version: receiptScans.version })
+    .from(receiptScans)
+    .where(and(eq(receiptScans.companyId, ctx.companyId), eq(receiptScans.txnType, txnType), eq(receiptScans.txnId, txnId)));
+  for (const scan of scans) {
+    await ctx.db
+      .update(attachments)
+      .set({ entityType: null, entityId: null })
+      .where(and(eq(attachments.id, scan.attachmentId), eq(attachments.companyId, ctx.companyId), eq(attachments.entityType, txnType), eq(attachments.entityId, txnId)));
+    await ctx.db
+      .update(receiptScans)
+      .set({ status: 'ready', txnType: null, txnId: null, version: scan.version + 1, updatedAt: new Date() })
+      .where(eq(receiptScans.id, scan.id));
+    await writeAudit(ctx, {
+      action: 'update',
+      entityType: 'receipt_scan',
+      entityId: scan.id,
+      oldValues: { status: 'saved', txnType, txnId },
+      newValues: { status: 'ready', reason: `${txnType} voided` },
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------

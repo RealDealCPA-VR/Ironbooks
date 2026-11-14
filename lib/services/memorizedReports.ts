@@ -217,8 +217,12 @@ async function runMemorizedRow(
   const cfg = row.config ?? {};
   const params = (cfg.params && typeof cfg.params === 'object' ? cfg.params : cfg) as Record<string, unknown>;
   const report = await runStandardReport(ctx, row.reportType, params, { now: opts.now });
-  const display = (cfg.display ?? {}) as { title?: string; subtitle?: string };
-  return { ...report, title: display.title?.trim() || row.name || report.title, subtitle: display.subtitle?.trim() || report.subtitle };
+  const display = (cfg.display ?? {}) as { title?: string; subtitle?: string; hiddenColumns?: unknown };
+  // The columns hidden when it was memorized stay hidden in a scheduled / batch export (the
+  // first, label column always shows).
+  const hidden = new Set(Array.isArray(display.hiddenColumns) ? display.hiddenColumns.filter((x): x is string => typeof x === 'string') : []);
+  const columns = hidden.size ? report.columns.filter((c, i) => i === 0 || !hidden.has(c.key)) : report.columns;
+  return { ...report, columns, title: display.title?.trim() || row.name || report.title, subtitle: display.subtitle?.trim() || report.subtitle };
 }
 
 // ---------------------------------------------------------------------------

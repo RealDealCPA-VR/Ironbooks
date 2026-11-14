@@ -505,6 +505,20 @@
       "when": 1781400091000,
       "tag": "0091_doc_line_tax_rates",
       "breakpoints": true
+    },
+    {
+      "idx": 92,
+      "version": "7",
+      "when": 1781400092000,
+      "tag": "0092_recurring_last_error",
+      "breakpoints": true
+    },
+    {
+      "idx": 93,
+      "version": "7",
+      "when": 1781400093000,
+      "tag": "0093_lookup_indexes",
+      "breakpoints": true
     }
   ]
 }

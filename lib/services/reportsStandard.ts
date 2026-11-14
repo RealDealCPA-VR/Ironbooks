@@ -15,6 +15,7 @@
  *    Customer / Vendor.
  */
 import type Decimal from 'decimal.js';
+import { pickRetainedEarnings } from './retainedEarnings';
 import { Money, toAmountString } from '@/lib/money';
 import type { CellValue, StdColumn, StdReport, StdRow } from '@/lib/reports/types';
 import type { ReportParams } from '@/lib/validation/reports';
@@ -568,9 +569,7 @@ function buildBSRows(
     for (const l of [...c.bs.assets, ...c.bs.liabilities, ...c.bs.equity]) put(l.accountId, i, Money.of(l.amount));
   });
   // Retained Earnings: fold prior-year earnings into the retained-earnings account when there is one.
-  const reAccount = [...meta.values()]
-    .filter((a) => a.section === 'equity' && /retained/.test(a.subtype))
-    .sort((a, b) => a.code.localeCompare(b.code))[0];
+  const reAccount = retainedEarningsAccount(meta);
   const priorYears = cols.map((c) => Money.of(c.bs.priorYearsEarnings));
   const netIncome = cols.map((c) => Money.of(c.bs.currentYearNetIncome));
   // The account's own balance before earlier years' earnings are folded in (QuickZoom below).
@@ -822,9 +821,8 @@ export async function balanceSheetReport(
 
 /** The account Retained Earnings is reported on (the first equity account of that kind), if any. */
 export function retainedEarningsAccount(meta: Map<string, AccountMeta>): AccountMeta | undefined {
-  return [...meta.values()]
-    .filter((a) => a.section === 'equity' && /retained/.test(a.subtype))
-    .sort((a, b) => a.code.localeCompare(b.code))[0];
+  // The year-end close's choice (retainedEarnings.ts), so the close's entries land on the line shown.
+  return pickRetainedEarnings([...meta.values()].map((a) => ({ ...a, equity: a.section === 'equity' }))) ?? undefined;
 }
 
 /**
@@ -1081,7 +1079,9 @@ export async function balanceSheetDetail(ctx: ServiceContext, p: ReportParams): 
 
 /** A filter that picks individual lines (so whole-account beginning balances no longer apply). */
 function hasLineFilter(p: ReportParams): boolean {
-  return !!(p.customerId || p.vendorId || p.employeeId || p.nameId || p.txnType || p.amountMin || p.amountMax || p.memo || p.number || (p.cleared && p.cleared !== 'any') || p.classId);
+  // Item and Customer:Job are line filters too (glFilterFromParams): without them a filtered Balance
+  // Sheet Detail / General Ledger opened every account with its whole beginning balance.
+  return !!(p.customerId || p.vendorId || p.employeeId || p.nameId || p.txnType || p.amountMin || p.amountMax || p.memo || p.number || (p.cleared && p.cleared !== 'any') || p.classId || p.itemId || p.customerJobId);
 }
 
 /**

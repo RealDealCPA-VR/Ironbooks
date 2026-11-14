@@ -18,6 +18,7 @@ import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from '../_base';
 import { applyToInvoice, createCreditMemo } from '../creditMemos';
 import { docRef } from '../docNumbers';
+import { foreignCode, homeCode } from '../exchangeRates';
 
 export interface WriteOffCandidate {
   invoiceId: string;
@@ -68,6 +69,7 @@ export async function listWriteOffCandidates(
     .where(and(...conds))
     .orderBy(invoices.date);
   const day = 86_400_000;
+  const home = await homeCode(ctx);
   return rows
     .map((r) => {
       const due = r.dueDate ?? r.date;
@@ -82,7 +84,8 @@ export async function listWriteOffCandidates(
         total: toAmountString(r.total),
         balanceDue: toAmountString(r.balanceDue),
         daysPastDue: Math.max(0, Math.floor((asOf.getTime() - due.getTime()) / day)),
-        foreignCurrency: r.exchangeRate != null && !Money.eq(r.exchangeRate, 1),
+        // By currency: a EUR invoice booked at exactly 1.0 is still foreign.
+        foreignCurrency: foreignCode(r.currency, home) !== null,
       };
     })
     .filter((r) => r.daysPastDue >= (filter.minDaysPastDue ?? 0));
@@ -121,6 +124,7 @@ export async function writeOffInvoices(
   if (!acct) throw notFound('Bad debt account');
   if (acct.type !== 'expense') throw validation('Choose an expense account (for example "Bad Debt") for write-offs.');
 
+  const home = await homeCode(ctx);
   return inTransaction(ctx, async (tx) => {
     const rows = await tx.db
       .select()
@@ -139,7 +143,7 @@ export async function writeOffInvoices(
       if (!balance.greaterThan(0)) {
         throw new ServiceError('CONFLICT', `Invoice #${no} has no open balance.`);
       }
-      if (inv.exchangeRate != null && !Money.eq(inv.exchangeRate, 1)) {
+      if (foreignCode(inv.currency, home) !== null) {
         throw validation(`Invoice #${no} is in a foreign currency — write it off with a credit memo in that currency.`);
       }
       if (input.date < inv.date) {

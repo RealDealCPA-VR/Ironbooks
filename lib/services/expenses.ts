@@ -1104,6 +1104,8 @@ async function voidExpenseInTx(ctx: ServiceContext, id: string) {
       .set({ voidedAt: new Date(), toPrint: false })
       .where(eq(expenses.id, id))
       .returning();
+    // A receipt saved as this expense goes back to the receipt inbox.
+    await (await import('./attachments')).releaseReceiptsOfVoidedTxn(tx, 'expense', id);
 
     await writeAudit(tx, {
       action: 'void',

@@ -175,6 +175,8 @@ export const REPORT_PARAM_KEYS = [
   'overDays',
   // Report gaps round: Sales by Rep, inventory sites, Cash Flow Forecast periods.
   'repId', 'siteId', 'period',
+  // Review loop 6: the type filters the report form offers (dropped from the URL, so ignored).
+  'customerTypeId', 'vendorTypeId', 'jobTypeId',
 ] as const;
 
 /** Only the report options from a params object (drops row / col / back and anything unknown). */

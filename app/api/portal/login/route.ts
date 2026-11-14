@@ -3,7 +3,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { eq, sql } from 'drizzle-orm';
 import { getDb } from '@/lib/db';
 import { companies, employees } from '@/lib/db/schema';
-import { verifyPassword, createPortalToken, isArchivedSettings, PORTAL_COOKIE } from '@/lib/auth';
+import { verifyPassword, verifyPasswordTimed, createPortalToken, isArchivedSettings, PORTAL_COOKIE } from '@/lib/auth';
 import { cookieSecure, originFromHeaders } from '@/lib/net/requestInfo';
 import { GLOBAL_KEY_WEIGHT, attemptKeys, loginLimiter, tooManyAttempts } from '@/lib/net/rateLimit';
 import { readJsonObject } from '@/lib/routeErrors';
@@ -38,7 +38,9 @@ export async function POST(req: NextRequest) {
       .where(sql`lower(trim(${employees.email})) = ${email.trim().toLowerCase()}`);
     // Employees of an archived (soft-deleted) company can no longer sign in to the portal.
     const matches = rows.filter((r) => !isArchivedSettings(r.companySettings)).map((r) => r.emp);
+    let checked = false;
     for (const emp of matches) {
+      if (emp.portalPasswordHash && emp.isActive) checked = true;
       if (emp.portalPasswordHash && emp.isActive && (await verifyPassword(password, emp.portalPasswordHash))) {
         limiter.recordSuccess(keys.slice(0, -1));
         // prefsperms A2: the company turned the employee portal off (Integrated Applications). Only
@@ -58,6 +60,9 @@ export async function POST(req: NextRequest) {
         return res;
       }
     }
+    // No password was checked (unknown email, inactive employee, no portal password): spend the
+    // same time a check takes, so the answer's timing doesn't tell which emails are portal users.
+    if (!checked) await verifyPasswordTimed(password, null);
     limiter.recordFailure(keys, Date.now(), weights);
     return NextResponse.json({ error: 'Invalid email or password.', code: 'FORBIDDEN' }, { status: 401 });
   } finally {

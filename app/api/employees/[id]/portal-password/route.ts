@@ -57,3 +57,36 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     return routeError(err, 'employees/portal-password');
   }
 }
+
+/**
+ * DELETE /api/employees/[id]/portal-password — remove an employee's portal access. Clearing the
+ * password also ends every portal session already signed in (tokens are bound to it). Before
+ * this the only ways to end access were a new password or making the employee inactive.
+ */
+export async function DELETE(_req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
+  try {
+    const ctx = await getServerContext();
+    const { id } = await params;
+    const [emp] = await ctx.db
+      .select({ id: employees.id, hadPassword: sql<boolean>`${employees.portalPasswordHash} IS NOT NULL` })
+      .from(employees)
+      .where(and(eq(employees.id, id), eq(employees.companyId, ctx.companyId)));
+    if (!emp) return NextResponse.json({ error: 'Employee not found', code: 'NOT_FOUND' }, { status: 404 });
+    await inTransaction(ctx, async (tx) => {
+      await tx.db
+        .update(employees)
+        .set({ portalPasswordHash: null, updatedAt: new Date() })
+        .where(and(eq(employees.id, id), eq(employees.companyId, tx.companyId)));
+      await writeAudit(tx, {
+        action: 'update',
+        entityType: 'employee',
+        entityId: id,
+        oldValues: { portalPassword: emp.hadPassword ? 'set' : 'none' },
+        newValues: { portalPassword: 'none' },
+      });
+    });
+    return NextResponse.json({ ok: true });
+  } catch (err) {
+    return routeError(err, 'employees/portal-password');
+  }
+}
