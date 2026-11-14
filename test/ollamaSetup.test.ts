@@ -11,7 +11,7 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 
 const require = createRequire(import.meta.url);
-const { installOllama, checkSignature, allowedUrl } = require('../electron/ollamaSetup.js');
+const { installOllama, checkSignature, allowedUrl, downloadTo, signedByOllama } = require('../electron/ollamaSetup.js');
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ib-ollama-'));
 afterAll(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
@@ -75,11 +75,44 @@ describe('installOllama', () => {
     expect(base.launch).not.toHaveBeenCalled();
   });
 
-  it('only https Ollama / GitHub addresses are allowed', () => {
+  it('only https Ollama addresses, Ollama releases on GitHub and GitHub download hosts are allowed', () => {
     expect(allowedUrl('https://ollama.com/download/OllamaSetup.exe')).toBe(true);
+    expect(allowedUrl('https://github.com/ollama/ollama/releases/download/v1/OllamaSetup.exe')).toBe(true);
     expect(allowedUrl('https://objects.githubusercontent.com/x')).toBe(true);
+    expect(allowedUrl('https://github.com/someone-else/ollama/releases/download/v1/OllamaSetup.exe')).toBe(false);
+    expect(allowedUrl('https://evil.githubusercontent.com/x')).toBe(false);
     expect(allowedUrl('http://ollama.com/x')).toBe(false);
     expect(allowedUrl('https://ollama.com.evil.example/x')).toBe(false);
+  });
+
+  it('a download that stalls gives up, and Cancel stops it', async () => {
+    const never = vi.fn(async (_u: string, init: RequestInit) => {
+      const body = new ReadableStream({
+        start(c) {
+          c.enqueue(new Uint8Array(3));
+          init.signal?.addEventListener('abort', () => c.error(new DOMException('aborted', 'AbortError')));
+        },
+      });
+      const res = new Response(body, { status: 200, headers: { 'content-length': '100' } });
+      Object.defineProperty(res, 'url', { value: 'https://ollama.com/download/OllamaSetup.exe' });
+      return res;
+    });
+    const dest = path.join(tmpDir, 'stall.exe');
+    await expect(downloadTo('https://ollama.com/download/OllamaSetup.exe', dest, { fetchImpl: never, stallMs: 50 })).rejects.toThrow(/stopped/);
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), 20);
+    await expect(downloadTo('https://ollama.com/download/OllamaSetup.exe', dest, { fetchImpl: never, signal: ac.signal, stallMs: 5000 })).rejects.toThrow(/cancelled/);
+    expect(fs.existsSync(dest)).toBe(false);
+  });
+});
+
+describe('signedByOllama', () => {
+  it('needs the organization to be exactly Ollama, not a look-alike', () => {
+    expect(signedByOllama('CN=Ollama Inc., O=Ollama Inc., L=Palo Alto, S=California, C=US')).toBe(true);
+    expect(signedByOllama('CN="Ollama, Inc.", O="Ollama, Inc.", C=US')).toBe(true);
+    expect(signedByOllama('CN=Ollama Tools LLC, O=Ollama Tools LLC')).toBe(false);
+    expect(signedByOllama('CN=Mallory, OU="O=Ollama Inc.", O=Mallory Ltd')).toBe(false);
+    expect(signedByOllama('CN=Ollama Inc.')).toBe(false);
   });
 });
 
@@ -88,6 +121,7 @@ describe('checkSignature', () => {
     const run = (out: object) => async () => JSON.stringify(out);
     expect((await checkSignature('x', { run: run({ status: 'Valid', subject: 'CN=Ollama Inc., O=Ollama Inc., C=US' }) })).ok).toBe(true);
     expect((await checkSignature('x', { run: run({ status: 'Valid', subject: 'CN=Someone Else LLC' }) })).ok).toBe(false);
+    expect((await checkSignature('x', { run: run({ status: 'Valid', subject: 'CN=Ollama Tools LLC, O=Ollama Tools LLC' }) })).ok).toBe(false);
     expect((await checkSignature('x', { run: run({ status: 'HashMismatch', subject: 'CN=Ollama Inc.' }) })).ok).toBe(false);
     expect((await checkSignature('x', { run: async () => '' })).ok).toBe(false);
   });

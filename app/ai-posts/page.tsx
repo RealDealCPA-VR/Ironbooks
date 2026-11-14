@@ -23,7 +23,7 @@ interface AiPost {
   accountCode: string;
   accountName: string;
   confidence: string;
-  state: 'posted' | 'undone';
+  state: 'posted' | 'changed' | 'undone';
 }
 
 export default function AiPostsPage() {
@@ -81,7 +81,8 @@ export default function AiPostsPage() {
         ) : (
           <>
             <div className="px-4 py-3 text-xs text-navy/50 border-b border-slate-100">
-              {live} still posted · {posts.length - live} undone
+              {live} still posted as the AI did · {posts.filter((p) => p.state === 'changed').length} changed by you ·{' '}
+              {posts.filter((p) => p.state === 'undone').length} undone
             </div>
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
@@ -97,7 +98,7 @@ export default function AiPostsPage() {
                 </thead>
                 <tbody>
                   {posts.map((p) => (
-                    <tr key={p.id} className={`border-t border-slate-100 ${p.state === 'undone' ? 'text-navy/40' : 'text-navy'}`}>
+                    <tr key={p.id} className={`border-t border-slate-100 ${p.state === 'posted' ? 'text-navy' : 'text-navy/40'}`}>
                       <td className="px-4 py-2 whitespace-nowrap">{formatDate(p.date)}</td>
                       <td className="px-4 py-2">
                         <div className="font-medium">{p.description || '—'}</div>
@@ -114,7 +115,7 @@ export default function AiPostsPage() {
                             <Undo2 className="h-4 w-4" /> Undo
                           </Button>
                         ) : (
-                          <Badge tone="neutral">Undone</Badge>
+                          <Badge tone="neutral">{p.state === 'changed' ? 'Changed by you' : 'Undone'}</Badge>
                         )}
                       </td>
                     </tr>

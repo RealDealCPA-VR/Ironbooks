@@ -79,6 +79,18 @@ describe('what the AI posted', () => {
     expect(again.applied.map((a) => a.bankTransactionId)).not.toContain(id);
   });
 
+  it('a line the person matched to another entry shows as changed by you and is not undone', async () => {
+    const id = await line('2026-03-09', '-44.40');
+    await autoApplyBankSuggestions(ctx, bankId);
+    const post = (await listAiPosts(ctx)).find((p) => p.bankTransactionId === id)!;
+    expect(post.state).toBe('posted');
+    // The person re-points the line at an entry of their own (what an edit of the entry also does).
+    const [other] = await db.select({ id: journalEntries.id }).from(journalEntries).where(eq(journalEntries.companyId, ctx.companyId)).limit(1);
+    await db.update(bankTransactions).set({ matchedEntryId: other.id }).where(eq(bankTransactions.id, id));
+    expect((await listAiPosts(ctx)).find((p) => p.id === post.id)!.state).toBe('changed');
+    await expect(undoAiPost(ctx, post.id)).rejects.toThrow(/You changed this one/);
+  });
+
   it('another company’s post is not found', async () => {
     await expect(undoAiPost({ ...ctx, companyId: '00000000-0000-0000-0000-000000000000' }, (await listAiPosts(ctx))[0].id)).rejects.toMatchObject({ code: 'NOT_FOUND' });
   });

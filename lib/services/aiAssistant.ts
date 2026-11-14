@@ -146,12 +146,16 @@ export const TOOLS: Record<string, ToolDef> = {
         .sort((x, y) => y.daysOverdue - x.daysOverdue)
         .map((x) => ({ invoice: x.refNumber, customer: x.customerName, date: x.date, dueDate: x.dueDate, daysOverdue: x.daysOverdue, total: x.total, balanceDue: x.balanceDue }));
       const c = cap(rows);
-      return { asOf: r.asOf, invoices: c.rows, truncated: c.truncated, count: rows.length, totalOpen: q ? toAmountString(Money.add(...rows.map((x) => x.balanceDue))) : r.totalOpen };
+      // In home currency, like the report's own total (a foreign balance at its booked rate).
+      const home = (x: { balanceDue: string; exchangeRate?: string | null }) =>
+        x.exchangeRate && !Money.of(x.exchangeRate).equals(1) ? Money.round2(Money.of(x.balanceDue).times(Money.of(x.exchangeRate))) : Money.of(x.balanceDue);
+      const picked = r.rows.filter((x) => !q || x.customerName.toLowerCase().includes(q));
+      return { asOf: r.asOf, invoices: c.rows, truncated: c.truncated, count: rows.length, totalOpen: q ? toAmountString(Money.add(...picked.map(home))) : r.totalOpen };
     },
   },
   sales_by_customer: {
     area: 'reports_sales.sales',
-    description: 'Sales by customer for a date range (who buys the most), largest first.',
+    description: 'Invoiced sales by customer for a date range, largest first. Invoice totals (including sales tax); sales receipts are not included — say "invoiced" when citing it.',
     argsHelp: '{"from"?: "YYYY-MM-DD", "to"?: "YYYY-MM-DD"}',
     args: z.object({ from: zDateStr.optional(), to: zDateStr.optional() }),
     async run(ctx, a) {
@@ -163,7 +167,7 @@ export const TOOLS: Record<string, ToolDef> = {
   },
   expenses_by_vendor: {
     area: 'reports_purchases.purchases',
-    description: 'Spending by vendor for a date range (who we pay the most), largest first.',
+    description: 'Billed spending by vendor for a date range, largest first. Entered bills only; checks and card charges paid without a bill are not included — say "billed" when citing it, and use profit_and_loss for total expenses.',
     argsHelp: '{"from"?: "YYYY-MM-DD", "to"?: "YYYY-MM-DD"}',
     args: z.object({ from: zDateStr.optional(), to: zDateStr.optional() }),
     async run(ctx, a) {
@@ -1359,21 +1363,25 @@ async function offlineAnswerInner(ctx: ServiceContext, q: string, today: Date): 
     answer =
       `Cash flow for ${p.label} (${p.from} to ${p.to}): operating ${fc(r.operating.total)}, investing ${fc(r.investing.total)}, ` +
       `financing ${fc(r.financing.total)}; net change in cash ${fc(r.netCashChange)} [cash_flow].`;
-  } else if (/(open|unpaid) invoices|invoices? (that are )?(open|unpaid)|list (of )?invoices/.test(t)) {
+  } else if (/(open|unpaid) invoices|invoices? (that are )?(open|unpaid)/.test(t) && !/owe|overdue|aging/.test(t)) {
     const r = (await call('open_invoices', {})) as { invoices: { invoice: string; customer: string; daysOverdue: number; balanceDue: string }[]; count: number; totalOpen: string };
     const top = r.invoices.slice(0, 5).map((i) => `#${i.invoice} ${i.customer} ${fc(i.balanceDue)}${i.daysOverdue > 0 ? ` (${i.daysOverdue} days overdue)` : ''}`).join('; ');
     answer = r.count ? `${r.count} open invoice(s), ${fc(r.totalOpen)} in total [open_invoices]. Most overdue: ${top}.` : 'No open invoices [open_invoices].';
-  } else if (/(top|best|biggest|largest) customers|sales by customer|who (buys|bought|spends?) (the )?most/.test(t)) {
+  } else if (/(top|best|biggest|largest) customers|sales by customer|who (buys|bought|spends?) (the )?most/.test(t) && !/owe|overdue|receivable/.test(t)) {
     const p = periodFromText(t, today);
     const r = (await call('sales_by_customer', { from: p.from, to: p.to })) as { customers: { customer: string; sales: string }[]; total: string };
     const top = r.customers.slice(0, 5).map((c) => `${c.customer} ${fc(c.sales)}`).join(', ');
-    answer = top ? `Top customers for ${p.label} (${p.from} to ${p.to}): ${top}; ${fc(r.total)} in all [sales_by_customer].` : `No sales for ${p.label} [sales_by_customer].`;
+    answer = top
+      ? `Top customers by invoiced sales for ${p.label} (${p.from} to ${p.to}): ${top}; ${fc(r.total)} invoiced in all, including sales tax [sales_by_customer].`
+      : `No invoiced sales for ${p.label} [sales_by_customer].`;
   } else if (/(top|biggest|largest) vendors|(spend(ing)?|expenses?) by vendor|who do (we|i) (pay|spend)/.test(t)) {
     const p = periodFromText(t, today);
     const r = (await call('expenses_by_vendor', { from: p.from, to: p.to })) as { vendors: { vendor: string; spent: string }[]; total: string };
     const top = r.vendors.slice(0, 5).map((v) => `${v.vendor} ${fc(v.spent)}`).join(', ');
-    answer = top ? `Top vendors for ${p.label} (${p.from} to ${p.to}): ${top}; ${fc(r.total)} in all [expenses_by_vendor].` : `No vendor spending for ${p.label} [expenses_by_vendor].`;
-  } else if (/receivable|\bar\b|owe[s]? (us|me)|outstanding invoices|overdue invoices/.test(t)) {
+    answer = top
+      ? `Top vendors by bills entered for ${p.label} (${p.from} to ${p.to}): ${top}; ${fc(r.total)} billed in all (checks and card charges without a bill are not counted) [expenses_by_vendor].`
+      : `No bills entered for ${p.label} [expenses_by_vendor].`;
+  } else if (/receivable|\bar\b|owe[s]? (us|me)|who owes|outstanding invoices|overdue invoices|invoices? (are |that are |is )?(overdue|past due|outstanding|late)/.test(t)) {
     const r = (await call('ar_aging', {})) as { customers: { name: string; total: string }[]; totals: { total: string; current: string } };
     const top = r.customers.slice(0, 5).map((c) => `${c.name} ${fc(c.total)}`).join(', ');
     answer = `Customers owe ${fc(r.totals.total)} in total (${fc(r.totals.current)} not yet due) [ar_aging].${top ? ` Largest balances: ${top}.` : ''}`;

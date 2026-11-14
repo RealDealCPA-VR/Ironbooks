@@ -55,6 +55,7 @@ contextBridge.exposeInMainWorld('bookkeeper', {
   /** "Set up free AI": install Ollama (asks first; Windows runs its signed installer). */
   ollama: {
     install: () => ipcRenderer.invoke('ollama:install'),
+    cancel: () => ipcRenderer.invoke('ollama:cancel'),
     onProgress: (cb) => {
       const handler = (_e, p) => cb(p);
       ipcRenderer.on('ollama:progress', handler);

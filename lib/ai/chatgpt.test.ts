@@ -95,4 +95,17 @@ describe('refresh', () => {
     expect([a.accessToken, b.accessToken, d.accessToken]).toEqual(['new', 'new', 'new']);
     expect(a.refreshToken).toBe('r2');
   });
+
+  it('rotated tokens are saved before the identity check, even when that check fails', async () => {
+    const fetchImpl = async (url: string): Promise<Response> => {
+      if (url.endsWith('/.well-known/openid-configuration')) {
+        return Response.json({ issuer: 'https://auth.openai.com', authorization_endpoint: 'https://auth.openai.com/a', token_endpoint: 'https://auth.openai.com/t' });
+      }
+      return Response.json({ access_token: 'new2', refresh_token: 'r3', token_type: 'Bearer', expires_in: 3600, id_token: jwt({ ...good, aud: 'cid-v', sub: 'another-account' }) });
+    };
+    const saved: string[] = [];
+    const c: ChatGptCredentials = { v: 1, clientId: 'cid-v', accessToken: 'old', refreshToken: 'r2', expiresAt: 0, scopes: [], subject: 's-v', email: null };
+    await expect(refreshCredentials(fetchImpl, c, { persist: async (n) => void saved.push(n.refreshToken!) })).rejects.toThrow(/different account/);
+    expect(saved).toEqual(['r3']);
+  });
 });

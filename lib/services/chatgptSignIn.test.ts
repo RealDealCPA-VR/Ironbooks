@@ -21,9 +21,9 @@ import { parseCredentials } from '@/lib/ai/chatgpt';
 import { AiError, type StoredProviderConfig } from '@/lib/ai/types';
 import type { ServiceContext } from './_base';
 import { createCompany } from './company';
-import { buildProviders, getPublicSettings, loadSettings } from './aiSettings';
+import { buildProviders, getPublicSettings, loadSettings, testConnection, updateSettings } from './aiSettings';
 import { getNetworkPolicy, setNetworkPolicy } from './networkPolicy';
-import { cancelChatGptSignIn, chatGptSignInStatus, disconnectChatGpt, startChatGptSignIn } from './chatgptSignIn';
+import { cancelChatGptSignIn, chatGptSignInStatus, disconnectChatGpt, persistChatGptCredentials, startChatGptSignIn } from './chatgptSignIn';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-chatgpt-signin');
 let db: DB;
@@ -34,7 +34,7 @@ const jwt = (claims: Record<string, unknown>) => `${b64({ alg: 'RS256' })}.${b64
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
 
 /** A fake OpenAI: discovery, token endpoint (code + refresh), models, Responses, revocation. */
-function fakeOpenAi(opts: { grantSharing?: boolean } = {}) {
+function fakeOpenAi(opts: { grantSharing?: boolean; gate?: Promise<void> } = {}) {
   const s = {
     nonce: '',
     access: 'at-1',
@@ -61,6 +61,7 @@ function fakeOpenAi(opts: { grantSharing?: boolean } = {}) {
       const p = new URLSearchParams(String(init.body));
       if (p.get('resource') !== 'https://api.openai.com/v1') return json({ error: 'invalid_request' }, 400);
       if (p.get('grant_type') === 'authorization_code') {
+        if (opts.gate) await opts.gate;
         if (p.get('code') !== 'code-123' || !p.get('code_verifier') || p.get('client_id') !== 'client_abc') return json({ error: 'invalid_grant' }, 400);
         return json({
           access_token: s.access,
@@ -238,11 +239,46 @@ describe('Continue with ChatGPT', () => {
     expect((await savedCreds()).creds.subject).toBe('user-1');
   });
 
+  it('Test connection saves a refreshed sign-in (rotated tokens are never only in memory)', async () => {
+    const fake = fakeOpenAi();
+    fake.s.access = 'at-elsewhere';
+    fake.s.refresh = 'rt-7';
+    fake.s.refreshes = 7;
+    const { p } = await savedCreds();
+    const r = await testConnection(ctx, { id: p.id, kind: 'chatgpt', label: p.label, model: p.model, enabled: true }, { fetch: fake.fn });
+    expect(r.ok).toBe(true);
+    expect((await savedCreds()).creds).toMatchObject({ accessToken: 'at-9', refreshToken: 'rt-9' });
+  });
+
+  it('a page save without the ChatGPT row keeps the connection (only Disconnect removes it)', async () => {
+    await updateSettings(ctx, { providers: [] });
+    expect((await savedCreds()).creds.subject).toBe('user-1');
+  });
+
+  it('a refresh for another account or with older tokens never overwrites the saved sign-in', async () => {
+    const { p, creds } = await savedCreds();
+    await persistChatGptCredentials(ctx, p.id, { ...creds, subject: 'someone-else', accessToken: 'x', expiresAt: Date.now() + 9e9 });
+    await persistChatGptCredentials(ctx, p.id, { ...creds, accessToken: 'older', expiresAt: creds.expiresAt - 1000 });
+    expect((await savedCreds()).creds).toMatchObject({ subject: 'user-1', accessToken: 'at-9' });
+  });
+
+  it('Cancel after the browser came back: nothing is saved and the new sign-in is revoked', async () => {
+    let release!: () => void;
+    const fake = fakeOpenAi({ gate: new Promise<void>((r) => (release = r)) });
+    const { attemptId, url } = await startChatGptSignIn(ctx, { fetch: fake.fn, port: 0 });
+    expect((await browserReturn(url, fake)).status).toBe(200);
+    await cancelChatGptSignIn(ctx, attemptId);
+    release();
+    expect(await waitDone(attemptId)).toEqual({ status: 'error', error: 'Sign-in was cancelled.' });
+    expect((await savedCreds()).creds.accessToken).toBe('at-9');
+    expect(fake.s.revoked).toContain('rt-1');
+  });
+
   it('Disconnect removes the connection and signs out at OpenAI', async () => {
     const fake = fakeOpenAi();
     const r = await disconnectChatGpt(ctx, { fetch: fake.fn });
     expect(r.revoked).toBe(true);
-    expect(fake.s.revoked).toEqual(['rt-7']);
+    expect(fake.s.revoked).toEqual(['rt-9']);
     expect((await loadSettings(ctx)).providers.filter((p: StoredProviderConfig) => p.kind === 'chatgpt')).toHaveLength(0);
   });
 
@@ -254,6 +290,33 @@ describe('Continue with ChatGPT', () => {
     expect(await chatGptSignInStatus(ctx, attemptId)).toEqual({ status: 'error', error: 'Sign-in was cancelled.' });
     for (let i = 0; i < 50 && (await getNetworkPolicy(ctx)).mode !== 'tailnet-only'; i++) await new Promise((r) => setTimeout(r, 20));
     expect((await getNetworkPolicy(ctx)).mode).toBe('tailnet-only');
+  });
+
+  it('cancelling gives back only the cloud-AI switch it turned on (other Privacy & Network changes stay)', async () => {
+    await setNetworkPolicy(ctx, { mode: 'tailnet-only' });
+    const { attemptId } = await startChatGptSignIn(ctx, { fetch: fakeOpenAi().fn, port: 0 });
+    const mid = await getNetworkPolicy(ctx);
+    await setNetworkPolicy(ctx, { mode: 'allow-cloud', cloudOptIn: { ...mid.cloudOptIn, email: true } });
+    await cancelChatGptSignIn(ctx, attemptId);
+    for (let i = 0; i < 50 && (await getNetworkPolicy(ctx)).cloudOptIn.ai; i++) await new Promise((r) => setTimeout(r, 20));
+    const after = await getNetworkPolicy(ctx);
+    expect(after.cloudOptIn).toMatchObject({ ai: false, email: true });
+    expect(after.mode).toBe('allow-cloud');
+  });
+
+  it('a double click runs one sign-in; finishing it keeps cloud AI allowed', async () => {
+    await setNetworkPolicy(ctx, { mode: 'tailnet-only' });
+    const fake = fakeOpenAi();
+    const [a, b] = await Promise.allSettled([startChatGptSignIn(ctx, { fetch: fake.fn, port: 0 }), startChatGptSignIn(ctx, { fetch: fake.fn, port: 0 })]);
+    const started = [a, b].filter((x): x is PromiseFulfilledResult<{ attemptId: string; url: string }> => x.status === 'fulfilled').map((x) => x.value);
+    const live = [];
+    for (const s of started) if ((await chatGptSignInStatus(ctx, s.attemptId)).status === 'pending') live.push(s);
+    expect(live).toHaveLength(1);
+    expect((await browserReturn(live[0].url, fake)).status).toBe(200);
+    expect(await waitDone(live[0].attemptId)).toMatchObject({ status: 'done' });
+    await new Promise((r) => setTimeout(r, 100));
+    expect((await getNetworkPolicy(ctx)).cloudOptIn.ai).toBe(true);
+    await disconnectChatGpt(ctx, { fetch: fake.fn });
   });
 
   it('offline mode is respected: sign-in does not start', async () => {

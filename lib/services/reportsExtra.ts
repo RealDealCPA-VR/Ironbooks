@@ -1573,6 +1573,8 @@ export interface OpenInvoiceRow {
   daysOverdue: number;
   total: string;
   balanceDue: string;
+  /** Booked rate to home currency for a foreign-currency invoice (null = home currency). */
+  exchangeRate?: string | null;
 }
 
 export interface OpenInvoicesReport {
@@ -1636,6 +1638,7 @@ export async function openInvoices(ctx: ServiceContext): Promise<OpenInvoicesRep
       daysOverdue: Math.max(0, ms_to_days(now.getTime() - effectiveDue.getTime())),
       total: toAmountString(r.total),
       balanceDue: toAmountString(r.balanceDue),
+      exchangeRate: r.exchangeRate ?? null,
     };
   });
 

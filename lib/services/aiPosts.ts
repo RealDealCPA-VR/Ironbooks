@@ -27,13 +27,17 @@ export interface AiPostRow {
   accountName: string;
   /** 0..1 as a decimal string. */
   confidence: string;
-  /** 'posted' = still in the books as the AI posted it; 'undone' = unmatched / voided since. */
-  state: 'posted' | 'undone';
+  /**
+   * 'posted' = still in the books as the AI posted it; 'changed' = the person edited the entry or
+   * matched the line to something else (the line is still posted, just not the AI's way);
+   * 'undone' = the line is back in review.
+   */
+  state: 'posted' | 'changed' | 'undone';
 }
 
 const bankLedger = alias(accounts, 'bank_ledger');
 
-export async function listAiPosts(ctx: ServiceContext, opts: { limit?: number } = {}): Promise<AiPostRow[]> {
+export async function listAiPosts(ctx: ServiceContext, opts: { limit?: number; id?: string } = {}): Promise<AiPostRow[]> {
   const limit = Math.min(Math.max(opts.limit ?? 200, 1), 1000);
   const rows = await ctx.db
     .select({
@@ -60,7 +64,7 @@ export async function listAiPosts(ctx: ServiceContext, opts: { limit?: number } 
     .innerJoin(bankAccounts, eq(bankAccounts.id, bankTransactions.bankAccountId))
     .innerJoin(bankLedger, eq(bankLedger.id, bankAccounts.accountId))
     .innerJoin(accounts, eq(accounts.id, aiAutoApplied.accountId))
-    .where(eq(aiAutoApplied.companyId, ctx.companyId))
+    .where(opts.id ? and(eq(aiAutoApplied.companyId, ctx.companyId), eq(aiAutoApplied.id, opts.id)) : eq(aiAutoApplied.companyId, ctx.companyId))
     .orderBy(desc(aiAutoApplied.createdAt))
     .limit(limit);
   return rows.map((r) => ({
@@ -74,7 +78,12 @@ export async function listAiPosts(ctx: ServiceContext, opts: { limit?: number } 
     accountCode: r.accountCode,
     accountName: r.accountName,
     confidence: r.confidence,
-    state: r.entryStatus === 'posted' && r.matched && r.matchedEntryId === r.journalEntryId ? 'posted' : 'undone',
+    state:
+      r.entryStatus === 'posted' && r.matched && r.matchedEntryId === r.journalEntryId
+        ? 'posted'
+        : r.matched && r.matchedEntryId
+          ? 'changed'
+          : 'undone',
   }));
 }
 
@@ -85,7 +94,10 @@ export async function undoAiPost(ctx: ServiceContext, id: string): Promise<AiPos
     .from(aiAutoApplied)
     .where(and(eq(aiAutoApplied.id, id), eq(aiAutoApplied.companyId, ctx.companyId)));
   if (!row) throw notFound('AI post');
-  const current = (await listAiPosts(ctx, { limit: 1000 })).find((r) => r.id === id);
+  const [current] = await listAiPosts(ctx, { id });
+  if (current?.state === 'changed') {
+    throw new ServiceError('CONFLICT', 'You changed this one since the AI posted it, so it is left as you set it. Use Unmatch in Bank Review to send it back to review.');
+  }
   if (current?.state !== 'posted') throw new ServiceError('CONFLICT', 'This one is already undone.');
   await unmatch(ctx, row.bankTransactionId);
   return { ...current, state: 'undone' };

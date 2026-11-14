@@ -12,7 +12,7 @@
  *  - Automation: learned bank-feed auto-apply threshold and LLM second opinions.
  *  - Learned categorizer status + retrain.
  */
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   AlertTriangle,
   Brain,
@@ -162,6 +162,22 @@ type SignIn =
   | { status: 'done'; providerId: string; account: string | null; model: string }
   | { status: 'error'; error: string };
 
+/** Ollama models that cannot chat (embeddings, speech, rerankers): never picked as the chat model. */
+function isNonChatModel(id: string): boolean {
+  return /embed|bge-|bge:|minilm|\be5-|gte-|nomic-bert|mxbai|paraphrase|snowflake-arctic-embed|whisper|tts|rerank|clip/i.test(id);
+}
+
+interface OllamaBridge {
+  install: () => Promise<{ ok: boolean; done?: string; error?: string; cancelled?: boolean }>;
+  cancel?: () => Promise<boolean>;
+  onProgress: (cb: (p: { received: number; total: number }) => void) => () => void;
+}
+
+/** The desktop app's "install Ollama" bridge (electron/preload.js), when running in it. */
+function ollamaBridge(): OllamaBridge | undefined {
+  return (window as unknown as { bookkeeper?: { ollama?: OllamaBridge } }).bookkeeper?.ollama;
+}
+
 let draftSeq = 0;
 function newDraft(partial: Partial<Draft>): Draft {
   return {
@@ -252,6 +268,33 @@ export default function AiSettingsPage() {
   const [localStatus, setLocalStatus] = useState<Record<string, { running: boolean; models: number } | 'checking'>>({});
 
   const [pulling, setPulling] = useState(false);
+  /** False once the person leaves the page: long setup loops stop instead of acting unseen. */
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
+
+  /**
+   * Take the server's copy of SOME provider rows (the ones `pick` selects) without throwing away
+   * the person's unsaved edits to the others. `withRouting` also takes the server's cloud switch
+   * and task policies (they change when ChatGPT is connected).
+   */
+  function mergeServerRows(s: Settings, pick: (p: PublicProvider) => boolean, withRouting = false) {
+    setSettings(s);
+    setDrafts((prev) => {
+      const rows = s.providers.filter(pick).map(toDraft);
+      const ids = new Set(rows.map((r) => r.id));
+      const rest = prev.filter((d) => !(d.id && ids.has(d.id)) && !(d.kind === 'chatgpt' && rows.some((r) => r.kind === 'chatgpt')));
+      return [...rest, ...rows];
+    });
+    if (withRouting) {
+      setCloudEnabled(s.cloudEnabled);
+      setPolicies(s.taskPolicies);
+    }
+  }
   /** "Continue with ChatGPT" in progress: the attempt being waited on. */
   const [chatgptAttempt, setChatgptAttempt] = useState<string | null>(null);
 
@@ -266,13 +309,22 @@ export default function AiSettingsPage() {
       setChatgptAttempt(attemptId);
       window.open(url, '_blank', 'noopener');
       toast('Finish signing in to ChatGPT in your browser, then come back here.', 'info');
-      const until = Date.now() + 10 * 60 * 1000;
-      while (Date.now() < until) {
+      const until = Date.now() + 11 * 60 * 1000;
+      let misses = 0;
+      while (Date.now() < until && alive.current) {
         await new Promise((r) => setTimeout(r, 1500));
-        const s = await api.get<SignIn>(`/api/ai/chatgpt?attempt=${encodeURIComponent(attemptId)}`);
+        let s: SignIn;
+        try {
+          s = await api.get<SignIn>(`/api/ai/chatgpt?attempt=${encodeURIComponent(attemptId)}`);
+          misses = 0;
+        } catch (err) {
+          // A brief hiccup (the app busy saving, a slow request): keep waiting, give up after ~30 s.
+          if (++misses < 20) continue;
+          throw err;
+        }
         if (s.status === 'pending') continue;
         if (s.status === 'done') {
-          apply(await api.get<Settings>('/api/ai/settings'));
+          mergeServerRows(await api.get<Settings>('/api/ai/settings'), (p) => p.kind === 'chatgpt', true);
           loadCloudVerdict();
           toast(`Connected to your ChatGPT plan${s.account ? ` (${s.account})` : ''}. The AI is ready to use.`, 'success');
         } else {
@@ -281,7 +333,7 @@ export default function AiSettingsPage() {
         return;
       }
     } catch (err) {
-      toast(err instanceof ApiError ? err.message : 'Could not start ChatGPT sign-in.', 'danger');
+      toast(err instanceof ApiError ? err.message : 'Could not finish connecting to ChatGPT. Reload the page to see whether it connected.', 'danger');
     } finally {
       setChatgptAttempt(null);
     }
@@ -295,7 +347,9 @@ export default function AiSettingsPage() {
     if (!window.confirm('Disconnect your ChatGPT plan from this company? You can sign in again any time.')) return;
     try {
       const r = await api.post<{ revoked: boolean }>('/api/ai/chatgpt', { action: 'disconnect' });
-      apply(await api.get<Settings>('/api/ai/settings'));
+      const s = await api.get<Settings>('/api/ai/settings');
+      setSettings(s);
+      setDrafts((prev) => prev.filter((d) => d.kind !== 'chatgpt'));
       toast(
         r.revoked
           ? 'ChatGPT disconnected.'
@@ -324,6 +378,8 @@ export default function AiSettingsPage() {
 
   /** "Set up free AI" in progress: what is happening now (null when idle). */
   const [freeAiStep, setFreeAiStep] = useState<string | null>(null);
+  /** Set by Cancel: the setup stops at its next step. */
+  const freeAiCancelled = useRef(false);
 
   /**
    * One click to a free AI on this computer: install Ollama if it is missing (desktop app: its
@@ -337,20 +393,22 @@ export default function AiSettingsPage() {
       api
         .post<TestResult>('/api/ai/test', { kind: 'ollama', label: 'Ollama', baseUrl: OLLAMA, model: '', enabled: true, timeoutMs: 3000 })
         .catch(() => null);
-    const bridge = (
-      window as unknown as {
-        bookkeeper?: {
-          ollama?: {
-            install: () => Promise<{ ok: boolean; done?: string; error?: string; cancelled?: boolean }>;
-            onProgress: (cb: (p: { received: number; total: number }) => void) => () => void;
-          };
-        };
-      }
-    ).bookkeeper?.ollama;
+    const bridge = ollamaBridge();
+    freeAiCancelled.current = false;
+    const stopped = () => !alive.current || freeAiCancelled.current;
     try {
       setFreeAiStep('Looking for Ollama on this computer…');
       let status = await ping();
       if (!status?.ok) {
+        // The OPEN company's Privacy & Network decides (the desktop app's own check reads the
+        // file's first company, which in a multi-company file may not be this one).
+        const allowed = await api
+          .get<{ allowed: boolean; reason?: string }>(`/api/network-policy/check?purpose=updates&url=${encodeURIComponent('https://ollama.com/download')}`)
+          .catch(() => null);
+        if (!allowed?.allowed) {
+          toast(allowed?.reason || 'Privacy & Network does not allow downloads from the internet for this company.', 'danger');
+          return;
+        }
         if (bridge) {
           const off = bridge.onProgress((p) =>
             setFreeAiStep(`Downloading Ollama… ${p.total ? `${Math.round((p.received / p.total) * 100)}%` : `${Math.round(p.received / 1e6)} MB`}`),
@@ -375,36 +433,38 @@ export default function AiSettingsPage() {
           setFreeAiStep('Install Ollama from the page that just opened — Ironbooks carries on when it is running…');
         }
         const until = Date.now() + 20 * 60 * 1000;
-        while (!status?.ok && Date.now() < until) {
+        while (!status?.ok && Date.now() < until && !stopped()) {
           await new Promise((res) => setTimeout(res, 4000));
           status = await ping();
         }
+        if (stopped()) return;
         if (!status?.ok) {
           toast('Ollama is not running yet. Start it, then click “Set up free AI” again.', 'danger');
           return;
         }
       }
-      const chat = status.models.find((m) => !/embed|whisper|tts|rerank/i.test(m.id));
-      let model = chat?.id;
+      let model = status.models.find((m) => !isNonChatModel(m.id))?.id;
       if (!model) {
         setFreeAiStep('Downloading a starter model (llama3.2, about 2 GB)…');
         model = (await api.post<{ model: string }>('/api/ai/pull', { baseUrl: OLLAMA })).model;
       }
+      if (stopped()) return;
       setFreeAiStep('Connecting…');
+      // Saved settings only: the person's unsaved edits on this page stay as they are.
       const current = await api.get<Settings>('/api/ai/settings');
-      const already = current.providers.some((p) => p.kind === 'ollama' && /localhost:11434|127\.0\.0\.1:11434/.test(p.baseUrl ?? ''));
-      if (!already) {
-        apply(
-          await api.put<Settings>('/api/ai/settings', {
-            providers: [
-              ...current.providers.map((p) => draftBody(toDraft(p))),
-              { kind: 'ollama', label: 'Ollama (this computer)', baseUrl: OLLAMA, model, enabled: true },
-            ],
-          }),
-        );
-      } else {
-        apply(current);
-      }
+      const existing = current.providers.find((p) => p.kind === 'ollama' && /\/\/(localhost|127\.0\.0\.1):11434\/?$/.test(p.baseUrl ?? ''));
+      const body = current.providers.map((p) => {
+        const b = draftBody(toDraft(p));
+        // An existing Ollama row that is switched off, has no model or an embedding-only one: fix it.
+        return existing && p.id === existing.id
+          ? { ...b, enabled: true, model: p.model && !isNonChatModel(p.model) ? p.model : model }
+          : b;
+      });
+      if (!existing) body.push({ kind: 'ollama', label: 'Ollama (this computer)', baseUrl: OLLAMA, model, enabled: true });
+      const saved = await api.put<Settings>('/api/ai/settings', { providers: body });
+      const row = saved.providers.find((p) => p.kind === 'ollama' && /\/\/(localhost|127\.0\.0\.1):11434\/?$/.test(p.baseUrl ?? ''));
+      mergeServerRows(saved, (p) => p.id === row?.id);
+      if (row) model = row.model;
       setLocalStatus((m) => ({ ...m, ollama: { running: true, models: Math.max(1, status?.models.length ?? 0) } }));
       toast(`Free AI is ready: ${model} on this computer. Nothing leaves your PC.`, 'success');
     } catch (err) {
@@ -639,7 +699,21 @@ export default function AiSettingsPage() {
             </span>
           </button>
         </div>
-        {freeAiStep && <p className="mt-2 text-xs text-navy/60" role="status">{freeAiStep}</p>}
+        {freeAiStep && (
+          <p className="mt-2 text-xs text-navy/60" role="status">
+            {freeAiStep}{' '}
+            <button
+              type="button"
+              className="text-red-500 hover:underline"
+              onClick={() => {
+                freeAiCancelled.current = true;
+                void ollamaBridge()?.cancel?.();
+              }}
+            >
+              Cancel
+            </button>
+          </p>
+        )}
         {chatgptAttempt && (
           <p className="mt-2 text-xs text-navy/60">
             Finish signing in in your browser.{' '}
@@ -875,15 +949,12 @@ export default function AiSettingsPage() {
                         <Button variant="secondary" size="sm" loading={t === 'running'} onClick={() => test(d)}>
                           Test connection
                         </Button>
-                        {d.apiKeyUnreadable ? (
-                          <Button size="sm" onClick={connectChatGpt}>
-                            Sign in again
-                          </Button>
-                        ) : (
-                          <Button variant="ghost" size="sm" onClick={disconnectChatGpt}>
-                            Disconnect
-                          </Button>
-                        )}
+                        <Button size="sm" variant={d.apiKeyUnreadable ? 'primary' : 'secondary'} loading={!!chatgptAttempt} onClick={connectChatGpt}>
+                          Sign in again
+                        </Button>
+                        <Button variant="ghost" size="sm" onClick={disconnectChatGpt}>
+                          Disconnect
+                        </Button>
                       </div>
                     </div>
                     <div className="mt-3 flex flex-wrap items-center gap-2 text-sm">

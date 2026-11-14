@@ -283,7 +283,18 @@ export function newestCredentials(c: ChatGptCredentials): ChatGptCredentials {
   return l && l.expiresAt > c.expiresAt ? l : c;
 }
 
-export async function refreshCredentials(fetchImpl: FetchLike, c: ChatGptCredentials, signal?: AbortSignal): Promise<ChatGptCredentials> {
+/**
+ * Refresh the sign-in. Refresh tokens ROTATE (the old one is dead once this answers), so:
+ *  - the request runs on its own deadline, never a caller's abort signal — one caller giving up
+ *    must not lose the new token for everyone waiting on the same refresh;
+ *  - the new tokens are handed to `persist` as soon as they arrive, before the identity check
+ *    (which can throw), so a restart can never be left holding only the used-up token.
+ */
+export async function refreshCredentials(
+  fetchImpl: FetchLike,
+  c: ChatGptCredentials,
+  opts: { persist?: (creds: ChatGptCredentials) => Promise<void> } = {},
+): Promise<ChatGptCredentials> {
   const key = connKey(c);
   const running = inflight.get(key);
   if (running) return running;
@@ -294,15 +305,16 @@ export async function refreshCredentials(fetchImpl: FetchLike, c: ChatGptCredent
       fetchImpl,
       d,
       new URLSearchParams({ grant_type: 'refresh_token', client_id: c.clientId, refresh_token: c.refreshToken, resource: CHATGPT_RESOURCE }),
-      signal,
+      AbortSignal.timeout(30_000),
     );
     const f = tokenFields(data, c.scopes);
-    let who = { subject: c.subject, email: c.email };
-    if (data.id_token !== undefined) {
-      who = verifyIdToken(data.id_token, c.clientId, null);
-      if (who.subject !== c.subject) throw new AiError('CONFIG', 'ChatGPT refreshed a different account. Sign in with ChatGPT again.');
-    }
-    const next: ChatGptCredentials = { ...c, ...f, refreshToken: f.refreshToken ?? c.refreshToken, ...who };
+    const rotated: ChatGptCredentials = { ...c, ...f, refreshToken: f.refreshToken ?? c.refreshToken };
+    latest.set(key, rotated);
+    if (opts.persist) await opts.persist(rotated).catch((e) => console.warn('[ai] could not save the refreshed ChatGPT sign-in:', e));
+    if (data.id_token === undefined) return rotated;
+    const who = verifyIdToken(data.id_token, c.clientId, null);
+    if (who.subject !== c.subject) throw new AiError('CONFIG', 'ChatGPT refreshed a different account. Sign in with ChatGPT again.');
+    const next = { ...rotated, ...who };
     latest.set(key, next);
     return next;
   })().finally(() => inflight.delete(key));
@@ -433,9 +445,7 @@ export function createChatGptProvider(cfg: ProviderRuntimeConfig, deps: ChatGptP
   async function fresh(force: boolean, signal?: AbortSignal): Promise<ChatGptCredentials> {
     creds = newestCredentials(creds);
     if (!force && creds.expiresAt - 60_000 > Date.now()) return creds;
-    const before = creds.accessToken;
-    creds = await refreshCredentials(deps.fetch, creds, signal);
-    if (creds.accessToken !== before && deps.persist) await deps.persist(cfg.id, creds).catch((e) => console.warn('[ai] could not save refreshed ChatGPT sign-in:', e));
+    creds = await refreshCredentials(deps.fetch, creds, { persist: deps.persist ? (c) => deps.persist!(cfg.id, c) : undefined });
     return creds;
   }
 

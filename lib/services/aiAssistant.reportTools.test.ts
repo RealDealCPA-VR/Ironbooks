@@ -79,6 +79,20 @@ describe('assistant report tools', () => {
     await expect(runTool(financialOnly as never, 'expenses_by_vendor', {})).rejects.toMatchObject({ code: 'FORBIDDEN' });
   });
 
+  it('questions that already worked offline still go to the same report', async () => {
+    const tool = async (q: string) => (await ask(ctx, [], q)).toolCalls[0]?.tool;
+    expect(await tool('What were sales last month?')).toBe('profit_and_loss');
+    expect(await tool('How much cash do we have?')).toBe('account_balances');
+    expect(await tool('Which invoices are overdue?')).toBe('ar_aging');
+    expect(await tool('Which of my top customers owe us money?')).toBe('ar_aging');
+    expect(await tool('Show unpaid bills')).toBe('ap_aging');
+  });
+
+  it('a customer-filtered open-invoices total is in home currency', async () => {
+    const r = (await runTool(ctx, 'open_invoices', { customer: 'big' })) as { totalOpen: string };
+    expect(r.totalOpen).toBe('900.00');
+  });
+
   it('offline mode (no AI connected) answers these questions from the tools', async () => {
     const open = await ask(ctx, [], 'Show me the open invoices');
     expect(open.mode).toBe('offline');

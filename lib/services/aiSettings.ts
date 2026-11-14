@@ -316,6 +316,12 @@ export async function updateSettings(ctx: ServiceContext, input: UpdateSettingsI
       };
     });
   }
+  if (body.providers) {
+    // A ChatGPT plan connection is only removed by Disconnect (which also signs out at OpenAI): a
+    // page that saves without its row (still loading it, or an old copy) must not delete it.
+    const kept = new Set(next.providers.map((p) => p.id));
+    for (const p of current.providers) if (p.kind === 'chatgpt' && !kept.has(p.id)) next.providers.push(p);
+  }
   if (body.taskPolicies) next.taskPolicies = normalizePolicies({ ...current.taskPolicies, ...body.taskPolicies });
   if (body.cloudEnabled !== undefined) next.cloudEnabled = body.cloudEnabled;
   if (body.cloudDailyCap !== undefined) next.cloudDailyCap = body.cloudDailyCap;
@@ -343,6 +349,16 @@ export async function updateSettings(ctx: ServiceContext, input: UpdateSettingsI
         sealed.push(plain === undefined ? p : { ...p, apiKeyEnc: await sealForFile(tx.db, plain, tx.companyId) });
       }
       next.providers = sealed;
+    }
+    // A ChatGPT sign-in refreshed since `current` was read must not be overwritten with the
+    // older (already used-up) tokens: take each ChatGPT row's sign-in from the row as it is now.
+    if (next.providers.some((p) => p.kind === 'chatgpt')) {
+      const [now] = await tx.db.select({ providers: aiSettings.providers }).from(aiSettings).where(eq(aiSettings.companyId, tx.companyId));
+      const fresh = new Map(((now?.providers as unknown as StoredProviderConfig[]) ?? []).map((p) => [p.id, p]));
+      next.providers = next.providers.map((p) => {
+        const f = fresh.get(p.id);
+        return p.kind === 'chatgpt' && f?.kind === 'chatgpt' ? { ...p, apiKeyEnc: f.apiKeyEnc ?? p.apiKeyEnc } : p;
+      });
     }
     const values = {
       providers: next.providers as unknown as Record<string, unknown>[],
@@ -386,6 +402,21 @@ function runtimeConfig(p: StoredProviderConfig, companyId: string): ProviderRunt
   return { ...rest, apiKey: openKey(p, companyId) };
 }
 
+/**
+ * What every provider is built with: this company's network policy (purpose 'ai') and, for a
+ * ChatGPT plan connection, a place to save refreshed sign-ins (its refresh token rotates — an
+ * unsaved one is dead after a restart). Used by the router AND Test connection.
+ */
+function runtimeDeps(ctx: Pick<ServiceContext, 'db' | 'companyId'>, deps: ProviderDeps = {}): ProviderDeps {
+  return {
+    ...deps,
+    policyCtx: { db: ctx.db, companyId: ctx.companyId },
+    persistChatGpt:
+      deps.persistChatGpt ??
+      (async (providerId, creds) => (await import('./chatgptSignIn')).persistChatGptCredentials(ctx, providerId, creds)),
+  };
+}
+
 /** Instantiate the enabled providers (skipping ones whose config cannot be used). */
 export function buildProviders(
   stored: StoredProviderConfig[],
@@ -394,14 +425,7 @@ export function buildProviders(
 ): AiProvider[] {
   const out: AiProvider[] = [];
   // Every provider call is checked against this company's network policy (purpose 'ai').
-  const withPolicy: ProviderDeps = {
-    ...deps,
-    policyCtx: { db: ctx.db, companyId: ctx.companyId },
-    // A refreshed ChatGPT sign-in is saved back (its refresh token rotates).
-    persistChatGpt:
-      deps.persistChatGpt ??
-      (async (providerId, creds) => (await import('./chatgptSignIn')).persistChatGptCredentials(ctx, providerId, creds)),
-  };
+  const withPolicy = runtimeDeps(ctx, deps);
   for (const p of stored) {
     if (!p.enabled) continue;
     try {
@@ -660,7 +684,7 @@ export async function testConnection(
   }
   let provider: AiProvider;
   try {
-    provider = createProvider(cfg, { ...deps, policyCtx: { db: ctx.db, companyId: ctx.companyId } });
+    provider = createProvider(cfg, runtimeDeps(ctx, deps));
   } catch (err) {
     return { ok: false, latencyMs: 0, error: err instanceof Error ? err.message : String(err), models: [], ...base };
   }

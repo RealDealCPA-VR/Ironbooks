@@ -3148,9 +3148,26 @@ ipcMain.handle('app:dataDir', (e) => (fromLocalApp(e) ? currentCompanyLocation()
  * an app update), and only runs an installer signed by Ollama. Resolves { ok, done?, error? }.
  */
 let ollamaInstalling = false;
+/** The running download (Cancel on the AI page aborts it). */
+let ollamaAbort = null;
+ipcMain.handle('ollama:cancel', (e) => {
+  if (!fromLocalApp(e) || !ollamaAbort) return false;
+  ollamaAbort.abort();
+  return true;
+});
 ipcMain.handle('ollama:install', async (e) => {
   if (!fromLocalApp(e)) return { ok: false, error: 'Not available here.' };
   if (ollamaInstalling) return { ok: false, error: 'Ollama is already being installed.' };
+  // Claimed BEFORE the dialog: two calls never show two dialogs or download into one file twice.
+  ollamaInstalling = true;
+  try {
+    return await installOllamaFlow(e);
+  } finally {
+    ollamaInstalling = false;
+    ollamaAbort = null;
+  }
+});
+async function installOllamaFlow(e) {
   const win = BrowserWindow.fromWebContents(e.sender) ?? mainWindow;
   const isWin = process.platform === 'win32';
   const { response } = await dialog.showMessageBox(win, {
@@ -3178,11 +3195,12 @@ ipcMain.handle('ollama:install', async (e) => {
   } catch {
     return { ok: false, error: 'Could not read the Privacy & Network settings.' };
   }
-  ollamaInstalling = true;
+  ollamaAbort = new AbortController();
   try {
     const { installOllama } = require('./ollamaSetup');
     let last = 0;
     const r = await installOllama({
+      signal: ollamaAbort.signal,
       tmpDir: path.join(app.getPath('temp'), 'ironbooks-ollama'),
       openPage: (url) => shell.openExternal(url),
       launch: async (file) => {
@@ -3198,11 +3216,10 @@ ipcMain.handle('ollama:install', async (e) => {
     });
     return { ok: true, done: r.done };
   } catch (err) {
+    if (ollamaAbort?.signal.aborted) return { ok: false, cancelled: true };
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
-  } finally {
-    ollamaInstalling = false;
   }
-});
+}
 
 // ---------------------------------------------------------------------------
 // Company-file management (drives the in-app "Company File" screen)
