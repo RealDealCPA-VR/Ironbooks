@@ -47,10 +47,13 @@ import { customers, users } from '@/lib/db/schema';
 import { ROUTE_METHOD_HEADER, ROUTE_PATH_HEADER } from '@/lib/permissions/routes';
 import { POST as signupPOST } from '@/app/api/auth/signup/route';
 import { POST as loginPOST } from '@/app/api/auth/login/route';
+import { POST as recoverPOST } from '@/app/api/auth/recover/route';
+import { POST as requestResetPOST } from '@/app/api/auth/request-reset/route';
+import session from '@/electron/companySession';
 import { resetCompanyFileSaveState, saveCompanyFile } from './companyFileSave';
 import { forgetFileKeys } from './fileProtection';
 import { createCustomer } from './customers';
-import { dataDirProblem, resetRecoveryState } from './workingCopyRecovery';
+import { dataDirProblem, recoveryNotice, resetRecoveryState } from './workingCopyRecovery';
 
 let lock: { token: string; dir: string } | null = null;
 
@@ -120,6 +123,23 @@ afterAll(async () => {
 describe('a protected company file whose working copy will not start after a crash', () => {
   let workDir = '';
   let secretBefore = '';
+  let recoveryKey = '';
+  let password = 'Bakery-Pass-2026';
+
+  /** The app crashes, the working copy is left unable to start, and the file is opened again here. */
+  async function crashDamageReopen(launch: string) {
+    await crash();
+    damageCheckpoint(process.env.BKA_DATA_DIR!);
+    const prep = await open(launch);
+    expect(prep.sealed).toBe('key');
+    return prep;
+  }
+
+  /** Customers in the books now open (as the company file last saved them). */
+  async function customerNames(): Promise<string[]> {
+    const db = await getDb();
+    return (await db.select({ name: customers.displayName }).from(customers)).map((c) => c.name);
+  }
 
   it('is set up, saved (encrypted) and changed again, then the app crashes and the copy is damaged', async () => {
     const prep = await open('launch-1');
@@ -135,7 +155,9 @@ describe('a protected company file whose working copy will not start after a cra
       }),
     );
     expect(res.status).toBe(201);
-    const { companyId } = await res.json();
+    const signedUp = await res.json();
+    const { companyId } = signedUp;
+    recoveryKey = signedUp.recoveryKey;
     const db = await getDb();
     const [pat] = await db.select({ id: users.id }).from(users).where(eq(users.email, 'pat'));
     const ctx = { db, companyId, userId: pat.id };
@@ -200,4 +222,69 @@ describe('a protected company file whose working copy will not start after a cra
     expect(await saveCompanyFile({ force: true })).toMatchObject({ outcome: 'saved', encrypted: true });
     expect(fs.readFileSync(FILE).includes(Buffer.from('After Recovery'))).toBe(false);
   }, 120_000);
+
+  it('two sign-ins at the same moment both get in (the second goes on with the first one\'s recovery)', async () => {
+    await crashDamageReopen('launch-3');
+    const [a, b] = await Promise.all([
+      loginPOST(req('/api/auth/login', { email: 'pat', password })),
+      loginPOST(req('/api/auth/login', { email: 'pat', password })),
+    ]);
+    expect([a.status, b.status]).toEqual([200, 200]);
+    expect(sealedMode()).toBeNull();
+    expect(await customerNames()).toContain('After Recovery');
+  }, 180_000);
+
+  it('the recovery key alone gets past a damaged working copy (a sole Admin who forgot the password)', async () => {
+    const prep = await crashDamageReopen('launch-4');
+    const wrong = await recoverPOST(req('/api/auth/recover', { recoveryKey: 'AAAA-BBBB-CCCC-DDDD-EEEE-FFFF', login: 'pat', password: 'Another-Pass-2026' }));
+    expect(wrong.status).toBe(403);
+    expect(sealedMode()).toBe('key'); // a wrong key changes nothing
+    expect(dataDirProblem(prep.dataDir)).toMatch(/missing/);
+
+    password = 'Recovered-Pass-2026';
+    const res = await recoverPOST(req('/api/auth/recover', { recoveryKey, login: 'pat', password }));
+    expect(res.status).toBe(200);
+    expect(sealedMode()).toBeNull();
+    expect(recoveryNotice()).toMatchObject({ keptAt: expect.stringMatching(/\.ironbooks$/) });
+    expect(await customerNames()).toContain('After Recovery');
+    const login = await loginPOST(req('/api/auth/login', { email: 'pat', password }));
+    expect(login.status).toBe(200);
+    // The new password goes into the company file with the next save.
+    expect(await saveCompanyFile({ force: true })).toMatchObject({ outcome: 'saved', encrypted: true });
+  }, 180_000);
+
+  it('the challenge answer ("I forgot my password") gets past a damaged working copy too', async () => {
+    await crashDamageReopen('launch-5');
+    // Asking for the question changes nothing yet.
+    const ask = await requestResetPOST(req('/api/auth/request-reset', { email: 'pat' }));
+    expect(await ask.json()).toMatchObject({ challengeQuestion: 'Name of your first pet' });
+    expect(sealedMode()).toBe('key');
+    const wrong = await requestResetPOST(req('/api/auth/request-reset', { email: 'pat', challengeAnswer: 'Rex' }));
+    expect(wrong.status).toBe(403);
+    expect(sealedMode()).toBe('key');
+
+    const res = await requestResetPOST(req('/api/auth/request-reset', { email: 'pat', challengeAnswer: 'Biscuit the corgi' }));
+    expect(res.status).toBe(200);
+    expect(sealedMode()).toBeNull();
+    expect(recoveryNotice()).not.toBeNull();
+    expect(await customerNames()).toContain('After Recovery');
+  }, 180_000);
+
+  it('a damaged copy that cannot be filed away still lets the sign-in in, and never stays in plain text', async () => {
+    await crashDamageReopen('launch-6');
+    const spy = vi.spyOn(session, 'keepDamagedCopy').mockRejectedValueOnce(Object.assign(new Error('EBUSY: resource busy'), { code: 'EBUSY' }));
+    let res: Response;
+    try {
+      res = await loginPOST(req('/api/auth/login', { email: 'pat', password }));
+    } finally {
+      spy.mockRestore();
+    }
+    expect(res.status).toBe(200);
+    expect(sealedMode()).toBeNull();
+    // It was left at its temporary name, recorded, and encrypted once the sign-in had the key.
+    const names = fs.readdirSync(workDir);
+    expect(names.filter((n) => /^data\.damaged-\d+$/.test(n))).toEqual([]);
+    expect(names.filter((n) => /^data\.damaged-\d+\.ironbooks$/.test(n))).toHaveLength(1);
+    expect(sessionMod.readState(workDir).damagedPlain ?? null).toBeNull();
+  }, 180_000);
 });

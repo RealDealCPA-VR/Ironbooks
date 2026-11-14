@@ -157,10 +157,11 @@ export class BooksBusyError extends ServiceError {
  * that will not start ('key' mode); nobody else may (an unauthenticated request must never make the
  * app set the working copy aside).
  */
-const recoveryAllowed = new AsyncLocalStorage<true>();
+const recoveryAllowed = new AsyncLocalStorage<{ fileKey: Buffer | null }>();
 
-export function withRecoveryAllowed<T>(fn: () => Promise<T>): Promise<T> {
-  return recoveryAllowed.run(true, fn);
+/** `fileKey`: the key the sign-in unlocked from the company file (the damaged copy is kept encrypted with it). */
+export function withRecoveryAllowed<T>(fn: () => Promise<T>, fileKey: Buffer | null = null): Promise<T> {
+  return recoveryAllowed.run({ fileKey }, fn);
 }
 
 function samePath(a: string, b: string): boolean {
@@ -298,6 +299,14 @@ async function doRecover(dir: string): Promise<RecoveryOutcome> {
   // folder that is open: a second Postgres on it is what damages it.
   if ((await openSettled(dir)) === true) return 'retry';
   if (isDbOpen(dir)) return 'retry';
+  // A save already writing out of this folder finishes first (one that has not taken its snapshot
+  // yet sees this recovery and stops): nothing is judged or replaced under a running save.
+  try {
+    const save = await import('./companyFileSave');
+    await save.whenNoSaveWriting();
+  } catch {
+    /* not loaded */
+  }
   const mode = sealedMode();
   // A protected file being decrypted from the company file ('extract' / 'conflict'): these books
   // ARE its last save, so there is nothing better to reopen from.
@@ -331,7 +340,28 @@ async function doRecover(dir: string): Promise<RecoveryOutcome> {
       return 'busy';
     }
     keepSessionSecret(aside, dir);
-    const kept = await session.keepDamagedCopy(workDir, aside, { companyName, appVersion: APP_VERSION });
+    // The sign-in proved its secret against the company file, so it holds the file key: the damaged
+    // copy is kept encrypted with it straight away (never in plain text when that key is known).
+    const signInKey = recoveryAllowed.getStore()?.fileKey ?? null;
+    const enc = manifest.encryption ?? {};
+    const { keyCheckOf } = (await import('@/electron/fileCrypto')).default as { keyCheckOf: (k: Buffer) => string };
+    const keyProtection =
+      signInKey && enc.keyCheck && keyCheckOf(signInKey) === enc.keyCheck
+        ? { fileKey: signInKey, keyCheck: enc.keyCheck, lookupSalt: enc.lookupSalt, slots: Array.isArray(enc.slots) ? enc.slots : [] }
+        : undefined;
+    let kept = aside;
+    try {
+      kept = await session.keepDamagedCopy(workDir, aside, { protection: keyProtection, companyName, appVersion: APP_VERSION });
+    } catch (err) {
+      // Left at its temporary name, recorded so the cleanup encrypts or removes it in time. The
+      // sign-in must go on all the same (decrypting the company file), never stay stuck on 'key'.
+      console.error('[company-file] could not file away the damaged copy (left at its temporary name):', (err as Error)?.message ?? err);
+      try {
+        session.recordDamagedPlain(workDir, aside);
+      } catch {
+        /* the state file is busy: the folder is still named data.damaged-<time> */
+      }
+    }
     overrideSealedMode('extract');
     setNotice(manifest.savedAt ?? null, changesLost, kept);
     console.error(`[company-file] the working copy ${dir} would not start; kept at ${kept}. The sign-in reopens the company file.`);
@@ -391,17 +421,30 @@ async function doRecover(dir: string): Promise<RecoveryOutcome> {
     dropTmp();
     return 'busy';
   }
+  let swapped = false;
   try {
     await format.renameWithRetry(tmp, dir);
+    swapped = true;
   } catch (err) {
-    console.error('[company-file] could not put the reopened save in place; the working copy is back as it was:', (err as Error)?.message ?? err);
+    console.error('[company-file] could not put the reopened save in place:', (err as Error)?.message ?? err);
     try {
       await format.renameWithRetry(aside, dir);
+      console.error('[company-file] the working copy is back as it was.');
     } catch (back) {
+      // Neither went back: try the good copy once more. Never delete it while the working copy is
+      // missing — it is then the only usable copy of the books on this computer.
       console.error(`[company-file] could not put the working copy back from ${aside}:`, (back as Error)?.message ?? back);
+      try {
+        await format.renameWithRetry(tmp, dir);
+        swapped = true;
+      } catch (again) {
+        console.error(`[company-file] the books are kept at ${tmp} (last save) and ${aside} (damaged copy):`, (again as Error)?.message ?? again);
+      }
     }
-    dropTmp();
-    return 'busy';
+    if (!swapped) {
+      if (fs.existsSync(path.join(dir, 'PG_VERSION'))) dropTmp();
+      return 'busy';
+    }
   }
   // Kept for support: an encrypted company file when the books are protected, else the folder.
   let kept = aside;
@@ -409,6 +452,14 @@ async function doRecover(dir: string): Promise<RecoveryOutcome> {
     kept = await session.keepDamagedCopy(workDir, aside, { protection, companyName, appVersion: APP_VERSION });
   } catch (err) {
     console.error('[company-file] could not file away the damaged copy (left at its temporary name):', (err as Error)?.message ?? err);
+    // Protected books left in plain text: recorded, so the cleanup encrypts or removes them in time.
+    if (protection) {
+      try {
+        session.recordDamagedPlain(workDir, aside);
+      } catch {
+        /* the state file is busy */
+      }
+    }
   }
   if (process.env.BKA_COMPANY_STATE) {
     session.writeState(path.dirname(path.resolve(process.env.BKA_COMPANY_STATE)), {
@@ -471,9 +522,11 @@ export function needsSignInToRecover(err: unknown): boolean {
  * has opened the company file: recover it (lib/db getDb, allowed here only) and return the sign-in
  * mode to continue with — 'extract' when the copy was set aside, still 'key' when it started after all.
  */
-export async function recoverSealedWorkingCopy(): Promise<SealedMode | null> {
+export async function recoverSealedWorkingCopy(fileKey: Buffer | null = null): Promise<SealedMode | null> {
+  // Another sign-in already set the copy aside (the mode is 'extract' now): go on with that.
+  if (sealedMode() !== 'key') return sealedMode();
   try {
-    await withRecoveryAllowed(() => withSealedAccess(() => getDb()));
+    await withRecoveryAllowed(() => withSealedAccess(() => getDb()), fileKey);
   } catch (err) {
     if (!(err as { details?: { resealed?: boolean } })?.details?.resealed) throw err;
   }

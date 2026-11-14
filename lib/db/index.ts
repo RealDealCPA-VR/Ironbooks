@@ -128,6 +128,21 @@ export class DatabaseWouldNotStartError extends Error {
   }
 }
 
+/**
+ * The database layout this app writes ({ migrations, lastMigrationAt } of its drizzle journal), for
+ * a company file written out without measuring a database (electron/companySession.js
+ * writeWorkingCopyAs); null without a journal.
+ */
+export function shippedSchemaStamp(migrationsFolder: string = MIGRATIONS_FOLDER): { migrations: number; lastMigrationAt: number } | null {
+  try {
+    const journal = JSON.parse(fs.readFileSync(path.join(migrationsFolder, 'meta', '_journal.json'), 'utf8')) as { entries?: unknown[] };
+    const at = latestShippedMigrationAt(migrationsFolder);
+    return at === null ? null : { migrations: (journal.entries ?? []).length, lastMigrationAt: at };
+  } catch {
+    return null;
+  }
+}
+
 /** The newest migration this app ships (`when` in the drizzle journal); null without a journal. */
 export function latestShippedMigrationAt(migrationsFolder: string = MIGRATIONS_FOLDER): number | null {
   try {
@@ -249,9 +264,10 @@ export const MIGRATIONS_FOLDER = process.env.BKA_MIGRATIONS_DIR
   : path.resolve(process.cwd(), 'drizzle');
 
 /**
- * `dir` is the working copy of the open single company file (BKA_COMPANY_FILE), and that file's
- * last save holds books (its listing records their database layout): a missing database there is
- * a lost working copy, not a brand-new company.
+ * `dir` is the working copy of the open single company file (BKA_COMPANY_FILE), and that file
+ * holds books (a protected file always does; a plain one has PG_VERSION in its listing or a
+ * recorded layout — electron/companyFileFormat.js companyFileHoldsBooks): a missing database there
+ * is a lost working copy, not a brand-new company.
  */
 function savedBooksExpectedIn(dir: string): boolean {
   const file = process.env.BKA_COMPANY_FILE;
@@ -261,8 +277,7 @@ function savedBooksExpectedIn(dir: string): boolean {
   const same = process.platform === 'win32' ? work.toLowerCase() === dir.toLowerCase() : work === dir;
   if (!same) return false;
   try {
-    const m = format.readCompanyManifest(path.resolve(file)) as { dbSchema?: unknown } | null;
-    return Boolean(m && m.dbSchema);
+    return Boolean(format.companyFileHoldsBooks(path.resolve(file)));
   } catch {
     return false;
   }

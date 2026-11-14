@@ -1026,6 +1026,33 @@ function firstStoredEntry(head, n) {
   return { name, data: head.subarray(start, start + csize) };
 }
 
+/**
+ * Does a company file hold books (a database)? A protected one always does (its protection lives
+ * in the database); a plain one when its listing has PG_VERSION or its manifest records a layout.
+ * lib/db openDb: a working copy without a database is then a lost copy, never a new company.
+ */
+function companyFileHoldsBooks(filePath) {
+  const m = readCompanyManifest(filePath);
+  if (!m) return false;
+  if (isSealedManifest(m) || m.dbSchema) return true;
+  let fd;
+  try {
+    fd = fs.openSync(filePath, 'r');
+    const reader = syncFileReader(fd, fs.fstatSync(fd).size);
+    return readDirectorySync(reader).some((e) => e.name === 'PG_VERSION');
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
 /** Read a plain (stored) manifest entry by name, through a synchronous reader; null if absent. */
 function readStoredEntrySync(reader, list, name) {
   const e = list.find((x) => x.name === name);
@@ -1580,6 +1607,7 @@ module.exports = {
   renameWithRetry,
   readCentralDirectory,
   readCompanyManifest,
+  companyFileHoldsBooks,
   readArchiveHead,
   isSealedManifest,
   isCompanyFile,

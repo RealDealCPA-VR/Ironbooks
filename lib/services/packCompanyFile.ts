@@ -5,7 +5,7 @@
  * (app/api/portable/restore, app/api/accountant-copy/open) through their internal-token path.
  */
 import path from 'node:path';
-import { closeDb } from '@/lib/db';
+import { closeDb, shippedSchemaStamp } from '@/lib/db';
 import { protectionForDir } from '@/lib/services/fileProtection';
 import { APP_VERSION } from '@/lib/appVersion';
 import session from '@/electron/companySession';
@@ -21,5 +21,7 @@ export async function packRestoredAsCompanyFile(
     appVersion: APP_VERSION,
     dataDir: restored.dataDir,
     protection,
+    // Restored by this app, so migrated to the layout it ships.
+    dbSchema: shippedSchemaStamp(),
   });
 }

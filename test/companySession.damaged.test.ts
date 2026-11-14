@@ -4,7 +4,7 @@
  *    known yet) is encrypted once it is (sealDamagedCopies) or removed after DAMAGED_PLAIN_MAX_AGE_MS;
  *  - a leftover of a recovery that did not finish (data.recover-<time>) is cache, removed with it.
  */
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -94,5 +94,40 @@ describe('damaged copies kept in a working folder', () => {
     session.writeState(work, { lastUsedAt: new Date(Date.now() - 60 * DAY).toISOString() });
     expect(session.pruneWorkingCopies(root, [], Date.now())).toEqual([work]);
     expect(fs.existsSync(work)).toBe(false);
+  });
+
+  it('a plain-text folder left behind after the encrypted copy was written is recorded, so it is removed in time', async () => {
+    const work = path.join(ROOT, 'busy');
+    const data = path.join(work, 'data');
+    await protectedBooks(data);
+    const realRm = fs.rmSync;
+    const spy = vi.spyOn(fs, 'rmSync').mockImplementation(((p: fs.PathLike, o?: fs.RmOptions) => {
+      if (String(p) === data) throw Object.assign(new Error('EBUSY: resource busy or locked'), { code: 'EBUSY' });
+      return realRm(p, o);
+    }) as typeof fs.rmSync);
+    let kept: string;
+    try {
+      kept = await session.keepDamagedCopy(work, data, { protection: protection() });
+    } finally {
+      spy.mockRestore();
+    }
+    expect(kept).toMatch(/\.ironbooks$/);
+    expect(fs.existsSync(data)).toBe(true); // still there for now
+    expect(session.readState(work).damagedPlain).toEqual([{ path: data, at: expect.any(String) }]);
+  }, 60_000);
+
+  it('the plain-text copies of the very file being opened expire too', () => {
+    const root = path.join(ROOT, 'prune-open');
+    const work = path.join(root, 'marigold-5678');
+    const old = path.join(work, 'damaged copy 2026-10-01 0900');
+    fs.mkdirSync(old, { recursive: true });
+    const now = Date.now();
+    session.writeState(work, {
+      lastUsedAt: new Date(now).toISOString(),
+      damagedPlain: [{ path: old, at: new Date(now - session.DAMAGED_PLAIN_MAX_AGE_MS - DAY).toISOString() }],
+    });
+    session.pruneWorkingCopies(root, [work], now); // `work` is the file being opened: kept, but not its old plain text
+    expect(fs.existsSync(work)).toBe(true);
+    expect(fs.existsSync(old)).toBe(false);
   });
 });

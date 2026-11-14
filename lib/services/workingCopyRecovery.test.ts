@@ -15,6 +15,13 @@ import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { sql } from 'drizzle-orm';
+import { NextRequest } from 'next/server';
+
+const h = vi.hoisted(() => ({ cookies: new Map<string, string>(), headers: new Map<string, string>() }));
+vi.mock('next/headers', () => ({
+  cookies: async () => ({ get: (n: string) => (h.cookies.has(n) ? { name: n, value: h.cookies.get(n)! } : undefined) }),
+  headers: async () => new Headers([...h.headers.entries()]),
+}));
 
 const require = createRequire(import.meta.url);
 const format = require('../../electron/companyFileFormat.js');
@@ -34,6 +41,16 @@ import { damageCheckpoint } from '@/lib/db/damage.fixture';
 import { autosaveTick, resetCompanyFileSaveState, saveCompanyFile, getCompanyFileSaveStatus } from './companyFileSave';
 import { createBackup } from './backup';
 import { dataDirProblem, recoverUnstartableWorkingCopy, recoveryNotice, resetRecoveryState, UnstartableBooksError } from './workingCopyRecovery';
+import { POST as loginPOST } from '@/app/api/auth/login/route';
+import { ROUTE_METHOD_HEADER, ROUTE_PATH_HEADER } from '@/lib/permissions/routes';
+
+function loginReq(body: unknown) {
+  h.headers.clear();
+  h.headers.set(ROUTE_PATH_HEADER, '/api/auth/login');
+  h.headers.set(ROUTE_METHOD_HEADER, 'POST');
+  h.headers.set('host', '127.0.0.1');
+  return new NextRequest('http://127.0.0.1/api/auth/login', { method: 'POST', headers: { 'content-type': 'application/json', host: '127.0.0.1' }, body: JSON.stringify(body) });
+}
 
 /** The damaged copies kept in the working folder (electron/companySession.js keepDamagedCopy). */
 function damagedCopies(): string[] {
@@ -246,6 +263,102 @@ describe('a working copy that will not start after a crash', () => {
     expect(await probeRows()).toEqual([1, 3]);
   }, 120_000);
 
+  it('when neither copy can be put back at first, the good copy is tried again — never deleted while the working copy is missing', async () => {
+    const dir = process.env.BKA_DATA_DIR!;
+    const realRename = fmt.renameWithRetry;
+    const failing = (fails: number[]) => {
+      let calls = 0;
+      return vi.spyOn(fmt, 'renameWithRetry').mockImplementation(async (from: string, to: string) => {
+        calls++;
+        if (fails.includes(calls)) throw Object.assign(new Error('EPERM: operation not permitted, rename'), { code: 'EPERM' });
+        return realRename(from, to);
+      });
+    };
+
+    // The last save into place fails, putting the damaged copy back fails: the last save once more works.
+    await crash();
+    damageCheckpoint(dir);
+    await open();
+    resetRecoveryState();
+    let spy = failing([2, 3]);
+    try {
+      expect(await probeRows()).toEqual([1, 3]);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(recoveryNotice()).not.toBeNull();
+    expect(leftovers()).toEqual([]);
+
+    // Nothing can be renamed at all: both copies stay where they are, nothing is deleted.
+    await crash();
+    damageCheckpoint(dir);
+    await open();
+    resetRecoveryState();
+    spy = failing([2, 3, 4]);
+    try {
+      await expect(getDb()).rejects.toThrow(/a file on this computer was busy/);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(fs.existsSync(dir)).toBe(false);
+    const good = fs.readdirSync(workDir).filter((n) => /^data\.recover-\d+$/.test(n));
+    const damaged = fs.readdirSync(workDir).filter((n) => /^data\.damaged-\d+$/.test(n));
+    expect(good).toHaveLength(1);
+    expect(damaged).toHaveLength(1);
+    expect(dataDirProblem(path.join(workDir, good[0]))).toBeNull();
+    // (The next open makes a fresh working copy; here the good copy is simply put in place.)
+    await closeDb().catch(() => undefined);
+    fs.renameSync(path.join(workDir, good[0]), dir);
+    fs.rmSync(path.join(workDir, damaged[0]), { recursive: true, force: true });
+    expect(await probeRows()).toEqual([1, 3]);
+  }, 180_000);
+
+  it('a save already on its way when a recovery starts stops before its snapshot; a recovery waits for a save that is writing', async () => {
+    const dir = process.env.BKA_DATA_DIR!;
+    await crash();
+    relock();
+    const savedBefore = format.readCompanyManifest(FILE).saveId;
+
+    // 1. The save passed its first check, then a recovery started: no snapshot is taken.
+    const realManifest = fmt.readCompanyManifest;
+    let recovery: Promise<unknown> | null = null;
+    let spy = vi.spyOn(fmt, 'readCompanyManifest').mockImplementation((file: string) => {
+      recovery ??= recoverUnstartableWorkingCopy(dir);
+      return realManifest(file);
+    });
+    try {
+      await expect(saveCompanyFile({ force: true })).rejects.toMatchObject({ code: 'RECOVERING' });
+    } finally {
+      spy.mockRestore();
+    }
+    expect(await recovery).toBe('retry'); // the copy starts: kept as it is
+    expect(format.readCompanyManifest(FILE).saveId).toBe(savedBefore);
+
+    // 2. A recovery that starts while a save is writing waits for it before it judges the folder.
+    const realWrite = fmt.writeCompanyFile;
+    let recoveryDoneAt = 0;
+    let saveDoneAt = 0;
+    let started: Promise<unknown> | null = null;
+    const spyWrite = vi.spyOn(fmt, 'writeCompanyFile').mockImplementation(async (target: string, opts: Parameters<typeof realWrite>[1]) => {
+      started = recoverUnstartableWorkingCopy(dir).then((r) => {
+        recoveryDoneAt = Date.now();
+        return r;
+      });
+      await new Promise((r) => setTimeout(r, 800)); // a slow network write
+      return realWrite(target, opts);
+    });
+    try {
+      expect(await saveCompanyFile({ force: true })).toMatchObject({ outcome: 'saved' });
+      saveDoneAt = Date.now();
+    } finally {
+      spyWrite.mockRestore();
+    }
+    expect(await started).toBe('retry');
+    expect(recoveryDoneAt).toBeGreaterThanOrEqual(saveDoneAt);
+    expect(await probeRows()).toEqual([1, 3]);
+    void spy;
+  }, 180_000);
+
   it('restoring a backup whose books do not start is rolled back, never "recovered" into the company file', async () => {
     const AdmZip = (await import('adm-zip')).default;
     const { restoreBackup } = await import('./backup');
@@ -319,6 +432,10 @@ describe('a working copy that will not start after a crash', () => {
     resetRecoveryState();
     await expect(getDb()).rejects.toThrow(/could not open this company file: its database is damaged .*Open your most recent backup/);
     expect(recoveryNotice()).toBeNull();
+    // The sign-in screen gets that plain answer too (409), never a server error.
+    const login = await loginPOST(loginReq({ email: 'mary', password: 'whatever-it-is' }));
+    expect(login.status).toBe(409);
+    expect((await login.json()).error).toMatch(/could not open this company file/);
     // Nothing was moved or deleted: the working copy is where it was.
     expect(fs.existsSync(path.join(process.env.BKA_DATA_DIR!, 'PG_VERSION'))).toBe(true);
   }, 120_000);

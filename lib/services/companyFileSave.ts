@@ -119,6 +119,8 @@ interface SaveState {
   lastSaveMs: number;
   lastSaveEndedAt: number;
   inflight: Promise<SaveResult> | null;
+  /** The running save is waiting for a working-copy recovery to finish (it never holds one up). */
+  waitingForRecovery?: boolean;
   status: SaveStatusKind;
   error: string | null;
   conflictCopy: string | null;
@@ -384,6 +386,16 @@ export async function saveCompanyFile(opts: { force?: boolean; final?: boolean; 
 }
 
 /**
+ * Resolves once no save is writing out of the working copy (lib/services/workingCopyRecovery.ts
+ * waits for it before it judges the folder). A save that is itself waiting for a recovery does not
+ * count: it snapshots nothing until the recovery is done.
+ */
+export async function whenNoSaveWriting(): Promise<void> {
+  const s = g.__ironbooksCompanyFileSave;
+  while (s?.inflight && !s.waitingForRecovery) await s.inflight.catch(() => undefined);
+}
+
+/**
  * What a save of the working copy is sealed with: the file key and the current key slots of a
  * protected company file, or null for a file without passwords. Read from the open database; a
  * closed one (the close-time save after the database was closed, a sandbox) uses the slots of the
@@ -411,7 +423,12 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
   // nothing is saved out of it meanwhile; the close-time save waits for it.
   if (isRecoveryInProgress()) {
     if (!opts.final) return { saved: false, outcome: 'unchanged' };
-    await whenRecoveryDone();
+    s.waitingForRecovery = true;
+    try {
+      await whenRecoveryDone();
+    } finally {
+      s.waitingForRecovery = false;
+    }
   }
 
   // Still ours? (A computer that slept past the lock's stale time may have lost it.)
@@ -486,6 +503,12 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
       fingerprint = currentFingerprint(dataDir);
       // A copy kept apart is a separate company file: it never carries this file's backup history
       // (its own rotation would delete this file's backup versions).
+      // A recovery that started while this save was on its way (it checks before judging the
+      // folder, and waits for a save that is already writing): never a snapshot of what it is
+      // replacing. Checked in the same synchronous turn as the snapshot itself.
+      if (isRecoveryInProgress()) {
+        throw Object.assign(new Error('Ironbooks is reopening the company file; this save waits for it.'), { code: 'RECOVERING' });
+      }
       entries = conflict ? withoutBackupHistory(format.snapshotDir(dataDir)) : format.snapshotDir(dataDir);
       // Never write books that would not start over the company file (or its "unsaved changes"
       // copy) — nor no books at all over a file that has some: the last good save is what a
@@ -631,6 +654,11 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
     noteUnsaved(s, Date.now(), true);
     // Taken over while this save was being written (assertLockStillOurs): it stays 'lost'.
     if ((err as { code?: string })?.code === 'LOCK_LOST') throw err;
+    // A recovery is reopening the working copy: nothing went wrong, the changes stay unsaved.
+    if ((err as { code?: string })?.code === 'RECOVERING') {
+      s.status = 'unsaved';
+      throw err;
+    }
     s.status = 'error';
     s.error = (err as { code?: string })?.code === 'SAVED_ELSEWHERE' ? (err as Error).message : friendlyIoError(err, s.file);
     throw err;

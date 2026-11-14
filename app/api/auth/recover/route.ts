@@ -14,6 +14,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { and, eq } from 'drizzle-orm';
+import { needsSignInToRecover, recoverSealedWorkingCopy } from '@/lib/services/workingCopyRecovery';
 import { getDb, resolveDataDir, sealedMode, withDamagedFileAccess, withSealedAccess, type DB } from '@/lib/db';
 import { users } from '@/lib/db/schema';
 import { MIN_PASSWORD_LENGTH } from '@/lib/auth';
@@ -69,15 +70,36 @@ async function handlePost(req: NextRequest) {
     return NextResponse.json({ error: WRONG_KEY_MESSAGE, code: 'FORBIDDEN' }, { status: 403 });
   };
   try {
-    const sealed = sealedMode();
-    let db: DB;
-    if (sealed === 'extract' || sealed === 'conflict') {
+    let sealed = sealedMode();
+    let db: DB | null = null;
+    if (sealed === 'key') {
+      try {
+        db = await withSealedAccess(() => getDb());
+      } catch (err) {
+        if (!needsSignInToRecover(err)) throw err;
+        // The working copy here will not start: the recovery key must open the company file itself
+        // before anything is set aside (lib/services/workingCopyRecovery.ts), then the company
+        // file's last save is decrypted with it, like opening it on a new computer.
+        const key = await unlockFromFile({ kind: 'recovery', secret: recoveryKey });
+        if (!key) return fail();
+        sealed = await recoverSealedWorkingCopy(key);
+        if (sealed === 'extract' || sealed === 'conflict') {
+          await unsealCompanyFile(key);
+          db = await getDb();
+        } else {
+          db = await withSealedAccess(() => getDb()); // it started after all
+        }
+      }
+    }
+    if (db && sealed !== 'key') {
+      // Reopened from the company file above: the recovery key already opened it.
+    } else if (sealed === 'extract' || sealed === 'conflict') {
       const key = await unlockFromFile({ kind: 'recovery', secret: recoveryKey });
       if (!key) return fail();
       await unsealCompanyFile(key);
       db = await getDb();
     } else {
-      db = sealed === 'key' ? await withSealedAccess(() => getDb()) : await getDb();
+      db = db ?? (sealed === 'key' ? await withSealedAccess(() => getDb()) : await getDb());
       if (!(await readProtection(db))) {
         return NextResponse.json(
           { error: 'This company file is not protected with passwords, so it has no recovery key. Ask an Admin to reset your password.', code: 'VALIDATION' },
