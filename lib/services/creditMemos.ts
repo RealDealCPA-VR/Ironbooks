@@ -49,7 +49,7 @@ import { averageAfter, takeAccountantCost } from './accountantCopy/inventoryCost
 import { cogsAccountForItem, fifoLayerValue, valueRemainderAfter } from './inventory';
 import { isDepositTargetAccount } from '@/lib/accountTypes';
 import { assertSalesTaxAllowed } from '@/lib/featureGate';
-import { and, asc, eq, inArray, ne, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, ne, sql } from 'drizzle-orm';
 import {
   accounts,
   classes,
@@ -199,8 +199,8 @@ async function isFifoTracked(ctx: ServiceContext, itemId: string): Promise<boole
 
 /**
  * Current restock unit cost for an item.
- *  - FIFO-tracked: blended cost of remaining layers (value / qty); falls back
- *    to averageCost / purchaseCost when every layer is empty.
+ *  - FIFO-tracked: blended cost of remaining layers (value / qty); when every
+ *    layer is empty, the latest layer's unit cost (then averageCost / purchaseCost).
  *  - Average-cost: item.averageCost, falling back to purchaseCost.
  */
 async function restockUnitCost(
@@ -224,6 +224,15 @@ async function restockUnitCost(
       totalValue = totalValue.plus(fifoLayerValue(q, l.unitCost)); // the valuation reports' rule
     }
     if (totalQty.greaterThan(0)) return totalValue.dividedBy(totalQty);
+    // Every layer used up: the cost of the latest layer received (what the units last cost). A
+    // FIFO item's averageCost is not kept up to date, so it could restock at a long-stale cost.
+    const [latest] = await ctx.db
+      .select({ unitCost: inventoryLayers.unitCost })
+      .from(inventoryLayers)
+      .where(and(eq(inventoryLayers.companyId, ctx.companyId), eq(inventoryLayers.itemId, item.id)))
+      .orderBy(desc(inventoryLayers.date), desc(inventoryLayers.createdAt))
+      .limit(1);
+    if (latest && Money.of(latest.unitCost).greaterThan(0)) return Money.of(latest.unitCost);
   }
   const avg = Money.of(item.averageCost ?? '0');
   if (avg.greaterThan(0)) return avg;
@@ -235,7 +244,7 @@ async function restockUnitCost(
 // ---------------------------------------------------------------------------
 
 /** Validate a credit memo input and compute every amount/account (read-only). */
-async function prepareCreditMemo(ctx: ServiceContext, input: CreateCreditMemoInput) {
+async function prepareCreditMemo(ctx: ServiceContext, input: CreateCreditMemoInput, keptTaxRate: string | null = null) {
   // Validate lines
   if (!input.lines || input.lines.length === 0) {
     throw validation('A credit memo must have at least one line.');
@@ -263,8 +272,10 @@ async function prepareCreditMemo(ctx: ServiceContext, input: CreateCreditMemoInp
       .from(taxRates)
       .where(and(eq(taxRates.companyId, ctx.companyId), eq(taxRates.id, input.taxRateId)));
     if (!taxRow) throw notFound('Tax rate');
-    taxRateDecimal = Money.of(taxRow.rate);
+    // An edit keeps the rate the document was charged at (never today's rate on an old one).
+    taxRateDecimal = Money.of(keptTaxRate ?? taxRow.rate);
   }
+  const taxRateValue = input.taxRateId ? taxRateDecimal.toFixed(6) : null;
 
   // Resolve standing accounts
   const arAccountId = await accountIdByCode(ctx, '1200');
@@ -416,7 +427,7 @@ async function prepareCreditMemo(ctx: ServiceContext, input: CreateCreditMemoInp
     throw validation('Credit memo total must be greater than zero.');
   }
 
-  return {
+  return { taxRateValue,
     arAccountId,
     defaultIncomeId,
     taxPayableId,
@@ -738,6 +749,7 @@ export async function createCreditMemo(ctx: ServiceContext, input: CreateCreditM
         // Persisted so the sales-tax liability engine can attribute the credited-back tax
         // to the rate's agencies (lib/services/accountant/salesTaxLedger.ts).
         taxRateId: input.taxRateId ?? null,
+        taxRateValue: prep.taxRateValue,
         status: 'open',
         subtotal: toAmountString(subtotal),
         taxAmount: toAmountString(taxAmount),
@@ -1578,7 +1590,7 @@ export async function updateCreditMemo(
     jobId: input.jobId === undefined ? existing.jobId : input.jobId,
   };
 
-  const prep = await prepareCreditMemo(ctx, input);
+  const prep = await prepareCreditMemo(ctx, input, input.taxRateId && input.taxRateId === existing.taxRateId ? existing.taxRateValue : null);
 
   return inTransaction(ctx, async (tx) => {
     const [memo] = await tx.db
@@ -1659,6 +1671,7 @@ export async function updateCreditMemo(
         status: newUnapplied.isZero() ? 'paid' : 'open',
         memo: input.memo ?? null,
         taxRateId: input.taxRateId ?? null,
+        taxRateValue: prep.taxRateValue,
         ...(renum ? { refNumber: renum.refNumber, memoNumber: renum.number } : {}),
         toBePrinted: input.toBePrinted ?? memo.toBePrinted,
         toBeEmailed: input.toBeEmailed ?? memo.toBeEmailed,

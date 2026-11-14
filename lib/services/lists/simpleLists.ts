@@ -12,6 +12,7 @@
  *    user who deletes the defaults never gets them back);
  *  - every mutation is audited (writeAudit → audit trail + transaction log).
  */
+import { requirePermission } from '../access';
 import { and, asc, eq, sql } from 'drizzle-orm';
 import type { z } from 'zod';
 import {
@@ -290,6 +291,15 @@ export function listDef(key: SimpleListKey): ListDef {
  * Insert QB's default entries for a list the first time the company uses it. Runs as a system
  * action (a view-only user opening the list still gets the defaults), audited like any insert.
  */
+/**
+ * Sales Tax Codes decide what is taxed: flipping a code's Taxable flag re-flags every item and
+ * customer on it. Editing them needs the sales-tax codes right (Sales Tax Items & Agencies), not
+ * just Other Lists — the route is mapped to the lists area, so it is checked here.
+ */
+function assertSalesTaxCodeRight(ctx: ServiceContext, key: SimpleListKey, action: 'create' | 'modify'): void {
+  if (key === 'sales-tax-codes') requirePermission(ctx, 'sales_tax.codes', action);
+}
+
 export async function ensureSeeded(ctx: ServiceContext, key: SimpleListKey): Promise<void> {
   const def = DEFS[key];
   if (!def.seed?.length) return;
@@ -372,6 +382,7 @@ async function assertUniqueName(ctx: ServiceContext, def: ListDef, name: string,
 }
 
 export async function createEntry(ctx: ServiceContext, key: SimpleListKey, body: unknown): Promise<Row> {
+  assertSalesTaxCodeRight(ctx, key, 'create');
   await ensureSeeded(ctx, key);
   const def = DEFS[key];
   let data = parse(def, body, false);
@@ -391,6 +402,7 @@ export async function createEntry(ctx: ServiceContext, key: SimpleListKey, body:
 }
 
 export async function updateEntry(ctx: ServiceContext, key: SimpleListKey, id: string, body: unknown): Promise<Row> {
+  assertSalesTaxCodeRight(ctx, key, 'modify');
   // Read, check and write in one transaction (a rename racing another save of the list).
   return inTransaction(ctx, (tx) => updateEntryInTx(tx, key, id, body));
 }
@@ -478,6 +490,7 @@ export async function removeEntry(
   key: SimpleListKey,
   id: string,
 ): Promise<{ deleted: boolean; deactivated: boolean }> {
+  assertSalesTaxCodeRight(ctx, key, 'modify');
   await assertListDeleteAllowed(ctx, 'delete', 'list entries'); // Accountant's Copy (I1)
   const def = DEFS[key];
   const before = await getEntry(ctx, key, id);

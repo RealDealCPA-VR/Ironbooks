@@ -491,6 +491,20 @@
       "when": 1781400089000,
       "tag": "0089_accountant",
       "breakpoints": true
+    },
+    {
+      "idx": 90,
+      "version": "7",
+      "when": 1781400090000,
+      "tag": "0090_doc_tax_rate",
+      "breakpoints": true
+    },
+    {
+      "idx": 91,
+      "version": "7",
+      "when": 1781400091000,
+      "tag": "0091_doc_line_tax_rates",
+      "breakpoints": true
     }
   ]
 }

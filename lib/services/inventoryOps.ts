@@ -77,7 +77,7 @@ async function accountIdByCode(ctx: ServiceContext, code: string): Promise<strin
  * quantity): a later-dated count entered first is then not taken for stock on hand at `date`.
  * Used to put a back-dated count against the quantity on hand at its date.
  */
-async function netMovedAfter(ctx: ServiceContext, itemId: string, date: Date): Promise<Decimal> {
+export async function netMovedAfter(ctx: ServiceContext, itemId: string, date: Date): Promise<Decimal> {
   const nextDay = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate() + 1));
   const [row] = await ctx.db
     .select({ qty: sql<string>`COALESCE(SUM(${inventoryMovements.quantity}), 0)` })

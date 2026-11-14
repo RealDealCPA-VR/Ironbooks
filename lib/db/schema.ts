@@ -590,6 +590,10 @@ export const invoices = pgTable('invoices', {
   classId: uuid('class_id').references(() => classes.id),
   locationId: uuid('location_id').references(() => locations.id),
   taxRateId: uuid('tax_rate_id').references(() => taxRates.id),
+  /** Review loop 4: the rate charged (kept while the tax item stays the same; 0090). */
+  taxRateValue: decimal('tax_rate_value', { precision: 9, scale: 6 }),
+  /** Review loop 4: the per-line tax item rates charged, {taxRateId: rate} (0091). */
+  lineTaxRates: jsonb('line_tax_rates').$type<Record<string, string>>(),
   salesRepId: uuid('sales_rep_id').references((): any => salesReps.id),
   currency: varchar('currency', { length: 3 }),
   exchangeRate: decimal('exchange_rate', { precision: 18, scale: 8 }),
@@ -691,6 +695,10 @@ export const salesReceipts = pgTable('sales_receipts', {
   date: timestamp('date').notNull(),
   /** Receipt-level sales tax rate (wave2 accountant: sales-tax liability attribution). */
   taxRateId: uuid('tax_rate_id').references(() => taxRates.id),
+  /** Review loop 4: the rate charged (kept while the tax item stays the same; 0090). */
+  taxRateValue: decimal('tax_rate_value', { precision: 9, scale: 6 }),
+  /** Review loop 4: the per-line tax item rates charged, {taxRateId: rate} (0091). */
+  lineTaxRates: jsonb('line_tax_rates').$type<Record<string, string>>(),
   method: paymentMethodEnum('method').notNull().default('cash'),
   /** salesar (0080): Payment Method list entry (B7); `method` keeps its type. */
   paymentMethodId: uuid('payment_method_id').references((): any => paymentMethods.id),
@@ -1170,6 +1178,8 @@ export const creditMemos = pgTable('credit_memos', {
   /** Memo-level sales tax rate (wave2 accountant: lets the sales-tax liability engine attribute
    *  credited-back tax to the right agency). Null on legacy memos. */
   taxRateId: uuid('tax_rate_id').references(() => taxRates.id),
+  /** Review loop 4: the rate charged (kept while the tax item stays the same; 0090). */
+  taxRateValue: decimal('tax_rate_value', { precision: 9, scale: 6 }),
   status: docStatusEnum('status').notNull().default('open'),
   subtotal: decimal('subtotal', { precision: 15, scale: 2 }).notNull().default('0'),
   taxAmount: decimal('tax_amount', { precision: 15, scale: 2 }).notNull().default('0'),

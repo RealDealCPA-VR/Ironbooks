@@ -124,7 +124,7 @@ export async function assertNotFifoTracked(ctx: ServiceContext, itemId: string):
 import { assertNotControlLineAccount, postJournalEntry } from './posting';
 import { assertPeriodOpen, recordClosingDateException } from './fiscalPeriods';
 import { activeCopy } from './accountantCopy/guard';
-import { averageAfter, takeAccountantCost } from './accountantCopy/inventoryCost';
+import { averageAfter, takeAccountantCost, takeKeptSaleCost } from './accountantCopy/inventoryCost';
 
 // ---------------------------------------------------------------------------
 // Adjustment Account / Class / Customer:Job (QB Adjust Quantity/Value on Hand) — p1 purchases
@@ -663,6 +663,59 @@ export async function cogsAccountForItem(
   return accountIdByCode(ctx, '5000');
 }
 
+/** An item's cost fields, as a sale edit found them (see restoreItemCosts). */
+export interface ItemCostSnapshot {
+  quantityOnHand: string | null;
+  averageCost: string | null;
+  valueRemainder: string | null;
+  valueRemainderAvg: string | null;
+}
+
+export async function snapshotItemCosts(ctx: ServiceContext, itemIds: string[]): Promise<Map<string, ItemCostSnapshot>> {
+  const out = new Map<string, ItemCostSnapshot>();
+  if (!itemIds.length) return out;
+  const rows = await ctx.db
+    .select({
+      id: items.id,
+      quantityOnHand: items.quantityOnHand,
+      averageCost: items.averageCost,
+      valueRemainder: items.valueRemainder,
+      valueRemainderAvg: items.valueRemainderAvg,
+    })
+    .from(items)
+    .where(and(eq(items.companyId, ctx.companyId), inArray(items.id, itemIds)));
+  for (const r of rows) out.set(r.id, r);
+  return out;
+}
+
+/**
+ * After a sale edit re-sold kept lines at their original cost: put each such item's average and
+ * value remainder back as they were before the edit. The reversal put back exactly what the
+ * re-post took out (same units, same cost), so the item — like its inventory account — ends where
+ * it started; re-deriving a 4dp average in between moved its value off the ledger. Only when the
+ * quantity is back where it was (it always is for a fully kept item).
+ */
+export async function restoreItemCosts(ctx: ServiceContext, snapshot: Map<string, ItemCostSnapshot>, itemIds: Iterable<string>): Promise<void> {
+  for (const id of itemIds) {
+    const before = snapshot.get(id);
+    if (!before) continue;
+    const [cur] = await ctx.db
+      .select({ quantityOnHand: items.quantityOnHand })
+      .from(items)
+      .where(and(eq(items.companyId, ctx.companyId), eq(items.id, id)));
+    if (!cur || !Money.of(cur.quantityOnHand ?? '0').equals(Money.of(before.quantityOnHand ?? '0'))) continue;
+    await ctx.db
+      .update(items)
+      .set({
+        averageCost: before.averageCost,
+        valueRemainder: before.valueRemainder ?? '0.00',
+        valueRemainderAvg: before.valueRemainderAvg,
+        updatedAt: new Date(),
+      })
+      .where(and(eq(items.companyId, ctx.companyId), eq(items.id, id)));
+  }
+}
+
 export async function recordCOGS(ctx: ServiceContext, input: RecordCOGSInput) {
   const qty = inventoryNumber(input.quantity, 'Quantity');
   if (qty.lessThanOrEqualTo(0)) throw validation('quantity must be positive for COGS recording.');
@@ -682,10 +735,13 @@ export async function recordCOGS(ctx: ServiceContext, input: RecordCOGSInput) {
   // Accountant's Copy import: the cost the accountant's file used (null otherwise). The average is
   // re-derived from what is left so the item's value stays equal to the ledger.
   const accountantCost = takeAccountantCost(input.itemId);
+  // A sale edit re-selling a kept line: the cost it was sold at. The edit restores the item's cost
+  // fields afterwards (restoreItemCosts), so nothing is re-derived here.
+  const keptCost = accountantCost ? null : takeKeptSaleCost(input.itemId);
   const atAverage = bookValueRelief(currentQty, newQty, avgCost);
   // Selling the last units also relieves the value remainder (the GL then holds exactly $0).
   const sellOut = sellOutRelief(item, newQty, atAverage);
-  const cogsAmount = accountantCost ? Money.round2(accountantCost) : sellOut.relief;
+  const cogsAmount = accountantCost ? Money.round2(accountantCost) : keptCost ? Money.round2(keptCost) : sellOut.relief;
   if (!cogsAmount.greaterThan(0)) {
     // A sale is reversed through its COGS entry (void / edit put the units back from it), and a $0
     // entry cannot be posted: refuse plainly (every sales form), as fifo.ts does for FIFO units —
@@ -698,7 +754,9 @@ export async function recordCOGS(ctx: ServiceContext, input: RecordCOGSInput) {
     accountantCost && !cogsAmount.equals(atAverage)
       ? averageAfter(currentQty, avgCost, newQty, cogsAmount.negated())
       : avgCost;
-  const remainder = !newAvgCost.equals(avgCost)
+  const remainder = keptCost
+    ? undefined // restored by the edit (restoreItemCosts)
+    : !newAvgCost.equals(avgCost)
     ? { valueRemainder: '0.00', valueRemainderAvg: null } // average re-derived (Accountant's Copy cost)
     : !accountantCost && sellOut.remainderRelieved
       ? { valueRemainder: '0.00', valueRemainderAvg: avgCost.toFixed(4) }
@@ -1412,7 +1470,7 @@ export interface ValuationAsOfRow {
   valueAsOf: string;
   /** Approximate quantity (valueAsOf / current unit cost); null when cost is unknown. */
   quantityAsOf: string | null;
-  /** Unit cost used to derive quantityAsOf (current cost). */
+  /** Current unit cost (used for quantityAsOf only where the movement history is incomplete). */
   unitCostUsed: string | null;
 }
 
@@ -1439,11 +1497,19 @@ export async function inventoryValuationAsOf(
       isActive: items.isActive,
       averageCost: items.averageCost,
       assetAccountId: items.assetAccountId,
+      quantityOnHand: items.quantityOnHand,
     })
     .from(items)
     .where(and(eq(items.companyId, ctx.companyId), eq(items.type, 'inventory')));
 
   const accountMap = await inventoryAccountMap(ctx, itemRows);
+  // Quantity at the date: today's on hand less what moved after it (the physical count's rule).
+  // value ÷ current cost was off whenever the cost had changed since the date.
+  const { netMovedAfter } = await import('./inventoryOps');
+  const qtyAt = new Map<string, Decimal>();
+  for (const r of itemRows) {
+    qtyAt.set(r.id, Money.of(r.quantityOnHand ?? '0').minus(await netMovedAfter(ctx, r.id, asOf)));
+  }
   const movements = await loadItemGlMovements(ctx, accountMap, asOf);
   const costs = await currentUnitCosts(ctx, itemRows);
 
@@ -1456,7 +1522,8 @@ export async function inventoryValuationAsOf(
       const value = valueOf(r.id);
       grandTotal = grandTotal.plus(value);
       const costInfo = costs.get(r.id) ?? { cost: null, costingMethod: 'average' as const };
-      const qty = costInfo.cost ? value.dividedBy(costInfo.cost) : null;
+      const moved = qtyAt.get(r.id);
+      const qty = moved && !moved.isNegative() ? moved : costInfo.cost ? value.dividedBy(costInfo.cost) : null;
       return {
         id: r.id,
         name: r.name,
@@ -1475,7 +1542,7 @@ export async function inventoryValuationAsOf(
     grandTotal: toAmountString(Money.round2(grandTotal)),
     notes: [
       'Values are reconstructed exactly from posted journal entries on each item’s inventory asset account.',
-      'Quantities are approximated as value ÷ current unit cost (exact when the unit cost has not changed since the as-of date).',
+      'Quantities are today’s quantity on hand less the stock moved after the as-of date (value ÷ current unit cost where that history is incomplete).',
       'Each posting is attributed to its item through the document that made it (bills, checks, item receipts, vendor credits, sales COGS, restocks, adjustments, assembly builds); manual journal entries on an inventory account are not attributed to any item.',
     ],
   };

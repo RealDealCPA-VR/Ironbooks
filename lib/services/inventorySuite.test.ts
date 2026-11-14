@@ -447,9 +447,9 @@ describe('inventory suite (value adjust, counts, commitment, pending builds, val
     expect(early.grandTotal).toBe('120.00');
     expect(early.notes.length).toBeGreaterThan(0);
 
-    // FIFO qty approximation: $60 at current effective cost $5 -> 12 units
-    // (documented approximation: layer costs changed after the as-of date).
-    expect(byId.get(fifoId)?.quantityAsOf).toBe('12.0000');
+    // Review loop 4: the quantity at the date is today's on hand less what moved after it — the
+    // 20 units received in January ($60), not $60 / today's $5 cost (12, the old approximation).
+    expect(byId.get(fifoId)?.quantityAsOf).toBe('20.0000');
     expect(byId.get(fifoId)?.costingMethod).toBe('fifo');
   });
 

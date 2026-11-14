@@ -31,7 +31,7 @@
  */
 import { systemAccountIdByCode } from './accountRoles';
 import { assertAccountantDatesOpen, assertAccountantMayBillCosts } from './accountantCopy/guard';
-import { hasAccountantCost } from './accountantCopy/inventoryCost';
+import { hasAccountantCost, keptSaleCosts, withKeptSaleCostQueue } from './accountantCopy/inventoryCost';
 import { and, eq, inArray, isNull, ne, notInArray, or, sql } from 'drizzle-orm';
 import { assertSalesTaxAllowed } from '@/lib/featureGate';
 import { creditLimitFixes } from '@/lib/errorFixes';
@@ -67,7 +67,7 @@ import { assertForeignCurrencyAllowed, effectiveHomeCurrency } from './multiCurr
 import { currencyRate } from './exchangeRates';
 import { foreignCode } from './fxLines';
 import { assertNotControlLineAccount, postJournalEntry, voidJournalEntry } from './posting';
-import { recordCOGS, valueRemainderAfter } from './inventory';
+import { recordCOGS, valueRemainderAfter, restoreItemCosts, snapshotItemCosts, type ItemCostSnapshot } from './inventory';
 import { consumeStock, restoreConsumedStock } from './fifo';
 import {
   type DocumentInventoryLine,
@@ -615,6 +615,10 @@ type ComputedLine = {
 };
 
 interface PreparedInvoice {
+  /** The tax rate charged (stored on the invoice; null without a tax item). */
+  taxRateValue: string | null;
+  /** Per-line tax item rates charged, {taxRateId: rate} (null when no line has its own). */
+  lineTaxRates: Record<string, string> | null;
   /** Set when the user overrode a credit-limit warning (recorded in the audit trail). */
   creditLimitOverride: CreditLimitBreach | null;
   exchangeRate: ReturnType<typeof Money.zero>;
@@ -656,7 +660,14 @@ interface PreparedInvoice {
 async function prepareInvoice(
   ctx: ServiceContext,
   input: CreateInvoiceInput,
-  opts?: { excludeInvoiceId?: string; alreadyApplied?: ReturnType<typeof Money.zero> },
+  opts?: {
+    excludeInvoiceId?: string;
+    alreadyApplied?: ReturnType<typeof Money.zero>;
+    /** The rate this invoice was charged at (kept on an edit that keeps the same tax item). */
+    keptTaxRate?: string | null;
+    /** The per-line tax item rates it was charged at ({taxRateId: rate}). */
+    keptLineRates?: Record<string, string> | null;
+  },
 ): Promise<PreparedInvoice> {
   // --- Validate inputs ---
   if (!input.lines || input.lines.length === 0) {
@@ -708,8 +719,11 @@ async function prepareInvoice(
       .from(taxRates)
       .where(and(eq(taxRates.companyId, ctx.companyId), eq(taxRates.id, input.taxRateId)));
     if (!taxRow) throw notFound('Tax rate');
-    taxRateDecimal = Money.of(taxRow.rate);
+    // An edit keeps the rate the invoice was charged at: re-reading today's rate re-taxed old
+    // invoices (and periods already paid) whenever the rate had changed since.
+    taxRateDecimal = Money.of(opts?.keptTaxRate ?? taxRow.rate);
   }
+  const taxRateValue = input.taxRateId ? taxRateDecimal.toFixed(6) : null;
 
   // Resolve fallback account ids (from COA defaults).
   const arAccountId = await accountIdByCode(ctx, '1200');    // A/R
@@ -852,11 +866,15 @@ async function prepareInvoice(
       .select({ id: taxRates.id, rate: taxRates.rate })
       .from(taxRates)
       .where(and(eq(taxRates.companyId, ctx.companyId), inArray(taxRates.id, lineTaxRateIds)));
-    for (const r of rateRows) lineTaxRateMap.set(r.id, Money.of(r.rate));
+    // An edit keeps the rate each line's tax item was charged at (as the invoice's own, 0090).
+    for (const r of rateRows) lineTaxRateMap.set(r.id, Money.of(opts?.keptLineRates?.[r.id] ?? r.rate));
     for (const id of lineTaxRateIds) {
       if (!lineTaxRateMap.has(id)) throw notFound(`Tax rate ${id}`);
     }
   }
+  const lineTaxRates = lineTaxRateMap.size
+    ? Object.fromEntries([...lineTaxRateMap].map(([id, r]) => [id, r.toFixed(6)]))
+    : null;
   // Accumulates tax from lines that carry their own rate (kept separate from the invoice-level rate).
   let perLineTax = Money.zero();
 
@@ -1078,6 +1096,8 @@ async function prepareInvoice(
   }
 
   return {
+    taxRateValue,
+    lineTaxRates,
     creditLimitOverride,
     exchangeRate,
     arAccountId,
@@ -1387,6 +1407,57 @@ async function postInvoiceCOGS(
   }
 }
 
+/**
+ * Cost of each average-cost sale line of an invoice: its COGS entry's amount with the line's item
+ * and quantity (FIFO lines are left out — their layers come back exactly on reversal).
+ */
+async function soldCostsByLine(tx: ServiceContext, invoiceId: string): Promise<Array<{ itemId: string; quantity: string; cost: string }>> {
+  const entries = await tx.db
+    .select({ id: journalEntries.id, reference: journalEntries.reference })
+    .from(journalEntries)
+    .where(and(eq(journalEntries.companyId, tx.companyId), eq(journalEntries.sourceRef, `invoice-cogs:${invoiceId}`), eq(journalEntries.status, 'posted')));
+  if (!entries.length) return [];
+  const lines = await tx.db.select().from(invoiceLines).where(eq(invoiceLines.invoiceId, invoiceId));
+  const byOrder = new Map(lines.map((l) => [l.lineOrder, l]));
+  const out: Array<{ itemId: string; quantity: string; cost: string }> = [];
+  for (const e of entries) {
+    const m = /^cogs:(\d+)$/.exec(e.reference ?? '');
+    const line = m ? byOrder.get(Number(m[1])) : undefined;
+    if (!line?.itemId) continue;
+    const [layer] = await tx.db
+      .select({ id: inventoryLayers.id })
+      .from(inventoryLayers)
+      .where(and(eq(inventoryLayers.companyId, tx.companyId), eq(inventoryLayers.itemId, line.itemId)))
+      .limit(1);
+    if (layer) continue;
+    const el = await tx.db.select({ debit: journalEntryLines.debit }).from(journalEntryLines).where(eq(journalEntryLines.journalEntryId, e.id));
+    const cost = el.reduce((sum, l) => sum.plus(Money.of(l.debit ?? '0')), Money.zero());
+    if (cost.greaterThan(0)) out.push({ itemId: line.itemId, quantity: Money.of(line.quantity).toFixed(4), cost: toAmountString(cost) });
+  }
+  return out;
+}
+
+/**
+ * Run the COGS re-post with each kept line costed at what it was sold at (see keptSaleCosts),
+ * then put those items' cost fields back as they were before the edit (restoreItemCosts).
+ */
+async function withKeptSaleCosts<T>(
+  tx: ServiceContext,
+  prep: PreparedInvoice,
+  soldAt: Array<{ itemId: string; quantity: string; cost: string }>,
+  costsBefore: Map<string, ItemCostSnapshot>,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const lines = prep.computedLines
+    .filter((cl) => cl.itemId && prep.itemMap.get(cl.itemId)?.type === 'inventory')
+    .map((cl) => ({ itemId: cl.itemId!, quantity: String(cl.quantity) }));
+  const costs = keptSaleCosts(soldAt, lines);
+  if (!costs) return fn();
+  const out = await withKeptSaleCostQueue(costs, fn);
+  await restoreItemCosts(tx, costsBefore, new Set(costs.map((c) => c.itemId)));
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // reverseInvoiceCOGS — void COGS entries and restore stock
 // ---------------------------------------------------------------------------
@@ -1629,6 +1700,8 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
         terms: termsColumn(input.terms),
         status: isDraft ? 'draft' : postedStatus(prep),
         taxRateId: input.taxRateId ?? null,
+        taxRateValue: prep.taxRateValue,
+        lineTaxRates: prep.lineTaxRates,
         classId: prep.headerClassId,
         jobId: prep.headerJobId,
         salesRepId: input.salesRepId ?? null,
@@ -2322,7 +2395,12 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
 
   // Validate + compute the new document (read-only). Exclude this invoice's own
   // current balance from the credit-limit exposure — it is being replaced.
-  const prep = await prepareInvoice(ctx, input, { excludeInvoiceId: id, alreadyApplied: externalPaidPre });
+  const prep = await prepareInvoice(ctx, input, {
+    excludeInvoiceId: id,
+    alreadyApplied: externalPaidPre,
+    keptTaxRate: input.taxRateId && input.taxRateId === existing.taxRateId ? existing.taxRateValue : null,
+    keptLineRates: existing.lineTaxRates ?? null,
+  });
   assertEditKeepsApplications(existing, input, prep, externalPaidPre);
   // The payment-item lines are in a bank deposit: that deposit took exactly their amount out of
   // Undeposited Funds, so the edit must keep it (same amount, currency and rate).
@@ -2408,6 +2486,8 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
           status: 'draft',
           ...(renum ? { refNumber: renum.refNumber, invoiceNumber: renum.number } : {}),
           taxRateId: input.taxRateId ?? null,
+        taxRateValue: prep.taxRateValue,
+        lineTaxRates: prep.lineTaxRates,
           classId: prep.headerClassId,
           jobId: prep.headerJobId,
           salesRepId: input.salesRepId ?? null,
@@ -2516,6 +2596,12 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
       await voidJournalEntry(tx, invoice.postedEntryId);
     }
 
+    // The cost each average-cost line was sold at, read before the COGS entries are voided: a line
+    // the edit keeps (same item, same quantity) is re-posted at THAT cost, not today's average —
+    // a memo-only edit re-costed a past sale at stock bought since, changing an earlier period's COGS.
+    const soldAt = await soldCostsByLine(tx, id);
+    const costsBefore = await snapshotItemCosts(tx, [...new Set(soldAt.map((x) => x.itemId))]);
+
     // 2) Void COGS entries + restore stock (reads old lines — must precede delete),
     //    and put the stock back at the site/bin/serial it left from.
     await reverseInvoiceCOGS(tx, { id, date: invoice.date });
@@ -2571,6 +2657,8 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
               ? 'partial'
               : 'open',
         taxRateId: input.taxRateId ?? null,
+        taxRateValue: prep.taxRateValue,
+        lineTaxRates: prep.lineTaxRates,
         classId: prep.headerClassId,
         jobId: prep.headerJobId,
         salesRepId: input.salesRepId ?? null,
@@ -2597,8 +2685,8 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
       .returning();
 
     // 5) Re-post perpetual inventory COGS for the new lines (site detail carried forward
-    //    for lines the edit did not touch).
-    await postInvoiceCOGS(tx, prep, id, shownRef, input.date);
+    //    for lines the edit did not touch) — kept lines at the cost they were sold at.
+    await withKeptSaleCosts(tx, prep, soldAt, costsBefore, () => postInvoiceCOGS(tx, prep, id, shownRef, input.date));
     await postDocumentInventory(tx, {
       sourceType: 'invoice',
       sourceId: id,

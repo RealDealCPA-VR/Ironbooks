@@ -52,7 +52,8 @@ import {
 } from './_base';
 import { assertNotControlAccount, postJournalEntry, voidJournalEntry } from './posting';
 import { armReconciledRepost, confirmReconciledRepost } from './reconciledEdits';
-import { recordCOGS, valueRemainderAfter } from './inventory';
+import { recordCOGS, restoreItemCosts, snapshotItemCosts, valueRemainderAfter } from './inventory';
+import { keptSaleCosts, withKeptSaleCostQueue } from './accountantCopy/inventoryCost';
 import { consumeStock, restoreConsumedStock } from './fifo';
 import {
   type InventoryLineDetail,
@@ -199,7 +200,12 @@ async function isFifoTracked(ctx: ServiceContext, itemId: string): Promise<boole
 // ---------------------------------------------------------------------------
 
 /** Validate a sales receipt input and compute every amount/account (read-only; create + edit). */
-async function prepareSalesReceipt(ctx: ServiceContext, input: CreateSalesReceiptInput) {
+async function prepareSalesReceipt(
+  ctx: ServiceContext,
+  input: CreateSalesReceiptInput,
+  keptTaxRate: string | null = null,
+  keptLineRates: Record<string, string> | null = null,
+) {
   // --- Validate inputs ---
   if (!input.lines || input.lines.length === 0) {
     throw validation('A sales receipt must have at least one line.');
@@ -227,8 +233,10 @@ async function prepareSalesReceipt(ctx: ServiceContext, input: CreateSalesReceip
       .from(taxRates)
       .where(and(eq(taxRates.companyId, ctx.companyId), eq(taxRates.id, input.taxRateId)));
     if (!taxRow) throw notFound('Tax rate');
-    taxRateDecimal = Money.of(taxRow.rate);
+    // An edit keeps the rate the document was charged at (never today's rate on an old one).
+    taxRateDecimal = Money.of(keptTaxRate ?? taxRow.rate);
   }
+  const taxRateValue = input.taxRateId ? taxRateDecimal.toFixed(6) : null;
 
   // Resolve the deposit account: explicit (must be an asset of this company),
   // otherwise default to 1050 Undeposited Funds (created if missing).
@@ -283,11 +291,15 @@ async function prepareSalesReceipt(ctx: ServiceContext, input: CreateSalesReceip
       .select({ id: taxRates.id, rate: taxRates.rate })
       .from(taxRates)
       .where(and(eq(taxRates.companyId, ctx.companyId), inArray(taxRates.id, lineTaxRateIds)));
-    for (const r of rateRows) lineTaxRateMap.set(r.id, Money.of(r.rate));
+    // An edit keeps the rate each line's tax item was charged at (as the receipt's own, 0090).
+    for (const r of rateRows) lineTaxRateMap.set(r.id, Money.of(keptLineRates?.[r.id] ?? r.rate));
     for (const id of lineTaxRateIds) {
       if (!lineTaxRateMap.has(id)) throw notFound(`Tax rate ${id}`);
     }
   }
+  const lineTaxRates = lineTaxRateMap.size
+    ? Object.fromEntries([...lineTaxRateMap].map(([id, r]) => [id, r.toFixed(6)]))
+    : null;
   let perLineTax = Money.zero();
 
   // --- Compute per-line amounts and subtotal (same math as createInvoice) ---
@@ -392,7 +404,7 @@ async function prepareSalesReceipt(ctx: ServiceContext, input: CreateSalesReceip
     throw validation('Sales receipt total must be greater than zero.');
   }
 
-  return { method, depositAccountId, taxPayableId, itemMap, computedLines, subtotal, grossIncome, taxAmount, total };
+  return { taxRateValue, lineTaxRates, method, depositAccountId, taxPayableId, itemMap, computedLines, subtotal, grossIncome, taxAmount, total };
 }
 
 type PreparedSalesReceipt = Awaited<ReturnType<typeof prepareSalesReceipt>>;
@@ -600,6 +612,8 @@ export async function createSalesReceipt(ctx: ServiceContext, input: CreateSales
         date: input.date,
         // Persisted for the sales-tax liability engine (lib/services/accountant/salesTaxLedger.ts).
         taxRateId: input.taxRateId ?? null,
+        taxRateValue: prep.taxRateValue,
+        lineTaxRates: prep.lineTaxRates,
         method,
         paymentMethodId: pm.paymentMethodId,
         reference: input.reference ?? null,
@@ -710,6 +724,35 @@ export async function getSalesReceipt(ctx: ServiceContext, id: string) {
  * FIFO layers, site movements reversed) and the main income/payment entry. Used by void and by
  * edit (C1, before re-posting).
  */
+/** Cost each average-cost line of a receipt was sold at (its COGS entry), with item and quantity. */
+async function receiptSoldCosts(
+  tx: ServiceContext,
+  receipt: { id: string; postedEntryId: string | null },
+): Promise<Array<{ itemId: string; quantity: string; cost: string }>> {
+  const lines = await tx.db.select().from(salesReceiptLines).where(eq(salesReceiptLines.salesReceiptId, receipt.id));
+  const lineById = new Map(lines.map((l) => [l.id, l]));
+  const entries = await tx.db
+    .select({ id: journalEntries.id, reference: journalEntries.reference })
+    .from(journalEntries)
+    .where(
+      and(
+        eq(journalEntries.companyId, tx.companyId),
+        eq(journalEntries.sourceRef, `salesreceipt:${receipt.id}`),
+        eq(journalEntries.status, 'posted'),
+        receipt.postedEntryId ? ne(journalEntries.id, receipt.postedEntryId) : undefined,
+      ),
+    );
+  const out: Array<{ itemId: string; quantity: string; cost: string }> = [];
+  for (const e of entries) {
+    const line = e.reference ? lineById.get(e.reference) : undefined;
+    if (!line?.itemId || (await isFifoTracked(tx, line.itemId))) continue;
+    const el = await tx.db.select({ debit: journalEntryLines.debit }).from(journalEntryLines).where(eq(journalEntryLines.journalEntryId, e.id));
+    const cost = el.reduce((sum, l) => sum.plus(Money.of(l.debit ?? '0')), Money.zero());
+    if (cost.greaterThan(0)) out.push({ itemId: line.itemId, quantity: Money.of(line.quantity).toFixed(4), cost: toAmountString(cost) });
+  }
+  return out;
+}
+
 async function reverseSalesReceiptPostings(
   tx: ServiceContext,
   receipt: { id: string; date: Date; postedEntryId: string | null },
@@ -940,7 +983,12 @@ export async function updateSalesReceipt(ctx: ServiceContext, id: string, input:
   );
   input = { ...input, method: pm.method, paymentMethodId: pm.paymentMethodId };
 
-  const prep = await prepareSalesReceipt(ctx, input);
+  const prep = await prepareSalesReceipt(
+    ctx,
+    input,
+    input.taxRateId && input.taxRateId === existing.taxRateId ? existing.taxRateValue : null,
+    existing.lineTaxRates ?? null,
+  );
   await assertDepositedReceiptEdit(ctx, id, existing, prep, input);
 
   return inTransaction(ctx, async (tx) => {
@@ -1021,21 +1069,35 @@ async function updateSalesReceiptInTx(
     // 1) Reverse the old version. Deposited straight to a bank and reconciled there: the re-post
     //    keeps it reconciled, and a changed amount / account gives QB's warning (step 2).
     await armReconciledRepost(tx, { entryId: receipt.postedEntryId, what: 'sales receipt' });
+    // What each average-cost line was sold at, read before its COGS is voided: a kept line (same
+    // item and quantity) is sold again at that cost, not today's average (see keptSaleCosts).
+    const soldAt = await receiptSoldCosts(tx, receipt);
+    const costsBefore = await snapshotItemCosts(tx, [...new Set(soldAt.map((x) => x.itemId))]);
     await reverseSalesReceiptPostings(tx, receipt);
 
     // 2) Replace lines + re-post.
     await tx.db.delete(salesReceiptLines).where(eq(salesReceiptLines.salesReceiptId, id));
-    const { insertedLines, entry, cogsEntries } = await postSalesReceiptDocument(
-      tx,
-      {
-        id,
-        receiptNumber: renum?.number ?? receipt.receiptNumber,
-        refNumber: renum?.refNumber ?? receipt.refNumber,
-      },
-      input,
-      prep,
-      { carryForward: true },
+    const keptCosts = keptSaleCosts(
+      soldAt,
+      input.lines
+        .filter((l) => l.itemId && prep.itemMap.get(l.itemId)?.type === 'inventory')
+        .map((l) => ({ itemId: l.itemId!, quantity: String(l.quantity) })),
     );
+    const post = () =>
+      postSalesReceiptDocument(
+        tx,
+        {
+          id,
+          receiptNumber: renum?.number ?? receipt.receiptNumber,
+          refNumber: renum?.refNumber ?? receipt.refNumber,
+        },
+        input,
+        prep,
+        { carryForward: true },
+      );
+    const { insertedLines, entry, cogsEntries } = await (keptCosts ? withKeptSaleCostQueue(keptCosts, post) : post());
+    // Kept lines sold exactly what the reversal put back: their items end where they started.
+    if (keptCosts) await restoreItemCosts(tx, costsBefore, new Set(keptCosts.map((c) => c.itemId)));
     await confirmReconciledRepost(tx, {
       oldEntryId: receipt.postedEntryId,
       newEntryId: entry.id,
@@ -1058,6 +1120,8 @@ async function updateSalesReceiptInTx(
         depositAccountId: prep.depositAccountId,
         memo: input.memo ?? null,
         taxRateId: input.taxRateId ?? null,
+        taxRateValue: prep.taxRateValue,
+        lineTaxRates: prep.lineTaxRates,
         ...(renum ? { refNumber: renum.refNumber, receiptNumber: renum.number } : {}),
         ...shippingColumns(input, receipt),
         customerMessageId: await resolveCustomerMessage(tx, input.customerMessageId, receipt.customerMessageId),

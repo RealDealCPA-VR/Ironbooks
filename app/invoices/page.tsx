@@ -175,6 +175,8 @@ interface Invoice {
 /** Full invoice (GET /api/invoices/:id) used to prefill the edit modal. */
 interface InvoiceDetail extends Invoice {
   taxRateId: string | null;
+  /** The rate this invoice was charged at (an edit keeping the same tax item keeps it). */
+  taxRateValue?: string | null;
   classId: string | null;
   salesRepId?: string | null;
   discount: string;
@@ -937,6 +939,10 @@ function InvoiceModal({
   // Jobs available for the selected customer (plus unassigned jobs).
   const customerJobs = jobs.filter((j) => !j.customerId || j.customerId === customerId);
   const selectedRate = taxRates.find((t) => t.id === taxRateId);
+  // Editing with the same tax item: the rate the invoice was charged at (what the server keeps),
+  // not the tax item's rate today.
+  const chargedRate =
+    editing && editing.taxRateId === taxRateId && editing.taxRateValue ? editing.taxRateValue : selectedRate?.rate;
 
   // Selected billables → extra (non-taxable) invoice lines. Markup applies to costs only, as its
   // own line per cost (lib/services/billables.ts), so each is rounded on its own.
@@ -954,7 +960,7 @@ function InvoiceModal({
     withShownTaxable(lines, taxCodes, customerTax),
     discount,
     discountType,
-    selectedRate?.rate ?? '',
+    chargedRate ?? '',
     selectedBillables,
     retainagePercent,
   );
@@ -1066,7 +1072,7 @@ function InvoiceModal({
       date,
       dueDate: dueDate || undefined,
       terms: terms || undefined,
-      taxRateId: taxRateId || undefined,
+      taxRateId: taxRateId || null,
       classId: classId || undefined,
       salesRepId: salesRepId || (editing ? null : undefined),
       discount: discount || undefined,
@@ -1210,7 +1216,7 @@ function InvoiceModal({
                 customerId,
                 date,
                 dueDate: dueDate || undefined,
-                taxRateId: taxRateId || undefined,
+                taxRateId: taxRateId || null,
                 classId: classId || undefined,
                 memo: memo || undefined,
                 // Each entry keeps the Customer Message and every line's Sales Tax Code.
@@ -1767,7 +1773,7 @@ function InvoiceModal({
             </div>
           )}
           <div className="flex items-center justify-between text-sm text-navy/60">
-            <span>Sales Tax{selectedRate ? ` (${(parseFloat(selectedRate.rate) * 100).toFixed(2)}%)` : ''}</span>
+            <span>Sales Tax{selectedRate && chargedRate ? ` (${(parseFloat(chargedRate) * 100).toFixed(2)}%)` : ''}</span>
             <span className="tabular-nums">{formatCurrency(totals.tax.toFixed(2), currency || 'USD')}</span>
           </div>
           <div className="flex items-center justify-between border-t border-navy/10 pt-1">

@@ -142,7 +142,10 @@ export async function salesTaxLiabilityAccounts(
     !['2000', '2100', '2300'].includes(a.code) &&
     a.id !== payrollId;
   return rows
-    .filter((a) => a.id === salesTaxId || a.code === SALES_TAX_PAYABLE_CODE || (ids.has(a.id) && usable(a)))
+    // Number 2200 only when no account holds the Sales Tax Payable role, and only if it is a plain
+    // liability: on a chart converted from QuickBooks, 2200 can be anything (accrued payroll, a
+    // loan), and every line of it was pulled into the liability report and Pay Sales Tax.
+    .filter((a) => a.id === salesTaxId || (!salesTaxId && a.code === SALES_TAX_PAYABLE_CODE && usable(a)) || (ids.has(a.id) && usable(a)))
     .map((a) => ({ id: a.id, code: a.code, name: a.name }));
 }
 

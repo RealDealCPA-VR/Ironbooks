@@ -1056,7 +1056,7 @@ export async function form940Data(
   return {
     company: companyProfile(company),
     year: input.year,
-    employeeCount: futaWagesByEmployee.size,
+    employeeCount: [...futaWagesByEmployee.values()].filter((w) => w.greaterThan(0)).length,
     totalPayments: toAmountString(totalPayments),
     exemptPayments: toAmountString(exemptPayments),
     exemptBreakdown: {
@@ -1188,7 +1188,11 @@ export async function w3Data(ctx: ServiceContext, input: W3DataInput): Promise<W
   return {
     company: companyProfile(company),
     year: input.year,
-    w2Count: perEmployee.size,
+    // Only employees who get a W-2: wages, or tax withheld (an employee with nothing but a $0
+    // liability adjustment this year gets no W-2, so Box c must not count them).
+    w2Count: [...perEmployee.values()].filter(
+      (f) => f.gross.greaterThan(0) || f.federalWithheld.greaterThan(0) || f.socialSecurity.greaterThan(0) || f.medicare.greaterThan(0) || f.stateWithheld.greaterThan(0),
+    ).length,
     wages: toAmountString(t.incomeTaxWages),
     federalWithheld: toAmountString(t.federalWithheld),
     ssWages: toAmountString(ssWages),

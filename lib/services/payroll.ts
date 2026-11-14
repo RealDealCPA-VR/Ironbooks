@@ -22,10 +22,11 @@
  * to paychecks (time_entries has no paycheck FK — see timeTracking.ts).
  */
 import { systemAccountIdByCode } from './accountRoles';
-import { and, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, ne, or, type SQL } from 'drizzle-orm';
+import { and, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, ne, or, sql, type SQL } from 'drizzle-orm';
 import { Money, toAmountString } from '@/lib/money';
 import {
   accounts,
+  journalEntryLines,
   employees,
   journalEntries,
   paychecks,
@@ -813,9 +814,21 @@ export async function ytdWagesPaid(
   const yearStart = new Date(Date.UTC(year, 0, 1));
   const yearEnd   = new Date(Date.UTC(year + 1, 0, 1));
 
+  // Only what was paid BEFORE this check: checks dated earlier, and same-day checks created
+  // before it (the order pay stubs use). Counting the whole year made an edited or backdated
+  // check see the later checks' wages and withhold too little Social Security / FUTA / SUI.
+  const day = payDate.toISOString().slice(0, 10);
+  let editedCreatedAt: Date | null = null;
+  if (excludePaycheckId) {
+    const [edited] = await ctx.db
+      .select({ createdAt: paychecks.createdAt })
+      .from(paychecks)
+      .where(and(eq(paychecks.id, excludePaycheckId), eq(paychecks.companyId, ctx.companyId)));
+    editedCreatedAt = edited?.createdAt ?? null;
+  }
   const rows = (
     await ctx.db
-      .select({ id: paychecks.id, grossPay: paychecks.grossPay })
+      .select({ id: paychecks.id, grossPay: paychecks.grossPay, payDate: paychecks.payDate, createdAt: paychecks.createdAt })
       .from(paychecks)
       .leftJoin(journalEntries, eq(paychecks.postedEntryId, journalEntries.id))
       .where(
@@ -827,7 +840,14 @@ export async function ytdWagesPaid(
           lt(paychecks.payDate, yearEnd),
         ),
       )
-  ).filter((r) => r.id !== excludePaycheckId);
+  ).filter((r) => {
+    if (r.id === excludePaycheckId) return false;
+    const d = r.payDate.toISOString().slice(0, 10);
+    if (d < day) return true;
+    if (d > day) return false;
+    // Same day: a new check comes after every check already there; an edited one keeps its place.
+    return !editedCreatedAt || r.createdAt.getTime() < editedCreatedAt.getTime();
+  });
 
   const ids = rows.map((r) => r.id);
   const lines = ids.length
@@ -1580,6 +1600,28 @@ export async function editPaycheck(ctx: ServiceContext, paycheckId: string, inpu
       .from(paycheckLines)
       .where(eq(paycheckLines.paycheckId, paycheckId));
 
+    // The bank account the check was drawn on: the edit keeps it (the paycheck account preference
+    // may have changed since — re-posting to today's default moved an old check between registers).
+    let paidFrom: string | null = null;
+    if (pc.postedEntryId) {
+      const [bankLine] = await tx.db
+        .select({ accountId: journalEntryLines.accountId })
+        .from(journalEntryLines)
+        .innerJoin(accounts, eq(accounts.id, journalEntryLines.accountId))
+        .where(
+          and(
+            eq(journalEntryLines.journalEntryId, pc.postedEntryId),
+            eq(accounts.type, 'asset'),
+            sql`${journalEntryLines.credit} IS NOT NULL`,
+            // The net-pay line (postPaycheckEntry's memo) — a deduction can credit an asset too
+            // (an employee-advance repayment), which is not the account the check was drawn on.
+            sql`${journalEntryLines.memo} LIKE ${'Net pay —%'}`,
+          ),
+        )
+        .limit(1);
+      paidFrom = bankLine?.accountId ?? null;
+    }
+
     // 1) Void the old posting (reconciliation + closed-period guards live here).
     if (pc.postedEntryId) await voidJournalEntry(tx, pc.postedEntryId);
 
@@ -1590,7 +1632,7 @@ export async function editPaycheck(ctx: ServiceContext, paycheckId: string, inpu
 
     // 3) Re-post.
     // A printed paycheck keeps its check number on the re-posted entry (registers show it).
-    const entry = await postPaycheckEntry(tx, prep, paycheckId, input.payDate, null, pc.checkNumber);
+    const entry = await postPaycheckEntry(tx, prep, paycheckId, input.payDate, paidFrom, pc.checkNumber);
     const [updated] = await tx.db
       .update(paychecks)
       .set({
@@ -1714,7 +1756,7 @@ export async function unpaidTimeForPayroll(
 
 export interface PayRunEmployeeInput {
   employeeId: string;
-  /** Hours for hourly employees (default 80 ≈ biweekly full-time). Ignored when `amount` is set. */
+  /** Hours for hourly employees (required unless time is pulled). Ignored when `amount` is set. */
   hours?: string | number | null;
   /** Override gross for this check (wins over hours x rate and the salary default). */
   amount?: string | number | null;
@@ -1760,7 +1802,7 @@ export interface PayRunEmployeeResult {
  * behavior, so one bad record doesn't block the whole run).
  *
  * Defaults per employee when no override is given:
- *   hourly:     hours (input.hours, or pulled time, or 80) x payRate
+ *   hourly:     hours (input.hours, or pulled time; refused when neither) x payRate
  *   salary:     payRate / periodsPerYear (annual salary spread per period), pulled time or not
  *   commission: requires an explicit amount
  * Pulled time entries are marked as used by the check for every pay type.
@@ -1858,11 +1900,12 @@ export async function createPayRun(ctx: ServiceContext, input: CreatePayRunInput
         if (empInput.amount != null && empInput.amount !== '') {
           earnings.push({ kind: 'regular', amount: empInput.amount });
         } else if (employee.payType === 'hourly') {
-          const hours =
-            timeHours ??
-            (empInput.hours != null && empInput.hours !== ''
-              ? Money.of(empInput.hours)
-              : Money.of(80));
+          // No hours, no amount and no pulled time: refused, never a hidden 80 hours (a cleared
+          // hours box — "not this week" — used to post a full two-week check).
+          if (timeHours == null && (empInput.hours == null || String(empInput.hours).trim() === '')) {
+            throw validation(`${employee.firstName} ${employee.lastName}: enter the hours worked (or an amount), or leave this employee out of the pay run.`);
+          }
+          const hours = timeHours ?? Money.of(empInput.hours!);
           earnings.push({
             kind: 'regular',
             hours: hours.toFixed(2),

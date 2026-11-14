@@ -55,7 +55,7 @@ import {
   writeAudit,
 } from './_base';
 import { postJournalEntry, voidJournalEntry } from './posting';
-import { valueRemainderAfter } from './inventory';
+import { cogsAccountForItem, valueRemainderAfter } from './inventory';
 import { billLineHomeShares } from './currencies';
 
 export type LandedCostMethod = 'quantity' | 'value' | 'weight';
@@ -604,7 +604,7 @@ export async function allocateLandedCost(ctx: ServiceContext, input: AllocateLan
     // first (freight forwarders bill before delivery) — capitalizing it earlier put value on the
     // inventory account for days the stock was not there yet.
     const date = input.date ?? (c.latestReceiptDate > c.bill.date ? c.latestReceiptDate : c.bill.date);
-    const cogsAccountId = await accountIdByCode(tx, '5000');
+    // (The COGS share goes to each item's own COGS account — cogsAccountForItem, like its sales.)
     let defaultInventoryId: string | null = null;
 
     const [allocation] = await tx.db
@@ -691,7 +691,7 @@ export async function allocateLandedCost(ctx: ServiceContext, input: AllocateLan
         postingLines.push(signedLine(inventoryAccountId, capitalised, memo));
       }
       if (!cogsPortion.isZero()) {
-        postingLines.push(signedLine(cogsAccountId, cogsPortion, `${memo} (units already sold / rounding)`));
+        postingLines.push(signedLine(await cogsAccountForItem(tx, item), cogsPortion, `${memo} (units already sold / rounding)`));
       }
       postingLines.push({ accountId: c.billLine.accountId, credit: toAmountString(amount), memo });
       const entry = await postJournalEntry(tx, {
@@ -856,7 +856,7 @@ export async function voidLandedCostAllocation(ctx: ServiceContext, id: string) 
     const allocation = await getLandedCostAllocation(tx, id);
     if (allocation.status === 'void') return allocation;
 
-    let cogsAccountId: string | null = null;
+
     for (const line of allocation.lines) {
       const inv = Money.of(line.inventoryAmount);
       const fifoLine = Boolean(line.layerAdjustments && line.layerAdjustments.length > 0);
@@ -922,7 +922,7 @@ export async function voidLandedCostAllocation(ctx: ServiceContext, id: string) 
       // so inventory GL == valuation still holds.
       const residual = valueChange.plus(inv);
       if (!residual.isZero()) {
-        cogsAccountId ??= await accountIdByCode(tx, '5000');
+        const cogsAccountId = await cogsAccountForItem(tx, item);
         const inventoryAccountId = item.assetAccountId ?? (await accountIdByCode(tx, '1300'));
         const memo = `Landed cost void rounding — ${line.itemName}`;
         await postJournalEntry(tx, {

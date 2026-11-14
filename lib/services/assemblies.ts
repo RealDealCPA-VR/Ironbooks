@@ -88,6 +88,11 @@ export interface BuildInput extends InventoryLineDetail {
   date?: Date | null;
 }
 
+/** A quantity as stored (4dp): what is checked, costed and moved is what is kept. */
+function q4(d: ReturnType<typeof Money.zero>): ReturnType<typeof Money.zero> {
+  return Money.of(d.toFixed(4));
+}
+
 /**
  * Site-tagged movements for a build (direction 1) or unbuild (direction -1): components move
  * out (in for unbuild) and the assembly moves in (out for unbuild) at the build's site.
@@ -110,7 +115,7 @@ function buildMovements(
         itemId: b.componentItemId,
         siteId: input.siteId ?? null,
         binId: d?.binId ?? null,
-        quantity: qty.times(Money.of(b.quantity)).times(-direction),
+        quantity: q4(qty.times(Money.of(b.quantity))).times(-direction),
         serialNumbers: d?.serialNumbers ?? null,
         lotNumber: d?.lotNumber ?? null,
         date,
@@ -437,7 +442,8 @@ type BuildResult = {
 };
 
 async function buildAssemblyInTx(ctx: ServiceContext, input: BuildInput): Promise<BuildResult> {
-  const buildQty = inventoryNumber(input.quantity, 'Build quantity');
+  // Stored to 4dp: the quantities checked, costed and moved are the ones that are kept.
+  const buildQty = q4(inventoryNumber(input.quantity, 'Build quantity'));
   if (!buildQty.greaterThan(0)) {
     throw validation('Build quantity must be greater than zero.');
   }
@@ -481,7 +487,7 @@ async function buildAssemblyInTx(ctx: ServiceContext, input: BuildInput): Promis
     if (!comp) throw notFound(`Component item ${bomLine.componentItemId}`);
     assertInventoryType(comp, 'component');
 
-    const required = buildQty.times(Money.of(bomLine.quantity));
+    const required = q4(buildQty.times(Money.of(bomLine.quantity)));
     const onHand = Money.of(comp.quantityOnHand ?? '0');
 
     if (onHand.lessThan(required)) {
@@ -505,7 +511,7 @@ async function buildAssemblyInTx(ctx: ServiceContext, input: BuildInput): Promis
     // Reduce each component's quantityOnHand
     for (const bomLine of bom) {
       const comp = componentMap.get(bomLine.componentItemId)!;
-      const consumed = buildQty.times(Money.of(bomLine.quantity));
+      const consumed = q4(buildQty.times(Money.of(bomLine.quantity)));
       const newQty = Money.of(comp.quantityOnHand ?? '0').minus(consumed);
 
       await tx.db
@@ -640,7 +646,7 @@ type UnbuildResult = {
 };
 
 async function unbuildAssemblyInTx(ctx: ServiceContext, input: BuildInput): Promise<UnbuildResult> {
-  const unbuildQty = inventoryNumber(input.quantity, 'Unbuild quantity');
+  const unbuildQty = q4(inventoryNumber(input.quantity, 'Unbuild quantity'));
   if (!unbuildQty.greaterThan(0)) {
     throw validation('Unbuild quantity must be greater than zero.');
   }
@@ -696,7 +702,7 @@ async function unbuildAssemblyInTx(ctx: ServiceContext, input: BuildInput): Prom
     const comp = componentMap.get(bomLine.componentItemId);
     if (!comp) throw notFound(`Component item ${bomLine.componentItemId}`);
     assertInventoryType(comp, 'component');
-    const returned = unbuildQty.times(Money.of(bomLine.quantity));
+    const returned = q4(unbuildQty.times(Money.of(bomLine.quantity)));
     const currentValue = returned.times(Money.of(comp.averageCost ?? '0'));
     return { comp, returned, currentValue };
   });
