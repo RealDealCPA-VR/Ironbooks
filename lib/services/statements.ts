@@ -1786,7 +1786,10 @@ export async function vendor1099Worksheet(
     box: Tax1099Box | null,
     amount: ReturnType<typeof Money.zero>,
   ) {
-    if (!box || amount.lessThanOrEqualTo(0)) return;
+    // Negative shares count too (a bill's price-variance or credit line): dropped, the positive
+    // shares — which add up to MORE than was paid — overstated the box. Each box is netted here
+    // and only its final total is kept at zero or above (rows below).
+    if (!box || amount.isZero()) return;
     if (!totals.has(vendorId)) {
       totals.set(vendorId, {
         vendorName,
@@ -1839,9 +1842,14 @@ export async function vendor1099Worksheet(
   const THRESHOLD = threshold1099(year);
   const rows: Vendor1099WorksheetRow[] = [];
   for (const [vendorId, acc] of totals) {
-    const nec1 = acc.boxes.nec_1;
-    const misc1 = acc.boxes.misc_1;
-    const misc3 = acc.boxes.misc_3;
+    // Rounded to cents before the threshold test (1,999.996 shows 2,000.00 and needs a form).
+    const box = (v: ReturnType<typeof Money.zero>) => {
+      const r = Money.round2(v);
+      return r.isNegative() ? Money.zero() : r;
+    };
+    const nec1 = box(acc.boxes.nec_1);
+    const misc1 = box(acc.boxes.misc_1);
+    const misc3 = box(acc.boxes.misc_3);
     const total = nec1.plus(misc1).plus(misc3);
     if (total.lessThanOrEqualTo(0)) continue;
     rows.push({

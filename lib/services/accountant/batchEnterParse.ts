@@ -371,11 +371,19 @@ export function normalizeAmount(raw: string | undefined | null): string | null {
     neg = !neg;
     s = s.slice(0, -1);
   }
-  s = s.replace(/[$€£¥,\s]/g, '');
-  if (s.startsWith('-')) {
+  s = s.replace(/[$€£¥]/g, '').trim();
+  // The leading sign first ("-1,234.56", Excel's negative): then the number itself is checked.
+  if (/^-\s*/.test(s)) {
     neg = !neg;
-    s = s.slice(1);
+    s = s.replace(/^-\s*/, '');
   }
+  // Commas only as real thousands groups ("1,234.56"): "12,50" or "1 234,56" pasted from a
+  // decimal-comma Excel became 1250 / 123456 and posted 100x the amount. Left unread instead.
+  if (s.includes(',')) {
+    if (!/^\d{1,3}(,\d{3})+(\.\d+)?$/.test(s)) return null;
+    s = s.replace(/,/g, '');
+  }
+  if (/\s/.test(s)) return null;
   if (!/^\d+(\.\d+)?$/.test(s) && !/^\.\d+$/.test(s)) return null;
   const n = s.startsWith('.') ? `0${s}` : s;
   return neg ? `-${n}` : n;

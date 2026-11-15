@@ -105,6 +105,8 @@ type CsvField = { key: string; label: string; aliases?: string[] };
 export const CSV_FIELDS: Record<CsvKind, CsvField[]> = {
   customers: [
     { key: 'displayName', label: 'Display Name *', aliases: ['name', 'display name', 'customer', 'customer name'] },
+    // A job's customer ("Customer:Job" names work without it).
+    { key: 'parent', label: 'Parent (Customer of a job)', aliases: ['parent', 'sub-customer of', 'subcustomer of'] },
     { key: 'companyName', label: 'Company Name', aliases: ['company', 'company name'] },
     { key: 'email', label: 'Email', aliases: ['email', 'e-mail'] },
     { key: 'phone', label: 'Phone', aliases: ['phone'] },

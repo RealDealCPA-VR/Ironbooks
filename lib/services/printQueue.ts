@@ -205,7 +205,7 @@ export async function listPrintQueue(
       id: r.e.id,
       date: r.e.date,
       payee: expensePayee(r.e, r.v, r.o, ''),
-      amount: toAmountString(Money.of(r.e.total).abs()),
+      amount: toAmountString(await amountFromBank(ctx, r.e, Money.of(r.e.total).abs())),
       memo: expenseMemo(r.e, r.v, r.o),
       paymentAccountId: r.e.paymentAccountId,
       paymentAccountName: r.acctName ?? null,
@@ -231,7 +231,7 @@ export async function listPrintQueue(
       id: r.p.id,
       date: r.p.date,
       payee: vendorCheckName(r.v, 'Vendor'),
-      amount: toAmountString(r.p.amount),
+      amount: toAmountString(await amountFromBank(ctx, r.p, Money.of(r.p.amount))),
       memo: r.v?.accountNumber ? `Acct # ${r.v.accountNumber}` : null,
       paymentAccountId: r.p.paymentAccountId,
       paymentAccountName: r.acctName ?? null,
@@ -822,6 +822,40 @@ function addressLines(addr: unknown): string[] {
  * "print on check as" name; when the memo is blank the vendor account number is printed on the
  * memo line ("Acct # …"), as QB does.
  */
+/**
+ * What a check actually pays from its bank account. A foreign-currency bill (or expense) paid from
+ * a HOME-currency bank stores its amount in the bill's currency, while the bank is credited the
+ * converted amount: the check printed "$1,000.00" for a EUR 1,000 bill that cost $1,100. The bank
+ * line's own amount is the check's (a bank in the document's currency prints the document amount).
+ */
+async function amountFromBank(
+  ctx: ServiceContext,
+  doc: { currency: string | null; postedEntryId: string | null; paymentAccountId: string | null },
+  docAmount: ReturnType<typeof Money.zero>,
+): Promise<ReturnType<typeof Money.zero>> {
+  if (!doc.currency || !doc.postedEntryId || !doc.paymentAccountId) return docAmount;
+  const [bank] = await ctx.db.select({ currency: accounts.currency }).from(accounts).where(and(eq(accounts.id, doc.paymentAccountId), eq(accounts.companyId, ctx.companyId)));
+  if (bank?.currency && bank.currency.toUpperCase() === doc.currency.toUpperCase()) return docAmount;
+  const lines = await ctx.db
+    .select({ debit: journalEntryLines.debit, credit: journalEntryLines.credit })
+    .from(journalEntryLines)
+    .where(and(eq(journalEntryLines.journalEntryId, doc.postedEntryId), eq(journalEntryLines.accountId, doc.paymentAccountId)));
+  if (!lines.length) return docAmount;
+  const net = lines.reduce((sum, l) => sum.plus(Money.of(l.credit ?? 0)).minus(Money.of(l.debit ?? 0)), Money.zero()).abs();
+  return net.greaterThan(0) ? Money.round2(net) : docAmount;
+}
+
+/** Stub lines scaled to the check's (bank) amount so they still add up to it. */
+function scaleVoucher<T extends { amount: string }>(voucher: T[], docAmount: ReturnType<typeof Money.zero>, checkAmount: ReturnType<typeof Money.zero>): T[] {
+  if (checkAmount.equals(docAmount) || docAmount.isZero() || voucher.length === 0) return voucher;
+  let left = checkAmount;
+  return voucher.map((v, i) => {
+    const share = i === voucher.length - 1 ? left : Money.round2(Money.of(v.amount).times(checkAmount).dividedBy(docAmount));
+    left = left.minus(share);
+    return { ...v, amount: toAmountString(share) };
+  });
+}
+
 export async function checkPrintData(
   ctx: ServiceContext,
   source: PrintSource,
@@ -855,19 +889,22 @@ export async function checkPrintData(
       .leftJoin(items, eq(expenseLines.itemId, items.id))
       .where(eq(expenseLines.expenseId, id))
       .orderBy(asc(expenseLines.lineOrder));
+    const docTotal = Money.of(row.e.total).abs();
+    const onBank = await amountFromBank(ctx, row.e, docTotal);
+    const expVoucher = lines.map((r) => ({
+      account: r.l.itemId && r.itemName ? `Item: ${r.itemName}` : `${r.code ?? ''} – ${r.name ?? 'Account'}`,
+      description: r.l.description,
+      amount: toAmountString(Money.of(r.l.amount).abs()),
+    }));
     return {
       payee: expensePayee(row.e, row.v, row.o, 'Payee'),
-      amount: toAmountString(Money.of(row.e.total).abs()),
+      amount: toAmountString(onBank),
       date: new Date(row.e.date).toISOString().slice(0, 10),
       memo: expenseMemo(row.e, row.v, row.o),
       checkNumber: row.e.reference,
       payeeAddress: addressLines(row.v?.address ?? row.o?.address),
       paymentAccountId: row.e.paymentAccountId,
-      voucher: lines.map((r) => ({
-        account: r.l.itemId && r.itemName ? `Item: ${r.itemName}` : `${r.code ?? ''} – ${r.name ?? 'Account'}`,
-        description: r.l.description,
-        amount: toAmountString(Money.of(r.l.amount).abs()),
-      })),
+      voucher: scaleVoucher(expVoucher, docTotal, onBank),
     };
   }
   if (source === 'bill_payment') {
@@ -901,15 +938,17 @@ export async function checkPrintData(
     // check amount (QB voucher: Payment / Discount columns).
     const journalTotal = journalPaid.reduce((s, j) => s.plus(Money.of(j.amount)), Money.zero());
     const cashByBill = await billPaymentCashByBill(ctx, row.p, apps.map((r) => r.a), journalTotal);
+    const docAmount = Money.of(row.p.amount);
+    const onBank = await amountFromBank(ctx, row.p, docAmount);
     return {
       payee: vendorCheckName(row.v, 'Vendor'),
-      amount: toAmountString(row.p.amount),
+      amount: toAmountString(onBank),
       date: new Date(row.p.date).toISOString().slice(0, 10),
       memo: row.v?.accountNumber ? `Acct # ${row.v.accountNumber}` : null,
       checkNumber: row.p.reference,
       payeeAddress: addressLines(row.v?.address),
       paymentAccountId: row.p.paymentAccountId,
-      voucher: [
+      voucher: scaleVoucher([
         ...apps.map((r, i) => {
           const cash = cashByBill[i];
           const discount = Money.round2(Money.of(r.a.amountApplied).minus(cash));
@@ -925,7 +964,7 @@ export async function checkPrintData(
           description: new Date(j.date).toISOString().slice(0, 10),
           amount: toAmountString(j.amount),
         })),
-      ],
+      ], docAmount, onBank),
     };
   }
   if (source === 'payment_check') {

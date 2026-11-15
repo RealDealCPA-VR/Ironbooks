@@ -37,7 +37,10 @@ import {
 import { Money, toAmountString } from '@/lib/money';
 import { buildXlsx, buildXlsxWorkbook, type XlsxSheetInput } from '@/lib/export/xlsx';
 import { validation, type ServiceContext } from './_base';
-import { exportListsIif, type IifListName } from './iifExport';
+import { IIF_EXPORT_LISTS, exportListsIif, type IifListName } from './iifExport';
+import { requirePermission } from './access';
+import { canRef } from '@/lib/permissions/model';
+import { encodeWindows1252 } from '@/lib/textEncode';
 import { apAging, arAging } from './reportsExtra';
 
 // ---------------------------------------------------------------------------
@@ -108,6 +111,15 @@ const IIF_SECTION: Partial<Record<ExportableList, IifListName>> = {
 };
 
 export type ExportFormat = 'csv' | 'xlsx' | 'iif';
+
+/**
+ * QuickBooks Desktop reads IIF in the Windows code page: written as UTF-8, "Café Ltd" came in as
+ * "CafÃ© Ltd" — a new, duplicate name the transactions went to.
+ */
+const IIF_CONTENT_TYPE = 'text/plain; charset=windows-1252';
+function iifBytes(text: string): Buffer {
+  return encodeWindows1252(text);
+}
 
 /**
  * Escape a single CSV cell per RFC 4180 (quote when it contains , " or newlines), with
@@ -433,7 +445,14 @@ async function workersCompTable(ctx: ServiceContext): Promise<Table> {
   };
 }
 
+/** Employees and payroll items carry pay data: File Utilities > Export alone must not reveal it. */
+const PAYROLL_LISTS = new Set<string>(['employees', 'payroll_items']);
+function payrollHidden(ctx: ServiceContext): boolean {
+  return !!ctx.access && !canRef(ctx.access, 'payroll', 'view');
+}
+
 async function tableFor(ctx: ServiceContext, list: ExportableList): Promise<Table> {
+  if (PAYROLL_LISTS.has(list)) requirePermission(ctx, 'payroll', 'view');
   switch (list) {
     case 'customers': return customersTable(ctx);
     case 'vendors': return vendorsTable(ctx);
@@ -500,11 +519,16 @@ export async function exportList(ctx: ServiceContext, list: string, format: Expo
 
   if (list === 'all') {
     if (format === 'csv') throw validation('Choose Excel or IIF to export every list in one file.');
+    const hide = payrollHidden(ctx);
     if (format === 'iif') {
-      return { filename: `all-lists-${today}.iif`, contentType: 'text/plain; charset=utf-8', body: await exportListsIif(ctx) };
+      const lists = hide ? IIF_EXPORT_LISTS.filter((l) => l !== 'employees') : IIF_EXPORT_LISTS;
+      return { filename: `all-lists-${today}.iif`, contentType: IIF_CONTENT_TYPE, body: iifBytes(await exportListsIif(ctx, lists)) };
     }
     const sheets: XlsxSheetInput[] = [];
-    for (const l of EXPORTABLE_LISTS) sheets.push(toXlsxSheet(l, await tableFor(ctx, l)));
+    for (const l of EXPORTABLE_LISTS) {
+      if (hide && PAYROLL_LISTS.has(l)) continue; // left out without the Payroll right
+      sheets.push(toXlsxSheet(l, await tableFor(ctx, l)));
+    }
     return {
       filename: `all-lists-${today}.xlsx`,
       contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -517,7 +541,8 @@ export async function exportList(ctx: ServiceContext, list: string, format: Expo
   if (format === 'iif') {
     const section = IIF_SECTION[list];
     if (!section) throw validation(`${LIST_LABELS[list]} cannot be exported to IIF. Choose CSV or Excel.`);
-    return { filename: `${base}.iif`, contentType: 'text/plain; charset=utf-8', body: await exportListsIif(ctx, [section]) };
+    if (PAYROLL_LISTS.has(list)) requirePermission(ctx, 'payroll', 'view');
+    return { filename: `${base}.iif`, contentType: IIF_CONTENT_TYPE, body: iifBytes(await exportListsIif(ctx, [section])) };
   }
   const t = await tableFor(ctx, list);
   if (format === 'xlsx') {

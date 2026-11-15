@@ -12,6 +12,8 @@
  * Returns the file as an attachment download.
  */
 import { NextRequest, NextResponse } from 'next/server';
+import { requirePermission } from '@/lib/services/access';
+import { encodeWindows1252 } from '@/lib/textEncode';
 import { getServerContext } from '@/lib/context';
 import { exportList, type ExportFormat } from '@/lib/services/listExport';
 import { exportJournalIif } from '@/lib/services/iifExport';
@@ -39,14 +41,19 @@ export async function GET(req: NextRequest, { params }: RouteParams) {
       if (!from || !to || !DATE_RE.test(from) || !DATE_RE.test(to)) {
         return NextResponse.json({ error: 'from and to (YYYY-MM-DD) are required', code: 'VALIDATION' }, { status: 400 });
       }
-      const body = await exportJournalIif(ctx, {
+      // Every posted transaction (paychecks by employee included): the ledger right, not just
+      // File Utilities > Export.
+      requirePermission(ctx, 'accounting', 'view');
+      const text = await exportJournalIif(ctx, {
         from: new Date(`${from}T00:00:00.000Z`),
         to: new Date(`${to}T23:59:59.999Z`),
       });
+      // QuickBooks Desktop reads IIF in the Windows code page (lib/textEncode.ts).
+      const body = new Uint8Array(encodeWindows1252(text));
       return new Response(body, {
         status: 200,
         headers: {
-          'Content-Type': 'text/plain; charset=utf-8',
+          'Content-Type': 'text/plain; charset=windows-1252',
           'Content-Disposition': `attachment; filename="journal-${from}-to-${to}.iif"`,
           'Cache-Control': 'no-store',
         },

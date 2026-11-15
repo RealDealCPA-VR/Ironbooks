@@ -133,8 +133,9 @@ describe('switching or closing company files (source pins)', () => {
     // openCompany / Close Company / New Company hand their config to relaunchApp…
     expect(main).toMatch(/function relaunchApp\(nextConfig = null\) \{[\s\S]{0,200}configAfterClose = \{ \.\.\.\(configAfterClose \|\| \{\}\), \.\.\.nextConfig \};/);
     const open = main.slice(main.indexOf('function openCompany(location, extra = {})'));
-    expect(open.slice(0, 600)).toMatch(/relaunchApp\(\{\s*\.\.\.\(single \? \{ companyFile: location \}/);
-    expect(open.slice(0, 600)).not.toMatch(/saveConfig\(/);
+    // (review loop 8: it first refuses inside the sandbox, which takes a few lines more)
+    expect(open.slice(0, 1200)).toMatch(/relaunchApp\(\{\s*\.\.\.\(single \? \{ companyFile: location \}/);
+    expect(open.slice(0, 1200)).not.toMatch(/saveConfig\(/);
     expect(main).toMatch(/openCompany\(target, \{ startRoute: convertFromQuickBooks \? '\/signup\?then=qb-import' : '\/signup' \}\);/);
     expect(main).not.toMatch(/saveConfig\(\{ startRoute: '\/signup' \}\)/);
     // …which before-quit applies only when the file closed (dropped on Keep Working).
@@ -157,7 +158,8 @@ describe('switching or closing company files (source pins)', () => {
 describe('switching back to single-user mode (source pins)', () => {
   const main = fs.readFileSync(path.resolve(__dirname, '..', 'electron', 'main.js'), 'utf8');
   it('updates the lock on the shared drive at once, so nobody is offered "Join" to a host that stopped', () => {
-    const fn = main.slice(main.indexOf('async function setHosting('));
+    // review loop 8: setHosting queues requests; the work is in setHostingNow.
+    const fn = main.slice(main.indexOf('async function setHostingNow('));
     const end = fn.indexOf('\n}\n');
     expect(fn.slice(0, end)).toMatch(/if \(openFile && !openFile\.lost\) lockHeartbeat\(\)\.catch\(\(\) => \{\}\);/);
     // …and the heartbeat drops the join details when not on the office network.

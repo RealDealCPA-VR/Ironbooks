@@ -78,6 +78,26 @@ let quittingAfterBackup = false;
 /** Relaunch once the quit has finished (set by relaunchApp; a cancelled quit cancels it too). */
 let relaunchAfterQuit = false;
 /**
+ * The quit-time backup + save back into the company file is running. Another quit request in the
+ * meantime (X again, File > Exit, a Recent company, a double-clicked file) must not reach the
+ * second pass, which kills the server mid-save and leaves the company file locked.
+ */
+let closingInProgress = false;
+/** "Restart & install now": install the downloaded update once the company file is saved. */
+let installAfterClose = false;
+/** Restore / Accountant's Copy scratch servers still running (stopped at quit). */
+const scratchChildren = new Set();
+
+/**
+ * The command line for a relaunch, without the file it was first started with: app.relaunch()
+ * reuses process.argv, so a launch from a double-clicked company file (or backup / Accountant's
+ * Copy file) reopened THAT file on every relaunch — Close Company, another Recent company, the
+ * sandbox and handing the file over all came back to it.
+ */
+function relaunchArgs() {
+  return process.argv.slice(1).filter((a) => !/\.(ironbooks|bka|bkp|ibac|ibcx)$/i.test(String(a)));
+}
+/**
  * Config for the next launch (which company file, or No Company Open), written only once the
  * open company file has been saved and closed. If that save fails and the person keeps working,
  * it is dropped: the next launch still opens the file they kept working in.
@@ -414,6 +434,17 @@ function rememberRecentCompany(dir) {
  * relaunch into it. The one open now is saved, backed up and released on the way out (before-quit).
  */
 function openCompany(location, extra = {}) {
+  // In the sandbox the practice copy is open: switching files from here kept the sandbox flag and
+  // ran the new file with no lock and no working copy. Leave the sandbox first (as Close Company).
+  if (sandboxActive()) {
+    dialog.showMessageBox(parentWindow(), {
+      noLink: true,
+      type: 'info',
+      message: 'Leave the sandbox first',
+      detail: 'This is a practice copy. Leave the sandbox (File menu), then open the other company file.',
+    });
+    return;
+  }
   // Opening a local file leaves any remote host, and ends "No Company Open" — once the file open
   // now has closed (relaunchApp).
   const single = companyFile.isSingleFile(location);
@@ -1552,6 +1583,18 @@ function findFreePort() {
   });
 }
 
+/** spawn() for a scratch server, tracked so a quit stops it (it is not killed with its parent). */
+function spawnScratch(...args) {
+  const child = spawn(...args);
+  scratchChildren.add(child);
+  child.once('exit', () => scratchChildren.delete(child));
+  child.once('error', (err) => {
+    scratchChildren.delete(child);
+    console.error('[scratch-server] could not start:', err?.message || err);
+  });
+  return child;
+}
+
 async function startNextServer() {
   if (isDev) return 'http://localhost:3000';
 
@@ -1598,6 +1641,21 @@ async function startNextServer() {
       NEXT_TELEMETRY_DISABLED: '1',
     },
     stdio: 'inherit',
+  });
+  // A server that stops while the app runs (a crash) is said at once — it used to go unnoticed
+  // until the quit-time save failed. A spawn failure was an uncaught 'error' event.
+  const started = serverProcess;
+  started.once('error', (err) => console.error('[server] could not start:', err?.message || err));
+  started.once('exit', (code, signal) => {
+    if (serverProcess !== started || quittingAfterBackup) return; // stopped on purpose
+    serverProcess = null;
+    console.error(`[server] stopped unexpectedly (code ${code}, signal ${signal}).`);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      dialog.showErrorBox(
+        'Ironbooks stopped working',
+        'The part of Ironbooks that keeps your books stopped unexpectedly. Close Ironbooks and start it again — your company file was saved as of the last change.',
+      );
+    }
   });
 
   // wait until the port is accepting connections
@@ -2100,7 +2158,7 @@ async function openAccountantCopyFlow(filePath) {
 async function startScratchServer(dataDir) {
   fs.mkdirSync(dataDir, { recursive: true });
   const port = await findFreePort();
-  const child = spawn(process.execPath, [path.join(process.resourcesPath, 'app', 'server.js')], {
+  const child = spawnScratch(process.execPath, [path.join(process.resourcesPath, 'app', 'server.js')], {
     env: {
       ...process.env,
       NODE_ENV: 'production',
@@ -2231,7 +2289,19 @@ async function switchToSingleUserFlow() {
  *    session: closing the company file ends it.
  * Never available in client mode.
  */
-async function setHosting(enable, { quiet = false, lan = false } = {}) {
+/**
+ * Turn multi-user hosting on/off, one request at a time: the launch-time start racing "Let Them In"
+ * started two proxies on one port; the loser's EADDRINUSE cleared the state, so the menu showed
+ * hosting off while the winner kept serving and could not be stopped.
+ */
+let hostingQueue = Promise.resolve();
+function setHosting(enable, opts = {}) {
+  const run = hostingQueue.then(() => setHostingNow(enable, opts));
+  hostingQueue = run.catch(() => {});
+  return run;
+}
+
+async function setHostingNow(enable, { quiet = false, lan = false } = {}) {
   if (remoteHostOrigin) return hostingStatus();
   if (enable && sandboxActive()) {
     if (!quiet) dialog.showErrorBox('Not available in the sandbox', 'Leave the sandbox to share your company file with other people.');
@@ -2871,6 +2941,11 @@ async function createWindow() {
   // Closing the window with a company file open: keep it on screen while the file is saved into
   // the company file (before-quit), so any question about that save has a window to appear on.
   mainWindow.on('close', (e) => {
+    // Already closing (the company file is being saved): this X / Alt+F4 waits for that save.
+    if (closingInProgress) {
+      e.preventDefault();
+      return;
+    }
     // Alt+F4 / File > Exit with a form being typed: ask first (the page knows: LeaveGuard).
     if (!quittingAfterBackup && !closeAnswered) {
       e.preventDefault();
@@ -3443,7 +3518,14 @@ ipcMain.handle('hosting:disconnect', (e) => {
 });
 // After the Privacy & Network settings change, re-read what the window may load.
 
-app.on('second-instance', (_event, argv) => {
+app.on('second-instance', (_event, rawArgv, workingDirectory) => {
+  // A relative file argument ("Ironbooks.exe Books.ironbooks" from a shortcut or a terminal) is
+  // relative to THAT launch's folder, not this instance's.
+  const argv = (rawArgv || []).map((a) =>
+    typeof a === 'string' && workingDirectory && /\.(ironbooks|bka|bkp|ibac|ibcx)$/i.test(a) && !path.isAbsolute(a)
+      ? path.resolve(workingDirectory, a)
+      : a,
+  );
   if (mainWindow) {
     if (mainWindow.isMinimized()) mainWindow.restore();
     mainWindow.focus();
@@ -3602,12 +3684,15 @@ async function checkForUpdates({ manual = false } = {}) {
   }
 }
 
-ipcMain.handle('app:updateStatus', () => updateState);
-ipcMain.handle('app:checkForUpdates', () => checkForUpdates({ manual: true }));
+ipcMain.handle('app:updateStatus', (e) => (fromLocalApp(e) ? updateState : null));
+ipcMain.handle('app:checkForUpdates', (e) => (fromLocalApp(e) ? checkForUpdates({ manual: true }) : null));
 
 // Renderer "Download & install" -> download the update that was found.
-ipcMain.handle('app:downloadUpdate', () => {
+ipcMain.handle('app:downloadUpdate', async (e) => {
+  if (!fromLocalApp(e)) return false;
   if (!autoUpdater || !['available', 'error'].includes(updateState.state)) return false;
+  // Privacy & Network may have gone offline since the update was found.
+  if (!(await updatesAllowed()).allowed) return false;
   setUpdateState({ state: 'downloading', version: updateState.version, percent: 0 });
   autoUpdater.downloadUpdate().catch((err) => {
     if (updateState.state === 'downloading') {
@@ -3619,16 +3704,15 @@ ipcMain.handle('app:downloadUpdate', () => {
 
 // Renderer "Restart & install now" -> apply the downloaded update immediately.
 // Returns false if no update is staged (the UI then tells the user to restart manually).
-ipcMain.handle('app:quitAndInstall', () => {
+ipcMain.handle('app:quitAndInstall', (e) => {
+  if (!fromLocalApp(e)) return false;
   if (!autoUpdater || updateState.state !== 'ready') return false;
   if (sandboxActive()) return false; // sandbox mode: no installs from a practice copy
-  // Defer so the IPC reply is sent before the app tears down; relaunch after install.
+  // Defer so the IPC reply is sent before the app tears down. The quit saves and releases the
+  // company file first; before-quit then starts the installer (and relaunches after it).
   setImmediate(() => {
-    try {
-      autoUpdater.quitAndInstall(false, true);
-    } catch {
-      /* nothing staged / updater unavailable — ignore */
-    }
+    installAfterClose = true;
+    app.quit();
   });
   return true;
 });
@@ -3659,11 +3743,15 @@ app.whenReady().then(async () => {
 });
 
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit();
+  // macOS keeps apps open without windows — but not while a local server holds a company folder:
+  // the Dock icon would start a second server (a second Postgres) on the same folder.
+  if (process.platform !== 'darwin' || serverProcess) app.quit();
 });
 
 app.on('activate', () => {
-  if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  if (BrowserWindow.getAllWindows().length === 0 && !serverProcess) {
+    createWindow().catch((err) => console.error('[startup] could not reopen the window:', err));
+  }
 });
 
 app.on('before-quit', (event) => {
@@ -3672,8 +3760,11 @@ app.on('before-quit', (event) => {
   // safety: a rotating local auto-backup means a bad restore / disk hiccup never costs more than
   // one session, and the company file on the server is complete when the app is gone.
   if (!quittingAfterBackup) {
-    quittingAfterBackup = true;
     event.preventDefault();
+    // A quit request while the save is running: that save finishes the quit (a relaunch or next
+    // config asked for meanwhile is applied when it does).
+    if (closingInProgress) return;
+    closingInProgress = true;
     runAutoBackup()
       .catch((err) => console.error('[auto-backup] skipped:', err?.message || err))
       .then(() => closeOpenCompanyFile())
@@ -3682,24 +3773,51 @@ app.on('before-quit', (event) => {
         return true;
       })
       .then((goOn) => {
+        closingInProgress = false;
         if (goOn === false) {
           // The person chose to keep working (the save failed): don't quit, don't relaunch, and
           // keep the config pointing at the file they are still working in.
-          quittingAfterBackup = false;
           relaunchAfterQuit = false;
+          installAfterClose = false;
           configAfterClose = null;
           return;
         }
+        quittingAfterBackup = true;
         if (configAfterClose) {
           saveConfig(configAfterClose);
           configAfterClose = null;
         }
-        if (relaunchAfterQuit) app.relaunch();
+        // "Restart & install now": only now, with the company file saved and released — the
+        // installer force-closes the app (and its server) about a second after it starts.
+        if (installAfterClose && autoUpdater) {
+          // It never throws: with nothing to install it just returns. Quit either way — the
+          // company file is already saved and released, so the window must not stay open on it.
+          try {
+            autoUpdater.quitAndInstall(false, true);
+          } catch {
+            /* nothing staged */
+          }
+          app.quit();
+          return;
+        }
+        if (relaunchAfterQuit) {
+          // A staged update installs on quit and its installer would kill the relaunched app while
+          // it starts (taking the lock, unpacking the working copy): install it on a real quit.
+          if (autoUpdater) autoUpdater.autoInstallOnAppQuit = false;
+          app.relaunch({ args: relaunchArgs() });
+        }
         app.quit();
       });
     return;
   }
-  // Second pass: backup done (or skipped) — stop hosting and shut the server down for real.
+  // Second pass: backup done (or skipped) — stop hosting and shut the servers down for real.
   if (hostingState) hosting.stopHosting(hostingState).catch(() => {});
   if (serverProcess) serverProcess.kill();
+  for (const child of scratchChildren) {
+    try {
+      child.kill();
+    } catch {
+      /* already gone */
+    }
+  }
 });

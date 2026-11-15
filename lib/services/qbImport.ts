@@ -815,7 +815,10 @@ export function parseIifDate(raw: string | undefined): Date | null {
   }
   if (!year || !month || !day || month > 12 || day > 31) return null;
   const d = new Date(Date.UTC(year, month - 1, day));
-  return Number.isNaN(d.getTime()) ? null : d;
+  if (Number.isNaN(d.getTime())) return null;
+  // A day the month doesn't have ("4/31", "2/30") rolled into the next month: refused instead.
+  if (d.getUTCFullYear() !== year || d.getUTCMonth() !== month - 1 || d.getUTCDate() !== day) return null;
+  return d;
 }
 
 /** Zip IIF header row + data row into an object keyed by column names. */
@@ -2796,6 +2799,8 @@ async function importIifTransactions(
  */
 export interface CsvColumnMapping {
   displayName?: string;
+  /** The parent customer of a job ("Customer:Job"), when the file keeps it in its own column. */
+  parent?: string;
   companyName?: string;
   email?: string;
   phone?: string;
@@ -2839,26 +2844,77 @@ function parseCsvRows(content: string): Row[] {
 
 async function importCustomerRows(ctx: ServiceContext, rows: Row[], mapping: CsvColumnMapping): Promise<ImportCounts> {
   const counts = emptyCounts();
-  for (const row of rows) {
-    const displayName = mapping.displayName ? (row[mapping.displayName] ?? '').trim() : '';
+  // "Customer:Job" names (and a Parent column) keep their hierarchy, as the IIF import does: a job
+  // came in as a flat customer literally named "Acme:Kitchen" (and our own export's jobs as
+  // top-level customers). Matched by full name, any case.
+  const existingRows = await ctx.db
+    .select({ id: customersTable.id, displayName: customersTable.displayName, parentId: customersTable.parentId })
+    .from(customersTable)
+    .where(eq(customersTable.companyId, ctx.companyId));
+  const index = customerKeyIndex(existingRows);
+  // A Parent column holds the parent's display name — a job made in Ironbooks can be a leaf name
+  // ("Kitchen" under "Acme"): resolve it to its full "Acme:Kitchen" path (display names are unique).
+  const byId = new Map(existingRows.map((r) => [r.id, r]));
+  const fullPathOf = (id: string): string => {
+    const parts: string[] = [];
+    let cur = byId.get(id);
+    for (let guard = 0; cur && guard < 20; guard++) {
+      parts.unshift(cur.displayName.split(':').pop()!.trim());
+      cur = cur.parentId ? byId.get(cur.parentId) : undefined;
+    }
+    return parts.join(':');
+  };
+  const byName = new Map(existingRows.map((r) => [r.displayName.trim().toLowerCase(), r.id]));
+  const nameOf = (row: Row) => {
+    const raw = mapping.displayName ? (row[mapping.displayName] ?? '').trim() : '';
+    const given = mapping.parent ? (row[mapping.parent] ?? '').trim() : '';
+    const known = given ? byName.get(given.toLowerCase()) : undefined;
+    const parent = known ? fullPathOf(known) : given;
+    const full = parent && raw && !raw.toLowerCase().startsWith(`${parent.toLowerCase()}:`) ? `${parent}:${raw}` : raw;
+    return full.split(':').map((x) => x.trim()).filter(Boolean).join(':');
+  };
+  const sortedRows = [...rows].sort((a, b) => nameOf(a).split(':').length - nameOf(b).split(':').length);
+  for (const row of sortedRows) {
+    const displayName = nameOf(row);
     if (!displayName) {
       counts.skipped++;
       counts.issues.push({ entity: 'customer', name: '(blank)', reason: 'validation', message: 'Row has no display name value.' });
       continue;
     }
-    const existing = await ctx.db
-      .select({ id: customersTable.id })
-      .from(customersTable)
-      .where(and(eq(customersTable.companyId, ctx.companyId), eq(customersTable.displayName, displayName)));
-    if (existing.length) {
+    if (index.has(customerKey(displayName))) {
       counts.skipped++;
       counts.issues.push({ entity: 'customer', name: displayName, reason: 'duplicate', message: `Customer "${displayName}" already exists.` });
+      continue;
+    }
+    const segs = displayName.split(':');
+    let parentId: string | null = null;
+    let parentProblem: string | null = null;
+    for (let i = 1; i < segs.length && !parentProblem; i++) {
+      const pName = segs.slice(0, i).join(':');
+      let pid = index.get(customerKey(pName));
+      if (!pid) {
+        try {
+          const created = await createCustomer(ctx, { displayName: pName, parentId });
+          pid = created.id;
+          index.set(customerKey(pName), pid);
+          counts.customers++;
+        } catch (caught) {
+          const err = importRowError(caught);
+          if (err?.code !== 'VALIDATION') throw caught;
+          parentProblem = `Its parent "${pName}" could not be created: ${err.message}`;
+        }
+      }
+      parentId = pid ?? null;
+    }
+    if (parentProblem) {
+      counts.skipped++;
+      counts.issues.push({ entity: 'customer', name: displayName, reason: 'validation', message: parentProblem });
       continue;
     }
     const part = (key: keyof CsvColumnMapping) => (mapping[key] ? (row[mapping[key]!] ?? '') : '');
     const terms = normalizeTerms(part('terms'));
     try {
-      await createCustomer(ctx, {
+      const made = await createCustomer(ctx, {
         displayName,
         companyName: mapping.companyName ? (row[mapping.companyName] || null) : null,
         email: mapping.email ? (row[mapping.email] || null) : null,
@@ -2874,7 +2930,9 @@ async function importCustomerRows(ctx: ServiceContext, rows: Row[], mapping: Csv
         }),
         notes: mapping.notes ? (row[mapping.notes] || null) : null,
         ...(terms ? { terms } : {}),
+        ...(parentId ? { parentId } : {}),
       });
+      index.set(customerKey(displayName), made.id);
       counts.customers++;
     } catch (caught) {
       const err = importRowError(caught) ?? caught;
@@ -3082,6 +3140,18 @@ async function importAccountRows(ctx: ServiceContext, rows: Row[], mapping: Acco
       else counts.issues.push({ entity: 'account', name: fullName, reason: 'unmatched-account', message: `Parent "${parentRef}" was not found — imported at the top level.` });
     }
     const { type, subtype } = resolveCsvAccountType(col('type', row), col('subtype', row));
+    // Without a number column: already in the chart under this full name (any case)? Matching by
+    // the leaf-derived code duplicated "Office Supplies" / "Checking" of a new company and dropped
+    // "Office:Telephone" as a copy of "Utilities:Telephone".
+    if (!col('code', row)) {
+      const parentRow = parentId ? [...lookup.byPath.values()].find((r) => r.id === parentId) : null;
+      const existing = lookup.byPath.get(normPath(parentRow ? `${parentRow.path}:${name}` : name));
+      if (existing) {
+        counts.skipped++;
+        counts.issues.push({ entity: 'account', name: fullName, code: existing.code, reason: 'duplicate', message: `Account "${fullName}" already exists.` });
+        continue;
+      }
+    }
     const created = await importAccountRow(ctx, counts, {
       name,
       code: col('code', row) || undefined,
@@ -3142,8 +3212,22 @@ export function assertImportSize(content: string | Uint8Array): void {
 }
 
 /** Rows of the first worksheet that has a header row (first row with 2+ non-empty cells). */
-export function xlsxRows(bytes: Uint8Array): { headers: string[]; rows: Row[]; sheet: string } {
-  const sheets = readXlsx(bytes);
+/** Sheet names that hold each list (our own "all lists" workbook names its sheets after them). */
+const SHEET_WORDS: Record<string, RegExp> = {
+  customers: /customer/i,
+  vendors: /vendor/i,
+  items: /item/i,
+  accounts: /account/i,
+};
+
+/**
+ * The first sheet with a header row — the sheet named for `kind` first when there is one: importing
+ * Accounts from a workbook whose first sheet was Customers made an expense account per customer.
+ */
+export function xlsxRows(bytes: Uint8Array, kind?: string): { headers: string[]; rows: Row[]; sheet: string } {
+  const all = readXlsx(bytes);
+  const want = kind ? SHEET_WORDS[kind] : undefined;
+  const sheets = want ? [...all.filter((s) => want.test(s.name)), ...all.filter((s) => !want.test(s.name))] : all;
   for (const s of sheets) {
     const hi = s.rows.findIndex((r) => r.cells.filter((c) => c.trim()).length >= 2);
     if (hi < 0) continue;
@@ -3172,7 +3256,7 @@ export async function importListXlsx(
   assertImportSize(bytes);
   let rows: Row[];
   try {
-    rows = xlsxRows(bytes).rows;
+    rows = xlsxRows(bytes, kind).rows;
   } catch (err) {
     if (err instanceof ServiceError) throw err;
     throw new ServiceError('VALIDATION', 'This file could not be read as an Excel workbook (.xlsx).');

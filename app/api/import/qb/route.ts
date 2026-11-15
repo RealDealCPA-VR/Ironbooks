@@ -69,7 +69,7 @@ export async function POST(req: NextRequest) {
       }
       const bytes = decodeBase64(body.data);
       if (body.preview) {
-        const { headers, rows, sheet } = xlsxRows(bytes);
+        const { headers, rows, sheet } = xlsxRows(bytes, typeof kind === "string" ? kind : undefined);
         return NextResponse.json({ headers, rows: rows.slice(0, 10), total: rows.length, sheet });
       }
       if (!LIST_KINDS.includes(kind as ListImportKind)) {
