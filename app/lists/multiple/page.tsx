@@ -111,6 +111,19 @@ export default function AddEditMultiplePage() {
       const hasContent = Object.entries(data).some(([k, v]) => k !== 'id' && (v ?? '').trim() !== '');
       if (!hasContent) return;
       if (mode === 'edit' && data.id && original[data.id] === JSON.stringify(rowWithoutKey(r, columns))) return; // unchanged
+      // Editing: only the cells changed here (and the id) — the whole row as loaded wrote back
+      // values another user had changed since (terms, credit limit, prices).
+      if (mode === 'edit' && data.id && original[data.id]) {
+        let before: Record<string, string> = {};
+        try {
+          before = JSON.parse(original[data.id]) as Record<string, string>;
+        } catch {
+          /* fall back to the whole row */
+        }
+        const changed = Object.fromEntries(Object.entries(data).filter(([k, v]) => k === 'id' || (before[k] ?? '') !== (v ?? '')));
+        out.push({ index, data: changed as Record<string, string> });
+        return;
+      }
       out.push({ index, data });
     });
     return out;

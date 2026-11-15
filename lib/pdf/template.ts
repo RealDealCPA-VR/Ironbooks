@@ -92,7 +92,8 @@ export function pdfSafe(text: string): string {
 export function formatMoney(value: string | number | null | undefined, currency = 'USD'): string {
   const n = typeof value === 'string' ? parseFloat(value) : (value ?? 0);
   try {
-    return new Intl.NumberFormat('en-US', { style: 'currency', currency }).format(Number.isFinite(n) ? n : 0);
+    // narrowSymbol: "$" for CAD / AUD (not "CA$"), "€", "£".
+    return new Intl.NumberFormat('en-US', { style: 'currency', currency, currencyDisplay: 'narrowSymbol' }).format(Number.isFinite(n) ? n : 0);
   } catch {
     return (Number.isFinite(n) ? n : 0).toFixed(2);
   }

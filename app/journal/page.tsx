@@ -207,6 +207,8 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
   const [date, setDate] = useState(todayISO());
   const [description, setDescription] = useState('');
   const [reference, setReference] = useState('');
+  /** The Entry No. the server suggested (sent only if the user changed it). */
+  const [suggestedRef, setSuggestedRef] = useState('');
   const [isAdjusting, setIsAdjusting] = useState(false);
   const [lines, setLines] = useState<LineRow[]>(() => [
     emptyLine(++lineCounter),
@@ -228,6 +230,7 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
       setDate(editEntry.date.slice(0, 10));
       setDescription(editEntry.description);
       setReference(editEntry.reference ?? '');
+      setSuggestedRef('');
       setIsAdjusting(!!editEntry.isAdjusting);
       setLines(
         editEntry.lines.map((l) => ({
@@ -244,6 +247,7 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
       setDate(todayISO());
       setDescription('');
       setReference('');
+      setSuggestedRef('');
       // Preferences > Accounting 'Automatically number journal entries': next Entry No. — the
       // server's, from journal entries only (the newest entries of every kind carry invoice,
       // bill and check numbers, which the journal's numbering never follows).
@@ -251,7 +255,10 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
         api
           .get<{ nextNumber?: string }>('/api/journal-entries?nextNumber=1&limit=1')
           .then((d) => {
-            if (d.nextNumber) setReference((r) => r || d.nextNumber!);
+            if (d.nextNumber) {
+              setSuggestedRef(d.nextNumber);
+              setReference((r) => r || d.nextNumber!);
+            }
           })
           .catch(() => {});
       }
@@ -385,7 +392,9 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
     const payload: JournalPayload = {
       date,
       description: description.trim(),
-      reference: reference.trim() || null,
+      // The suggested Entry No. left as it was is not sent: the server numbers it as it saves, so
+      // two people entering journal entries at once never both get "1005".
+      reference: reference.trim() && reference.trim() !== suggestedRef ? reference.trim() : null,
       isAdjusting,
       // Exactly what the Save gate validated ("1,250.00 " -> "1250.00"), names included.
       lines: journalPayloadLines(lines),

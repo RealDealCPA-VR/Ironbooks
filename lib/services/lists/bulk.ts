@@ -9,7 +9,7 @@
  * if any row fails — or `dryRun` is set — the whole batch is rolled back and nothing is saved.
  */
 import { and, eq } from 'drizzle-orm';
-import { accounts, items, salesTaxCodes, vendors } from '@/lib/db/schema';
+import { accounts, customers, items, salesTaxCodes, vendors } from '@/lib/db/schema';
 import { BULK_COLUMNS, type BulkList, ITEM_TYPES_FOR_BULK, parseAmount, parseBool, parseDateCell } from '@/lib/lists/bulk';
 import { type ServiceContext, ServiceError, inTransaction, validation } from '../_base';
 import { createCustomer, updateCustomer } from '../customers';
@@ -138,6 +138,24 @@ async function termsRef(ctx: ServiceContext, row: RawRow, editing: boolean): Pro
   return t.id;
 }
 
+/**
+ * An address edited in the grid: only its parts in the grid (street 1, city, state, zip) change —
+ * replacing the whole address dropped the second street line and the country of every row edited.
+ */
+function mergeAddress(
+  existing: Record<string, unknown> | null | undefined,
+  touched: Array<[string, string | null]>,
+): Record<string, string> | null {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(existing ?? {})) if (typeof v === 'string' && v) out[k] = v;
+  for (const [k, v] of touched) {
+    if (v) out[k] = v;
+    else delete out[k];
+    if (k === 'line1') delete out.street; // the old key for street 1
+  }
+  return Object.keys(out).length ? out : null;
+}
+
 async function saveCustomer(ctx: ServiceContext, row: RawRow, lk: Lookups): Promise<{ id: string; created: boolean }> {
   const id = str(row.id) || null;
   const editing = !!id;
@@ -165,6 +183,13 @@ async function saveCustomer(ctx: ServiceContext, row: RawRow, lk: Lookups): Prom
     notes: optText(row, 'notes', editing),
   };
   if (editing) {
+    if (addressTouched) {
+      const [cur] = await ctx.db.select({ a: customers.billingAddress }).from(customers).where(and(eq(customers.id, id!), eq(customers.companyId, ctx.companyId)));
+      const touched = ([['billLine1', 'line1'], ['billCity', 'city'], ['billState', 'state'], ['billZip', 'zip']] as const)
+        .filter(([k]) => has(row, k))
+        .map(([k, a]) => [a, str(row[k]) || null] as [string, string | null]);
+      input.billingAddress = mergeAddress(cur?.a as Record<string, unknown> | null, touched) as typeof input.billingAddress;
+    }
     const patch = Object.fromEntries(Object.entries(input).filter(([, v]) => v !== undefined));
     const r = await updateCustomer(ctx, id!, patch);
     return { id: r.id, created: false };
@@ -199,6 +224,11 @@ async function saveVendor(ctx: ServiceContext, row: RawRow): Promise<{ id: strin
     notes: optText(row, 'notes', editing),
   };
   if (editing) {
+    if (addressTouched) {
+      const [cur] = await ctx.db.select({ a: vendors.address }).from(vendors).where(and(eq(vendors.id, id!), eq(vendors.companyId, ctx.companyId)));
+      const touched = (['line1', 'city', 'state', 'zip'] as const).filter((k) => has(row, k)).map((k) => [k, str(row[k]) || null] as [string, string | null]);
+      input.address = mergeAddress(cur?.a as Record<string, unknown> | null, touched) as typeof input.address;
+    }
     const patch = Object.fromEntries(Object.entries(input).filter(([, v]) => v !== undefined));
     if (patch.displayName === '') throw new FieldError('displayName', 'Vendor name is required.');
     const r = await updateVendor(ctx, id!, patch);

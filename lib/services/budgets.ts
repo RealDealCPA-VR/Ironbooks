@@ -7,7 +7,7 @@
  *  - budgetVsActual calls profitAndLoss for the budget's fiscal year and matches income/expense
  *    accounts by accountId, returning [{accountId, code, name, budget, actual, variance}].
  */
-import { and, eq, isNotNull, isNull } from 'drizzle-orm';
+import { and, eq, isNotNull, isNull, inArray } from 'drizzle-orm';
 import { accounts, budgetLines, budgets, classes, customers } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { profitAndLoss } from '@/lib/services/reports';
@@ -202,6 +202,33 @@ export async function getBudget(ctx: ServiceContext, id: string): Promise<Budget
 // setBudgetLine (upsert)
 // ---------------------------------------------------------------------------
 
+/**
+ * One line per (budget, account, month, class, customer): after a merge re-pointed the merged
+ * record's lines, a cell could hold two (the grid showed one, reports summed both, an edit
+ * changed only one). Colliding lines are summed into one.
+ */
+export async function consolidateBudgetLines(ctx: ServiceContext): Promise<number> {
+  const rows = await ctx.db
+    .select({ id: budgetLines.id, budgetId: budgetLines.budgetId, accountId: budgetLines.accountId, month: budgetLines.month, classId: budgetLines.classId, customerId: budgetLines.customerId, amount: budgetLines.amount })
+    .from(budgetLines)
+    .innerJoin(budgets, eq(budgets.id, budgetLines.budgetId))
+    .where(eq(budgets.companyId, ctx.companyId));
+  const groups = new Map<string, typeof rows>();
+  for (const r of rows) {
+    const k = [r.budgetId, r.accountId, r.month, r.classId ?? '', r.customerId ?? ''].join('|');
+    groups.set(k, [...(groups.get(k) ?? []), r]);
+  }
+  let merged = 0;
+  for (const g of groups.values()) {
+    if (g.length < 2) continue;
+    const total = g.reduce((sum, r) => sum.plus(Money.of(r.amount)), Money.zero());
+    await ctx.db.update(budgetLines).set({ amount: toAmountString(total) }).where(eq(budgetLines.id, g[0].id));
+    await ctx.db.delete(budgetLines).where(inArray(budgetLines.id, g.slice(1).map((r) => r.id)));
+    merged += g.length - 1;
+  }
+  return merged;
+}
+
 export async function setBudgetLine(
   ctx: ServiceContext,
   input: {
@@ -251,6 +278,8 @@ async function setBudgetLineInTx(
   if ((budget.kind ?? 'profit_loss') === 'balance_sheet') {
     if (isPl) throw validation('A balance sheet budget can only hold balance sheet accounts.');
     if (customerId) throw validation('Balance sheet budgets cannot be split by customer.');
+    // Their actuals are company balances (never by class): a class line compared with them.
+    if (input.classId) throw validation('Balance sheet budgets cannot be split by class.');
   } else if (!isPl) {
     throw validation('Budget lines can only be set for revenue or expense accounts.');
   }
@@ -773,6 +802,9 @@ export async function budgetVsActualReport(ctx: ServiceContext, p: ReportParams)
       sections: [...PL_SECTIONS],
       excludeClose: true,
       classId: p.classId,
+      // Narrowed to the job in SQL (as Fill from Actuals does): every P&L line of the year was
+      // read, and a big company hit the line cap for every customer.
+      jobCustomerId: p.customerId,
       limit: 50000,
     });
     truncated = cut;
@@ -804,7 +836,8 @@ export async function budgetVsActualReport(ctx: ServiceContext, p: ReportParams)
       const act = v[i * 2];
       const bud = v[i * 2 + 1];
       out[`${per.key}_over`] = toAmountString(act.minus(bud));
-      out[`${per.key}_pct`] = bud.isZero() ? null : act.dividedBy(bud.abs()).times(100).toFixed(2);
+      // Actual / budget as QB shows it (a -10,000 budgeted loss with -5,000 actual is 50%, not -50%).
+      out[`${per.key}_pct`] = bud.isZero() ? null : act.dividedBy(bud).times(100).toFixed(2);
     });
     return out;
   };

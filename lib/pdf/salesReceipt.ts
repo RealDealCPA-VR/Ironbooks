@@ -9,6 +9,8 @@ import { renderFormPdf } from './template';
 import type { PdfTemplate } from './invoice';
 
 export interface SalesReceiptPdfData {
+  /** ISO currency of the amounts (default USD). */
+  currency?: string | null;
   company: { name: string; addressLines?: string[]; phone?: string | null; email?: string | null };
   customerName: string;
   /** Customer address lines under the name (template layout only). */
@@ -48,6 +50,7 @@ export async function renderSalesReceiptPdf(data: SalesReceiptPdfData, template?
       {
         formType: 'sales_receipt',
         company: data.company,
+        currency: data.currency ?? undefined,
         fields: { number: r.number, date: r.date, method, reference: r.reference ?? null },
         parties: { billTo: [data.customerName, ...(data.billToLines ?? [])] },
         lines: data.lines.map((l) => ({ ...l, description: l.description || '—' })),
@@ -65,6 +68,7 @@ export async function renderSalesReceiptPdf(data: SalesReceiptPdfData, template?
   }
   return renderSalesFormPdf({
     company: data.company,
+    currency: data.currency ?? null,
     title: 'SALES RECEIPT',
     number: data.receipt.number,
     date: data.receipt.date,

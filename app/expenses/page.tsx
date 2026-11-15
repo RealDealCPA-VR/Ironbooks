@@ -301,6 +301,8 @@ function ExpensesPageContent() {
   /** The payee the form currently shows (guards late recall responses). */
   const payeeRef = useRef('');
   const [reference, setReference] = useState('');
+  /** The check number suggested here (left as it was, the server assigns the next free one). */
+  const [suggestedCheckNo, setSuggestedCheckNo] = useState('');
   const [toPrint, setToPrint] = useState(false);
   const [memo, setMemo] = useState('');
   const [lines, setLines] = useState<LineRow[]>([emptyLine()]);
@@ -410,7 +412,10 @@ function ExpensesPageContent() {
     let cancelled = false;
     if (entryType !== 'check' || toPrint || !paymentAccountId || editingId) return;
     void nextCheckNumber(paymentAccountId).then((next) => {
-      if (!cancelled && next) setReference(next); // null: non-fatal — the user can type a number
+      if (!cancelled && next) {
+        setSuggestedCheckNo(next);
+        setReference(next); // null: non-fatal — the user can type a number
+      }
     });
     return () => {
       cancelled = true;
@@ -766,7 +771,11 @@ function ExpensesPageContent() {
         reference:
           entryType === 'check' && toPrint
             ? undefined
-            : reference.trim() || undefined,
+            : // An untouched suggested check number: the server numbers the check as it saves, so
+              // two people writing checks from one account at once never both get "1005".
+              entryType === 'check' && !editingId && reference.trim() === suggestedCheckNo
+              ? undefined
+              : reference.trim() || undefined,
         toPrint: entryType === 'check' ? toPrint : false,
         paymentAccountId,
         memo: memo.trim() || undefined,

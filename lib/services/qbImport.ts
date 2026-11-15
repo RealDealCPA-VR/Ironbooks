@@ -1374,6 +1374,14 @@ const budgetImporter: ListImporter = async ({ ctx, counts, lookup }, rows) => {
   const existing = await listBudgets(ctx);
   const budgetIds = new Map(existing.map((b) => [`${b.name}|${b.fiscalYear}`, b.id]));
   const fye = await companyFiscalYearEnd(ctx);
+  // A budget by class / Customer:Job keeps that dimension (it was only in the budget's NAME, so
+  // each class's budget was compared with the whole company's actuals).
+  const classByName = new Map(
+    (await ctx.db.select({ id: classesTable.id, name: classesTable.name }).from(classesTable).where(eq(classesTable.companyId, ctx.companyId))).map((c) => [c.name.trim().toLowerCase(), c.id]),
+  );
+  const customerIndex = customerKeyIndex(
+    await ctx.db.select({ id: customersTable.id, displayName: customersTable.displayName, parentId: customersTable.parentId }).from(customersTable).where(eq(customersTable.companyId, ctx.companyId)),
+  );
   let n = 0;
   for (const r of rows) {
     const start = parseIifDate(r.STARTDATE);
@@ -1389,7 +1397,11 @@ const budgetImporter: ListImporter = async ({ ctx, counts, lookup }, rows) => {
       continue;
     }
     const suffix = [opt(r.CLASS), opt(r.CUSTOMER)].filter(Boolean).join(' / ');
-    const name = suffix ? `QuickBooks budget — ${suffix}` : 'QuickBooks budget';
+    const classId = opt(r.CLASS) ? classByName.get(String(opt(r.CLASS)).trim().toLowerCase()) ?? null : null;
+    const customerId = opt(r.CUSTOMER) ? customerIndex.get(customerKey(String(opt(r.CUSTOMER)))) ?? null : null;
+    // Balance-sheet accounts go to a balance-sheet budget (a P&L budget refused every such row).
+    const balanceSheet = acct.type !== 'revenue' && acct.type !== 'expense';
+    const name = `${suffix ? `QuickBooks budget — ${suffix}` : 'QuickBooks budget'}${balanceSheet ? ' (balance sheet)' : ''}`;
     try {
       const period = (r.PERIOD ?? 'MONTH').toUpperCase();
       const months = period.startsWith('Q') ? 3 : period.startsWith('Y') ? 12 : 1;
@@ -1404,11 +1416,18 @@ const budgetImporter: ListImporter = async ({ ctx, counts, lookup }, rows) => {
         const key = `${name}|${fiscalYear}`;
         let budgetId = budgetIds.get(key);
         if (!budgetId) {
-          const b = await createBudget(ctx, { name, fiscalYear });
+          const b = await createBudget(ctx, { name, fiscalYear, ...(balanceSheet ? { kind: 'balance_sheet' as const } : {}) });
           budgetId = b.id;
           budgetIds.set(key, budgetId);
         }
-        await setBudgetLine(ctx, { budgetId, accountId: acct.id, month: mid.getUTCMonth() + 1, amount: toAmountString(parts[i]) });
+        await setBudgetLine(ctx, {
+          budgetId,
+          accountId: acct.id,
+          month: mid.getUTCMonth() + 1,
+          amount: toAmountString(parts[i]),
+          // Balance-sheet budgets are company-wide (budgets.ts).
+          ...(balanceSheet ? {} : { classId, customerId }),
+        });
       }
       n++;
     } catch (caught) {

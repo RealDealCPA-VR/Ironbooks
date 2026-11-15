@@ -501,7 +501,8 @@ export async function runTrackerAction(
   if (action === 'email') {
     const forms = items.filter((i) => FORM_OF[i.type]).map((i) => ({ kind: FORM_OF[i.type]!, id: i.id }));
     for (const i of items) if (!FORM_OF[i.type]) result.failed.push({ ...i, error: 'This kind of row cannot be emailed.' });
-    const r = await sendQueuedEmails(ctx, forms);
+    // Picked here, not from the Send Forms queue: no "waiting to be emailed" claim.
+    const r = await sendQueuedEmails(ctx, forms, { queued: false });
     for (const s of r.sent) result.done.push({ type: s.kind, id: s.id, detail: `Emailed to ${s.to}` });
     for (const f of r.failed) result.failed.push({ type: f.kind, id: f.id, error: f.error });
     return result;

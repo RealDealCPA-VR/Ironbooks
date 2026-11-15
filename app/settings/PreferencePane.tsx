@@ -277,7 +277,11 @@ export default function PreferencePane({
     setSaving(true);
     try {
       if (scope === 'company') {
-        await api.patch('/api/company', { settings: draft });
+        // Only what was changed on this tab: the whole tab as loaded (maybe hours ago) wrote back
+        // another admin's newer choice on a key this user never touched.
+        const loaded = prefs.company as unknown as Draft;
+        const changed = Object.fromEntries(Object.entries(draft).filter(([k, v]) => JSON.stringify(v) !== JSON.stringify(loaded[k])));
+        if (Object.keys(changed).length) await api.patch('/api/company', { settings: changed });
       } else {
         await api.patch('/api/preferences/my', myDraft);
         // Desktop shell: apply the spelling preference right away.

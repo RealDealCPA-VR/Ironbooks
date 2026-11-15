@@ -8,6 +8,8 @@ import { renderFormPdf } from './template';
 import type { PdfTemplate } from './invoice';
 
 export interface CreditMemoPdfData {
+  /** ISO currency of the amounts (default USD). */
+  currency?: string | null;
   company: { name: string; addressLines?: string[]; phone?: string | null; email?: string | null };
   customerName: string;
   /** Customer address lines under the name (template layout only). */
@@ -39,6 +41,7 @@ export async function renderCreditMemoPdf(data: CreditMemoPdfData, template?: Pd
       {
         formType: 'credit_memo',
         company: data.company,
+        currency: data.currency ?? undefined,
         fields: { number: m.number, date: m.date },
         parties: { billTo: [data.customerName, ...(data.billToLines ?? [])] },
         lines: data.lines.map((l) => ({ ...l, description: l.description || '—' })),
@@ -65,6 +68,7 @@ export async function renderCreditMemoPdf(data: CreditMemoPdfData, template?: Pd
   totals.push(['Remaining credit', data.memo.remaining]);
   return renderSalesFormPdf({
     company: data.company,
+    currency: data.currency ?? null,
     title: refunded ? 'CREDIT MEMO / REFUND' : 'CREDIT MEMO',
     number: data.memo.number,
     date: data.memo.date,

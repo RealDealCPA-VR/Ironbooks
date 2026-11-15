@@ -9,6 +9,8 @@ import { renderFormPdf } from './template';
 import { shipToObjectLines, type PdfTemplate } from './invoice';
 
 export interface SalesOrderPdfData {
+  /** ISO currency of the amounts (default USD). */
+  currency?: string | null;
   company: { name: string; addressLines?: string[]; phone?: string | null; email?: string | null };
   customerName: string;
   /** Customer address lines under the name (template layout only). */
@@ -36,6 +38,7 @@ export async function renderSalesOrderPdf(data: SalesOrderPdfData, template?: Pd
       {
         formType: 'sales_order',
         company: data.company,
+        currency: data.currency ?? undefined,
         fields: { number: o.number, date: o.date, poNumber: ship?.poNumber ?? null, shipVia: ship?.shipVia ?? null },
         parties: {
           billTo: [data.customerName, ...(data.billToLines ?? [])],
@@ -52,6 +55,7 @@ export async function renderSalesOrderPdf(data: SalesOrderPdfData, template?: Pd
   }
   return renderSalesFormPdf({
     company: data.company,
+    currency: data.currency ?? null,
     title: 'SALES ORDER',
     number: data.order.number,
     date: data.order.date,

@@ -224,6 +224,17 @@ async function createManualEntryInner(
     throw validation('A valid date is required.');
   }
   await assertJournalNames(ctx, input.lines);
+  // The automatic Entry No. is taken inside the posting transaction under a per-company lock
+  // (as document numbers are, docNumbers.ts): two entries saved at once got the same number.
+  return inTransaction(ctx, async (tx) => {
+    if (!input.reference?.trim()) {
+      await tx.db.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`jenum:${tx.companyId}`}))`);
+    }
+    return postJournalEntryNumbered(tx, input);
+  });
+}
+
+async function postJournalEntryNumbered(ctx: ServiceContext, input: ManualEntryInput) {
   return postJournalEntry(ctx, {
     date: input.date,
     description: input.description.trim(),

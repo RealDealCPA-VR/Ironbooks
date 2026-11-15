@@ -1319,7 +1319,10 @@ export async function cashFlowForecast(ctx: ServiceContext, p: ReportParams): Pr
   const periods = forecastPeriods(from, to, p.period === 'month' ? 'month' : 'week');
   if (periods.length > 104) throw validation('Too many periods — choose a shorter date range or display by month.');
   const asOf = parseDay(todayStr, true)!;
-  const [ar, ap, meta] = await Promise.all([arAgingDetail(ctx, asOf), apAgingDetail(ctx, asOf), loadAccountMeta(ctx)]);
+  // Open documents as of the END of the window: a payment entered ahead (a check dated next
+  // Tuesday for Friday's bill) is in the bank column — counted as open A/P too, it went out twice.
+  const openAt = to > asOf ? to : asOf;
+  const [ar, ap, meta] = await Promise.all([arAgingDetail(ctx, openAt), apAgingDetail(ctx, openAt), loadAccountMeta(ctx)]);
   const bankIds = [...meta.values()].filter((a) => a.section === 'bank').map((a) => a.id);
   const dayBefore = new Date(from.getTime() - 1);
   // Bank balance at the start.
@@ -1330,10 +1333,13 @@ export async function cashFlowForecast(ctx: ServiceContext, p: ReportParams): Pr
   // counted here once and never again under A/R or A/P.
   const bankAct = bankIds.length ? await activityByAccount(ctx, { from, to, accountIds: bankIds }, 'day') : [];
 
+  // -1 = overdue at the start; a period index; -2 = due after the window (not in this forecast —
+  // it was counted as overdue cash at the start, findIndex also returning -1).
   const dueIndex = (due: string | null, date: string): number => {
     const d = parseDay((due ?? date).slice(0, 10))!;
     if (d < from) return -1;
-    return periods.findIndex((x) => d >= x.from && d <= x.to);
+    const i = periods.findIndex((x) => d >= x.from && d <= x.to);
+    return i >= 0 ? i : -2;
   };
   const arBy = periods.map(() => Money.zero());
   const apBy = periods.map(() => Money.zero());

@@ -15,6 +15,7 @@
  * sub-ledger documents is updated. The GL and trial balance remain balanced.
  */
 import { isSystemAccount } from './accountRoles';
+import { repointLooseReferences } from './lists/looseReferences';
 import { and, eq, inArray, like, sql } from 'drizzle-orm';
 import {
   billingGroupMembers,
@@ -319,6 +320,10 @@ export async function mergeCustomers(
         .where(eq(customers.id, toId));
     }
     const sweptCustomer = await repointForeignKeys(tx, 'customers', fromId, toId);
+    // Ids in JSON and columns without a foreign key (lists/looseReferences.ts).
+    await repointLooseReferences(tx, fromId, toId);
+    // Both had a budget amount for the same cell: one line, summed (budgets.ts).
+    await (await import('./budgets')).consolidateBudgetLines(tx);
     const movedCustomerNotes = await moveNotesAndTodos(tx, 'customer', fromId, toId);
 
     // Deactivate the from-customer.
@@ -443,6 +448,8 @@ export async function mergeVendors(
     // Wave-2 lists: sweep every remaining foreign key to the vendor (items' preferred vendor,
     // item receipts, tables added by other modules, ...) and carry notes / to-dos over.
     const sweptVendor = await repointForeignKeys(tx, 'vendors', fromId, toId);
+    // Ids in JSON and columns without a foreign key (lists/looseReferences.ts).
+    await repointLooseReferences(tx, fromId, toId);
     const movedVendorNotes = await moveNotesAndTodos(tx, 'vendor', fromId, toId);
 
     // Deactivate the from-vendor.
@@ -653,11 +660,26 @@ export async function mergeAccounts(
 
     // --- Sub-account hierarchy: if the survivor was a child of the source, hoist it
     // to the source's parent FIRST so re-pointing children cannot self-parent it. ---
-    if (toRow.parentId === fromId) {
-      await tx.db
-        .update(accounts)
-        .set({ parentId: fromRow.parentId ?? null, updatedAt: new Date() })
-        .where(eq(accounts.id, toId));
+    // Anywhere below it (a grandchild: A > X > B merged into B made X and B each other's parent,
+    // and both — with all of the merged ledger — dropped out of the report trees).
+    {
+      const chart = await tx.db.select({ id: accounts.id, parentId: accounts.parentId }).from(accounts).where(eq(accounts.companyId, tx.companyId));
+      const parentOf = new Map(chart.map((a) => [a.id, a.parentId]));
+      let cur = parentOf.get(toId) ?? null;
+      let below = false;
+      for (let guard = 0; cur && guard < 100; guard++) {
+        if (cur === fromId) {
+          below = true;
+          break;
+        }
+        cur = parentOf.get(cur) ?? null;
+      }
+      if (below) {
+        await tx.db
+          .update(accounts)
+          .set({ parentId: fromRow.parentId ?? null, updatedAt: new Date() })
+          .where(eq(accounts.id, toId));
+      }
     }
     await count(
       'childAccounts',
@@ -981,6 +1003,10 @@ export async function mergeAccounts(
     // check documents, landed cost, AI auto-apply log, working TB notes, and any table added
     // later) follows the survivor. The hierarchy was handled above.
     const swept = await repointForeignKeys(tx, 'accounts', fromId, toId, { skip: ['accounts.parent_id'] });
+    // Ids in JSON and columns without a foreign key (lists/looseReferences.ts).
+    await repointLooseReferences(tx, fromId, toId);
+    // Both had a budget amount for the same cell: one line, summed (budgets.ts).
+    await (await import('./budgets')).consolidateBudgetLines(tx);
     for (const [k, n] of Object.entries(swept)) reassigned[`fk:${k}`] = n;
 
     // --- Cached balances: the DB trigger already moved the balance along with the

@@ -14,7 +14,7 @@
  *  - journal entries by entry number or description
  *  - exact amounts ("123.45", "$1,234.50") against invoice/bill/expense totals
  */
-import { and, eq, ilike, or, sql } from 'drizzle-orm';
+import { and, eq, ilike, or, sql, isNull } from 'drizzle-orm';
 import type { DB } from '@/lib/db';
 import {
   accounts,
@@ -90,7 +90,8 @@ function docNumberSearch(
 
 /** Run all type queries in parallel. Every query is scoped to companyId. */
 export async function runGlobalSearch(db: DB, companyId: string, q: string): Promise<SearchHits> {
-  const like = `%${q}%`;
+  // LIKE wildcards typed by the user are literal ("%%" matched every record), as Advanced Find.
+  const like = `%${q.replace(/[\\%_]/g, (c) => '\\' + c)}%`;
   const amount = parseAmountQuery(q);
   const none = Promise.resolve([]);
 
@@ -191,6 +192,8 @@ export async function runGlobalSearch(db: DB, companyId: string, q: string): Pro
       .where(
         and(
           eq(journalEntries.companyId, companyId),
+          // Batch-deleted entries are gone from the books (the journal list hides them too).
+          isNull(journalEntries.deletedAt),
           or(
             sql`CAST(${journalEntries.entryNumber} AS TEXT) ILIKE ${like}`,
             ilike(journalEntries.description, like),

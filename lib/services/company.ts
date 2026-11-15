@@ -4,6 +4,7 @@
  * active database; multi-file management is layered on in the Electron shell.
  */
 import { and, eq, sql } from 'drizzle-orm';
+import { requireRole } from './rbac';
 import { accounts, aiSettings, companies, currencies, users, userCompanies } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
 import { inTransaction, notFound, validation, writeAudit } from './_base';
@@ -325,6 +326,13 @@ export async function updateCompany(ctx: ServiceContext, input: UpdateCompanyInp
   const updated = await inTransaction(ctx, async (tx) => {
     const existing = await getCompany(tx);
     if (!existing) throw notFound('company');
+    // Integrated Applications (who may reach the company file from outside: the employee portal,
+    // phone receipt links) is an owner / admin decision, like the network policy and AI settings —
+    // a role with Company: modify (an External Accountant) turned the portal back on.
+    const current = (existing.settings ?? {}) as Record<string, unknown>;
+    if (['integratedAppsBlocked', 'allowEmployeePortal', 'allowPhoneReceipts'].some((k) => k in settingsPatch && settingsPatch[k] !== current[k])) {
+      await requireRole(tx, 'admin');
+    }
     // Account-valued preferences must name the right kind of account (a paycheck account that is
     // A/R or a wages account that is A/P would break the subledger == control-account rule).
     await assertPreferenceAccounts(tx, settingsPatch);

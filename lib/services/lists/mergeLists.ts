@@ -14,6 +14,7 @@
  *  - employees: refused when both have paychecks (it would merge two people's W-2 wages).
  */
 import { systemAccountIdOrNull } from '../accountRoles';
+import { repointLooseReferences } from './looseReferences';
 import { and, eq, inArray, sql } from 'drizzle-orm';
 import Decimal from 'decimal.js';
 import {
@@ -236,6 +237,8 @@ async function mergeItemsInTx(ctx: ServiceContext, fromId: string, toId: string)
     }
 
     Object.assign(reassigned, await repointForeignKeys(tx, 'items', fromId, toId));
+    // Ids in JSON and columns without a foreign key (lists/looseReferences.ts).
+    await repointLooseReferences(tx, fromId, toId);
     if (await bomHasCycle(tx, toId)) {
       throw validation(
         `Merging "${from.name}" into "${to.name}" would make "${to.name}" a component of its own assembly. Change the bills of materials first.`,
@@ -379,6 +382,10 @@ export async function mergeClasses(ctx: ServiceContext, { fromId, toId }: { from
       cur = parentOf.get(cur);
     }
     const reassigned = await repointForeignKeys(tx, 'classes', fromId, toId);
+    // Ids in JSON and columns without a foreign key (lists/looseReferences.ts).
+    await repointLooseReferences(tx, fromId, toId);
+    // Both had a budget amount for the same cell: one line, summed (budgets.ts).
+    await (await import('./../budgets')).consolidateBudgetLines(tx);
     reassigned.recurringTemplates = await rewriteTemplates(tx, fromId, toId);
     await tx.db.update(classes).set({ isActive: false }).where(eq(classes.id, fromId));
     await writeAudit(tx, {
@@ -416,6 +423,17 @@ export async function mergeEmployees(ctx: ServiceContext, { fromId, toId }: { fr
   }
   return inTransaction(ctx, async (tx) => {
     const reassigned = await repointForeignKeys(tx, 'employees', fromId, toId);
+    // Ids in JSON and columns without a foreign key (lists/looseReferences.ts).
+    await repointLooseReferences(tx, fromId, toId);
+    // Journal entry lines naming the employee follow it (as customer / vendor merges do).
+    await allowLedgerRewrite(tx, 'merge');
+    reassigned.journalLines = (
+      await tx.db
+        .update(journalEntryLines)
+        .set({ entityId: toId })
+        .where(and(eq(journalEntryLines.entityType, 'employee'), eq(journalEntryLines.entityId, fromId)))
+        .returning({ id: journalEntryLines.id })
+    ).length;
     reassigned.recurringTemplates = await rewriteTemplates(tx, fromId, toId);
     const moved = await moveNotesAndTodos(tx, 'employee', fromId, toId);
     reassigned.notes = moved.notes;
@@ -455,6 +473,8 @@ export async function mergeOtherNames(ctx: ServiceContext, { fromId, toId }: { f
   return inTransaction(ctx, async (tx) => {
     // Re-points expenses.other_name_id (B3, drizzle/0055) and every other foreign key.
     const reassigned = await repointForeignKeys(tx, 'other_names', fromId, toId);
+    // Ids in JSON and columns without a foreign key (lists/looseReferences.ts).
+    await repointLooseReferences(tx, fromId, toId);
     // Checks / expenses written to an other name also carry the payee as text: rename those
     // linked to the merged entry, and legacy free-text checks typed with its name.
     const renamed = await tx.db

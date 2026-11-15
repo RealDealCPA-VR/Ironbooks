@@ -29,6 +29,8 @@ export interface SalesFormPdfLine {
 
 export interface SalesFormPdfData {
   company: { name: string };
+  /** ISO currency of the amounts (default USD). */
+  currency?: string | null;
   /** Upper-case form title, e.g. 'SALES RECEIPT'. */
   title: string;
   number: string | number;
@@ -58,9 +60,14 @@ const COLOR_LIGHT = rgb(0.9, 0.92, 0.95);
 const COLOR_BLACK = rgb(0, 0, 0);
 const COLOR_GRAY = rgb(0.45, 0.45, 0.5);
 
-export function fmtMoney(value: string | number): string {
+export function fmtMoney(value: string | number, currency: string = 'USD'): string {
   const n = typeof value === 'string' ? parseFloat(value) : value;
-  return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(isNaN(n) ? 0 : n);
+  try {
+    // narrowSymbol: "$" for CAD / AUD (not "CA$"), "€", "£".
+    return new Intl.NumberFormat('en-US', { style: 'currency', currency, currencyDisplay: 'narrowSymbol' }).format(isNaN(n) ? 0 : n);
+  } catch {
+    return (isNaN(n) ? 0 : n).toFixed(2);
+  }
 }
 
 function fmtQty(value: string | number): string {
@@ -157,6 +164,7 @@ export function drawShippingBand(
 }
 
 export async function renderSalesFormPdf(data: SalesFormPdfData): Promise<Uint8Array> {
+  const cur = data.currency || 'USD';
   const pdfDoc = await PDFDocument.create();
   const regular = await pdfDoc.embedFont(StandardFonts.Helvetica);
   const bold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
@@ -216,8 +224,8 @@ export async function renderSalesFormPdf(data: SalesFormPdfData): Promise<Uint8A
     }
     page.drawText(trunc(safeText(line.description), 58), { x: MARGIN_L, y: cursor, font: regular, size: 10, color: COLOR_BLACK });
     right(fmtQty(line.quantity), cursor, regular, 10, COLOR_BLACK, COL_QTY + 12);
-    right(fmtMoney(line.rate), cursor, regular, 10, COLOR_BLACK, COL_RATE + 30);
-    right(fmtMoney(line.amount), cursor, regular, 10);
+    right(fmtMoney(line.rate, cur), cursor, regular, 10, COLOR_BLACK, COL_RATE + 30);
+    right(fmtMoney(line.amount, cur), cursor, regular, 10);
     cursor -= 16;
   }
 
@@ -233,7 +241,7 @@ export async function renderSalesFormPdf(data: SalesFormPdfData): Promise<Uint8A
     const font = last ? bold : regular;
     const size = last ? 12 : 10;
     right(safeText(label), cursor, font, size, last ? COLOR_NAVY : COLOR_GRAY, MARGIN_R - 110);
-    right(typeof value === 'number' || /^-?\d/.test(String(value)) ? fmtMoney(value) : safeText(String(value)), cursor, font, size, last ? COLOR_NAVY : COLOR_BLACK);
+    right(typeof value === 'number' || /^-?\d/.test(String(value)) ? fmtMoney(value, cur) : safeText(String(value)), cursor, font, size, last ? COLOR_NAVY : COLOR_BLACK);
     cursor -= last ? 20 : 15;
   });
 

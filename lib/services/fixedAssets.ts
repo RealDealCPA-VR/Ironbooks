@@ -413,14 +413,19 @@ export async function postDepreciation(ctx: ServiceContext, input: PostDepreciat
         and(
           eq(depreciationEntries.companyId, tx.companyId),
           eq(depreciationEntries.fixedAssetId, assetId),
-          eq(depreciationEntries.date, date),
+          // Once per calendar month (posting on the 14th and again on the 21st booked two months
+          // of expense in one; the schedule shows one row per month).
+          sql`to_char(${depreciationEntries.date}, 'YYYY-MM') = ${date.toISOString().slice(0, 7)}`,
         ),
       );
     if (dup) {
       throw new ServiceError(
         'CONFLICT',
-        `Depreciation for "${asset.name}" on ${date.toISOString().slice(0, 10)} has already been posted.`,
+        `Depreciation for "${asset.name}" for ${date.toISOString().slice(0, 7)} has already been posted.`,
       );
+    }
+    if (asset.placedInService && date.getTime() < new Date(asset.placedInService).getTime()) {
+      throw validation(`"${asset.name}" was placed in service on ${new Date(asset.placedInService).toISOString().slice(0, 10)}; depreciation can't be posted before that.`);
     }
 
     // Post GL entry: Dr Depreciation Expense / Cr Accumulated Depreciation.

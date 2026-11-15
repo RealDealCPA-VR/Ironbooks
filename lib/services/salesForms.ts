@@ -121,6 +121,15 @@ export interface RenderedForm {
 }
 
 /** A form's own currency code when it has one (null = the home currency). */
+async function homeCurrencyOf(ctx: ServiceContext): Promise<string> {
+  try {
+    const { effectiveHomeCurrency } = await import('./multiCurrency');
+    return ((await effectiveHomeCurrency(ctx)) ?? 'USD').toUpperCase();
+  } catch {
+    return 'USD';
+  }
+}
+
 function currencyOf(doc: object): string | null {
   const c = (doc as { currency?: unknown }).currency;
   return typeof c === 'string' && c.trim() ? c.trim() : null;
@@ -189,6 +198,7 @@ export async function renderSalesForm(
       const cust = await customerInfo(ctx, est.customerId);
       const bytes = await renderEstimatePdf({
         company: letterhead,
+        currency: currencyOf(est) ?? (await homeCurrencyOf(ctx)),
         customerMessage: await customerMessageText(ctx, est.customerMessageId),
         billToLines: cust.billToLines,
         customerName: cust.name,
@@ -222,6 +232,7 @@ export async function renderSalesForm(
       const cust = await customerInfo(ctx, r.customerId);
       const bytes = await renderSalesReceiptPdf({
         company: letterhead,
+        currency: currencyOf(r) ?? (await homeCurrencyOf(ctx)),
         customerMessage: await customerMessageText(ctx, r.customerMessageId),
         billToLines: cust.billToLines,
         customerName: cust.name,
@@ -256,6 +267,7 @@ export async function renderSalesForm(
       const cust = await customerInfo(ctx, m.customerId);
       const bytes = await renderCreditMemoPdf({
         company: letterhead,
+        currency: currencyOf(m) ?? (await homeCurrencyOf(ctx)),
         customerMessage: await customerMessageText(ctx, m.customerMessageId),
         billToLines: cust.billToLines,
         customerName: cust.name,
@@ -289,6 +301,7 @@ export async function renderSalesForm(
       const cust = await customerInfo(ctx, o.customerId);
       const bytes = await renderSalesOrderPdf({
         company: letterhead,
+        currency: currencyOf(o) ?? (await homeCurrencyOf(ctx)),
         customerMessage: await customerMessageText(ctx, o.customerMessageId),
         billToLines: cust.billToLines,
         customerName: cust.name,
@@ -620,6 +633,8 @@ export async function markPrinted(ctx: ServiceContext, items: Array<{ kind: Sale
 export async function sendQueuedEmails(
   ctx: ServiceContext,
   items: Array<{ kind: SalesFormKind; id: string; to?: string | null }>,
+  /** false: forms picked elsewhere (Income Tracker's Email), not only those waiting in the queue. */
+  opts: { queued?: boolean } = { queued: true },
 ) {
   if (!(await isConfigured(ctx))) throw emailNotSetUpError();
   const sent: Array<{ kind: SalesFormKind; id: string; to: string }> = [];
@@ -631,7 +646,7 @@ export async function sendQueuedEmails(
     }
     try {
       // Only forms still waiting to be emailed (claimed atomically — see emailSalesForm).
-      const r = await emailSalesForm(ctx, it.kind, it.id, it.to, null, { queued: true });
+      const r = await emailSalesForm(ctx, it.kind, it.id, it.to, null, { queued: opts.queued !== false });
       sent.push({ kind: it.kind, id: it.id, to: r.to });
     } catch (err) {
       // A form-specific refusal (no right to that form) is that item's failure, not the batch's.
