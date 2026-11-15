@@ -129,9 +129,9 @@ export const ROUTE_ACTIVITIES: Record<string, ActivityRef> = {
   '/api/leads': 'customers.leads',
   '/api/customer-prices': 'customers.pricing',
   '/api/pricing/customers': 'customers.center',
-  // (no activity: any member who may view Customers gets quotes on the forms they enter — a clerk
-  //  with Invoices only silently got base prices; prices are not sensitive, rules are edited
-  //  under Customer Pricing)
+  // Customer Center view, not Customer Pricing: a clerk entering invoices / estimates silently got
+  // base prices (prices aren't sensitive; the rules are edited under Customer Pricing).
+  '/api/pricing/quote': 'customers.center',
   '/api/invoices': 'customers.invoices',
   '/api/invoices/batch': 'customers.batch_invoicing',
   '/api/invoices/statement-charges': 'customers.statement_charges',
@@ -226,6 +226,8 @@ export const ROUTE_ACTIVITIES: Record<string, ActivityRef> = {
   '/api/assemblies': 'inventory.assemblies',
   '/api/fifo': 'inventory.fifo',
   '/api/inventory-sites': 'inventory.sites',
+  // A quantity adjustment at a site posts value to the ledger: Adjust Quantity, not Sites & Bins.
+  '/api/inventory-sites/adjust': 'inventory.adjust',
   '/api/inventory-sites/reports': 'reports_inventory.stock',
   '/api/inventory-transfers': 'inventory.transfers',
   '/api/landed-cost': 'inventory.landed_cost',

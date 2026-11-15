@@ -18,6 +18,7 @@ export interface QuoteLine {
   itemId: string | null | undefined;
   quantity: string | number | null | undefined;
   classId?: string | null;
+  jobId?: string | null;
 }
 
 export interface QuoteHeader {
@@ -27,6 +28,9 @@ export interface QuoteHeader {
   classId?: string | null;
   salesRepId?: string | null;
   jobId?: string | null;
+  /** Foreign-currency document: quotes come back in its currency. */
+  currency?: string | null;
+  exchangeRate?: string | null;
 }
 
 function qtyOf(q: QuoteLine['quantity']): number {
@@ -39,8 +43,8 @@ export function usePriceQuotes(header: QuoteHeader, lines: QuoteLine[], delayMs 
   const seq = useRef(0);
 
   const date = header.date && /^\d{4}-\d{2}-\d{2}$/.test(header.date) ? header.date : todayISO();
-  const wanted = lines.map((l, idx) => ({ idx, itemId: l.itemId, qty: qtyOf(l.quantity), classId: l.classId ?? null }));
-  const key = JSON.stringify([header.customerId ?? null, date, header.classId ?? null, header.salesRepId ?? null, header.jobId ?? null, wanted]);
+  const wanted = lines.map((l, idx) => ({ idx, itemId: l.itemId, qty: qtyOf(l.quantity), classId: l.classId ?? null, jobId: l.jobId ?? null }));
+  const key = JSON.stringify([header.customerId ?? null, date, header.classId ?? null, header.salesRepId ?? null, header.jobId ?? null, header.currency ?? null, header.exchangeRate ?? null, wanted]);
 
   useEffect(() => {
     const req = wanted.filter((w) => w.itemId && w.qty > 0);
@@ -60,7 +64,9 @@ export function usePriceQuotes(header: QuoteHeader, lines: QuoteLine[], delayMs 
           classId: header.classId || null,
           salesRepId: header.salesRepId || null,
           jobId: header.jobId || null,
-          lines: req.map((w) => ({ itemId: w.itemId, quantity: String(w.qty), classId: w.classId })),
+          currency: header.currency || null,
+          exchangeRate: header.exchangeRate || null,
+          lines: req.map((w) => ({ itemId: w.itemId, quantity: String(w.qty), classId: w.classId, jobId: w.jobId })),
         })
         .then((res) => {
           if (mine !== seq.current) return; // a newer request superseded this one

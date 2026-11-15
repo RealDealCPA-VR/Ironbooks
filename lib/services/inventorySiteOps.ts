@@ -40,8 +40,6 @@ export interface SiteAdjustmentInput extends InventoryLineDetail, AdjustmentDime
 }
 
 export async function adjustQuantityAtSite(ctx: ServiceContext, input: SiteAdjustmentInput) {
-  // A quantity adjustment (it posts value to the ledger): the Adjust Quantity right, not Sites & Bins.
-  requirePermission(ctx, 'inventory.adjust', 'create');
   const qty = inventoryNumber(input.quantityChange, 'Quantity');
   if (qty.isZero()) throw validation('quantityChange cannot be zero.');
   if (input.unitCost != null && input.unitCost !== '') inventoryNumber(input.unitCost, 'Unit cost');

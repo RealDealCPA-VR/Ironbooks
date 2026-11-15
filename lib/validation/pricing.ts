@@ -18,6 +18,9 @@ export const quoteSchema = z.object({
   classId: zUuid.nullish(),
   salesRepId: zUuid.nullish(),
   jobId: zUuid.nullish(),
+  /** A foreign-currency document: quotes come back in its currency (its rate, else the list's). */
+  currency: z.string().trim().max(3).nullish(),
+  exchangeRate: z.union([z.string(), z.number()]).nullish(),
   lines: z
     .array(
       z.object({

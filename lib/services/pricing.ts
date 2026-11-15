@@ -932,6 +932,25 @@ export interface PricingHeader {
   jobId?: string | null;
   /** A foreign-currency document: home units per 1 document unit (prices are converted). */
   exchangeRate?: string | number | null;
+  /** The document's currency: with no rate given, the currency list's rate converts the prices. */
+  currency?: string | null;
+}
+
+/** Home units per document unit for a foreign-currency document (null: home currency). */
+async function documentRate(ctx: ServiceContext, header: PricingHeader): Promise<Decimal | null> {
+  let rate: Decimal | null = null;
+  if (header.exchangeRate != null && String(header.exchangeRate).trim() !== '') rate = toDecimal(header.exchangeRate);
+  else if (header.currency) {
+    const { currencyRate } = await import('./exchangeRates');
+    const fx = await currencyRate(ctx, header.currency, null).catch(() => null);
+    rate = fx?.currency ? toDecimal(fx.rate.toString()) : null;
+  }
+  return rate && rate.greaterThan(0) && !rate.equals(1) ? rate : null;
+}
+
+/** A home-currency amount in the document's currency (cents, half up — as every rate converts). */
+function inDocument(amount: string, rate: Decimal | null): string {
+  return rate ? toDecimal(amount).dividedBy(rate).toDecimalPlaces(2, Decimal.ROUND_HALF_UP).toFixed(2) : amount;
 }
 
 export interface QuoteLineInput {
@@ -1094,18 +1113,21 @@ export async function quotePrices(
     lines.map((l) => l.itemId),
   );
   const date = isoDay(header.date);
+  const fxRate = await documentRate(ctx, header);
   return lines.map((l, i) => {
     const item = itemMap.get(l.itemId);
     if (!item) throw notFound(`Item on line ${i + 1}`);
     const qty = toDecimal(l.quantity);
     if (qty.isNegative()) throw validation(`Line ${i + 1}: quantity cannot be negative.`);
-    return evaluateLinePrice(item, data, {
+    const q = evaluateLinePrice(item, data, {
       date,
       quantity: qty,
       classId: l.classId ?? header.classId ?? null,
       salesRepId: header.salesRepId ?? null,
       jobId: l.jobId ?? header.jobId ?? null,
     });
+    // In the document's currency (a EUR invoice is quoted in EUR, at the rate the save uses).
+    return fxRate ? { ...q, price: inDocument(q.price, fxRate), basePrice: inDocument(q.basePrice, fxRate) } : q;
   });
 }
 
@@ -1146,6 +1168,7 @@ export async function resolveLinePricing<T extends PricedLineInput>(
     ? await loadPricingData(ctx, header.customerId, itemIds)
     : { data: null, items: new Map<string, EngineItem>() };
   const date = isoDay(header.date);
+  const fxRate = await documentRate(ctx, header);
 
   return lines.map((l, i) => {
     const { pricing: incoming, rate: rawRate, ...rest } = l;
@@ -1174,11 +1197,7 @@ export async function resolveLinePricing<T extends PricedLineInput>(
     });
     // Prices are home-currency: on a foreign-currency document they are converted at its rate
     // (a $100 item on a EUR invoice at 1.10 is €90.91, not €100).
-    const fxRate = header.exchangeRate != null && String(header.exchangeRate).trim() !== '' ? toDecimal(header.exchangeRate) : null;
-    const quote =
-      fxRate && fxRate.greaterThan(0) && !fxRate.equals(1)
-        ? { ...homeQuote, price: toDecimal(homeQuote.price).dividedBy(fxRate).toDecimalPlaces(2, Decimal.ROUND_HALF_UP).toFixed(2) }
-        : homeQuote;
+    const quote = fxRate ? { ...homeQuote, price: inDocument(homeQuote.price, fxRate) } : homeQuote;
     const overridden = hasRate && !toDecimal(rawRate).equals(toDecimal(quote.price));
     const pricing: AppliedPricing = {
       source: overridden ? 'manual' : quote.source,

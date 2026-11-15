@@ -359,7 +359,8 @@ function NewMemoModal({ open, editing, onClose, customers, onCustomerAdded, item
   // from the same server engine the credit memo service re-runs on save.
   const quotes = usePriceQuotes(
     { customerId: customerId || null, date },
-    lines.map((l) => ({ itemId: l.itemId || null, quantity: l.quantity || '1' })),
+    // Each line's class too (the server prices class rules with it).
+    lines.map((l) => ({ itemId: l.itemId || null, quantity: l.quantity || '1', classId: l.classId || null })),
   );
   useEffect(() => {
     setLines((prev) => {

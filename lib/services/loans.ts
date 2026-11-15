@@ -743,20 +743,20 @@ export type LoanBalanceSource =
   | { source: 'schedule'; balance: null; reason: 'shared' | 'currency' | 'not_recorded' };
 
 async function liabilityAccountBalance(ctx: ServiceContext, loan: typeof loans.$inferSelect): Promise<LoanBalanceSource> {
-  const others = await ctx.db
-    .select({ id: loans.id })
+  const otherRows = await ctx.db
+    .select()
     .from(loans)
-    .where(
-      and(
-        eq(loans.companyId, ctx.companyId),
-        eq(loans.liabilityAccountId, loan.liabilityAccountId),
-        // Removed loans too: one removed with a balance still owes on the account (the other loan
-        // then read the whole account — both loans — as its own balance).
-        ne(loans.id, loan.id),
-      ),
-    )
-    .limit(1);
-  if (others.length > 0) return { source: 'schedule', balance: null, reason: 'shared' };
+    .where(and(eq(loans.companyId, ctx.companyId), eq(loans.liabilityAccountId, loan.liabilityAccountId), ne(loans.id, loan.id)));
+  // An active loan on the account, or a removed one that still owes (removed with a balance, the
+  // other loan read both loans' account balance as its own); a paid-off or duplicate removed loan
+  // doesn't count, or one removal switched the other loan to its schedule for good.
+  let shared = otherRows.some((o) => o.isActive);
+  for (const o of otherRows) {
+    if (shared) break;
+    const paid = (await paymentsFor(ctx, o.id)).filter((p) => p.active).reduce((sum, p) => sum.plus(Money.of(p.principal)), Money.zero());
+    if (scheduledBalanceBefore(o, Math.max(1, o.scheduleStartNumber ?? 1)).minus(paid).greaterThan(0)) shared = true;
+  }
+  if (shared) return { source: 'schedule', balance: null, reason: 'shared' };
   const home = await effectiveHomeCurrency(ctx);
   const [acct] = await ctx.db
     .select({ currency: accounts.currency })
