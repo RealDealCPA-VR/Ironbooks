@@ -545,9 +545,9 @@ async function syncReceiptScanLink(ctx: ServiceContext, attachmentId: string, en
 }
 
 /**
- * The expense / bill a receipt was saved as was voided: the receipt goes back to the inbox (its
- * file unfiled from the void transaction) so it can be booked again. It was stuck as "saved" to a
- * void transaction — it could not be saved, read again or deleted.
+ * The expense / bill a receipt was saved as was voided: the receipt goes back to the receipt inbox
+ * (its file unfiled from the void transaction, so To review lists it) to be booked again. It was
+ * stuck as "saved" to a void transaction — it could not be saved, read again or deleted.
  */
 export async function releaseReceiptsOfVoidedTxn(ctx: ServiceContext, txnType: 'expense' | 'bill', txnId: string): Promise<void> {
   const scans = await ctx.db

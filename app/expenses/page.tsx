@@ -104,6 +104,7 @@ interface ExpenseDetail extends Expense {
     amount: string;
     classId: string | null;
     customerId: string | null;
+    jobId?: string | null;
   }>;
 }
 
@@ -146,6 +147,8 @@ interface LineRow {
   amount: string;
   classId: string;
   customerId: string;
+  /** The line's job (API / memorized checks): kept through an edit — the form has no column. */
+  jobId?: string | null;
   /**
    * Item lines loaded for edit: the stored amount and the item / qty / unit cost shown with it.
    * The stored unit cost is rounded to 4 places, so while those are untouched the line re-sends
@@ -417,7 +420,14 @@ function ExpensesPageContent() {
   // ── line helpers ──────────────────────────────────────────────────────────
 
   function updateLine(index: number, field: keyof LineRow, value: string) {
-    setLines((prev) => prev.map((row, i) => (i === index ? { ...row, [field]: value } : row)));
+    setLines((prev) =>
+      prev.map((row, i) =>
+        i === index
+          ? // The line's job (no column here) belongs to its customer: another customer drops it.
+            { ...row, [field]: value, ...(field === 'customerId' && value !== row.customerId ? { jobId: null } : {}) }
+          : row,
+      ),
+    );
   }
   function addLine() {
     setLines((prev) => [...prev, emptyLine()]);
@@ -538,9 +548,9 @@ function ExpensesPageContent() {
                   unitCost: l.unitCost ? String(Number(l.unitCost)) : '',
                   amount: String(Math.abs(Number(l.amount)).toFixed(2)),
                 };
-                return { ...emptyLine('item'), ...shown, description: l.description ?? '', classId: l.classId ?? '', customerId: l.customerId ?? '', loaded: shown };
+                return { ...emptyLine('item'), ...shown, description: l.description ?? '', classId: l.classId ?? '', customerId: l.customerId ?? '', jobId: l.jobId ?? null, loaded: shown };
               })()
-            : { ...emptyLine('expense'), accountId: l.accountId, amount: isCredit ? String(Math.abs(Number(l.amount)).toFixed(2)) : l.amount, description: l.description ?? '', classId: l.classId ?? '', customerId: l.customerId ?? '' },
+            : { ...emptyLine('expense'), accountId: l.accountId, amount: isCredit ? String(Math.abs(Number(l.amount)).toFixed(2)) : l.amount, description: l.description ?? '', classId: l.classId ?? '', customerId: l.customerId ?? '', jobId: l.jobId ?? null },
         ),
       );
       setPrefillNote('');
@@ -734,6 +744,8 @@ function ExpensesPageContent() {
               description: l.description.trim() || undefined,
               classId: l.classId || undefined,
               customerId: l.customerId || undefined,
+              // The line's job survives an edit (left out, a memo fix took it off job costing).
+              ...(l.jobId ? { jobId: l.jobId } : {}),
             }
           : {
               accountId: l.accountId,
@@ -741,6 +753,7 @@ function ExpensesPageContent() {
               amount: l.amount,
               classId: l.classId || undefined,
               customerId: l.customerId || undefined,
+              ...(l.jobId ? { jobId: l.jobId } : {}),
             },
       );
       const body: ExpenseBody = {

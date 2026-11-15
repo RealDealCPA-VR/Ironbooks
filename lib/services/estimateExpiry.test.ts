@@ -80,7 +80,7 @@ describe('estimateExpiry service', () => {
     return row;
   }
 
-  it('expires overdue draft/open/accepted estimates and returns count', async () => {
+  it('expires overdue draft/open estimates (not accepted ones) and returns count', async () => {
     const past = new Date('2024-01-01'); // clearly in the past
     const future = new Date('2099-12-31'); // clearly in the future
     const asOf = new Date('2025-06-01');
@@ -131,9 +131,9 @@ describe('estimateExpiry service', () => {
     });
 
     const count = await expireOverdueEstimates(ctx, asOf);
-    expect(count).toBe(3);
+    expect(count).toBe(2);
 
-    // Confirm the three overdue ones are now rejected.
+    // Confirm the two overdue ones are now rejected.
     const [r1] = await db
       .select({ status: estimates.status })
       .from(estimates)
@@ -153,7 +153,8 @@ describe('estimateExpiry service', () => {
       .select({ status: estimates.status })
       .from(estimates)
       .where((await import('drizzle-orm')).eq(estimates.id, overdueAccepted.id));
-    expect(r3.status).toBe('rejected');
+    // Review loop 7: the customer accepted it — the work is under way, it does not expire.
+    expect(r3.status).toBe('accepted');
   });
 
   it('does not expire a converted estimate even if overdue', async () => {

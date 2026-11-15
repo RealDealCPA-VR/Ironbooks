@@ -2104,7 +2104,26 @@ async function keepBillableLinks(
   }
   for (const cl of claims) {
     if (await claimBillable(tx, invoiceId, customerId, cl.billableSource!)) settled.add(cl);
-    else cl.billableSource = null;
+    else {
+      // The line IS that time / cost (same description) and it was billed on another invoice since —
+      // an Undo of the edit that released it, a form opened before: kept as a plain line it billed
+      // the same time or cost twice. A stated link that doesn't fit the line is ignored, as before.
+      const holder = await billableHolder(tx, cl.billableSource!);
+      // Billable lines read "Billable cost: <its description>" (costToLines) or the time entry's text.
+      const same = (src: string | null | undefined, line: string | null | undefined) => {
+        const a = (src ?? '').trim().toLowerCase();
+        const b = (line ?? '').trim().toLowerCase();
+        return a.length > 0 && (a === b || b.includes(a));
+      };
+      if (holder?.invoiceId && holder.invoiceId !== invoiceId && holder.descriptions.some((d) => same(d, cl.description))) {
+        throw new ServiceError(
+          'CONFLICT',
+          `"${(cl.description ?? '').trim() || 'A line'}" bills time or a cost that is already billed on another invoice. Remove that line from this invoice.`,
+          { billableTaken: true, invoiceId: holder.invoiceId },
+        );
+      }
+      cl.billableSource = null;
+    }
   }
   const norm = (d: string | null) => (d ?? '').trim();
   const passes: Array<(o: (typeof pool)[number], cl: ComputedLine) => boolean> = [
@@ -2134,6 +2153,31 @@ async function keepBillableLinks(
  * unbilled (or already billed by this invoice), owed by the invoice's customer, and its bill /
  * check is not void — the same rule as billing it from the Time/Costs list. False when it is not.
  */
+/** The invoice a billable cost / time entry is billed on, and the descriptions its lines carry. */
+async function billableHolder(tx: ServiceContext, src: BillableSource): Promise<{ invoiceId: string | null; descriptions: string[] } | null> {
+  if (src.kind === 'bill_line') {
+    const [r] = await tx.db
+      .select({ invoiceId: billLines.billedInvoiceId, description: billLines.description })
+      .from(billLines)
+      .innerJoin(bills, eq(bills.id, billLines.billId))
+      .where(and(eq(billLines.id, src.id), eq(bills.companyId, tx.companyId)));
+    return r ? { invoiceId: r.invoiceId, descriptions: [r.description ?? ''] } : null;
+  }
+  if (src.kind === 'expense_line') {
+    const [r] = await tx.db
+      .select({ invoiceId: expenseLines.billedInvoiceId, description: expenseLines.description })
+      .from(expenseLines)
+      .innerJoin(expenses, eq(expenses.id, expenseLines.expenseId))
+      .where(and(eq(expenseLines.id, src.id), eq(expenses.companyId, tx.companyId)));
+    return r ? { invoiceId: r.invoiceId, descriptions: [r.description ?? ''] } : null;
+  }
+  const [r] = await tx.db
+    .select({ invoiceId: timeEntries.invoicedInvoiceId, description: timeEntries.description, date: timeEntries.date })
+    .from(timeEntries)
+    .where(and(eq(timeEntries.id, src.id), eq(timeEntries.companyId, tx.companyId)));
+  return r ? { invoiceId: r.invoiceId, descriptions: [r.description ?? '', `Time entry — ${r.date.toISOString().slice(0, 10)}`] } : null;
+}
+
 async function claimBillable(tx: ServiceContext, invoiceId: string, customerId: string, src: BillableSource): Promise<boolean> {
   if (src.kind === 'bill_line') {
     const [row] = await tx.db

@@ -23,6 +23,7 @@
  * Read-only: no posting, no data leaves the machine.
  */
 import type Decimal from 'decimal.js';
+import { pickRetainedEarnings } from './retainedEarnings';
 import { Money, formatCurrency, toAmountString } from '@/lib/money';
 import type { CellDrilldown, DrillTransaction } from '@/lib/reports/drilldown';
 import { isDrilldownReport } from '@/lib/reports/drilldown';
@@ -386,9 +387,8 @@ interface BsSelection {
 
 function bsSelection(row: StdRow, meta: Map<string, AccountMeta>): BsSelection {
   const inSecs = (secs: SectionKey[]) => (a: AccountMeta) => secs.includes(a.section);
-  const reAccount = [...meta.values()]
-    .filter((a) => a.section === 'equity' && /retained/.test(a.subtype))
-    .sort((a, b) => a.code.localeCompare(b.code))[0];
+  // The Balance Sheet's own choice (retainedEarnings.ts), so the drill-down ties to the row.
+  const reAccount = pickRetainedEarnings([...meta.values()].map((a) => ({ ...a, equity: a.section === 'equity' })));
   const members = accountRowMembers(row, meta);
   if (members) return { account: (a) => members.has(a.id), priorPL: !!reAccount && members.has(reAccount.id), currentPL: false };
   const id = row.id.replace(/:total$/, '');

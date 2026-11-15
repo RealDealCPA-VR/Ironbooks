@@ -24,11 +24,11 @@ export async function POST(req: NextRequest) {
   try {
     const ctx = await getServerContext();
     const body = await requireJsonObject(req);
-    const { bankAccountId } = body ?? {};
+    const { bankAccountId, expectStatementDate } = body ?? {};
     if (!bankAccountId) {
       return NextResponse.json({ error: 'bankAccountId is required.' }, { status: 400 });
     }
-    const undone = await undoLastReconciliation(ctx, bankAccountId);
+    const undone = await undoLastReconciliation(ctx, bankAccountId, typeof expectStatementDate === 'string' ? expectStatementDate : null);
     return NextResponse.json(undone);
   } catch (err) {
     if (err instanceof ServiceError) return errResponse(err);

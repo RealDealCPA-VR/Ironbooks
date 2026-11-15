@@ -1743,7 +1743,8 @@ export async function unpaidTimeForPayroll(
         eq(timeEntries.companyId, ctx.companyId),
         eq(timeEntries.employeeId, opts.employeeId),
         gte(timeEntries.date, opts.periodStart),
-        lte(timeEntries.date, opts.periodEnd),
+        // The whole last day of the period (an entry saved with a time of day was left out).
+        lt(timeEntries.date, new Date(Date.UTC(opts.periodEnd.getUTCFullYear(), opts.periodEnd.getUTCMonth(), opts.periodEnd.getUTCDate() + 1))),
       ),
     )
     .orderBy(timeEntries.date);
@@ -1890,6 +1891,14 @@ export async function createPayRun(ctx: ServiceContext, input: CreatePayRunInput
             if ((r.description ?? '').includes(PAYROLL_PAID_TAG)) {
               throw validation('Time entry was already paid on a previous paycheck.');
             }
+            // Pulled time belongs to this pay period (whole calendar days).
+            const day = r.date.toISOString().slice(0, 10);
+            if (input.periodStart && day < input.periodStart.toISOString().slice(0, 10)) {
+              throw validation(`Time entry dated ${day} is before this pay period.`);
+            }
+            if (input.periodEnd && day > input.periodEnd.toISOString().slice(0, 10)) {
+              throw validation(`Time entry dated ${day} is after this pay period.`);
+            }
           }
           timeHours = rows.reduce((s, r) => s.plus(Money.of(r.hours)), Money.zero());
         }
@@ -1944,17 +1953,10 @@ export async function createPayRun(ctx: ServiceContext, input: CreatePayRunInput
           ...(paycheck.notes.length ? { notes: paycheck.notes } : {}),
         };
 
-        // Tag pulled time entries AFTER the check posts (in the same transaction). A marking
-        // failure (its own savepoint) is surfaced as a warning, not a rollback of the paycheck.
-        if (timeEntryIds.length > 0) {
-          try {
-            await markTimeEntriesPaidInPayroll(tx, timeEntryIds, paycheck.id);
-          } catch (err) {
-            done.warning = `Paycheck posted, but time entries could not be marked: ${
-              err instanceof Error ? err.message : 'unknown error'
-            }`;
-          }
-        }
+        // Tag pulled time entries AFTER the check posts (in the same transaction).
+        // A failure to mark them rolls this employee's check back: left unmarked, the same hours were
+        // offered — and paid — again on the next run.
+        if (timeEntryIds.length > 0) await markTimeEntriesPaidInPayroll(tx, timeEntryIds, paycheck.id);
         return done;
       });
 

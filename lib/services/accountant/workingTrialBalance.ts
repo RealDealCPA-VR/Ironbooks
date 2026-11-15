@@ -17,6 +17,7 @@
  * sheet's prior-years earnings. Balance-sheet accounts carry their full history.
  */
 import { and, eq, gte, lt, lte, sql } from 'drizzle-orm';
+import { pickRetainedEarnings } from '../retainedEarnings';
 import { accounts, journalEntries, journalEntryLines, workingTbNotes } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from '../_base';
@@ -110,9 +111,8 @@ export async function workingTrialBalance(
   const isPL = (type: string) => type === 'revenue' || type === 'expense';
   let priorEarnings = z; // debit-positive: a profit is a negative (credit) amount
   for (const a of acctRows) if (isPL(a.type)) priorEarnings = priorEarnings.plus(priorYears.get(a.id) ?? z);
-  const reAccount =
-    acctRows.find((a) => a.type === 'equity' && (a.subtype as string | null) === 'retained_earnings') ??
-    acctRows.find((a) => a.type === 'equity' && a.code === '3900');
+  // The same Retained Earnings account as the close and the reports (retainedEarnings.ts).
+  const reAccount = pickRetainedEarnings(acctRows.map((a) => ({ ...a, subtype: a.subtype as string | null, equity: a.type === 'equity' }))) ?? undefined;
 
   let tb = z, tt = z, ta = z, te = z;
   const rows: WtbRow[] = [];

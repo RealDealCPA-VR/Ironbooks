@@ -13,11 +13,13 @@
  */
 import { and, eq, isNull, lt, lte, gte, inArray, sql } from 'drizzle-orm';
 import { estimates, customers } from '@/lib/db/schema';
-import { type ServiceContext, writeAudit } from './_base';
+import { type ServiceContext, inTransaction, writeAudit } from './_base';
 import { companyToday } from './salesDates';
 
 /** Statuses that can still expire (not already terminal). */
-const EXPIRABLE_STATUSES = ['draft', 'open', 'accepted'] as const;
+// Not 'accepted': the customer said yes — expiring it rejected work under way (convert and
+// progress invoicing then refused it).
+const EXPIRABLE_STATUSES = ['draft', 'open'] as const;
 
 /**
  * Mark every estimate whose expirationDate < asOf and status is still
@@ -48,19 +50,26 @@ export async function expireOverdueEstimates(
 
   const ids = candidates.map((r) => r.id);
 
-  await ctx.db
+  // Re-checked in the update (an estimate converted or accepted meanwhile stays as it is), in one
+  // transaction with its audit rows.
+  return inTransaction(ctx, async (tx) => {
+  const expired = await tx.db
     .update(estimates)
     .set({ status: 'rejected', updatedAt: new Date() })
     .where(
       and(
-        eq(estimates.companyId, ctx.companyId),
+        eq(estimates.companyId, tx.companyId),
         inArray(estimates.id, ids),
+        inArray(estimates.status, [...EXPIRABLE_STATUSES]),
+        isNull(estimates.convertedInvoiceId),
       ),
-    );
+    )
+    .returning({ id: estimates.id });
+  const done = new Set(expired.map((r) => r.id));
 
   // Write one audit row per expired estimate.
-  for (const row of candidates) {
-    await writeAudit(ctx, {
+  for (const row of candidates.filter((r) => done.has(r.id))) {
+    await writeAudit(tx, {
       action: 'update',
       entityType: 'estimate',
       entityId: row.id,
@@ -69,7 +78,8 @@ export async function expireOverdueEstimates(
     });
   }
 
-  return candidates.length;
+  return done.size;
+  });
 }
 
 export interface ExpiringEstimate {

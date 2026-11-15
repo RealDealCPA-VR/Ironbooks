@@ -14,6 +14,7 @@
  * `convertToInvoice` is the only mutation that touches the GL, and it does so
  * by delegating entirely to `createInvoice` from the invoices service.
  */
+import { requireActivity } from './access';
 import { assertAccountantMayConvert, assertDividingDateOpen } from './accountantCopy/guard';
 import { and, eq, inArray, ne, or, sql } from 'drizzle-orm';
 import { Money, toAmountString } from '@/lib/money';
@@ -645,6 +646,8 @@ export async function convertToInvoice(
   estimateId: string,
   opts?: { overrideCreditLimit?: boolean },
 ) {
+  // Converting posts a invoice: it needs the right to create one, not just to edit the source.
+  requireActivity(ctx, 'customers.invoices', 'create');
   // Invoice creation and estimate stamping must commit or roll back TOGETHER —
   // otherwise a failure after createInvoice leaves a posted GL invoice with the
   // estimate still open and convertible again (duplicate invoice + revenue).
@@ -760,6 +763,8 @@ export async function createProgressInvoice(
   estimateId: string,
   input: ProgressInvoiceInput,
 ) {
+  // Converting posts a invoice: it needs the right to create one, not just to edit the source.
+  requireActivity(ctx, 'customers.invoices', 'create');
   // Preferences > Jobs & Estimates 'Use progress invoicing'.
   await assertFeatureOn(ctx, 'progressInvoicingEnabled');
   await assertAccountantMayConvert(ctx, 'Progress invoicing from an estimate'); // Accountant's Copy (I1)

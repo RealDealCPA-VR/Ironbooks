@@ -608,6 +608,19 @@ export async function mergeAccounts(
   // reconciliation, Home Currency Adjustment read them); QB only merges accounts in the same
   // currency.
   await assertSameCurrency(ctx, fromRow.currency, toRow.currency, `"${fromRow.name}" and "${toRow.name}"`);
+  // One bank record (bank feed, reconciliation history, opening balance) per account: merging two
+  // accounts that both have one left two reconciliation histories on one register — lines cleared
+  // under one hidden from the other, two sessions open over the same lines (bankAccounts.ts
+  // refuses that state when a record is made).
+  {
+    const [fromBank] = await ctx.db.select({ id: bankAccounts.id }).from(bankAccounts).where(and(eq(bankAccounts.companyId, ctx.companyId), eq(bankAccounts.accountId, fromId))).limit(1);
+    const [toBank] = await ctx.db.select({ id: bankAccounts.id }).from(bankAccounts).where(and(eq(bankAccounts.companyId, ctx.companyId), eq(bankAccounts.accountId, toId))).limit(1);
+    if (fromBank && toBank) {
+      throw validation(
+        `"${fromRow.name}" and "${toRow.name}" both have their own bank feed / reconciliation records, so they can't be merged (one register would keep two reconciliation histories). Make the one you no longer use inactive instead.`,
+      );
+    }
+  }
   // By number, or the account a role resolves to (lib/services/accountRoles.ts — a converted chart's
   // "20000 Accounts Payable").
   if (CODE_POSTED_ACCOUNTS.has(fromRow.code) || (await isSystemAccount(ctx, fromRow))) {

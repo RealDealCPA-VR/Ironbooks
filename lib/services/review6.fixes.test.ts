@@ -71,6 +71,7 @@ describe('receipts and their transactions', { timeout: 120_000 }, () => {
     const after = await getReceipt(t.ctx, r.id);
     expect(after.status).toBe('ready');
     expect(after.txnId ?? null).toBeNull();
+    // Back in the inbox (To review lists unfiled receipts).
     const [att] = await t.db.select().from(attachments).where(eq(attachments.id, r.attachmentId));
     expect(att.entityId ?? null).toBeNull();
     // ...and it can be saved again.
@@ -86,6 +87,8 @@ describe('receipts and their transactions', { timeout: 120_000 }, () => {
     expect(again.txnType).toBe('expense');
     const [scan] = await t.db.select().from(receiptScans).where(eq(receiptScans.id, r.id));
     expect(scan.txnId).toBe(again.txnId);
+    const [moved] = await t.db.select().from(attachments).where(eq(attachments.id, r.attachmentId));
+    expect(moved.entityId).toBe(again.txnId);
   });
 
   it('flags a charge already in the books for the same amount', async () => {

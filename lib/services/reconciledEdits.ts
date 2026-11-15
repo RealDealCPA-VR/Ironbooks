@@ -232,11 +232,67 @@ export async function prepareReconciledRepost(
  * Call after posting the edited document's new entry: moves the reconciled marks prepared for
  * `oldEntryId` onto `newEntryId`'s lines and records what changed. No-op when nothing was prepared.
  */
+/**
+ * A line ticked in a reconciliation still IN PROGRESS keeps its tick when the transaction is
+ * edited (void + re-post): the tick moves onto the matching new line (same account, same amounts).
+ * Left on the voided line it silently dropped out of the cleared balance (QB keeps the mark).
+ */
+async function carryInProgressTicks(ctx: ServiceContext, oldEntryId: string, newEntryId: string | null | undefined): Promise<void> {
+  if (!newEntryId) return;
+  const ticks = await ctx.db
+    .select({
+      itemId: reconciliationItems.id,
+      accountId: journalEntryLines.accountId,
+      debit: journalEntryLines.debit,
+      credit: journalEntryLines.credit,
+      foreignAmount: journalEntryLines.foreignAmount,
+      statementDate: reconciliations.statementDate,
+    })
+    .from(reconciliationItems)
+    .innerJoin(reconciliations, eq(reconciliationItems.reconciliationId, reconciliations.id))
+    .innerJoin(journalEntryLines, eq(reconciliationItems.journalEntryLineId, journalEntryLines.id))
+    .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+    .where(
+      and(
+        eq(journalEntryLines.journalEntryId, oldEntryId),
+        eq(journalEntries.companyId, ctx.companyId),
+        eq(reconciliations.status, 'in_progress'),
+        eq(reconciliationItems.isCleared, true),
+      ),
+    );
+  if (ticks.length === 0) return;
+  const fresh = await ctx.db
+    .select({ id: journalEntryLines.id, accountId: journalEntryLines.accountId, debit: journalEntryLines.debit, credit: journalEntryLines.credit, foreignAmount: journalEntryLines.foreignAmount, date: journalEntries.date })
+    .from(journalEntryLines)
+    .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+    .where(and(eq(journalEntryLines.journalEntryId, newEntryId), eq(journalEntries.companyId, ctx.companyId)));
+  const same = (a: string | number | null | undefined, b: string | number | null | undefined) => Money.of(a ?? 0).equals(Money.of(b ?? 0));
+  const used = new Set<string>();
+  for (const t of ticks) {
+    // Moved after the statement date: not on this statement (the list would hide it while the
+    // cleared balance counted it) — it comes back unticked.
+    const day = (x: Date) => x.toISOString().slice(0, 10);
+    const match = fresh.find(
+      (l) =>
+        !used.has(l.id) &&
+        l.accountId === t.accountId &&
+        same(l.debit, t.debit) &&
+        same(l.credit, t.credit) &&
+        same(l.foreignAmount, t.foreignAmount) &&
+        day(l.date) <= day(t.statementDate),
+    );
+    if (!match) continue; // the bank line itself changed: it comes back unticked (the user re-checks it)
+    used.add(match.id);
+    await ctx.db.update(reconciliationItems).set({ journalEntryLineId: match.id }).where(eq(reconciliationItems.id, t.itemId));
+  }
+}
+
 export async function carryReconciledLines(
   ctx: ServiceContext,
   params: { oldEntryId: string | null | undefined; newEntryId: string | null | undefined },
 ): Promise<{ changed: boolean }> {
   if (!params.oldEntryId) return { changed: false };
+  await carryInProgressTicks(ctx, params.oldEntryId, params.newEntryId);
   const pending = await ctx.db
     .select({
       id: reconciliationChanges.id,

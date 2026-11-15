@@ -158,6 +158,8 @@ interface SalesReceipt {
 interface SalesReceiptDetail extends SalesReceipt {
   depositAccountId: string | null;
   taxRateId: string | null;
+  /** The rate the receipt was charged at (an edit keeping the same tax item keeps it). */
+  taxRateValue?: string | null;
   classId?: string | null;
   memo: string | null;
   shipDate?: string | null;
@@ -515,7 +517,12 @@ function NewReceiptModal({
   // Line-grid keyboard ergonomics: Ctrl+Insert add / Ctrl+Delete remove / Enter down.
   const grid = useGridKeys({ addRow: addLine, removeRow: removeLine, disabled: saving });
 
-  const selectedTaxRate = taxRates.find((t) => t.id === taxRateId);
+  const currentTaxRate = taxRates.find((t) => t.id === taxRateId);
+  // Editing with the same tax item: the rate it was charged at (what the server keeps).
+  const selectedTaxRate =
+    currentTaxRate && editing && editing.taxRateId === taxRateId && editing.taxRateValue
+      ? { ...currentTaxRate, rate: editing.taxRateValue }
+      : currentTaxRate;
   const { subtotal, tax, total } = computeTotals(lines, selectedTaxRate, items, taxCodes, customerTax);
   // QB's per-line "Tax" column (Sales Tax Code) only while sales tax is on (or the receipt has a tax item).
   const showTaxColumn = prefs.company.salesTaxEnabled || !!taxRateId;

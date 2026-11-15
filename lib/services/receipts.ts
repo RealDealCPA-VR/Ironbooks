@@ -666,6 +666,19 @@ export interface ReceiptSuggestions {
   possibleDuplicates: Array<{ txnType: 'expense' | 'bill'; txnId: string; date: string; amount: string; payee: string | null }>;
 }
 
+/** True when the record a file is filed to is a voided expense / bill (its receipt may be booked again). */
+async function isVoidedTxn(ctx: ServiceContext, entityType: string | null, entityId: string): Promise<boolean> {
+  if (entityType === 'expense') {
+    const [e] = await ctx.db.select({ voidedAt: expenses.voidedAt }).from(expenses).where(and(eq(expenses.id, entityId), eq(expenses.companyId, ctx.companyId)));
+    return !!e?.voidedAt;
+  }
+  if (entityType === 'bill') {
+    const [b] = await ctx.db.select({ status: bills.status }).from(bills).where(and(eq(bills.id, entityId), eq(bills.companyId, ctx.companyId)));
+    return b?.status === 'void';
+  }
+  return false;
+}
+
 /** Non-void expenses and bills for `total` dated within 3 days of `date` (see possibleDuplicates). */
 async function possibleDuplicates(
   ctx: ServiceContext,
@@ -678,13 +691,16 @@ async function possibleDuplicates(
   const at = new Date(`${date.slice(0, 10)}T00:00:00.000Z`).getTime();
   const from = new Date(at - 3 * 86_400_000);
   const to = new Date(at + 4 * 86_400_000);
-  const exp = await ctx.db
+  // Only what the user may see: a Doc Center user must not learn of other purchases this way.
+  const seeExpenses = !ctx.access || canActivity(ctx.access, 'banking.write_checks', 'view');
+  const seeBills = !ctx.access || canActivity(ctx.access, 'vendors.bills', 'view');
+  const exp = !seeExpenses ? [] : await ctx.db
     .select({ id: expenses.id, date: expenses.date, total: expenses.total, payee: expenses.payeeName, vendor: vendors.displayName })
     .from(expenses)
     .leftJoin(vendors, eq(vendors.id, expenses.vendorId))
     .where(and(eq(expenses.companyId, ctx.companyId), isNull(expenses.voidedAt), eq(expenses.total, toAmountString(amount)), gt(expenses.date, new Date(from.getTime() - 1)), lt(expenses.date, to)))
     .limit(5);
-  const bl = await ctx.db
+  const bl = !seeBills ? [] : await ctx.db
     .select({ id: bills.id, date: bills.date, total: bills.total, vendor: vendors.displayName })
     .from(bills)
     .leftJoin(vendors, eq(vendors.id, bills.vendorId))
@@ -853,7 +869,7 @@ export async function saveReceipt(ctx: ServiceContext, id: string, raw: unknown)
       .select({ entityType: attachments.entityType, entityId: attachments.entityId })
       .from(attachments)
       .where(and(eq(attachments.id, scan.attachmentId), eq(attachments.companyId, tx.companyId)));
-    if (file?.entityId) {
+    if (file?.entityId && !(await isVoidedTxn(tx, file.entityType, file.entityId))) {
       throw validation('This receipt was already attached to another record in the Doc Center. Unfile it there first.');
     }
 

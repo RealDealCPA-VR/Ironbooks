@@ -32,6 +32,7 @@
  *   stock back out (CONFLICT if it was already consumed), and releases any
  *   claimed PO quantities (PO can return to 'open').
  */
+import { requireActivity } from './access';
 import { systemAccountIdByCode } from './accountRoles';
 import { assertAccountantMayConvert } from './accountantCopy/guard';
 import { and, asc, desc, eq, inArray, or, sql } from 'drizzle-orm';
@@ -991,6 +992,8 @@ export async function convertToBill(
   receiptId: string,
   opts?: ConvertReceiptToBillOptions,
 ) {
+  // Converting posts a bill: it needs the right to create one, not just to edit the source.
+  requireActivity(ctx, 'vendors.bills', 'create');
   await assertAccountantMayConvert(ctx, 'Turning an item receipt into a bill'); // Accountant's Copy (I1)
   const [receipt] = await ctx.db
     .select()

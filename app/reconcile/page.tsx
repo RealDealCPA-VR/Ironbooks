@@ -230,7 +230,8 @@ function StartForm({
     if (!info) return;
     setUndoing(true);
     try {
-      await api.post('/api/reconciliations/undo', { bankAccountId });
+      // The reconciliation shown here: refused if another window undid or finished one since.
+      await api.post('/api/reconciliations/undo', { bankAccountId, expectStatementDate: info.lastReconciledDate });
       toast('Last reconciliation undone.', 'success');
       // Refresh the info panel and the history list.
       const refreshed = await api.get<ReconcileInfo>(

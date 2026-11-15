@@ -8,7 +8,7 @@
 import { useEffect, useRef } from 'react';
 import { Plus, Trash2 } from 'lucide-react';
 import { AmountInput, Button, Input, useGridKeys } from '@/components/ui';
-import { formatCurrency } from '@/lib/money';
+import { formatCurrency, Money } from '@/lib/money';
 import { usePriceQuotes, samePrice, type QuoteHeader } from '@/lib/usePriceQuotes';
 import { PriceSourceBadge } from '@/components/PriceSourceBadge';
 import { TypeaheadSelect } from '@/components/TypeaheadSelect';
@@ -133,7 +133,14 @@ export function PricedLinesEditor({
         <div className="col-span-2 text-right">Amount</div>
       </div>
       {lines.map((line, idx) => {
-        const amount = (parseFloat(line.quantity) || 0) * (parseFloat(line.rate) || 0);
+        // In decimals, rounded to cents as the server does (qty 1 x 2.675 is 2.68, not float's 2.67).
+        const amount = (() => {
+          try {
+            return Money.round2(Money.of(line.quantity || 0).times(Money.of(line.rate || 0))).toNumber();
+          } catch {
+            return 0;
+          }
+        })();
         return (
           <div key={idx} data-grid-row className="grid grid-cols-12 gap-2 items-start mb-2">
             <div className="col-span-3">

@@ -116,6 +116,8 @@ interface CreditMemo {
 /** GET /api/credit-memos/:id — prefills the edit form (wave2 sales C1). */
 interface CreditMemoDetail extends CreditMemo {
   taxRateId: string | null;
+  /** The rate the memo was charged at (an edit keeping the same tax item keeps it). */
+  taxRateValue?: string | null;
   toBePrinted?: boolean;
   toBeEmailed?: boolean;
   /** Customer Message list entry printed at the foot of the memo. */
@@ -128,6 +130,8 @@ interface CreditMemoDetail extends CreditMemo {
     taxable?: boolean;
     /** The line's Sales Tax Code (null on lines saved before codes: shown by `taxable`). */
     salesTaxCodeId?: string | null;
+    classId?: string | null;
+    jobId?: string | null;
     restock?: boolean;
     // Advanced Inventory detail (present only when stored for the line)
     siteId?: string | null;
@@ -176,6 +180,9 @@ interface LineRow {
   salesTaxCodeId?: string;
   /** Inventory items only: true = return to stock, false = damaged write-off. */
   restock: boolean;
+  /** The line's own class / job (API, batch, Accountant's Copy): kept through an edit. */
+  classId?: string | null;
+  jobId?: string | null;
   /** Advanced pricing (B12): the user typed the rate, so automatic prices leave it alone. */
   rateManual?: boolean;
   /** Advanced Inventory: site / bin / serials / lot the returned goods go back to. */
@@ -283,6 +290,8 @@ function NewMemoModal({ open, editing, onClose, customers, onCustomerAdded, item
           taxable: l.taxable !== false,
           // Lines saved before codes have none: they show the standard code for `taxable`.
           salesTaxCodeId: l.salesTaxCodeId ?? '',
+          classId: l.classId ?? null,
+          jobId: l.jobId ?? null,
           restock: l.restock !== false,
           // Saved prices stay as they are; the badge still offers the current quote.
           rateManual: true,
@@ -365,7 +374,10 @@ function NewMemoModal({ open, editing, onClose, customers, onCustomerAdded, item
     });
   }, [quotes]);
 
-  const selectedRate = taxRates.find((t) => t.id === taxRateId);
+  const currentRate = taxRates.find((t) => t.id === taxRateId);
+  // Editing with the same tax item: the rate the memo was charged at (what the server keeps).
+  const selectedRate =
+    currentRate && editing && editing.taxRateId === taxRateId && editing.taxRateValue ? { ...currentRate, rate: editing.taxRateValue } : currentRate;
   const itemType = (id: string) => itemMap.get(id)?.type ?? null;
   // Each line is taxed as its Sales Tax Code says (a non-taxable customer: nothing is taxed).
   const live = computeLiveTotals(
@@ -417,15 +429,17 @@ function NewMemoModal({ open, editing, onClose, customers, onCustomerAdded, item
   async function handleSubmit() {
     if (!customerId) { toast('Please select a customer.', 'danger'); return; }
     if (!date) { toast('Please enter a date.', 'danger'); return; }
-    const validLines = lines.filter((l) => l.quantity || l.rate);
+    // A line with an item or description counts too (an item with no sales price was silently
+    // dropped); messages number the rows as the user sees them.
+    const used = lines.map((l, row) => ({ l, row })).filter(({ l }) => l.quantity || l.rate || l.itemId || l.description.trim());
+    const validLines = used.map(({ l }) => l);
     if (validLines.length === 0) { toast('Add at least one line item.', 'danger'); return; }
-    for (let i = 0; i < validLines.length; i++) {
-      const l = validLines[i];
+    for (const { l, row } of used) {
       if (!l.quantity || parseFloat(l.quantity) <= 0) {
-        toast(`Line ${i + 1}: quantity must be positive.`, 'danger'); return;
+        toast(`Line ${row + 1}: quantity must be positive.`, 'danger'); return;
       }
-      if (!l.rate || parseFloat(l.rate) < 0) {
-        toast(`Line ${i + 1}: rate cannot be negative.`, 'danger'); return;
+      if (l.rate === '' || !Number.isFinite(parseFloat(l.rate)) || parseFloat(l.rate) < 0) {
+        toast(`Line ${row + 1}: enter a rate (it cannot be negative).`, 'danger'); return;
       }
     }
 
@@ -447,6 +461,9 @@ function NewMemoModal({ open, editing, onClose, customers, onCustomerAdded, item
           rate: l.rate,
           // B9: the line's Sales Tax Code (the server decides taxability from it).
           ...lineTaxPayload({ ...l, itemType: itemType(l.itemId) }, taxCodes, customerTax),
+          // Left out, the server gave every line the memo's class (P&L by Class moved on a memo edit).
+          ...(l.classId ? { classId: l.classId } : {}),
+          ...(l.jobId ? { jobId: l.jobId } : {}),
           restock: l.restock,
           ...(l.restock ? inventoryLinePayload(l.inv) : {}),
         })),
@@ -551,7 +568,11 @@ function NewMemoModal({ open, editing, onClose, customers, onCustomerAdded, item
             nameType="customer"
             value={customerId}
             choices={customerChoices}
-            onChange={setCustomerId}
+            onChange={(id) => {
+              // Lines' jobs (no column here) belong to the old customer: another one drops them.
+              if (id !== customerId) setLines((prev) => prev.map((l) => (l.jobId ? { ...l, jobId: null } : l)));
+              setCustomerId(id);
+            }}
             onAdded={(n) => onCustomerAdded?.({ id: n.id, displayName: n.label })}
             placeholder="Type a customer name…"
             autoFocus

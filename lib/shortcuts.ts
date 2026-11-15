@@ -46,9 +46,20 @@ import {
 export function isMathExpression(raw: string): boolean {
   const s = normalizeAmountText(raw);
   if (!s) return false;
+  // "(500.00)" is the accounting way to write a negative, not arithmetic (see committedAmountText).
+  if (ACCOUNTING_NEGATIVE_RE.test(s)) return false;
   if (/[*/()]/.test(s)) return true;
   // A + or - anywhere after the first character means arithmetic, not a sign.
   return /[+\-]/.test(s.slice(1));
+}
+
+/** "(500.00)" / "$(1,234.56)" / "($12)": a negative amount written the accounting way. */
+const ACCOUNTING_NEGATIVE_RE = /^\$?\(\$?(\d+(?:\.\d*)?|\.\d+)\)$/;
+
+/** A number token with commas that are not real thousands groups ("12,50" — a decimal comma). */
+const BAD_COMMA_TOKEN_RE = /\d[\d,]*,[\d,]*/g;
+function hasDecimalComma(raw: string): boolean {
+  return (raw.match(BAD_COMMA_TOKEN_RE) ?? []).some((t) => !/^\d{1,3}(?:,\d{3})+$/.test(t.replace(/,$/, '')));
 }
 
 /** Strip currency adornments ($, commas, whitespace) before parsing. */
@@ -196,7 +207,19 @@ const GROUPED_AMOUNT_RE = /^-?(\d{1,3}(,\d{3})+|\d+)(\.\d*)?$/;
  * page's own validation reports that).
  */
 export function committedAmountText(raw: string): string | null {
+  // "(500.00)" is minus 500 (an opening balance owed TO the customer, a fee on a deposit) — it was
+  // worked out as math and saved as +500. Commas must be real thousands groups here too.
+  {
+    const s = normalizeAmountText(raw);
+    const m = ACCOUNTING_NEGATIVE_RE.exec(s);
+    if (m) {
+      if (hasDecimalComma(raw)) return null;
+      return `-${m[1]}`;
+    }
+  }
   if (isMathExpression(raw)) {
+    // "12,50*2" is a decimal comma, not 1250×2: leave it as typed for validation to flag.
+    if (hasDecimalComma(raw)) return null;
     const d = evaluateAmountDecimal(raw);
     if (d === null) return null;
     const next = formatAmountResult(d);
@@ -1336,6 +1359,9 @@ export function useGridKeys(options: GridKeysOptions): {
       }
       if (action === 'remove') {
         e.preventDefault();
+        // Commit what is being typed into THIS row first: grids keyed by index re-use the input for
+        // the row that moves up, and a picker's half-typed text was committed into that row on blur.
+        if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
         removeRowRef.current(rowIdx);
         focusAfterRender(container, rowSelector, Math.max(0, rowIdx - (rowIdx >= rows.length - 1 ? 1 : 0)), cellIdx, rows.length);
         return;

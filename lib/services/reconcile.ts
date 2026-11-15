@@ -281,6 +281,12 @@ async function startReconciliationInTx(
     );
   if (!bankAcct) throw notFound('Bank account');
   await assertReconciliationDateOpen(ctx, statementDate); // Accountant's Copy (I1)
+  // A statement before the last one reconciled (a mistyped year) moved the last-reconciled date
+  // backwards and made Undo take the wrong session: statements are reconciled in order.
+  if (bankAcct.lastReconciledDate && statementDate.getTime() < new Date(bankAcct.lastReconciledDate).getTime()) {
+    const last = new Date(bankAcct.lastReconciledDate).toISOString().slice(0, 10);
+    throw validation(`This account is reconciled through ${last}. The statement date must be on or after it (undo the later reconciliation first to redo an earlier one).`);
+  }
 
   // Guard: only one in_progress reconciliation per bank account at a time.
   const [existing] = await ctx.db
@@ -639,6 +645,13 @@ export async function updateStatement(
       throw validation('Cannot modify a reconciliation that is not in_progress.');
     }
     await assertReconciliationDateOpen(tx, newDate ?? recon.statementDate); // Accountant's Copy (I1)
+    if (newDate) {
+      // The same order rule as starting one: never before the last statement reconciled.
+      const [ba] = await tx.db.select({ last: bankAccounts.lastReconciledDate }).from(bankAccounts).where(eq(bankAccounts.id, recon.bankAccountId));
+      if (ba?.last && newDate.getTime() < new Date(ba.last).getTime()) {
+        throw validation(`This account is reconciled through ${new Date(ba.last).toISOString().slice(0, 10)}. The statement date must be on or after it.`);
+      }
+    }
 
     const [updated] = await tx.db
       .update(reconciliations)
@@ -1049,6 +1062,18 @@ export async function addStatementAdjustments(
     const homeOf = (amtStr: string) => (adjFx ? toAmountString(toHome(amtStr, adjFx.rate)) : amtStr);
     const fxEntry = adjFx ? { currency: adjFx.currency, exchangeRate: adjFx.rate.toFixed(8) } : {};
 
+    // Entered once per reconciliation: a retried or double-submitted form posted (and cleared) the
+    // charge again — booked twice, and still balanced, so nobody noticed.
+    for (const [a, kind, label] of [[charge, 'charge', 'service charge'], [interest, 'interest', 'interest']] as const) {
+      if (!a) continue;
+      const [dup] = await tx.db
+        .select({ id: journalEntries.id })
+        .from(journalEntries)
+        .where(and(eq(journalEntries.companyId, tx.companyId), eq(journalEntries.sourceRef, reconciliationAdjustmentRef(reconciliationId, kind)), eq(journalEntries.status, 'posted')))
+        .limit(1);
+      if (dup) throw new ServiceError('CONFLICT', `A ${label} is already entered for this reconciliation. Void it in the register to enter a different amount.`);
+    }
+
     if (charge) {
       const homeStr = homeOf(charge.amtStr);
       const entry = await postJournalEntry(tx, {
@@ -1098,9 +1123,14 @@ export async function addStatementAdjustments(
  * NOT_FOUND when the account has no completed reconciliation to undo.
  */
 export async function undoLastReconciliation(
-  ctx: ServiceContext,
+  outer: ServiceContext,
   bankAccountId: string,
+  /** The statement date of the reconciliation the user confirmed undoing (refused if it moved). */
+  expectStatementDate?: Date | string | null,
 ): Promise<typeof reconciliations.$inferSelect> {
+  // Reads and the write in ONE transaction: two confirmations (two windows, a retry) each undid
+  // "the latest" — the second took the reconciliation before it.
+  return inTransaction(outer, async (ctx) => {
   const [ba] = await ctx.db
     .select({ id: bankAccounts.id })
     .from(bankAccounts)
@@ -1140,6 +1170,9 @@ export async function undoLastReconciliation(
     throw notFound('Completed reconciliation');
   }
   const [latest, previous] = completed;
+  if (expectStatementDate && new Date(expectStatementDate).toISOString().slice(0, 10) !== latest.statementDate.toISOString().slice(0, 10)) {
+    throw new ServiceError('CONFLICT', 'The last reconciliation changed since you opened this (someone else undid or finished one). Review it again before undoing.');
+  }
   await assertReconciliationDateOpen(ctx, latest.statementDate); // Accountant's Copy (I1)
 
   return inTransaction(ctx, async (tx) => {
@@ -1148,8 +1181,9 @@ export async function undoLastReconciliation(
     const [undone] = await tx.db
       .update(reconciliations)
       .set({ status: 'undone' })
-      .where(eq(reconciliations.id, latest.id))
+      .where(and(eq(reconciliations.id, latest.id), eq(reconciliations.status, 'completed')))
       .returning();
+    if (!undone) throw new ServiceError('CONFLICT', 'This reconciliation was already undone.');
 
     await tx.db
       .update(bankAccounts)
@@ -1178,6 +1212,7 @@ export async function undoLastReconciliation(
     });
 
     return undone;
+  });
   });
 }
 

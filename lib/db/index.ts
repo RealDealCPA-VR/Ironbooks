@@ -133,6 +133,9 @@ export class CompanyFileUpgradeError extends ServiceError {
   }
 }
 
+/** Folders given their pre-upgrade safety copy in this process. */
+const upgradeCopied = new Set<string>();
+
 /** Steps of this version not yet applied to the file (0 for a brand-new database). */
 async function pendingMigrationCount(client: PGlite, migrationsFolder: string): Promise<number> {
   let newest: number | null = null;
@@ -395,11 +398,22 @@ export function openDb(dataDir?: string): DbHandle {
       // A file from an earlier version is about to be upgraded (some steps rewrite data in place,
       // and an older app refuses the upgraded file): keep a safety copy first, as QuickBooks backs
       // up before upgrading a company file. Best-effort — it never blocks the open.
-      if ((await pendingMigrationCount(client, MIGRATIONS_FOLDER)) > 0) {
+      // Only the company file being opened (not a backup being restored or previewed — a restore
+      // makes its own copy), once per folder per process (a failing upgrade retried on every
+      // request rotated the older safety copies out), sealed like the file when it is protected.
+      if (!upgradeCopied.has(dir) && path.resolve(dir) === path.resolve(resolveDataDir()) && (await pendingMigrationCount(client, MIGRATIONS_FOLDER)) > 0) {
+        upgradeCopied.add(dir);
         try {
           await client.exec('CHECKPOINT');
+          const { sealProtectionFor, isMarkedProtected } = await import('@/lib/services/fileProtection');
+          // A file older than the protection tables (0077 / 0086) can't be read for its slots yet:
+          // a plain file is copied as it is; a protected one is never copied unsealed.
+          const protection = await sealProtectionFor(db as never, dir).catch((err) => {
+            if (isMarkedProtected(dir)) throw err;
+            return null;
+          });
           const { ensurePreOpBackup } = await import('@/lib/services/backup');
-          ensurePreOpBackup(null, 'upgrade', dir);
+          ensurePreOpBackup(null, 'upgrade', dir, protection);
         } catch (err) {
           console.warn('[db] could not make a safety copy before upgrading the company file:', (err as Error)?.message ?? err);
         }

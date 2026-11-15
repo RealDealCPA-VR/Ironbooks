@@ -366,7 +366,8 @@ async function buildBillableLines(
       itemId: t.serviceItemId,
       description: t.description ?? `Time entry — ${t.date.toISOString().slice(0, 10)}`,
       quantity: t.hours,
-      rate: t.rate,
+      // The rate is a home-currency price: on a foreign-currency invoice it is converted, like costs.
+      rate: invoiceFx.currency && t.rate != null ? toAmountString(Money.round2(Money.of(t.rate).dividedBy(invoiceFx.rate))) : t.rate,
       taxable: false,
       jobId: t.jobId,
       // The line remembers the time it bills: an edit that removes it puts the time back.

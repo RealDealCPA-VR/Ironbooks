@@ -312,7 +312,16 @@ export async function pivotReport(ctx: ServiceContext, input: PivotInput): Promi
       if (v && input.source === 'gl' && input.cols && zr && zc) {
         hrefs[`c${i}`] = stdHref(
           'transaction-detail-by-account',
-          within({ from: dayStr(from), to: dayStr(to), ...(input.section && !zr.section && !zc.section ? { section: input.section } : {}), ...zr, ...zc }),
+          within({
+            from: dayStr(from),
+            to: dayStr(to),
+            ...(input.section && !zr.section && !zc.section ? { section: input.section } : {}),
+            ...zr,
+            ...zc,
+            // Both a period (month rows, quarter columns): the cell is where they overlap.
+            ...(zr.from && zc.from ? { from: zr.from > zc.from ? zr.from : zc.from } : {}),
+            ...(zr.to && zc.to ? { to: zr.to < zc.to ? zr.to : zc.to } : {}),
+          }),
         );
       }
     });

@@ -24,6 +24,9 @@
  *   UPDATE on quantityBilled inside the transaction. convertedBillId is stamped
  *   with the bill that completes (closes) the PO.
  */
+import { requireActivity } from './access';
+import { companyToday } from './salesDates';
+import Decimal from 'decimal.js';
 import { assertAccountantMayConvert, assertDividingDateOpen } from './accountantCopy/guard';
 import { and, asc, desc, eq, inArray, sql } from 'drizzle-orm';
 import { accounts, auditLogs, bills, classes, customers, itemReceipts, items, jobs, purchaseOrders, purchaseOrderLines, vendors } from '@/lib/db/schema';
@@ -659,10 +662,32 @@ async function updateStatusInTx(ctx: ServiceContext, id: string, status: 'open' 
   }
 
   if (po.status === 'closed' && status !== 'closed') {
-    throw new ServiceError(
-      'CONFLICT',
-      'Cannot reopen a closed (converted) purchase order.',
-    );
+    if (!po.closedManually) {
+      throw new ServiceError(
+        'CONFLICT',
+        'Cannot reopen a closed (converted) purchase order.',
+      );
+    }
+    // Closed by hand (Mark as Closed): reopening clears it, as QB's Closed checkbox does — the P.O.
+    // goes back to what its lines show (open / partial). It could not be undone before: a mistaken
+    // close meant re-entering the whole P.O.
+    await ctx.db
+      .update(purchaseOrders)
+      .set({ closedManually: false })
+      .where(and(eq(purchaseOrders.id, id), eq(purchaseOrders.companyId, ctx.companyId)));
+    await recomputePoStatusFromLines(ctx, id, 'closed', 'reopened');
+    const [reopened] = await ctx.db
+      .select()
+      .from(purchaseOrders)
+      .where(and(eq(purchaseOrders.id, id), eq(purchaseOrders.companyId, ctx.companyId)));
+    await writeAudit(ctx, {
+      action: 'update',
+      entityType: 'purchase_order',
+      entityId: id,
+      oldValues: { status: 'closed', closedManually: true },
+      newValues: { status: reopened.status, closedManually: false },
+    });
+    return reopened;
   }
 
   if (po.status === 'partial' && status === 'open') {
@@ -892,6 +917,8 @@ export async function convertToBill(
   poId: string,
   opts?: ConvertToBillOptions,
 ) {
+  // Converting posts a bill: it needs the right to create one, not just to edit the source.
+  requireActivity(ctx, 'vendors.bills', 'create');
   await assertAccountantMayConvert(ctx, 'Turning a purchase order into a bill'); // Accountant's Copy (I1)
   const [po] = await ctx.db
     .select()
@@ -1064,7 +1091,8 @@ export async function convertToBill(
       billNumber: opts?.billNumber ?? null,
       // QB duplicate vendor reference warning (A4), as Enter Bills gives it.
       checkDuplicateNumber: !opts?.allowDuplicateNumber,
-      date: opts?.date ?? po.date,
+      // Dated today unless given (QB): the PO's date put the bill (and its due date) in the past.
+      date: opts?.date ?? (await companyToday(tx)),
       // The PO's expected date is a DELIVERY date, not a payment due date: leave it blank so
       // createBill works the due date out from the vendor's terms (QB parity).
       dueDate: null,
@@ -1612,12 +1640,30 @@ export async function releaseReceiptQuantities(
       );
     }
 
+    // What a receipt claimed sits in each line's received-not-billed counter: release that first.
+    // Taking from quantityBilled in line order also undid a BILL's claim on a later line (a PO
+    // billed directly for part of it), which could then be billed again. Only what the counters
+    // can't cover (receipts entered before enhanced receiving carry none) falls back to billed.
     let left = qty;
+    const plan = new Map<string, Decimal>();
+    for (const pass of ['unbilled', 'billed'] as const) {
+      for (const line of candidates) {
+        if (left.lessThanOrEqualTo(0)) break;
+        const already = plan.get(line.id) ?? Money.zero();
+        const billed = Money.of(line.quantityBilled ?? '0').minus(already);
+        const room =
+          pass === 'unbilled'
+            ? Decimal.min(Money.of(line.quantityReceivedUnbilled ?? '0').minus(already), billed)
+            : billed;
+        if (!room.greaterThan(0)) continue;
+        const give = left.lessThanOrEqualTo(room) ? left : room;
+        plan.set(line.id, already.plus(give));
+        left = left.minus(give);
+      }
+    }
     for (const line of candidates) {
-      if (left.lessThanOrEqualTo(0)) break;
-      const billed = Money.of(line.quantityBilled ?? '0');
-      if (!billed.greaterThan(0)) continue;
-      const give = left.lessThanOrEqualTo(billed) ? left : billed;
+      const give = plan.get(line.id);
+      if (!give || !give.greaterThan(0)) continue;
       const giveStr = give.toFixed(4);
       const released = await ctx.db
         .update(purchaseOrderLines)
@@ -1640,7 +1686,6 @@ export async function releaseReceiptQuantities(
           'Purchase order quantities changed in another transaction. Reload and retry.',
         );
       }
-      left = left.minus(give);
     }
     if (left.greaterThan(0)) {
       throw new ServiceError(

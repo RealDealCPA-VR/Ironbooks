@@ -23,6 +23,8 @@
  *   the invoice that completes (closes) the order. `backorderReport` exposes
  *   the remaining (backordered) quantity per open sales-order line.
  */
+import { requireActivity } from './access';
+import { companyToday } from './salesDates';
 import { assertAccountantMayConvert, assertDividingDateOpen } from './accountantCopy/guard';
 import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import { Money, toAmountString } from '@/lib/money';
@@ -547,6 +549,8 @@ export async function convertToInvoice(
   salesOrderId: string,
   opts?: ConvertToInvoiceOptions,
 ) {
+  // Converting posts a invoice: it needs the right to create one, not just to edit the source.
+  requireActivity(ctx, 'customers.invoices', 'create');
   await assertAccountantMayConvert(ctx, 'Turning a sales order into an invoice'); // Accountant's Copy (I1)
   // Invoice creation and order stamping must commit or roll back TOGETHER —
   // otherwise a failure after createInvoice leaves a posted GL invoice with the
@@ -653,7 +657,9 @@ export async function convertToInvoice(
     // its internal inTransaction nests as a savepoint on this transaction.
     const invoice = await createInvoice(tx, {
       customerId: order.customerId,
-      date: opts?.date ?? order.date,
+      // Dated today unless given (QB, like an estimate's): the order's date put revenue, COGS and
+      // the due date back in the order's month (refused outright once that month is closed).
+      date: opts?.date ?? (await companyToday(tx)),
       memo: order.memo,
       // The order's tax item and Tax column carry over (null = the order was not taxed).
       taxRateId: order.taxRateId ?? null,

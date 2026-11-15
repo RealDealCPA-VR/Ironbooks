@@ -175,6 +175,8 @@ interface Invoice {
 /** Full invoice (GET /api/invoices/:id) used to prefill the edit modal. */
 interface InvoiceDetail extends Invoice {
   taxRateId: string | null;
+  /** The invoice's header Customer:Job. */
+  jobId?: string | null;
   /** The rate this invoice was charged at (an edit keeping the same tax item keeps it). */
   taxRateValue?: string | null;
   classId: string | null;
@@ -199,6 +201,8 @@ interface InvoiceDetail extends Invoice {
     taxable: boolean;
     /** salesar (B9): the line's Sales Tax Code (null on lines saved before codes: shown by `taxable`). */
     salesTaxCodeId?: string | null;
+    /** The line's own tax item (imported / API invoices taxed in two jurisdictions). */
+    taxRateId?: string | null;
     jobId: string | null;
     /** The line's class (stored as its own class, or the invoice's when it had none). */
     classId?: string | null;
@@ -230,6 +234,8 @@ interface LineRow {
   taxable: boolean;
   /** salesar (B9): the line's Sales Tax Code ('' / absent = the standard code for `taxable`). */
   salesTaxCodeId?: string;
+  /** The line's own tax item, kept through an edit (the form has no column for it). */
+  taxRateId?: string | null;
   jobId: string;
   /** The line's own class when it differs from the invoice's ('' / absent = the invoice class). */
   classId?: string;
@@ -584,6 +590,7 @@ function InvoiceModal({
           taxable: l.taxable,
           // Lines saved before codes have none: they show the standard code for `taxable`.
           salesTaxCodeId: l.salesTaxCodeId ?? '',
+          taxRateId: l.taxRateId ?? null,
           jobId: l.jobId ?? '',
           classId: lineClassOverride(l.classId, editing.classId),
           discountPercent: false,
@@ -596,7 +603,7 @@ function InvoiceModal({
       );
       // Every line on one of this customer's jobs: the header shows "Customer:Job".
       const lineJobs = new Set(editing.lines.map((l) => l.jobId ?? ''));
-      const onlyJob = lineJobs.size === 1 ? [...lineJobs][0] : '';
+      const onlyJob = editing.jobId ?? (lineJobs.size === 1 ? [...lineJobs][0] : '');
       setHeaderJobId(onlyJob && jobs.some((j) => j.id === onlyJob && j.customerId === editing.customerId) ? onlyJob : '');
     } else {
       setCustomerId('');
@@ -1071,8 +1078,11 @@ function InvoiceModal({
       customerId,
       date,
       dueDate: dueDate || undefined,
-      terms: terms || undefined,
+      // An edit that clears Terms clears them (left out, the old early-payment discount stayed).
+      terms: terms || (editing ? null : undefined),
       taxRateId: taxRateId || null,
+      // The header Customer:Job (job reports charge the header discount to it).
+      jobId: headerJobId || (editing ? null : undefined),
       classId: classId || undefined,
       salesRepId: salesRepId || (editing ? null : undefined),
       discount: discount || undefined,
@@ -1114,6 +1124,8 @@ function InvoiceModal({
           ...lineTaxPayload(l, taxCodes, customerTax),
           jobId: l.jobId || null,
           classId: l.classId || null,
+          // A line taxed by its own tax item keeps it (dropped, a memo edit re-taxed the line).
+          ...(l.taxRateId ? { taxRateId: l.taxRateId } : {}),
           ...inventoryLinePayload(l.inv),
           // Edits send each row's estimate link back so progress billing stays on the right line,
           // and its billable cost / time link so only a deleted row unbills its source.
