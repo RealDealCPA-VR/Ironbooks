@@ -35,6 +35,7 @@
  * with the closing-date password; two clicks can never undo twice.
  */
 import { and, desc, eq, gte, inArray, isNotNull, lt, ne, sql } from 'drizzle-orm';
+import { voidJournalEntry } from './posting';
 import {
   accounts,
   auditLogs,
@@ -589,6 +590,8 @@ function estimateInput(s: Snap): CreateEstimateInput {
     toBeEmailed: bool(s.toBeEmailed),
     customerMessageId: str(s.customerMessageId),
     lines: arr(s.lines).map((l) => ({
+      // The line's id: pending invoices link to it (re-matched by position it lost the link).
+      ...(str(l.id) ? { id: str(l.id)! } : {}),
       itemId: str(l.itemId),
       description: str(l.description),
       quantity: reqStr(l.quantity ?? '1'),
@@ -716,6 +719,8 @@ function vendorCreditInput(s: Snap): CreateVendorCreditInput {
       classId: str(l.classId),
       customerId: str(l.customerId),
       jobId: str(l.jobId),
+      // Where the returned units went (site / bin / serials / lot), as the other stock forms.
+      ...invDetail(l),
     })),
   };
 }
@@ -741,6 +746,7 @@ function customerPatch(s: Snap): UpdateCustomerInput {
     taxExemptionReason: str(s.taxExemptionReason),
     // B12: the customer form sends the price level too (only re-checked when it changes).
     priceLevelId: str(s.priceLevelId),
+    customerTypeId: str(s.customerTypeId),
   };
 }
 
@@ -760,6 +766,7 @@ function vendorPatch(s: Snap): UpdateVendorInput {
     printOnCheckAs: str(s.printOnCheckAs),
     accountNumber: str(s.accountNumber),
     currency: str(s.currency),
+    vendorTypeId: str(s.vendorTypeId),
   };
 }
 
@@ -1201,6 +1208,15 @@ const ADAPTERS: Record<string, Adapter> = {
     snapshot: async (ctx, id) => toJson(await getItem(ctx, id)),
     describe: (s) => `item “${s.name}”`,
     async undoCreate(ctx, id, snap) {
+      // Saved with opening stock: making it inactive left the units and their Inventory Asset /
+      // Opening Balance Equity entry posted while the message said it was removed.
+      const [it] = await ctx.db.select({ qty: items.quantityOnHand }).from(items).where(and(eq(items.id, id), eq(items.companyId, ctx.companyId)));
+      if (it && !Money.of(it.qty ?? '0').isZero()) {
+        throw new ServiceError(
+          'CONFLICT',
+          `${cap(this.describe(snap))} has stock on hand. Adjust its quantity to zero (Adjust Quantity/Value on Hand), then make it inactive.`,
+        );
+      }
       await deactivateItem(ctx, id);
       return { message: `Undone: ${this.describe(snap)} was removed from your active items (made inactive).` };
     },
@@ -1228,6 +1244,13 @@ const ADAPTERS: Record<string, Adapter> = {
     snapshot: async (ctx, id) => toJson(await getAccount(ctx, id)),
     describe: (s) => `account “${s.name}”`,
     async undoCreate(ctx, id, snap) {
+      // Saved with an opening balance: void that entry first, or making it inactive always failed
+      // ("non-zero balance").
+      const opening = await ctx.db
+        .select({ id: journalEntries.id })
+        .from(journalEntries)
+        .where(and(eq(journalEntries.companyId, ctx.companyId), eq(journalEntries.sourceRef, `account:${id}`), eq(journalEntries.status, 'posted')));
+      for (const e of opening) await voidJournalEntry(ctx, e.id);
       await deactivateAccount(ctx, id);
       return { message: `Undone: ${this.describe(snap)} was removed from your active accounts (made inactive).` };
     },
@@ -1556,6 +1579,9 @@ export async function commitUndo(
     .where(and(eq(undoActions.id, input.token), eq(undoActions.companyId, ctx.companyId)));
   if (!tok || tok.userId !== userId) throw notFound('Undo');
   if (tok.status !== 'pending' || tok.kind !== input.kind || tok.entityType !== a.entity) throw notDone();
+  // Armed right after the save it was prepared for: a token kept for hours could arm a snapshot
+  // older than someone else's change since (only the newest audit row is compared).
+  if (Date.now() - new Date(tok.createdAt).getTime() > 10 * 60_000) throw notDone();
   // A void that released order / billing links can't be undone (see Adapter.voidLinks).
   const links = input.kind === 'void' ? voidLinksOf(tok.snapshot) : [];
   if (links.length) throw voidLinksError(a, links);

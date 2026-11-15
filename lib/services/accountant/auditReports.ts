@@ -549,6 +549,9 @@ function pickStr(v: Record<string, unknown>, keys: string[]): string | null {
   return null;
 }
 
+/** The Voided/Deleted Transactions report holds at most this many rows (truncated: true beyond). */
+const VOIDED_LIMIT = 5000;
+
 export async function voidedDeletedTransactions(
   ctx: ServiceContext,
   optsIn: { from?: HappenedBound; to?: HappenedBound; detail?: boolean } = {},
@@ -566,7 +569,7 @@ export async function voidedDeletedTransactions(
   ];
   if (opts.from) conds.push(gte(auditLogs.createdAt, opts.from));
   if (opts.to) conds.push(lte(auditLogs.createdAt, opts.to));
-  const logs = await ctx.db
+  const fetched = await ctx.db
     .select({
       id: auditLogs.id,
       action: auditLogs.action,
@@ -581,7 +584,10 @@ export async function voidedDeletedTransactions(
     .leftJoin(users, eq(auditLogs.userId, users.id))
     .where(and(...conds))
     .orderBy(desc(auditLogs.createdAt))
-    .limit(5000);
+    .limit(VOIDED_LIMIT + 1);
+  // More than the report holds: say so (the oldest were dropped silently).
+  const truncated = fetched.length > VOIDED_LIMIT;
+  const logs = truncated ? fetched.slice(0, VOIDED_LIMIT) : fetched;
 
   // Pull number/date/total from the (still existing) voided documents and journal entries.
   const info = new Map<string, { number: string | null; date: string | null; amount: string | null; name: string | null }>();
@@ -683,5 +689,5 @@ export async function voidedDeletedTransactions(
     if (opts.detail) row.original = maskForContext(ctx, l.oldValues ?? l.newValues);
     return row;
   });
-  return { rows, count: rows.length };
+  return { rows, count: rows.length, ...(truncated ? { truncated: true } : {}) };
 }

@@ -12,7 +12,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
-import { emailInvoice } from '@/lib/services/email';
+import { emailSalesForm } from '@/lib/services/salesForms';
 import { templateIdParam } from '@/lib/validation/prefs';
 import { ServiceError } from '@/lib/services/_base';
 import { serviceErrorStatus } from '@/lib/routeErrors';
@@ -52,7 +52,8 @@ export async function POST(req: NextRequest, { params }: RouteContext) {
       // No body or non-JSON body — fall back to customer email.
     }
 
-    await emailInvoice(ctx, id, to, templateId);
+    // The same path as Send Forms: clears "to be emailed", audits the send, merges every field.
+    await emailSalesForm(ctx, 'invoice', id, to ?? null, templateId ?? null);
     return NextResponse.json({ ok: true });
   } catch (err) {
     return errorResponse(err);

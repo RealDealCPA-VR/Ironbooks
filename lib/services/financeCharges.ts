@@ -303,7 +303,8 @@ export async function previewFinanceCharges(
         eq(invoices.companyId, ctx.companyId),
         ne(invoices.status, 'void'),
         like(invoices.memo, '%[FC:%'),
-        lt(invoices.date, new Date(asOf.getTime() + DAY_MS)),
+        // Any date — a run dated BEFORE a later assessment (June after July) charged the days
+        // that assessment already covered a second time; from a later charge nothing is due.
       ),
     )
     .groupBy(invoices.customerId);

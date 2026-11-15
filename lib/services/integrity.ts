@@ -879,6 +879,9 @@ async function computeOrphanedAuditFixes(ctx: ServiceContext): Promise<RebuildFi
     .from(auditLogs)
     .where(eq(auditLogs.companyId, ctx.companyId));
 
+  // After a Condense the closed period's transactions are gone by design (one 'condense' row, no
+  // per-entry delete): their audit rows are the only history left of them, never "damage".
+  if (rows.some((r) => r.entityType === 'condense')) return [];
   // Entities with a recorded delete/void are legitimate history, never orphans.
   const legitimized = new Set(
     rows.filter((r) => r.action === 'delete' || r.action === 'void').map((r) => `${r.entityType}:${r.entityId}`),

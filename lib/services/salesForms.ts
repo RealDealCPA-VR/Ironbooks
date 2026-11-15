@@ -16,6 +16,8 @@
  * Every mutation writes an audit row (and so reaches the transaction log).
  */
 import { and, asc, eq, inArray } from 'drizzle-orm';
+import type { ActivityKey } from '@/lib/permissions/activities';
+import { requireActivity } from './access';
 import {
   creditMemos,
   customers,
@@ -406,6 +408,16 @@ const TABLE = {
   sales_order: salesOrders,
 } as const;
 
+/** The activity each sales form belongs to (its own print right is needed to email it). */
+const SALES_FORM_ACTIVITY: Record<SalesFormKind, ActivityKey> = {
+  invoice: 'customers.invoices',
+  estimate: 'customers.estimates',
+  sales_receipt: 'customers.sales_receipts',
+  credit_memo: 'customers.credit_memos',
+  sales_order: 'customers.sales_orders',
+};
+const EMAIL_ADDRESS_RE = /^[^\s@,;]+@[^\s@,;]+\.[^\s@,;]+$/;
+
 /**
  * Email one sales form to the customer (or `to`). Clears its "to be emailed" flag. The PDF prints
  * with `templateId` when given, else the form's default template (B11).
@@ -416,12 +428,37 @@ export async function emailSalesForm(
   id: string,
   to?: string | null,
   templateId?: string | null,
+  opts?: { queued?: boolean },
 ): Promise<{ ok: true; to: string }> {
   if (!(await isConfigured(ctx))) throw emailNotSetUpError();
-  const form = await renderSalesForm(ctx, kind, id, templateId);
-  const recipient = await deliver(ctx, form, to);
+  // The form's own right (print), not only Send Forms: a batch-only user emailed any receipt.
+  requireActivity(ctx, SALES_FORM_ACTIVITY[kind], 'print');
+  if (to != null && to !== '' && !EMAIL_ADDRESS_RE.test(String(to).trim())) throw validation(`"${to}" is not an email address.`);
   const t = TABLE[kind];
-  await inTransaction(ctx, async (tx) => {
+  // Emailing changes nothing in the books: a member who may only view and print forms (the
+  // legacy 'viewer' role) may send one. The flag and audit are written without that role —
+  // refused AFTER the email went out, the user saw an error, the flag stayed and a retry emailed
+  // the customer again (attention.ts does the same for reminders).
+  const writeCtx: ServiceContext = { ...ctx, role: ctx.role === 'viewer' ? undefined : ctx.role };
+  // A queued send claims the form first: two overlapping batch sends emailed the overlap twice.
+  if (opts?.queued) {
+    const claimed = await writeCtx.db
+      .update(t)
+      .set({ toBeEmailed: false } as never)
+      .where(and(eq(t.companyId, ctx.companyId), eq(t.id, id), eq((t as unknown as { toBeEmailed: typeof invoices.toBeEmailed }).toBeEmailed, true)))
+      .returning({ id: t.id });
+    if (claimed.length === 0) throw new ServiceError('CONFLICT', 'This form was already sent (it is no longer waiting to be emailed).', { alreadySent: true });
+  }
+  let recipient: string;
+  try {
+    const form = await renderSalesForm(ctx, kind, id, templateId);
+    recipient = await deliver(ctx, form, to);
+  } catch (err) {
+    // Not sent: back in the queue.
+    if (opts?.queued) await writeCtx.db.update(t).set({ toBeEmailed: true } as never).where(and(eq(t.companyId, ctx.companyId), eq(t.id, id)));
+    throw err;
+  }
+  await inTransaction(writeCtx, async (tx) => {
     await tx.db
       .update(t)
       .set({ toBeEmailed: false, lastEmailedAt: new Date() } as never)
@@ -445,7 +482,8 @@ export async function emailCustomerStatement(
   if (!(await isConfigured(ctx))) throw emailNotSetUpError();
   const form = await renderCustomerStatement(ctx, customerId, { from: opts?.from, to: opts?.to });
   const recipient = await deliver(ctx, form, opts?.email);
-  await writeAudit(ctx, {
+  // Audited without the view-only role (see emailSalesForm): the statement already went out.
+  await writeAudit({ ...ctx, role: ctx.role === 'viewer' ? undefined : ctx.role }, {
     action: 'update',
     entityType: 'customer',
     entityId: customerId,
@@ -592,10 +630,12 @@ export async function sendQueuedEmails(
       continue;
     }
     try {
-      const r = await emailSalesForm(ctx, it.kind, it.id, it.to);
+      // Only forms still waiting to be emailed (claimed atomically — see emailSalesForm).
+      const r = await emailSalesForm(ctx, it.kind, it.id, it.to, null, { queued: true });
       sent.push({ kind: it.kind, id: it.id, to: r.to });
     } catch (err) {
-      if (err instanceof ServiceError && err.code === 'FORBIDDEN') throw err;
+      // A form-specific refusal (no right to that form) is that item's failure, not the batch's.
+      if (err instanceof ServiceError && err.code === 'FORBIDDEN' && !(err.details as { activity?: string } | undefined)?.activity) throw err;
       failed.push({ kind: it.kind, id: it.id, error: err instanceof Error ? err.message : 'Could not send.' });
     }
   }

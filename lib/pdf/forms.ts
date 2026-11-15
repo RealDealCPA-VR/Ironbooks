@@ -7,6 +7,18 @@
  * `resolveFormTemplate(ctx, '<form>', templateId)`, then `renderFormPdf(doc, t.design, t.logo)`.
  */
 import { and, eq, inArray } from 'drizzle-orm';
+import { effectiveHomeCurrency } from '@/lib/services/multiCurrency';
+import { Money, toAmountString } from '@/lib/money';
+
+/** The company's home currency code for printed amounts (USD when none is set). */
+async function homeCurrencyCode(ctx: ServiceContext): Promise<string> {
+  try {
+    return ((await effectiveHomeCurrency(ctx)) ?? 'USD').toUpperCase();
+  } catch {
+    return 'USD';
+  }
+}
+const toStr = (d: ReturnType<typeof Money.zero>) => toAmountString(d.isNegative() ? Money.zero() : d);
 import { accounts, customers, items, jobs, vendors } from '@/lib/db/schema';
 import type { ServiceContext } from '@/lib/services/_base';
 import { getCompany, getPreferences } from '@/lib/services/company';
@@ -113,7 +125,10 @@ export async function buildInvoicePdf(
     {
       company: letterhead,
       customerName,
-      currency: invoice.currency ?? undefined,
+      // Home-currency invoices store no currency: the company's own, never a blanket USD.
+      currency: invoice.currency ?? (await homeCurrencyCode(ctx)),
+      payments: toStr(Money.of(invoice.total).minus(Money.of(invoice.balanceDue)).minus(Money.of((invoice as { retainageAmount?: string }).retainageAmount ?? '0'))),
+      retainage: (invoice as { retainageAmount?: string }).retainageAmount ?? null,
       customerMessage: await customerMessageText(ctx, invoice.customerMessageId),
       billToLines: addressToLines(cust?.billingAddress),
       shipToLines: addressToLines(cust?.shippingAddress),
@@ -175,6 +190,7 @@ export async function buildEstimatePdf(
     {
       company: letterhead,
       customerName: cust?.displayName ?? 'Customer',
+      currency: (estimate as { currency?: string | null }).currency ?? (await homeCurrencyCode(ctx)),
       billToLines: addressToLines(cust?.billingAddress),
       customerMessage: await customerMessageText(ctx, estimate.customerMessageId),
       estimate: {

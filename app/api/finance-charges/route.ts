@@ -10,6 +10,7 @@
  * balance (idempotent per asOf month). Returns { assessed, skipped }.
  */
 import { NextRequest, NextResponse } from 'next/server';
+import { canRef } from '@/lib/permissions/model';
 import { getServerContext } from '@/lib/context';
 import { assessFinanceCharges } from '@/lib/services/financeCharges';
 import { ServiceError } from '@/lib/services/_base';
@@ -39,7 +40,9 @@ export async function POST(req: NextRequest) {
     const result = await assessFinanceCharges(ctx, {
       asOf,
       customerIds: Array.isArray(body.customerIds) ? body.customerIds.map(String) : undefined,
-      settings: body.settings ?? undefined,
+      // Run-time overrides of the stored preferences (rate, account, charging finance charges)
+      // need the right to change those preferences; otherwise the company's settings apply.
+      settings: body.settings && (!ctx.access || canRef(ctx.access, 'company', 'modify')) ? body.settings : undefined,
     });
     return NextResponse.json(result);
   } catch (err) {

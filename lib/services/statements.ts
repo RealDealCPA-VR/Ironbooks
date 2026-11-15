@@ -579,7 +579,65 @@ async function homeCurrencyStatement(
  */
 const invoicePaymentLinesSql = sql`(SELECT COALESCE(SUM(CAST(${invoiceLines.amount} AS NUMERIC)), 0) FROM ${invoiceLines} INNER JOIN ${items} ON ${items.id} = ${invoiceLines.itemId} WHERE ${invoiceLines.invoiceId} = ${invoices.id} AND ${items.type} = 'payment')`;
 
+/** A customer and all its jobs (any depth), the customer first. */
+async function customerWithJobs(ctx: ServiceContext, customerId: string): Promise<string[]> {
+  const rows = await ctx.db
+    .select({ id: customers.id, parentId: customers.parentId })
+    .from(customers)
+    .where(eq(customers.companyId, ctx.companyId));
+  const ids = [customerId];
+  const keep = new Set(ids);
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const r of rows) if (r.parentId && keep.has(r.parentId) && !keep.has(r.id)) (keep.add(r.id), ids.push(r.id), (grew = true));
+  }
+  return ids;
+}
+
+/**
+ * Balance-forward statement of a customer, its jobs included (QB: one statement per customer,
+ * covering all its jobs — Acme's showed $0 while its jobs owed $7,000 and A/R aging said so).
+ * Each job's lines merge into the customer's by date with one running balance.
+ */
 export async function customerStatement(
+  ctx: ServiceContext,
+  customerId: string,
+  range?: { from?: Date; to?: Date },
+): Promise<CustomerStatement> {
+  const ids = await customerWithJobs(ctx, customerId);
+  const own = await customerStatementOne(ctx, customerId, range);
+  if (ids.length === 1) return own;
+  const parts = [own];
+  for (const id of ids.slice(1)) parts.push(await customerStatementOne(ctx, id, range));
+  let opening = Money.zero();
+  const moves: Array<{ line: StatementLine; delta: ReturnType<typeof Money.zero>; seq: number }> = [];
+  let seq = 0;
+  for (const st of parts) {
+    opening = opening.plus(Money.of(st.openingBalance));
+    let prev = Money.of(st.openingBalance);
+    for (const line of st.lines) {
+      const run = Money.of(line.runningBalance);
+      moves.push({ line, delta: run.minus(prev), seq: seq++ });
+      prev = run;
+    }
+  }
+  moves.sort((a, b) => (a.line.date < b.line.date ? -1 : a.line.date > b.line.date ? 1 : a.seq - b.seq));
+  let running = opening;
+  const lines = moves.map(({ line, delta }) => {
+    running = running.plus(delta);
+    return { ...line, runningBalance: toAmountString(running) };
+  });
+  return {
+    ...own,
+    openingBalance: toAmountString(opening),
+    lines,
+    closingBalance: toAmountString(parts.reduce((sum, st) => sum.plus(Money.of(st.closingBalance)), Money.zero())),
+    homeCurrency: parts.some((st) => st.homeCurrency) || undefined,
+  };
+}
+
+async function customerStatementOne(
   ctx: ServiceContext,
   customerId: string,
   range?: { from?: Date; to?: Date },
@@ -996,7 +1054,9 @@ export async function openItemStatement(
 
   // Lazy import: reportsExtra pulls in the report stack, which statements does not need otherwise.
   const { arAgingDetail } = await import('./reportsExtra');
-  const detail = (await arAgingDetail(ctx, asOf)).rows.filter((r) => r.entityId === customerId);
+  // The customer's jobs too (as A/R aging by customer does).
+  const scope = new Set(await customerWithJobs(ctx, customerId));
+  const detail = (await arAgingDetail(ctx, asOf)).rows.filter((r) => scope.has(r.entityId));
 
   // Document details the aging rows don't carry (totals, numbers).
   const idsOf = (t: string) => detail.filter((d) => d.docType === t).map((d) => d.docId);
@@ -1172,10 +1232,12 @@ export async function batchStatements(
     asOf?: Date;
   },
 ): Promise<BatchStatementEntry[]> {
+  // Every customer — an inactive one that still owes gets its statement too (empty ones are
+  // skipped below) — but not jobs: they are on their customer's statement.
   const custRows = await ctx.db
-    .select({ id: customers.id, displayName: customers.displayName })
+    .select({ id: customers.id, displayName: customers.displayName, parentId: customers.parentId })
     .from(customers)
-    .where(and(eq(customers.companyId, ctx.companyId), eq(customers.isActive, true)))
+    .where(and(eq(customers.companyId, ctx.companyId), isNull(customers.parentId)))
     .orderBy(asc(customers.displayName));
 
   const out: BatchStatementEntry[] = [];

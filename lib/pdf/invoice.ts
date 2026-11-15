@@ -40,6 +40,10 @@ export interface InvoicePdfData {
   shipToLines?: string[];
   lines: InvoicePdfLine[];
   currency?: string;
+  /** Payments and credits applied (Total − Balance Due − retainage held). */
+  payments?: string | number | null;
+  /** Retainage held back from this invoice. */
+  retainage?: string | number | null;
   /**
    * wave2 sales (B6): the invoice's own ship date / via / FOB / tracking # / ship-to / customer
    * P.O. No. Fills the template's header fields and Ship To block (wins over the defaults above).
@@ -115,6 +119,9 @@ export async function renderInvoicePdf(data: InvoicePdfData, template?: PdfTempl
         ...(discount !== 0 ? [{ label: 'Discount', value: -Math.abs(discount) }] : []),
         ...(tax !== 0 ? [{ label: 'Tax', value: inv.tax }] : []),
         { label: 'Total', value: inv.total, emphasis: 'total' as const },
+        // What closes the gap between Total and Balance Due (QB prints Payments/Credits).
+        ...((parseFloat(String(data.payments ?? 0)) || 0) > 0 ? [{ label: 'Payments/Credits', value: -Math.abs(parseFloat(String(data.payments))) }] : []),
+        ...((parseFloat(String(data.retainage ?? 0)) || 0) > 0 ? [{ label: 'Retainage held', value: -Math.abs(parseFloat(String(data.retainage))) }] : []),
         ...(balance > 0 ? [{ label: 'Balance Due', value: inv.balanceDue, emphasis: 'balance' as const }] : []),
       ],
       memo: inv.memo,
