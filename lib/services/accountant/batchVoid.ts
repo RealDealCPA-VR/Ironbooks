@@ -67,7 +67,7 @@ import { createPurchaseOrder, deletePurchaseOrder, updateStatus as updatePurchas
 import { voidJournalEntry } from '../posting';
 import { createManualEntry, voidEntry } from '../journal';
 import { assertNotFifoTracked } from '../inventory';
-import { reverseSourceMovements } from '../inventorySites';
+import { reverseSourceMovements, assertDefaultSiteQuantities } from '../inventorySites';
 import { refuseInAccountantCopy } from '../nonPostingDocs';
 import { type VersionedEntity, assertCurrentVersion } from '../concurrency';
 import { requirePermission } from '../access';
@@ -513,11 +513,15 @@ export async function voidInventoryAdjustment(ctx: ServiceContext, entryId: stri
     const newValue = qoh.times(avg).minus(valueChange);
     const newAvg = newQty.isZero() ? Money.zero() : newValue.div(newQty);
     await voidJournalEntry(tx, entryId);
-    await reverseSourceMovements(tx, 'adjustment', entryId);
+    // The new on-hand quantity first, then the site movements are reversed and the default site
+    // re-checked against it (as invoices and receipts do): checked against the OLD quantity, a void
+    // whose units were sold from the default site left that site negative.
     await tx.db
       .update(items)
       .set({ quantityOnHand: newQty.toFixed(4), averageCost: (newAvg.isNegative() ? Money.zero() : newAvg).toFixed(4), updatedAt: new Date() })
       .where(eq(items.id, itemId));
+    await reverseSourceMovements(tx, 'adjustment', entryId);
+    await assertDefaultSiteQuantities(tx, [itemId]);
     await writeAudit(tx, {
       action: 'void',
       entityType: 'inventory_adjustment',

@@ -11,6 +11,7 @@
  * 'adjustment', sourceId = the posted journal entry) is written in the same transaction.
  */
 import { and, eq, isNotNull, sql } from 'drizzle-orm';
+import { requirePermission } from './access';
 import { inventoryLayers, itemSiteSettings, items } from '@/lib/db/schema';
 import { Money } from '@/lib/money';
 import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from './_base';
@@ -39,6 +40,8 @@ export interface SiteAdjustmentInput extends InventoryLineDetail, AdjustmentDime
 }
 
 export async function adjustQuantityAtSite(ctx: ServiceContext, input: SiteAdjustmentInput) {
+  // A quantity adjustment (it posts value to the ledger): the Adjust Quantity right, not Sites & Bins.
+  requirePermission(ctx, 'inventory.adjust', 'create');
   const qty = inventoryNumber(input.quantityChange, 'Quantity');
   if (qty.isZero()) throw validation('quantityChange cannot be zero.');
   if (input.unitCost != null && input.unitCost !== '') inventoryNumber(input.unitCost, 'Unit cost');

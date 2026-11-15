@@ -476,7 +476,8 @@ function NewReceiptModal({
 
   // Advanced pricing: server-side price rules / price levels / customer prices per line.
   const quotes = usePriceQuotes(
-    { customerId: customerId || null, date },
+    // The receipt's class too (the server prices class rules with it).
+    { customerId: customerId || null, date, classId: classId || null },
     lines.map((l) => ({ itemId: l.itemId || null, quantity: l.quantity || '1' })),
   );
   useEffect(() => {

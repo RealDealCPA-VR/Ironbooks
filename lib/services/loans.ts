@@ -625,6 +625,25 @@ export async function updateLoan(ctx: ServiceContext, id: string, input: LoanInp
   const v = await validateLoanInput(ctx, input, existing);
   // Payments already made through the Loan Manager carry their numbers: the loan's starting point
   // can't move under them.
+  const madeAny = (await paymentsFor(ctx, id)).some((p) => p.active);
+  if (madeAny) {
+    // The currency, rate, liability account and schedule the recorded payments were made under:
+    // changed afterwards, the schedule mixed currencies, jumped its dates or split the balance
+    // across two accounts.
+    const day = (x: Date | string | null | undefined) => (x ? new Date(x).toISOString().slice(0, 10) : null);
+    const changed: string[] = [];
+    if ((v.currency ?? null) !== (existing.currency ?? null)) changed.push('currency');
+    if ((v.fxRate ?? null) !== null && existing.exchangeRate != null && !Money.of(v.fxRate as never).equals(Money.of(existing.exchangeRate))) changed.push('exchange rate');
+    if (input.liabilityAccountId !== existing.liabilityAccountId) changed.push('loan account');
+    if (Number(v.ppy) !== Number(existing.paymentsPerYear)) changed.push('payment frequency');
+    if (day(input.firstPaymentDate) !== day(existing.firstPaymentDate)) changed.push('first payment date');
+    if (changed.length) {
+      throw new ServiceError(
+        'CONFLICT',
+        `Payments were already made on this loan in the Loan Manager, so its ${changed.join(', ')} can't be changed. Set up a new loan for new terms.`,
+      );
+    }
+  }
   if (v.startNumber !== existing.scheduleStartNumber) {
     const made = (await paymentsFor(ctx, id)).filter((p) => p.active);
     if (made.length > 0) {
@@ -731,7 +750,8 @@ async function liabilityAccountBalance(ctx: ServiceContext, loan: typeof loans.$
       and(
         eq(loans.companyId, ctx.companyId),
         eq(loans.liabilityAccountId, loan.liabilityAccountId),
-        eq(loans.isActive, true),
+        // Removed loans too: one removed with a balance still owes on the account (the other loan
+        // then read the whole account — both loans — as its own balance).
         ne(loans.id, loan.id),
       ),
     )

@@ -684,6 +684,8 @@ async function prepareInvoice(
       classId: input.classId ?? null,
       salesRepId: input.salesRepId ?? null,
       jobId: input.jobId ?? null,
+      // A foreign-currency invoice is priced in its currency (the typed rate, else the list's).
+      exchangeRate: input.currency ? (await currencyRate(ctx, input.currency, input.exchangeRate ?? null).catch(() => null))?.rate?.toString() ?? null : null,
     },
     input.lines,
   );

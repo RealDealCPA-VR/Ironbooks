@@ -800,21 +800,27 @@ function InvoiceModal({
 
   // Advanced pricing: server-side price rules / price levels / customer prices per line.
   const quotes = usePriceQuotes(
-    { customerId, date, classId: classId || null },
-    lines.map((l) => ({ itemId: lineKind(l) === 'income' ? l.itemId : null, quantity: l.quantity || '1' })),
+    // Everything the server prices with (rep / job / line class rules applied only on save, as
+    // "overridden" with the base price billed, when the form left them out).
+    { customerId, date, classId: classId || null, salesRepId: salesRepId || null, jobId: headerJobId || null },
+    lines.map((l) => ({ itemId: lineKind(l) === 'income' ? l.itemId : null, quantity: l.quantity || '1', classId: l.classId || null })),
   );
   useEffect(() => {
     setLines((prev) => {
       let changed = false;
       const next = prev.map((l, i) => {
         const qt = quotes[i];
-        if (!qt || l.rateManual || l.itemId !== qt.itemId || samePrice(l.rate, qt.price)) return l;
+        // Quotes are home-currency: a foreign-currency invoice shows them at its typed rate.
+        if (!qt || l.rateManual || l.itemId !== qt.itemId) return l;
+        const fx = currency && exchangeRate && Number(exchangeRate) > 0 ? Number(exchangeRate) : 1;
+        const price = fx === 1 ? qt.price : (Math.round((Number(qt.price) / fx) * 100) / 100).toFixed(2);
+        if (samePrice(l.rate, price)) return l;
         changed = true;
-        return { ...l, rate: String(Number(qt.price)) };
+        return { ...l, rate: String(Number(price)) };
       });
       return changed ? next : prev;
     });
-  }, [quotes]);
+  }, [quotes, currency, exchangeRate]);
 
   /** Expand a bundle item into its component lines (printed grouped under the bundle name). */
   async function expandBundle(idx: number, bundle: Item) {

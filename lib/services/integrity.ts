@@ -819,6 +819,9 @@ async function computeItemQuantityFixes(ctx: ServiceContext): Promise<ItemQtyFix
 
   const fixes: ItemQtyFix[] = [];
   for (const item of itemRows) {
+    // Only FIFO items keep layers: an average-cost item has none by design, and "expected 0"
+    // zeroed every one of them (their default site then went negative).
+    if (!qtyByItem.has(item.id)) continue;
     const expected = Money.of(qtyByItem.get(item.id) ?? 0);
     const current = Money.of(item.quantityOnHand ?? 0);
     if (!Money.eq(current, expected)) {

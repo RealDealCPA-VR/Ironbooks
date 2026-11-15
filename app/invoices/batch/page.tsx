@@ -216,7 +216,9 @@ export default function BatchInvoicingPage() {
           itemId: l.itemId || null,
           description: l.description || null,
           quantity: l.quantity || '1',
-          rate: l.rate === '' ? null : l.rate,
+          // A rate the user didn't type is left to the server, which prices each customer with its
+          // own price level / customer price / rules (this grid quotes for no customer).
+          rate: l.rate === '' || !l.rateManual ? null : l.rate,
           taxable: l.taxable,
         })),
       });

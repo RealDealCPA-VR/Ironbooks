@@ -1033,6 +1033,15 @@ export async function payCreditCard(ctx: ServiceContext, input: PayCreditCardInp
   if (!isBankAccount(pay)) {
     throw validation(`"${pay.name}" is not a bank account. Pay the credit card from a checking or savings (bank) account.`);
   }
+  // A home-currency card paid from a foreign-currency bank posted at the list rate (or 1:1 with
+  // none) and ignored the rate typed: pay it from a home-currency account.
+  {
+    const [payCur] = await ctx.db.select({ currency: accounts.currency }).from(accounts).where(eq(accounts.id, input.paymentAccountId));
+    const { foreignCode, homeCode } = await import('./exchangeRates');
+    if (foreignCode(payCur?.currency ?? null, await homeCode(ctx))) {
+      throw validation(`"${pay.name}" is a ${payCur!.currency} account. Pay this home-currency card from a home-currency bank account.`);
+    }
+  }
 
   const sourceRef = input.reconciliationId ? `cc-payment:${input.reconciliationId}` : undefined;
   const amtStr = toAmountString(amt);

@@ -84,7 +84,8 @@ export function PricedLinesEditor({
 
   const quotes = usePriceQuotes(
     header,
-    lines.map((l) => ({ itemId: l.itemId || null, quantity: l.quantity || '1' })),
+    // Each line's class too (the server prices class rules with it).
+    lines.map((l) => ({ itemId: l.itemId || null, quantity: l.quantity || '1', classId: l.classId || null })),
   );
   useEffect(() => {
     let changed = false;

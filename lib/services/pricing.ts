@@ -109,6 +109,8 @@ export function roundPrice(value: Decimal.Value, mode: RoundingMode | null | und
   const step = (inc: string, rounding: Decimal.Rounding) =>
     cents(p.dividedBy(inc).toDecimalPlaces(0, rounding).times(inc));
 
+  // A free line stays free (".99" rounding billed a 100%-off sample at $0.99).
+  if (p.lessThanOrEqualTo(0)) return cents(new Decimal(0));
   const up99 = () => {
     // Smallest N.99 >= p.
     let n = p.minus('0.99').toDecimalPlaces(0, Decimal.ROUND_CEIL);
@@ -316,6 +318,9 @@ export function priceUnderRule(
   // A cost-based adjustment on an item with no known cost cannot be evaluated: skip the rule
   // rather than price from a cost of 0 (which would give the item away).
   if (adjustment.method !== 'fixed' && adjustment.basis === 'cost' && item.cost == null) return null;
+  // Likewise a price-based adjustment on an item with no sales price: it priced the line at $0,
+  // and in "lowest price wins" that $0 beat the customer's own price.
+  if (adjustment.method !== 'fixed' && adjustment.basis !== 'cost' && item.salesPrice == null) return null;
   const raw = applyAdjustment(item.salesPrice ?? 0, item.cost ?? 0, adjustment);
   return {
     price: roundPrice(raw, rule.rounding ?? defaultRounding),
@@ -380,9 +385,10 @@ export function evaluateLinePrice(item: EngineItem, data: EngineData, line: Engi
       if (level.type === 'per_item') {
         const p = data.levelPrices.get(item.id);
         if (p != null) levelPrice = roundPrice(p, 'none');
-      } else {
+      } else if (item.salesPrice != null) {
+        // A fixed-% level needs the item's price (none: no level price, never $0).
         const pct = new Decimal(level.percent || 0);
-        const raw = new Decimal(item.salesPrice ?? 0).times(new Decimal(100).plus(pct)).dividedBy(100);
+        const raw = new Decimal(item.salesPrice).times(new Decimal(100).plus(pct)).dividedBy(100);
         levelPrice = roundPrice(raw, level.rounding ?? data.settings.defaultRounding);
       }
       if (levelPrice) {
@@ -924,6 +930,8 @@ export interface PricingHeader {
   classId?: string | null;
   salesRepId?: string | null;
   jobId?: string | null;
+  /** A foreign-currency document: home units per 1 document unit (prices are converted). */
+  exchangeRate?: string | number | null;
 }
 
 export interface QuoteLineInput {
@@ -1157,13 +1165,20 @@ export async function resolveLinePricing<T extends PricedLineInput>(
         pricing: null,
       };
     }
-    const quote = evaluateLinePrice(item, data, {
+    const homeQuote = evaluateLinePrice(item, data, {
       date,
       quantity: qty,
       classId: l.classId ?? header.classId ?? null,
       salesRepId: header.salesRepId ?? null,
       jobId: l.jobId ?? header.jobId ?? null,
     });
+    // Prices are home-currency: on a foreign-currency document they are converted at its rate
+    // (a $100 item on a EUR invoice at 1.10 is €90.91, not €100).
+    const fxRate = header.exchangeRate != null && String(header.exchangeRate).trim() !== '' ? toDecimal(header.exchangeRate) : null;
+    const quote =
+      fxRate && fxRate.greaterThan(0) && !fxRate.equals(1)
+        ? { ...homeQuote, price: toDecimal(homeQuote.price).dividedBy(fxRate).toDecimalPlaces(2, Decimal.ROUND_HALF_UP).toFixed(2) }
+        : homeQuote;
     const overridden = hasRate && !toDecimal(rawRate).equals(toDecimal(quote.price));
     const pricing: AppliedPricing = {
       source: overridden ? 'manual' : quote.source,

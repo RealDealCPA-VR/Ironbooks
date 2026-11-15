@@ -39,7 +39,7 @@ import {
   writeAudit,
 } from './_base';
 import { postJournalEntry } from './posting';
-import { accountNumberFor, maskForContext } from './access';
+import { accountNumberFor, maskForContext, requirePermission } from './access';
 import { payCreditCard } from './liabilityPayments';
 import { accountCreditSql, accountDebitSql, foreignCurrencyOfAccount, nz } from './fxLedger';
 import { currencyRate, toHome } from './exchangeRates';
@@ -1742,6 +1742,8 @@ export async function payCreditCardBalance(
   reconciliationId: string,
   input: PayCreditCardBalanceInput,
 ) {
+  // It writes a check: the Write Checks right, not only Reconcile.
+  requirePermission(ctx, 'banking.write_checks', 'create');
   // Typed input from the "write a check for the balance" form: a non-number amount or an
   // unparseable date used to escape as MoneyParseError / RangeError → HTTP 500.
   if (typeof input.paymentAccountId !== 'string' || !input.paymentAccountId) throw validation('Choose the account to pay from.');

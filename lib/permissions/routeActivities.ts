@@ -129,7 +129,9 @@ export const ROUTE_ACTIVITIES: Record<string, ActivityRef> = {
   '/api/leads': 'customers.leads',
   '/api/customer-prices': 'customers.pricing',
   '/api/pricing/customers': 'customers.center',
-  '/api/pricing/quote': 'customers.pricing',
+  // (no activity: any member who may view Customers gets quotes on the forms they enter — a clerk
+  //  with Invoices only silently got base prices; prices are not sensitive, rules are edited
+  //  under Customer Pricing)
   '/api/invoices': 'customers.invoices',
   '/api/invoices/batch': 'customers.batch_invoicing',
   '/api/invoices/statement-charges': 'customers.statement_charges',

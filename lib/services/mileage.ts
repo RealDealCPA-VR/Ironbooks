@@ -317,7 +317,8 @@ export async function mileageSummary(
 
   for (const r of rows) {
     const mi = Money.of(r.miles);
-    const amt = Money.mul(r.miles, r.ratePerMile);
+    // Each trip rounded to the cent, as its row shows (the total of rows, not of raw products).
+    const amt = Money.round2(Money.mul(r.miles, r.ratePerMile));
     totalMiles = totalMiles.plus(mi);
     totalAmount = totalAmount.plus(amt);
 
