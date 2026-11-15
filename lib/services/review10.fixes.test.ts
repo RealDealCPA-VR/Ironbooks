@@ -16,6 +16,7 @@ import { createAsset, postDepreciation } from './fixedAssets';
 import { createTemplate } from './recurring';
 import { cashFlowForecast } from './reportsMore';
 import { makeTestCompany, type TestCompany } from './testkit.prefs';
+import { renderSalesFormPdf } from '@/lib/pdf/salesForm';
 
 let t: TestCompany;
 const d = (s: string) => new Date(`${s}T00:00:00.000Z`);
@@ -79,5 +80,21 @@ describe('cash flow forecast', { timeout: 120_000 }, () => {
     const after = await cashFlowForecast(t.ctx, { from: '2026-06-01', to: '2026-07-12' } as never);
     const begin = (r: typeof before) => JSON.stringify(r.rows.find((x) => /begin/i.test(String(x.cells.label ?? '')))?.cells ?? {});
     expect(begin(after)).toBe(begin(before));
+  });
+});
+
+describe('printed forms', () => {
+  it('a currency symbol the PDF font lacks prints as its code (no crash)', async () => {
+    const bytes = await renderSalesFormPdf({
+      company: { name: 'R10 Co' },
+      title: 'SALES RECEIPT',
+      number: '1',
+      date: '2026-11-14',
+      customerName: 'Buyer',
+      currency: 'INR',
+      lines: [{ description: 'Item', quantity: 1, rate: 1234.5, amount: 1234.5 }],
+      totals: [['Total', 1234.5]],
+    } as never);
+    expect(bytes.length).toBeGreaterThan(500);
   });
 });

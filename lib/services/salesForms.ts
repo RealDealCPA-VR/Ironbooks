@@ -120,7 +120,7 @@ export interface RenderedForm {
   currency?: string | null;
 }
 
-/** A form's own currency code when it has one (null = the home currency). */
+/** The company's home currency code (USD when none is set). */
 async function homeCurrencyOf(ctx: ServiceContext): Promise<string> {
   try {
     const { effectiveHomeCurrency } = await import('./multiCurrency');
@@ -130,6 +130,7 @@ async function homeCurrencyOf(ctx: ServiceContext): Promise<string> {
   }
 }
 
+/** A form's own currency code when it has one (null = the home currency). */
 function currencyOf(doc: object): string | null {
   const c = (doc as { currency?: unknown }).currency;
   return typeof c === 'string' && c.trim() ? c.trim() : null;

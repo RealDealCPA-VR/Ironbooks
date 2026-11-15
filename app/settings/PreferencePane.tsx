@@ -247,9 +247,13 @@ export default function PreferencePane({
   const companyCount = companyKeys.length + (!myOnly && notes.company ? 1 : 0);
   const myCount = myKeys.length + (notes.my ? 1 : 0);
 
+  /** The company values this tab's draft was built from (what a save diffs against). */
+  const baseline = React.useRef<Draft>({});
   React.useEffect(() => {
     if (!prefs.loaded) return;
-    setDraft(Object.fromEntries(companyKeys.map((k) => [k, (prefs.company as unknown as Draft)[k]])));
+    const loadedDraft = Object.fromEntries(companyKeys.map((k) => [k, (prefs.company as unknown as Draft)[k]]));
+    baseline.current = loadedDraft;
+    setDraft(loadedDraft);
     setMyDraft(Object.fromEntries(myKeys.map((k) => [k, (prefs.my as unknown as Draft)[k]])));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [prefs.loaded, categoryId]);
@@ -279,9 +283,11 @@ export default function PreferencePane({
       if (scope === 'company') {
         // Only what was changed on this tab: the whole tab as loaded (maybe hours ago) wrote back
         // another admin's newer choice on a key this user never touched.
-        const loaded = prefs.company as unknown as Draft;
+        // Against what this draft was built from (the shared cache moves on when anyone refreshes).
+        const loaded = baseline.current;
         const changed = Object.fromEntries(Object.entries(draft).filter(([k, v]) => JSON.stringify(v) !== JSON.stringify(loaded[k])));
         if (Object.keys(changed).length) await api.patch('/api/company', { settings: changed });
+        baseline.current = { ...loaded, ...changed };
       } else {
         await api.patch('/api/preferences/my', myDraft);
         // Desktop shell: apply the spelling preference right away.

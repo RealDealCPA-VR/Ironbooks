@@ -24,3 +24,13 @@ export function encodeWindows1252(text: string): Buffer {
   }
   return Buffer.from(out);
 }
+
+/** True when every character of `text` exists in Windows-1252 (what the PDF standard fonts draw). */
+export function isWindows1252(text: string): boolean {
+  for (const ch of text) {
+    const cp = ch.codePointAt(0)!;
+    if (cp < 0x80 || (cp >= 0xa0 && cp <= 0xff)) continue;
+    if (CP1252_HIGH[cp] === undefined) return false;
+  }
+  return true;
+}

@@ -11,6 +11,7 @@
  * column headings repeated; "Page x of y" and the footer print on every page.
  */
 import { PDFDocument, PDFFont, PDFImage, PDFPage, StandardFonts, rgb, PageSizes, type RGB } from 'pdf-lib';
+import { isWindows1252 } from '@/lib/textEncode';
 import { stampSandbox } from './sandboxStamp';
 import {
   MONEY_COLUMNS,
@@ -92,8 +93,11 @@ export function pdfSafe(text: string): string {
 export function formatMoney(value: string | number | null | undefined, currency = 'USD'): string {
   const n = typeof value === 'string' ? parseFloat(value) : (value ?? 0);
   try {
-    // narrowSymbol: "$" for CAD / AUD (not "CA$"), "€", "£".
-    return new Intl.NumberFormat('en-US', { style: 'currency', currency, currencyDisplay: 'narrowSymbol' }).format(Number.isFinite(n) ? n : 0);
+    // narrowSymbol: "$" for CAD / AUD (not "CA$"), "€", "£"; a symbol the standard font can't
+    // draw ("₦" printed as "?") shows its ISO code instead.
+    const v = Number.isFinite(n) ? n : 0;
+    const sym = new Intl.NumberFormat('en-US', { style: 'currency', currency, currencyDisplay: 'narrowSymbol' }).format(v);
+    return isWindows1252(sym) ? sym : new Intl.NumberFormat('en-US', { style: 'currency', currency, currencyDisplay: 'code' }).format(v);
   } catch {
     return (Number.isFinite(n) ? n : 0).toFixed(2);
   }

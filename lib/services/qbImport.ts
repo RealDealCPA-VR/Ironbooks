@@ -1370,15 +1370,12 @@ const salesRepImporter: ListImporter = async ({ ctx, counts }, rows) => {
  * One budget per (fiscal year, class, customer); quarter / year amounts are spread evenly
  * (penny-exact) across their months.
  */
-const budgetImporter: ListImporter = async ({ ctx, counts, lookup }, rows) => {
+const budgetImporter: ListImporter = async ({ ctx, counts, lookup, classIdByPath }, rows) => {
   const existing = await listBudgets(ctx);
   const budgetIds = new Map(existing.map((b) => [`${b.name}|${b.fiscalYear}`, b.id]));
   const fye = await companyFiscalYearEnd(ctx);
   // A budget by class / Customer:Job keeps that dimension (it was only in the budget's NAME, so
   // each class's budget was compared with the whole company's actuals).
-  const classByName = new Map(
-    (await ctx.db.select({ id: classesTable.id, name: classesTable.name }).from(classesTable).where(eq(classesTable.companyId, ctx.companyId))).map((c) => [c.name.trim().toLowerCase(), c.id]),
-  );
   const customerIndex = customerKeyIndex(
     await ctx.db.select({ id: customersTable.id, displayName: customersTable.displayName, parentId: customersTable.parentId }).from(customersTable).where(eq(customersTable.companyId, ctx.companyId)),
   );
@@ -1397,11 +1394,22 @@ const budgetImporter: ListImporter = async ({ ctx, counts, lookup }, rows) => {
       continue;
     }
     const suffix = [opt(r.CLASS), opt(r.CUSTOMER)].filter(Boolean).join(' / ');
-    const classId = opt(r.CLASS) ? classByName.get(String(opt(r.CLASS)).trim().toLowerCase()) ?? null : null;
+    // Classes by their full "Parent:Sub" path (leaf names collide across parents).
+    const classId = opt(r.CLASS) ? classIdByPath.get(normPath(String(opt(r.CLASS)))) ?? null : null;
     const customerId = opt(r.CUSTOMER) ? customerIndex.get(customerKey(String(opt(r.CUSTOMER)))) ?? null : null;
-    // Balance-sheet accounts go to a balance-sheet budget (a P&L budget refused every such row).
+    // Balance-sheet accounts go to a balance-sheet budget (a P&L budget refused every such row);
+    // those are company-wide, so they are not named after a class / customer.
     const balanceSheet = acct.type !== 'revenue' && acct.type !== 'expense';
-    const name = `${suffix ? `QuickBooks budget — ${suffix}` : 'QuickBooks budget'}${balanceSheet ? ' (balance sheet)' : ''}`;
+    if (!balanceSheet && ((opt(r.CLASS) && !classId) || (opt(r.CUSTOMER) && !customerId))) {
+      counts.issues.push({
+        entity: 'list',
+        name: `Budget ${r.ACCNT ?? ''}`,
+        reason: 'validation',
+        message: `Budget row for ${[opt(r.CLASS), opt(r.CUSTOMER)].filter(Boolean).join(' / ')}: that class / customer was not found, so it was skipped (it would have counted company-wide).`,
+      });
+      continue;
+    }
+    const name = balanceSheet ? 'QuickBooks budget (balance sheet)' : suffix ? `QuickBooks budget — ${suffix}` : 'QuickBooks budget';
     try {
       const period = (r.PERIOD ?? 'MONTH').toUpperCase();
       const months = period.startsWith('Q') ? 3 : period.startsWith('Y') ? 12 : 1;

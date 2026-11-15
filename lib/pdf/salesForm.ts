@@ -8,6 +8,7 @@
  * continues on a new page when it runs out of room.
  */
 import { PDFDocument, PageSizes, StandardFonts, rgb, type PDFFont, type PDFPage } from 'pdf-lib';
+import { isWindows1252 } from '@/lib/textEncode';
 import { stampSandbox } from './sandboxStamp';
 
 export interface SalesShippingInfo {
@@ -63,8 +64,11 @@ const COLOR_GRAY = rgb(0.45, 0.45, 0.5);
 export function fmtMoney(value: string | number, currency: string = 'USD'): string {
   const n = typeof value === 'string' ? parseFloat(value) : value;
   try {
-    // narrowSymbol: "$" for CAD / AUD (not "CA$"), "€", "£".
-    return new Intl.NumberFormat('en-US', { style: 'currency', currency, currencyDisplay: 'narrowSymbol' }).format(isNaN(n) ? 0 : n);
+    // narrowSymbol: "$" for CAD / AUD (not "CA$"), "€", "£" — but a symbol the PDF's standard
+    // font can't draw ("₹", "₦", "₺") made the page throw: then the ISO code ("INR 1,234.50").
+    const v = isNaN(n) ? 0 : n;
+    const sym = new Intl.NumberFormat('en-US', { style: 'currency', currency, currencyDisplay: 'narrowSymbol' }).format(v);
+    return isWindows1252(sym) ? sym : new Intl.NumberFormat('en-US', { style: 'currency', currency, currencyDisplay: 'code' }).format(v);
   } catch {
     return (isNaN(n) ? 0 : n).toFixed(2);
   }

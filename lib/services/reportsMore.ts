@@ -1321,7 +1321,9 @@ export async function cashFlowForecast(ctx: ServiceContext, p: ReportParams): Pr
   const asOf = parseDay(todayStr, true)!;
   // Open documents as of the END of the window: a payment entered ahead (a check dated next
   // Tuesday for Friday's bill) is in the bank column — counted as open A/P too, it went out twice.
-  const openAt = to > asOf ? to : asOf;
+  // (A past window too: an invoice paid after it was still open within it.)
+  const openAt = to;
+  void asOf;
   const [ar, ap, meta] = await Promise.all([arAgingDetail(ctx, openAt), apAgingDetail(ctx, openAt), loadAccountMeta(ctx)]);
   const bankIds = [...meta.values()].filter((a) => a.section === 'bank').map((a) => a.id);
   const dayBefore = new Date(from.getTime() - 1);
@@ -1371,8 +1373,9 @@ export async function cashFlowForecast(ctx: ServiceContext, p: ReportParams): Pr
     kind: 'subtotal',
     cells: { label: 'Beginning Balance', ar: amt(arOverdue), ap: amt(apOverdue.negated()), bank: amt(beginBank), net: null, proj: amt(proj) },
     hrefs: {
-      ar: stdHref('ar-aging-detail', { asOf: todayStr }),
-      ap: stdHref('ap-aging-detail', { asOf: todayStr }),
+      // The aging the forecast read (as of the window's end).
+      ar: stdHref('ar-aging-detail', { asOf: dayStr(openAt) }),
+      ap: stdHref('ap-aging-detail', { asOf: dayStr(openAt) }),
       bank: stdHref('balance-sheet', { asOf: dayStr(dayBefore) }),
     },
   });
