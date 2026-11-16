@@ -31,6 +31,7 @@ const core = require('./hostingCore');
 
 const STRIP_REQUEST_HEADERS = [
   'x-bka-remote-addr',
+  'sec-bka-proxy',
   'x-bka-internal',
   'x-forwarded-for',
   'x-forwarded-proto',
@@ -138,6 +139,10 @@ function createProxyHandler(upstreamPort, { secure }) {
     const headers = { ...req.headers };
     for (const h of STRIP_REQUEST_HEADERS) delete headers[h];
     headers['x-bka-remote-addr'] = peer || 'unknown';
+    // A "Sec-" header no web page can set (browsers forbid it in fetch / XHR): the app server takes a
+    // request naming a non-loopback host as proxied only with it, so a DNS-rebinding page that adds
+    // its own x-bka-remote-addr is still refused (middleware.ts).
+    headers['sec-bka-proxy'] = '1';
     headers['x-forwarded-for'] = peer || 'unknown';
     headers['x-forwarded-proto'] = secure ? 'https' : 'http';
     if (req.headers.host) headers['x-forwarded-host'] = req.headers.host;

@@ -58,7 +58,7 @@ import { effectiveHomeCurrency } from './multiCurrency';
 import { foreignCode } from './fxLines';
 import { assertClosedPeriodEdit } from './postedEdit';
 import { armReconciledRepost, confirmReconciledRepost } from './reconciledEdits';
-import { assertPeriodOpen } from './fiscalPeriods';
+import { assertPeriodOpen, recordClosingDateException } from './fiscalPeriods';
 import { applyToBill } from './vendorCredits';
 import { vendorCreditHomeOnBill } from './vendorCreditsFx';
 import {
@@ -702,7 +702,7 @@ export async function payBillsWithCredits(
     if (hasPayment && reference && input.method === 'check' && input.checkDuplicateNumber) {
       await assertCheckNumberAvailable(tx, { paymentAccountId: input.paymentAccountId, number: reference });
     }
-    await assertPeriodOpen(tx, input.date);
+    const periodCheck = await assertPeriodOpen(tx, input.date);
     let creditsApplied = Money.zero();
 
     // 1. Vendor credit documents -> bills (balances drop before the cash is validated).
@@ -737,6 +737,14 @@ export async function payBillsWithCredits(
       ...(await applyJournalCreditsToBills(tx, { vendorId: input.vendorId, date: input.date, credits: journalCredits })),
       ...(await applyJournalOffsets(tx, { side: 'ap', entityId: input.vendorId, date: input.date, offsets: journalOffsets })),
     ];
+    // No entry is posted (the cash payment's entry records its own override), so a closing-date
+    // password override is recorded here.
+    await recordClosingDateException(tx, periodCheck, {
+      entryId: input.vendorId,
+      operation: 'apply',
+      transactionDate: input.date,
+      sourceRef: `vendor:${input.vendorId}`,
+    });
     await writeAudit(tx, {
       action: 'update',
       entityType: 'vendor',

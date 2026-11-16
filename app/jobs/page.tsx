@@ -106,7 +106,7 @@ interface Customer {
 }
 
 interface ProfitabilityLine {
-  source: 'invoice_line' | 'credit_memo_line' | 'bill_line' | 'expense_line';
+  source: 'invoice_line' | 'credit_memo_line' | 'bill_line' | 'expense_line' | 'vendor_credit_line';
   id: string;
   description: string | null;
   amount: string;
@@ -156,6 +156,7 @@ function sourceLabel(source: ProfitabilityLine['source']): string {
     case 'credit_memo_line': return 'Credit Memo';
     case 'bill_line': return 'Bill Cost';
     case 'expense_line': return 'Direct Expense';
+    case 'vendor_credit_line': return 'Vendor Credit';
   }
 }
 

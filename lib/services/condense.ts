@@ -454,6 +454,11 @@ async function computePlan(ctx: ServiceContext, cutoff: Date): Promise<CondenseP
     protectedIds.add(row.entryId);
   }
 
+  // A year-end closing entry stays as it is: reports leave it out by its fiscal-close:<year>
+  // sourceRef, and merged into a month's condense: summary it was counted, zeroing the closed
+  // year's Net Income on the P&L and the Balance Sheet.
+  for (const e of candidates) if ((e.sourceRef ?? '').startsWith('fiscal-close:')) protectedIds.add(e.id);
+
   const posted = candidates.filter((e) => e.status === 'posted' && !protectedIds.has(e.id));
   const voids = candidates.filter((e) => e.status === 'void' && !protectedIds.has(e.id));
   const keptOpenDoc = candidates.filter(
@@ -478,7 +483,10 @@ async function computePlan(ctx: ServiceContext, cutoff: Date): Promise<CondenseP
     if (typeof closingDate === 'string' && closingDate && d.toISOString().slice(0, 10) <= closingDate) {
       return true;
     }
-    return closedPeriods.some((p) => p.start <= d && d <= p.end);
+    // Per calendar day, as assertPeriodOpen: periods are stored at 00:00Z, so an entry later on the
+    // period's last day (a year-end close at 23:59:59Z) counted as outside the closed period.
+    const day = d.toISOString().slice(0, 10);
+    return closedPeriods.some((p) => new Date(p.start).toISOString().slice(0, 10) <= day && day <= new Date(p.end).toISOString().slice(0, 10));
   };
   const unlocked = [...posted, ...voids].filter((e) => !isLocked(e.date));
   if (unlocked.length > 0) {

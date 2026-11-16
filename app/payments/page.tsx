@@ -30,7 +30,7 @@ import { todayISO } from '@/lib/dates';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/format';
 import { useFocusId, useNewParam } from '@/lib/useFocusParam';
-import { isDepositTargetAccount } from '@/lib/accountTypes';
+import { isCustomerRefundSourceAccount, isDepositTargetAccount } from '@/lib/accountTypes';
 // wave2 prefs: Payments > auto-apply / auto-calculate / Undeposited Funds; date warnings
 import { usePreferences } from '@/lib/usePreferences';
 import { confirmTransactionDate } from '@/lib/formPrefs';
@@ -1773,7 +1773,7 @@ function RefundPaymentModal({ open, payment, accounts, onClose, onRefunded }: Re
 
   // Refunds are paid from a bank or cash account (the server refuses A/R, inventory and the like);
   // Undeposited Funds is left out — a refund check is written on a bank account.
-  const bankAccounts = depositTargets(accounts).filter((a) => a.code !== '1050' && a.subtype !== 'undeposited_funds');
+  const bankAccounts = accounts.filter((a) => isCustomerRefundSourceAccount({ type: a.type, subtype: a.subtype ?? null, code: a.code }));
 
   async function handleRefund() {
     if (!payment) return;

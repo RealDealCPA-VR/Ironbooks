@@ -316,6 +316,22 @@ export async function createTransfer(ctx: ServiceContext, input: CreateTransferI
 // updateTransfer / voidTransfer (D1)
 // ---------------------------------------------------------------------------
 
+/**
+ * Inside the edit / void transaction: the transfer is still the one read before it. Another edit
+ * in between re-posted it (E1 void, E2 posted); working from the old copy voided E1 again (a no-op)
+ * and left E2 posted next to this request's entry, or stamped the transfer void with E2 live.
+ */
+async function assertTransferUnchanged(tx: ServiceContext, existing: { id: string; postedEntryId: string | null }) {
+  const [now] = await tx.db
+    .select({ postedEntryId: transfers.postedEntryId, voidedAt: transfers.voidedAt })
+    .from(transfers)
+    .where(and(eq(transfers.companyId, tx.companyId), eq(transfers.id, existing.id)));
+  if (!now) throw notFound('Transfer');
+  if (now.voidedAt || now.postedEntryId !== existing.postedEntryId) {
+    throw new ServiceError('CONFLICT', 'This transfer was changed by another request. Reload it and try again.');
+  }
+}
+
 export async function updateTransfer(ctx: ServiceContext, id: string, input: CreateTransferInput) {
   const amountStr = validateTransfer(input);
   const [existing] = await ctx.db
@@ -330,6 +346,7 @@ export async function updateTransfer(ctx: ServiceContext, id: string, input: Cre
   const fx = await resolveTransferFx(ctx, input, amountStr, existing);
 
   return inTransaction(ctx, async (tx) => {
+    await assertTransferUnchanged(tx, existing);
     const lines = transferLines(input, fx);
     let plan = await planPostedEdit(tx, {
       entryId: existing.postedEntryId,
@@ -412,6 +429,7 @@ export async function voidTransfer(ctx: ServiceContext, id: string) {
   if (!existing) throw notFound('Transfer');
   if (existing.voidedAt) return existing; // idempotent
   return inTransaction(ctx, async (tx) => {
+    await assertTransferUnchanged(tx, existing);
     if (existing.postedEntryId) await voidJournalEntry(tx, existing.postedEntryId);
     const [updated] = await tx.db
       .update(transfers)

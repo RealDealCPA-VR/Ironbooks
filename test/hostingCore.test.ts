@@ -132,6 +132,7 @@ describe('host proxy header guarantees', () => {
     });
     expect(await res.text()).toBe('hello');
     expect(seen['x-bka-remote-addr']).toBe('127.0.0.1');
+    expect(seen['sec-bka-proxy']).toBe('1');
     expect(seen['x-bka-internal']).toBeUndefined();
     expect(seen['x-forwarded-proto']).toBe('http');
     expect(res.headers.getSetCookie()).toEqual(['a=1', 'b=2']);

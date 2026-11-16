@@ -276,7 +276,9 @@ export async function setBom(
 
   // Validate all quantities > 0
   for (const c of components) {
-    const qty = inventoryNumber(c.quantity, 'Component quantity');
+    // Checked as stored (4dp): 0.00004 passed the check and was kept as 0.0000, a component the
+    // builds never consumed or costed.
+    const qty = q4(inventoryNumber(c.quantity, 'Component quantity'));
     if (!qty.greaterThan(0)) {
       throw validation(`Component quantity must be greater than zero (got ${c.quantity}).`);
     }

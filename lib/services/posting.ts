@@ -494,14 +494,32 @@ async function restoreRefundedCustomerCredit(
   // The refund posts Dr A/R / Cr bank: the A/R debit equals the bank credit, i.e. the entry total.
   const base = Money.round2(lines.reduce((s, l) => s.plus(Money.of(l.debit ?? '0')), Money.zero()));
   if (!base.greaterThan(0)) return;
+  // A customer refund at a typed rate can also debit Exchange Gain/Loss (a realized loss): the
+  // credit given back is the A/R debit alone, never A/R + loss (that over-restored the credit and
+  // the void's FX plug then booked a phantom gain against A/R).
+  const debitIds = [...new Set(lines.filter((l) => Money.gt(l.debit ?? '0', 0)).map((l) => l.accountId))];
+  const arIds = new Set(
+    debitIds.length
+      ? (
+          await tx.db
+            .select({ id: accounts.id })
+            .from(accounts)
+            .where(and(eq(accounts.companyId, tx.companyId), inArray(accounts.id, debitIds), eq(accounts.subtype, 'accounts_receivable')))
+        ).map((r) => r.id)
+      : [],
+  );
+  const arLines = lines.filter((l) => arIds.has(l.accountId) && Money.gt(l.debit ?? '0', 0));
+  const arBase = arLines.length
+    ? Money.round2(arLines.reduce((s, l) => s.plus(Money.of(l.debit ?? '0')), Money.zero()))
+    : base;
 
   const [memo] = await tx.db
     .select()
     .from(creditMemos)
     .where(and(eq(creditMemos.companyId, tx.companyId), eq(creditMemos.id, docId)));
   if (memo) {
-    const unapplied = Money.round2(Money.of(memo.unapplied).plus(base));
-    const refunded = Money.round2(Money.of(memo.refundedAmount).minus(base));
+    const unapplied = Money.round2(Money.of(memo.unapplied).plus(arBase));
+    const refunded = Money.round2(Money.of(memo.refundedAmount).minus(arBase));
     const status = memo.status === 'void' ? memo.status : 'open';
     await tx.db
       .update(creditMemos)
@@ -546,8 +564,8 @@ async function restoreRefundedCustomerCredit(
     const amount = recorded
       ? Money.round2(Money.of(recorded))
       : rate.greaterThan(0) && !rate.equals(1)
-        ? Money.round2(Money.div(base, rate))
-        : base;
+        ? Money.round2(Money.div(arBase, rate))
+        : arBase;
     const unapplied = Money.round2(Money.of(payment.unapplied).plus(amount));
     await tx.db
       .update(paymentsReceived)
@@ -560,7 +578,7 @@ async function restoreRefundedCustomerCredit(
     // the (cent-level) difference to A/R against Exchange Gain/Loss so A/R stays equal to the
     // aging — at every date from the refund's date on, not just today (see postRefundVoidFxPlug).
     // sourceRef `payment:<id>`: voiding the payment voids these plugs with its other FX plugs.
-    const arLine = lines.find((l) => l.debit != null && Money.gt(l.debit, 0));
+    const arLine = arLines[0] ?? lines.find((l) => l.debit != null && Money.gt(l.debit, 0));
     if (arLine) await postRefundVoidFxPlug(tx, {
       payment: { id: payment.id, postedEntryId: payment.postedEntryId, exchangeRate: payment.exchangeRate },
       arAccountId: arLine.accountId,
@@ -568,7 +586,7 @@ async function restoreRefundedCustomerCredit(
       rate,
       unappliedBefore: Money.of(payment.unapplied),
       unappliedAfter: unapplied,
-      reversed: base,
+      reversed: arBase,
     });
     await writeAudit(tx, {
       action: 'update',

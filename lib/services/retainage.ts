@@ -277,7 +277,15 @@ export async function billRetainage(ctx: ServiceContext, input: BillRetainageInp
     await tx.db.execute(
       sql`SELECT pg_advisory_xact_lock(hashtext(${`retainage:${tx.companyId}:${input.customerId}`}))`,
     );
-    const open = Money.of(await openRetainage(tx, input.customerId));
+    // What is held on the release's own date counts too: a release dated before the invoice that
+    // held the retainage credited Retainage Receivable before it was ever debited (negative open
+    // retainage for the customer in between).
+    const openAll = Money.of(await openRetainage(tx, input.customerId));
+    const openThen = Money.of((await retainageReport(tx, { customerId: input.customerId, asOf: input.date })).rows[0]?.open ?? '0.00');
+    const open = openThen.lessThan(openAll) ? openThen : openAll;
+    if (!open.greaterThan(0) && openAll.greaterThan(0)) {
+      throw new ServiceError('CONFLICT', `None of ${cust.displayName}'s retainage was held yet on that date. Date the release after the invoice that held it.`);
+    }
     if (!open.greaterThan(0)) {
       throw new ServiceError('CONFLICT', `${cust.displayName} has no retainage left to bill.`);
     }

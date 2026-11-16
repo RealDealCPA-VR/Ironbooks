@@ -12,7 +12,8 @@
  * The total is computed from the sum of all line amounts.
  * postedEntryId is stored on the expense_reports row after posting.
  */
-import { and, desc, eq } from 'drizzle-orm';
+import { and, asc, desc, eq } from 'drizzle-orm';
+import { isBankAccount } from '@/lib/accountTypes';
 import type Decimal from 'decimal.js';
 import { MAX_LEDGER_AMOUNT, Money, toAmountString } from '@/lib/money';
 import { accounts, employees, expenseReports, expenseReportLines } from '@/lib/db/schema';
@@ -26,6 +27,7 @@ import {
   writeAudit,
 } from './_base';
 import { assertNotControlLineAccount, postJournalEntry } from './posting';
+import { effectiveHomeCurrency } from './multiCurrency';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -70,14 +72,31 @@ function lineAmount(raw: string | number, lineNo: number): Decimal {
   return r;
 }
 
-/** Resolve Checking account (code 1000) id scoped to company. */
-async function checkingAccountId(ctx: ServiceContext): Promise<string> {
-  const [row] = await ctx.db
-    .select({ id: accounts.id })
+/**
+ * The bank account the reimbursement is paid from: the one the caller chose, else the company's
+ * 1000 Checking when that number IS a bank account, else its first active checking account. A
+ * chart converted from QuickBooks has no "1000" (Checking is 10000, or unnumbered), and a "1000"
+ * that is not a bank must never be credited with the reimbursement.
+ */
+async function reimbursementBankAccountId(ctx: ServiceContext, chosenId?: string | null): Promise<string> {
+  const home = await effectiveHomeCurrency(ctx);
+  const usable = (a: { type: string; subtype: string | null; isActive: boolean; currency: string | null }) =>
+    isBankAccount(a) && a.isActive && (!a.currency || a.currency === home);
+  const rows = await ctx.db
+    .select({ id: accounts.id, code: accounts.code, type: accounts.type, subtype: accounts.subtype, isActive: accounts.isActive, currency: accounts.currency })
     .from(accounts)
-    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, '1000')));
-  if (!row) throw notFound('Account with code 1000 (Checking)');
-  return row.id;
+    .where(eq(accounts.companyId, ctx.companyId))
+    .orderBy(asc(accounts.code));
+  if (chosenId) {
+    const chosen = rows.find((a) => a.id === chosenId);
+    if (!chosen) throw notFound('Bank account');
+    if (!usable(chosen)) throw validation('Reimbursements are paid from an active home-currency bank account.');
+    return chosen.id;
+  }
+  const byNumber = rows.find((a) => a.code === '1000' && usable(a));
+  const fallback = byNumber ?? rows.find((a) => a.subtype === 'checking' && usable(a)) ?? rows.find(usable);
+  if (!fallback) throw validation('Add a bank account to pay the reimbursement from.');
+  return fallback.id;
 }
 
 // ---------------------------------------------------------------------------
@@ -228,11 +247,11 @@ export async function submitReport(ctx: ServiceContext, id: string) {
  *
  * Posts GL:
  *   Dr  <line.accountId>  (expense)   per-line amount
- *   Cr  1000 Checking                 total reimbursement
+ *   Cr  bank account (chosen, else 1000 Checking / first checking)  total reimbursement
  *
  * Stores postedEntryId on the report row.
  */
-export async function approveAndReimburse(ctx: ServiceContext, id: string) {
+export async function approveAndReimburse(ctx: ServiceContext, id: string, opts: { bankAccountId?: string | null } = {}) {
   const [report] = await ctx.db
     .select()
     .from(expenseReports)
@@ -257,7 +276,7 @@ export async function approveAndReimburse(ctx: ServiceContext, id: string) {
   }
   if (total.isZero()) throw validation('Total reimbursement amount is zero.');
 
-  const checkingId = await checkingAccountId(ctx);
+  const checkingId = await reimbursementBankAccountId(ctx, opts.bankAccountId);
 
   return inTransaction(ctx, async (tx) => {
     // Claim the report first (conditional on 'submitted') so two concurrent approvals can never

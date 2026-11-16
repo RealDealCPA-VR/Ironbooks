@@ -1062,6 +1062,22 @@ export async function createDeposit(ctx: ServiceContext, input: CreateDepositInp
  * entry is voided and re-posted (a reconciled deposit after QB's warning is confirmed:
  * allowReconciledEdit, reconciledEdits.ts).
  */
+/**
+ * Inside the edit / void transaction: the deposit is still the one read before it. An edit in
+ * between re-posted it (E1 void, E2 posted); working from the old copy voided E1 again (a no-op),
+ * so a void left E2 in the bank and an edit posted a second entry next to it.
+ */
+async function assertDepositUnchanged(tx: ServiceContext, existing: { id: string; postedEntryId: string | null }) {
+  const [now] = await tx.db
+    .select({ postedEntryId: deposits.postedEntryId, voidedAt: deposits.voidedAt })
+    .from(deposits)
+    .where(and(eq(deposits.id, existing.id), eq(deposits.companyId, tx.companyId)));
+  if (!now) throw notFound('Deposit');
+  if (now.voidedAt || now.postedEntryId !== existing.postedEntryId) {
+    throw new ServiceError('CONFLICT', 'This deposit was changed by another request. Reload it and try again.');
+  }
+}
+
 export async function updateDeposit(ctx: ServiceContext, id: string, input: CreateDepositInput) {
   const [existing] = await ctx.db
     .select()
@@ -1104,6 +1120,7 @@ export async function updateDeposit(ctx: ServiceContext, id: string, input: Crea
   }
 
   return inTransaction(ctx, async (tx) => {
+    await assertDepositUnchanged(tx, existing);
     const oldLines = await tx.db.select().from(depositLines).where(eq(depositLines.depositId, id));
     // A deposit saved before the Undeposited Funds / Inventory Asset rule keeps its own lines.
     const keep = new Set<string>();
@@ -1235,6 +1252,20 @@ export async function voidDeposit(ctx: ServiceContext, id: string) {
   }
 
   return inTransaction(ctx, async (tx) => {
+    await assertDepositUnchanged(tx, deposit);
+    // The bounce check again, inside the transaction (one recorded since the check above).
+    const [bouncedNow] = await tx.db
+      .select({ id: bouncedChecks.id })
+      .from(bouncedChecks)
+      .innerJoin(depositLines, eq(depositLines.paymentId, bouncedChecks.paymentId))
+      .where(and(eq(bouncedChecks.companyId, tx.companyId), eq(depositLines.depositId, id)))
+      .limit(1);
+    if (bouncedNow) {
+      throw new ServiceError(
+        'CONFLICT',
+        'A check in this deposit was recorded as bounced, and the bank already took that money back. This deposit can no longer be voided.',
+      );
+    }
     if (deposit.postedEntryId) {
       await voidJournalEntry(tx, deposit.postedEntryId);
     }

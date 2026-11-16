@@ -10,7 +10,7 @@ import type { ServiceContext } from './_base';
 import { inTransaction, notFound, validation, writeAudit } from './_base';
 import { hashPassword, verifyPassword } from '@/lib/auth';
 import { assertWrite } from './rbac';
-import { requireEffectivePermission } from './access';
+import { requireEffectivePermission, requirePermission } from './access';
 import { stripSecrets } from '@/lib/permissions/mask';
 import type { DB } from '@/lib/db';
 import { logTransaction } from './transactionLog';
@@ -329,6 +329,11 @@ export async function updateCompany(ctx: ServiceContext, input: UpdateCompanyInp
     // Integrated Applications (who may reach the company file from outside: the employee portal,
     // phone receipt links) is an owner / admin decision, like the network policy and AI settings —
     // a role with Company: modify (an External Accountant) turned the portal back on.
+    // Renaming the company file needs Rename & Archive Company File (as /api/companies/[id] does),
+    // not just Preferences: modify.
+    if (input.name !== undefined && input.name !== existing.name) {
+      requirePermission(tx, 'company.company_file', 'modify');
+    }
     const current = (existing.settings ?? {}) as Record<string, unknown>;
     if (['integratedAppsBlocked', 'allowEmployeePortal', 'allowPhoneReceipts'].some((k) => k in settingsPatch && settingsPatch[k] !== current[k])) {
       await requireRole(tx, 'admin');

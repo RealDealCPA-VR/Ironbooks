@@ -306,6 +306,15 @@ export function isDepositTargetAccount(a: AcctLike): boolean {
   if (a.type !== 'asset') return false;
   return ['checking', 'savings', 'undeposited_funds', 'other_current_asset'].includes(a.subtype ?? '');
 }
+/**
+ * Accounts a CUSTOMER refund can be paid from: deposit targets except Undeposited Funds (Make
+ * Deposits takes no negative items, so a refund there could never be cleared) and the Retainage
+ * Receivable account (1250; its balance is the retainage still owed, lib/services/retainage.ts).
+ */
+export function isCustomerRefundSourceAccount(a: AcctLike & { code?: string | null }): boolean {
+  if (!isDepositTargetAccount(a) || isUndepositedFunds(a)) return false;
+  return !(a.subtype === 'other_current_asset' && a.code === '1250');
+}
 /** Current assets (classified balance sheet). */
 export function isCurrentAsset(a: AcctLike): boolean {
   return a.type === 'asset' && BY_SUBTYPE.get(a.subtype ?? '')?.section === 'current_asset';

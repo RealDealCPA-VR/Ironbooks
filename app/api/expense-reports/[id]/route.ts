@@ -4,7 +4,8 @@
  *
  * POST body:
  *   { action: 'submit' }     — transition draft → submitted
- *   { action: 'reimburse' }  — transition submitted → reimbursed + post GL
+ *   { action: 'reimburse', bankAccountId? }  — transition submitted → reimbursed + post GL
+ *                                             (paid from bankAccountId, else the default checking account)
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
@@ -51,7 +52,8 @@ export async function POST(
     }
 
     if (action === 'reimburse') {
-      const updated = await approveAndReimburse(ctx, id);
+      const bankAccountId = typeof body.bankAccountId === 'string' && body.bankAccountId ? body.bankAccountId : null;
+      const updated = await approveAndReimburse(ctx, id, { bankAccountId });
       return NextResponse.json(updated);
     }
 

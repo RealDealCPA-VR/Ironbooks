@@ -26,6 +26,7 @@ import {
   fixedAssets,
   reconciliationItems,
   reconciliations,
+  paymentChecks,
 } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import {
@@ -658,6 +659,24 @@ export async function updateEntry(ctx: ServiceContext, id: string, input: Update
   return withBalanceFixes(input.lines, () => updateEntryInner(ctx, id, input));
 }
 
+/**
+ * The Pay Liabilities / Pay Sales Tax check (payment_checks) written on this entry, if any. A
+ * payroll liability check (and a sales tax check with no agency) posts with no sourceRef, so it
+ * looks like a General Journal entry; editing it here re-posted it as a new manual entry and left
+ * the check pointing at the voided one (shown void, number free again, its own Void a no-op).
+ */
+export async function paymentCheckOfEntry(
+  ctx: ServiceContext,
+  entryId: string,
+): Promise<{ id: string; kind: string } | null> {
+  const [row] = await ctx.db
+    .select({ id: paymentChecks.id, kind: paymentChecks.kind })
+    .from(paymentChecks)
+    .where(and(eq(paymentChecks.companyId, ctx.companyId), eq(paymentChecks.postedEntryId, entryId)))
+    .limit(1);
+  return row ?? null;
+}
+
 async function updateEntryInner(ctx: ServiceContext, id: string, input: UpdateEntryInput) {
   if (!input.description?.trim()) {
     throw validation('Description is required.');
@@ -675,6 +694,12 @@ async function updateEntryInner(ctx: ServiceContext, id: string, input: UpdateEn
     throw new ServiceError(
       'CONFLICT',
       'This entry was posted by a source document. Edit the source document instead.',
+    );
+  }
+  if (await paymentCheckOfEntry(ctx, id)) {
+    throw new ServiceError(
+      'CONFLICT',
+      'This entry is a check written from Pay Liabilities or Pay Sales Tax. Void the check there and write it again instead.',
     );
   }
   // Well-formed, balanced lines first (the "did anything change?" comparison reads their amounts).

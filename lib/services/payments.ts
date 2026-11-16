@@ -18,7 +18,7 @@
  * The returned paymentsReceived row's `postedEntryId` links back to the journal entry.
  */
 import { appliedExceedsPaymentFixes, fixMoney, overAppliedFixes } from '@/lib/errorFixes';
-import { isDepositTargetAccount } from '@/lib/accountTypes';
+import { isCustomerRefundSourceAccount } from '@/lib/accountTypes';
 import { and, desc, eq, gte, ilike, inArray, isNull, lt, ne, or, sql, type SQL } from 'drizzle-orm';
 import {
   accounts,
@@ -1073,7 +1073,14 @@ async function postPayment(
 
   // A payment that only applies credits posts no journal entry, so the closing-date check
   // inside postJournalEntry never runs. Check it here so it cannot be dated in a closed period.
-  if (postingLines.length < 2) await assertPeriodOpen(tx, input.date);
+  if (postingLines.length < 2) {
+    await recordClosingDateException(tx, await assertPeriodOpen(tx, input.date), {
+      entryId: existingId ?? input.customerId,
+      operation: 'apply',
+      transactionDate: input.date,
+      sourceRef: `customer:${input.customerId}`,
+    });
+  }
 
   const entry =
     postingLines.length >= 2
@@ -1620,8 +1627,14 @@ async function reversePaymentEffects(
   if (payment.postedEntryId) {
     await voidJournalEntry(tx, payment.postedEntryId);
   } else {
-    // Credits-only payment: no entry to void, so check the closing date here.
-    await assertPeriodOpen(tx, payment.date, { movable: false });
+    // Credits-only payment: no entry to void, so check the closing date here (and record a
+    // password override, which voidJournalEntry would otherwise have done).
+    await recordClosingDateException(tx, await assertPeriodOpen(tx, payment.date, { movable: false }), {
+      entryId: payment.id,
+      operation: 'void',
+      transactionDate: payment.date,
+      sourceRef: `payment:${payment.id}`,
+    });
   }
   // FX plugs posted by later apply/unapply of this payment.
   const fxEntries = await tx.db
@@ -1750,7 +1763,10 @@ export async function updatePayment(ctx: ServiceContext, id: string, input: Rece
   // Any foreign payment edited without a rate (same customer, so same currency) keeps its booked
   // rate, as invoices, deposits and vendor credits do — re-pricing at today's list rate silently
   // changed its realized gain / loss and bank value.
-  if (!rateTyped && ((deposit && !takeOut) || (payment.currency && input.customerId === payment.customerId))) {
+  // Only while it stays in the same currency: a EUR payment edited to GBP kept 1.10 (EUR's rate).
+  const sameCurrency =
+    !!payment.currency && (await normalizeCurrency(ctx, input.currency)) === (await normalizeCurrency(ctx, payment.currency));
+  if (!rateTyped && ((deposit && !takeOut) || (sameCurrency && input.customerId === payment.customerId))) {
     input = { ...input, exchangeRate: payment.exchangeRate };
   }
   if (deposit && !takeOut) await assertDepositedEditAllowed(ctx, payment, deposit, input);
@@ -2483,12 +2499,13 @@ async function refundPaymentInTx(ctx: ServiceContext, input: RefundPaymentInput)
 
   // Validate the bank account: must be a company-owned bank/cash asset.
   const [bankAcct] = await ctx.db
-    .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype, currency: accounts.currency })
+    .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype, code: accounts.code, currency: accounts.currency })
     .from(accounts)
     .where(and(eq(accounts.id, input.bankAccountId), eq(accounts.companyId, ctx.companyId)));
   if (!bankAcct) throw notFound('Bank account');
-  // Bank accounts, Undeposited Funds or another cash-like current asset (lib/accountTypes.ts).
-  if (!isDepositTargetAccount(bankAcct)) {
+  // Bank accounts or another cash-like current asset — not Undeposited Funds or Retainage
+  // Receivable (lib/accountTypes.ts).
+  if (!isCustomerRefundSourceAccount(bankAcct)) {
     throw validation('Refunds must be paid from a bank/cash account.');
   }
   // review5 fx: refund from an account in the payment's currency or the home currency (a third

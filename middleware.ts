@@ -37,8 +37,11 @@ export function middleware(req: NextRequest) {
   // DNS rebinding: the app server only listens on this computer, so a request naming any other
   // host either came through the multi-user proxy (which always stamps x-bka-remote-addr — and a
   // request carrying it is treated as REMOTE, with less trust) or from a web page that rebound its
-  // own name to 127.0.0.1 to reach the books as if it were the app. Refuse the latter.
-  if (!LOOPBACK_HOSTS.has(req.nextUrl.hostname.toLowerCase()) && !req.headers.get('x-bka-remote-addr')) {
+  // own name to 127.0.0.1 to reach the books as if it were the app. Refuse the latter. A page can
+  // add x-bka-remote-addr itself, so the proxy also stamps sec-bka-proxy: browsers never let a
+  // page set a "Sec-" header.
+  const proxied = Boolean(req.headers.get('x-bka-remote-addr')) && req.headers.get('sec-bka-proxy') === '1';
+  if (!LOOPBACK_HOSTS.has(req.nextUrl.hostname.toLowerCase()) && !proxied) {
     return refuse('This address is not the Ironbooks app on this computer.');
   }
 

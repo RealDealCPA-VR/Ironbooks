@@ -746,7 +746,12 @@ export async function updateExpense(ctx: ServiceContext, id: string, input: Crea
       oldLines.every(
         (o, i) =>
           (o.itemId ?? null) === prep.lines[i].itemId &&
-          Money.of(o.quantity ?? 0).equals(Money.of(prep.lines[i].quantity ?? 0)),
+          Money.of(o.quantity ?? 0).equals(Money.of(prep.lines[i].quantity ?? 0)) &&
+          // The unchanged path copies line fields by position: lines moved around (same ledger,
+          // other order) put one line's billable customer / description on another's amount.
+          o.accountId === prep.lines[i].accountId &&
+          (o.classId ?? null) === (prep.lines[i].classId ?? null) &&
+          Money.of(o.amount).equals(Money.of(prep.lines[i].amount)),
       );
     const sameCurrency = (cur.currency ?? null) === prep.currency;
     const what = input.method === 'credit_card' ? 'charge' : 'check';

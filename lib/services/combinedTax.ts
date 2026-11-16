@@ -138,12 +138,15 @@ export async function setComponents(
       for (const c of parsed) combinedRate = combinedRate.plus(c.rate);
     }
 
-    // Recompute parent taxRates.rate = sum of components.
-    const newRate = combinedRate.toFixed(6);
-    await tx.db
-      .update(taxRates)
-      .set({ rate: newRate })
-      .where(eq(taxRates.id, taxRateId));
+    // Recompute parent taxRates.rate = sum of components. Removing every component makes the rate
+    // a plain rate again and keeps what it charges (it used to drop to 0% on every later invoice).
+    const newRate = parsed.length > 0 ? combinedRate.toFixed(6) : String(rate.rate);
+    if (parsed.length > 0) {
+      await tx.db
+        .update(taxRates)
+        .set({ rate: newRate })
+        .where(eq(taxRates.id, taxRateId));
+    }
 
     await writeAudit(tx, {
       action: 'update',

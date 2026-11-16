@@ -79,6 +79,7 @@ import {
   withShownTaxable,
 } from '@/lib/salesFormListsClient';
 import { SaveAndNewButton } from '@/components/FormShortcuts';
+import { isCustomerRefundSourceAccount } from '@/lib/accountTypes';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -148,6 +149,7 @@ interface Account {
   code: string;
   name: string;
   type: string;
+  subtype?: string | null;
 }
 
 interface Item {
@@ -919,7 +921,8 @@ function RefundModal({ open, memo, accounts, onClose, onRefunded }: RefundModalP
     }
   }, [open, memo]);
 
-  const bankAccounts = accounts.filter((a) => a.type === 'asset');
+  // The accounts the server accepts (no A/R, inventory, Undeposited Funds or Retainage Receivable).
+  const bankAccounts = accounts.filter((a) => isCustomerRefundSourceAccount({ type: a.type, subtype: a.subtype ?? null, code: a.code }));
 
   async function handleRefund() {
     if (!memo) return;

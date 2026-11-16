@@ -30,6 +30,8 @@ import {
   salesReceiptLines,
   creditMemos,
   creditMemoLines,
+  vendorCredits,
+  vendorCreditLines,
 } from '@/lib/db/schema';
 import { toAmountString, Money } from '@/lib/money';
 import {
@@ -61,7 +63,8 @@ export type UpdateJobInput = Partial<CreateJobInput> & { status?: string };
 
 export interface JobProfitabilityLineItem {
   /** credit_memo_line: a credit memo line for the job (a return or a write-off) — negative revenue. */
-  source: 'invoice_line' | 'credit_memo_line' | 'bill_line' | 'expense_line';
+  /** vendor_credit_line: a vendor credit line costed to the job (a return, a rebate) — negative cost. */
+  source: 'invoice_line' | 'credit_memo_line' | 'bill_line' | 'expense_line' | 'vendor_credit_line';
   id: string;
   description: string | null;
   amount: string;
@@ -422,6 +425,28 @@ async function jobFacts(ctx: ServiceContext, jobIds: string[]): Promise<JobFact[
       line: { source: 'expense_line', id: l.id, description: l.description, amount: toAmountString(homeOf(l.amount, l.fx)) },
     });
   }
+
+  // Vendor credits costed to the job (returns, rebates) reduce its cost, as in the Job
+  // Profitability reports (reportsJobsTime.ts) and QuickBooks.
+  const creditCostLines = await ctx.db
+    .select({
+      id: vendorCreditLines.id,
+      jobId: vendorCreditLines.jobId,
+      description: vendorCreditLines.description,
+      amount: vendorCreditLines.amount,
+      fx: vendorCredits.exchangeRate,
+    })
+    .from(vendorCreditLines)
+    .innerJoin(vendorCredits, eq(vendorCreditLines.vendorCreditId, vendorCredits.id))
+    .where(and(eq(vendorCredits.companyId, ctx.companyId), inArray(vendorCreditLines.jobId, jobIds), ne(vendorCredits.status, 'void')));
+  for (const l of creditCostLines) {
+    if (!l.jobId) continue;
+    out.push({
+      jobId: l.jobId,
+      kind: 'cost',
+      line: { source: 'vendor_credit_line', id: l.id, description: l.description, amount: toAmountString(homeOf(l.amount, l.fx).negated()) },
+    });
+  }
   return out;
 }
 
@@ -446,7 +471,7 @@ export async function jobProfitability(ctx: ServiceContext, jobId: string): Prom
   const budgetVariance = job.budget != null ? profit.minus(Money.of(job.budget)) : null;
 
   // Revenue lines first, then bill costs, then direct expenses (as before).
-  const order = { invoice_line: 0, credit_memo_line: 1, bill_line: 2, expense_line: 3 } as const;
+  const order = { invoice_line: 0, credit_memo_line: 1, bill_line: 2, expense_line: 3, vendor_credit_line: 4 } as const;
   const lines = facts.map((f) => f.line).sort((a, b) => order[a.source] - order[b.source]);
 
   return {

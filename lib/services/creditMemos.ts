@@ -47,7 +47,7 @@ import { systemAccountIdByCode } from './accountRoles';
 import { assertAccountantDatesOpen } from './accountantCopy/guard';
 import { averageAfter, takeAccountantCost } from './accountantCopy/inventoryCost';
 import { cogsAccountForItem, fifoLayerValue, valueRemainderAfter } from './inventory';
-import { isDepositTargetAccount } from '@/lib/accountTypes';
+import { isCustomerRefundSourceAccount } from '@/lib/accountTypes';
 import { assertSalesTaxAllowed } from '@/lib/featureGate';
 import { and, asc, desc, eq, inArray, ne, sql } from 'drizzle-orm';
 import {
@@ -1144,12 +1144,13 @@ async function refundCreditMemoInTx(ctx: ServiceContext, input: RefundCreditMemo
 
   // Validate the bank account: company-owned bank/cash asset.
   const [bankAcct] = await ctx.db
-    .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype })
+    .select({ id: accounts.id, type: accounts.type, subtype: accounts.subtype, code: accounts.code })
     .from(accounts)
     .where(and(eq(accounts.id, input.bankAccountId), eq(accounts.companyId, ctx.companyId)));
   if (!bankAcct) throw notFound('Bank account');
-  // Bank accounts, Undeposited Funds or another cash-like current asset (lib/accountTypes.ts).
-  if (!isDepositTargetAccount(bankAcct)) {
+  // Bank accounts or another cash-like current asset — not Undeposited Funds or Retainage
+  // Receivable (lib/accountTypes.ts).
+  if (!isCustomerRefundSourceAccount(bankAcct)) {
     throw validation('Refunds must be paid from a bank/cash account.');
   }
   // review5 fx: credit memos are in home currency; refund them from a home-currency account.

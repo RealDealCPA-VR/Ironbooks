@@ -22,6 +22,7 @@ import type { ReportParams } from '@/lib/validation/reports';
 import { validation } from './_base';
 import { resolveAccess } from './access';
 import { canActivity, type ActivityKey } from '@/lib/permissions/model';
+import { effectiveHomeCurrency } from './multiCurrency';
 
 /** The activity each combined report needs in every company it combines (lib/reports/catalog.ts reportActivity). */
 const CONSOLIDATED_ACTIVITY: Record<'reports_financial' | 'reports_sales' | 'reports_purchases', ActivityKey> = {
@@ -210,6 +211,9 @@ export async function reportableCompanies(
 ) {
   const all = await listCompanies(ctx.db);
   const out: typeof all = [];
+  // Figures are summed as they are, so only companies keeping their books in the same home
+  // currency as the current company can be combined (QB combines same-currency files only).
+  const home = await effectiveHomeCurrency(ctx);
   for (const c of all) {
     if (c.id === ctx.companyId) {
       out.push(c);
@@ -220,7 +224,9 @@ export async function reportableCompanies(
     if ((c.settings as Record<string, unknown> | null)?.archived === true) continue;
     const r = await resolveAccess(ctx.db, c.id, ctx.userId);
     // prefsperms: the combined report's own activity in that company, not any report of the area.
-    if (r.member && r.active && canActivity(r.access, CONSOLIDATED_ACTIVITY[area], 'view')) out.push(c);
+    if (!(r.member && r.active && canActivity(r.access, CONSOLIDATED_ACTIVITY[area], 'view'))) continue;
+    if ((await effectiveHomeCurrency({ db: ctx.db, companyId: c.id })) !== home) continue;
+    out.push(c);
   }
   return out;
 }

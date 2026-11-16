@@ -362,8 +362,13 @@ describe('Receive Payments page: buttons only offer what the server accepts', ()
     );
   });
 
-  it('Refund lists bank / cash accounts only (no Undeposited Funds)', () => {
-    expect(page()).toMatch(/depositTargets\(accounts\)\.filter\(\(a\) => a\.code !== '1050' && a\.subtype !== 'undeposited_funds'\)/);
+  it('Refund lists bank / cash accounts only (no Undeposited Funds or Retainage Receivable)', async () => {
+    expect(page()).toMatch(/const bankAccounts = accounts\.filter\(\(a\) => isCustomerRefundSourceAccount\(/);
+    const { isCustomerRefundSourceAccount } = await import('@/lib/accountTypes');
+    expect(isCustomerRefundSourceAccount({ type: 'asset', subtype: 'checking', code: '1000' })).toBe(true);
+    expect(isCustomerRefundSourceAccount({ type: 'asset', subtype: 'undeposited_funds', code: '1050' })).toBe(false);
+    expect(isCustomerRefundSourceAccount({ type: 'asset', subtype: 'other_current_asset', code: '1250' })).toBe(false);
+    expect(isCustomerRefundSourceAccount({ type: 'asset', subtype: 'accounts_receivable', code: '1200' })).toBe(false);
   });
 
   it('Pay all marks the amounts as chosen by the user', () => {

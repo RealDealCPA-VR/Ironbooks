@@ -65,7 +65,8 @@ import { createEstimate, deleteEstimate, updateEstimateStatus, voidEstimate } fr
 import { createSalesOrder, deleteSalesOrder, updateStatus as updateSalesOrderStatus, voidSalesOrder } from '../salesOrders';
 import { createPurchaseOrder, deletePurchaseOrder, updateStatus as updatePurchaseOrderStatus, voidPurchaseOrder } from '../purchaseOrders';
 import { voidJournalEntry } from '../posting';
-import { createManualEntry, voidEntry } from '../journal';
+import { createManualEntry, paymentCheckOfEntry, voidEntry } from '../journal';
+import { voidPaymentCheck } from '../liabilityPayments';
 import { assertNotFifoTracked } from '../inventory';
 import { reverseSourceMovements, assertDefaultSiteQuantities } from '../inventorySites';
 import { refuseInAccountantCopy } from '../nonPostingDocs';
@@ -701,7 +702,7 @@ async function deleteOne(ctx: ServiceContext, type: BatchTxnType, id: string): P
       await deleteDraftEntry(ctx, entry);
       return;
     }
-    if (!GJ_KINDS.has(kindOf(entry.sourceRef))) {
+    if (!GJ_KINDS.has(kindOf(entry.sourceRef)) || (await paymentCheckOfEntry(ctx, id))) {
       throw new ServiceError('CONFLICT', 'Only General Journal entries you entered can be deleted; void this one instead.');
     }
     if (entry.status === 'void') throw new ServiceError('CONFLICT', 'This entry is already void.');
@@ -823,6 +824,14 @@ async function voidOne(ctx: ServiceContext, type: BatchTxnType, id: string): Pro
       const srcKind = kindOf(entry.sourceRef);
       if (!['manual', 'tax_agency', 'sales_tax_adj', 'adjusting'].includes(srcKind)) {
         throw new ServiceError('CONFLICT', 'This entry belongs to a document — void the document instead.');
+      }
+      // A Pay Liabilities / Pay Sales Tax check is voided as the check (its own right, and the
+      // check row marked void), not as a bare journal entry under the Accounting right.
+      const check = await paymentCheckOfEntry(ctx, id);
+      if (check) {
+        requirePermission(ctx, check.kind === 'payroll_liability' ? 'payroll.liabilities' : 'sales_tax.pay', 'delete');
+        await voidPaymentCheck(ctx, check.id);
+        return 'void';
       }
       if (srcKind === 'tax_agency' || srcKind === 'sales_tax_adj') requirePermission(ctx, 'sales_tax.pay', 'delete');
       await voidJournalEntry(ctx, id);

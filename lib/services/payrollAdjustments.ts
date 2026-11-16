@@ -49,7 +49,7 @@ import {
   writeAudit,
 } from './_base';
 import { postJournalEntry, voidJournalEntry, type PostingLine } from './posting';
-import { assertPeriodOpen } from './fiscalPeriods';
+import { assertPeriodOpen, recordClosingDateException, type PeriodCheck } from './fiscalPeriods';
 import { getEmployee, payrollDefaultAccounts } from './payroll';
 import { defaultPayrollLiabilityAccountId } from './liabilityPayments';
 import { getPayrollItemsByIds, resolveItemTracking, type PayrollItem } from './payrollItems';
@@ -260,7 +260,7 @@ export async function createYtdAdjustment(ctx: ServiceContext, input: YtdAdjustm
 
   // A non-posting adjustment still changes what closed periods report (W-2, 941 / 940 and the
   // wage-base YTD): the closed period is checked like a posting (which checks it itself).
-  if (!input.affectsAccounts) await assertPeriodOpen(ctx, date);
+  const periodCheck: PeriodCheck | null = input.affectsAccounts ? null : await assertPeriodOpen(ctx, date);
 
   // GL accounts (only when posting).
   let posting: PostingLine[] | null = null;
@@ -315,6 +315,10 @@ export async function createYtdAdjustment(ctx: ServiceContext, input: YtdAdjustm
       })
       .returning();
     await tx.db.insert(paycheckLines).values(rows.map((r) => ({ ...r, paycheckId: pc.id })));
+    // Non-posting: no entry records a closing-date password override, so record it here.
+    if (periodCheck) {
+      await recordClosingDateException(tx, periodCheck, { entryId: pc.id, operation: 'post', transactionDate: date, sourceRef: `paycheck:${pc.id}` });
+    }
 
     let postedEntryId: string | null = null;
     if (posting && posting.length >= 2) {
@@ -376,7 +380,7 @@ export async function createLiabilityAdjustment(ctx: ServiceContext, input: Liab
   withinBounds(deductions, 'The deduction total');
 
   // A non-posting adjustment still changes what closed periods report (941 / 940): checked too.
-  if (!input.affectsAccounts) await assertPeriodOpen(ctx, date);
+  const periodCheck: PeriodCheck | null = input.affectsAccounts ? null : await assertPeriodOpen(ctx, date);
 
   let posting: PostingLine[] | null = null;
   if (input.affectsAccounts) {
@@ -412,6 +416,10 @@ export async function createLiabilityAdjustment(ctx: ServiceContext, input: Liab
       })
       .returning();
     await tx.db.insert(paycheckLines).values(rows.map((r) => ({ ...r, paycheckId: pc.id })));
+    // Non-posting: no entry records a closing-date password override, so record it here.
+    if (periodCheck) {
+      await recordClosingDateException(tx, periodCheck, { entryId: pc.id, operation: 'post', transactionDate: date, sourceRef: `paycheck:${pc.id}` });
+    }
 
     let postedEntryId: string | null = null;
     if (posting && posting.length >= 2) {
@@ -482,7 +490,14 @@ export async function voidPayrollAdjustment(ctx: ServiceContext, id: string) {
     if (pc.voidedAt) throw validation('This adjustment is already voided.');
     if (pc.postedEntryId) await voidJournalEntry(tx, pc.postedEntryId);
     // Not posted: the void still changes the closed period's payroll forms — checked like one.
-    else await assertPeriodOpen(tx, pc.payDate, { movable: false });
+    else {
+      await recordClosingDateException(tx, await assertPeriodOpen(tx, pc.payDate, { movable: false }), {
+        entryId: pc.id,
+        operation: 'void',
+        transactionDate: pc.payDate,
+        sourceRef: `paycheck:${pc.id}`,
+      });
+    }
     const [updated] = await tx.db
       .update(paychecks)
       .set({ voidedAt: new Date() })

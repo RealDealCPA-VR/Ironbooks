@@ -23,7 +23,13 @@ describe('middleware: DNS rebinding', () => {
   it('lets this computer and proxied teammates through', () => {
     expect(middleware(req('http://localhost:51234/api/company')).status).toBe(200);
     expect(middleware(req('http://127.0.0.1:51234/api/company')).status).toBe(200);
-    expect(middleware(req('https://office-pc:8443/api/company', { headers: { 'x-bka-remote-addr': '192.168.1.20' } })).status).toBe(200);
+    expect(
+      middleware(req('https://office-pc:8443/api/company', { headers: { 'x-bka-remote-addr': '192.168.1.20', 'sec-bka-proxy': '1' } })).status,
+    ).toBe(200);
+  });
+
+  it('refuses a rebinding page that adds its own x-bka-remote-addr (it cannot set a Sec- header)', () => {
+    expect(middleware(req('http://evil.example:51234/api/company-file/info', { headers: { 'x-bka-remote-addr': '1.2.3.4' } })).status).toBe(403);
   });
 });
 

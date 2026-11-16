@@ -44,7 +44,7 @@ import {
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
 import { isSubledgerSource } from './posting';
-import { assertPeriodOpen, ledgerToday } from './fiscalPeriods';
+import { assertPeriodOpen, ledgerToday, recordClosingDateException } from './fiscalPeriods';
 import { assertAccountantDatesOpen } from './accountantCopy/guard';
 import { effectiveHomeCurrency } from './multiCurrency';
 import { foreignCode } from './fxLines';
@@ -715,7 +715,14 @@ export async function applyJournalCredit(
   if (opts.side === 'ap' && input.invoiceId) throw validation('Pick a bill or a General Journal charge of this vendor.');
   return inTransaction(ctx, async (tx) => {
     await assertCopyDates(tx, { lineIds: [input.journalLineId, input.chargeLineId], invoiceId: input.invoiceId, billId: input.billId });
-    await assertPeriodOpen(tx, date);
+    // Applying posts no entry, so a closing-date password override is recorded here (the Closing
+    // Date Exception report), as Receive Payments' apply / unapply do.
+    await recordClosingDateException(tx, await assertPeriodOpen(tx, date), {
+      entryId: input.journalLineId,
+      operation: 'apply',
+      transactionDate: date,
+      sourceRef: `journal_line:${input.journalLineId}`,
+    });
     let rows: ApplicationRow[];
     if (input.chargeLineId) {
       const [line] = await tx.db
@@ -794,7 +801,12 @@ export async function unapplyJournalApplication(
       if (p?.voidedAt || p?.bouncedAt) throw new ServiceError('CONFLICT', 'That payment is void or bounced.');
     }
     await assertCopyDates(tx, { lineIds: [app.journalLineId], invoiceId: app.invoiceId, billId: app.billId, paymentId: app.paymentId });
-    await assertPeriodOpen(tx, app.date, { movable: false });
+    await recordClosingDateException(tx, await assertPeriodOpen(tx, app.date, { movable: false }), {
+      entryId: app.id,
+      operation: 'unapply',
+      transactionDate: app.date,
+      sourceRef: `journal_line:${app.journalLineId}`,
+    });
     // A General Journal credit applied to a General Journal charge is one application in two rows.
     const rows =
       app.kind === 'journal_offset' && app.pairId
@@ -848,7 +860,12 @@ export async function applyPaymentToJournalCharges(
         `The payment only has ${toAmountString(payment.unapplied)} unapplied (tried to use ${toAmountString(total)}).`,
       );
     }
-    await assertPeriodOpen(tx, payment.date, { movable: false });
+    await recordClosingDateException(tx, await assertPeriodOpen(tx, payment.date, { movable: false }), {
+      entryId: payment.id,
+      operation: 'apply',
+      transactionDate: payment.date,
+      sourceRef: `payment:${payment.id}`,
+    });
     const rows = await recordJournalChargesPaid(tx, {
       paymentId: payment.id,
       customerId: payment.customerId,
