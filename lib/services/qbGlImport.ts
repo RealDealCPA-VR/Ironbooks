@@ -89,6 +89,123 @@ export interface GlImportInput {
   accounts?: Record<string, GlAccountChoice>;
   /** Post any difference to 'QB Import Suspense' instead of rolling back. */
   acceptVariance?: boolean;
+  /**
+   * The user confirmed importing although accounts this report posts to already hold entries
+   * that did not come from a General Ledger import (IIF opening balances, setup-interview
+   * balances, manual entries…). Without it such an import is rolled back: those balances would
+   * be counted twice.
+   */
+  acceptExistingEntries?: boolean;
+}
+
+/** Entries already in an account the GL import posts to that did not come from a GL import. */
+export interface GlExistingEntries {
+  accountId: string;
+  code: string;
+  name: string;
+  /** Net of those entries, debit-positive. */
+  balance: string;
+  sources: { source: string; label: string; entries: number; amount: string }[];
+}
+
+/** Human label for a journal entry's sourceRef prefix. */
+function sourceLabel(prefix: string | null): string {
+  switch (prefix) {
+    case 'account':
+      return 'account opening balance (IIF list import or New Account)';
+    case 'setup-opening':
+      return 'setup interview opening balance';
+    case 'iif':
+      return 'IIF transaction import';
+    case 'item':
+      return 'item quantity on hand / inventory';
+    case 'qbopen-offset':
+      return 'open invoices / bills import';
+    case null:
+    case '':
+    case 'manual':
+    case 'journal_line':
+      return 'manual journal entry';
+    default:
+      return `${prefix.replace(/_/g, ' ')} transactions`;
+  }
+}
+
+/**
+ * Posted entries (any date) in `accountIds` that did not come from a General Ledger import,
+ * grouped by account and by source. Accounts whose such entries net to zero are left out.
+ */
+export async function nonGlEntriesIn(ctx: ServiceContext, accountIds: string[]): Promise<GlExistingEntries[]> {
+  const ids = [...new Set(accountIds)];
+  if (!ids.length) return [];
+  const prefix = sql<string | null>`split_part(${journalEntries.sourceRef}, ':', 1)`;
+  const rows: { accountId: string; prefix: string | null; n: number; dr: string; cr: string }[] = [];
+  for (let i = 0; i < ids.length; i += 500) {
+    const chunk = ids.slice(i, i + 500);
+    rows.push(
+      ...(await ctx.db
+        .select({
+          accountId: journalEntryLines.accountId,
+          prefix,
+          n: sql<number>`count(DISTINCT ${journalEntries.id})::int`,
+          dr: sql<string>`COALESCE(SUM(${journalEntryLines.debit}), 0)`,
+          cr: sql<string>`COALESCE(SUM(${journalEntryLines.credit}), 0)`,
+        })
+        .from(journalEntryLines)
+        .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+        .where(
+          and(
+            eq(journalEntries.companyId, ctx.companyId),
+            eq(journalEntries.status, 'posted'),
+            inArray(journalEntryLines.accountId, chunk),
+            sql`(${journalEntries.sourceRef} IS NULL OR ${journalEntries.sourceRef} NOT LIKE 'qbgl:%')`,
+          ),
+        )
+        .groupBy(journalEntryLines.accountId, prefix)),
+    );
+  }
+  if (!rows.length) return [];
+  const acctRows = await ctx.db
+    .select({ id: accounts.id, code: accounts.code, name: accounts.name })
+    .from(accounts)
+    .where(and(eq(accounts.companyId, ctx.companyId), inArray(accounts.id, [...new Set(rows.map((r) => r.accountId))])));
+  const acct = new Map(acctRows.map((a) => [a.id, a]));
+  const byAccount = new Map<string, GlExistingEntries & { net: Decimal }>();
+  for (const r of rows) {
+    const amt = Money.of(r.dr).minus(Money.of(r.cr));
+    const a = acct.get(r.accountId);
+    const cur = byAccount.get(r.accountId) ?? {
+      accountId: r.accountId,
+      code: a?.code ?? '',
+      name: a?.name ?? '',
+      balance: '0.00',
+      sources: [],
+      net: Money.zero(),
+    };
+    cur.net = cur.net.plus(amt);
+    const src = r.prefix || 'manual';
+    const label = sourceLabel(r.prefix || null);
+    const same = cur.sources.find((s) => s.label === label);
+    if (same) {
+      same.entries += r.n;
+      same.amount = toAmountString(Money.of(same.amount).plus(amt));
+    } else {
+      cur.sources.push({ source: src, label, entries: r.n, amount: toAmountString(amt) });
+    }
+    byAccount.set(r.accountId, cur);
+  }
+  return [...byAccount.values()]
+    .filter((a) => !a.net.isZero())
+    .map(({ net, ...a }) => ({ ...a, balance: toAmountString(net) }))
+    .sort((x, y) => x.code.localeCompare(y.code, undefined, { numeric: true }));
+}
+
+/** One sentence listing the accounts and where their non-GL entries came from. */
+export function describeExistingEntries(list: GlExistingEntries[], max = 8): string {
+  return `${list
+    .slice(0, max)
+    .map((a) => `${a.code} ${a.name} ${a.balance} (${a.sources.map((s) => `${s.label}: ${s.amount}`).join(', ')})`)
+    .join('; ')}${list.length > max ? `; and ${list.length - max} more` : ''}`;
 }
 
 /** Max decoded size per file (the app is local; this only guards against mistakes). */
@@ -177,6 +294,12 @@ export interface GlPreview {
   otherPostedEntries: number;
   /** Rebuilt transactions already imported earlier (same sourceRef). */
   alreadyImported: number;
+  /**
+   * Existing accounts this report is mapped onto that already hold entries which did not come
+   * from a General Ledger import (IIF opening balances, setup interview, manual…). Importing
+   * needs `acceptExistingEntries`: those balances would otherwise be counted twice.
+   */
+  existingEntries: GlExistingEntries[];
 }
 
 async function loadExistingAccounts(ctx: ServiceContext): Promise<ExistingAccount[]> {
@@ -279,6 +402,15 @@ export async function previewGlImport(ctx: ServiceContext, input: GlImportInput)
     );
   const already = await existingRefs(ctx, analysis.transactions.map((t) => t.ref));
   const count = (role: string) => analysis.names.filter((n) => n.role === role).length;
+  const existingEntries = await nonGlEntriesIn(
+    ctx,
+    p.accounts.filter((a) => a.mapTo !== 'new').map((a) => a.mapTo),
+  );
+  if (existingEntries.length) {
+    analysis.warnings.push(
+      `${existingEntries.length} account(s) this report posts to already hold balances that did not come from a General Ledger import, so the General Ledger would count them twice: ${describeExistingEntries(existingEntries)}. Remove those entries first (for IIF opening balances: void the "Opening balance for …" entries), or map those QuickBooks accounts to new accounts. Importing anyway needs your explicit confirmation.`,
+    );
+  }
   if ((other?.n ?? 0) > 0) {
     analysis.warnings.push(
       `This company file already has ${other!.n} posted transaction(s) that did not come from a General Ledger import. The proof only checks what this import brings in; if those transactions cover the same period, balances will be counted twice.`,
@@ -307,6 +439,7 @@ export async function previewGlImport(ctx: ServiceContext, input: GlImportInput)
     qbTypes: QB_ACCOUNT_TYPES,
     otherPostedEntries: other?.n ?? 0,
     alreadyImported: already.size,
+    existingEntries,
   };
 }
 
@@ -390,6 +523,11 @@ export interface GlImportResult {
   variancePosted: string | null;
   importId: string | null;
   warnings: string[];
+  /**
+   * Accounts this import posts to that also hold entries from elsewhere (any date). Non-empty
+   * with ok:false = refused until `acceptExistingEntries`; with ok:true = the user accepted.
+   */
+  existingEntries?: GlExistingEntries[];
 }
 
 /** Thrown inside the import transaction to roll it back while returning a result. */
@@ -968,16 +1106,30 @@ async function runGlImportUnanalyzed(
         proof = await buildProof();
       }
       if (!proof.trialBalanceMatches) throw tbRollback();
-      // The proof counts imported entries only. Say so plainly when other postings in the same
-      // accounts make the account's real balance differ from QuickBooks.
-      const full = await importedBalances(tx, asOf, false);
-      const drifted = proof.rows.filter((r) => !Money.of(r.actual).equals(full.get(r.accountId) ?? Money.zero()));
-      if (drifted.length) {
+      // The proof counts imported entries only. Every OTHER posted entry in the same accounts —
+      // at ANY date (IIF opening balances are dated the import day, long after the GL period) —
+      // would sit on top of the QuickBooks history and double those balances. Refuse unless the
+      // user explicitly confirmed; then say so plainly in the result.
+      const existingEntries = await nonGlEntriesIn(tx, proof.rows.map((r) => r.accountId));
+      if (existingEntries.length) {
+        const list = describeExistingEntries(existingEntries, 5);
+        if (!input.acceptExistingEntries) {
+          throw new Rollback({
+            ok: false,
+            dryRun,
+            rolledBack: true,
+            message: `Nothing was saved: ${existingEntries.length} account(s) this report posts to already hold entries that did not come from a General Ledger import, so their balances would be counted twice: ${list}. Remove those entries first (for IIF opening balances: void the "Opening balance for …" entries), map those QuickBooks accounts to new accounts, or confirm that you want to import anyway.`,
+            proof,
+            counts,
+            review: analysis.review,
+            variancePosted: null,
+            importId: null,
+            warnings,
+            existingEntries,
+          });
+        }
         warnings.push(
-          `${drifted.length} account(s) also hold entries that weren't part of this import, so their balance in Ironbooks differs from QuickBooks: ${drifted
-            .slice(0, 5)
-            .map((r) => `${r.code} ${r.name} (${toAmountString(full.get(r.accountId) ?? 0)} here vs ${r.expected} in QuickBooks)`)
-            .join('; ')}${drifted.length > 5 ? '; …' : ''}.`,
+          `${existingEntries.length} account(s) also hold entries that weren't part of this import, so their balance in Ironbooks differs from QuickBooks: ${describeExistingEntries(existingEntries, 50)}.`,
         );
       }
       if (!proof.ledger.balanced) {
@@ -990,14 +1142,15 @@ async function runGlImportUnanalyzed(
         dryRun,
         rolledBack: dryRun,
         message: dryRun
-          ? `Dry run passed: every account matches${variancePosted ? ` after moving ${variancePosted} to ${QB_SUSPENSE.name}` : ''}. Nothing was saved yet.`
-          : `Imported ${counts.entriesPosted} transaction(s). Every account matches the QuickBooks report${variancePosted ? ` after moving ${variancePosted} to ${QB_SUSPENSE.name}` : ''}.`,
+          ? `Dry run passed: every account matches${variancePosted ? ` after moving ${variancePosted} to ${QB_SUSPENSE.name}` : ''}${existingEntries.length ? `, but ${existingEntries.length} account(s) also hold other entries you chose to keep (see the warnings)` : ''}. Nothing was saved yet.`
+          : `Imported ${counts.entriesPosted} transaction(s). Every account matches the QuickBooks report${variancePosted ? ` after moving ${variancePosted} to ${QB_SUSPENSE.name}` : ''}${existingEntries.length ? ` in what this import brought in, but ${existingEntries.length} account(s) also hold other entries you chose to keep (see the warnings)` : ''}.`,
         proof,
         counts,
         review: analysis.review,
         variancePosted,
         importId: null,
         warnings,
+        existingEntries,
       };
       if (dryRun) throw new Rollback(result);
 

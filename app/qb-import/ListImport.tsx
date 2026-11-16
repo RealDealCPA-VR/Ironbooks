@@ -23,6 +23,7 @@ import {
   Card,
   Select,
   Label,
+  Input,
   Badge,
   Table,
   Th,
@@ -220,6 +221,26 @@ export function ListImport() {
   // IIF: bring open invoices / bills in as documents (A/R and A/P detail).
   const [openItemsAsDocs, setOpenItemsAsDocs] = useState(false);
   const [alreadyInGl, setAlreadyInGl] = useState(true);
+  // IIF: post each account's OBAMOUNT (QuickBooks' list export writes the CURRENT balance there).
+  const [postBalances, setPostBalances] = useState(false);
+  const [balancesDate, setBalancesDate] = useState('');
+  // A General Ledger import already holds every balance: posting OBAMOUNT too would double them.
+  const [glImported, setGlImported] = useState(false);
+  useEffect(() => {
+    let live = true;
+    api
+      .get<{ imports: unknown[] }>('/api/qb-import/gl')
+      .then((r) => {
+        if (live && Array.isArray(r?.imports) && r.imports.length > 0) {
+          setGlImported(true);
+          setPostBalances(false);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, []);
 
   // Detect whether Electron file-open API is available.
   const canOpenFile =
@@ -305,6 +326,9 @@ export function ListImport() {
               format: 'iif',
               content,
               ...(openItemsAsDocs ? { openItems: { asDocuments: true, alreadyInGl } } : {}),
+              ...(postBalances && !glImported
+                ? { postOpeningBalances: true, ...(balancesDate ? { openingBalanceDate: balancesDate } : {}) }
+                : {}),
             }
           : format === 'xlsx'
             ? { format: 'xlsx', kind: csvKind, data: xlsxData, mapping }
@@ -393,6 +417,38 @@ export function ListImport() {
                   as they are — the documents only add the per-customer and per-vendor detail.
                 </span>
               </label>
+            )}
+            <label className={`flex items-start gap-2 text-sm ${glImported ? 'text-navy/50' : 'text-navy'}`}>
+              <input
+                type="checkbox"
+                className="mt-1"
+                checked={postBalances && !glImported}
+                disabled={glImported}
+                onChange={(e) => setPostBalances(e.target.checked)}
+              />
+              <span>
+                Post account balances from this file as opening balances.{' '}
+                <span className="text-navy/60">
+                  QuickBooks’ <b>Export Lists to IIF</b> writes each account’s <b>current</b> balance into the file.
+                  Leave this unticked if you will import your General Ledger (step 2) — it brings every balance in
+                  with the full history, and posting these too would count them twice. Tick it only if you are{' '}
+                  <b>not</b> importing the General Ledger and want these balances as your starting point (each is
+                  balanced through Opening Balance Equity; A/R and A/P balances still come from step 3).
+                  {glImported && ' Not available: a General Ledger import is already in the books.'}
+                </span>
+              </span>
+            </label>
+            {postBalances && !glImported && (
+              <div className="pl-6 max-w-xs">
+                <Label htmlFor="iif-ob-date">Balances are as of (the day you exported the file)</Label>
+                <Input
+                  id="iif-ob-date"
+                  type="date"
+                  value={balancesDate}
+                  onChange={(e) => setBalancesDate(e.target.value)}
+                />
+                <p className="mt-1 text-xs text-navy/60">Leave blank to use today’s date.</p>
+              </div>
             )}
           </div>
         )}

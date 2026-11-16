@@ -76,6 +76,12 @@ entry's declared size, with every entry and the total capped (`electron/companyF
    unchanged since this computer last saved it, recovered when it holds changes that never reached
    the file (the app stopped before saving), or kept aside as `… (unsaved changes from PC, date)
    .ironbooks` when someone else saved the file in the meantime — nothing is ever silently lost.
+   It is also kept aside (and the company file opened as saved) when the app stopped without
+   closing and the working copy's transaction log is behind, or has split off from, the save it
+   was opened from: the company file is flushed to disk on every save and the working copy is not,
+   so a power cut can leave it older than the file, and it is never saved over it
+   (`companySession.js` `workingCopyBehind`). Books whose ledger was found damaged when they
+   opened are never saved over the company file either (`companyFileSave.ts`).
 3. **Server.** The app server runs on the working copy with `BKA_COMPANY_FILE`,
    `BKA_COMPANY_STATE`, `BKA_COMPANY_LOCK` and `BKA_COMPANY_LOCK_TOKEN`.
 

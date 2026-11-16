@@ -96,7 +96,8 @@ interface DesktopBridgeApi {
   isDesktop?: boolean;
   onMenu?: (cb: (action: string) => void) => Unsubscribe;
   onNavigate?: (cb: (route: string) => void) => Unsubscribe;
-  quitAndInstall?: () => Promise<boolean>;
+  /** 'cancelled': the person chose to keep a form they were typing (nothing happens). */
+  quitAndInstall?: () => Promise<boolean | 'cancelled'>;
   updates?: {
     status?: () => Promise<UpdateState>;
     onChange?: (cb: (state: UpdateState) => void) => Unsubscribe;
@@ -251,6 +252,11 @@ export default function DesktopBridge() {
     setInstalling(true);
     try {
       const staged = await bridge()?.quitAndInstall?.();
+      if (staged === 'cancelled') {
+        // Kept working on an unrecorded form: the update stays ready for later.
+        setInstalling(false);
+        return;
+      }
       if (staged === false) {
         setInstalling(false);
         toast('No update is staged — please restart the app manually.', 'danger');

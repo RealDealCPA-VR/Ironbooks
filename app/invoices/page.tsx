@@ -313,6 +313,13 @@ function lineKind(l: { itemType: ItemType | null }): LineKind {
   return 'income';
 }
 
+/** An Item typed on a line that matched nothing on the Item List: the message, else null. */
+function unknownItemMessage(l: { itemName: string; itemId: string | null }): string | null {
+  const typed = l.itemName.trim();
+  if (!typed || l.itemId) return null;
+  return `Item '${typed}' isn't on the Item List. Pick it from the list or clear the Item box.`;
+}
+
 const KIND_BADGES: Partial<Record<ItemType, { label: string; tone: 'info' | 'success' | 'warning' | 'danger' | 'neutral' }>> = {
   bundle: { label: 'Bundle', tone: 'neutral' },
   discount: { label: 'Discount', tone: 'danger' },
@@ -477,6 +484,10 @@ function InvoiceModal({
   const recalledTaxRef = useRef<string | null>(null);
   /** Current terms (so a late due-date lookup for replaced terms is ignored). */
   const termsRef = useRef('');
+  /** The due date was typed (not worked out from the terms): a new invoice date leaves it alone. */
+  const dueTyped = useRef(false);
+  /** The latest invoice date (a late due-date lookup for an older date is ignored). */
+  const dateRef = useRef('');
   const [discount, setDiscount] = useState('');
   const [discountType, setDiscountType] = useState<DiscountType>('amount');
   const [currency, setCurrency] = useState('');
@@ -537,6 +548,7 @@ function InvoiceModal({
   // Smart defaults (lib/useSmartDefaults.ts): default date + recall the customer's last invoice.
   const smart = useSmartDefaults('invoice');
   termsRef.current = terms;
+  dateRef.current = date;
 
   // Sales reps for the Rep field (list permission may be missing: then the field just hides).
   useEffect(() => {
@@ -558,6 +570,15 @@ function InvoiceModal({
       setCustomerId(editing.customerId);
       setDate(editing.date ? editing.date.slice(0, 10) : todayISO());
       setDueDate(editing.dueDate ? editing.dueDate.slice(0, 10) : '');
+      // A saved due date counts as typed unless it is what the terms give for the saved date
+      // (then a new invoice date moves it, as on a new invoice).
+      dueTyped.current = Boolean(editing.dueDate);
+      if (editing.dueDate && editing.terms && editing.date) {
+        const savedDue = editing.dueDate.slice(0, 10);
+        void fetchDueDateForTerms(editing.date.slice(0, 10), editing.terms).then((due) => {
+          if (due && due === savedDue) dueTyped.current = false;
+        });
+      }
       setTerms(editing.terms ?? '');
       setTaxRateId(editing.taxRateId ?? '');
       setClassId(editing.classId ?? '');
@@ -611,6 +632,7 @@ function InvoiceModal({
       // My Preferences > General "Default date": today, or the last invoice date entered this session.
       setDate(smart.defaultDate());
       setDueDate('');
+      dueTyped.current = false;
       setTerms('');
       setTaxRateId('');
       setClassId('');
@@ -690,7 +712,10 @@ function InvoiceModal({
     // Terms list entries (Standard or Date-Driven) via /api/terms/compute.
     let live = true;
     void fetchDueDateForTerms(date, custTerms).then((due) => {
-      if (live && due && termsRef.current === (custTerms ?? '')) setDueDate(due);
+      if (live && due && termsRef.current === (custTerms ?? '') && dateRef.current === date) {
+        dueTyped.current = false;
+        setDueDate(due);
+      }
     });
     return () => {
       live = false;
@@ -716,7 +741,10 @@ function InvoiceModal({
         termsRef.current = t;
         if (date) {
           void fetchDueDateForTerms(date, t).then((due) => {
-            if (live && due && termsRef.current === t) setDueDate(due);
+            if (live && due && termsRef.current === t && dateRef.current === date) {
+              dueTyped.current = false;
+              setDueDate(due);
+            }
           });
         }
       }
@@ -751,7 +779,20 @@ function InvoiceModal({
     setTerms(value);
     if (!value || !date) return;
     void fetchDueDateForTerms(date, value).then((due) => {
-      if (due) setDueDate(due);
+      if (!due) return;
+      dueTyped.current = false;
+      setDueDate(due);
+    });
+  }
+
+  /** Invoice date changed: a due date worked out from the terms moves with it (a typed one stays). */
+  function handleDateChange(value: string) {
+    setDate(value);
+    dateRef.current = value;
+    const t = termsRef.current;
+    if (dueTyped.current || !value || !t) return;
+    void fetchDueDateForTerms(value, t).then((due) => {
+      if (due && !dueTyped.current && dateRef.current === value && termsRef.current === t) setDueDate(due);
     });
   }
 
@@ -991,6 +1032,13 @@ function InvoiceModal({
       }),
     };
     lines.forEach((l, idx) => {
+      // An Item typed that is not on the Item List (a typo, a partial name) would save the line
+      // with no item and post it to the default income account.
+      const unknownItem = unknownItemMessage(l);
+      if (unknownItem) {
+        entries[`line-${idx}-item`] = `Line ${idx + 1}: ${unknownItem}`;
+        return;
+      }
       if (!(l.itemId || l.description || l.quantity || l.rate)) return;
       const kind = lineKind(l);
       const n = idx + 1;
@@ -1024,7 +1072,7 @@ function InvoiceModal({
     for (const op of fix.patch ?? []) {
       const value = getPath(patched, op.path);
       const str = typeof value === 'string' ? value : value == null ? '' : String(value);
-      if (op.path === 'date') setDate(str);
+      if (op.path === 'date') handleDateChange(str);
       else if (op.path === 'refNumber') setRefNumber(str);
       else if (op.path === 'taxRateId') setTaxRateId(str);
       else if (op.path === 'classId') setClassId(str);
@@ -1326,7 +1374,7 @@ function InvoiceModal({
             <DateInput
               id="inv-date"
               value={date}
-              onChange={(e) => setDate(e.target.value)}
+              onChange={(e) => handleDateChange(e.target.value)}
               aria-required="true"
               {...fieldA11y('inv', 'date', fieldErrors)}
             />
@@ -1337,7 +1385,10 @@ function InvoiceModal({
             <DateInput
               id="inv-due"
               value={dueDate}
-              onChange={(e) => setDueDate(e.target.value)}
+              onChange={(e) => {
+                dueTyped.current = Boolean(e.target.value);
+                setDueDate(e.target.value);
+              }}
               {...fieldA11y('inv', 'due', fieldErrors)}
             />
             <FieldError formId="inv" name="due" errors={fieldErrors} />
@@ -1490,6 +1541,8 @@ function InvoiceModal({
                     list="inv-item-options"
                     value={line.itemName}
                     onChange={(e) => handleItemInput(idx, e.target.value)}
+                    aria-label={`Line ${idx + 1} item`}
+                    {...fieldA11y('inv', `line-${idx}-item`, fieldErrors)}
                     className={line.itemId ? 'border-electric/50' : undefined}
                   />
                   <Input

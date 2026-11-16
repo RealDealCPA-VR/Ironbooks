@@ -61,6 +61,11 @@ import {
 import { depositMethodLabel, depositMethodViews, matchesDepositMethodView } from '@/lib/salesFormListsClient';
 import { SaveAndNewButton } from '@/components/FormShortcuts';
 
+/** Nothing entered on an additional line (Enter on the last line adds one): not validated or saved. */
+function isBlankExtraLine(l: ExtraLine): boolean {
+  return !l.accountId && !l.amount.trim() && !l.description.trim() && !l.entityId;
+}
+
 /** Body sent to /api/deposits (fix patches address its paths, e.g. "paymentIds", "depositAccountId"). */
 type DepositBody = Record<string, unknown> & {
   paymentIds: string[];
@@ -211,19 +216,22 @@ function MakeDepositModal({
 
   /** Inline field messages (lib/fieldValidation.ts). */
   function validateForm(): FieldErrors {
+    const filledExtra = extraLines.filter((l) => !isBlankExtraLine(l)).length;
     const entries: Record<string, string | null> = {
       account: requiredMessage(depositAccountId, 'Choose the bank account the money goes into.'),
       date: dateMessage(date, 'Deposit date'),
       cashBackAmount: amountMessage(cashBackAmount, { label: 'Cash back' }),
       cashBackAccount: cashBackNum > 0 && !cashBackAccountId ? 'Choose the account that cash back goes to.' : null,
       total:
-        selectedIds.size === 0 && extraLines.length === 0
+        selectedIds.size === 0 && filledExtra === 0
           ? 'Select at least one payment or add a deposit line.'
           : netTotal <= 0
             ? 'Cash back is as much as the deposit itself. Lower the cash back or add more to deposit.'
             : null,
     };
     extraLines.forEach((l, i) => {
+      // A blank line is left out, as in QuickBooks.
+      if (isBlankExtraLine(l)) return;
       entries[`extra-${i}-account`] = requiredMessage(l.accountId, `Additional line ${i + 1}: choose where the money came from.`);
       entries[`extra-${i}-amount`] = amountMessage(l.amount, { label: `Additional line ${i + 1} amount`, required: true });
     });
@@ -232,7 +240,7 @@ function MakeDepositModal({
   const fieldErrors: FieldErrors = showErrors ? validateForm() : {};
 
   /** Copy a fix's changes (request-body paths) back onto the form. */
-  function applyToForm(patched: DepositBody, fix: ErrorFix) {
+  function applyToForm(patched: DepositBody, fix: ErrorFix, extraIdx: number[] = []) {
     for (const op of fix.patch ?? []) {
       const value = getPath(patched, op.path);
       const str = typeof value === 'string' ? value : value == null ? '' : String(value);
@@ -251,7 +259,8 @@ function MakeDepositModal({
       } else {
         const lp = parseLinePath(op.path);
         if (lp?.collection === 'extraLines' && (lp.field === 'accountId' || lp.field === 'amount')) {
-          patchExtraLine(lp.index, { [lp.field]: str });
+          // Body line → form line (blank form lines are not sent).
+          patchExtraLine(extraIdx[lp.index] ?? lp.index, { [lp.field]: str });
         }
       }
     }
@@ -295,13 +304,16 @@ function MakeDepositModal({
       .map((p) => p.id);
 
     {
+      // Blank additional lines are not sent; extraIdx maps each sent line back to its form line.
+      const kept = extraLines.map((l, i) => ({ l, i })).filter(({ l }) => !isBlankExtraLine(l));
+      const extraIdx = kept.map(({ i }) => i);
       const body: DepositBody = {
         depositAccountId,
         date,
         paymentIds,
         salesReceiptIds,
         invoicePaymentIds,
-        extraLines: extraLines.map(extraLinePayload),
+        extraLines: kept.map(({ l }) => extraLinePayload(l)),
         cashBack:
           cashBackNum > 0
             ? { accountId: cashBackAccountId, amount: cashBackAmount }
@@ -313,7 +325,12 @@ function MakeDepositModal({
         await send(body);
       } catch (err: unknown) {
         // Already deposited / not in Undeposited Funds / wrong account → Fix buttons.
-        fixer.report(err, { payload: body, resubmit: send, applyToForm, fallback: 'Failed to save deposit.' });
+        fixer.report(err, {
+          payload: body,
+          resubmit: send,
+          applyToForm: (patched: DepositBody, fix: ErrorFix) => applyToForm(patched, fix, extraIdx),
+          fallback: 'Failed to save deposit.',
+        });
       }
     }
   }

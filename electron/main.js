@@ -855,8 +855,25 @@ async function confirmTakeOver(filePath, holder) {
 }
 
 /** Unsaved changes on this computer can't be combined with a newer save: keep them apart? */
-async function confirmConflict(filePath, state, manifest) {
+async function confirmConflict(filePath, state, manifest, reason) {
   const name = companyFile.locationName(filePath);
+  if (reason === 'behind') {
+    // The working copy on this computer is OLDER than the company file (the computer lost power or
+    // restarted before its last writes reached the disk): it is never saved over the company file.
+    const { response } = await dialog.showMessageBox(parentWindow(), {
+      noLink: true,
+      type: 'warning',
+      message: `Ironbooks closed unexpectedly the last time ${name} was open on this computer.`,
+      detail:
+        'The copy of the books on this computer is missing some of the work that was already saved into the company file (the computer may have lost power or restarted). ' +
+        'Ironbooks will open the company file as it was last saved, so nothing saved is lost.\n\n' +
+        'The copy from this computer is kept as a separate company file next to this one (its name says "unsaved changes"), in case it holds anything the company file does not. You can open it later to compare.',
+      buttons: ['Open the Company File', 'Cancel'],
+      defaultId: 0,
+      cancelId: 1,
+    });
+    return response === 0;
+  }
   const sb = manifest && manifest.savedBy;
   const by = sb ? ` from ${sb.appUser ? `${sb.appUser} on ` : ''}${sb.computer || 'another computer'}` : '';
   const when = state.unsavedSince ? ` around ${timeOfDay(state.unsavedSince)} on ${new Date(state.unsavedSince).toLocaleDateString()}` : '';
@@ -914,7 +931,7 @@ async function openSingleFileForLaunch(filePath) {
       appVersion: app.getVersion(),
       // A file a newer Ironbooks saved is refused before its working copy is touched.
       knownSchemaAt: companySession.latestMigrationAt(migrationsDir()),
-      onConflict: ({ state, manifest }) => confirmConflict(filePath, state, manifest),
+      onConflict: ({ state, manifest, reason }) => confirmConflict(filePath, state, manifest, reason),
     });
   } catch (err) {
     companyLock.release(lock);
@@ -1737,6 +1754,19 @@ async function createCompanyFlow({ convertFromQuickBooks = false } = {}) {
     dialog.showErrorBox('Could not create the company file', openErrorText(e));
     return;
   }
+  // The same advice as File > Open (a OneDrive / Dropbox folder, a temporary folder): a new file
+  // saved in Documents synced by OneDrive is the commonest case.
+  const checked = await confirmCompanyFileLocation(target).catch(() => target);
+  if (!checked) {
+    // Cancelled: the empty file made a moment ago is not left behind (it was never opened).
+    try {
+      fs.rmSync(target, { force: true });
+    } catch {
+      /* best effort */
+    }
+    return;
+  }
+  target = checked;
   // First page of the new file: set up its Admin user, then the setup interview (only once the
   // file open now has closed — never for that file if the person keeps working in it).
   // "Convert from QuickBooks": after the Admin is set up, the QuickBooks import wizard comes next
@@ -1873,7 +1903,10 @@ async function restoreBackupAsNewFileFlow(bkaPath) {
       defaultId: 0,
       cancelId: 1,
     });
-    if (response === 0) openCompany(target);
+    // The same advice as File > Open (a OneDrive / Dropbox folder, a temporary folder).
+    // (Never lets the restored file be removed below: a failing check just opens it as before.)
+    const checked = response === 0 ? await confirmCompanyFileLocation(target).catch(() => target) : null;
+    if (checked) openCompany(checked);
     else if (startScreenMode) mainWindow?.webContents.reload();
     else buildMenu();
   } catch (err) {
@@ -3141,8 +3174,12 @@ function startBackupScheduler(url) {
     .catch((err) => console.error('[backup] could not start the backup schedule:', err?.message || err));
 }
 
+/** The server the background jobs run against (set once they are scheduled; null: none). */
+let backgroundJobsUrl = null;
+
 function scheduleBackgroundJobs(url) {
   if (scheduledReportsTimer || recurringTimer) return;
+  backgroundJobsUrl = url;
   if (!remoteHostOrigin) startBackupScheduler(url);
   scheduledReportsTimer = setInterval(() => runDueScheduledReports(url), SCHEDULED_REPORTS_EVERY_MS);
   recurringTimer = setInterval(() => runDueRecurring(url), RECURRING_EVERY_MS);
@@ -3150,9 +3187,21 @@ function scheduleBackgroundJobs(url) {
   setTimeout(() => runDueScheduledReports(url), 60 * 1000);
 }
 
-app.on('before-quit', () => {
+/** Stop the recurring-transaction and scheduled-report timers (quitting: the file is being closed). */
+function stopBackgroundJobs() {
   if (scheduledReportsTimer) clearInterval(scheduledReportsTimer);
   if (recurringTimer) clearInterval(recurringTimer);
+  scheduledReportsTimer = null;
+  recurringTimer = null;
+}
+
+/** The quit was cancelled (Keep Working after a failed save): the timers run again. */
+function resumeBackgroundJobs() {
+  if (backgroundJobsUrl && !scheduledReportsTimer && !recurringTimer) scheduleBackgroundJobs(backgroundJobsUrl);
+}
+
+app.on('before-quit', () => {
+  stopBackgroundJobs();
 });
 
 // --- Window frame: theme colors and the in-page menu bar (components/WindowTitleBar.tsx) ---
@@ -3704,10 +3753,13 @@ ipcMain.handle('app:downloadUpdate', async (e) => {
 
 // Renderer "Restart & install now" -> apply the downloaded update immediately.
 // Returns false if no update is staged (the UI then tells the user to restart manually).
-ipcMain.handle('app:quitAndInstall', (e) => {
+ipcMain.handle('app:quitAndInstall', async (e) => {
   if (!fromLocalApp(e)) return false;
   if (!autoUpdater || updateState.state !== 'ready') return false;
   if (sandboxActive()) return false; // sandbox mode: no installs from a practice copy
+  // A form being typed is lost by the restart: ask first, as closing the window does (the quit
+  // below skips that question — the window closes with quittingAfterBackup set).
+  if (mainWindow && !mainWindow.isDestroyed() && !(await confirmCloseOverUnsavedWork(mainWindow))) return 'cancelled';
   // Defer so the IPC reply is sent before the app tears down. The quit saves and releases the
   // company file first; before-quit then starts the installer (and relaunches after it).
   setImmediate(() => {
@@ -3779,6 +3831,7 @@ app.on('before-quit', (event) => {
           // keep the config pointing at the file they are still working in.
           relaunchAfterQuit = false;
           installAfterClose = false;
+          resumeBackgroundJobs();
           configAfterClose = null;
           return;
         }

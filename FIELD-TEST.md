@@ -73,6 +73,28 @@ Nothing typed should be lost, and the file on the server should never be damaged
 - [ ] Close Field Test on PC B, turn PC A back on and open Field Test there. If PC A had unsaved
   changes, Ironbooks offers to keep them as a separate company file named "… unsaved changes …"
   next to Field Test, then opens the file as PC B saved it. Nothing PC B entered is overwritten.
+- [ ] Recovering after the app is killed: on one PC, enter a transaction, wait for **Saved**, enter
+  a second one and end Ironbooks in Task Manager straight away. Open Field Test again: both
+  transactions are there (the second one recovered), the title bar returns to **Saved**, and no
+  earlier transaction is missing.
+- [ ] If Ironbooks ever says it "closed unexpectedly" and offers to open the company file as last
+  saved, choose it: the file opens with everything that was saved, and a "… unsaved changes …" copy
+  is kept next to it. Note what you did just before.
+
+## 5a. Backups and updates
+
+- [ ] File > Back Up Company… > **Back up now**. The new backup is listed with today's time.
+- [ ] Enter a test transaction, then restore that backup into the open file (File > Open or Restore
+  Company, choose the `.bka`, **Into the Open Company…**). After the preview and confirmation the
+  test transaction is gone, everything from before the backup is there, and a safety copy made
+  before the restore is listed.
+- [ ] Restore the same backup **As a New Company File…** into Documents: it opens as its own file
+  and Field Test is unchanged.
+- [ ] Updating while a file is open (when an update is offered): start typing an invoice without
+  saving it, then choose **Restart & install now**. Ironbooks first asks about the unrecorded
+  form; **Cancel** keeps you in it. Save the invoice, choose **Restart & install now** again: the
+  file is saved and closed, the update installs, Ironbooks reopens Field Test, and the invoice is
+  there.
 
 ## 6. Passwords travel with the file
 
@@ -110,7 +132,9 @@ Use a PC that has never had Ironbooks, if you have one.
 - [ ] In Edge, download **Ironbooks-Setup-1.7.8.exe** from
   [the latest release](https://github.com/RealDealCPA-VR/Ironbooks/releases/latest). Note exactly
   what the browser and Windows say. Until signing is set up, Windows shows "Windows protected your
-  PC": choose **More info**, then **Run anyway**.
+  PC": choose **More info**, then **Run anyway**. If there is no **Run anyway** at all, check
+  Windows Security > App & browser control > Smart App Control: when it is On, Windows 11 blocks
+  unsigned apps outright. Note what it says.
 - [ ] The installer finishes without errors, and Ironbooks opens to the welcome screen.
 - [ ] Double-clicking a `.ironbooks` file in File Explorer opens it in Ironbooks.
 - [ ] Once the winget listing is approved, `winget install RealDealCPA-VR.Ironbooks` in a terminal

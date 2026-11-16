@@ -53,11 +53,29 @@ const typedDate = new WeakMap<HTMLInputElement, string>();
 export function completeTypedDate(el: HTMLInputElement): boolean {
   const typed = typedDate.get(el);
   typedDate.delete(el);
-  if (!typed || el.value || !el.validity.badInput || el.readOnly || el.disabled) return false;
+  if (el.readOnly || el.disabled) return false;
+  // A two-digit year typed over a filled-in date ("10/31/26"): the browser keeps it as the year
+  // 0026. QuickBooks reads two-digit years as 20xx (lib/shortcuts.ts parseTypedDate).
+  const century = twoDigitYearFix(el.value);
+  if (century) {
+    setValue(el, century, true);
+    return true;
+  }
+  if (!typed || el.value || !el.validity.badInput) return false;
   const iso = parseTypedDate(typed);
   if (!iso) return false;
-  setValue(el, iso);
+  setValue(el, iso, true);
   return true;
+}
+
+/** "0026-10-31" (a two-digit year the date box kept as is) → "2026-10-31"; null when the year is fine. */
+export function twoDigitYearFix(value: string): string | null {
+  const m = /^(\d{4,})-(\d{2})-(\d{2})$/.exec(value);
+  if (!m) return null;
+  const year = Number(m[1]);
+  if (year >= 100) return null;
+  // 00xx and 20xx share the leap-year pattern, so the day stays valid.
+  return `${2000 + year}-${m[2]}-${m[3]}`;
 }
 
 type ValueField = HTMLInputElement | HTMLTextAreaElement;
@@ -70,12 +88,13 @@ function isValueField(el: EventTarget | null): el is ValueField {
   return !['checkbox', 'radio', 'button', 'submit', 'reset', 'file', 'hidden', 'image', 'range', 'color'].includes(type);
 }
 
-function setValue(el: ValueField, value: string) {
+function setValue(el: ValueField, value: string, change = false) {
   const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
   const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
   if (setter) setter.call(el, value);
   else el.value = value;
   el.dispatchEvent(new Event('input', { bubbles: true }));
+  if (change) el.dispatchEvent(new Event('change', { bubbles: true }));
 }
 
 /** Ctrl+Z (no Shift / Alt) undoes the last change in `el`; true when it did. */

@@ -28,7 +28,7 @@ import { asc } from 'drizzle-orm';
 import { getDb, resolveDataDir, sealedMode, withDamagedFileAccess } from '@/lib/db';
 import { companies } from '@/lib/db/schema';
 import { ServiceError } from './errors';
-import { createBackup } from './backup';
+import { createBackup, writeFileDurablyAs } from './backup';
 import { protectionForDir } from './fileProtection';
 import { currentFingerprint } from './backupFingerprint';
 import { readSandboxMarker, sandboxBlockedError } from './sandboxState';
@@ -180,10 +180,9 @@ async function doVersionedBackup(source: VersionedSource, opts: VersionedBackupO
   const { buffer } = createBackup(opts.companyName ?? undefined, dir, { protection: await protectionForDir(dir) });
   const filename = versionFilename(source, opts.companyName ?? null, now);
   const outPath = path.join(folder, filename);
-  // Write to a temp name first so a half-written file never looks like a version.
-  const tmp = `${outPath}.partial`;
-  fs.writeFileSync(tmp, buffer);
-  fs.renameSync(tmp, outPath);
+  // Write to a temp name first so a half-written file never looks like a version — flushed to the
+  // disk before it is renamed, and so before the rotation below deletes an older good version.
+  writeFileDurablyAs(outPath, buffer);
   removeStalePartials(folder);
 
   const record = recordBackup(

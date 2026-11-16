@@ -924,15 +924,28 @@ export async function reverseEntry(ctx: ServiceContext, id: string, asOfDate?: D
     };
   });
 
-  return postJournalEntry(ctx, {
+  const reversal = {
     date,
     description: `Reversal of #${original.entryNumber}: ${original.description}`,
     reference: `REV of #${original.entryNumber}`,
-    status: 'posted',
+    status: 'posted' as const,
     lines,
     sourceRef: `reversal:${id}`,
     isAdjusting: original.isAdjusting,
     ...(fxCurrencies.size === 1 ? { currency: [...fxCurrencies][0] } : {}),
+  };
+  // One live reversal per entry: a double-click (or a second Reverse) posted the reversal twice,
+  // swinging the books the other way. Checked and posted in one transaction.
+  return inTransaction(ctx, async (tx) => {
+    const [already] = await tx.db
+      .select({ entryNumber: journalEntries.entryNumber })
+      .from(journalEntries)
+      .where(and(eq(journalEntries.companyId, tx.companyId), eq(journalEntries.sourceRef, `reversal:${id}`), eq(journalEntries.status, 'posted')))
+      .limit(1);
+    if (already) {
+      throw new ServiceError('CONFLICT', `This entry was already reversed by entry #${already.entryNumber}. Void that reversal first to reverse it again.`);
+    }
+    return postJournalEntry(tx, reversal);
   });
 }
 

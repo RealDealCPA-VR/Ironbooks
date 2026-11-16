@@ -73,6 +73,9 @@ interface ReconciliationReport {
   discrepancies: ReportLine[];
   /** Reconciled transactions changed after this statement was reconciled. */
   changes?: ReportChange[];
+  uncleared?: ReportLine[];
+  unclearedTotal?: string;
+  registerBalance?: string;
 }
 
 interface ReportChange {
@@ -144,6 +147,16 @@ function buildCsv(r: ReconciliationReport): string {
         l.isVoided ? 'YES' : '',
       ),
     );
+  }
+  if (r.uncleared && r.registerBalance != null) {
+    out.push('');
+    out.push(toCsvRow(`Uncleared Transactions as of ${fmtDate(r.statementDate)}`));
+    out.push(toCsvRow('Date', 'Entry #', 'Description', 'Memo', 'Debit', 'Credit', 'Amount'));
+    for (const l of r.uncleared) {
+      out.push(toCsvRow(fmtDate(l.date), l.entryNumber, l.description, l.memo ?? '', l.debit ?? '', l.credit ?? '', l.amount));
+    }
+    out.push(toCsvRow('Total Uncleared', r.unclearedTotal ?? '0.00'));
+    out.push(toCsvRow(`Register Balance as of ${fmtDate(r.statementDate)}`, r.registerBalance));
   }
   return out.join('\n');
 }
@@ -403,6 +416,49 @@ export default function ReconciliationDetailReportPage() {
               </Table>
             )}
           </Card>
+
+          {/* QB Reconciliation Detail: uncleared transactions and the register tie-out */}
+          {report.uncleared && report.registerBalance != null && (
+            <Card className="p-6">
+              <h3 className="text-base font-bold text-navy mb-1">
+                Uncleared Transactions as of {fmtDate(report.statementDate)} ({report.uncleared.length})
+              </h3>
+              <p className="text-sm text-navy/60 mb-4">
+                Cleared balance {formatCurrency(report.clearedBalance)} + uncleared {formatCurrency(report.unclearedTotal ?? '0')} ={' '}
+                register balance {formatCurrency(report.registerBalance)}.
+              </p>
+              {report.uncleared.length > 0 && (
+                <Table>
+                  <thead>
+                    <tr>
+                      <Th>Date</Th>
+                      <Th>Entry #</Th>
+                      <Th>Description</Th>
+                      <Th>Memo</Th>
+                      <Th className="text-right">Amount</Th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {report.uncleared.map((l) => (
+                      <Tr key={l.lineId}>
+                        <Td className="whitespace-nowrap">{fmtDate(l.date)}</Td>
+                        <Td className="tabular-nums text-navy/60">#{l.entryNumber}</Td>
+                        <Td className="max-w-xs truncate">{l.description}</Td>
+                        <Td className="text-navy/60">{l.memo ?? '—'}</Td>
+                        <Td numeric className={Number(l.amount) < 0 ? 'text-red-500' : 'text-navy'}>
+                          {formatCurrency(l.amount)}
+                        </Td>
+                      </Tr>
+                    ))}
+                  </tbody>
+                </Table>
+              )}
+              <div className="mt-3">
+                <SummaryRow label="Total uncleared" value={formatCurrency(report.unclearedTotal ?? '0')} />
+                <SummaryRow label={`Register balance as of ${fmtDate(report.statementDate)}`} value={formatCurrency(report.registerBalance)} bold />
+              </div>
+            </Card>
+          )}
         </div>
       )}
     </main>

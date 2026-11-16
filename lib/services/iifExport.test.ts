@@ -44,8 +44,9 @@ const SOURCE_IIF = [
   t('!VEND', 'NAME', 'ADDR1', 'ADDR2', 'TERMS', '1099', 'TAXID'),
   t('VEND', 'Contractor Joe', '9 Side St', 'Dayton, OH 45402', 'Net 30', 'Y', '98-7654321'),
   t('!INVITEM', 'NAME', 'INVITEMTYPE', 'DESC', 'PRICE', 'COST', 'ACCNT'),
-  t('INVITEM', 'Bolt', 'PART', 'Bolt', '1.00', '0.40', 'Sales Income'),
-  t('INVITEM', 'Nut', 'PART', 'Nut', '0.50', '0.10', 'Sales Income'),
+  // QuickBooks: INVENTORY = Inventory Part (PART is a NON-inventory part).
+  t('INVITEM', 'Bolt', 'INVENTORY', 'Bolt', '1.00', '0.40', 'Sales Income'),
+  t('INVITEM', 'Nut', 'INVENTORY', 'Nut', '0.50', '0.10', 'Sales Income'),
   t('INVITEM', 'Hardware Kit', 'GRP', 'Kit', '', '', ''),
   t('INVITEM', 'Setup Fee', 'OTHC', 'Setup', '50.00', '', 'Sales Income'),
   t('INVITEM', 'County Tax', 'STAX', 'County', '7.5%', '', ''),

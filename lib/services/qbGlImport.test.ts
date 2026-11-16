@@ -313,7 +313,11 @@ describe('qbGlImport — QuickBooks General Ledger migration', () => {
     const preview = await previewGlImport(ctx, { file });
     expect(preview.otherPostedEntries).toBe(1);
     const fuel = preview.accounts.find((a) => a.number === '60100')!;
-    const r = await runGlImport(ctx, { file, accounts: { [fuel.key]: { mapTo: car.id } } });
+    // Refused until the user confirms keeping those entries (they would count twice).
+    const refused = await runGlImport(ctx, { file, accounts: { [fuel.key]: { mapTo: car.id } } });
+    expect(refused.ok).toBe(false);
+    expect(refused.existingEntries?.map((e) => e.code)).toEqual(['6999']);
+    const r = await runGlImport(ctx, { file, accounts: { [fuel.key]: { mapTo: car.id } }, acceptExistingEntries: true });
     expect(r.ok).toBe(true);
     expect(r.proof.allMatch).toBe(true);
     expect(r.warnings.some((w) => /weren't part of this import/.test(w) && w.includes('6999'))).toBe(true);

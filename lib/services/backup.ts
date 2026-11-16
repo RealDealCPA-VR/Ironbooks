@@ -189,7 +189,11 @@ export interface BackupResult {
  *                     here is refused, never backed up in plain text.
  * @returns { buffer, filename } — filename is 'ironbooks-backup-<slug>.bka'.
  */
-export function createBackup(companyName?: string, dataDir?: string, opts: { protection?: SealProtection | null } = {}): BackupResult {
+export function createBackup(
+  companyName?: string,
+  dataDir?: string,
+  opts: { protection?: SealProtection | null; dbSchemaAt?: number | null } = {},
+): BackupResult {
   const dir = resolveDataDir(dataDir);
 
   if (!fs.existsSync(dir)) {
@@ -211,7 +215,7 @@ export function createBackup(companyName?: string, dataDir?: string, opts: { pro
       companyName: companyName ?? null,
       createdAt: new Date().toISOString(),
       appVersion: APP_VERSION,
-      ...schemaStamp(),
+      ...schemaStamp(opts.dbSchemaAt),
     };
     const entries = format.snapshotDir(dir).filter((e: { name: string }) => !FILE_LOCAL_FILES.includes(e.name));
     return {
@@ -238,15 +242,20 @@ export function createBackup(companyName?: string, dataDir?: string, opts: { pro
     companyName: companyName ?? null,
     createdAt: new Date().toISOString(),
     appVersion: APP_VERSION,
-    ...schemaStamp(),
+    ...schemaStamp(opts.dbSchemaAt),
   };
   zip.addFile(BACKUP_MANIFEST_ENTRY, Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'));
 
   return { buffer: zip.toBuffer(), filename: buildBackupFilename('ironbooks-backup', companyName) };
 }
 
-/** The database layout this app writes (its newest migration), for a backup's manifest. */
-function schemaStamp(): { dbSchemaAt?: number } {
+/**
+ * The database layout of a backup, for its manifest: `known` when the caller measured the
+ * database (the pre-upgrade safety copy holds books in the layout from BEFORE the upgrade, which
+ * the version used before must be able to restore), else the newest migration this app ships.
+ */
+function schemaStamp(known?: number | null): { dbSchemaAt?: number } {
+  if (typeof known === 'number' && Number.isFinite(known) && known > 0) return { dbSchemaAt: known };
   const at = latestShippedMigrationAt();
   return at === null ? {} : { dbSchemaAt: at };
 }
@@ -304,6 +313,36 @@ export interface PreOpBackupResult {
   filename: string;
 }
 
+/**
+ * Write `data` to `target` so a power cut never leaves a half-written file under that name, and
+ * the file is on the disk before anything relies on it (a rotation deleting an older backup):
+ * written to `<target>.partial`, flushed, then renamed into place.
+ */
+export function writeFileDurablyAs(target: string, data: Buffer | Uint8Array): void {
+  const tmp = `${target}.partial`;
+  try {
+    const fd = fs.openSync(tmp, 'w');
+    try {
+      fs.writeFileSync(fd, data);
+      try {
+        fs.fsyncSync(fd);
+      } catch {
+        /* a file system without flush support: written all the same */
+      }
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.renameSync(tmp, target);
+  } catch (err) {
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {
+      /* best effort */
+    }
+    throw err;
+  }
+}
+
 /** Monotonic suffix so two pre-op backups in the same millisecond never collide. */
 let preOpSeq = 0;
 
@@ -339,6 +378,9 @@ export function preOpFolderTag(dataDir?: string): string {
  * @param dataDir  Optional data-dir override; defaults to the active dir.
  * @param protection  The folder's protection (protectionForDir); omitted: the slot set of its last
  *                 save. A safety copy of a protected file is encrypted like the file.
+ * @param opts.dbSchemaAt  The layout the books are in (their newest applied migration), when the
+ *                 caller measured it: the copy made before an upgrade is stamped with the layout
+ *                 from before it, so the version used before can restore it.
  * @returns the written file's path/filename, or null when the data dir does
  *          not exist yet (nothing to protect — e.g. first run).
  */
@@ -347,11 +389,15 @@ export function ensurePreOpBackup(
   label: string,
   dataDir?: string,
   protection?: SealProtection | null,
+  opts: { dbSchemaAt?: number | null } = {},
 ): PreOpBackupResult | null {
   const dir = resolveDataDir(dataDir);
   if (!fs.existsSync(dir)) return null;
 
-  const { buffer } = createBackup(undefined, dir, protection === undefined ? {} : { protection });
+  const { buffer } = createBackup(undefined, dir, {
+    ...(protection === undefined ? {} : { protection }),
+    ...(opts.dbSchemaAt != null ? { dbSchemaAt: opts.dbSchemaAt } : {}),
+  });
 
   const outDir = preOpBackupDir(dataDir);
   fs.mkdirSync(outDir, { recursive: true });
@@ -360,7 +406,9 @@ export function ensurePreOpBackup(
   preOpSeq = (preOpSeq + 1) % 1_000_000;
   const filename = `preop-${slug}-${tag}-${Date.now()}-${preOpSeq}.bka`;
   const outPath = path.join(outDir, filename);
-  fs.writeFileSync(outPath, buffer);
+  // On the disk, complete, before it is named as a safety copy — and before the rotation below
+  // removes an older one.
+  writeFileDurablyAs(outPath, buffer);
   recordBackup(
     {
       source: 'pre-op',

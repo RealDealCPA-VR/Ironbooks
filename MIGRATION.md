@@ -62,6 +62,9 @@ All exports below are from the QuickBooks Desktop menus.
    `File → Utilities → Export → Lists to IIF Files…`
    Tick at minimum: **Chart of Accounts, Customer List, Vendor List, Item
    List, Class List, Employee List**. Save the `.IIF` file(s).
+   **Note:** this export writes each balance-sheet account's **current** balance
+   into the file (`OBAMOUNT`). Ironbooks does **not** post those balances unless
+   you tick **"Post account balances from this file"** — see section 3, step 2.
 2. **Trial Balance (opening balances)**
    `Reports → Accountant & Taxes → Trial Balance`. Set the date to your
    cutover date (typically the last day of the prior fiscal period — e.g.
@@ -92,14 +95,24 @@ Order matters: each step references records created by the previous one.
 2. **Chart of Accounts** — *Migrate from QuickBooks → Step 1 (Lists)*: the
    QuickBooks IIF file (`!ACCNT` sections), or a CSV / Excel list. Verify account
    types/subtypes after import; A/R and A/P accounts must keep their special
-   subtypes. Files over **60 MB** (IIF, CSV or Excel) are refused before they are read — split
+   subtypes. **Account balances:** QuickBooks' list export carries each account's
+   *current* balance. By default none of them are posted (each one is listed in the
+   import results so nothing is silent) — the General Ledger import (section 3a) or
+   your Trial Balance entry (step 8) brings the balances in. Only if you are doing
+   neither, tick **"Post account balances from this file"** and enter the date the
+   balances are as of (the export date): each is posted against Opening Balance
+   Equity (A/R and A/P still come from step 8's open invoices / bills). The option is
+   refused once a General Ledger import is in the books. Files over **60 MB** (IIF, CSV or Excel) are refused before they are read — split
    the export. Pick the IIF file with **Choose file…** as QuickBooks saved it: it is
    read in QuickBooks' own Windows character set, so accented names (Société,
    Müller) come over exactly.
 3. **Customers and Vendors** — IIF (`!CUST`, `!VEND`) or CSV list import.
    Jobs/sub-customers come in under their parent customers.
 4. **Items** — IIF (`!INVITEM`) or CSV. Check that each item's income/expense
-   (and inventory asset/COGS) account mapping survived. Ironbooks supports
+   (and inventory asset/COGS) account mapping survived. QuickBooks' IIF item types:
+   `INVENTORY` = Inventory Part, `PART` = Non-inventory Part, `ASSEMBLY` = Inventory
+   Assembly (a `PART` row that carries an inventory asset account or a quantity on hand,
+   as older Ironbooks exports wrote, still comes in as inventory). Ironbooks supports
    the full QB item-type set including other charge, discount, subtotal,
    payment, and sales-tax items.
 5. **Classes** — IIF (`!CLASS`) or create manually (usually a short list).
@@ -136,6 +149,17 @@ QuickBooks' General Ledger report. Open **Migrate from QuickBooks** (sidebar →
 File → Migrate from QuickBooks…):
 
 1. **Lists (optional)** — import your IIF lists first so contact details and items come over.
+   Leave **"Post account balances from this file"** unticked: the General Ledger brings every
+   balance in. If an account the General Ledger posts to already holds other entries (IIF
+   opening balances, the setup interview's opening balances, manual entries — at any date), the
+   practice run and the import stop and list them by source, because those balances would be
+   counted twice. Void them first (for IIF opening balances, the "Opening balance for …"
+   journal entries), map those QuickBooks accounts to new accounts, or explicitly confirm that
+   you want to keep them. **Item quantities:** an IIF item list's quantities on hand are set
+   up without posting a second inventory entry when the file also carries the Inventory Asset
+   account's QuickBooks balance (the General Ledger or Trial Balance import brings that balance).
+   An item list whose asset account has no balance in the file posts its stock to Inventory
+   Asset; the check above lists such entries.
 2. **Upload** the General Ledger: `Reports → Accountant & Taxes → General Ledger`, date range
    *All* (or the years you want), no filters, then `Excel → Create New Worksheet` (.xlsx),
    `Excel → Create .CSV file`, or `File → Save as PDF`. Optionally add the **Account Listing**
@@ -145,7 +169,9 @@ File → Migrate from QuickBooks…):
 4. **Account types** — a GL doesn't say what kind each account is; Ironbooks works it out from
    QB's section order, account numbers, names, running-balance direction and how each account is
    used. Confirm or change them, and map accounts onto ones that already exist (no duplicates).
-5. **Dry run** — the whole import runs and is proven, then rolled back.
+5. **Dry run** — the whole import runs and is proven, then rolled back. Expect it to take a
+   while on a long history: about a minute for ~3,000 transactions, and the import itself
+   takes as long again.
 6. **Import** — one database transaction: accounts (numbers and `Parent:Child` hierarchy),
    classes, customers/vendors/employees, one opening entry dated the day before the period for
    the beginning balances, and every rebuilt transaction (each verified to balance, posted
@@ -169,7 +195,8 @@ File → Migrate from QuickBooks…):
    - Lines that offset each other but whose `Split` column points to other accounts are not
      forced into one entry; they go to the review list.
    - The proof compares the entries this import posted. If the company file already has other
-     entries in a mapped account, the import warns that the account's full balance differs.
+     entries (at any date) in an account the import posts to, nothing is saved until you
+     confirm; the result then warns that the account's full balance differs from QuickBooks.
 
 8. **Open invoices and bills (Step 3)** — the General Ledger brings your A/R and A/P *balances*,
    not the documents behind them, so until this step the A/R and A/P aging reports (and Receive

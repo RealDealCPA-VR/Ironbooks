@@ -200,9 +200,16 @@ describe('customer / vendor ledgers', () => {
     expect(row(r, 'Acme')!.cells.balance).toBe('100.00');
     expect(row(r, 'Acme:Kitchen')!.cells.balance).toBe('150.00');
     expect(row(r, 'Acme')!.href).toContain('customer-balance-detail');
+    // Review 13: the Customer filter takes in the customer's jobs (QB, and the A/R aging) …
     const detail = await run('customer-balance-detail', { customerId: ids.cust });
-    expect(detail.rows.filter((x) => x.entryId)).toHaveLength(2);
+    expect(detail.rows.filter((x) => x.entryId)).toHaveLength(3);
     expect(row(detail, 'Total Acme')!.cells.balance).toBe('100.00');
+    expect(row(detail, 'Total Acme:Kitchen')!.cells.balance).toBe('150.00');
+    // … while the summary's "Acme" row (Acme's own balance) opens Acme alone.
+    expect(row(r, 'Acme')!.href).toContain(`customerJobId=${ids.cust}`);
+    const own = await run('customer-balance-detail', { customerJobId: ids.cust });
+    expect(own.rows.filter((x) => x.entryId)).toHaveLength(2);
+    expect(row(own, 'Total Acme')!.cells.balance).toBe('100.00');
   });
 
   it('Vendor balances, Unpaid Bills Detail and Bills & Applied Payments', async () => {

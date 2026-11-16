@@ -181,6 +181,9 @@ export function RegisterEntryRow({
   sideRef.current = side;
   const other = accounts.find((a) => a.id === accountId);
   const plan = other && side ? planRegisterEntry(register, other, side) : null;
+  // Deposits and transfers have no number (lib/services/registerEntry.ts): the Number column is
+  // off for them, and a number typed before the row became one is not sent.
+  const noNumber = !!plan?.ok && (plan.kind === 'deposit' || plan.kind === 'transfer');
 
   // ---- Payee -------------------------------------------------------------------------------
   const prefill = useCallback(
@@ -261,12 +264,15 @@ export function RegisterEntryRow({
     // before React re-renders).
     const accountId = account.current.id;
     if (!side || !accountId) return;
+    const chosen = accounts.find((a) => a.id === accountId);
+    const chosenPlan = chosen ? planRegisterEntry(register, chosen, side) : null;
+    const numbered = !(chosenPlan?.ok && (chosenPlan.kind === 'deposit' || chosenPlan.kind === 'transfer'));
     setSaving(true);
     try {
       const res = await saveWithDuplicateCheck((allowDuplicateNumber) =>
         api.post<{ entry: { kind: RegisterEntryKind; id: string } }>(`/api/registers/${register.id}`, {
           date,
-          number: number.trim() || null,
+          number: numbered ? number.trim() || null : null,
           payee: payee.trim() || null,
           name,
           otherAccountId: accountId,
@@ -352,7 +358,15 @@ export function RegisterEntryRow({
           <Input ref={dateRef} type="date" aria-label="Date" value={date} onChange={(e) => setDate(e.target.value)} className="min-w-[130px]" />
         </td>
         <td className={cell}>
-          <DocNumberInput aria-label="Number" placeholder={register.subtype === 'checking' || register.subtype === 'savings' ? 'Auto' : ''} value={number} onChange={(e) => setNumber(e.target.value)} className="w-20" />
+          <DocNumberInput
+            aria-label="Number"
+            placeholder={noNumber ? '' : register.subtype === 'checking' || register.subtype === 'savings' ? 'Auto' : ''}
+            value={noNumber ? '' : number}
+            disabled={noNumber}
+            title={noNumber ? 'Deposits and transfers have no number.' : undefined}
+            onChange={(e) => setNumber(e.target.value)}
+            className="w-20"
+          />
         </td>
         {/* The register's Type column: set by what the line becomes when it is recorded. */}
         <td className={cell} />

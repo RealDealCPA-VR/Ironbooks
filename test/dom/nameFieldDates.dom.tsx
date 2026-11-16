@@ -30,6 +30,37 @@ domTest('a date typed as 10/24 then Tab fills in the current year', async () => 
   }
 });
 
+function ControlledDate() {
+  const [value, setValue] = React.useState('2026-11-16');
+  return (
+    <div>
+      <KeyboardBase />
+      <DateInput aria-label="Date" value={value} onChange={(e) => setValue(e.target.value)} />
+      <input aria-label="After" />
+      <output aria-label="State">{value}</output>
+    </div>
+  );
+}
+
+domTest('a two-digit year typed over a filled-in date is 20xx (10/31/26 is 2026, not the year 26)', async () => {
+  await mount(<ControlledDate />);
+  const date = $<HTMLInputElement>('[aria-label="Date"]')!;
+  date.focus();
+  await settle();
+  await typeText('103126');
+  await press('Tab');
+  equal(date.value, '2026-10-31', 'the field');
+  equal($('[aria-label="State"]')!.textContent, '2026-10-31', "the form's state (React onChange ran)");
+  // Leaving with a click (blur) fixes it too.
+  date.focus();
+  await settle();
+  await typeText('010225');
+  $<HTMLInputElement>('[aria-label="After"]')!.focus();
+  await settle();
+  equal(date.value, '2025-01-02', 'blur');
+  equal($('[aria-label="State"]')!.textContent, '2025-01-02', 'state after blur');
+});
+
 function Picker({ onPicked }: { onPicked: (id: string) => void }) {
   const [list, setList] = React.useState([
     { id: 'c1', label: 'Acme Supply' },

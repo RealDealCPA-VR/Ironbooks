@@ -85,7 +85,9 @@ describe('wave-2 QB migration — adversarial QA', { timeout: 180_000 }, () => {
   // -------------------------------------------------------------------------
   it('L2: every QuickBooks INVITEMTYPE maps to its own item type', () => {
     expect(mapIifItemType('SERV')).toBe('service');
-    expect(mapIifItemType('PART')).toBe('inventory');
+    // QuickBooks: PART = Non-inventory Part, INVENTORY = Inventory Part (review 13).
+    expect(mapIifItemType('PART')).toBe('non_inventory');
+    expect(mapIifItemType('PART', { assetAccount: 'Inventory Asset' })).toBe('inventory');
     expect(mapIifItemType('INVENTORY')).toBe('inventory');
     expect(mapIifItemType('ASSEMBLY')).toBe('inventory');
     expect(isAssemblyType('ASSEMBLY')).toBe(true);

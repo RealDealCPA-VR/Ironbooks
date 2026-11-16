@@ -79,6 +79,7 @@ export function GlWizard() {
   const [dry, setDry] = useState<GlImportResult | null>(null);
   const [done, setDone] = useState<GlImportResult | null>(null);
   const [acceptVariance, setAcceptVariance] = useState(false);
+  const [acceptExisting, setAcceptExisting] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [onlyCheck, setOnlyCheck] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -91,6 +92,7 @@ export function GlWizard() {
     periodEnd: periodEnd || null,
     accounts: choices,
     acceptVariance,
+    acceptExistingEntries: acceptExisting,
     ...extra,
   });
 
@@ -112,11 +114,16 @@ export function GlWizard() {
     }
   }
 
-  async function runDry(accept = acceptVariance) {
-    setBusy('Doing a practice import and checking every account…');
+  async function runDry(accept = acceptVariance, acceptExistingEntries = acceptExisting) {
+    setBusy(
+      'Doing a practice import and checking every account… A long history (thousands of transactions) can take several minutes — please keep this window open.',
+    );
     setError(null);
     try {
-      const r = await api.post<GlImportResult>('/api/qb-import/gl', body('dry-run', { acceptVariance: accept }));
+      const r = await api.post<GlImportResult>(
+        '/api/qb-import/gl',
+        body('dry-run', { acceptVariance: accept, acceptExistingEntries }),
+      );
       setDry(r);
       setStep('dryrun');
     } catch (err) {
@@ -127,14 +134,21 @@ export function GlWizard() {
   }
 
   async function runImport() {
-    setBusy('Importing and proving every balance…');
+    setBusy(
+      'Importing and proving every balance… A long history (thousands of transactions) can take several minutes — please keep this window open.',
+    );
     setError(null);
     try {
       const r = await api.post<GlImportResult>('/api/qb-import/gl', body('import'));
       if (r.ok) {
         setDone(r);
         setStep('done');
-        toast('Your QuickBooks history is in. Every account matches.', 'success');
+        toast(
+          r.existingEntries?.length
+            ? 'Your QuickBooks history is in. Some accounts also hold other entries — see the warnings.'
+            : 'Your QuickBooks history is in. Every account matches.',
+          r.existingEntries?.length ? 'info' : 'success',
+        );
       } else {
         setDry(r);
         setStep('dryrun');
@@ -158,6 +172,7 @@ export function GlWizard() {
     setDry(null);
     setDone(null);
     setAcceptVariance(false);
+    setAcceptExisting(false);
     setError(null);
   }
 
@@ -244,6 +259,11 @@ export function GlWizard() {
             setAcceptVariance(v);
             void runDry(v);
           }}
+          acceptExisting={acceptExisting}
+          setAcceptExisting={(v) => {
+            setAcceptExisting(v);
+            void runDry(acceptVariance, v);
+          }}
           onBack={() => setStep('types')}
           onImport={runImport}
           busy={!!busy}
@@ -260,6 +280,7 @@ export function GlWizard() {
             </div>
           </div>
           <Counts result={done} />
+          {done.warnings.length > 0 && <Problems errors={[]} warnings={done.warnings} />}
           <ProofView proof={done.proof} />
           <div className="flex flex-wrap gap-3">
             <Button variant="secondary" onClick={() => window.location.assign('/reports')}>
@@ -323,6 +344,10 @@ function UploadStep({
           want to bring over (for example <i>All</i> or <i>Last Fiscal Year</i>), then choose{' '}
           <b>Excel → Create New Worksheet</b>, <b>Excel → Create .CSV file</b>, or <b>File → Save as PDF</b>. Don’t
           filter the report — every account is needed so the books balance.
+        </p>
+        <p className="text-sm text-navy/70 mt-1">
+          A few years of history (a few thousand transactions) takes a minute or more for each run — the practice run
+          and the import each do all the work — so expect several minutes in total for a long history.
         </p>
       </div>
       <div>
@@ -602,6 +627,8 @@ function DryRunStep({
   result,
   acceptVariance,
   setAcceptVariance,
+  acceptExisting,
+  setAcceptExisting,
   onBack,
   onImport,
   busy,
@@ -609,6 +636,8 @@ function DryRunStep({
   result: GlImportResult;
   acceptVariance: boolean;
   setAcceptVariance: (v: boolean) => void;
+  acceptExisting: boolean;
+  setAcceptExisting: (v: boolean) => void;
   onBack: () => void;
   onImport: () => void;
   busy: boolean;
@@ -632,6 +661,43 @@ function DryRunStep({
       <ProofView proof={result.proof} />
       {result.review.length > 0 && <ReviewList review={result.review} />}
       {result.warnings.length > 0 && <Problems errors={[]} warnings={result.warnings} />}
+
+      {/* Accounts that already hold balances from elsewhere (an IIF list import's opening balances,
+          the setup interview, manual entries): the GL history would count them twice. */}
+      {(result.existingEntries?.length ?? 0) > 0 && (
+        <div className="space-y-2 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800">
+          <p className="font-semibold">
+            {result.existingEntries!.length} account(s) already have balances that did not come from a General
+            Ledger import. Your QuickBooks history brings these balances in too, so they would be counted twice:
+          </p>
+          <ul className="list-disc pl-5 space-y-0.5">
+            {result.existingEntries!.slice(0, 30).map((a) => (
+              <li key={a.accountId}>
+                <b>
+                  {a.code} {a.name}
+                </b>{' '}
+                {drCr(a.balance)} — {a.sources.map((src) => `${src.label}: ${drCr(src.amount)}`).join('; ')}
+              </li>
+            ))}
+            {result.existingEntries!.length > 30 && <li>…and {result.existingEntries!.length - 30} more</li>}
+          </ul>
+          <p>
+            Best: go back and void those entries first (for an IIF list import, the “Opening balance for …” journal
+            entries), or map those QuickBooks accounts to new accounts.
+          </p>
+          <label className="flex items-start gap-2 text-navy">
+            <input
+              type="checkbox"
+              className="mt-1"
+              checked={acceptExisting}
+              onChange={(e) => setAcceptExisting(e.target.checked)}
+            />
+            <span>
+              I understand these balances will stay in the books on top of my QuickBooks history. Import anyway.
+            </span>
+          </label>
+        </div>
+      )}
 
       {/* A Trial Balance difference can't be moved to suspense — only General Ledger differences can. */}
       {(!result.proof.allMatch || acceptVariance) && (

@@ -67,6 +67,8 @@ interface ClearableLine {
   journalEntryId: string;
   date: string;
   description: string;
+  /** Check number / reference (QB's Chk # column). */
+  reference?: string | null;
   debit: string | null;
   credit: string | null;
   memo: string | null;
@@ -382,6 +384,8 @@ function ReconcileSession({
   const [completing, setCompleting] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [confirmCancel, setConfirmCancel] = useState(false);
+  const [confirmAdjust, setConfirmAdjust] = useState(false);
+  const [markingAll, setMarkingAll] = useState(false);
   /** Lines whose cleared mark is being saved (each stays disabled until its own answer). */
   const [toggling, setToggling] = useState<ReadonlySet<string>>(() => new Set());
   /** Toggles sent so far: only the latest answer's totals are shown (answers can cross). */
@@ -484,6 +488,47 @@ function ReconcileSession({
       toast('Reconciliation completed successfully.', 'success');
       if (info?.isCreditCard) {
         // QB flow: offer to write a check for the reconciled balance.
+        setPayAmount(progress?.statementBalance ?? recon.statementBalance);
+        setShowPayCC(true);
+      } else {
+        onComplete();
+      }
+    } catch (err) {
+      toastError(err, 'Failed to complete reconciliation.');
+    } finally {
+      setCompleting(false);
+    }
+  }
+
+  /** Mark All / Unmark All (one request, same checks as single ticks). */
+  async function handleMarkAll(isCleared: boolean) {
+    setMarkingAll(true);
+    try {
+      const ids = lines.filter((l) => l.isCleared !== isCleared).map((l) => l.journalEntryLineId);
+      if (ids.length) {
+        const updated = await api.patch<Progress>(`/api/reconciliations/${recon.id}`, {
+          action: 'setClearedMany',
+          journalEntryLineIds: ids,
+          isCleared,
+        });
+        setProgress(updated);
+        setLines((prev) => prev.map((l) => (ids.includes(l.journalEntryLineId) ? { ...l, isCleared } : l)));
+      }
+    } catch (err) {
+      toastError(err, isCleared ? 'Failed to mark all.' : 'Failed to unmark all.');
+    } finally {
+      setMarkingAll(false);
+    }
+  }
+
+  /** QuickBooks' "Enter Adjustment": post the difference to Reconciliation Discrepancies and finish. */
+  async function handleCompleteWithAdjustment() {
+    setCompleting(true);
+    try {
+      await api.patch(`/api/reconciliations/${recon.id}`, { action: 'complete', adjust: true });
+      setConfirmAdjust(false);
+      toast('Reconciliation completed with an adjustment to Reconciliation Discrepancies.', 'success');
+      if (info?.isCreditCard) {
         setPayAmount(progress?.statementBalance ?? recon.statementBalance);
         setShowPayCC(true);
       } else {
@@ -685,11 +730,26 @@ function ReconcileSession({
               Cancel Reconciliation
             </Button>
           )}
+          {recon.status === 'in_progress' && progress && !canComplete && !Money.isZero(progress.difference) && (
+            <Button variant="secondary" onClick={() => setConfirmAdjust(true)} disabled={completing}>
+              Finish with Adjustment
+            </Button>
+          )}
           <Button onClick={handleComplete} loading={completing} disabled={!canComplete}>
             Finish Reconciliation
           </Button>
         </div>
       </Card>
+
+      <ConfirmDialog
+        open={confirmAdjust}
+        title="Finish with an adjustment?"
+        message={`The statement and your cleared transactions differ by ${fmt(progress?.difference)}. Ironbooks will post that amount to Reconciliation Discrepancies, dated ${fmtDate(recon.statementDate)}, and finish, as QuickBooks' Enter Adjustment does. Use this for a difference you can't trace, such as a check written before you converted that is still outstanding; you can void the adjustment in the register later.`}
+        confirmLabel="Enter Adjustment and Finish"
+        loading={completing}
+        onConfirm={handleCompleteWithAdjustment}
+        onClose={() => setConfirmAdjust(false)}
+      />
 
       <ConfirmDialog
         open={confirmCancel}
@@ -859,14 +919,26 @@ function ReconcileSession({
 
       {/* Clearable lines */}
       <Card className="p-6">
-        <h3 className="text-base font-bold text-navy mb-4">
-          Transactions to Clear
-          {!loadingLines && (
-            <span className="ml-2 text-sm font-normal text-navy/50">
-              ({lines.filter((l) => l.isCleared).length} of {lines.length} cleared)
-            </span>
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+          <h3 className="text-base font-bold text-navy">
+            Transactions to Clear
+            {!loadingLines && (
+              <span className="ml-2 text-sm font-normal text-navy/50">
+                ({lines.filter((l) => l.isCleared).length} of {lines.length} cleared)
+              </span>
+            )}
+          </h3>
+          {recon.status === 'in_progress' && lines.length > 0 && (
+            <div className="flex gap-2">
+              <Button variant="secondary" size="sm" onClick={() => handleMarkAll(true)} loading={markingAll} disabled={markingAll || lines.every((l) => l.isCleared)}>
+                Mark All
+              </Button>
+              <Button variant="secondary" size="sm" onClick={() => handleMarkAll(false)} disabled={markingAll || !lines.some((l) => l.isCleared)}>
+                Unmark All
+              </Button>
+            </div>
           )}
-        </h3>
+        </div>
         {loadingLines ? (
           <div className="py-10 flex justify-center">
             <Spinner className="text-electric" />
@@ -881,6 +953,7 @@ function ReconcileSession({
               <tr>
                 <Th className="w-10">Clear</Th>
                 <Th>Date</Th>
+                <Th>Chk #</Th>
                 <Th>Description</Th>
                 <Th>Memo</Th>
                 <Th numeric>Amount</Th>
@@ -902,6 +975,7 @@ function ReconcileSession({
                     />
                   </Td>
                   <Td>{fmtDate(line.date)}</Td>
+                  <Td className="text-navy/70">{line.reference || ''}</Td>
                   <Td className="max-w-xs truncate">{line.description}</Td>
                   <Td className="text-navy/60">{line.memo ?? '—'}</Td>
                   <Td numeric>

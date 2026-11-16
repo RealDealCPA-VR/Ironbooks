@@ -12,7 +12,11 @@
  *  - it may match an entry already in the books: a Bank Review match candidate, or any posted
  *    entry of the same amount on this bank account within ±120 days that no line of THIS feed is
  *    matched to yet (a check written weeks before it cleared; the other side of a transfer
- *    already booked from the other account's feed).
+ *    already booked from the other account's feed);
+ *  - it is dated on or before the account's last reconciliation (that month is closed out);
+ *  - another line of this account's feed has the same amount within ±5 days (the same payment
+ *    downloaded twice with a changed description or date: pending then posted, or a PDF statement
+ *    imported over a CSV / QBO download).
  */
 import { and, eq, gte, inArray, isNotNull, like, lte, or, sql } from 'drizzle-orm';
 import { aiAutoApplied, bankAccounts, bankTransactions, journalEntries, journalEntryLines } from '@/lib/db/schema';
@@ -20,12 +24,15 @@ import { Money } from '@/lib/money';
 import type { ServiceContext } from './_base';
 
 const WIDE_DAYS = 120;
+const DUPLICATE_DAYS = 5;
 const DAY = 24 * 60 * 60 * 1000;
 
 export const BLOCK_REASONS = {
   undone: 'Posted before and undone; it waits for you.',
   history: 'Dated on or before your imported QuickBooks history; it may already be in the books.',
   match: 'It may match a transaction already entered; review the match in Bank Review.',
+  reconciled: 'Dated in a month already reconciled; it waits for you.',
+  duplicate: 'Another downloaded line has the same amount a few days apart; it may be the same payment.',
 } as const;
 
 /** The last day of imported QuickBooks history (never later than today), or null. */
@@ -58,7 +65,7 @@ export async function autoPostBlockers(
   const out = new Map<string, string>();
   if (lineIds.length === 0) return out;
   const [ba] = await ctx.db
-    .select({ accountId: bankAccounts.accountId })
+    .select({ accountId: bankAccounts.accountId, lastReconciledDate: bankAccounts.lastReconciledDate })
     .from(bankAccounts)
     .where(and(eq(bankAccounts.id, bankAccountId), eq(bankAccounts.companyId, ctx.companyId)));
   if (!ba) return new Map(lineIds.map((id) => [id, BLOCK_REASONS.match]));
@@ -133,10 +140,39 @@ export async function autoPostBlockers(
     }
   }
 
+  // 4. Possible duplicates: another line of this feed (staged or already posted / matched) with the
+  //    same amount within a few days.
+  const duplicate = new Set<string>();
+  if (lines.length) {
+    const from = new Date(Math.min(...lines.map((l) => l.date.getTime())) - DUPLICATE_DAYS * DAY);
+    const to = new Date(Math.max(...lines.map((l) => l.date.getTime())) + DUPLICATE_DAYS * DAY);
+    const others = await ctx.db
+      .select({ id: bankTransactions.id, date: bankTransactions.date, amount: bankTransactions.amount })
+      .from(bankTransactions)
+      .where(
+        and(
+          eq(bankTransactions.companyId, ctx.companyId),
+          eq(bankTransactions.bankAccountId, bankAccountId),
+          gte(bankTransactions.date, from),
+          lte(bankTransactions.date, to),
+        ),
+      );
+    for (const l of lines) {
+      const hit = others.some(
+        (o) => o.id !== l.id && Money.of(o.amount).equals(Money.of(l.amount)) && Math.abs(o.date.getTime() - l.date.getTime()) <= DUPLICATE_DAYS * DAY,
+      );
+      if (hit) duplicate.add(l.id);
+    }
+  }
+  // 5. Dated in a month already reconciled (calendar days, as the reconciliation compares them).
+  const reconciledThrough = ba.lastReconciledDate ? new Date(ba.lastReconciledDate).toISOString().slice(0, 10) : null;
+
   for (const l of lines) {
     if (undone.has(l.id)) out.set(l.id, BLOCK_REASONS.undone);
+    else if (reconciledThrough && l.date.toISOString().slice(0, 10) <= reconciledThrough) out.set(l.id, BLOCK_REASONS.reconciled);
     else if (cutover && l.date.getTime() <= cutover.getTime()) out.set(l.id, BLOCK_REASONS.history);
     else if ((candidates[l.id] ?? []).length > 0 || sameAmount.has(l.id)) out.set(l.id, BLOCK_REASONS.match);
+    else if (duplicate.has(l.id)) out.set(l.id, BLOCK_REASONS.duplicate);
   }
   // Ids not on this account's feed are never posted from here.
   for (const id of lineIds) if (!lines.some((l) => l.id === id)) out.set(id, BLOCK_REASONS.match);

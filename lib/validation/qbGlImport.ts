@@ -28,6 +28,8 @@ export const qbGlImportSchema = z.object({
     )
     .optional(),
   acceptVariance: z.boolean().optional(),
+  /** Import although mapped accounts already hold non-GL entries (they would count twice). */
+  acceptExistingEntries: z.boolean().optional(),
 });
 
 export type QbGlImportRequest = z.infer<typeof qbGlImportSchema>;

@@ -117,6 +117,9 @@ interface CreditMemo {
 /** GET /api/credit-memos/:id — prefills the edit form (wave2 sales C1). */
 interface CreditMemoDetail extends CreditMemo {
   taxRateId: string | null;
+  /** The memo's Class and Customer:Job (lines without their own take them). */
+  classId?: string | null;
+  jobId?: string | null;
   /** The rate the memo was charged at (an edit keeping the same tax item keeps it). */
   taxRateValue?: string | null;
   toBePrinted?: boolean;
@@ -142,6 +145,18 @@ interface CreditMemoDetail extends CreditMemo {
     lotExpiration?: string | null;
   }>;
   applications: Array<{ id: string; invoiceId: string; invoiceNumber: number; invoiceRef?: string | null; amount: string; paymentId: string | null }>;
+}
+
+interface ClassRow {
+  id: string;
+  name: string;
+  isActive?: boolean | null;
+}
+
+interface Job {
+  id: string;
+  name: string;
+  customerId: string | null;
 }
 
 interface Account {
@@ -247,12 +262,42 @@ interface NewMemoModalProps {
 }
 
 function NewMemoModal({ open, editing, onClose, customers, onCustomerAdded, items, taxRates, onCreated, nav = null }: NewMemoModalProps) {
-  const customerChoices = useMemo(() => customers.map((c) => ({ id: c.id, label: c.displayName })), [customers]);
+  // Class list and jobs for the Class and Customer:Job fields.
+  const [classes, setClasses] = useState<ClassRow[]>([]);
+  const [jobs, setJobs] = useState<Job[]>([]);
+  useEffect(() => {
+    if (!open) return;
+    let live = true;
+    api
+      .get<ClassRow[]>('/api/classes')
+      .then((r) => live && setClasses(Array.isArray(r) ? r : []))
+      .catch(() => live && setClasses([]));
+    api
+      .get<Job[]>('/api/jobs')
+      .then((r) => live && setJobs(Array.isArray(r) ? r : []))
+      .catch(() => live && setJobs([]));
+    return () => {
+      live = false;
+    };
+  }, [open]);
+  // QuickBooks' Customer:Job: each customer, then its jobs as "Customer:Job" (ids "job:<id>").
+  const customerChoices = useMemo(
+    () =>
+      customers.flatMap((c) => [
+        { id: c.id, label: c.displayName },
+        ...jobs.filter((j) => j.customerId === c.id).map((j) => ({ id: `job:${j.id}`, label: `${c.displayName}:${j.name}` })),
+      ]),
+    [customers, jobs],
+  );
   const [customerId, setCustomerId] = useState('');
+  /** The job picked in the Customer:Job field (lines without their own job take it). */
+  const [headerJobId, setHeaderJobId] = useState('');
+  const [classId, setClassId] = useState('');
   const [date, setDate] = useState(() => todayISO());
   const [memoNote, setMemoNote] = useState('');
   const [taxRateId, setTaxRateId] = useState('');
-  const salesTaxOn = usePreferences().company.salesTaxEnabled;
+  const prefs = usePreferences();
+  const salesTaxOn = prefs.company.salesTaxEnabled;
   const [lines, setLines] = useState<LineRow[]>([{ ...EMPTY_LINE }]);
   const [flags, setFlags] = useState<ShippingState>(EMPTY_SHIPPING);
   const [applications, setApplications] = useState<CreditMemoDetail['applications']>([]);
@@ -276,6 +321,8 @@ function NewMemoModal({ open, editing, onClose, customers, onCustomerAdded, item
   useEffect(() => {
     if (open && editing) {
       setCustomerId(editing.customerId);
+      setHeaderJobId(editing.jobId ?? '');
+      setClassId(editing.classId ?? '');
       setDate(editing.date.slice(0, 10));
       setMemoNote(editing.memo ?? '');
       setTaxRateId(editing.taxRateId ?? '');
@@ -292,8 +339,9 @@ function NewMemoModal({ open, editing, onClose, customers, onCustomerAdded, item
           taxable: l.taxable !== false,
           // Lines saved before codes have none: they show the standard code for `taxable`.
           salesTaxCodeId: l.salesTaxCodeId ?? '',
-          classId: l.classId ?? null,
-          jobId: l.jobId ?? null,
+          // A line on the memo's own class / job follows the header (changing it moves the line).
+          classId: l.classId && l.classId !== editing.classId ? l.classId : null,
+          jobId: l.jobId && l.jobId !== editing.jobId ? l.jobId : null,
           restock: l.restock !== false,
           // Saved prices stay as they are; the badge still offers the current quote.
           rateManual: true,
@@ -308,6 +356,8 @@ function NewMemoModal({ open, editing, onClose, customers, onCustomerAdded, item
       setFlags(shippingFromDoc(null));
       setApplications([]);
       setCustomerId('');
+      setHeaderJobId('');
+      setClassId('');
       setDate(todayISO());
       setMemoNote('');
       setTaxRateId('');
@@ -362,7 +412,7 @@ function NewMemoModal({ open, editing, onClose, customers, onCustomerAdded, item
   const quotes = usePriceQuotes(
     { customerId: customerId || null, date },
     // Each line's class too (the server prices class rules with it).
-    lines.map((l) => ({ itemId: l.itemId || null, quantity: l.quantity || '1', classId: l.classId || null })),
+    lines.map((l) => ({ itemId: l.itemId || null, quantity: l.quantity || '1', classId: l.classId || classId || null })),
   );
   useEffect(() => {
     setLines((prev) => {
@@ -438,6 +488,8 @@ function NewMemoModal({ open, editing, onClose, customers, onCustomerAdded, item
     const validLines = used.map(({ l }) => l);
     if (validLines.length === 0) { toast('Add at least one line item.', 'danger'); return; }
     for (const { l, row } of used) {
+      // A Subtotal item has no quantity or price (the server adds up the lines above it).
+      if (itemType(l.itemId) === 'subtotal') continue;
       if (!l.quantity || parseFloat(l.quantity) <= 0) {
         toast(`Line ${row + 1}: quantity must be positive.`, 'danger'); return;
       }
@@ -455,13 +507,16 @@ function NewMemoModal({ open, editing, onClose, customers, onCustomerAdded, item
         date,
         memo: memoNote || null,
         taxRateId: taxRateId || null,
+        // The memo's Class and Customer:Job (null clears a saved one on an edit).
+        classId: classId || null,
+        jobId: headerJobId || null,
         // B8: the Customer Message (null clears a saved one).
         customerMessageId: customerMessagePayload(customerMessageId),
         lines: validLines.map((l) => ({
           itemId: l.itemId || null,
           description: l.description || null,
-          quantity: l.quantity,
-          rate: l.rate,
+          // A Subtotal item has no quantity or price: the server works out its amount.
+          ...(itemType(l.itemId) === 'subtotal' ? { quantity: '1', rate: '0' } : { quantity: l.quantity, rate: l.rate }),
           // B9: the line's Sales Tax Code (the server decides taxability from it).
           ...lineTaxPayload({ ...l, itemType: itemType(l.itemId) }, taxCodes, customerTax),
           // Left out, the server gave every line the memo's class (P&L by Class moved on a memo edit).
@@ -563,24 +618,43 @@ function NewMemoModal({ open, editing, onClose, customers, onCustomerAdded, item
             </ul>
           </div>
         )}
-        {/* Customer */}
+        {/* Customer:Job */}
         <div>
-          <Label htmlFor="cm-customer">Customer *</Label>
+          <Label htmlFor="cm-customer">Customer:Job *</Label>
           <NameField
             id="cm-customer"
             nameType="customer"
-            value={customerId}
+            value={headerJobId && jobs.some((j) => j.id === headerJobId) ? `job:${headerJobId}` : customerId}
             choices={customerChoices}
-            onChange={(id) => {
+            onChange={(v) => {
+              const job = v.startsWith('job:') ? jobs.find((j) => `job:${j.id}` === v) : undefined;
+              if (v.startsWith('job:') && !job?.customerId) return;
+              const id = job?.customerId ?? v;
               // Lines' jobs (no column here) belong to the old customer: another one drops them.
               if (id !== customerId) setLines((prev) => prev.map((l) => (l.jobId ? { ...l, jobId: null } : l)));
               setCustomerId(id);
+              setHeaderJobId(job?.id ?? '');
             }}
             onAdded={(n) => onCustomerAdded?.({ id: n.id, displayName: n.label })}
             placeholder="Type a customer name…"
             autoFocus
           />
         </div>
+
+        {/* Class (hidden while "Use class tracking" is off, as in QB; a saved class still shows) */}
+        {(prefs.company.classTrackingEnabled || classId) && (
+          <div>
+            <Label htmlFor="cm-class">Class</Label>
+            <Select id="cm-class" value={classId} onChange={(e) => setClassId(e.target.value)}>
+              <option value="">No class</option>
+              {classes
+                .filter((c) => c.isActive !== false || c.id === classId)
+                .map((c) => (
+                  <option key={c.id} value={c.id}>{c.name}</option>
+                ))}
+            </Select>
+          </div>
+        )}
 
         {/* Credit No. + Date */}
         <div className="grid grid-cols-2 gap-3">

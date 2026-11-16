@@ -101,12 +101,15 @@ export interface PrintQueueItem {
   paymentAccountName: string | null;
 }
 
+/** The default checking account: 1000 when it is a checking account, else the first active one. */
 async function checkingAccount(ctx: ServiceContext) {
-  const [row] = await ctx.db
-    .select({ id: accounts.id, name: accounts.name })
+  const rows = await ctx.db
+    .select({ id: accounts.id, name: accounts.name, code: accounts.code })
     .from(accounts)
-    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.code, '1000')));
-  return row ?? null;
+    .where(and(eq(accounts.companyId, ctx.companyId), eq(accounts.subtype, 'checking'), eq(accounts.isActive, true)))
+    .orderBy(asc(accounts.code));
+  const row = rows.find((r) => r.code === '1000') ?? rows[0];
+  return row ? { id: row.id, name: row.name } : null;
 }
 
 /**
@@ -383,7 +386,7 @@ async function markPaycheckPrintedInTx(
   const bank =
     (pc.postedEntryId ? (await paycheckBankAccounts(ctx, [pc.postedEntryId])).get(pc.postedEntryId) : undefined) ??
     (await checkingAccount(ctx));
-  if (!bank) throw notFound('Checking account (1000)');
+  if (!bank) throw notFound('Checking account');
   const checkNumber = await allocateCheckNumber(ctx, {
     paymentAccountId: bank.id,
     number: input.checkNumber,

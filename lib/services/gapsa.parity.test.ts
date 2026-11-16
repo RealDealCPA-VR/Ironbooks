@@ -616,7 +616,8 @@ describe('G1 opening quantity on hand and value', () => {
       '!INVITEM\tNAME\tINVITEMTYPE\tCOST\tQNTY\tASSETACCNT',
       'INVITEM\tIif Carried\tPART\t50.00\t10\tIif Stock',
     ].join('\r\n');
-    const counts = await importIIF(ctx, iif);
+    // A list-only file posts OBAMOUNT only when asked (QuickBooks writes the CURRENT balance there).
+    const counts = await importIIF(ctx, iif, { postOpeningBalances: true });
     const carried = await itemByName('Iif Carried');
     expect(carried).toBeDefined();
     // The stock itself arrives (quantity, average cost; average-cost item, so no FIFO layer)...

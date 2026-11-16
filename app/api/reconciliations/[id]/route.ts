@@ -5,8 +5,12 @@
  *
  * PATCH request body variants:
  *
- *   Complete the reconciliation:
- *     { action: "complete" }
+ *   Complete the reconciliation (adjust: true posts a remaining difference to Reconciliation
+ *   Discrepancies first, QuickBooks' "Enter Adjustment"):
+ *     { action: "complete", adjust?: boolean }
+
+ *   Mark or un-mark many lines (Mark All / Unmark All):
+ *     { action: "setClearedMany", journalEntryLineIds: string[], isCleared: boolean }
  *
  *   Toggle a journal entry line as cleared / un-cleared:
  *     { action: "toggleCleared", journalEntryLineId: string, isCleared: boolean }
@@ -25,8 +29,10 @@ import { ServiceError } from '@/lib/services/_base';
 import {
   getProgress,
   completeReconciliation,
+  completeWithAdjustment,
   cancelReconciliation,
   toggleCleared,
+  setClearedMany,
   updateStatement,
   listClearable,
   addStatementAdjustments,
@@ -74,8 +80,23 @@ export async function PATCH(
     const { action } = body ?? {};
 
     if (action === 'complete') {
+      if (body?.adjust === true) {
+        const { reconciliation } = await completeWithAdjustment(ctx, id);
+        return NextResponse.json(reconciliation);
+      }
       const completed = await completeReconciliation(ctx, id);
       return NextResponse.json(completed);
+    }
+
+    if (action === 'setClearedMany') {
+      const { journalEntryLineIds, isCleared } = body ?? {};
+      if (!Array.isArray(journalEntryLineIds)) {
+        return NextResponse.json({ error: 'journalEntryLineIds (a list) is required.' }, { status: 400 });
+      }
+      if (typeof isCleared !== 'boolean') {
+        return NextResponse.json({ error: 'isCleared (boolean) is required.' }, { status: 400 });
+      }
+      return NextResponse.json(await setClearedMany(ctx, id, journalEntryLineIds, isCleared));
     }
 
     if (action === 'toggleCleared') {
@@ -127,7 +148,7 @@ export async function PATCH(
 
     return NextResponse.json(
       {
-        error: `Unknown action "${action}". Expected "complete", "toggleCleared", "updateStatement", or "adjustments".`,
+        error: `Unknown action "${action}". Expected "complete", "toggleCleared", "setClearedMany", "updateStatement", or "adjustments".`,
       },
       { status: 400 },
     );

@@ -58,16 +58,23 @@ their next launch.
    **Restart & install now** (quits, installs, relaunches immediately via the `app:quitAndInstall`
    IPC handler) or **Later**.
 4. If they chose Later, the NSIS updater applies it on the next quit; relaunch runs the new version.
-5. **Data is preserved.** The local PGlite database lives in the OS user-data dir, untouched by the
-   update. On first launch of the new version, `lib/db/index.ts` runs any **new Drizzle migrations**
-   bundled in the release, so schema changes (e.g. new columns/tables) apply automatically without
-   the user losing data. Always ship the matching `drizzle/` migration files with a release that
-   changes the schema.
+5. **Data is preserved.** The books are in the user's `.ironbooks` company file, wherever they saved
+   it (DESKTOP.md); the working copy (`%LOCALAPPDATA%\Ironbooks\Working`), automatic backups and
+   settings (`%APPDATA%\Ironbooks`) are outside the install folder, so the update never touches
+   them. "Restart & install now" first asks about a form still being typed, then saves and closes
+   the open company file before the installer runs. The first time the new version opens a company
+   file, `lib/db/index.ts` makes a safety copy (stamped with the file's pre-upgrade layout, so the
+   previous version can still restore it) and runs any **new Drizzle migrations** bundled in the
+   release. Always ship the matching `drizzle/` migration files with a release that changes the
+   schema. Once a release with new migrations has saved a file, older versions refuse to open it
+   (they ask to update).
 
 ## Signing caveats
 
-- **Windows:** auto-update works **unsigned**, but SmartScreen warns on first run of each new version.
-  Sign with an EV/OV code-signing cert (see `SIGNING.md`) to remove the warning.
+- **Windows:** auto-update works **unsigned**, but SmartScreen warns on first run of each new version,
+  and on Windows 11 with Smart App Control **On** an unsigned installer is blocked outright (no "Run
+  anyway"; Windows Security > App & browser control > Smart App Control). Sign with an EV/OV
+  code-signing cert (see `SIGNING.md`) to remove the warning.
 - **macOS:** auto-update **requires** a properly **signed + notarized** build. The self-signed pipeline
   in `SIGNING.md` is enough to run locally but will **not** auto-update on macOS — you need an Apple
   Developer ID cert + notarization for the `.dmg`/`.zip` feed.

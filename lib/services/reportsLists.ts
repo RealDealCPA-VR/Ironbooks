@@ -71,6 +71,7 @@ import {
   type SectionKey,
   payeeGroupOf,
   inIds,
+  customerWithJobs,
 } from './reportEngine';
 import { rangeLabel } from './reportsStandard';
 import { docRef } from './docNumbers';
@@ -115,7 +116,9 @@ function balanceSummary(
     .sort((a, b) => (a[0] === '' ? 1 : b[0] === '' ? -1 : a[1].name.localeCompare(b[1].name)))
     .map(([id, v]) => {
       total = total.plus(v.total);
-      const param = nameType === 'customer' ? 'customerId' : 'vendorId';
+      // A customer row is that customer:job's own balance (each job has its own row), so it opens
+      // that job alone — customerId would take in the customer's jobs too.
+      const param = nameType === 'customer' ? 'customerJobId' : 'vendorId';
       return {
         id: `bal:${id || 'none'}`,
         depth: 0,
@@ -534,20 +537,38 @@ const homeOf = (v: Decimal, rate: string | null | undefined): Decimal =>
  */
 const SALES_LINE_ONLY = sql`COALESCE(${items.type}::text, '') NOT IN ('subtotal', 'payment', 'sales_tax')`;
 
+export interface SalesLineFilter {
+  /** QB Customer:Job filter on a customer: the customer and its jobs (any depth), like the A/R aging. */
+  customerId?: string;
+  /** One customer:job alone (a Sales by Customer Summary row: each job has its own row). */
+  customerJobId?: string;
+  itemId?: string;
+  classId?: string;
+}
+
+/** The customers a sales filter keeps (null = every customer). */
+async function salesCustomerIds(ctx: ServiceContext, filter: SalesLineFilter): Promise<string[] | null> {
+  const tree = filter.customerId ? await customerWithJobs(ctx, filter.customerId) : null;
+  if (!filter.customerJobId) return tree;
+  return !tree || tree.includes(filter.customerJobId) ? [filter.customerJobId] : [];
+}
+
 /** Item sales lines (invoices, sales receipts, credit memos as negatives) in a date range. */
 export async function salesLines(
   ctx: ServiceContext,
   range: { from: Date; to: Date },
-  filter: { customerId?: string; itemId?: string; classId?: string } = {},
+  filter: SalesLineFilter = {},
   /** Only these invoices / credit memos, any date (no sales receipts) — used by the cash basis. */
   scope?: { invoiceIds: string[]; creditMemoIds: string[] },
 ): Promise<SalesLine[]> {
   const c = ctx.companyId;
   const out: SalesLine[] = [];
+  const custIds = await salesCustomerIds(ctx, filter);
+  if (custIds && custIds.length === 0) return out;
   const invConds: SQL[] = [eq(invoices.companyId, c), notInArray(invoices.status, ['void', 'draft']), SALES_LINE_ONLY];
   if (scope) invConds.push(inIds(invoices.id, scope.invoiceIds));
   else invConds.push(gte(invoices.date, range.from), lte(invoices.date, range.to));
-  if (filter.customerId) invConds.push(eq(invoices.customerId, filter.customerId));
+  if (custIds) invConds.push(inArray(invoices.customerId, custIds));
   if (filter.itemId) invConds.push(eq(invoiceLines.itemId, filter.itemId));
   if (filter.classId) invConds.push(sql`COALESCE(${invoiceLines.classId}, ${invoices.classId}) = ${filter.classId}`);
   for (const r of await ctx.db
@@ -578,7 +599,7 @@ export async function salesLines(
     const discConds: SQL[] = [eq(invoices.companyId, c), notInArray(invoices.status, ['void', 'draft']), sql`${invoices.discount} <> 0`];
     if (scope) discConds.push(inIds(invoices.id, scope.invoiceIds));
     else discConds.push(gte(invoices.date, range.from), lte(invoices.date, range.to));
-    if (filter.customerId) discConds.push(eq(invoices.customerId, filter.customerId));
+    if (custIds) discConds.push(inArray(invoices.customerId, custIds));
     if (filter.classId) discConds.push(eq(invoices.classId, filter.classId));
     for (const r of await ctx.db
       .select({ id: invoices.id, date: invoices.date, num: invoices.invoiceNumber, ref: invoices.refNumber, customerId: invoices.customerId, discount: invoices.discount, fx: invoices.exchangeRate })
@@ -590,7 +611,7 @@ export async function salesLines(
   }
   const srConds: SQL[] = [eq(salesReceipts.companyId, c), ne(salesReceipts.status, 'void'), SALES_LINE_ONLY, gte(salesReceipts.date, range.from), lte(salesReceipts.date, range.to)];
   if (scope) srConds.push(sql`false`);
-  if (filter.customerId) srConds.push(eq(salesReceipts.customerId, filter.customerId));
+  if (custIds) srConds.push(inArray(salesReceipts.customerId, custIds));
   if (filter.itemId) srConds.push(eq(salesReceiptLines.itemId, filter.itemId));
   if (filter.classId) srConds.push(sql`COALESCE(${salesReceiptLines.classId}, ${salesReceipts.classId}) = ${filter.classId}`);
   for (const r of await ctx.db
@@ -617,7 +638,7 @@ export async function salesLines(
     const cmConds: SQL[] = [eq(creditMemos.companyId, c), ne(creditMemos.status, 'void'), SALES_LINE_ONLY];
     if (scope) cmConds.push(inIds(creditMemos.id, scope.creditMemoIds));
     else cmConds.push(gte(creditMemos.date, range.from), lte(creditMemos.date, range.to));
-    if (filter.customerId) cmConds.push(eq(creditMemos.customerId, filter.customerId));
+    if (custIds) cmConds.push(inArray(creditMemos.customerId, custIds));
     if (filter.itemId) cmConds.push(eq(creditMemoLines.itemId, filter.itemId));
     for (const r of await ctx.db
       .select({
@@ -653,7 +674,7 @@ export async function salesLines(
 export async function salesLinesOnBasis(
   ctx: ServiceContext,
   range: { from: Date; to: Date },
-  filter: { customerId?: string; itemId?: string; classId?: string },
+  filter: SalesLineFilter,
   basis: 'accrual' | 'cash' | undefined,
 ): Promise<SalesLine[]> {
   if (basis !== 'cash') return salesLines(ctx, range, filter);
@@ -816,7 +837,7 @@ async function salesDetail(ctx: ServiceContext, p: ReportParams, by: 'customer' 
   const lines = await ofCustomerType(
     ctx,
     p,
-    await salesLinesOnBasis(ctx, { from, to }, { customerId: p.customerId, itemId: p.itemId, classId: p.classId }, basis),
+    await salesLinesOnBasis(ctx, { from, to }, { customerId: p.customerId, customerJobId: p.customerJobId, itemId: p.itemId, classId: p.classId }, basis),
   );
   const names = await customerNames(ctx);
   const entryIds = await entryIdsForSourceRefs(ctx, lines.map((l) => l.sourceRef));
@@ -896,7 +917,7 @@ export async function salesByCustomerSummary(ctx: ServiceContext, p: ReportParam
   const lines = await ofCustomerType(
     ctx,
     p,
-    await salesLinesOnBasis(ctx, { from, to }, { customerId: p.customerId, itemId: p.itemId, classId: p.classId }, basis),
+    await salesLinesOnBasis(ctx, { from, to }, { customerId: p.customerId, customerJobId: p.customerJobId, itemId: p.itemId, classId: p.classId }, basis),
   );
   const names = await customerNames(ctx);
   const by = new Map<string, Decimal>();
@@ -913,7 +934,8 @@ export async function salesByCustomerSummary(ctx: ServiceContext, p: ReportParam
         depth: 0,
         kind: 'data' as const,
         cells: { label: label(id), amount: amt(v) },
-        href: id ? stdHref('sales-by-customer-detail', { customerId: id, itemId: p.itemId, classId: p.classId, from: dayStr(from), to: dayStr(to), basis }) : null,
+        // Each customer:job has its own row: it opens that job alone (customerId takes in its jobs).
+        href: id ? stdHref('sales-by-customer-detail', { customerJobId: id, itemId: p.itemId, classId: p.classId, from: dayStr(from), to: dayStr(to), basis }) : null,
       };
     });
   rows.push({ id: 'sbc:grand', depth: 0, kind: 'grand', cells: { label: 'TOTAL', amount: amt(total) } });
@@ -950,7 +972,7 @@ const ITEM_TYPE_LABEL: Record<string, string> = {
 export async function salesByItemSummary(ctx: ServiceContext, p: ReportParams): Promise<StdReport> {
   const { from, to } = await resolveRange(ctx, p);
   const basis = p.basis === 'cash' ? 'cash' : undefined;
-  const lines = await salesLinesOnBasis(ctx, { from, to }, { customerId: p.customerId, itemId: p.itemId, classId: p.classId }, basis);
+  const lines = await salesLinesOnBasis(ctx, { from, to }, { customerId: p.customerId, customerJobId: p.customerJobId, itemId: p.itemId, classId: p.classId }, basis);
   const posted = await postedCogsBySalesLine(ctx, lines);
   const acc = new Map<string, { qty: Decimal; amount: Decimal; cogs: Decimal }>();
   for (const l of lines) {
@@ -1014,7 +1036,7 @@ export async function salesByItemSummary(ctx: ServiceContext, p: ReportParams): 
         depth: 1,
         kind: 'data',
         cells: cellsFor(x.name, x.agg),
-        href: x.id ? stdHref('sales-by-item-detail', { itemId: x.id, customerId: p.customerId, classId: p.classId, from: dayStr(from), to: dayStr(to), basis }) : null,
+        href: x.id ? stdHref('sales-by-item-detail', { itemId: x.id, customerId: p.customerId, customerJobId: p.customerJobId, classId: p.classId, from: dayStr(from), to: dayStr(to), basis }) : null,
       });
     }
     grand.qty = grand.qty.plus(sub.qty);
@@ -1262,7 +1284,8 @@ export async function customerContactList(ctx: ServiceContext, _p: ReportParams,
             terms: c.terms ?? '',
             balance: amt(balances.get(c.id) ?? Money.zero()),
           },
-      href: stdHref('customer-balance-detail', { customerId: c.id }),
+      // The balance shown is this customer:job's own: open it alone (customerId takes in its jobs).
+      href: stdHref('customer-balance-detail', { customerJobId: c.id }),
     }));
   return {
     key: phoneOnly ? 'customer-phone-list' : 'customer-contact-list',

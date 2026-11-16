@@ -125,9 +125,27 @@ function writeState(workDir, patch) {
   fs.mkdirSync(workDir, { recursive: true });
   const file = path.join(workDir, STATE_FILE);
   const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(next, null, 2));
+  writeFileDurably(tmp, JSON.stringify(next, null, 2));
   fs.renameSync(tmp, file);
   return next;
+}
+
+/**
+ * Write a file and flush it to the disk before it is renamed into place: after a power cut the
+ * renamed file is then never an empty or half-written one (the rename can land before the data).
+ */
+function writeFileDurably(file, data) {
+  const fd = fs.openSync(file, 'w');
+  try {
+    fs.writeFileSync(fd, data);
+    try {
+      fs.fsyncSync(fd);
+    } catch {
+      /* a file system without flush support: written all the same */
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 function dataDirOf(workDir) {
@@ -151,16 +169,99 @@ function hasData(workDir) {
  *               to the company file right away)
  *  - 'conflict' the working copy holds unsaved changes AND someone else has saved the company
  *               file since: the two can't be combined; keep the unsaved changes as a separate
- *               copy, then open the company file as it is
+ *               copy, then open the company file as it is. Also when the app stopped without
+ *               closing and the working copy's transaction log is BEHIND (or has split off from)
+ *               the save it was opened from: a power cut lost writes the company file already
+ *               has (it is flushed to disk on every save; the working copy is not), so the
+ *               working copy must never be saved over it — it is kept apart instead.
+ *
+ * `workingBehind` (workingCopyBehind with the data folder) is worked out by the caller; when it
+ * is not given, it is judged from the two fingerprints alone.
  */
-function planOpen({ companyFile, state, manifest, dataExists, workingFingerprint }) {
+function planOpen({ companyFile, state, manifest, dataExists, workingFingerprint, workingBehind }) {
   if (!dataExists || !state || !state.companyFile || pathKey(state.companyFile) !== pathKey(companyFile)) {
     return 'extract';
   }
   const baseSaveId = state.base && state.base.saveId;
   const sameSave = Boolean(baseSaveId && manifest && manifest.saveId === baseSaveId);
+  const unclean = state.closedCleanly === false;
+  const behind = workingBehind === undefined ? workingCopyBehind(state.base, workingFingerprint) : Boolean(workingBehind);
+  // Everything this working copy holds already went into an "unsaved changes" copy.
+  const alreadyKept = Boolean(state.conflictFingerprint && workingFingerprint !== undefined && workingFingerprint === state.conflictFingerprint);
+  if (behind && (unclean || state.unsavedSince) && !alreadyKept) return 'conflict';
+  if (behind) return 'extract';
   if (state.unsavedSince || crashedWithUnsavedBooks(state, workingFingerprint)) return sameSave ? 'recover' : 'conflict';
   return sameSave ? 'reuse' : 'extract';
+}
+
+/** { seq, hash } of a 'log:<seq>:<hash>' fingerprint; null for anything else. */
+function parseLogFingerprint(fp) {
+  const m = typeof fp === 'string' ? /^log:(\d+):(.+)$/.exec(fp) : null;
+  return m ? { seq: Number(m[1]), hash: m[2] } : null;
+}
+
+/**
+ * True when the working copy's transaction log is BEHIND the save it was opened from (or has
+ * split off from it): `base` is state.base, whose `fingerprint` is the log head the company file
+ * holds; `workingFingerprint` is logFingerprint(<working copy>/data). With `dataDir`, a working log
+ * that is ahead is also checked to still hold the base's record (same hash at that seq). False
+ * when it can't be told (no recorded fingerprint, a company file without a log).
+ */
+function workingCopyBehind(base, workingFingerprint, dataDir) {
+  if (workingFingerprint === undefined || !base || !Object.prototype.hasOwnProperty.call(base, 'fingerprint')) return false;
+  const baseFp = base.fingerprint ?? null;
+  if (baseFp === null || workingFingerprint === baseFp) return false;
+  const b = parseLogFingerprint(baseFp);
+  if (!b) return false;
+  const w = parseLogFingerprint(workingFingerprint);
+  // The company file has a log; the working copy has none (or none that can be read): lost.
+  if (!w) return true;
+  // Lower: records the company file holds are missing. Same seq, other hash: split off.
+  if (w.seq <= b.seq) return true;
+  if (!dataDir) return false;
+  return !logHoldsRecord(dataDir, b.seq, b.hash);
+}
+
+/** Does <dataDir>/transactions.bktlg hold the record `seq` with exactly `hash`? (Read in chunks.) */
+function logHoldsRecord(dataDir, seq, hash) {
+  const file = path.join(dataDir, TRANSACTION_LOG_FILE);
+  const needle = `"seq":${seq}`;
+  // A character split between two chunks is decoded whole (never a damaged line by accident).
+  const decoder = new (require('node:string_decoder').StringDecoder)('utf8');
+  let fd;
+  try {
+    fd = fs.openSync(file, 'r');
+    const chunk = Buffer.alloc(1024 * 1024);
+    let rest = '';
+    let pos = 0;
+    for (;;) {
+      const n = fs.readSync(fd, chunk, 0, chunk.length, pos);
+      const text = rest + (n > 0 ? decoder.write(chunk.subarray(0, n)) : decoder.end());
+      const lines = text.split('\n');
+      rest = n > 0 ? lines.pop() : '';
+      for (const line of lines) {
+        if (!line.includes(needle)) continue;
+        try {
+          const rec = JSON.parse(line);
+          if (rec && rec.seq === seq) return rec.hash === hash;
+        } catch {
+          /* a damaged line */
+        }
+      }
+      if (n <= 0) return false;
+      pos += n;
+    }
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
 }
 
 /**
@@ -351,22 +452,21 @@ async function prepareWorkingCopy(companyFile, { root, onConflict, appVersion, k
   const workDir = workingDirFor(companyFile, root);
   const state = readState(workDir);
   const dataExists = hasData(workDir);
-  const plan = planOpen({
-    companyFile,
-    state,
-    manifest,
-    dataExists,
-    workingFingerprint: dataExists ? logFingerprint(dataDirOf(workDir)) : undefined,
-  });
+  const workingFingerprint = dataExists ? logFingerprint(dataDirOf(workDir)) : undefined;
+  const workingBehind = Boolean(dataExists && state && workingCopyBehind(state.base, workingFingerprint, dataDirOf(workDir)));
+  const plan = planOpen({ companyFile, state, manifest, dataExists, workingFingerprint, workingBehind });
+  // Why a 'conflict': the working copy is older than the company file (a power cut lost its last
+  // writes), not newer work someone else's save got in the way of. The question is worded for it.
+  const conflictReason = plan === 'conflict' && workingBehind ? 'behind' : plan === 'conflict' ? 'saved-elsewhere' : null;
   // Unsaved work made through another path to this same file (mapped drive vs UNC): kept apart.
   const others = await keepWorkThroughOtherPaths(companyFile, root, manifest, appVersion, knownSchemaAt);
   const otherPaths = { otherPathCopies: others.copies, otherPathUnsaved: others.protectedLeft };
-  if (format.isSealedManifest(manifest)) return { ...(await prepareSealed(companyFile, { workDir, state, manifest, plan, onConflict })), ...otherPaths };
+  if (format.isSealedManifest(manifest)) return { ...(await prepareSealed(companyFile, { workDir, state, manifest, plan, onConflict, conflictReason })), ...otherPaths };
   let conflictCopy = null;
   let keptOnThisComputer = null;
   let damagedCopy = null;
   if (plan === 'conflict') {
-    const keep = onConflict ? await onConflict({ state, manifest, workDir }) : true;
+    const keep = onConflict ? await onConflict({ state, manifest, workDir, reason: conflictReason }) : true;
     if (!keep) return { workDir, dataDir: dataDirOf(workDir), plan: 'cancelled', manifest };
     if (isProtectedData(dataDirOf(workDir))) {
       // The unsaved changes are of books protected with passwords, and this shell never has their
@@ -621,9 +721,9 @@ function pruneDamagedPlain(workDir, now = Date.now()) {
  * has extracted the file at sign-in, so a crash before anyone signs in still finds the same plan
  * (never reuses an old working copy as if it were the file's current save).
  */
-async function prepareSealed(companyFile, { workDir, state, manifest, plan, onConflict }) {
+async function prepareSealed(companyFile, { workDir, state, manifest, plan, onConflict, conflictReason }) {
   if (plan === 'conflict') {
-    const keep = onConflict ? await onConflict({ state, manifest, workDir }) : true;
+    const keep = onConflict ? await onConflict({ state, manifest, workDir, reason: conflictReason }) : true;
     if (!keep) return { workDir, dataDir: dataDirOf(workDir), plan: 'cancelled', manifest, sealed: null };
   }
   if (plan === 'extract') {
@@ -747,6 +847,7 @@ module.exports = {
   dataDirOf,
   hasData,
   planOpen,
+  workingCopyBehind,
   conflictCopyPath,
   writeWorkingCopyAs,
   keepDamagedCopy,

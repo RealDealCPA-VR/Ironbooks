@@ -9,6 +9,7 @@
  *     periodStart?, periodEnd?: 'YYYY-MM-DD',   // override the dates read from the report
  *     accounts?: { [qbAccountKey]: { qbType?, mapTo?: 'new' | accountId } },
  *     acceptVariance?: boolean,                 // post differences to 'QB Import Suspense'
+ *     acceptExistingEntries?: boolean,          // import although mapped accounts hold non-GL entries
  *   }
  *
  * preview → GlPreview (accounts with suggested types/mappings, totals, review list, problems).

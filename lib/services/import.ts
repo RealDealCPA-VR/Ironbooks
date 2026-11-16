@@ -179,6 +179,13 @@ export function readBankAmount(raw: unknown): string | null | 'bad' {
     neg = true;
     s = s.slice(1).trim();
   }
+  // "125.00 CR" / "125.00 DR" (statement style, as the PDF statement reader accepts): a credit is
+  // money in, a debit money out.
+  const crdr = /\s*(CR|DR)\.?$/i.exec(s);
+  if (crdr) {
+    if (crdr[1].toUpperCase() === 'DR') neg = !neg;
+    s = s.slice(0, crdr.index).trim().replace(/^\$\s*/, '');
+  }
   if (!/^((\d{1,3}(,\d{3})+|\d+)(\.\d+)?|\.\d+)$/.test(s)) return 'bad';
   const v = Money.round2(s.replace(/,/g, ''));
   return toAmountString(neg && !v.isZero() ? v.negated() : v);
@@ -589,6 +596,7 @@ function applySkipRows(content: string, skipRows?: number): string {
 export function parseCSV(content: string, mapping: CsvMapping): ParsedTransaction[] {
   const result = Papa.parse<Record<string, string>>(applySkipRows(content, mapping.skipRows), {
     header: true,
+    // A row of only commas / spaces (Excel leaves ",,," rows at the end) is dropped below.
     skipEmptyLines: true,
     transformHeader: (h) => h.trim(),
   });
@@ -612,7 +620,26 @@ export function parseCSV(content: string, mapping: CsvMapping): ParsedTransactio
     if (autoFormat) mapping = { ...mapping, dateFormat: autoFormat };
   }
 
-  return result.data.map((row, i) => {
+  // Rows that carry no transaction are skipped instead of refusing the whole file: one whose date
+  // and amount cells are all blank, and a trailer whose date cell is a summary label ("Total",
+  // "Ending balance") or holds no digits and no amount. A row with an amount and no date, or with
+  // an amount and a date cell that isn't a date ("not-a-date"), is still refused.
+  const TRAILER_LABEL = /^(grand\s+)?(total|totals|subtotal|summary|(beginning|ending|opening|closing|available|ledger|current)\s+balance|balance)\b/i;
+  const cellOf = (row: Record<string, string>, key: string | number | undefined): string => {
+    if (key === undefined) return '';
+    const v = typeof key === 'number' ? Object.values(row)[key] : row[key];
+    return String(v ?? '').trim();
+  };
+  const hasAmount = (row: Record<string, string>) =>
+    [mapping.amountCol, mapping.debitCol, mapping.creditCol].some((k) => cellOf(row, k) !== '');
+  const rows = result.data.filter((row) => {
+    const dateCell = cellOf(row, mapping.dateCol);
+    if (!dateCell && !hasAmount(row)) return false;
+    if (dateCell && !/\d/.test(dateCell) && (TRAILER_LABEL.test(dateCell) || !hasAmount(row))) return false;
+    return true;
+  });
+
+  return rows.map((row, i) => {
     // The cell as read (earlier versions used it as is).
     const rawCol = (key: string | number): string => {
       if (typeof key === 'number') {

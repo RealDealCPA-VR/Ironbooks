@@ -549,8 +549,8 @@ function NewReceiptModal({
       lines: validLines.map((l) => ({
         itemId: l.itemId || null,
         description: l.description || null,
-        quantity: l.quantity,
-        rate: l.rate,
+        // A Subtotal item has no quantity or price: the server works out its amount.
+        ...(itemType(l.itemId) === 'subtotal' ? { quantity: '1', rate: '0' } : { quantity: l.quantity, rate: l.rate }),
         // B9: the line's Sales Tax Code (the server decides taxability from it).
         ...lineTaxPayload({ ...l, itemType: itemType(l.itemId) }, taxCodes, customerTax),
         ...inventoryLinePayload(l.inv),
@@ -560,15 +560,21 @@ function NewReceiptModal({
 
   async function handleSubmit() {
     if (!date) { toast('Please enter a receipt date.', 'danger'); return; }
-    const validLines = lines.filter((l) => l.itemId || l.description || l.quantity || l.rate);
+    // Messages number the rows as the user sees them.
+    const used = lines.map((l, row) => ({ l, row })).filter(({ l }) => l.itemId || l.description || l.quantity || l.rate);
+    const validLines = used.map(({ l }) => l);
     if (validLines.length === 0) { toast('Add at least one line item.', 'danger'); return; }
-    for (let i = 0; i < validLines.length; i++) {
-      const l = validLines[i];
+    for (const { l, row } of used) {
+      // A Subtotal item has no quantity or price (the server adds up the lines above it).
+      if (itemType(l.itemId) === 'subtotal') continue;
       if (!l.quantity || parseFloat(l.quantity) <= 0) {
-        toast(`Line ${i + 1}: quantity must be a positive number.`, 'danger'); return;
+        toast(`Line ${row + 1}: quantity must be a positive number.`, 'danger'); return;
       }
-      if (!l.rate || parseFloat(l.rate) < 0) {
-        toast(`Line ${i + 1}: rate cannot be negative.`, 'danger'); return;
+      if (!l.rate.trim() || !Number.isFinite(parseFloat(l.rate))) {
+        toast(`Line ${row + 1}: enter a rate (price each).`, 'danger'); return;
+      }
+      if (parseFloat(l.rate) < 0) {
+        toast(`Line ${row + 1}: rate cannot be negative.`, 'danger'); return;
       }
     }
 

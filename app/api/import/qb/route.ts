@@ -13,6 +13,9 @@
  *     mapping?: Record<string, string>,                         // required for csv / xlsx
  *     preview?: boolean,                                        // xlsx: return headers + rows only
  *     openItems?: { asDocuments: boolean, alreadyInGl?: boolean } // iif: open invoices / bills
+ *     postOpeningBalances?: boolean,  // iif: post ACCNT OBAMOUNT as opening balances (opt-in for
+ *                                     //      a list-only file; refused after a GL import)
+ *     openingBalanceDate?: 'YYYY-MM-DD' // iif: date of those opening balances
  *   }
  *
  * IIF imports cover the account hierarchy, customers (with jobs), vendors, classes, items
@@ -60,6 +63,8 @@ export async function POST(req: NextRequest) {
       mapping?: Record<string, string>;
       preview?: boolean;
       openItems?: { asDocuments?: boolean; alreadyInGl?: boolean };
+      postOpeningBalances?: unknown;
+      openingBalanceDate?: unknown;
     };
     const { format, kind, content, mapping } = body;
 
@@ -92,6 +97,10 @@ export async function POST(req: NextRequest) {
           openItems: body.openItems?.asDocuments
             ? { asDocuments: true, alreadyInGl: body.openItems.alreadyInGl !== false }
             : undefined,
+          ...(typeof body.postOpeningBalances === 'boolean' ? { postOpeningBalances: body.postOpeningBalances } : {}),
+          ...(typeof body.openingBalanceDate === 'string' && body.openingBalanceDate
+            ? { openingBalanceDate: body.openingBalanceDate }
+            : {}),
         }),
       );
     }

@@ -97,17 +97,20 @@ export const STATEMENT_FILTER_KEYS = [
   'txnType', 'amountMin', 'amountMax', 'memo', 'number', 'cleared',
 ] as const;
 
-/** The statement filters set on `p` (the Customer filter is that Customer:Job, like P&L by Job). */
+/**
+ * The statement filters set on `p`. The Customer filter is the P&L by Job column rule (the
+ * customer's lines and the costs job-costed to it) for the customer AND its jobs, any depth (QB:
+ * filtering by "Smith" takes in "Smith:Kitchen"): it is carried as customerId = customerJobId,
+ * which glFilterFromParams reads as exactly that. customerJobId alone (a P&L by Job cell) stays
+ * that one job.
+ */
 export function statementFilters(p: ReportParams): Record<string, string> {
   const out: Record<string, string> = {};
   for (const k of STATEMENT_FILTER_KEYS) {
     const v = (p as Record<string, unknown>)[k];
     if (typeof v === 'string' && v && !(k === 'cleared' && v === 'any')) out[k] = v;
   }
-  if (out.customerId && !out.customerJobId) {
-    out.customerJobId = out.customerId;
-    delete out.customerId;
-  }
+  if (out.customerId && !out.customerJobId) out.customerJobId = out.customerId;
   return out;
 }
 
@@ -959,6 +962,14 @@ export async function transactionDetailByAccount(ctx: ServiceContext, p: ReportP
   const range: { from?: Date; to?: Date } =
     p.from || p.to ? await resolveRange(ctx, { from: p.from ?? '1900-01-01', to: p.to }) : {};
   const f = glFilterFromParams(meta, p, range);
+  // Income / expense accounts (the QuickZoom of a Profit & Loss or Trial Balance account row) list
+  // their activity without the year-end closing entry, like the statement they open from: the
+  // closing debit made a closed year's "Sales" list every sale and then total $0. Balance-sheet
+  // accounts (Retained Earnings) keep it — it is part of their balance.
+  const picked = f.sections
+    ? [...meta.values()].filter((a) => f.sections!.includes(a.section) && (!f.accountIds || f.accountIds.includes(a.id)))
+    : f.accountIds?.map((id) => meta.get(id)).filter((a): a is AccountMeta => !!a);
+  if (picked?.length && picked.every((a) => isPLSection(a.section))) f.excludeClose = true;
   const { lines, truncated } = await fetchGlLines(ctx, meta, f);
   const groupBy: GroupKey = (p.subtotalBy as GroupKey) ?? 'account';
   const laid = layoutDetail(lines, {

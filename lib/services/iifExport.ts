@@ -2,7 +2,7 @@
  * IIF export (QB Desktop "File > Utilities > Export > Lists to IIF Files" parity, plus a
  * general-journal transaction export).
  *
- * Writes QuickBooks' own IIF codes (ACCNTTYPE BANK/AR/OCASSET/…, INVITEMTYPE SERV/PART/…) so
+ * Writes QuickBooks' own IIF codes (ACCNTTYPE BANK/AR/OCASSET/…, INVITEMTYPE SERV/INVENTORY/PART/…) so
  * QuickBooks Desktop can read the file, and everything our importer (qbImport.importIIF)
  * needs to rebuild the same lists — the round trip is covered by iifExport.test.ts:
  *   ACCNT (full "Parent:Sub" names), CLASS, CTYPE, VTYPE, SALESREP, CUSTNAMEDICT, CUST
@@ -107,19 +107,22 @@ export function qbAccountType(type: string, subtype: string): string {
   }
 }
 
-/** Our item type → QuickBooks INVITEMTYPE. */
+/**
+ * Our item type → QuickBooks INVITEMTYPE. QuickBooks' own codes: INVENTORY = Inventory Part,
+ * PART = Non-inventory Part, ASSEMBLY = Inventory Assembly.
+ */
 export function qbItemType(type: string, hasBom: boolean): string {
   switch (type) {
     case 'service': return 'SERV';
-    case 'inventory': return hasBom ? 'ASSEMBLY' : 'PART';
-    case 'non_inventory': return 'NONINV';
+    case 'inventory': return hasBom ? 'ASSEMBLY' : 'INVENTORY';
+    case 'non_inventory': return 'PART';
     case 'other_charge': return 'OTHC';
     case 'discount': return 'DISC';
     case 'subtotal': return 'SUBT';
     case 'payment': return 'PMT';
     case 'sales_tax': return 'STAX';
     case 'bundle': return 'GRP';
-    default: return 'NONINV';
+    default: return 'PART';
   }
 }
 
@@ -194,6 +197,13 @@ export async function exportListsIif(ctx: ServiceContext, lists: IifListName[] =
     for (const r of obRows) {
       if (r.ref !== `account:${r.accountId}`) continue;
       obOf.set(r.accountId, (obOf.get(r.accountId) ?? Money.zero()).plus(Money.of(r.debit ?? 0)).minus(Money.of(r.credit ?? 0)));
+    }
+    // QuickBooks' own list export writes each account's CURRENT balance into OBAMOUNT, so the
+    // importer leaves OBAMOUNT unposted unless asked. Ours is the opening-balance entry (the
+    // journal export leaves those out): say who wrote the file so a re-import posts them.
+    if ([...obOf.values()].some((v) => !v.isZero())) {
+      w.raw('!HDR\tPROD\tIIFVER');
+      w.raw('HDR\tIronbooks\t1');
     }
     w.section(
       'ACCNT',
@@ -432,7 +442,9 @@ export async function exportListsIif(ctx: ServiceContext, lists: IifListName[] =
         INVITEMTYPE: qbItemType(i.type, hasBom.has(i.id) && i.type === 'inventory'),
         DESC: i.description,
         ACCNT: acctPath(i.incomeAccountId),
-        ASSETACCNT: acctPath(i.assetAccountId),
+        // Only inventory carries an asset account: a PART (non-inventory) row with one reads back as
+        // inventory (older exports wrote inventory as PART).
+        ASSETACCNT: i.type === 'inventory' ? acctPath(i.assetAccountId) : '',
         COGSACCNT: acctPath(i.expenseAccountId),
         PRICE: i.salesPrice ? (i.type === 'sales_tax' ? `${Money.of(i.salesPrice).toString()}%` : toAmountString(i.salesPrice)) : '',
         COST: i.purchaseCost ? toAmountString(i.purchaseCost) : '',

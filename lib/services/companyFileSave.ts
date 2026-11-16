@@ -36,7 +36,7 @@ import { randomUUID } from 'node:crypto';
 import { sql } from 'drizzle-orm';
 import format from '@/electron/companyFileFormat';
 import lockFormat from '@/electron/companyLock';
-import { closeDb, firstOpenWalPosition, getDb, holdDbOpen, isDbOpen, resolveDataDir, withDamagedFileAccess, type DB } from '@/lib/db';
+import { closeDb, firstOpenWalPosition, getDb, holdDbOpen, isDbOpen, openDbDamage, resolveDataDir, withDamagedFileAccess, type DB } from '@/lib/db';
 import { sealedMode } from '@/lib/db/sealed';
 import { currentFingerprint } from './backupFingerprint';
 import { BACKUP_HISTORY_FILE } from './backupHistory';
@@ -226,7 +226,19 @@ function writeWorkingState(s: SaveState, patch: Partial<WorkingState>): void {
   try {
     const next = { ...(readWorkingState(s.statePath) ?? {}), ...patch };
     const tmp = `${s.statePath}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(next, null, 2));
+    // Flushed before the rename: after a power cut the state is the old one or the new one, never
+    // an empty file (crash recovery reads it on the next open).
+    const fd = fs.openSync(tmp, 'w');
+    try {
+      fs.writeFileSync(fd, JSON.stringify(next, null, 2));
+      try {
+        fs.fsyncSync(fd);
+      } catch {
+        /* a file system without flush support */
+      }
+    } finally {
+      fs.closeSync(fd);
+    }
     fs.renameSync(tmp, s.statePath);
   } catch (err) {
     console.warn('[company-file] could not update the working copy state:', (err as Error).message);
@@ -504,6 +516,18 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
       }
     }
 
+    // Books whose ledger was found damaged when they opened (lib/db getDb refuses them for normal
+    // work) are never written over the company file: its last save is what a reopen or a restore
+    // starts from. The changes stay counted as unsaved (catch below).
+    if (workingCopyActive(s) && openDbDamage(dataDir)) {
+      throw Object.assign(
+        new Error(
+          'Ironbooks found problems in the books on this computer, so it is not saving them over the company file (it still holds its last save). Restore your most recent backup (File > Back Up and Restore), or contact support.',
+        ),
+        { code: 'LEDGER_DAMAGED' },
+      );
+    }
+
     // The company file must still be the save this working copy started from.
     const ws = readWorkingState(s.statePath);
     const baseSaveId = ws?.base?.saveId ?? null;
@@ -692,7 +716,7 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
     }
     s.status = 'error';
     const code = (err as { code?: string })?.code;
-    s.error = code === 'SAVED_ELSEWHERE' || code === 'LOCK_UNCONFIRMED' ? (err as Error).message : friendlyIoError(err, s.file);
+    s.error = code === 'SAVED_ELSEWHERE' || code === 'LOCK_UNCONFIRMED' || code === 'LEDGER_DAMAGED' ? (err as Error).message : friendlyIoError(err, s.file);
     throw err;
   }
 }

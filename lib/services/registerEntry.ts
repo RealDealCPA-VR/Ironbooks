@@ -27,7 +27,10 @@ import { foreignCode, homeCode } from './fxLines';
 
 export interface RegisterEntryInput {
   date: Date;
-  /** Number column: the check number (blank = next number), card ref or journal entry number. */
+  /**
+   * Number column: the check number (blank = next number), card ref or journal entry number.
+   * Deposits and transfers have no number: one typed for them is refused, never dropped.
+   */
   number?: string | null;
   /** Payee / description. On checks and card entries a vendor or Other Name with this exact name is linked. */
   payee?: string | null;
@@ -134,6 +137,11 @@ export async function enterRegisterTransaction(
   }
   const memo = input.memo?.trim() || null;
   const number = input.number?.trim() || null;
+  if (number && (plan.kind === 'deposit' || plan.kind === 'transfer')) {
+    throw validation(
+      `A ${plan.kind} has no Number. Clear the Number column (put the number in the Memo if you want to keep it).`,
+    );
+  }
 
   switch (plan.kind) {
     case 'check':

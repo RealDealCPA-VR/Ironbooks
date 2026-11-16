@@ -10,7 +10,7 @@
 import { closedPeriodFixes, nextDay } from '@/lib/errorFixes';
 import { and, eq, lte, gte } from 'drizzle-orm';
 import { companies, fiscalPeriods } from '@/lib/db/schema';
-import { type ServiceContext, ServiceError, notFound, writeAudit } from './_base';
+import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
 import { assertWrite } from './rbac';
 import { activeCopy, assertDividingDateOpen, formatDividingDate } from './accountantCopy/guard';
 
@@ -47,24 +47,48 @@ export async function closePeriod(
       { accountantCopy: true, side: copy.side, dividingDate: copy.dividingDate },
     );
   }
-  const [row] = await ctx.db
-    .insert(fiscalPeriods)
-    .values({
-      companyId: ctx.companyId,
-      periodStart: input.periodStart,
-      periodEnd: input.periodEnd,
-      isClosed: true,
-      closedAt: new Date(),
-      closedBy: ctx.userId,
-    })
-    .returning();
-  await writeAudit(ctx, {
-    action: 'update',
-    entityType: 'fiscal_period',
-    entityId: row.id,
-    newValues: { periodStart: input.periodStart, periodEnd: input.periodEnd, isClosed: true },
+  const day = (d: Date) => new Date(d).toISOString().slice(0, 10);
+  if (day(input.periodEnd) < day(input.periodStart)) throw validation('The period must end on or after its start date.');
+  return inTransaction(ctx, async (tx) => {
+    // A closed period overlapping another one locked the same days twice: reopening either left
+    // them locked by the other, with nothing on screen saying why.
+    const [overlap] = await tx.db
+      .select({ start: fiscalPeriods.periodStart, end: fiscalPeriods.periodEnd })
+      .from(fiscalPeriods)
+      .where(
+        and(
+          eq(fiscalPeriods.companyId, tx.companyId),
+          eq(fiscalPeriods.isClosed, true),
+          lte(fiscalPeriods.periodStart, new Date(`${day(input.periodEnd)}T23:59:59.999Z`)),
+          gte(fiscalPeriods.periodEnd, new Date(`${day(input.periodStart)}T00:00:00.000Z`)),
+        ),
+      )
+      .limit(1);
+    if (overlap) {
+      throw new ServiceError(
+        'CONFLICT',
+        `That period overlaps the closed period ${day(overlap.start)} to ${day(overlap.end)}. Close only the days after it, or reopen it first.`,
+      );
+    }
+    const [row] = await tx.db
+      .insert(fiscalPeriods)
+      .values({
+        companyId: tx.companyId,
+        periodStart: input.periodStart,
+        periodEnd: input.periodEnd,
+        isClosed: true,
+        closedAt: new Date(),
+        closedBy: tx.userId,
+      })
+      .returning();
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'fiscal_period',
+      entityId: row.id,
+      newValues: { periodStart: input.periodStart, periodEnd: input.periodEnd, isClosed: true },
+    });
+    return row;
   });
-  return row;
 }
 
 export async function reopenPeriod(ctx: ServiceContext, id: string) {

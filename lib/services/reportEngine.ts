@@ -16,7 +16,7 @@
  * Everything reads POSTED journal lines (the source of truth) — never cached balances — and
  * every amount is Decimal (lib/money.ts).
  */
-import { and, asc, desc, eq, gte, inArray, lte, sql, type SQL } from 'drizzle-orm';
+import { and, asc, desc, eq, gte, inArray, lte, sql, type SQL, type SQLWrapper } from 'drizzle-orm';
 import { itemCandidates, linesForItem } from './reportItemLines';
 import type Decimal from 'decimal.js';
 import {
@@ -1340,6 +1340,13 @@ export interface GlLineFilter extends ActivityFilter {
    * or by their document) and bill / check / vendor-credit lines costed to it (costLineCustomers).
    */
   jobCustomerId?: string;
+  /**
+   * QB Customer:Job filter on a customer: `nameId` (when nameType is 'customer') also matches that
+   * customer's jobs (sub-customers, any depth), as the A/R aging does. Off = that name only.
+   */
+  nameWithJobs?: boolean;
+  /** `jobCustomerId` also matches the customer's jobs (a statement's Customer filter). Off = that job only (a P&L by Job column). */
+  jobWithJobs?: boolean;
   /** QB "Item" filter: the part of each line that comes from this item's document lines (reportItemLines.ts). */
   itemId?: string;
   txnType?: TxnTypeKey;
@@ -1381,19 +1388,28 @@ export function glFilterFromParams(
   if (p.memo) f.memo = p.memo;
   if (p.number) f.number = p.number;
   if (p.nameId) f.nameId = p.nameId;
-  if (p.customerId) {
+  // QB Customer:Job filter: a customer includes its jobs (any depth); a job is just that job.
+  // customerId = customerJobId is a statement's Customer filter (statementFilters): the job-column
+  // rule (named lines and job-costed bill / check lines) for the customer and its jobs.
+  if (p.customerId && p.customerJobId === p.customerId) {
+    f.jobCustomerId = p.customerId;
+    f.jobWithJobs = true;
+  } else if (p.customerId) {
     f.nameId = p.customerId;
     f.nameType = 'customer';
+    f.nameWithJobs = true;
   }
   if (p.vendorId) {
     f.nameId = p.vendorId;
     f.nameType = 'vendor';
+    f.nameWithJobs = false;
   }
   if (p.employeeId) {
     f.nameId = p.employeeId;
     f.nameType = 'employee';
+    f.nameWithJobs = false;
   }
-  if (p.customerJobId) f.jobCustomerId = p.customerJobId;
+  if (p.customerJobId && !f.jobCustomerId) f.jobCustomerId = p.customerJobId;
   if (p.itemId) f.itemId = p.itemId;
   if (p.section) {
     const secs = p.section.split(',').filter((s) => [...PL_SECTIONS, ...BS_SECTIONS].includes(s as SectionKey));
@@ -1419,40 +1435,59 @@ export const GL_LIMITS = {
  * ('customer:<id>', 'vendor:<id>', 'tax_agency:<id>'). Covers every document type
  * resolveEntryNames reads, so it is a superset of the exact match.
  */
-function nameCandidates(companyId: string, nameId: string): SQL {
+function nameCandidates(companyId: string, nameIds: string[]): SQL {
   const c = companyId;
+  // `col IN (ids)`: one name, or a customer and its jobs.
+  const anyOf = (col: SQLWrapper) => sql`${col} IN (${sql.join(nameIds.map((id) => sql`${id}`), sql`, `)})`;
   const docIds = sql.join(
     [
-      sql`SELECT ${invoices.id}::text FROM ${invoices} WHERE ${invoices.companyId} = ${c} AND ${invoices.customerId} = ${nameId}`,
-      sql`SELECT ${paymentsReceived.id}::text FROM ${paymentsReceived} WHERE ${paymentsReceived.companyId} = ${c} AND ${paymentsReceived.customerId} = ${nameId}`,
-      sql`SELECT ${salesReceipts.id}::text FROM ${salesReceipts} WHERE ${salesReceipts.companyId} = ${c} AND ${salesReceipts.customerId} = ${nameId}`,
-      sql`SELECT ${creditMemos.id}::text FROM ${creditMemos} WHERE ${creditMemos.companyId} = ${c} AND ${creditMemos.customerId} = ${nameId}`,
-      sql`SELECT ${bills.id}::text FROM ${bills} WHERE ${bills.companyId} = ${c} AND ${bills.vendorId} = ${nameId}`,
-      sql`SELECT ${vendorCredits.id}::text FROM ${vendorCredits} WHERE ${vendorCredits.companyId} = ${c} AND ${vendorCredits.vendorId} = ${nameId}`,
-      sql`SELECT ${expenses.id}::text FROM ${expenses} WHERE ${expenses.companyId} = ${c} AND (${expenses.vendorId} = ${nameId} OR ${expenses.otherNameId} = ${nameId})`,
-      sql`SELECT ${itemReceipts.id}::text FROM ${itemReceipts} WHERE ${itemReceipts.companyId} = ${c} AND ${itemReceipts.vendorId} = ${nameId}`,
-      sql`SELECT ${paychecks.id}::text FROM ${paychecks} WHERE ${paychecks.companyId} = ${c} AND ${paychecks.employeeId} = ${nameId}`,
-      sql`SELECT ${expenseReports.id}::text FROM ${expenseReports} WHERE ${expenseReports.companyId} = ${c} AND ${expenseReports.employeeId} = ${nameId}`,
+      sql`SELECT ${invoices.id}::text FROM ${invoices} WHERE ${invoices.companyId} = ${c} AND ${anyOf(invoices.customerId)}`,
+      sql`SELECT ${paymentsReceived.id}::text FROM ${paymentsReceived} WHERE ${paymentsReceived.companyId} = ${c} AND ${anyOf(paymentsReceived.customerId)}`,
+      sql`SELECT ${salesReceipts.id}::text FROM ${salesReceipts} WHERE ${salesReceipts.companyId} = ${c} AND ${anyOf(salesReceipts.customerId)}`,
+      sql`SELECT ${creditMemos.id}::text FROM ${creditMemos} WHERE ${creditMemos.companyId} = ${c} AND ${anyOf(creditMemos.customerId)}`,
+      sql`SELECT ${bills.id}::text FROM ${bills} WHERE ${bills.companyId} = ${c} AND ${anyOf(bills.vendorId)}`,
+      sql`SELECT ${vendorCredits.id}::text FROM ${vendorCredits} WHERE ${vendorCredits.companyId} = ${c} AND ${anyOf(vendorCredits.vendorId)}`,
+      sql`SELECT ${expenses.id}::text FROM ${expenses} WHERE ${expenses.companyId} = ${c} AND (${anyOf(expenses.vendorId)} OR ${anyOf(expenses.otherNameId)})`,
+      sql`SELECT ${itemReceipts.id}::text FROM ${itemReceipts} WHERE ${itemReceipts.companyId} = ${c} AND ${anyOf(itemReceipts.vendorId)}`,
+      sql`SELECT ${paychecks.id}::text FROM ${paychecks} WHERE ${paychecks.companyId} = ${c} AND ${anyOf(paychecks.employeeId)}`,
+      sql`SELECT ${expenseReports.id}::text FROM ${expenseReports} WHERE ${expenseReports.companyId} = ${c} AND ${anyOf(expenseReports.employeeId)}`,
     ],
     sql` UNION ALL `,
   );
   const docOf = sql`split_part(${journalEntries.sourceRef}, ':', 2)`;
-  return sql`(${journalEntryLines.entityId} = ${nameId} OR (${journalEntryLines.entityId} IS NULL AND (${docOf} = ${nameId} OR ${docOf} IN (${docIds}))))`;
+  return sql`(${anyOf(journalEntryLines.entityId)} OR (${journalEntryLines.entityId} IS NULL AND (${anyOf(docOf)} OR ${docOf} IN (${docIds}))))`;
 }
 
 /**
  * Lines of the bills, checks / credit-card charges and vendor credits with a document line costed
- * to the customer:job `customerId` (QB job costing; the posted lines carry the vendor's name).
- * A superset: fetchGlLines matches each posted line to its document line (costLineCustomers).
+ * to one of the customer:jobs `customerIds` (QB job costing; the posted lines carry the vendor's
+ * name). A superset: fetchGlLines matches each posted line to its document line (costLineCustomers).
  */
-function costedToCandidates(companyId: string, customerId: string): SQL {
+function costedToCandidates(companyId: string, customerIds: string[]): SQL {
   const c = companyId;
+  const ids = sql.join(customerIds.map((id) => sql`${id}`), sql`, `);
   const prefix = sql`split_part(${journalEntries.sourceRef}, ':', 1)`;
   const docOf = sql`split_part(${journalEntries.sourceRef}, ':', 2)`;
   return sql`(${journalEntryLines.entityId} IS NULL AND (
-    (${prefix} = 'bill' AND ${docOf} IN (SELECT ${billLines.billId}::text FROM ${billLines} JOIN ${bills} ON ${bills.id} = ${billLines.billId} WHERE ${bills.companyId} = ${c} AND ${billLines.customerId} = ${customerId}))
-    OR (${prefix} = 'expense' AND ${docOf} IN (SELECT ${expenseLines.expenseId}::text FROM ${expenseLines} JOIN ${expenses} ON ${expenses.id} = ${expenseLines.expenseId} WHERE ${expenses.companyId} = ${c} AND ${expenseLines.customerId} = ${customerId}))
-    OR (${prefix} = 'vendor_credit' AND ${docOf} IN (SELECT ${vendorCreditLines.vendorCreditId}::text FROM ${vendorCreditLines} JOIN ${vendorCredits} ON ${vendorCredits.id} = ${vendorCreditLines.vendorCreditId} WHERE ${vendorCredits.companyId} = ${c} AND ${vendorCreditLines.customerId} = ${customerId}))))`;
+    (${prefix} = 'bill' AND ${docOf} IN (SELECT ${billLines.billId}::text FROM ${billLines} JOIN ${bills} ON ${bills.id} = ${billLines.billId} WHERE ${bills.companyId} = ${c} AND ${billLines.customerId} IN (${ids})))
+    OR (${prefix} = 'expense' AND ${docOf} IN (SELECT ${expenseLines.expenseId}::text FROM ${expenseLines} JOIN ${expenses} ON ${expenses.id} = ${expenseLines.expenseId} WHERE ${expenses.companyId} = ${c} AND ${expenseLines.customerId} IN (${ids})))
+    OR (${prefix} = 'vendor_credit' AND ${docOf} IN (SELECT ${vendorCreditLines.vendorCreditId}::text FROM ${vendorCreditLines} JOIN ${vendorCredits} ON ${vendorCredits.id} = ${vendorCreditLines.vendorCreditId} WHERE ${vendorCredits.companyId} = ${c} AND ${vendorCreditLines.customerId} IN (${ids})))))`;
+}
+
+/** A customer and its jobs (sub-customers, any depth), from customerNames. */
+export function customerAndJobs(names: Map<string, { parentId: string | null }>, customerId: string): string[] {
+  const keep = new Set([customerId]);
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const [id, c] of names) if (c.parentId && keep.has(c.parentId) && !keep.has(id)) (keep.add(id), (grew = true));
+  }
+  return [...keep];
+}
+
+/** A customer and its jobs (any depth) — QB's Customer:Job filter on a customer. */
+export async function customerWithJobs(ctx: ServiceContext, customerId: string): Promise<string[]> {
+  return customerAndJobs(await customerNames(ctx), customerId);
 }
 
 /**
@@ -1501,8 +1536,14 @@ export async function fetchGlLines(
   // is checked after resolution. Without it the read took the company's FIRST 50,000 lines (oldest
   // first) and filtered those, so on a large file a customer's newer transactions silently fell
   // off Customer Balance Detail and every other name-filtered detail report.
-  if (f.nameId) conds.push(nameCandidates(ctx.companyId, f.nameId));
-  if (f.jobCustomerId) conds.push(sql`(${nameCandidates(ctx.companyId, f.jobCustomerId)} OR ${costedToCandidates(ctx.companyId, f.jobCustomerId)})`);
+  // A customer filter takes in the customer's jobs (any depth), like the A/R aging: invoices to
+  // "Smith:Kitchen" are Smith's. A job filter is that job (and its own sub-jobs).
+  const tree =
+    (f.nameId && f.nameWithJobs && f.nameType === 'customer') || (f.jobCustomerId && f.jobWithJobs) ? await customerNames(ctx) : null;
+  const nameIds = f.nameId ? (tree && f.nameWithJobs && f.nameType === 'customer' ? customerAndJobs(tree, f.nameId) : [f.nameId]) : null;
+  const jobIds = f.jobCustomerId ? (tree && f.jobWithJobs ? customerAndJobs(tree, f.jobCustomerId) : [f.jobCustomerId]) : null;
+  if (nameIds) conds.push(nameCandidates(ctx.companyId, nameIds));
+  if (jobIds) conds.push(sql`(${nameCandidates(ctx.companyId, jobIds)} OR ${costedToCandidates(ctx.companyId, jobIds)})`);
   // Item: entries that can involve the item (cash-basis shares are added after the read).
   if (f.itemId) conds.push(itemCandidates(ctx.companyId, f.itemId));
 
@@ -1607,13 +1648,19 @@ export async function fetchGlLines(
   });
   lines = lines.filter((l) => !!l.account);
   if (f.basis === 'cash') lines = await applyCashBasisToGlLines(ctx, meta, { ...f, accountIds }, lines);
-  if (f.nameId) lines = lines.filter((l) => l.nameId === f.nameId && (!f.nameType || l.nameType === f.nameType));
-  if (f.jobCustomerId) {
+  if (nameIds) {
+    const want = new Set(nameIds);
+    lines = lines.filter((l) => !!l.nameId && want.has(l.nameId) && (!f.nameType || l.nameType === f.nameType));
+  }
+  if (jobIds) {
     // The Profit & Loss by Job column rule (reportsStandard jobBucketOf): the line's customer, or
     // the customer:job its bill / check / vendor-credit line is costed to.
-    const job = f.jobCustomerId;
+    const jobs = new Set(jobIds);
     const costed = await costLineCustomers(ctx, lines);
-    lines = lines.filter((l) => (l.nameType === 'customer' && l.nameId ? l.nameId === job : costed.get(l.lineId) === job));
+    lines = lines.filter((l) => {
+      const job = l.nameType === 'customer' && l.nameId ? l.nameId : costed.get(l.lineId);
+      return !!job && jobs.has(job);
+    });
   }
   if (f.number) {
     const needle = f.number.toLowerCase();

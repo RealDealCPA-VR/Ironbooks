@@ -519,6 +519,12 @@ export async function categorizeSuggested(
 
 /** Days on either side of the feed date to search for match candidates. */
 const MATCH_WINDOW_DAYS = 14;
+/**
+ * A check or payment written up to this many days BEFORE it cleared the bank is still offered (low
+ * confidence; first when its number matches): checks often clear weeks later, and with no
+ * candidate the person clicked Add and the expense was entered twice.
+ */
+const LATE_CLEARING_DAYS = 120;
 const DAY_MS = 86_400_000;
 
 /** Digit runs (2+ digits, leading zeros stripped) found in a string — check #s, refs. */
@@ -550,7 +556,8 @@ function referenceMatches(
  * Candidates are POSTED journal entries whose net effect on the bank account's GL
  * account (debits − credits across all of the entry's lines on that account) equals
  * the feed line's signed amount — i.e. amount-equal AND sign-compatible — dated
- * within ±14 days, and not already matched by any other feed line.
+ * within ±14 days (or, for money out and reference matches, up to 120 days before the line: a
+ * check that cleared late), and not already matched by any other feed line.
  *
  * Ranking: exact check-number/reference matches first, then by date proximity.
  */
@@ -622,7 +629,7 @@ async function matchCandidatesFor(
   const foreign = !!(await foreignCurrencyOfAccount(ctx, ba.accountId));
 
   const times = live.map((t) => new Date(t.date).getTime());
-  const from = new Date(Math.min(...times) - MATCH_WINDOW_DAYS * DAY_MS);
+  const from = new Date(Math.min(...times) - LATE_CLEARING_DAYS * DAY_MS);
   const to = new Date(Math.max(...times) + MATCH_WINDOW_DAYS * DAY_MS);
 
   // Entries already linked by a feed line OF THIS BANK ACCOUNT (whether matched or created via
@@ -700,9 +707,11 @@ async function matchCandidatesFor(
     // Same amount key = amount-equal AND sign-compatible; then this line's own ±14-day window.
     for (const [entryId, e] of byAmount.get(toAmountString(txn.amount)) ?? []) {
       const diffMs = Math.abs(e.date.getTime() - txnDate.getTime());
-      if (diffMs > MATCH_WINDOW_DAYS * DAY_MS) continue;
-      const dateDiffDays = Math.round(diffMs / DAY_MS);
       const refMatch = referenceMatches(e.reference, txn);
+      const clearedLate =
+        e.date.getTime() <= txnDate.getTime() && diffMs <= LATE_CLEARING_DAYS * DAY_MS && (refMatch || Money.isNegative(Money.of(txn.amount)));
+      if (diffMs > MATCH_WINDOW_DAYS * DAY_MS && !clearedLate) continue;
+      const dateDiffDays = Math.round(diffMs / DAY_MS);
       const score = refMatch ? 100 : Math.max(10, 90 - dateDiffDays * 5);
       const confidence: MatchConfidence =
         refMatch || dateDiffDays <= 3 ? 'high' : dateDiffDays <= 7 ? 'medium' : 'low';

@@ -1076,6 +1076,7 @@ export async function salesTaxRevenueSummary(
       taxRateId: invoices.taxRateId,
       fx: invoices.exchangeRate,
       total: invoices.total,
+      discount: invoices.discount,
       retainageAmount: invoices.retainageAmount,
       amountPaid: invoices.amountPaid,
       date: invoices.date,
@@ -1142,7 +1143,17 @@ export async function salesTaxRevenueSummary(
     );
     const salesLines = groupRows(retainageAcct ? lines.filter((l) => l.accountId !== retainageAcct.id) : lines, (l) => l.docId);
     for (const h of invHeads) {
-      addDoc(h.taxRateId, salesLines.get(h.id) ?? [], Money.of(h.fx ?? 1), 1, invShare.get(h.id));
+      const docLines = salesLines.get(h.id) ?? [];
+      // The invoice's header Discount reduces its sales (it is posted as a debit to income, so the
+      // P&L and the sales reports show the net). It does not reduce the taxable base — the invoice
+      // charges tax on the full taxable lines (invoices.ts) — so, like a non-taxable discount item
+      // in QB, it is a negative NON-taxable sale on the invoice's rate: taxable sales stay the
+      // amount the tax was charged on.
+      const discount = Money.of(h.discount ?? 0);
+      const withDiscount = discount.greaterThan(0)
+        ? [...docLines, { itemId: null, amount: toAmountString(discount.negated()), taxable: false, taxRateId: null }]
+        : docLines;
+      addDoc(h.taxRateId, withDiscount, Money.of(h.fx ?? 1), 1, invShare.get(h.id));
     }
   }
 

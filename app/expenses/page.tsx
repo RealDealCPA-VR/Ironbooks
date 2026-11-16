@@ -195,6 +195,21 @@ function emptyLine(mode: LineRow['mode'] = 'expense'): LineRow {
   return { mode, accountId: '', itemId: '', quantity: '', unitCost: '', description: '', amount: '', classId: '', customerId: '' };
 }
 
+/** Nothing entered on the line (Enter on the last line adds one): it is not validated or saved. */
+function isBlankLine(l: LineRow): boolean {
+  return (
+    !l.accountId &&
+    !l.itemId &&
+    !l.amount.trim() &&
+    !l.quantity.trim() &&
+    !l.unitCost.trim() &&
+    !l.description.trim() &&
+    !l.classId &&
+    !l.customerId &&
+    !l.jobId
+  );
+}
+
 /** Entry type → the smart-defaults form whose history is recalled (a card credit recalls charges). */
 const ENTRY_SMART_FORM: Record<EntryType, SmartForm> = {
   check: 'check',
@@ -660,8 +675,11 @@ function ExpensesPageContent() {
       account: requiredMessage(paymentAccountId, isCC ? 'Choose the credit card account.' : 'Choose the bank account the money came from.'),
       date: dateMessage(date, 'Date'),
     };
+    const someFilled = lines.some((l) => !isBlankLine(l));
     lines.forEach((line, i) => {
       const n = i + 1;
+      // A blank line (Enter on the last line adds one) is left out, as in QuickBooks.
+      if (someFilled && isBlankLine(line)) return;
       if (line.mode === 'item') {
         entries[`line-${i}-item`] = requiredMessage(line.itemId, `Line ${n}: choose an item.`);
         entries[`line-${i}-qty`] = !(Number(line.quantity) > 0)
@@ -681,7 +699,7 @@ function ExpensesPageContent() {
   const fieldErrors: FieldErrors = showErrors ? validateForm().errors : {};
 
   /** Copy a fix's changes (request-body paths) back onto the form. */
-  function applyToForm(patched: ExpenseBody, fix: ErrorFix) {
+  function applyToForm(patched: ExpenseBody, fix: ErrorFix, lineIdx: number[] = []) {
     for (const op of fix.patch ?? []) {
       const value = getPath(patched, op.path);
       if (op.path === 'date' && typeof value === 'string') {
@@ -692,7 +710,8 @@ function ExpensesPageContent() {
       else {
         const lp = parseLinePath(op.path);
         if (lp?.collection === 'lines' && (lp.field === 'accountId' || lp.field === 'amount' || lp.field === 'classId')) {
-          updateLine(lp.index, lp.field, typeof value === 'string' ? value : '');
+          // Body line → form line (blank form lines are not sent).
+          updateLine(lineIdx[lp.index] ?? lp.index, lp.field, typeof value === 'string' ? value : '');
         }
       }
     }
@@ -737,7 +756,10 @@ function ExpensesPageContent() {
     // "Use the next free check number" / "Keep it anyway" fixes.
 
     {
-      const bodyLines = lines.map((l) =>
+      // Blank lines are not sent; lineIdx maps each sent line back to its form line.
+      const kept = lines.map((l, i) => ({ l, i })).filter(({ l }) => !isBlankLine(l));
+      const lineIdx = kept.map(({ i }) => i);
+      const bodyLines = kept.map(({ l }) =>
         l.mode === 'item'
           ? {
               itemId: l.itemId,
@@ -782,7 +804,12 @@ function ExpensesPageContent() {
         exchangeRate: docCurrency && exchangeRate.trim() ? exchangeRate.trim() : undefined,
         lines: bodyLines,
       };
-      const ctx = { payload: body, resubmit: send, applyToForm, fallback: 'Failed to save expense.' };
+      const ctx = {
+        payload: body,
+        resubmit: send,
+        applyToForm: (patched: ExpenseBody, fix: ErrorFix) => applyToForm(patched, fix, lineIdx),
+        fallback: 'Failed to save expense.',
+      };
       // Class tracking "warn when a transaction has no class" (lib/formPrefs.ts): offer fixes
       // instead of a yes/no box — use the class already on another line (or the only class), or
       // save without one.

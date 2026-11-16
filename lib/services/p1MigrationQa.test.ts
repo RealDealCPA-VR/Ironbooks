@@ -174,8 +174,9 @@ describe('P1 migration — tester QA', () => {
       t('ACCNT', 'Savings', 'BANK', '1020', '2500.55'),
       t('ACCNT', 'Truck Loan', 'LTLIAB', '2700', '-10000.00'),
     ].join('\r\n');
-    await importIIF(c, iif);
-    await importIIF(c, iif);
+    // A list-only file posts OBAMOUNT only when asked (QuickBooks writes the CURRENT balance there).
+    await importIIF(c, iif, { postOpeningBalances: true });
+    await importIIF(c, iif, { postOpeningBalances: true });
     const [sav] = await db.select().from(accounts).where(and(eq(accounts.companyId, c.companyId), eq(accounts.code, '1020')));
     const [loan] = await db.select().from(accounts).where(and(eq(accounts.companyId, c.companyId), eq(accounts.code, '2700')));
     expect(Money.of(sav.balance).toFixed(2)).toBe('2500.55');

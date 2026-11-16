@@ -167,6 +167,19 @@ describe('enterRegisterTransaction', () => {
     expect(Number(await balanceOf(acct['1100']))).toBe(1000);
   });
 
+  it('a Number typed on a deposit or transfer is refused, not silently dropped', async () => {
+    const depBefore = (await db.select().from(deposits)).length;
+    const xferBefore = (await db.select().from(transfers)).length;
+    await expect(
+      enterRegisterTransaction(ctx, acct['1000'], { date: day('2026-01-07'), number: '501', payee: 'Owner', otherAccountId: acct['3000'], side: 'increase', amount: '10' }),
+    ).rejects.toMatchObject({ code: 'VALIDATION', message: expect.stringMatching(/deposit has no Number/) });
+    await expect(
+      enterRegisterTransaction(ctx, acct['1000'], { date: day('2026-01-07'), number: '502', otherAccountId: acct['1100'], side: 'decrease', amount: '10' }),
+    ).rejects.toMatchObject({ code: 'VALIDATION', message: expect.stringMatching(/transfer has no Number/) });
+    expect(await db.select().from(deposits)).toHaveLength(depBefore);
+    expect(await db.select().from(transfers)).toHaveLength(xferBefore);
+  });
+
   it('a charge typed into the card register is a card charge; a refund is a card credit', async () => {
     const charge = await enterRegisterTransaction(ctx, acct['2100'], { date: day('2026-01-08'), payee: 'Office Depot', otherAccountId: acct['6000'], side: 'increase', amount: '75' });
     expect(charge.kind).toBe('card_charge');

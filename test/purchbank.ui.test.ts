@@ -111,7 +111,9 @@ describe('post-merge fixes: forms', () => {
     const src = fs.readFileSync('app/deposits/page.tsx', 'utf8');
     expect(src).toContain('placeholder="Received From"');
     expect(src).toContain('onChange={(v) => patchExtraLine(idx, receivedFromPatch(v))}');
-    expect(src.match(/extraLines: (extraLines|rows)\.map\(extraLinePayload\)/g)?.length).toBe(2);
+    // Save (blank lines left out) and Memorize both send each line through extraLinePayload.
+    expect(src).toContain('extraLines: kept.map(({ l }) => extraLinePayload(l))');
+    expect(src).toContain('extraLines: rows.map(extraLinePayload)');
   });
 
   it('Sales Receipts: editing a reconciled receipt asks QB\'s "Change it anyway?" and saves', () => {

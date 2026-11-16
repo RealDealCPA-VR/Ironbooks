@@ -136,15 +136,24 @@ export class CompanyFileUpgradeError extends ServiceError {
 /** Folders given their pre-upgrade safety copy in this process. */
 const upgradeCopied = new Set<string>();
 
-/** Steps of this version not yet applied to the file (0 for a brand-new database). */
-async function pendingMigrationCount(client: PGlite, migrationsFolder: string): Promise<number> {
-  let newest: number | null = null;
+/**
+ * The newest migration applied to the database (`created_at` of drizzle's journal table, the
+ * migration's `when`): the layout its books are in. Null for a database never migrated.
+ */
+async function appliedSchemaAt(client: PGlite): Promise<number | null> {
   try {
     const res = await client.query<{ last: string | number | null }>('SELECT MAX(created_at) AS last FROM drizzle.__drizzle_migrations');
-    newest = res.rows[0]?.last == null ? null : Number(res.rows[0].last);
+    const newest = res.rows[0]?.last == null ? null : Number(res.rows[0].last);
+    return newest !== null && Number.isFinite(newest) ? newest : null;
   } catch {
-    return 0; // never migrated: a brand-new database, nothing to protect
+    return null;
   }
+}
+
+/** Steps of this version not yet applied to the file (0 for a brand-new database). */
+async function pendingMigrationCount(client: PGlite, migrationsFolder: string): Promise<number> {
+  // Never migrated: a brand-new database, nothing to protect.
+  const newest = await appliedSchemaAt(client);
   if (newest === null) return 0;
   try {
     const journal = JSON.parse(fs.readFileSync(path.join(migrationsFolder, 'meta', '_journal.json'), 'utf8')) as {
@@ -413,7 +422,10 @@ export function openDb(dataDir?: string): DbHandle {
             return null;
           });
           const { ensurePreOpBackup } = await import('@/lib/services/backup');
-          ensurePreOpBackup(null, 'upgrade', dir, protection);
+          // Stamped with the layout the books are in NOW (before the upgrade), not the one this
+          // app ships: the version used before must be able to restore its own safety copy (it
+          // refuses a backup stamped newer than it knows).
+          ensurePreOpBackup(null, 'upgrade', dir, protection, { dbSchemaAt: await appliedSchemaAt(client) });
         } catch (err) {
           console.warn('[db] could not make a safety copy before upgrading the company file:', (err as Error)?.message ?? err);
         }
@@ -554,6 +566,16 @@ export async function getDb(dataDir?: string): Promise<DB> {
   if (handle.lost) throw handle.lost;
   if (handle.damage && !damagedFileAccess.getStore()) throw new LedgerDamagedError(handle.damage);
   return handle.db;
+}
+
+/**
+ * Ledger problems found when the handle open in this process for `dataDir` opened (null: healthy,
+ * or nothing open). Never opens anything: lib/services/companyFileSave.ts asks it so books found
+ * damaged are never saved over the company file.
+ */
+export function openDbDamage(dataDir?: string): LedgerProblem[] | null {
+  const damage = handles.get(resolveDataDir(dataDir))?.damage;
+  return damage && damage.length ? damage : null;
 }
 
 /** Synchronous accessor for code paths that manage readiness themselves. */

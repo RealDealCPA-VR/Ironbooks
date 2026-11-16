@@ -63,6 +63,8 @@ export interface ClearableLine {
   journalEntryId: string;
   date: Date;
   description: string;
+  /** Check number / reference of the entry (QB's Chk # column). */
+  reference?: string | null;
   /**
    * Debit (money in) / credit (money out) in the ACCOUNT's currency — for a foreign-currency
    * account that is the amount on the statement (p1 fx), not the home value.
@@ -376,6 +378,7 @@ export async function listClearable(
       journalEntryId: journalEntryLines.journalEntryId,
       date: journalEntries.date,
       description: journalEntries.description,
+      reference: journalEntries.reference,
       debit: accountDebitSql(foreign),
       credit: accountCreditSql(foreign),
       homeDebit: journalEntryLines.debit,
@@ -405,7 +408,9 @@ export async function listClearable(
             ),
         ),
       ),
-    );
+    )
+    // In date order (then entry number), like QB's reconcile window and the printed statement.
+    .orderBy(journalEntries.date, journalEntries.entryNumber);
 
   // If a reconciliationId is given, fetch the current session's cleared state.
   const clearedSet = new Set<string>();
@@ -431,6 +436,7 @@ export async function listClearable(
       journalEntryId: r.journalEntryId,
       date: r.date,
       description: r.description,
+      reference: r.reference,
       debit: foreign ? nz(r.debit) : r.debit,
       credit: foreign ? nz(r.credit) : r.credit,
       memo: r.memo,
@@ -453,6 +459,26 @@ export async function toggleCleared(
   // Check-then-insert in one transaction: two clicks at once must not insert two rows for the
   // same line (each would count toward the cleared balance).
   return inTransaction(ctx, (tx) => toggleClearedInTx(tx, reconciliationId, journalEntryLineId, isCleared));
+}
+
+/**
+ * Mark or un-mark many lines at once (QB's Mark All / Unmark All), with the same checks as one tick
+ * each, in one transaction: a converted account's first reconciliation can list a thousand lines.
+ */
+export async function setClearedMany(
+  ctx: ServiceContext,
+  reconciliationId: string,
+  journalEntryLineIds: string[],
+  isCleared: boolean,
+): Promise<ReconciliationProgress> {
+  if (!Array.isArray(journalEntryLineIds) || journalEntryLineIds.some((id) => typeof id !== 'string')) {
+    throw validation('journalEntryLineIds must be a list of line ids.');
+  }
+  if (journalEntryLineIds.length > 20_000) throw validation('Too many lines at once (20,000 at most).');
+  return inTransaction(ctx, async (tx) => {
+    for (const id of new Set(journalEntryLineIds)) await toggleClearedInTx(tx, reconciliationId, id, isCleared);
+    return getProgress(tx, reconciliationId);
+  });
 }
 
 async function toggleClearedInTx(
@@ -989,7 +1015,7 @@ async function autoClearBankLine(
  * the service charge, "reconciliation:<id>:interest" for interest earned. Reports show them as a
  * Check / Deposit (QB) instead of "Other"; entries posted before this carry "reconciliation:<id>".
  */
-export function reconciliationAdjustmentRef(reconciliationId: string, kind: 'charge' | 'interest'): string {
+export function reconciliationAdjustmentRef(reconciliationId: string, kind: 'charge' | 'interest' | 'adjustment'): string {
   return `reconciliation:${reconciliationId}:${kind}`;
 }
 
@@ -1105,6 +1131,92 @@ export async function addStatementAdjustments(
     }
 
     return getProgress(tx, reconciliationId);
+  });
+}
+
+/** QuickBooks' account for reconciliation adjustments. */
+export const RECONCILIATION_DISCREPANCIES = 'Reconciliation Discrepancies';
+
+/**
+ * Finish a reconciliation that does not balance by posting the difference to Reconciliation
+ * Discrepancies (an expense account, created on first use), dated the statement date and cleared
+ * into this session: QuickBooks' "Enter Adjustment". It lets a converted file's first
+ * reconciliation finish when a check written before the conversion is still outstanding (that
+ * check is inside the imported opening balance, not a line of its own). The entry can be voided
+ * from the register like the service charge.
+ */
+export async function completeWithAdjustment(
+  ctx: ServiceContext,
+  reconciliationId: string,
+): Promise<{ reconciliation: typeof reconciliations.$inferSelect; adjustment: string }> {
+  return inTransaction(ctx, async (tx) => {
+    const recon = await loadReconciliation(tx, reconciliationId);
+    if (recon.status !== 'in_progress') throw validation(`Reconciliation is already ${recon.status}.`);
+    await assertReconciliationDateOpen(tx, recon.statementDate); // Accountant's Copy (I1)
+    if (await foreignCurrencyOfAccount(tx, recon.glAccountId)) {
+      throw validation('A foreign-currency account is adjusted with a service charge or interest entry, in its own currency.');
+    }
+    const [dup] = await tx.db
+      .select({ id: journalEntries.id })
+      .from(journalEntries)
+      .where(
+        and(
+          eq(journalEntries.companyId, tx.companyId),
+          eq(journalEntries.sourceRef, reconciliationAdjustmentRef(reconciliationId, 'adjustment')),
+          eq(journalEntries.status, 'posted'),
+        ),
+      )
+      .limit(1);
+    if (dup) throw new ServiceError('CONFLICT', 'An adjustment is already entered for this reconciliation.');
+    const [gl] = await tx.db.select({ type: accounts.type }).from(accounts).where(eq(accounts.id, recon.glAccountId));
+    const difference = Money.round2(Money.of(recon.statementBalance).minus(await computeClearedBalance(tx, reconciliationId)));
+    if (difference.isZero()) throw validation('The reconciliation already balances; there is nothing to adjust.');
+
+    // The discrepancy account (by name, as QB names it), created the first time.
+    let [disc] = await tx.db
+      .select({ id: accounts.id })
+      .from(accounts)
+      .where(
+        and(
+          eq(accounts.companyId, tx.companyId),
+          eq(accounts.type, 'expense'),
+          sql`lower(${accounts.name}) = lower(${RECONCILIATION_DISCREPANCIES})`,
+        ),
+      )
+      .limit(1);
+    if (!disc) {
+      const { createAccount, nextAccountNumber } = await import('./accounts');
+      const created = await createAccount(tx, {
+        code: await nextAccountNumber(tx, 'expense' as never, 'operating_expenses'),
+        name: RECONCILIATION_DISCREPANCIES,
+        type: 'expense',
+        subtype: 'operating_expenses',
+      } as never);
+      disc = { id: created.id };
+    }
+
+    // The cleared balance runs on the account's natural side (a card's grows with credits), so a
+    // positive difference is a debit to a bank account and a credit to a card account.
+    const amount = toAmountString(difference.abs());
+    const increase = difference.greaterThan(0);
+    const bankDebit = gl?.type === 'liability' ? !increase : increase;
+    const entry = await postJournalEntry(tx, {
+      date: recon.statementDate,
+      description: 'Reconciliation adjustment',
+      sourceRef: reconciliationAdjustmentRef(reconciliationId, 'adjustment'),
+      lines: bankDebit
+        ? [
+            { accountId: recon.glAccountId, debit: amount },
+            { accountId: disc.id, credit: amount },
+          ]
+        : [
+            { accountId: disc.id, debit: amount },
+            { accountId: recon.glAccountId, credit: amount },
+          ],
+    });
+    await autoClearBankLine(tx, reconciliationId, entry.id, recon.glAccountId);
+    const reconciliation = await completeReconciliationInTx(tx, reconciliationId);
+    return { reconciliation, adjustment: toAmountString(difference) };
   });
 }
 
@@ -1352,6 +1464,14 @@ export interface ReconciliationReport {
    * then allows it). The lines above stay as reconciled; these are the changes since.
    */
   changes: ReconciliationChangeRow[];
+  /**
+   * QB's Reconciliation Detail "Uncleared Transactions": posted lines on the account dated on or
+   * before the statement date that were not cleared by this or an earlier reconciliation.
+   */
+  uncleared: ReconciliationReportLine[];
+  unclearedTotal: string;
+  /** Account (register) balance as of the statement date; = clearedBalance + unclearedTotal when it ties. */
+  registerBalance: string;
   /** p1 fx: the account's currency (null = home); every amount above is in it. */
   currency?: string | null;
 }
@@ -1472,6 +1592,70 @@ export async function getReconciliationReport(
   const clearedBalance = beginning.plus(clearedTotal);
   const statementBalance = Money.of(recon.statementBalance);
 
+  // Uncleared transactions and the register balance as of the statement date (QB's Reconciliation
+  // Detail tie-out: cleared balance + uncleared = register balance).
+  const accountRows = await ctx.db
+    .select({
+      lineId: journalEntryLines.id,
+      journalEntryId: journalEntryLines.journalEntryId,
+      entryNumber: journalEntries.entryNumber,
+      date: journalEntries.date,
+      description: journalEntries.description,
+      memo: journalEntryLines.memo,
+      debit: accountDebitSql(reportForeign),
+      credit: accountCreditSql(reportForeign),
+    })
+    .from(journalEntryLines)
+    .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+    .where(
+      and(
+        eq(journalEntryLines.accountId, recon.glAccountId),
+        eq(journalEntries.companyId, ctx.companyId),
+        eq(journalEntries.status, 'posted'),
+        onOrBeforeDay(recon.statementDate),
+      ),
+    )
+    .orderBy(journalEntries.date, journalEntries.entryNumber);
+  // Cleared as of this statement: by this session, or by a completed reconciliation of this
+  // account whose statement date is not after this one's.
+  const clearedThen = new Set(
+    (
+      await ctx.db
+        .select({ lineId: reconciliationItems.journalEntryLineId })
+        .from(reconciliationItems)
+        .innerJoin(reconciliations, eq(reconciliationItems.reconciliationId, reconciliations.id))
+        .where(
+          and(
+            eq(reconciliations.bankAccountId, recon.bankAccountId),
+            eq(reconciliationItems.isCleared, true),
+            sql`(${reconciliations.id} = ${reconciliationId} OR (${reconciliations.status} = 'completed' AND ${reconciliations.statementDate} <= ${recon.statementDate}))`,
+          ),
+        )
+    ).map((r) => r.lineId),
+  );
+  let registerBalance = Money.zero();
+  let unclearedTotal = Money.zero();
+  const uncleared: ReconciliationReportLine[] = [];
+  for (const r of accountRows) {
+    const amount = naturalAmount(meta.glType, r.debit, r.credit);
+    registerBalance = registerBalance.plus(amount);
+    // A Home Currency Adjustment line has no amount in the account's currency: never on a statement.
+    if (clearedThen.has(r.lineId) || (reportForeign && amount.isZero())) continue;
+    unclearedTotal = unclearedTotal.plus(amount);
+    uncleared.push({
+      lineId: r.lineId,
+      journalEntryId: r.journalEntryId,
+      entryNumber: r.entryNumber,
+      date: r.date,
+      description: r.description,
+      memo: r.memo,
+      debit: r.debit,
+      credit: r.credit,
+      amount: toAmountString(amount),
+      isVoided: false,
+    });
+  }
+
   return {
     id: recon.id,
     bankAccountId: recon.bankAccountId,
@@ -1497,6 +1681,9 @@ export async function getReconciliationReport(
     lines,
     discrepancies: lines.filter((l) => l.isVoided),
     changes,
+    uncleared,
+    unclearedTotal: toAmountString(unclearedTotal),
+    registerBalance: toAmountString(registerBalance),
     currency: reportCurrency,
   };
 }

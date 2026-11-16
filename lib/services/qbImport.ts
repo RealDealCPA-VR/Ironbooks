@@ -49,7 +49,7 @@
 import { systemAccountIdOrNull } from './accountRoles';
 import { createHash } from 'node:crypto';
 import Papa from 'papaparse';
-import { and, eq, like } from 'drizzle-orm';
+import { and, eq, like, ne } from 'drizzle-orm';
 import { csvUnsafeText } from '@/lib/csv';
 import { withPlannerStats } from '@/lib/db/plannerStats';
 import {
@@ -69,7 +69,7 @@ import {
 import { Money, allocate, toAmountString } from '@/lib/money';
 import type { ServiceContext } from './_base';
 import { ServiceError, writeAudit } from './_base';
-import { createAccount } from './accounts';
+import { createAccount, findOrCreateOpeningBalanceEquity } from './accounts';
 import { createCustomer, type CustomerAddress } from './customers';
 import { createVendor } from './vendors';
 import { createClass } from './dimensions';
@@ -389,6 +389,11 @@ export interface ParsedIIF {
   transactions: IIFTransaction[];
   /** Every other list section keyed by its row type (CTYPE, TERMS, BUD, …). */
   lists: Record<string, IIFListRows>;
+  /**
+   * HDR PROD: the program that wrote the file ('Ironbooks' for our own exports, whose ACCNT
+   * OBAMOUNT is each account's opening-balance entry rather than its current balance).
+   */
+  producer?: string;
   /** CUSTNAMEDICT custom-field labels by CUSTFLD index, per name list. */
   customFieldLabels: {
     customer: Record<number, string>;
@@ -665,6 +670,9 @@ export function parseIIF(content: string): ParsedIIF {
         break;
       case 'SPL':
         if (currentTxn) currentTxn.lines.push(txnLineFrom(row));
+        break;
+      case 'HDR':
+        if (row.PROD?.trim()) result.producer = row.PROD.trim();
         break;
       default:
         if (!CORE_SECTIONS.has(rowType)) {
@@ -1138,7 +1146,25 @@ async function importIifAccounts(
   rows: IIFAccount[],
   lookup: AccountLookup,
   obDate: Date = new Date(),
-): Promise<void> {
+  /**
+   * Post each account's OBAMOUNT as an opening balance. Off for a QuickBooks list export (its
+   * OBAMOUNT is the account's CURRENT balance, which the General Ledger import brings in too).
+   */
+  postOpeningBalances = true,
+): Promise<{ postedOpeningAccountIds: Set<string> }> {
+  const postedOpeningAccountIds = new Set<string>();
+  /** Every OBAMOUNT that is not posted is reported — a balance is never dropped silently. */
+  const unposted = (displayPath: string, code: string | undefined, ob: string, why: string) =>
+    counts.issues.push({
+      entity: 'account',
+      name: displayPath,
+      ...(code ? { code } : {}),
+      reason: 'note',
+      message: `QuickBooks lists a balance of ${toAmountString(Money.of(ob))} (OBAMOUNT) for this account. It was not posted: ${why}`,
+    });
+  const notOptedIn =
+    "a QuickBooks list export carries each account's CURRENT balance, which your General Ledger import (or your opening-balance entry) brings in. " +
+    'To use these balances as opening balances instead, import the file again with "Post account balances from this file" ticked.';
   // Non-posting accounts (estimates, purchase orders) are imported as the wave2 foundation
   // 'non_posting' subtype (IIF_TYPE_MAP NONPOSTING): they never carry amounts or reach reports.
   const typeOfPath = new Map<string, { type: string; subtype: string }>();
@@ -1160,14 +1186,24 @@ async function importIifAccounts(
     const displayPath = def?.name ?? key;
     if (lookup.byPath.has(key)) {
       if (def) {
+        const existing = lookup.byPath.get(key)!;
         counts.skipped++;
         counts.issues.push({
           entity: 'account',
           name: displayPath,
-          code: lookup.byPath.get(key)!.code,
+          code: existing.code,
           reason: 'duplicate',
           message: `Account "${displayPath}" already exists.`,
         });
+        const ob = def.obAmount ? parseIifAmount(def.obAmount) : null;
+        if (ob && !Money.isZero(ob)) {
+          if (!postOpeningBalances) unposted(displayPath, existing.code, ob, notOptedIn);
+          else {
+            const why = await postOpeningOnExisting(ctx, existing, ob, obDate);
+            if (why) unposted(displayPath, existing.code, ob, why);
+            else postedOpeningAccountIds.add(existing.id);
+          }
+        }
       }
       continue;
     }
@@ -1225,10 +1261,14 @@ async function importIifAccounts(
       // direction (credit-normal accounts flip the sign).
       const ob = def?.obAmount ? parseIifAmount(def.obAmount) : null;
       let row;
-      if (ob && !Money.isZero(ob)) {
+      if (ob && !Money.isZero(ob) && !postOpeningBalances) {
+        row = await createAccount(ctx, base);
+        unposted(displayPath, code, ob, notOptedIn);
+      } else if (ob && !Money.isZero(ob)) {
         const natural = t.type === 'asset' || t.type === 'expense' ? Money.of(ob) : Money.of(ob).negated();
         try {
           row = await createAccount(ctx, { ...base, openingBalance: toAmountString(natural), openingBalanceDate: obDate });
+          postedOpeningAccountIds.add(row.id);
         } catch (err) {
           if (!(err instanceof ServiceError)) throw err;
           row = await createAccount(ctx, base);
@@ -1269,6 +1309,62 @@ async function importIifAccounts(
       throw err;
     }
   }
+  return { postedOpeningAccountIds };
+}
+
+/**
+ * Post an IIF OBAMOUNT (debit-positive) as the opening balance of an account that already exists
+ * (e.g. one of the default chart's accounts the IIF account matched by name), against Opening
+ * Balance Equity — the same entry createAccount posts for a new account. Returns why it was NOT
+ * posted, or null when it was.
+ */
+async function postOpeningOnExisting(ctx: ServiceContext, acct: AccountRef, ob: string, date: Date): Promise<string | null> {
+  if (acct.subtype === 'accounts_receivable' || acct.subtype === 'accounts_payable') {
+    return "an Accounts Receivable / Payable balance must come from the customers' invoices or the vendors' bills (Migrate from QuickBooks, step 3).";
+  }
+  if (acct.subtype === 'non_posting') return 'a non-posting account cannot hold a balance.';
+  const [used] = await ctx.db
+    .select({ id: journalEntries.id })
+    .from(journalEntryLines)
+    .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+    .where(and(eq(journalEntries.companyId, ctx.companyId), eq(journalEntryLines.accountId, acct.id), ne(journalEntries.status, 'void')))
+    .limit(1);
+  if (used) return `"${acct.code} ${acct.name}" already has entries in Ironbooks, so its balance was left as it is.`;
+  const obe = await findOrCreateOpeningBalanceEquity(ctx);
+  if (obe.id === acct.id) return 'it is the Opening Balance Equity account itself (it takes the offset of the other balances).';
+  const amount = toAmountString(Money.of(ob).abs());
+  const debit = Money.of(ob).isPositive();
+  try {
+    await postJournalEntry(ctx, {
+      date,
+      description: `Opening balance for ${acct.code} ${acct.name}`,
+      status: 'posted',
+      sourceRef: `account:${acct.id}`,
+      lines: debit
+        ? [
+            { accountId: acct.id, debit: amount, memo: 'Opening balance' },
+            { accountId: obe.id, credit: amount, memo: 'Opening balance offset' },
+          ]
+        : [
+            { accountId: acct.id, credit: amount, memo: 'Opening balance' },
+            { accountId: obe.id, debit: amount, memo: 'Opening balance offset' },
+          ],
+    });
+  } catch (err) {
+    if (!(err instanceof ServiceError)) throw err;
+    return err.message;
+  }
+  return null;
+}
+
+/** Any posted General Ledger import (qbgl:) entry in this company? */
+async function hasGlImport(ctx: ServiceContext): Promise<boolean> {
+  const [row] = await ctx.db
+    .select({ id: journalEntries.id })
+    .from(journalEntries)
+    .where(and(eq(journalEntries.companyId, ctx.companyId), eq(journalEntries.status, 'posted'), like(journalEntries.sourceRef, 'qbgl:%')))
+    .limit(1);
+  return !!row;
 }
 
 /** Original-case segment name for an implicit parent path key. */
@@ -1512,6 +1608,21 @@ export interface ImportIifOptions {
    * account and the control-account balances do not change.
    */
   openItems?: { asDocuments: boolean; alreadyInGl?: boolean };
+  /**
+   * Post each account's OBAMOUNT as an opening balance against Opening Balance Equity.
+   * QuickBooks' File > Export > Lists to IIF writes every balance-sheet account's CURRENT balance
+   * into OBAMOUNT, so for a list-only file (no TRNS rows) this is OFF by default: following it with
+   * the General Ledger import would count every balance twice. Default: on only when the file
+   * also carries transactions (a hand-built conversion file whose OBAMOUNTs open those
+   * transactions) and no General Ledger import is in the books. `true` is refused when a General
+   * Ledger import is already in the books. Every OBAMOUNT not posted is reported as an issue note.
+   */
+  postOpeningBalances?: boolean;
+  /**
+   * Date of those opening balances (YYYY-MM-DD or a Date) — for a list export, the day the
+   * balances are as of. Default: the day before the file's first transaction, else today.
+   */
+  openingBalanceDate?: string | Date;
 }
 
 /**
@@ -1539,17 +1650,59 @@ async function importIIFRows(
   const counts = emptyCounts();
 
   // ---- Accounts (full hierarchy) ----
+  // OBAMOUNT: QuickBooks' list export writes each account's CURRENT balance there, so a list-only
+  // file posts none of them unless the user asked for it (ImportIifOptions.postOpeningBalances),
+  // and never on top of a General Ledger import, which already holds every balance.
+  const glImported = await hasGlImport(ctx);
+  const obTotal = parsed.accounts.filter((a) => {
+    const ob = parseIifAmount(a.obAmount);
+    return !!ob && !Money.isZero(ob);
+  }).length;
+  if (opts.postOpeningBalances === true && glImported && obTotal > 0) {
+    throw new ServiceError(
+      'VALIDATION',
+      'Account balances from this file can\'t be posted: a General Ledger import is already in the books and holds every account\'s balance, so they would be counted twice. Import the file without "Post account balances from this file".',
+    );
+  }
+  // Our own list export writes each account's opening-balance ENTRY into OBAMOUNT (and leaves it
+  // out of the journal export), so those post by default.
+  const ownExport = /^ironbooks$/i.test(parsed.producer ?? '');
+  const postOpening =
+    !glImported && (opts.postOpeningBalances ?? (parsed.transactions.length > 0 || ownExport));
   const lookup = await loadAccountLookup(ctx);
-  // Opening balances (OBAMOUNT) are dated the day before the file's first transaction (QB has no
-  // opening-balance date in the IIF), or today when the file has no transactions.
+  // Opening balances (OBAMOUNT) are dated as the user chose, else the day before the file's first
+  // transaction (QB has no opening-balance date in the IIF), or today when it has none.
   // (A loop, not Math.min(...dates): spreading 150,000 dates as arguments overflows the stack.)
   let firstTxn: number | null = null;
   for (const t of parsed.transactions) {
     const d = parseIifDate(t.date)?.getTime();
     if (d !== undefined && (firstTxn === null || d < firstTxn)) firstTxn = d;
   }
-  const obDate = firstTxn !== null ? new Date(firstTxn - 86_400_000) : await companyToday(ctx);
-  await importIifAccounts(ctx, counts, parsed.accounts, lookup, obDate);
+  let obDate: Date;
+  if (opts.openingBalanceDate) {
+    const raw = opts.openingBalanceDate;
+    const d =
+      raw instanceof Date ? raw : /^\d{4}-\d{2}-\d{2}$/.test(raw) ? new Date(`${raw}T00:00:00.000Z`) : null;
+    if (!d || Number.isNaN(d.getTime())) {
+      throw new ServiceError('VALIDATION', 'The opening balance date must be a date (YYYY-MM-DD).');
+    }
+    obDate = d;
+  } else {
+    obDate = firstTxn !== null ? new Date(firstTxn - 86_400_000) : await companyToday(ctx);
+  }
+  const { postedOpeningAccountIds } = await importIifAccounts(ctx, counts, parsed.accounts, lookup, obDate, postOpening);
+  if (!postOpening && obTotal > 0) {
+    counts.issues.unshift({
+      entity: 'list',
+      name: 'Account balances (OBAMOUNT)',
+      reason: 'note',
+      message:
+        `${obTotal} account balance(s) in this file were NOT posted. QuickBooks' "Export Lists to IIF" writes each account's current balance, ` +
+        (glImported
+          ? 'and your General Ledger import already holds those balances.'
+          : 'which the General Ledger import (step 2) brings in with the full history. If you are not importing the General Ledger, import this file again with "Post account balances from this file" ticked and the date the balances are as of.'),
+    });
+  }
 
   // ---- Classes ("Parent:Sub") ----
   const classIdByPath = await importIifClasses(ctx, counts, parsed.classes);
@@ -1567,7 +1720,14 @@ async function importIIFRows(
   // Inventory asset accounts whose balance this file already brings in (opening balance or
   // transactions), or a General Ledger import already brought: item QNTY on those accounts is
   // not posted again (it would double the stock).
+  // Only an OBAMOUNT that was actually POSTED counts: one left out (list export, not opted in)
+  // leaves the asset account without that balance, so the item quantities post it.
   const carriedAccountIds = await glImportedAssetAccountIds(ctx);
+  for (const id of postedOpeningAccountIds) carriedAccountIds.add(id);
+  // An account with a QuickBooks balance in this file is carried whether or not that balance is
+  // posted here: when it isn't, the balance comes from the General Ledger or Trial Balance import
+  // (the documented order is lists first, then the GL). Posting the item quantities' stock entry
+  // on it as well doubled the inventory once the GL arrived, and the GL import then refused.
   for (const a of parsed.accounts) {
     const ob = parseIifAmount(a.obAmount);
     if (!ob || Money.of(ob).isZero()) continue;
@@ -2022,8 +2182,18 @@ async function importIifEmployees(ctx: ServiceContext, counts: ImportCounts, row
 // Items
 // ---------------------------------------------------------------------------
 
-/** Map a QuickBooks INVITEMTYPE / CSV type value to our item type enum. */
-export function mapIifItemType(raw: string | undefined): ItemType {
+/**
+ * Map a QuickBooks INVITEMTYPE / CSV type value to our item type enum.
+ *
+ * QuickBooks Desktop's IIF codes: INVENTORY = Inventory Part, PART = NON-inventory Part,
+ * ASSEMBLY = Inventory Assembly. Older Ironbooks exports wrote inventory items as PART, so a PART
+ * row that carries inventory data (an asset account, a quantity on hand or a stock value — pass
+ * them in `stock`) is still read as an inventory item.
+ */
+export function mapIifItemType(
+  raw: string | undefined,
+  stock?: { assetAccount?: string | null; quantityOnHand?: string | null; totalValue?: string | null },
+): ItemType {
   const k = (raw ?? '').trim().toUpperCase().replace(/[\s_-]/g, '');
   if (!k) return 'service';
   if (k === 'SERVICE' || k === 'SERV') return 'service';
@@ -2036,8 +2206,17 @@ export function mapIifItemType(raw: string | undefined): ItemType {
     return 'sales_tax';
   }
   if (k.startsWith('NONINV') || k === 'NONINVENTORY') return 'non_inventory';
+  if (k === 'PART') {
+    const nonZero = (v: string | null | undefined) => {
+      const a = parseIifAmount(v ?? undefined);
+      return !!a && !Money.isZero(a);
+    };
+    return stock && (stock.assetAccount?.trim() || nonZero(stock.quantityOnHand) || nonZero(stock.totalValue))
+      ? 'inventory'
+      : 'non_inventory';
+  }
   if (
-    k === 'PART' || k === 'INVPART' || k === 'INVENTORY' || k === 'INVENTORYPART' || k === 'STOCK' ||
+    k === 'INVPART' || k === 'INVENTORY' || k === 'INVENTORYPART' || k === 'STOCK' ||
     k === 'ASSEMBLY' || k === 'INVASSY' || k === 'INVENTORYASSEMBLY' || k === 'ASSY' || k === 'INVASSEMBLY'
   ) {
     return 'inventory';
@@ -2067,7 +2246,7 @@ async function importIifItems(
 ) {
   const rates = await nameMap(ctx, taxRates);
   for (const item of rows) {
-    const type = mapIifItemType(item.itemType);
+    const type = mapIifItemType(item.itemType, item);
     const pct = percentOf(item.price);
     let salesPrice = pct ? null : parseIifAmount(item.price);
     let purchaseCost = parseIifAmount(item.cost);
@@ -3093,7 +3272,11 @@ async function importItemRows(ctx: ServiceContext, rows: Row[], mapping: ItemsCs
       ...(taxable ? { taxable: yes(taxable) } : {}),
       name,
       sku: col('sku', row) || null,
-      type: mapIifItemType(col('type', row)),
+      type: mapIifItemType(col('type', row), {
+        assetAccount: col('assetAccount', row),
+        quantityOnHand: col('quantityOnHand', row),
+        totalValue: col('totalValue', row),
+      }),
       description: col('description', row) || null,
       salesPrice,
       purchaseCost,

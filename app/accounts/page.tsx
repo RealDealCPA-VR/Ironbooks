@@ -50,6 +50,13 @@ import {
 /** QB View Balance: the server blanked this account's balance for the signed-in role. */
 const balanceHidden = (a: unknown) => Boolean((a as { balanceHidden?: boolean }).balanceHidden);
 
+/**
+ * QB Desktop leaves the Balance column blank for income, cost of goods sold, expense, other
+ * income and other expense accounts (and their totals): the cached figure is a lifetime total
+ * that matches no report. Their activity is on the Profit & Loss / QuickReport.
+ */
+const isProfitAndLoss = (a: { type?: string | null }) => a.type === 'revenue' || a.type === 'expense';
+
 // ---- Types ----------------------------------------------------------------
 
 /** Node shape returned by GET /api/accounts?tree=true (getAccountTree). */
@@ -306,7 +313,7 @@ function AccountRow({ node, depth, onDeactivate, onReactivate, onEdit }: Account
           )}
         </Td>
         <Td numeric className="font-semibold text-navy">
-          {balanceHidden(node) ? (
+          {isProfitAndLoss(node) ? null : balanceHidden(node) ? (
             <span className="font-normal text-navy/40" title={HIDDEN_BALANCE_TITLE}>Hidden</span>
           ) : (
           <div className="inline-flex items-center gap-1">
@@ -319,7 +326,7 @@ function AccountRow({ node, depth, onDeactivate, onReactivate, onEdit }: Account
             />
           </div>
           )}
-          {hasChildren && !balanceHidden(node) && (
+          {hasChildren && !balanceHidden(node) && !isProfitAndLoss(node) && (
             <div className="text-xs font-normal text-navy/50">
               Total {formatCurrency(rolledUp)}
             </div>
@@ -397,7 +404,7 @@ function AccountGroup({ type, roots, onDeactivate, onReactivate, onEdit }: Accou
           )}
         </span>
         <span className="text-sm font-semibold text-navy/60 tabular-nums">
-          {all.some(balanceHidden) ? 'Hidden' : formatCurrency(total)}
+          {isProfitAndLoss({ type: info.baseType }) ? '' : all.some(balanceHidden) ? 'Hidden' : formatCurrency(total)}
         </span>
         <Badge tone="info">{all.length}</Badge>
       </button>

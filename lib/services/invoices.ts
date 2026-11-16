@@ -459,7 +459,12 @@ async function invoicePaymentDepositOf(ctx: ServiceContext, invoiceId: string) {
 async function retainageGuard(
   tx: ServiceContext,
   customerIds: string[],
-  touched: { held: Array<string | null | undefined>; lineAccountIds: Array<string | null | undefined> },
+  touched: {
+    held: Array<string | null | undefined>;
+    lineAccountIds: Array<string | null | undefined>;
+    /** The document's date: retainage billed then can't exceed what was held by that day either. */
+    asOf?: Date | null;
+  },
 ): Promise<() => Promise<void>> {
   const none = async () => {};
   const [ret] = await tx.db
@@ -472,18 +477,21 @@ async function retainageGuard(
   // Imported lazily: retainage.ts imports this module (createInvoice).
   const { retainageReport } = await import('./retainage');
   const ids = [...new Set(customerIds)];
-  const openOf = async (customerId: string) =>
-    Money.of((await retainageReport(tx, { customerId })).rows[0]?.open ?? '0');
+  const openOf = async (customerId: string, asOf?: Date | null) =>
+    Money.of((await retainageReport(tx, { customerId, asOf: asOf ?? null })).rows[0]?.open ?? '0');
+  // All time, and as of the document's date: a release dated before the invoice that held the
+  // retainage passed the all-time check and left the customer's retainage negative in between.
+  const when: Array<Date | null> = touched.asOf ? [null, touched.asOf] : [null];
   const before = new Map<string, ReturnType<typeof Money.zero>>();
   for (const customerId of ids) {
     // Same lock as billRetainage / voidInvoice, so a release and this change cannot interleave.
     await tx.db.execute(sql`SELECT pg_advisory_xact_lock(hashtext(${`retainage:${tx.companyId}:${customerId}`}))`);
-    before.set(customerId, await openOf(customerId));
+    for (const [i, d] of when.entries()) before.set(`${customerId}|${i}`, await openOf(customerId, d));
   }
   return async () => {
-    for (const customerId of ids) {
-      const open = await openOf(customerId);
-      if (open.lessThan(0) && open.lessThan(before.get(customerId)!)) {
+    for (const customerId of ids) for (const [i, d] of when.entries()) {
+      const open = await openOf(customerId, d);
+      if (open.lessThan(0) && open.lessThan(before.get(`${customerId}|${i}`)!)) {
         throw new ServiceError(
           'CONFLICT',
           `This would bill ${toAmountString(open.negated())} more retainage than this customer's invoices still hold, which would leave Retainage Receivable below zero. Reduce or void the retainage billing invoice first.`,
@@ -1677,7 +1685,7 @@ export async function createInvoice(ctx: ServiceContext, input: CreateInvoiceInp
     // A hand-typed line on Retainage Receivable bills retainage: no more than is held.
     const checkRetainage = isDraft
       ? async () => {}
-      : await retainageGuard(tx, [input.customerId], { held: [], lineAccountIds: prep.computedLines.map((l) => l.accountId) });
+      : await retainageGuard(tx, [input.customerId], { held: [], lineAccountIds: prep.computedLines.map((l) => l.accountId), asOf: input.date });
 
     const { refNumber, number: invoiceNumber } = await allocateDocNumber(tx, 'invoice', input.refNumber, {
       allowDuplicate: input.allowDuplicateNumber === true,
@@ -2636,6 +2644,7 @@ export async function updateInvoice(ctx: ServiceContext, id: string, input: Crea
     const checkRetainage = await retainageGuard(tx, [invoice.customerId, input.customerId], {
       held: [invoice.retainageAmount],
       lineAccountIds: [...oldLines.map((l) => l.accountId), ...prep.computedLines.map((l) => l.accountId)],
+      asOf: input.date,
     });
 
     // 1) Void the original A/R journal entry (assertPeriodOpen runs on its date).

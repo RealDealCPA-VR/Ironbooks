@@ -218,6 +218,21 @@ function statusLabel(status: Bill['status']): string {
 // Empty line factory
 // ---------------------------------------------------------------------------
 
+/** Nothing entered on the line (Enter on the last line adds one): it is not validated or saved. */
+function isBlankLine(l: LineRow): boolean {
+  return (
+    !l.accountId &&
+    !l.itemId &&
+    !l.amount.trim() &&
+    !l.quantity.trim() &&
+    !String(l.unitCost ?? '').trim() &&
+    !l.description.trim() &&
+    !l.classId &&
+    !l.customerId &&
+    !l.jobId
+  );
+}
+
 function emptyLine(mode: LineMode = 'expense'): LineRow {
   return {
     mode,
@@ -661,8 +676,11 @@ function BillsPageContent() {
       date: dateMessage(date, 'Bill date'),
       due: dateMessage(dueDate, 'Due date', { required: false, notBefore: date ? { value: date, what: 'the bill date' } : undefined }),
     };
+    const someFilled = lines.some((l) => !isBlankLine(l));
     lines.forEach((line, i) => {
       const n = i + 1;
+      // A blank line (Enter on the last line adds one) is left out, as in QuickBooks.
+      if (someFilled && isBlankLine(line)) return;
       if (line.mode === 'item') {
         entries[`line-${i}-item`] = requiredMessage(line.itemId, `Line ${n}: choose an item.`);
         entries[`line-${i}-qty`] = Number(line.quantity) > 0 ? null : `Line ${n}: the quantity must be more than zero.`;
@@ -680,7 +698,7 @@ function BillsPageContent() {
   const fieldErrors: FieldErrors = showErrors ? validateForm().errors : {};
 
   /** Copy a fix's changes (request-body paths) back onto the form. */
-  function applyToForm(patched: BillBody, fix: ErrorFix) {
+  function applyToForm(patched: BillBody, fix: ErrorFix, lineIdx: number[] = []) {
     for (const op of fix.patch ?? []) {
       const value = getPath(patched, op.path);
       if (op.path === 'date' && typeof value === 'string') setDate(value);
@@ -688,7 +706,8 @@ function BillsPageContent() {
       else {
         const lp = parseLinePath(op.path);
         if (lp?.collection === 'lines' && (lp.field === 'accountId' || lp.field === 'amount' || lp.field === 'classId')) {
-          updateLine(lp.index, { [lp.field]: typeof value === 'string' ? value : '' });
+          // Body line → form line (blank form lines are not sent).
+          updateLine(lineIdx[lp.index] ?? lp.index, { [lp.field]: typeof value === 'string' ? value : '' });
         }
       }
     }
@@ -723,6 +742,9 @@ function BillsPageContent() {
     // offers a "Keep it anyway" fix.
 
     {
+      // Blank lines are not sent; lineIdx maps each sent line back to its form line.
+      const kept = lines.map((l, i) => ({ l, i })).filter(({ l }) => !isBlankLine(l));
+      const lineIdx = kept.map(({ i }) => i);
       const payload: BillBody = {
         vendorId,
         billNumber: billNumber.trim() || undefined,
@@ -732,7 +754,7 @@ function BillsPageContent() {
         memo: memo.trim() || undefined,
         classId: classId || (editingId ? null : undefined),
         exchangeRate: selectedVendor?.currency && exchangeRate.trim() ? exchangeRate.trim() : undefined,
-        lines: lines.map((l) => {
+        lines: kept.map(({ l }) => {
           // Blank class = the bill's class (the service fills it in).
           const dims = {
             classId: l.classId || null,
@@ -763,7 +785,7 @@ function BillsPageContent() {
       const ctx = {
         payload,
         resubmit: send,
-        applyToForm,
+        applyToForm: (patched: BillBody, fix: ErrorFix) => applyToForm(patched, fix, lineIdx),
         fallback: editingId ? 'Failed to update bill.' : 'Failed to create bill.',
       };
       // Class tracking "warn when a transaction has no class" (lib/formPrefs.ts): offer fixes

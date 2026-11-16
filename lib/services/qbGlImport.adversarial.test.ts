@@ -648,7 +648,10 @@ describe('qbGlImport — adversarial QA', () => {
     const file = upload('gl.csv', glCsv(SAMPLE_GL));
     const preview = await previewGlImport(ctx, { file });
     const key = preview.accounts.find((a) => a.number === '62000')!.key;
-    const r = await runGlImport(ctx, { file, accounts: { [key]: { mapTo: rent.id } } });
+    const refused = await runGlImport(ctx, { file, accounts: { [key]: { mapTo: rent.id } } });
+    expect(refused.ok).toBe(false);
+    expect(refused.message).toMatch(/62000 Rent Expense 50\.00 \(manual journal entry: 50\.00\)/);
+    const r = await runGlImport(ctx, { file, accounts: { [key]: { mapTo: rent.id } }, acceptExistingEntries: true });
     expect([r.ok, r.message]).toEqual([true, r.message]);
     expect(r.proof.allMatch).toBe(true);
     expect(r.warnings.some((w) => /weren't part of this import/.test(w) && w.includes('62000'))).toBe(true);
