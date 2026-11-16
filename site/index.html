@@ -1,0 +1,507 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ironbooks: desktop accounting you own</title>
+  <meta name="description" content="Free, open-source desktop accounting for Windows. QuickBooks Desktop-style bookkeeping with no subscription: your company file stays on your PC, and the database refuses to let your books go out of balance.">
+  <meta name="theme-color" content="#081122">
+  <link rel="icon" type="image/png" sizes="32x32" href="assets/icon-32.png">
+  <link rel="icon" type="image/png" sizes="192x192" href="assets/icon-192.png">
+  <link rel="apple-touch-icon" href="assets/icon-180.png">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Ironbooks: desktop accounting you own">
+  <meta property="og:description" content="QuickBooks Desktop-style bookkeeping with no subscription. Free and open source. Your books stay on your PC.">
+  <meta property="og:image" content="https://realdealcpa-vr.github.io/Ironbooks/assets/og-image.png">
+  <meta property="og:url" content="https://realdealcpa-vr.github.io/Ironbooks/">
+  <meta name="twitter:card" content="summary_large_image">
+  <style>
+    :root {
+      --bg: #ffffff;
+      --bg-soft: #f5f7fa;
+      --card: #ffffff;
+      --text: #0d1526;
+      --text-2: #4a5568;
+      --text-3: #6b7689;
+      --line: #e3e8ef;
+      --accent: #0071e3;
+      --accent-hover: #0062c4;
+      --accent-soft: #e8f1fd;
+      --good: #1f8a3d;
+      --bad: #c4302b;
+      --navy: #081122;
+      --navy-2: #0e1f3d;
+      --radius: 14px;
+      --shadow: 0 1px 2px rgba(13, 21, 38, .05), 0 8px 24px rgba(13, 21, 38, .06);
+      --font: "Segoe UI Variable Text", "Segoe UI", -apple-system, BlinkMacSystemFont, "Inter", "Helvetica Neue", Arial, sans-serif;
+      --font-display: "Segoe UI Variable Display", "Segoe UI", -apple-system, BlinkMacSystemFont, "Inter", "Helvetica Neue", Arial, sans-serif;
+      color-scheme: light;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0b1220;
+        --bg-soft: #0f1829;
+        --card: #121d31;
+        --text: #eef2f8;
+        --text-2: #b4bfd0;
+        --text-3: #8592a8;
+        --line: #213049;
+        --accent: #3b9bff;
+        --accent-hover: #63b0ff;
+        --accent-soft: #11294a;
+        --good: #4cc26b;
+        --bad: #ff6b63;
+        --shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 8px 24px rgba(0, 0, 0, .25);
+        color-scheme: dark;
+      }
+    }
+
+    *, *::before, *::after { box-sizing: border-box; }
+    html { scroll-behavior: smooth; -webkit-text-size-adjust: 100%; }
+    @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 17px/1.6 var(--font);
+      -webkit-font-smoothing: antialiased;
+    }
+    img { max-width: 100%; display: block; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    :focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; border-radius: 6px; }
+    h1, h2, h3 { font-family: var(--font-display); line-height: 1.15; margin: 0; letter-spacing: -0.02em; }
+    h2 { font-size: clamp(28px, 4vw, 40px); }
+    h3 { font-size: 19px; letter-spacing: -0.01em; }
+    p { margin: 0; }
+    .wrap { max-width: 1120px; margin: 0 auto; padding: 0 24px; }
+    @media (max-width: 480px) { .wrap { padding: 0 16px; } }
+    .skip { position: absolute; left: -9999px; }
+    .skip:focus { left: 16px; top: 16px; z-index: 10; background: var(--card); padding: 8px 12px; }
+
+    /* ---------- Buttons ---------- */
+    .btn {
+      display: inline-flex; align-items: center; justify-content: center; gap: 10px;
+      font: 600 16px/1 var(--font); padding: 15px 22px; border-radius: 12px;
+      border: 1px solid transparent; cursor: pointer; text-decoration: none !important;
+      transition: background-color .15s, border-color .15s, transform .15s;
+    }
+    .btn:active { transform: translateY(1px); }
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-primary:hover { background: var(--accent-hover); }
+    .btn-ghost { background: transparent; color: inherit; border-color: currentColor; opacity: .9; }
+    .btn-ghost:hover { opacity: 1; }
+    .btn-lg { font-size: 18px; padding: 18px 28px; border-radius: 14px; }
+    .btn svg { width: 20px; height: 20px; flex: none; }
+
+    /* ---------- Nav ---------- */
+    .nav { position: absolute; inset: 0 0 auto 0; z-index: 5; }
+    .nav .wrap { display: flex; align-items: center; justify-content: space-between; height: 72px; }
+    .brand { display: flex; align-items: center; gap: 10px; color: #fff; font: 600 19px var(--font-display); letter-spacing: -0.01em; }
+    .brand:hover { text-decoration: none; }
+    .brand img { width: 32px; height: 32px; }
+    .nav-links { display: flex; align-items: center; gap: 28px; }
+    .nav-links a { color: rgba(255, 255, 255, .78); font-size: 15px; }
+    .nav-links a:hover { color: #fff; text-decoration: none; }
+    .nav-links .btn { padding: 10px 16px; font-size: 14px; color: #fff; }
+    @media (max-width: 760px) { .nav-links a:not(.btn) { display: none; } }
+
+    /* ---------- Hero ---------- */
+    .hero {
+      position: relative; overflow: hidden; color: #fff;
+      background:
+        radial-gradient(900px 520px at 18% 10%, rgba(37, 109, 230, .45), transparent 65%),
+        radial-gradient(700px 500px at 95% 90%, rgba(20, 70, 160, .35), transparent 70%),
+        linear-gradient(180deg, var(--navy-2) 0%, var(--navy) 100%);
+      padding: 140px 0 96px;
+    }
+    .hero-grid { display: grid; grid-template-columns: 1.15fr .85fr; gap: 56px; align-items: center; }
+    @media (max-width: 920px) { .hero-grid { grid-template-columns: 1fr; gap: 48px; } }
+    .eyebrow {
+      display: inline-flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600;
+      color: #9cc6ff; background: rgba(59, 155, 255, .12); border: 1px solid rgba(110, 175, 255, .25);
+      padding: 6px 12px; border-radius: 999px; margin-bottom: 22px;
+    }
+    .hero h1 { font-size: clamp(40px, 6.4vw, 68px); font-weight: 700; letter-spacing: -0.035em; }
+    .hero h1 span { background: linear-gradient(90deg, #d9e4f5, #8fbcff); -webkit-background-clip: text; background-clip: text; color: transparent; }
+    .lede { margin-top: 22px; font-size: clamp(18px, 2.1vw, 21px); line-height: 1.55; color: #c3cfe2; max-width: 600px; }
+    .cta-row { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 34px; }
+    .hero .btn-primary { background: #0a84ff; box-shadow: 0 10px 30px rgba(10, 132, 255, .35); }
+    .hero .btn-primary:hover { background: #2a94ff; }
+    .hero .btn-ghost { color: #dfe8f6; border-color: rgba(223, 232, 246, .35); }
+    .dl-meta { margin-top: 14px; font-size: 14px; color: #8ea0bd; }
+    .dl-meta a { color: #b9d6ff; white-space: nowrap; }
+    .smartscreen { margin-top: 18px; font-size: 14px; color: #8ea0bd; max-width: 560px; }
+    .smartscreen strong { color: #c3cfe2; font-weight: 600; }
+    .os-note { display: none; margin-top: 14px; font-size: 14px; color: #ffd28a; }
+    .os-note a { color: #ffe3b3; text-decoration: underline; }
+
+    .art { position: relative; display: flex; flex-direction: column; align-items: center; }
+    .art-icon { width: 220px; height: 220px; margin-right: 110px; filter: drop-shadow(0 30px 60px rgba(10, 100, 255, .35)); }
+    .ledger {
+      position: relative; margin: -56px 0 0 110px; width: min(330px, 100%);
+      background: rgba(13, 24, 46, .82); border: 1px solid rgba(140, 180, 240, .2);
+      border-radius: 16px; padding: 16px 18px; backdrop-filter: blur(10px);
+      box-shadow: 0 24px 60px rgba(0, 0, 0, .45); font-size: 13px;
+    }
+    .ledger-head { display: flex; justify-content: space-between; color: #8ea0bd; margin-bottom: 10px; font-weight: 600; }
+    .ledger table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+    .ledger th { text-align: right; color: #7f91ad; font-weight: 500; padding: 0 0 6px; font-size: 12px; }
+    .ledger th:first-child { text-align: left; }
+    .ledger td { padding: 6px 0; border-top: 1px solid rgba(140, 180, 240, .12); color: #dbe5f3; text-align: right; }
+    .ledger td:first-child { text-align: left; color: #b8c6dc; }
+    .ledger tfoot td { font-weight: 700; color: #fff; border-top: 1px solid rgba(140, 180, 240, .35); }
+    .balanced { display: inline-flex; align-items: center; gap: 6px; margin-top: 10px; color: #6fe08f; font-weight: 600; }
+    .balanced svg { width: 16px; height: 16px; }
+    @media (max-width: 920px) { .art-icon { width: 160px; height: 160px; margin-right: 0; } .ledger { margin: -36px 0 0; } }
+
+    /* ---------- Sections ---------- */
+    section { padding: 96px 0; }
+    .soft { background: var(--bg-soft); }
+    .section-head { max-width: 720px; margin-bottom: 48px; }
+    .section-head p { margin-top: 14px; color: var(--text-2); font-size: 19px; }
+    .kicker { display: block; font-size: 14px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--accent); margin-bottom: 12px; }
+
+    .why { display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px; }
+    @media (max-width: 1000px) { .why { grid-template-columns: repeat(2, 1fr); } }
+    @media (max-width: 600px) { .why { grid-template-columns: 1fr; } }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 26px; box-shadow: var(--shadow); }
+    .card p { margin-top: 10px; color: var(--text-2); font-size: 16px; }
+    .icon-badge { width: 44px; height: 44px; border-radius: 12px; display: grid; place-items: center; background: var(--accent-soft); color: var(--accent); margin-bottom: 18px; }
+    .icon-badge svg { width: 22px; height: 22px; }
+
+    /* Comparison */
+    .table-scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius); background: var(--card); box-shadow: var(--shadow); }
+    .compare { width: 100%; min-width: 640px; border-collapse: collapse; font-size: 16px; }
+    .compare th, .compare td { padding: 14px 18px; border-bottom: 1px solid var(--line); text-align: center; }
+    .compare tr:last-child td { border-bottom: 0; }
+    .compare th { font-size: 14px; color: var(--text-2); font-weight: 600; background: var(--bg-soft); }
+    .compare th:first-child, .compare td:first-child { text-align: left; }
+    .compare .us { background: var(--accent-soft); color: var(--text); font-weight: 700; }
+    .yes, .compare .us.yes { color: var(--good); font-weight: 700; }
+    .no { color: var(--bad); font-weight: 700; }
+    .part { color: var(--text-3); }
+    .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+    /* Features */
+    .features { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }
+    @media (max-width: 960px) { .features { grid-template-columns: repeat(2, 1fr); } }
+    @media (max-width: 600px) { .features { grid-template-columns: 1fr; } }
+    .features ul { margin: 12px 0 0; padding-left: 18px; color: var(--text-2); font-size: 15.5px; }
+    .features li { margin: 4px 0; }
+
+    .extras { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px 40px; margin-top: 48px; }
+    @media (max-width: 760px) { .extras { grid-template-columns: 1fr; } }
+    .extra { display: flex; gap: 14px; }
+    .extra svg { flex: none; width: 22px; height: 22px; color: var(--accent); margin-top: 3px; }
+    .extra p { color: var(--text-2); font-size: 16px; }
+    .extra strong { color: var(--text); }
+    kbd { font: 600 13px/1 var(--font); padding: 3px 6px; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 6px; background: var(--card); color: var(--text); }
+
+    /* Steps */
+    .steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; counter-reset: step; }
+    @media (max-width: 860px) { .steps { grid-template-columns: 1fr; } }
+    .step { position: relative; padding-top: 58px; }
+    .step::before {
+      counter-increment: step; content: counter(step);
+      position: absolute; top: 22px; left: 26px; width: 26px; height: 26px; border-radius: 50%;
+      display: grid; place-items: center; font: 700 14px var(--font); background: var(--accent); color: #fff;
+    }
+    .note { margin-top: 24px; color: var(--text-2); }
+
+    /* AI */
+    .ai-grid { display: grid; grid-template-columns: .9fr 1.1fr; gap: 48px; align-items: start; }
+    @media (max-width: 900px) { .ai-grid { grid-template-columns: 1fr; } }
+    .ai-grid .section-head { margin-bottom: 0; }
+    .ai-rows { display: grid; gap: 14px; }
+    .ai-row { display: grid; grid-template-columns: 1fr auto; gap: 6px 16px; align-items: center; }
+    .ai-row h3 { font-size: 17px; }
+    .ai-row p { grid-column: 1 / -1; margin-top: 0; }
+    .pill { font-size: 13px; font-weight: 600; padding: 4px 10px; border-radius: 999px; white-space: nowrap; }
+    .pill-on { background: rgba(31, 138, 61, .12); color: var(--good); }
+    .pill-opt { background: var(--bg-soft); color: var(--text-2); border: 1px solid var(--line); }
+
+    /* Final CTA */
+    .final {
+      color: #fff; text-align: center;
+      background: radial-gradient(700px 400px at 50% 0%, rgba(37, 109, 230, .45), transparent 70%), var(--navy);
+    }
+    .final img { width: 88px; height: 88px; margin: 0 auto 24px; filter: drop-shadow(0 16px 40px rgba(10, 100, 255, .4)); }
+    .final p { color: #c3cfe2; margin: 14px auto 0; max-width: 560px; font-size: 19px; }
+    .final .cta-row { justify-content: center; }
+    .final .btn-primary { background: #0a84ff; }
+    .final .btn-primary:hover { background: #2a94ff; }
+    .final .btn-ghost { color: #dfe8f6; border-color: rgba(223, 232, 246, .35); }
+    .final .dl-meta { color: #8ea0bd; font-size: 14px; }
+
+    /* FAQ */
+    .faq { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
+    @media (max-width: 760px) { .faq { grid-template-columns: 1fr; } }
+    details { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 0 22px; }
+    summary { cursor: pointer; list-style: none; padding: 18px 0; font-weight: 600; display: flex; justify-content: space-between; gap: 16px; }
+    summary::-webkit-details-marker { display: none; }
+    summary::after { content: "+"; color: var(--text-3); font-size: 22px; line-height: 1; }
+    details[open] summary::after { content: "\2212"; }
+    details p { padding-bottom: 18px; color: var(--text-2); font-size: 16px; }
+
+    footer { border-top: 1px solid var(--line); padding: 40px 0 56px; color: var(--text-3); font-size: 14px; }
+    .foot { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 20px; }
+    .foot nav { display: flex; flex-wrap: wrap; gap: 20px; }
+    .foot nav a { color: var(--text-2); }
+    .disclaimer { margin-top: 20px; max-width: 760px; }
+  </style>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+
+  <header class="nav">
+    <div class="wrap">
+      <a class="brand" href="#top" aria-label="Ironbooks home">
+        <img src="assets/icon-64.png" srcset="assets/icon-192.png 2x" alt="" width="32" height="32">
+        Ironbooks
+      </a>
+      <nav class="nav-links" aria-label="Main">
+        <a href="#features">Features</a>
+        <a href="#switch">Switching from QuickBooks</a>
+        <a href="#ai">AI</a>
+        <a href="https://github.com/RealDealCPA-VR/Ironbooks">GitHub</a>
+        <a class="btn btn-primary js-download" href="https://github.com/RealDealCPA-VR/Ironbooks/releases/latest">Download</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="hero" id="top">
+      <div class="wrap hero-grid">
+        <div>
+          <span class="eyebrow">Free and open source · MIT licensed</span>
+          <h1>Desktop accounting<br><span>you own.</span></h1>
+          <p class="lede">QuickBooks Desktop-style bookkeeping with no subscription. Your company file stays on your computer, and the database itself refuses to let your books go out of balance.</p>
+          <div class="cta-row">
+            <a class="btn btn-primary btn-lg js-download" href="https://github.com/RealDealCPA-VR/Ironbooks/releases/latest">
+              <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M3 5.1 10.4 4v7.2H3V5.1Zm0 13.8 7.4 1.1v-7.1H3v6Zm8.2 1.2L21 21.5v-8.6h-9.8v7.2Zm0-16.2v7.3H21V2.5l-9.8 1.4Z"/></svg>
+              Download for Windows
+            </a>
+            <a class="btn btn-ghost btn-lg" href="https://github.com/RealDealCPA-VR/Ironbooks">View on GitHub</a>
+          </div>
+          <p class="dl-meta"><span class="js-meta">Latest release · Windows 10 and 11 (64-bit)</span> · <a class="js-portable" href="https://github.com/RealDealCPA-VR/Ironbooks/releases/latest">Portable version</a> · <a href="https://github.com/RealDealCPA-VR/Ironbooks/releases">All releases</a></p>
+          <p class="os-note js-os-note">Ironbooks ships for Windows. On a Mac or Linux you can <a href="https://github.com/RealDealCPA-VR/Ironbooks#-quick-start">build it from source</a>.</p>
+          <p class="smartscreen">Installers aren't code-signed yet, so Windows may say <strong>"Windows protected your PC"</strong>. Choose <strong>More info → Run anyway</strong>. <a href="https://github.com/RealDealCPA-VR/Ironbooks#-code-signing-policy">Why?</a></p>
+        </div>
+        <div class="art" aria-hidden="true">
+          <img class="art-icon" src="assets/icon-256.png" alt="" width="220" height="220">
+          <div class="ledger">
+            <div class="ledger-head"><span>Journal entry</span><span>JE-1042</span></div>
+            <table>
+              <thead><tr><th>Account</th><th>Debit</th><th>Credit</th></tr></thead>
+              <tbody>
+                <tr><td>Office Supplies</td><td>420.00</td><td></td></tr>
+                <tr><td>Rent</td><td>2,500.00</td><td></td></tr>
+                <tr><td>Checking</td><td></td><td>2,920.00</td></tr>
+              </tbody>
+              <tfoot><tr><td>Total</td><td>2,920.00</td><td>2,920.00</td></tr></tfoot>
+            </table>
+            <div class="balanced"><svg viewBox="0 0 20 20" fill="currentColor"><path d="M10 18a8 8 0 1 0 0-16 8 8 0 0 0 0 16Zm3.7-9.3-4 4a1 1 0 0 1-1.4 0l-2-2a1 1 0 1 1 1.4-1.4L9 10.6l3.3-3.3a1 1 0 0 1 1.4 1.4Z"/></svg>Balanced, enforced by the database</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="why">
+      <div class="wrap">
+        <div class="section-head">
+          <span class="kicker">Why Ironbooks</span>
+          <h2>The third option between rising subscriptions and someone else's cloud.</h2>
+        </div>
+        <div class="why">
+          <article class="card">
+            <div class="icon-badge"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 1 1 8 0v3"/></svg></div>
+            <h3>Your books stay on your PC</h3>
+            <p>The company file is one file you own, like a .QBW. No account, no telemetry and no lock-in.</p>
+          </article>
+          <article class="card">
+            <div class="icon-badge"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v18M5 7h14M7 7l-3 7a3 3 0 0 0 6 0L7 7Zm10 0-3 7a3 3 0 0 0 6 0l-3-7Z"/></svg></div>
+            <h3>Unbalanced books are impossible</h3>
+            <p>Ledger rules run as database triggers. An unbalanced entry or an edit to a posted line is rejected, whatever tries it.</p>
+          </article>
+          <article class="card">
+            <div class="icon-badge"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="7" width="14" height="12" rx="3"/><path d="M12 3v4M9 12h.01M15 12h.01M9.5 16h5"/></svg></div>
+            <h3>AI on your hardware</h3>
+            <p>Local models categorize transactions, suggest entries for your approval and catch mistakes. Cloud AI is opt-in.</p>
+          </article>
+          <article class="card">
+            <div class="icon-badge"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 9h2M11 9h2M15 9h2M7 13h10"/></svg></div>
+            <h3>Feels like QuickBooks Desktop</h3>
+            <p>Built screen by screen from QuickBooks Desktop Enterprise, down to its keyboard shortcuts. Your bookkeeper already knows it.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="soft" id="compare">
+      <div class="wrap">
+        <div class="section-head">
+          <span class="kicker">At a glance</span>
+          <h2>How it compares</h2>
+        </div>
+        <div class="table-scroll">
+          <table class="compare">
+            <thead>
+              <tr><th scope="col"><span class="sr">Feature</span></th><th scope="col">QuickBooks Desktop Enterprise</th><th scope="col">Cloud accounting</th><th scope="col" class="us">Ironbooks</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Data stays on your machine</td><td class="yes">Yes</td><td class="no">No</td><td class="us yes">Yes</td></tr>
+              <tr><td>No subscription</td><td class="no">No</td><td class="no">No</td><td class="us yes">Yes</td></tr>
+              <tr><td>Open source</td><td class="no">No</td><td class="no">No</td><td class="us yes">Yes</td></tr>
+              <tr><td>Ledger balance enforced by the database</td><td class="no">No</td><td class="part">Varies</td><td class="us yes">Yes</td></tr>
+              <tr><td>AI on your own hardware</td><td class="no">No</td><td class="no">No</td><td class="us yes">Yes</td></tr>
+              <tr><td>Tamper-evident transaction log</td><td class="part">Partial</td><td class="no">No</td><td class="us yes">Yes</td></tr>
+              <tr><td>Imports a QuickBooks General Ledger from PDF, Excel or CSV</td><td class="no">No</td><td class="part">Partial</td><td class="us yes">Yes</td></tr>
+              <tr><td>Multi-user</td><td class="yes">Yes</td><td class="yes">Yes</td><td class="us yes">Yes</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="features">
+      <div class="wrap">
+        <div class="section-head">
+          <span class="kicker">What you get</span>
+          <h2>Everything a small business and its accountant use, in one app.</h2>
+          <p>From the first invoice to year-end close, with the reports and accountant tools QuickBooks Desktop users expect.</p>
+        </div>
+        <div class="features">
+          <article class="card"><h3>Rock-solid ledger</h3><ul><li>Every QuickBooks account type, sub-accounts and tax lines</li><li>A/R and A/P always tie to aging</li><li>Closing date and password, audit trail, integrity check</li></ul></article>
+          <article class="card"><h3>Sales &amp; receivables</h3><ul><li>Estimates, sales orders and invoices with retainage</li><li>Receive Payments with discounts and credits</li><li>Statements, batch invoicing, Collections Center</li></ul></article>
+          <article class="card"><h3>Purchases &amp; payables</h3><ul><li>Purchase orders, item receipts and bills</li><li>Pay Bills, check printing with printer alignment</li><li>Vendor credits, Loan Manager, multi-currency</li></ul></article>
+          <article class="card"><h3>Banking</h3><ul><li>Registers you type into on any account</li><li>Statement import from PDF, scans, Excel, OFX and CSV</li><li>Reconciliation, with no bank connection ever</li></ul></article>
+          <article class="card"><h3>Inventory &amp; payroll</h3><ul><li>FIFO and average cost, assemblies, landed cost, sites</li><li>After-the-fact payroll with year-by-year tax limits</li><li>941, 940 and W-2 data</li></ul></article>
+          <article class="card"><h3>Accountant toolbox &amp; reports</h3><ul><li>Accountant Center, Working Trial Balance, Batch Enter</li><li>The standard report set with QuickZoom drill-down</li><li>Budgets, forecasts and multi-company reports</li></ul></article>
+        </div>
+
+        <div class="extras">
+          <div class="extra"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 5 5L20 7"/></svg><p><strong>A command bar that understands plain English.</strong> Press <kbd>Ctrl</kbd> <kbd>K</kbd> and type "invoice Acme 3 hours consulting". The form opens filled in for you to confirm.</p></div>
+          <div class="extra"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 5 5L20 7"/></svg><p><strong>Undo for 30 seconds</strong> after any save, void or delete, and "Why did this number change?" on report totals.</p></div>
+          <div class="extra"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 5 5L20 7"/></svg><p><strong>Bank rules that learn.</strong> Categorize the same payee twice and Ironbooks offers a rule.</p></div>
+          <div class="extra"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12 5 5L20 7"/></svg><p><strong>QuickBooks' keyboard shortcuts</strong>: <kbd>Ctrl</kbd> <kbd>W</kbd> Write Checks, <kbd>Ctrl</kbd> <kbd>I</kbd> Invoice, <kbd>Ctrl</kbd> <kbd>R</kbd> Register and the date keys you already use.</p></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="soft" id="switch">
+      <div class="wrap">
+        <div class="section-head">
+          <span class="kicker">Switching from QuickBooks</span>
+          <h2>Bring your history with you.</h2>
+        </div>
+        <div class="steps">
+          <article class="card step"><h3>Import your General Ledger</h3><p>From a QuickBooks GL report in PDF, Excel or CSV. It reconciles to the penny against the trial balance before anything is saved.</p></article>
+          <article class="card step"><h3>Import your lists</h3><p>Accounts, items, customers, vendors and employees come over from IIF files, with the account hierarchy intact.</p></article>
+          <article class="card step"><h3>Pick up open invoices and bills</h3><p>They arrive as real documents, so you can receive payments and pay bills on day one.</p></article>
+        </div>
+        <p class="note">Want out again? Lists and transactions export to IIF, CSV and Excel.</p>
+      </div>
+    </section>
+
+    <section id="ai">
+      <div class="wrap ai-grid">
+        <div class="section-head">
+          <span class="kicker">AI that stays home</span>
+          <h2>Use the AI you already have, or none at all.</h2>
+          <p>Sign in with your ChatGPT plan with no API key, or set up a free model on this computer in one click. The AI learns how you categorize, suggests entries for your approval and reviews the books for mistakes.</p>
+        </div>
+        <div class="ai-rows">
+          <div class="card ai-row"><h3>On this computer</h3><span class="pill pill-on">Default</span><p>Ollama, LM Studio or any OpenAI-compatible server. Nothing leaves your PC.</p></div>
+          <div class="card ai-row"><h3>On your office network</h3><span class="pill pill-on">Default</span><p>A model on your LAN or Tailscale network. Nothing leaves your own network.</p></div>
+          <div class="card ai-row"><h3>A cloud service</h3><span class="pill pill-opt">Opt-in per company</span><p>Only the question is sent, with names, SSNs, tax IDs and account numbers replaced. Never the company file.</p></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="final">
+      <div class="wrap">
+        <img src="assets/icon-192.png" alt="" width="88" height="88">
+        <h2>Take your books back.</h2>
+        <p>Free and open source, with updates built in.</p>
+        <div class="cta-row">
+          <a class="btn btn-primary btn-lg js-download" href="https://github.com/RealDealCPA-VR/Ironbooks/releases/latest">
+            <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M3 5.1 10.4 4v7.2H3V5.1Zm0 13.8 7.4 1.1v-7.1H3v6Zm8.2 1.2L21 21.5v-8.6h-9.8v7.2Zm0-16.2v7.3H21V2.5l-9.8 1.4Z"/></svg>
+            Download for Windows
+          </a>
+          <a class="btn btn-ghost btn-lg" href="https://github.com/RealDealCPA-VR/Ironbooks/releases/latest">Release notes</a>
+        </div>
+        <p class="dl-meta js-meta">Latest release · Windows 10 and 11 (64-bit)</p>
+      </div>
+    </section>
+
+    <section id="faq">
+      <div class="wrap">
+        <div class="section-head">
+          <span class="kicker">Good to know</span>
+          <h2>Questions</h2>
+        </div>
+        <div class="faq">
+          <details><summary>Is it really free?</summary><p>Yes. Ironbooks is open source under the MIT license. There is no subscription, no paid tier and no account to create.</p></details>
+          <details><summary>What do I need to run it?</summary><p>A 64-bit Windows 10 or 11 PC. Use the installer, or the portable version if you'd rather not install anything. On a Mac or Linux you can build it from the source code.</p></details>
+          <details><summary>Why does Windows warn me when I install it?</summary><p>The installers aren't code-signed yet, so Windows SmartScreen doesn't recognize the publisher. Choose More info, then Run anyway. Every installer is built by GitHub Actions from the public source code.</p></details>
+          <details><summary>How do updates work?</summary><p>An installed copy checks for new versions and updates itself after asking you. You can turn update checks off in Privacy &amp; Network.</p></details>
+          <details><summary>Does anything leave my computer?</summary><p>Only what you turn on. Update checks (the app version and platform) are the one connection on by default. The privacy policy lists everything else and the switch for each.</p></details>
+          <details><summary>Can more than one person use the books?</summary><p>Yes. Ironbooks hosts the company file for your team over your office network or a Tailscale network, with users, roles and permissions.</p></details>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap">
+      <div class="foot">
+        <span>Ironbooks · MIT License</span>
+        <nav aria-label="Footer">
+          <a href="https://github.com/RealDealCPA-VR/Ironbooks">Source code</a>
+          <a href="https://github.com/RealDealCPA-VR/Ironbooks/releases">Releases</a>
+          <a href="https://github.com/RealDealCPA-VR/Ironbooks/blob/main/PRIVACY.md">Privacy</a>
+          <a href="https://github.com/RealDealCPA-VR/Ironbooks#-code-signing-policy">Code signing policy</a>
+          <a href="https://github.com/RealDealCPA-VR/Ironbooks/issues">Report a problem</a>
+        </nav>
+      </div>
+      <p class="disclaimer">Accounting, tax and payroll features, including tax tables and wage bases, are provided as-is. Check them against current regulations before filing. Ironbooks is open-source software, not professional accounting advice. QuickBooks is a trademark of Intuit Inc.; Ironbooks is not affiliated with Intuit.</p>
+    </div>
+  </footer>
+
+  <script>
+    // The download buttons point at the latest release page until the GitHub API names the
+    // installer; then they download it directly. Any failure (offline, rate limit) keeps the
+    // release page, which always lists the current files.
+    (function () {
+      var REPO = 'RealDealCPA-VR/Ironbooks';
+      var isWindows = /Windows/i.test(navigator.userAgent) || /Win/i.test(navigator.platform || '');
+      var isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+      if (!isWindows && !isMobile) {
+        document.querySelectorAll('.js-os-note').forEach(function (el) { el.style.display = 'block'; });
+      }
+      function mb(bytes) { return Math.round(bytes / 1e6) + ' MB'; }
+      fetch('https://api.github.com/repos/' + REPO + '/releases/latest', { headers: { Accept: 'application/vnd.github+json' } })
+        .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+        .then(function (rel) {
+          var assets = rel.assets || [];
+          var setup = assets.find(function (a) { return /^Ironbooks-Setup-[\d.]+\.exe$/i.test(a.name); });
+          var portable = assets.find(function (a) { return /^Ironbooks-[\d.]+\.exe$/i.test(a.name); });
+          var version = String(rel.tag_name || '').replace(/^v/, '');
+          if (setup) {
+            document.querySelectorAll('.js-download').forEach(function (a) { a.href = setup.browser_download_url; });
+          }
+          if (portable) {
+            document.querySelectorAll('.js-portable').forEach(function (a) { a.href = portable.browser_download_url; });
+          }
+          if (version) {
+            var date = rel.published_at ? new Date(rel.published_at).toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' }) : '';
+            var text = 'Version ' + version + (setup ? ' · ' + mb(setup.size) : '') + (date ? ' · ' + date : '') + ' · Windows 10 and 11 (64-bit)';
+            document.querySelectorAll('.js-meta').forEach(function (el) { el.textContent = text; });
+          }
+        })
+        .catch(function () { /* keep the release-page links */ });
+    })();
+  </script>
+</body>
+</html>

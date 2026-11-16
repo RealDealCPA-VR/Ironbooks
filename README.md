@@ -15,7 +15,7 @@ refuses to let your books go out of balance.**
 ![platforms](https://img.shields.io/badge/desktop-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
 ![stack](https://img.shields.io/badge/Next.js%2015%20%C2%B7%20Electron%20%C2%B7%20Postgres-black)
 
-[Download](https://github.com/RealDealCPA-VR/Ironbooks/releases/latest) · [Why](#-why-ironbooks) · [Features](#-what-you-get) · [Switching from QuickBooks](#-switching-from-quickbooks) · [AI](#-ai-that-stays-home) · [Quick start](#-quick-start) · [Roadmap](#-roadmap) · [Code signing policy](#-code-signing-policy)
+[Website](https://realdealcpa-vr.github.io/Ironbooks/) · [Download](https://github.com/RealDealCPA-VR/Ironbooks/releases/latest) · [Why](#-why-ironbooks) · [Features](#-what-you-get) · [Switching from QuickBooks](#-switching-from-quickbooks) · [AI](#-ai-that-stays-home) · [Quick start](#-quick-start) · [Roadmap](#-roadmap) · [Code signing policy](#-code-signing-policy)
 
 </div>
 
