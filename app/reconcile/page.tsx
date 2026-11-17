@@ -24,7 +24,7 @@ import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
 import { formatCurrency, Money } from '@/lib/money';
 import { canFinishReconciliation, reconcilesAsLiability, statementLineAmount } from '@/lib/reconcileRules';
-import { isBankAccount } from '@/lib/accountTypes';
+import { isBankAccount, isCreditCardAccount } from '@/lib/accountTypes';
 import { formatDate as fmtDate, todayISO } from '@/lib/dates';
 // cmdbar: "reconcile checking" opens this page with the account picked.
 import { usePrefill } from '@/lib/commands/usePrefill';
@@ -151,12 +151,24 @@ function differenceClose(difference: string): boolean {
 // Start Reconciliation form
 // ---------------------------------------------------------------------------
 
+/** A Bank or Credit Card account in the chart that has no bank-account record yet (QB reconciles them all). */
+interface UnlinkedGlAccount {
+  id: string;
+  code: string;
+  name: string;
+}
+
 function StartForm({
   bankAccounts,
+  unlinked,
+  onLinked,
   onStarted,
   onUndone,
 }: {
   bankAccounts: BankAccount[];
+  unlinked: UnlinkedGlAccount[];
+  /** A chart account was picked: its bank-account record now exists (reload the list). */
+  onLinked: () => Promise<void>;
   onStarted: (recon: Reconciliation) => void;
   onUndone: () => void;
 }) {
@@ -267,12 +279,38 @@ function StartForm({
           <Select
             id="recon-bank-account"
             value={bankAccountId}
-            onChange={(e) => setBankAccountId(e.target.value)}
+            onChange={async (e) => {
+              const value = e.target.value;
+              if (!value.startsWith('gl:')) {
+                setBankAccountId(value);
+                return;
+              }
+              // A chart account with no bank-account record yet (a converted or new company file):
+              // link it now, as QuickBooks reconciles every Bank and Credit Card account directly.
+              const gl = unlinked.find((a) => `gl:${a.id}` === value);
+              if (!gl) return;
+              try {
+                const created = await api.post<{ id: string }>('/api/bank-accounts', {
+                  accountId: gl.id,
+                  bankName: gl.name,
+                  accountNumber: '',
+                });
+                await onLinked();
+                setBankAccountId(created.id);
+              } catch (err) {
+                toastError(err, 'Could not set up that account for reconciling.');
+              }
+            }}
           >
             <option value="">Select bank account…</option>
             {bankAccounts.map((ba) => (
               <option key={ba.id} value={ba.id}>
                 {ba.bankName} – {ba.glAccountCode} {ba.glAccountName}
+              </option>
+            ))}
+            {unlinked.map((a) => (
+              <option key={`gl:${a.id}`} value={`gl:${a.id}`}>
+                {a.code} {a.name}
               </option>
             ))}
           </Select>
@@ -1068,6 +1106,7 @@ function PastReconciliations({
 
 export default function ReconcilePage() {
   const [bankAccounts, setBankAccounts] = useState<BankAccount[]>([]);
+  const [unlinked, setUnlinked] = useState<UnlinkedGlAccount[]>([]);
   const [reconciliations, setReconciliations] = useState<Reconciliation[]>([]);
   const [activeRecon, setActiveRecon] = useState<Reconciliation | null>(null);
   const [loading, setLoading] = useState(true);
@@ -1075,11 +1114,22 @@ export default function ReconcilePage() {
   const loadData = useCallback(async () => {
     setLoading(true);
     try {
-      const [bas, recons] = await Promise.all([
+      const [bas, recons, chart] = await Promise.all([
         api.get<BankAccount[]>('/api/bank-accounts'),
         api.get<Reconciliation[]>('/api/reconciliations'),
+        api
+          .get<Array<{ id: string; code: string; name: string; type: string; subtype?: string | null; isActive?: boolean }>>('/api/accounts')
+          .catch(() => []),
       ]);
       setBankAccounts(bas);
+      // Bank and Credit Card accounts in the chart with no bank-account record yet: offered too.
+      const linked = new Set(bas.map((b) => b.accountId));
+      setUnlinked(
+        (Array.isArray(chart) ? chart : [])
+          .filter((a) => a.isActive !== false && !linked.has(a.id))
+          .filter((a) => isBankAccount({ type: a.type, subtype: a.subtype ?? null }) || isCreditCardAccount({ type: a.type, subtype: a.subtype ?? null }))
+          .map((a) => ({ id: a.id, code: a.code, name: a.name })),
+      );
       setReconciliations(recons);
       // Auto-resume if there is exactly one in-progress reconciliation (for the account named by
       // a ?account= deep link, when there is one).
@@ -1098,6 +1148,14 @@ export default function ReconcilePage() {
   useEffect(() => {
     loadData();
   }, [loadData]);
+
+  /** Re-read the bank-account records only (no page spinner, so the start form keeps its entries). */
+  async function refreshBankAccounts() {
+    const bas = await api.get<BankAccount[]>('/api/bank-accounts');
+    setBankAccounts(bas);
+    const linked = new Set(bas.map((b) => b.accountId));
+    setUnlinked((prev) => prev.filter((a) => !linked.has(a.id)));
+  }
 
   function handleStarted(recon: Reconciliation) {
     setReconciliations((prev) => [recon, ...prev]);
@@ -1137,6 +1195,8 @@ export default function ReconcilePage() {
         <div className="space-y-8">
           <StartForm
             bankAccounts={bankAccounts}
+            unlinked={unlinked}
+            onLinked={refreshBankAccounts}
             onStarted={handleStarted}
             onUndone={loadData}
           />
