@@ -365,7 +365,7 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
   },
   '/sandbox': {
     title: 'Try it on a copy',
-    what: 'Opens a throwaway copy of your whole company file so you can practise or test a change. Emails, bank feeds and automatic backups are off there.',
+    what: 'Opens a throwaway copy of your whole company file so you can practice or test a change. Emails, bank feeds and automatic backups are off there.',
     first: 'Click "Try it on a copy". When done, discard the copy or keep it as a training file.',
     qb: 'Sample / practice company file',
   },

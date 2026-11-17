@@ -224,7 +224,7 @@ export default function SignupPage() {
               {info?.singleFile && protect && (
                 <p className={`mt-1 text-xs ${weakAnswer ? 'text-red-600' : 'text-navy/50'}`}>
                   {weakAnswer
-                    ? `Use a longer answer: at least 10 characters, like a short phrase ("pip the grey cat"). Otherwise this answer can't get you back into the protected file if you forget the password.`
+                    ? `Use a longer answer: at least 10 characters, like a short phrase ("pip the gray cat"). Otherwise this answer can't get you back into the protected file if you forget the password.`
                     : CHALLENGE_SLOT_RULE_TEXT}
                 </p>
               )}

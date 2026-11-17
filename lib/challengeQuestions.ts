@@ -26,7 +26,7 @@ export function normalizeChallengeAnswer(answer: string): string {
  * In a company file protected with passwords, an answer also OPENS the encrypted file (its own key
  * slot) — and a copy of the file can be attacked offline, without any sign-in limit. So that slot
  * is only made for an answer of at least this many characters (after the case and spacing are
- * evened out) with some variety in it: a short phrase rather than one word ("pip the grey cat").
+ * evened out) with some variety in it: a short phrase rather than one word ("pip the gray cat").
  * A shorter answer still resets the password while the file is open; it just never opens the file.
  */
 export const MIN_CHALLENGE_SLOT_ANSWER = 10;
@@ -38,7 +38,7 @@ export function challengeAnswerOpensFile(answer: string): boolean {
 }
 
 /** What the challenge-question screens say about this in a protected company file. */
-export const CHALLENGE_SLOT_RULE_TEXT = `In a company file protected with passwords, an answer of at least ${MIN_CHALLENGE_SLOT_ANSWER} characters (a short phrase works well, like "pip the grey cat") also opens the file when you forget your password. A shorter answer still resets your password while the file is open on this or another computer, but it can't open the file by itself.`;
+export const CHALLENGE_SLOT_RULE_TEXT = `In a company file protected with passwords, an answer of at least ${MIN_CHALLENGE_SLOT_ANSWER} characters (a short phrase works well, like "pip the gray cat") also opens the file when you forget your password. A shorter answer still resets your password while the file is open on this or another computer, but it can't open the file by itself.`;
 
 export function isKnownChallengeQuestion(q: unknown): q is string {
   return typeof q === 'string' && (CHALLENGE_QUESTIONS as readonly string[]).includes(q);

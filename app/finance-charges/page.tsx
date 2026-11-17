@@ -208,7 +208,7 @@ export default function FinanceChargesPage() {
       <PageHeader title="Late-payment charges (finance charges)" icon={Percent} />
 
       {/* ---- Settings ---- */}
-      <Card className="mb-6">
+      <Card className="mb-6 p-6">
         <h2 className="mb-3 text-sm font-bold uppercase tracking-wide text-navy/60">
           Finance Charge Settings
         </h2>
@@ -270,7 +270,7 @@ export default function FinanceChargesPage() {
       </Card>
 
       {/* ---- Preview controls ---- */}
-      <Card className="mb-6">
+      <Card className="mb-6 p-6">
         <div className="flex flex-wrap items-end gap-4">
           <div>
             <Label htmlFor="asOf">Assessment Date</Label>

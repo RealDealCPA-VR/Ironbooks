@@ -701,7 +701,7 @@ export default function PayBillsPage() {
       <PageHeader title="Pay Bills" icon={HandCoins} />
 
       {/* Vendor + payment header */}
-      <Card className="mb-6">
+      <Card className="mb-6 p-6">
         <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-6 gap-4">
           <div className="lg:col-span-2">
             <Label htmlFor="pb-vendor" required>Vendor <Help term="ap" side="bottom" /></Label>

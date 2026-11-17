@@ -12,7 +12,7 @@
  * Print prints the report on screen; Download CSV saves it (needs the report's Print right).
  * Data: GET /api/users/permissions-report (lib/services/permissionReports.ts).
  */
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import { ArrowLeft, Download, FileText, Printer } from 'lucide-react';
 import { Badge, Button, Card, PageHeader, PageSkeleton, Table, Td, Th, Tr, toast } from '@/components/ui';
@@ -71,6 +71,29 @@ function errMsg(e: unknown) {
 
 const LEVEL_TONE: Record<Cell['level'], 'success' | 'info' | 'neutral'> = { Full: 'success', Partial: 'info', None: 'neutral' };
 
+/**
+ * The matrix's scroll area fills the window below where it starts, so its sideways scrollbar is
+ * on screen without scrolling the page (it sat below the window and the last columns looked cut
+ * off). Re-measured when the window is resized or what is above it changes.
+ */
+function useFitToWindow(deps: unknown[]) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [maxHeight, setMaxHeight] = useState<number | undefined>(undefined);
+  useLayoutEffect(() => {
+    function fit() {
+      const el = ref.current;
+      if (!el) return;
+      const top = el.getBoundingClientRect().top + window.scrollY;
+      setMaxHeight(Math.max(320, window.innerHeight - top - 24));
+    }
+    fit();
+    window.addEventListener('resize', fit);
+    return () => window.removeEventListener('resize', fit);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, deps);
+  return { ref, maxHeight };
+}
+
 export default function ViewPermissionsPage() {
   const [kind, setKind] = useState<Kind>('roles');
   const [roles, setRoles] = useState<Choice[]>([]);
@@ -80,6 +103,7 @@ export default function ViewPermissionsPage() {
   const [userRows, setUserRows] = useState<UserRow[] | null>(null);
   const [roleRows, setRoleRows] = useState<RoleRow[] | null>(null);
   const [onlyGranted, setOnlyGranted] = useState(true);
+  const matrixBox = useFitToWindow([matrix, kind, picked.length]);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
 
@@ -221,14 +245,22 @@ export default function ViewPermissionsPage() {
         <PageSkeleton />
       ) : kind === 'roles' || kind === 'users' ? (
         matrix && (
-          <Card className="p-0">
+          <Card className="p-0 overflow-hidden">
             <h2 className="px-4 pt-4 text-lg font-bold text-navy">{matrix.title}</h2>
-            <Table>
-              <thead>
+            {/* Its own scroll area, as tall as the window: the sideways scrollbar is always on screen
+                (at the bottom of the whole page it was out of sight and the last role columns looked
+                cut off). The header row and the activity column stay in place while it scrolls. */}
+            <div
+              ref={matrixBox.ref}
+              style={{ maxHeight: matrixBox.maxHeight }}
+              className="mt-2 overflow-auto print:!max-h-none print:overflow-visible"
+            >
+            <table className="w-full border-collapse">
+              <thead className="sticky top-0 z-20 bg-white">
                 <tr>
-                  <Th>Area and activity</Th>
+                  <Th className="sticky left-0 z-30 bg-white min-w-[220px]">Area and activity</Th>
                   {matrix.columns.map((c) => (
-                    <Th key={c.key}>
+                    <Th key={c.key} className="min-w-[130px]">
                       {c.name}
                       {c.detail && <span className="block font-normal text-navy/40">{c.detail}</span>}
                     </Th>
@@ -243,20 +275,20 @@ export default function ViewPermissionsPage() {
                     out.push(
                       <tr key={`a-${r.area}`}>
                         <td colSpan={matrix.columns.length + 1} className="bg-slate-50 px-4 py-1.5 text-xs font-bold uppercase tracking-wider text-navy/50">
-                          {r.areaLabel}
+                          <span className="sticky left-4 inline-block">{r.areaLabel}</span>
                         </td>
                       </tr>,
                     );
                   }
                   out.push(
                     <Tr key={r.activity}>
-                      <Td className="pl-8 text-sm">{r.label}</Td>
+                      <Td className="sticky left-0 z-10 bg-white pl-8 text-sm">{r.label}</Td>
                       {matrix.columns.map((c) => {
                         const cell = r.cells[c.key];
                         return (
-                          <Td key={c.key} className="text-sm">
+                          <Td key={c.key} className="text-sm align-top">
                             <Badge tone={LEVEL_TONE[cell.level]}>{cell.level}</Badge>
-                            {cell.level === 'Partial' && <span className="ml-1.5 text-xs text-navy/60">{cell.text}</span>}
+                            {cell.level === 'Partial' && <span className="mt-0.5 block text-xs text-navy/60">{cell.text}</span>}
                           </Td>
                         );
                       })}
@@ -266,12 +298,12 @@ export default function ViewPermissionsPage() {
                 })}
                 <tr>
                   <td colSpan={matrix.columns.length + 1} className="bg-slate-50 px-4 py-1.5 text-xs font-bold uppercase tracking-wider text-navy/50">
-                    Sensitive data
+                    <span className="sticky left-4 inline-block">Sensitive data</span>
                   </td>
                 </tr>
                 {matrix.flags.map((f) => (
                   <Tr key={f.key}>
-                    <Td className="pl-8 text-sm">{f.label}</Td>
+                    <Td className="sticky left-0 z-10 bg-white pl-8 text-sm">{f.label}</Td>
                     {matrix.columns.map((c) => (
                       <Td key={c.key} className="text-sm">
                         {f.cells[c.key] ? 'Yes' : 'No'}
@@ -280,7 +312,8 @@ export default function ViewPermissionsPage() {
                   </Tr>
                 ))}
               </tbody>
-            </Table>
+            </table>
+            </div>
           </Card>
         )
       ) : kind === 'user_list' ? (

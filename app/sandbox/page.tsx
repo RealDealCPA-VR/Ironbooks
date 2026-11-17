@@ -228,7 +228,7 @@ export default function SandboxPage() {
       {!banner?.active && (
         <>
           <Card className="p-6 mb-6">
-            <h2 className="text-lg font-bold text-navy">Practise or test a change without risk</h2>
+            <h2 className="text-lg font-bold text-navy">Practice or test a change without risk</h2>
             <p className="text-sm text-navy/70 mt-1">
               One click makes a complete copy of your company file (every company in it) and opens Ironbooks on the copy.
               An orange <strong>SANDBOX</strong> bar stays at the top of every page, and anything you print is stamped
