@@ -130,5 +130,17 @@ contextBridge.exposeInMainWorld('bookkeeper', {
         Array.isArray(items) ? items.map((f) => ({ label: String(f && f.label), route: String(f && f.route) })) : [],
       ),
   },
+  /**
+   * window.confirm / window.alert replacements (components/DesktopBridge.tsx installs them): the
+   * main process shows the message box and gives the keyboard back to the window. Chromium's own
+   * dialogs in Electron on Windows left the window refusing clicks and keystrokes until it was
+   * switched away from and back (a register "froze" after a save-time warning).
+   */
+  dialogs: {
+    confirm: (message) => ipcRenderer.sendSync('dialog:confirm-sync', String(message ?? '')),
+    alert: (message) => {
+      ipcRenderer.sendSync('dialog:alert-sync', String(message ?? ''));
+    },
+  },
   isDesktop: true,
 });

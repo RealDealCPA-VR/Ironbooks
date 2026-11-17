@@ -27,6 +27,7 @@ import {
 import { Help } from '@/components/Help';
 import { api } from '@/lib/client';
 import { useOpenParam } from '@/lib/useOpenParam';
+import { usePrefill } from '@/lib/commands/usePrefill';
 import MemorizeButton from '@/components/MemorizeButton';
 import { formatCurrency } from '@/lib/money';
 import { formatDate, todayISO } from '@/lib/dates';
@@ -95,6 +96,15 @@ interface MakeDepositModalProps {
   editing?: DepositEdit | null;
   /** QB's Previous / Next / Revert / Journal toolbar (components/TransactionNav.tsx). */
   nav?: React.ReactNode;
+  /** A NEW deposit opened filled in (a register's Splits button, lib/commands/prefill.ts). */
+  prefill?: DepositPrefill | null;
+}
+
+interface DepositPrefill {
+  depositAccountId?: string;
+  date?: string;
+  memo?: string;
+  lines: ExtraLine[];
 }
 
 function MakeDepositModal({
@@ -107,6 +117,7 @@ function MakeDepositModal({
   loadingItems,
   editing,
   nav = null,
+  prefill = null,
 }: MakeDepositModalProps) {
   // While editing, the items already on the deposit are selectable alongside the free ones.
   const allItems = editing
@@ -134,6 +145,9 @@ function MakeDepositModal({
   }, [open]);
   const [cashBackAccountId, setCashBackAccountId] = useState('');
   const [cashBackAmount, setCashBackAmount] = useState('');
+  // Cash back is tucked behind a link: with it always on screen, money being deposited was typed
+  // into it (it is SUBTRACTED from the deposit) and the deposit showed as a negative amount.
+  const [showCashBack, setShowCashBack] = useState(false);
   const [saving, setSaving] = useState(false);
   // Fix errors where they happen: server fix suggestions + inline field messages.
   const fixer = useErrorFixes<DepositBody>();
@@ -144,16 +158,34 @@ function MakeDepositModal({
     if (open) {
       // Editing keeps the deposit's own account; a new deposit starts on the Preferences default.
       const def = prefs.company.defaultDepositAccountId;
+      const pre = editing ? null : prefill;
       setDepositAccountId(
-        editing ? (editing.depositAccountId ?? '') : def && bankAccounts.some((a) => a.id === def) ? def : '',
+        editing
+          ? (editing.depositAccountId ?? '')
+          : pre?.depositAccountId && bankAccounts.some((a) => a.id === pre.depositAccountId)
+            ? pre.depositAccountId
+            : def && bankAccounts.some((a) => a.id === def)
+              ? def
+              : '',
       );
-      setDate(editing?.date ?? todayISO());
-      setMemo(editing?.memo ?? '');
+      setDate(editing?.date ?? pre?.date ?? todayISO());
+      setMemo(editing?.memo ?? pre?.memo ?? '');
       setSelectedIds(new Set(editing?.items.map((i) => i.id) ?? []));
       setMethodFilter('all');
-      setExtraLines(editing?.extraLines ?? []);
+      // A new deposit opens with one blank deposit line ready for the account and amount (as
+      // QuickBooks' Make Deposits grid); a blank line is not saved.
+      setExtraLines(
+        editing?.extraLines?.length
+          ? editing.extraLines
+          : editing
+            ? []
+            : pre?.lines.length
+              ? [...pre.lines, emptyExtraLine()]
+              : [emptyExtraLine()],
+      );
       setCashBackAccountId(editing?.cashBackAccountId ?? '');
       setCashBackAmount(editing?.cashBackAmount ?? '');
+      setShowCashBack(Boolean(editing?.cashBackAmount && Number(editing.cashBackAmount) !== 0));
       setFxRate('');
       fixer.clear();
       setShowErrors(false);
@@ -369,11 +401,11 @@ function MakeDepositModal({
           <Button variant="secondary" onClick={onClose} disabled={saving}>
             Cancel
           </Button>
-          <SaveAndNewButton disabled={saving || (selectedIds.size === 0 && extraLines.length === 0)} />
+          <SaveAndNewButton disabled={saving || (selectedIds.size === 0 && extraLines.every(isBlankExtraLine))} />
           <Button
             onClick={handleSubmit}
             loading={saving}
-            disabled={selectedIds.size === 0 && extraLines.length === 0}
+            disabled={selectedIds.size === 0 && extraLines.every(isBlankExtraLine)}
             title={`Deposit ${money(netTotal.toFixed(2))}`}
           >
             Save &amp; Close
@@ -554,7 +586,7 @@ function MakeDepositModal({
         {/* Additional deposit lines (e.g. owner contribution) */}
         <div>
           <div className="flex items-center justify-between mb-2">
-            <Label className="mb-0">Additional Deposit Lines</Label>
+            <Label className="mb-0">Deposit Lines</Label>
             <button
               type="button"
               onClick={() => setExtraLines((prev) => [...prev, emptyExtraLine()])}
@@ -565,7 +597,8 @@ function MakeDepositModal({
           </div>
           {extraLines.length === 0 ? (
             <p className="text-xs text-navy/40">
-              For funds not in Undeposited Funds — e.g. an owner contribution or refund.
+              Money you are depositing that isn&apos;t in Undeposited Funds: choose the account it came
+              from (an income account, an owner contribution, a refund) and the amount.
             </p>
           ) : (
             <div className="space-y-2" onKeyDown={extraGrid.onKeyDown}>
@@ -630,9 +663,21 @@ function MakeDepositModal({
           )}
         </div>
 
-        {/* Cash back */}
+        {/* Cash back (behind a link: it is subtracted from the deposit) */}
+        {!showCashBack ? (
+          <button
+            type="button"
+            onClick={() => setShowCashBack(true)}
+            className="text-xs text-electric font-semibold hover:text-electric/70 flex items-center gap-1"
+          >
+            <Plus className="h-3 w-3" /> Take cash back from this deposit
+          </button>
+        ) : (
         <div>
-          <Label className="mb-2">Cash Back (optional)</Label>
+          <Label className="mb-1">Cash Back (optional)</Label>
+          <p className="mb-2 text-xs text-navy/50">
+            Money you kept out of this deposit; it is subtracted. To deposit money, use a deposit line above.
+          </p>
           <div className="flex gap-2">
             <div className="flex-1 min-w-0">
               <Select
@@ -663,8 +708,9 @@ function MakeDepositModal({
           </div>
           <FieldError formId="dep" name="cashBackAccount" errors={fieldErrors} />
           <FieldError formId="dep" name="cashBackAmount" errors={fieldErrors} />
-          <FieldError formId="dep" name="total" errors={fieldErrors} />
         </div>
+        )}
+        <FieldError formId="dep" name="total" errors={fieldErrors} />
 
         {/* Live total */}
         {(selectedIds.size > 0 || extraTotal > 0 || cashBackNum > 0) && (
@@ -783,6 +829,24 @@ function DepositsPageContent() {
 
   // Quick Actions navigate here with ?new=1 — open the Make Deposit modal.
   useNewParam(openModal);
+  // A register's Splits button (or the command bar): a NEW deposit filled in, one line per split.
+  const [prefill, setPrefill] = useState<DepositPrefill | null>(null);
+  usePrefill(
+    'deposit',
+    (p) => {
+      setPrefill({
+        depositAccountId: p.paymentAccountId,
+        date: p.date,
+        memo: p.memo,
+        lines: p.lines
+          .filter((l) => l.accountId || l.amount)
+          .map((l) => ({ ...emptyExtraLine(), accountId: l.accountId ?? '', amount: l.amount ?? '', description: l.description ?? '' })),
+      });
+      setFormKey((k) => k + 1);
+      openModal();
+    },
+    !loading && accounts.length > 0,
+  );
   // Drill-downs (the transaction log) link here with ?focus=<id> — open that deposit.
   useFocusId(true, (id) => void openEdit(id));
 
@@ -961,9 +1025,11 @@ function DepositsPageContent() {
         onClose={() => {
           setShowModal(false);
           setEditing(null);
+          setPrefill(null);
         }}
         onCreated={handleCreated}
         editing={editing}
+        prefill={prefill}
         bankAccounts={bankAccounts}
         allAccounts={accounts}
         undepositedItems={undepositedItems}

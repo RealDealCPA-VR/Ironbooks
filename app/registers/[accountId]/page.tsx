@@ -26,10 +26,11 @@ import { SUBTYPE_LABELS } from '@/lib/accountTypes';
 import { Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useParams, useRouter, useSearchParams } from 'next/navigation';
-import { ArrowLeft, BookOpen, ChevronDown, Plus, Search } from 'lucide-react';
+import { ArrowLeft, Ban, BookOpen, ChevronDown, Plus, Search, Trash2 } from 'lucide-react';
 import {
   Button,
   Card,
+  ConfirmDialog,
   Input,
   Label,
   PageHeader,
@@ -37,6 +38,7 @@ import {
   Th,
   Td,
   toast,
+  toastError,
   useListKeys,
 } from '@/components/ui';
 import { setActiveListRow } from '@/lib/shortcuts';
@@ -285,6 +287,9 @@ function RegisterPageInner() {
   const [resultSearch, setResultSearch] = useState('');
   const [loading, setLoading] = useState(true);
   const [detailId, setDetailId] = useState<string | null>(null);
+  // QB register Edit > Void / Delete for one line's transaction.
+  const [removal, setRemoval] = useState<{ row: RegisterRow; action: 'void' | 'delete' } | null>(null);
+  const [removing, setRemoving] = useState(false);
   /** Show every row instead of the newest REGISTER_PAGE_ROWS (large registers open fast). */
   const [showAll, setShowAll] = useState(false);
 
@@ -485,6 +490,9 @@ function RegisterPageInner() {
                     <Th className="text-center" title="Cleared: ✔ reconciled, * cleared in a reconciliation in progress">{'✓'}</Th>
                     <Th numeric>Balance{fxCur ? ` (${fxCur})` : ''}</Th>
                     {fxCur && <Th numeric>Balance ({result.homeCurrency ?? 'home'})</Th>}
+                    <Th className="w-16">
+                      <span className="sr-only">Void or delete</span>
+                    </Th>
                   </tr>
                 </thead>
                 <tbody>
@@ -508,12 +516,13 @@ function RegisterPageInner() {
                         {fxCur ? bal(result.foreignOpeningBalance, fxCur) : bal(result.openingBalance)}
                       </Td>
                       {fxCur && <Td numeric className="text-navy/60">{bal(result.openingBalance)}</Td>}
+                      <Td />
                     </tr>
                   )}
 
                   {result.rows.length < result.totalRows && (
                     <tr>
-                      <Td colSpan={fxCur ? 11 : 10} className="py-2 text-center text-xs text-navy/60">
+                      <Td colSpan={fxCur ? 12 : 11} className="py-2 text-center text-xs text-navy/60">
                         Showing the latest {result.rows.length.toLocaleString('en-US')} of{' '}
                         {result.totalRows.toLocaleString('en-US')} transactions.{' '}
                         <button
@@ -536,7 +545,7 @@ function RegisterPageInner() {
 
                   {result.rows.length === 0 && (
                     <tr>
-                      <Td colSpan={fxCur ? 11 : 10} className="py-12 text-center text-navy/40">
+                      <Td colSpan={fxCur ? 12 : 11} className="py-12 text-center text-navy/40">
                         No transactions in this register for the selected filters.
                       </Td>
                     </tr>
@@ -600,6 +609,34 @@ function RegisterPageInner() {
                             {bal(row.runningBalance)}
                           </Td>
                         )}
+                        <Td className="whitespace-nowrap">
+                          <span className="inline-flex gap-0.5">
+                            <button
+                              type="button"
+                              title="Void this transaction (kept, amounts set to zero)"
+                              aria-label={`Void ${row.description}`}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setRemoval({ row, action: 'void' });
+                              }}
+                              className="rounded p-1 text-navy/30 hover:bg-slate-100 hover:text-navy"
+                            >
+                              <Ban className="h-3.5 w-3.5" />
+                            </button>
+                            <button
+                              type="button"
+                              title="Delete this transaction"
+                              aria-label={`Delete ${row.description}`}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setRemoval({ row, action: 'delete' });
+                              }}
+                              className="rounded p-1 text-navy/30 hover:bg-red-50 hover:text-red-600"
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </button>
+                          </span>
+                        </Td>
                       </tr>
                     );
                   })}
@@ -607,7 +644,7 @@ function RegisterPageInner() {
                     <RegisterEntryRow
                       register={result.account}
                       columns={config.columns}
-                      colSpanAfter={fxCur ? 3 : 2}
+                      colSpanAfter={fxCur ? 4 : 3}
                       onSaved={() => load(resultFrom, resultTo, resultSearch)}
                     />
                   )}
@@ -642,6 +679,37 @@ function RegisterPageInner() {
       </Card>
 
       <EntryDetailModal entryId={detailId} onClose={() => setDetailId(null)} />
+      <ConfirmDialog
+        open={removal !== null}
+        title={removal?.action === 'delete' ? 'Delete this transaction?' : 'Void this transaction?'}
+        message={
+          removal
+            ? removal.action === 'delete'
+              ? `${removal.row.description} on ${formatDate(removal.row.date)} will be deleted. General Journal entries can be deleted; checks, deposits, bills and other forms are voided instead so their history is kept (you'll be told if so). A reconciled transaction or one in a closed period can't be changed.`
+              : `${removal.row.description} on ${formatDate(removal.row.date)} will be voided: it stays in the register with its amounts set to zero. A reconciled transaction or one in a closed period can't be voided.`
+            : null
+        }
+        confirmLabel={removal?.action === 'delete' ? 'Delete' : 'Void'}
+        tone="danger"
+        loading={removing}
+        onConfirm={async () => {
+          if (!removal) return;
+          setRemoving(true);
+          try {
+            await api.del(
+              `/api/registers/${accountId}?entryId=${encodeURIComponent(removal.row.journalEntryId)}&action=${removal.action}`,
+            );
+            toast(removal.action === 'delete' ? 'Transaction deleted.' : 'Transaction voided.', 'success');
+            setRemoval(null);
+            await load(resultFrom, resultTo, resultSearch);
+          } catch (err) {
+            toastError(err, removal.action === 'delete' ? 'Could not delete the transaction.' : 'Could not void the transaction.');
+          } finally {
+            setRemoving(false);
+          }
+        }}
+        onClose={() => setRemoval(null)}
+      />
     </main>
   );
 }

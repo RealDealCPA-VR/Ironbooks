@@ -1,13 +1,13 @@
 /**
  * GET    /api/accounts/[id]  — fetch one account
  * PATCH  /api/accounts/[id]  — update mutable fields
- * DELETE /api/accounts/[id]  — soft-deactivate
+ * DELETE /api/accounts/[id]  — soft-deactivate (?permanent=1: delete an account that was never used)
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { balancesForContext } from '@/lib/services/access';
 import { expectedVersion, withVersionCheck } from '@/lib/services/concurrency';
-import { getAccount, updateAccount, deactivateAccount } from '@/lib/services/accounts';
+import { getAccount, updateAccount, deactivateAccount, deleteUnusedAccount } from '@/lib/services/accounts';
 import { ServiceError } from '@/lib/services/_base';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { updateAccountSchema } from '@/lib/validation/accounts';
@@ -55,6 +55,10 @@ export async function DELETE(req: NextRequest, { params }: RouteParams) {
   try {
     const { id } = await params;
     const ctx = await getServerContext();
+    // ?permanent=1: delete an account that was never used (refused with the reason otherwise).
+    if (req.nextUrl.searchParams.get('permanent') === '1') {
+      return NextResponse.json(await deleteUnusedAccount(ctx, id));
+    }
     return NextResponse.json(await withVersionCheck(ctx, 'account', id, expectedVersion(req), (c) => deactivateAccount(c, id)));
   } catch (err) {
     return errorResponse(err);

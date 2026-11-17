@@ -10,12 +10,14 @@ import { accessKeyParts } from '@/lib/shortcuts';
 export function AccessKeyText({ text, accessKey }: { text: string; accessKey: string }) {
   const parts = accessKeyParts(text, accessKey);
   if (!parts) return <>{text}</>;
+  // One element: inside a flex button with a gap (Previous / Next / Clear), three loose pieces
+  // were laid out as three items and read "P revious".
   return (
-    <>
+    <span>
       {parts.before}
       <u className="underline decoration-1 underline-offset-2">{parts.letter}</u>
       {parts.after}
-    </>
+    </span>
   );
 }
 

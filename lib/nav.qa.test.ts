@@ -72,7 +72,7 @@ describe('Simple and Advanced menus', () => {
               expect(hidden.has(l.path), `${r.key} ${mode} ${l.path}`).toBe(false);
             }
           }
-          if (mode === 'simple') expect(groups.flatMap((g) => g.links).length).toBeLessThanOrEqual(20);
+          if (mode === 'simple') expect(groups.flatMap((g) => g.links).length).toBeLessThanOrEqual(21);
         }
       }
     }

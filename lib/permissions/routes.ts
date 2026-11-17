@@ -486,7 +486,7 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/loans/what-if': r('banking', 'POST:view'), // purchbank F1: evaluate a new loan (nothing saved)
   '/api/banking/account-currency': r('accounting', 'POST:modify'),
   '/api/registers': r('banking', 'GET'),
-  '/api/registers/[accountId]': r('banking', 'GET POST'),
+  '/api/registers/[accountId]': r('banking', 'GET POST DELETE'),
 
   // ---- Sensitive accounting ----
   '/api/journal-entries': r('accounting', 'GET POST'),

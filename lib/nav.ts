@@ -272,6 +272,7 @@ export const simpleNavGroups: NavGroup[] = [
       { icon: Rss, label: 'Bank Feeds / Import', path: '/bank-feeds', qb: 'Bank Feeds', keywords: 'download import bank' },
       { icon: Scale, label: 'Reconcile', path: '/reconcile', qb: 'Reconcile', keywords: 'bank statement' },
       { icon: PiggyBank, label: 'Make Deposit', path: '/deposits', href: '/deposits?new=1', qb: 'Make Deposits', keywords: 'deposit' },
+      { icon: BookOpen, label: 'Registers', path: '/registers', qb: 'Use Register (Check Register)', keywords: 'check register ledger' },
     ],
   },
   {

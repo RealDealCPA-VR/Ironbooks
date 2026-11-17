@@ -33,7 +33,7 @@ describe('Needs attention in the menus', () => {
       expect(home.indexOf('/attention')).toBe(home.indexOf('/dashboard') + 1);
     }
     expect(fs.existsSync(path.resolve(process.cwd(), 'app', 'attention', 'page.tsx'))).toBe(true);
-    expect(links(simpleNavGroups).length).toBeLessThanOrEqual(20);
+    expect(links(simpleNavGroups).length).toBeLessThanOrEqual(21);
   });
 
   it('every member sees it (the list itself is filtered to what they can act on)', () => {

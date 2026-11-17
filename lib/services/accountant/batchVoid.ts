@@ -905,6 +905,42 @@ export async function batchVoidTransactions(
   return { results, succeeded, failed: results.length - succeeded, salesTaxFixesVoided };
 }
 
+/**
+ * A register's Void / Delete (QB register: Edit > Void / Delete): the transaction a journal entry
+ * belongs to (a check, a deposit, a bill payment, a journal entry...) is voided or deleted exactly
+ * as Batch Delete/Void does, with the same rights for its type and the same refusals (a reconciled
+ * line, a closed period, a document that must be voided rather than deleted).
+ */
+export async function voidOrDeleteEntryTransaction(
+  ctx: ServiceContext,
+  entryId: string,
+  action: 'void' | 'delete',
+): Promise<BatchVoidResult> {
+  const [entry] = await ctx.db
+    .select({ date: journalEntries.date, status: journalEntries.status })
+    .from(journalEntries)
+    .where(and(eq(journalEntries.companyId, ctx.companyId), eq(journalEntries.id, entryId)));
+  if (!entry) throw new ServiceError('NOT_FOUND', 'Transaction not found.');
+  if (entry.status === 'void') throw new ServiceError('CONFLICT', 'This transaction is already void.');
+  const day = new Date(entry.date).toISOString().slice(0, 10);
+  const rows = await listBatchTransactions(ctx, {
+    from: new Date(`${day}T00:00:00.000Z`),
+    to: new Date(`${day}T23:59:59.999Z`),
+    limit: 2000,
+  });
+  const row = rows.find((r) => r.entryId === entryId);
+  if (!row) {
+    throw new ServiceError(
+      'CONFLICT',
+      'This line belongs to another transaction (for example the cost of an invoice). Open that transaction and void it there.',
+    );
+  }
+  const res = await batchVoidTransactions(ctx, [row.key], { action });
+  const result = res.results[0];
+  if (!result?.ok) throw new ServiceError('CONFLICT', result?.error ?? `Could not ${action} this transaction.`);
+  return result;
+}
+
 // ---------------------------------------------------------------------------
 // Restore deleted transactions
 // ---------------------------------------------------------------------------

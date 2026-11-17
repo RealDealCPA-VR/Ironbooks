@@ -50,14 +50,14 @@ describe('Simple mode menu', () => {
     expect((PREFERENCE_FIELDS as Record<string, unknown>).navMode).toBeTruthy();
   });
 
-  it('shows 15-20 everyday tasks grouped like the QuickBooks Home page', () => {
+  it('shows 15-21 everyday tasks (Registers included) grouped like the QuickBooks Home page', () => {
     const all = links(simpleNavGroups);
     expect(all.length).toBeGreaterThanOrEqual(15);
-    expect(all.length).toBeLessThanOrEqual(20);
+    expect(all.length).toBeLessThanOrEqual(21);
     const byGroup = Object.fromEntries(simpleNavGroups.map((g) => [g.heading, g.links.map((l) => l.label)]));
     expect(byGroup.Customers).toEqual(['Create Invoice', 'Receive Payment', 'Customers']);
     expect(byGroup.Vendors).toEqual(['Enter Bill', 'Pay Bills', 'Vendors']);
-    expect(byGroup.Banking).toEqual(['Write Check', 'Bank Feeds / Import', 'Reconcile', 'Make Deposit']);
+    expect(byGroup.Banking).toEqual(['Write Check', 'Bank Feeds / Import', 'Reconcile', 'Make Deposit', 'Registers']);
     expect(byGroup.Employees).toEqual(['Run Payroll']);
     expect(byGroup.Reports).toEqual(['Profit & Loss', 'Balance Sheet', 'Report Center']);
     expect(byGroup.Company).toEqual(['Chart of Accounts', 'Items', 'Close the month']);

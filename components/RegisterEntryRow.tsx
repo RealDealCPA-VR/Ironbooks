@@ -24,6 +24,8 @@ import { api, ApiError } from '@/lib/client';
 import { todayISO } from '@/lib/dates';
 import { SUBTYPE_LABELS } from '@/lib/accountTypes';
 import { saveWithDuplicateCheck } from '@/lib/purchasesClient';
+import { useRouter } from 'next/navigation';
+import { PREFILL_EVENT, PREFILL_PATHS, stashPrefill, type FormPrefill } from '@/lib/commands/prefill';
 import {
   type TypeaheadChoice,
   type TypeaheadOption,
@@ -340,6 +342,46 @@ export function RegisterEntryRow({
   // Payment-like columns suggest a vendor for a new name; money in suggests a customer.
   const moneyOut = side ? planSuggestsVendor(register, side) : true;
 
+  // QB's Splits: a check or deposit spread over several accounts. Bank and card registers open
+  // Write Checks / Make Deposits with this row filled in, where more lines can be added.
+  const router = useRouter();
+  const splitsKind: 'expense' | 'deposit' | null = (() => {
+    const bank = register.type === 'asset' && (register.subtype === 'checking' || register.subtype === 'savings');
+    const card = register.type === 'liability' && register.subtype === 'credit_card';
+    if (card) return 'expense';
+    if (!bank) return null;
+    return side === 'increase' ? 'deposit' : 'expense';
+  })();
+  function openSplits() {
+    if (!splitsKind) return;
+    const amountRaw = side ? amounts[side].replace(/[$,\s]/g, '') : '';
+    const amount = /^\d{1,13}(\.\d{1,4})?$/.test(amountRaw) ? amountRaw : undefined;
+    const accountIdNow = account.current.id || undefined;
+    const prefill: FormPrefill = {
+      kind: splitsKind,
+      paymentAccountId: register.id,
+      date: /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : undefined,
+      memo: memo.trim() || undefined,
+      ...(splitsKind === 'expense'
+        ? pickedRef.current?.type === 'vendor'
+          ? { vendorId: pickedRef.current.id }
+          : payee.trim()
+            ? { payeeName: payee.trim() }
+            : {}
+        : {}),
+      lines: accountIdNow || amount ? [{ accountId: accountIdNow, amount, description: memo.trim() || undefined }] : [],
+      note: 'Split from the register: add a line for each account, then save.',
+    };
+    try {
+      if (!stashPrefill(window.sessionStorage, prefill)) throw new Error('prefill');
+    } catch {
+      toast('Could not open the split form. Open Write Checks or Make Deposits instead.', 'danger');
+      return;
+    }
+    window.dispatchEvent(new Event(PREFILL_EVENT));
+    router.push(PREFILL_PATHS[splitsKind]);
+  }
+
   return (
     <>
       <tr
@@ -443,9 +485,22 @@ export function RegisterEntryRow({
           </td>
         ))}
         <td className={cell} colSpan={colSpanAfter}>
-          <Button onClick={save} loading={saving} className="whitespace-nowrap">
-            Record
-          </Button>
+          <span className="inline-flex gap-1">
+            <Button onClick={save} loading={saving} className="whitespace-nowrap">
+              Record
+            </Button>
+            {splitsKind && (
+              <Button
+                variant="secondary"
+                onClick={openSplits}
+                disabled={saving}
+                className="whitespace-nowrap"
+                title={splitsKind === 'deposit' ? 'Split this deposit over several accounts (Make Deposits)' : 'Split this check over several accounts (Write Checks)'}
+              >
+                Splits
+              </Button>
+            )}
+          </span>
         </td>
       </tr>
       <tr className="bg-electric/5">

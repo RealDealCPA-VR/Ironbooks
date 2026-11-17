@@ -510,6 +510,51 @@ export async function deactivateAccount(
   return updateAccount(ctx, id, { isActive: false });
 }
 
+/**
+ * Delete an account that was never used (QuickBooks: Edit > Delete Account). Refused, with the
+ * reason, when it has any transaction (posted, void or draft), sub-accounts, is a system account,
+ * is chosen in Preferences / System Accounts, or is still referenced by another record (an item,
+ * a bank-account record, a budget...): make such an account inactive instead.
+ */
+export async function deleteUnusedAccount(ctx: ServiceContext, id: string) {
+  const { assertListDeleteAllowed } = await import('./accountantCopy/guard');
+  await assertListDeleteAllowed(ctx, 'delete', 'accounts'); // Accountant's Copy (I1)
+  return inTransaction(ctx, async (tx) => {
+    const acct = await getAccount(tx, id);
+    const inactiveInstead = 'Make it inactive instead (it disappears from lists but keeps its history).';
+    const [line] = await tx.db
+      .select({ id: journalEntryLines.id })
+      .from(journalEntryLines)
+      .where(eq(journalEntryLines.accountId, id))
+      .limit(1);
+    if (line) throw validation(`"${acct.name}" has transactions, so it can't be deleted. ${inactiveInstead}`);
+    const [child] = await tx.db
+      .select({ id: accounts.id })
+      .from(accounts)
+      .where(and(eq(accounts.companyId, tx.companyId), eq(accounts.parentId, id)))
+      .limit(1);
+    if (child) throw validation(`"${acct.name}" has sub-accounts. Move or delete them first.`);
+    if (await isSystemAccount(tx, { id: acct.id, code: acct.code })) {
+      throw validation(`"${acct.name}" is a system account Ironbooks posts to, so it can't be deleted.`);
+    }
+    const [co] = await tx.db.select({ settings: companies.settings }).from(companies).where(eq(companies.id, tx.companyId));
+    if (JSON.stringify(co?.settings ?? {}).includes(id)) {
+      throw validation(`"${acct.name}" is chosen in Preferences or System Accounts. Choose another account there first.`);
+    }
+    try {
+      await tx.db.delete(accounts).where(and(eq(accounts.id, id), eq(accounts.companyId, tx.companyId)));
+    } catch (err) {
+      const code = (err as { code?: string; cause?: { code?: string } })?.code ?? (err as { cause?: { code?: string } })?.cause?.code;
+      if (code === '23503') {
+        throw validation(`"${acct.name}" is still used by another record (an item, a bank account, a budget...). ${inactiveInstead}`);
+      }
+      throw err;
+    }
+    await writeAudit(tx, { action: 'delete', entityType: 'account', entityId: id, oldValues: acct as unknown as Record<string, unknown> });
+    return { deleted: true as const, id };
+  });
+}
+
 /** Build a parent→children tree for UI rendering. */
 export async function getAccountTree(ctx: ServiceContext) {
   const rows = await listAccounts(ctx, { includeInactive: true });

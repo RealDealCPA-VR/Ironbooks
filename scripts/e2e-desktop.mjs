@@ -26,7 +26,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { clickNativeButton as clickHelper, nativeButtonShown, onFileServer } from './e2e-helpers.mjs';
+import { clickNativeButton as clickHelper, nativeButtonShown, onFileServer, ownProcs, powershell } from './e2e-helpers.mjs';
 
 const require = createRequire(import.meta.url);
 const root = process.cwd();
@@ -253,6 +253,30 @@ async function main() {
   await page.shot('02-home');
   const saved = await until(async () => format.readCompanyManifest(companyFile)?.saveId !== 'new', 60_000);
   assert(saved, 'autosave wrote the company file');
+
+  // 2b. confirm() / alert() go through the main process's message box (preload `dialogs`): after
+  //     Chromium's own dialog the window on Windows took no clicks or keys (a register "froze"
+  //     after a save-time date warning). Answer one, then type into the page with REAL keystrokes.
+  const bridged = await page.eval(
+    `typeof window.bookkeeper?.dialogs?.confirm === 'function' && !String(window.confirm).includes('[native code]')`,
+  );
+  assert(bridged, 'confirm() goes through the desktop message box');
+  void page.send('Runtime.evaluate', {
+    expression: `setTimeout(() => { window.__ibConfirm = window.confirm('Ironbooks test: keep working?'); }, 0); 1`,
+  });
+  const clickedOk = await clickNativeButton('OK');
+  assert(clickedOk, 'the message box appears and OK answers it');
+  const answered = await until(() => page.eval('window.__ibConfirm === true'), 15_000);
+  assert(answered, 'the page gets OK back');
+  await page.eval(`(() => { const i = document.querySelector('input[type=search]'); if (!i) return false; i.value = ''; i.focus(); return document.activeElement === i; })()`);
+  await powershell(`
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -Namespace IbNs2 -Name IbWin -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetForegroundWindow(System.IntPtr h);'
+$p = ${ownProcs(EXE)} | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+if ($p) { [IbNs2.IbWin]::SetForegroundWindow($p.MainWindowHandle) | Out-Null; Start-Sleep -Milliseconds 400; [System.Windows.Forms.SendKeys]::SendWait('pay bills') }`);
+  const typed = await until(() => page.eval(`document.querySelector('input[type=search]')?.value === 'pay bills'`), 10_000);
+  assert(typed, 'after the message box the window still takes typing');
+  await page.eval(`(() => { const i = document.querySelector('input[type=search]'); if (i) { i.value = ''; i.blur(); } return true; })()`);
 
   // 3. Another workstation asks; Not Now.
   const r1 = companyLock.requestAccess(companyFile, { appUser: 'Bob', computer: 'BACK-OFFICE', osUser: 'bob' });

@@ -105,7 +105,29 @@ interface DesktopBridgeApi {
   };
   company?: { newFile?: () => Promise<unknown>; open?: () => Promise<unknown> };
   spellcheck?: { setEnabled?: (enabled: boolean) => Promise<unknown> };
+  dialogs?: { confirm?: (message: string) => boolean; alert?: (message: string) => void };
 }
+
+/**
+ * In the desktop app, window.confirm / window.alert go through the main process (preload
+ * `dialogs`): after Chromium's own dialog closed, Electron on Windows left the window refusing
+ * clicks and keystrokes (a register stopped responding after a "date is more than 90 days in the
+ * past" warning). Same synchronous true / false for every caller.
+ */
+function installDesktopDialogs(): void {
+  if (typeof window === 'undefined') return;
+  const b = (window as unknown as { bookkeeper?: DesktopBridgeApi }).bookkeeper;
+  const d = b?.dialogs;
+  if (!b?.isDesktop || !d?.confirm || !d.alert) return;
+  const w = window as unknown as { __ibDialogs?: boolean };
+  if (w.__ibDialogs) return;
+  w.__ibDialogs = true;
+  const confirmFn = d.confirm;
+  const alertFn = d.alert;
+  window.confirm = (message?: string) => Boolean(confirmFn(String(message ?? '')));
+  window.alert = (message?: unknown) => alertFn(String(message ?? ''));
+}
+installDesktopDialogs();
 
 function bridge(): DesktopBridgeApi | undefined {
   if (typeof window === 'undefined') return undefined;

@@ -130,3 +130,24 @@ function mapError(err: unknown): NextResponse {
   console.error('[registers/[accountId]] Unexpected error:', err);
   return NextResponse.json({ error: 'Internal server error.' }, { status: 500 });
 }
+
+/**
+ * DELETE /api/registers/[accountId]?entryId=<journal entry>&action=void|delete
+ * QB register Edit > Void / Delete: the transaction the line belongs to is voided (kept, amounts
+ * zeroed) or deleted where that is allowed, with the rights of its own type
+ * (lib/services/accountant/batchVoid.ts voidOrDeleteEntryTransaction).
+ */
+export async function DELETE(req: NextRequest) {
+  try {
+    const ctx = await getServerContext();
+    const entryId = req.nextUrl.searchParams.get('entryId') ?? '';
+    const action = req.nextUrl.searchParams.get('action') === 'delete' ? 'delete' : 'void';
+    if (!/^[0-9a-f-]{36}$/i.test(entryId)) {
+      return NextResponse.json({ error: 'entryId is required.', code: 'VALIDATION' }, { status: 400 });
+    }
+    const { voidOrDeleteEntryTransaction } = await import('@/lib/services/accountant/batchVoid');
+    return NextResponse.json(await voidOrDeleteEntryTransaction(ctx, entryId, action));
+  } catch (err) {
+    return mapError(err);
+  }
+}

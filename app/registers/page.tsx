@@ -11,8 +11,8 @@ import { SUBTYPE_LABELS } from '@/lib/accountTypes';
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { BookOpen, ChevronRight } from 'lucide-react';
-import { Card, EmptyState, PageHeader, Spinner, Table, Th, Td, Tr, toast } from '@/components/ui';
+import { Archive, BookOpen, ChevronRight, Trash2 } from 'lucide-react';
+import { Card, ConfirmDialog, EmptyState, PageHeader, Spinner, Table, Th, Td, Tr, toast, toastError } from '@/components/ui';
 import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { HIDDEN_BALANCE_TITLE } from '@/lib/permissions/balances';
@@ -51,16 +51,42 @@ export default function RegistersIndexPage() {
   const router = useRouter();
   const [accounts, setAccounts] = useState<RegisterAccount[]>([]);
   const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    api
+  // Make inactive (archive) or delete an account right from the list, as QuickBooks' Chart of Accounts.
+  const [pending, setPending] = useState<{ account: RegisterAccount; action: 'inactive' | 'delete' } | null>(null);
+  const [working, setWorking] = useState(false);
+  function load() {
+    return api
       .get<{ accounts: RegisterAccount[] }>('/api/registers')
       .then((data) => setAccounts(data.accounts))
       .catch((err) => {
         toast(err instanceof ApiError ? err.message : 'Failed to load accounts.', 'danger');
       })
       .finally(() => setLoading(false));
+  }
+  useEffect(() => {
+    load();
   }, []);
+
+  async function runPending() {
+    if (!pending) return;
+    setWorking(true);
+    try {
+      const { account, action } = pending;
+      if (action === 'delete') {
+        await api.del(`/api/accounts/${account.id}?permanent=1`);
+        toast(`${account.name} was deleted.`, 'success');
+      } else {
+        await api.del(`/api/accounts/${account.id}`);
+        toast(`${account.name} is inactive. Show it again from the Chart of Accounts.`, 'success');
+      }
+      setPending(null);
+      await load();
+    } catch (err) {
+      toastError(err, pending.action === 'delete' ? 'Could not delete the account.' : 'Could not make the account inactive.');
+    } finally {
+      setWorking(false);
+    }
+  }
 
   return (
     <main className="min-h-screen bg-offwhite p-8 font-sans">
@@ -142,8 +168,34 @@ export default function RegistersIndexPage() {
                             formatCurrency(a.balance)
                           )}
                         </Td>
-                        <Td>
-                          <ChevronRight className="h-4 w-4 text-navy/30 group-hover:text-electric" />
+                        <Td className="whitespace-nowrap">
+                          <span className="inline-flex items-center gap-1">
+                            <button
+                              type="button"
+                              title={`Make ${a.name} inactive`}
+                              aria-label={`Make ${a.name} inactive`}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setPending({ account: a, action: 'inactive' });
+                              }}
+                              className="rounded p-1 text-navy/30 hover:bg-slate-100 hover:text-navy opacity-0 group-hover:opacity-100 focus:opacity-100"
+                            >
+                              <Archive className="h-4 w-4" />
+                            </button>
+                            <button
+                              type="button"
+                              title={`Delete ${a.name}`}
+                              aria-label={`Delete ${a.name}`}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setPending({ account: a, action: 'delete' });
+                              }}
+                              className="rounded p-1 text-navy/30 hover:bg-red-50 hover:text-red-600 opacity-0 group-hover:opacity-100 focus:opacity-100"
+                            >
+                              <Trash2 className="h-4 w-4" />
+                            </button>
+                            <ChevronRight className="h-4 w-4 text-navy/30 group-hover:text-electric" />
+                          </span>
                         </Td>
                       </Tr>
                     ))}
@@ -153,6 +205,20 @@ export default function RegistersIndexPage() {
             </div>
           );
         })}
+      <ConfirmDialog
+        open={pending !== null}
+        title={pending?.action === 'delete' ? `Delete ${pending.account.name}?` : `Make ${pending?.account.name ?? ''} inactive?`}
+        message={
+          pending?.action === 'delete'
+            ? 'Only an account that was never used can be deleted. If it has transactions, make it inactive instead. This cannot be undone.'
+            : 'The account is hidden from lists and pickers but keeps its history. Its balance must be zero. You can make it active again from the Chart of Accounts (show inactive accounts).'
+        }
+        confirmLabel={pending?.action === 'delete' ? 'Delete Account' : 'Make Inactive'}
+        tone={pending?.action === 'delete' ? 'danger' : undefined}
+        loading={working}
+        onConfirm={runPending}
+        onClose={() => setPending(null)}
+      />
     </main>
   );
 }

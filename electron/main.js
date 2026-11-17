@@ -3224,6 +3224,52 @@ nativeTheme.on('updated', applyWindowTheme);
 
 // Asked once by the preload, synchronously, so the page knows before it paints whether it must
 // draw its own title bar. Only the main window is frameless.
+// window.confirm / window.alert from the app's pages (preload `dialogs`): a native message box,
+// then the keyboard back to the page. Chromium's renderer dialogs left the window unusable on
+// Windows after they closed.
+function pageDialog(e, kind, raw) {
+  const win = BrowserWindow.fromWebContents(e.sender);
+  const message = String(raw ?? '').slice(0, 4000);
+  let ok = false;
+  try {
+    const response = dialog.showMessageBoxSync(win ?? undefined, {
+      type: kind === 'confirm' ? 'question' : 'info',
+      buttons: kind === 'confirm' ? ['OK', 'Cancel'] : ['OK'],
+      defaultId: 0,
+      cancelId: kind === 'confirm' ? 1 : 0,
+      noLink: true,
+      title: 'Ironbooks',
+      message,
+    });
+    ok = response === 0;
+  } finally {
+    setImmediate(() => {
+      try {
+        if (win && !win.isDestroyed()) win.focus();
+        if (!e.sender.isDestroyed()) e.sender.focus();
+      } catch {
+        /* the window closed meanwhile */
+      }
+    });
+  }
+  return ok;
+}
+ipcMain.on('dialog:confirm-sync', (e, message) => {
+  if (!fromAppOrigin(e)) {
+    e.returnValue = false;
+    return;
+  }
+  e.returnValue = pageDialog(e, 'confirm', message);
+});
+ipcMain.on('dialog:alert-sync', (e, message) => {
+  if (!fromAppOrigin(e)) {
+    e.returnValue = null;
+    return;
+  }
+  pageDialog(e, 'alert', message);
+  e.returnValue = null;
+});
+
 ipcMain.on('chrome:info', (e) => {
   e.returnValue = {
     frameless: Boolean(mainWindow && e.sender === mainWindow.webContents),
