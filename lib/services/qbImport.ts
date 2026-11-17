@@ -77,6 +77,7 @@ import { createItem, type CreateItemInput, type ItemType } from './items';
 import { createItemWithOpeningStock, planOpeningStock, type OpeningStockInput } from './lists/openingStock';
 import { setBom } from './assemblies';
 import { createJob } from './jobs';
+import { iifTypeFor, mergeStarterChart, removeUnusedStarterAccounts } from './qbStarterChart';
 import { createEmployee, updateEmployee } from './payroll';
 import { assertBalanced, postJournalEntry, type PostingLine } from './posting';
 import { controlSideOfAccount, customerKey, customerKeyIndex, loadQbNameResolver, type QbNameRole } from './qbNameResolver';
@@ -1623,6 +1624,12 @@ export interface ImportIifOptions {
    * balances are as of. Default: the day before the file's first transaction, else today.
    */
   openingBalanceDate?: string | Date;
+  /**
+   * Replace Ironbooks' starter chart of accounts with the file's chart (lib/services/qbStarterChart.ts):
+   * system starter accounts take their QuickBooks counterpart's name, and the starter accounts the
+   * file doesn't bring and that were never used are deleted. Only when the file has accounts.
+   */
+  replaceStarterChart?: boolean;
 }
 
 /**
@@ -1669,6 +1676,17 @@ async function importIIFRows(
   const ownExport = /^ironbooks$/i.test(parsed.producer ?? '');
   const postOpening =
     !glImported && (opts.postOpeningBalances ?? (parsed.transactions.length > 0 || ownExport));
+  // Replace the starter chart: system starter accounts take their QuickBooks counterpart's name
+  // first, so the accounts below use them instead of creating duplicates.
+  const replaceStarter = opts.replaceStarterChart === true && parsed.accounts.length > 0;
+  // Canonical QuickBooks type codes (the file may use aliases such as ARACCNT or EXPENSE).
+  const starterChart = replaceStarter
+    ? parsed.accounts.map((a) => {
+        const t = mapIifType(a.accntType, a.name);
+        return { name: a.name, accntType: iifTypeFor(t.type, t.subtype) };
+      })
+    : [];
+  const starterMatched = replaceStarter ? await mergeStarterChart(ctx, starterChart, counts) : null;
   const lookup = await loadAccountLookup(ctx);
   // Opening balances (OBAMOUNT) are dated as the user chose, else the day before the file's first
   // transaction (QB has no opening-balance date in the IIF), or today when it has none.
@@ -1779,6 +1797,10 @@ async function importIIFRows(
   if (txns.length) {
     await importIifTransactions(ctx, counts, txns, lookup, classIdByPath, redirectControl);
   }
+
+  // Last, once nothing else in the file can still refer to them: the starter accounts the file
+  // didn't bring and that were never used are removed.
+  if (starterMatched) await removeUnusedStarterAccounts(ctx, starterChart, starterMatched, counts);
 
   return counts;
 }
@@ -3327,11 +3349,27 @@ function resolveCsvAccountType(rawType: string, rawSubtype: string): { type: str
   return mapIifType(rawType);
 }
 
-async function importAccountRows(ctx: ServiceContext, rows: Row[], mapping: AccountsCsvMapping): Promise<ImportCounts> {
+async function importAccountRows(
+  ctx: ServiceContext,
+  rows: Row[],
+  mapping: AccountsCsvMapping,
+  opts: { replaceStarterChart?: boolean } = {},
+): Promise<ImportCounts> {
   const counts = emptyCounts();
   const col = (key: keyof AccountsCsvMapping, row: Row): string => (mapping[key] ? (row[mapping[key]!] ?? '').trim() : '');
   // Shallow rows first so "Parent:Sub" names (or a Parent column) find their parent.
   const ordered = [...rows].sort((a, b) => col('name', a).split(':').length - col('name', b).split(':').length);
+  // Replace the starter chart (lib/services/qbStarterChart.ts), as the IIF chart import does.
+  const chartRows = opts.replaceStarterChart
+    ? ordered
+        .filter((r) => col('name', r))
+        .map((r) => {
+          const t = resolveCsvAccountType(col('type', r), col('subtype', r));
+          const parent = col('parent', r);
+          return { name: parent ? `${parent}:${col('name', r)}` : col('name', r), accntType: iifTypeFor(t.type, t.subtype) };
+        })
+    : [];
+  const starterMatched = chartRows.length ? await mergeStarterChart(ctx, chartRows, counts) : null;
   const lookup = await loadAccountLookup(ctx);
   for (const row of ordered) {
     const fullName = col('name', row);
@@ -3353,10 +3391,12 @@ async function importAccountRows(ctx: ServiceContext, rows: Row[], mapping: Acco
     // Without a number column: already in the chart under this full name (any case)? Matching by
     // the leaf-derived code duplicated "Office Supplies" / "Checking" of a new company and dropped
     // "Office:Telephone" as a copy of "Utilities:Telephone".
-    if (!col('code', row)) {
+    // Replacing the starter chart: a starter account of the same name IS that account, whatever
+    // the number (as the IIF import matches by name), so it isn't created a second time.
+    {
       const parentRow = parentId ? [...lookup.byPath.values()].find((r) => r.id === parentId) : null;
       const existing = lookup.byPath.get(normPath(parentRow ? `${parentRow.path}:${name}` : name));
-      if (existing) {
+      if (existing && (!col('code', row) || starterMatched?.has(existing.id))) {
         counts.skipped++;
         counts.issues.push({ entity: 'account', name: fullName, code: existing.code, reason: 'duplicate', message: `Account "${fullName}" already exists.` });
         continue;
@@ -3375,6 +3415,7 @@ async function importAccountRows(ctx: ServiceContext, rows: Row[], mapping: Acco
       addToLookup(lookup, { id: created.id, type, subtype, code: created.code, name, path: parent ? `${parent.path}:${name}` : name });
     }
   }
+  if (starterMatched) await removeUnusedStarterAccounts(ctx, chartRows, starterMatched, counts);
   return counts;
 }
 
@@ -3383,9 +3424,14 @@ async function importAccountRows(ctx: ServiceContext, rows: Row[], mapping: Acco
  * Dedupe and code-collision behaviour matches importAccountRow so accounts are never
  * silently dropped.
  */
-export async function importAccountsCSV(ctx: ServiceContext, content: string, mapping: AccountsCsvMapping): Promise<ImportCounts> {
+export async function importAccountsCSV(
+  ctx: ServiceContext,
+  content: string,
+  mapping: AccountsCsvMapping,
+  opts: { replaceStarterChart?: boolean } = {},
+): Promise<ImportCounts> {
   assertImportSize(content);
-  return withImportLock(ctx, () => withPlannerStats(ctx.db, 'account import', () => importAccountRows(ctx, parseCsvRows(content), mapping)));
+  return withImportLock(ctx, () => withPlannerStats(ctx.db, 'account import', () => importAccountRows(ctx, parseCsvRows(content), mapping, opts)));
 }
 
 // ---------------------------------------------------------------------------
@@ -3462,6 +3508,7 @@ export async function importListXlsx(
   kind: ListImportKind,
   bytes: Uint8Array,
   mapping: Record<string, string>,
+  opts: { replaceStarterChart?: boolean } = {},
 ): Promise<ImportCounts> {
   assertImportSize(bytes);
   let rows: Row[];
@@ -3480,7 +3527,7 @@ export async function importListXlsx(
       case 'items':
         return importItemRows(ctx, rows, mapping as ItemsCsvMapping);
       case 'accounts':
-        return importAccountRows(ctx, rows, mapping as AccountsCsvMapping);
+        return importAccountRows(ctx, rows, mapping as AccountsCsvMapping, opts);
       default:
         throw new ServiceError('VALIDATION', `Unknown list "${kind as string}".`);
     }

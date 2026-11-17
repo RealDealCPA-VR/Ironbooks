@@ -223,6 +223,8 @@ export function ListImport() {
   const [alreadyInGl, setAlreadyInGl] = useState(true);
   // IIF: post each account's OBAMOUNT (QuickBooks' list export writes the CURRENT balance there).
   const [postBalances, setPostBalances] = useState(false);
+  // Replace Ironbooks' starter chart with the client's chart (lib/services/qbStarterChart.ts).
+  const [replaceStarter, setReplaceStarter] = useState(true);
   const [balancesDate, setBalancesDate] = useState('');
   // A General Ledger import already holds every balance: posting OBAMOUNT too would double them.
   const [glImported, setGlImported] = useState(false);
@@ -326,13 +328,14 @@ export function ListImport() {
               format: 'iif',
               content,
               ...(openItemsAsDocs ? { openItems: { asDocuments: true, alreadyInGl } } : {}),
+              replaceStarterChart: replaceStarter,
               ...(postBalances && !glImported
                 ? { postOpeningBalances: true, ...(balancesDate ? { openingBalanceDate: balancesDate } : {}) }
                 : {}),
             }
           : format === 'xlsx'
-            ? { format: 'xlsx', kind: csvKind, data: xlsxData, mapping }
-            : { format: 'csv', kind: csvKind, content, mapping };
+            ? { format: 'xlsx', kind: csvKind, data: xlsxData, mapping, replaceStarterChart: csvKind === 'accounts' && replaceStarter }
+            : { format: 'csv', kind: csvKind, content, mapping, replaceStarterChart: csvKind === 'accounts' && replaceStarter };
 
       const counts = await api.post<ImportCounts>('/api/import/qb', body);
       setResult(counts);
@@ -389,6 +392,27 @@ export function ListImport() {
             </Button>
           ))}
         </div>
+
+
+        {(format === 'iif' || csvKind === 'accounts') && (
+          <label className="flex items-start gap-2 rounded-lg bg-slate-50 p-3 text-sm text-navy">
+            <input
+              type="checkbox"
+              className="mt-1"
+              checked={replaceStarter}
+              onChange={(e) => setReplaceStarter(e.target.checked)}
+            />
+            <span>
+              Replace Ironbooks&apos; starter chart of accounts with your QuickBooks chart.{' '}
+              <span className="text-navy/60">
+                Starter accounts your chart doesn&apos;t have are removed (only ones never used). The accounts
+                Ironbooks posts to on its own — A/R, A/P, Undeposited Funds, Inventory, Sales Tax Payable, Payroll
+                Liabilities, Retained Earnings, Sales, Cost of Goods Sold, Payroll Expense — stay and take your
+                QuickBooks names, so nothing is doubled.
+              </span>
+            </span>
+          </label>
+        )}
 
         {format === 'iif' && (
           <div className="space-y-2 rounded-lg bg-slate-50 p-3">
