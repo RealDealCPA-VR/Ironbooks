@@ -4,7 +4,8 @@ A practical, step-by-step guide for moving a company file from QuickBooks
 Desktop (Pro/Premier/Enterprise) into Ironbooks.
 
 > **TL;DR:** Open **Migrate from QuickBooks** (File → Migrate from QuickBooks…).
-> Step 1 brings your lists (IIF / CSV / Excel), step 2 your full history from the
+> Work through it **in order**. Step 1 brings your chart of accounts first (it replaces
+> Ironbooks' starter accounts), then your other lists (IIF / CSV / Excel); step 2 your full history from the
 > QuickBooks **General Ledger** report (proven account by account before anything is
 > saved), step 3 your **open invoices and unpaid bills** as real documents. Then run
 > the verification checklist at the bottom before retiring the old file. (The older
@@ -92,8 +93,17 @@ Order matters: each step references records created by the previous one.
    start date: each is balanced through Opening Balance Equity (customers become invoices,
    vendors bills), respects the closing date, and re-running the interview never doubles them.
    If you do that, skip step 8 below for those accounts.
-2. **Chart of Accounts** — *Migrate from QuickBooks → Step 1 (Lists)*: the
-   QuickBooks IIF file (`!ACCNT` sections), or a CSV / Excel list. Verify account
+2. **Chart of Accounts** — *Migrate from QuickBooks → Step 1 (Chart of accounts and
+   lists — start here)*: the QuickBooks IIF file (`!ACCNT` sections), or a CSV / Excel
+   list. Import it **before anything else**. **"Replace Ironbooks' starter chart of
+   accounts"** (ticked by default) makes your chart *the* chart: the starter accounts it
+   doesn't have are removed (only ones never used — anything with a transaction, a
+   sub-account or a Preferences setting stays and is listed in the results), and the
+   accounts Ironbooks posts to by number (A/R 1200, A/P 2000, Undeposited Funds 1050,
+   Inventory Asset 1300, Sales Tax Payable 2200, Payroll Liabilities 2300, Retained
+   Earnings 3900, Sales Income 4000, Cost of Goods Sold 5000, Payroll Expense 6500) stay
+   and take your QuickBooks name when the file has exactly one counterpart, so nothing
+   is doubled. 1000 Checking goes only when your file has a bank account. Verify account
    types/subtypes after import; A/R and A/P accounts must keep their special
    subtypes. **Account balances:** QuickBooks' list export carries each account's
    *current* balance. By default none of them are posted (each one is listed in the
@@ -148,7 +158,8 @@ Instead of (or after) opening balances, you can migrate **every transaction** fr
 QuickBooks' General Ledger report. Open **Migrate from QuickBooks** (sidebar → Setup, or
 File → Migrate from QuickBooks…):
 
-1. **Lists (optional)** — import your IIF lists first so contact details and items come over.
+1. **Chart of accounts and lists (start here)** — import your chart of accounts first (it replaces
+   Ironbooks' starter chart), then your other IIF lists so contact details and items come over.
    Leave **"Post account balances from this file"** unticked: the General Ledger brings every
    balance in. If an account the General Ledger posts to already holds other entries (IIF
    opening balances, the setup interview's opening balances, manual entries — at any date), the

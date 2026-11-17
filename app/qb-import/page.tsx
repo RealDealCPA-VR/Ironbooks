@@ -3,7 +3,7 @@
 /**
  * Migrate from QuickBooks.
  *
- *   Step 1 (optional) — Lists: IIF / CSV / Excel import of the chart of accounts (full
+ *   Step 1 (start here) — Chart of accounts and lists: IIF / CSV / Excel import of the chart of accounts (full
  *                       hierarchy), customers & jobs, vendors, items, classes, employees and the
  *                       other QuickBooks lists (ListImport.tsx).
  *   Step 2 — History: the QuickBooks General Ledger report (Excel, CSV or PDF) becomes part of
@@ -52,7 +52,8 @@ function Section({
 }
 
 export default function QbImportPage() {
-  const [showLists, setShowLists] = useState(false);
+  // Step 1 is where a conversion starts (the chart of accounts first): open from the start.
+  const [showLists, setShowLists] = useState(true);
   const [showOpenItems, setShowOpenItems] = useState(false);
   const [showExport, setShowExport] = useState(false);
   // File > Utilities > Export Lists to IIF Files (electron/menuRoutes.js) opens straight onto the export.
@@ -67,12 +68,15 @@ export default function QbImportPage() {
       <div className="max-w-5xl mx-auto space-y-6">
         <Card className="p-6 space-y-2">
           <p className="text-navy">
-            Move your books from QuickBooks Desktop step by step. Your files never leave this computer.
+            Move your books from QuickBooks Desktop step by step, <b>in this order</b>. Your files never leave this
+            computer.
           </p>
           <ol className="list-decimal pl-5 text-sm text-navy/70 space-y-1">
             <li>
-              <b>Lists (optional):</b> bring over accounts, customers and jobs, vendors, items and employees from
-              QuickBooks IIF, CSV or Excel exports.
+              <b>Chart of accounts and lists (start here):</b> import your chart of accounts first — it replaces
+              Ironbooks&apos; starter accounts — then customers and jobs, vendors, items and employees, from QuickBooks
+              IIF, CSV or Excel exports (File &rsaquo; Utilities &rsaquo; Export &rsaquo; Lists to IIF Files exports them
+              all in one file).
             </li>
             <li>
               <b>History:</b> upload your General Ledger report. We rebuild every transaction, check that each one
@@ -93,12 +97,15 @@ export default function QbImportPage() {
           </ol>
         </Card>
 
-        <Section title="Step 1 · Lists (IIF / CSV / Excel) — optional" open={showLists} onToggle={() => setShowLists((v) => !v)}>
+        <Section title="Step 1 · Chart of accounts and lists (IIF / CSV / Excel) — start here" open={showLists} onToggle={() => setShowLists((v) => !v)}>
           <ListImport />
         </Section>
 
         <div className="space-y-3">
           <h2 className="text-lg font-bold text-navy">Step 2 · History from your General Ledger</h2>
+          <p className="text-sm text-navy/60">
+            After your chart of accounts is in (Step 1): each QuickBooks account then finds its account here by name.
+          </p>
           <GlWizard />
         </div>
 

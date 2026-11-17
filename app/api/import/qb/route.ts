@@ -65,8 +65,11 @@ export async function POST(req: NextRequest) {
       openItems?: { asDocuments?: boolean; alreadyInGl?: boolean };
       postOpeningBalances?: unknown;
       openingBalanceDate?: unknown;
+      replaceStarterChart?: unknown;
     };
     const { format, kind, content, mapping } = body;
+    // Replace Ironbooks' starter chart with the file's chart (lib/services/qbStarterChart.ts).
+    const replaceStarterChart = body.replaceStarterChart === true;
 
     if (format === 'xlsx') {
       if (!body.data || typeof body.data !== 'string') {
@@ -81,7 +84,7 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ error: `kind must be one of: ${LIST_KINDS.join(', ')}.`, code: 'VALIDATION' }, { status: 400 });
       }
       await assertExclusiveAccess(ctx, 'Import');
-      return NextResponse.json(await importListXlsx(ctx, kind as ListImportKind, bytes, mapping ?? {}));
+      return NextResponse.json(await importListXlsx(ctx, kind as ListImportKind, bytes, mapping ?? {}, { replaceStarterChart }));
     }
 
     if (!content || typeof content !== 'string') {
@@ -101,6 +104,7 @@ export async function POST(req: NextRequest) {
           ...(typeof body.openingBalanceDate === 'string' && body.openingBalanceDate
             ? { openingBalanceDate: body.openingBalanceDate }
             : {}),
+          replaceStarterChart,
         }),
       );
     }
@@ -121,7 +125,7 @@ export async function POST(req: NextRequest) {
         case 'items':
           return NextResponse.json(await importItemsCSV(ctx, content, colMapping));
         case 'accounts':
-          return NextResponse.json(await importAccountsCSV(ctx, content, colMapping));
+          return NextResponse.json(await importAccountsCSV(ctx, content, colMapping, { replaceStarterChart }));
       }
     }
 
