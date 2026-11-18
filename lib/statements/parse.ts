@@ -209,8 +209,27 @@ function sectionOf(lower: string, kind: StatementKind): Section | undefined {
   return undefined;
 }
 
-const OPENING_RE = /\b(beginning|opening|previous|starting|prior)\s+(statement\s+)?balance\b/i;
-const CLOSING_RE = /\b(ending|closing|new)\s+(statement\s+)?balance\b/i;
+const OPENING_RE =
+  /\b(beginning|opening|previous|starting|prior)\s+(statement\s+)?balance\b|\bbalance\s+(brought\s+)?forward\b|\b(last|previous)\s+statement\s+balance\b|\bbalance\s+(as\s+of\s+)?last\s+statement\b/i;
+const CLOSING_RE = /\b(ending|closing|new)\s+(statement\s+)?balance\b|\bbalance\s+this\s+statement\b/i;
+/**
+ * The column labels of an account summary table ("Beginning Balance  Deposits  Withdrawals
+ * Ending Balance" with the amounts on the line below): their order says which amount is which.
+ */
+const SUMMARY_LABEL_RE = new RegExp(
+  [
+    OPENING_RE.source,
+    CLOSING_RE.source,
+    String.raw`\b(total\s+)?deposits?(\s+(and|&)\s+(other\s+)?(additions|credits))?\b`,
+    String.raw`\b(other\s+)?(credits|additions)\b`,
+    String.raw`\b(total\s+)?withdrawals?(\s+(and|&)\s+(other\s+)?(debits|subtractions))?\b`,
+    String.raw`\b(debits|subtractions)\b`,
+    String.raw`\bchecks(\s+paid)?\b`,
+    String.raw`\b(service\s+)?(fees|charges)\b`,
+    String.raw`\binterest(\s+(paid|earned))?\b`,
+  ].join('|'),
+  'gi',
+);
 const TOTAL_RE = /^\s*(total|subtotal)\b/i;
 
 function lastMoneyCents(text: string): number | null {
@@ -256,19 +275,36 @@ export function parseStatementText(lines: StatementLine[], opts: { kind: Stateme
   // Opening / closing balances: the first opening line and the last closing line.
   let opening: number | null = null;
   let closing: number | null = null;
-  // The amount is on the same line, or alone on the next one (never a dated row: "Daily Ending
-  // Balance" tables are not the closing balance).
-  const amountOn = (i: number): number | null => {
-    const same = lastMoneyCents(texts[i]);
-    if (same !== null) return same;
-    const next = texts[i + 1];
-    return next && !leadingDate(next) ? lastMoneyCents(next) : null;
+  // The amount is the one right AFTER the label on the same line ("Beginning Balance $5,000.00
+  // Ending Balance $5,560.65" on one line used to give the ending balance as the beginning one),
+  // or on the next line: alone, or in a summary table whose column order says which it is. Never a
+  // dated row: "Daily Ending Balance" tables are not the closing balance.
+  const amountOn = (i: number, re: RegExp, which: 'opening' | 'closing'): number | null => {
+    const t = texts[i];
+    const m = re.exec(t);
+    if (m) {
+      const after = t.slice((m.index ?? 0) + m[0].length);
+      // Up to the next label: "Beginning Balance Ending Balance" has no amount for the first one.
+      const next = SUMMARY_LABEL_RE.exec(after);
+      SUMMARY_LABEL_RE.lastIndex = 0;
+      const own = next ? after.slice(0, next.index) : after;
+      const tok = [...own.matchAll(MONEY_RE)].map((x) => parseMoney(x[0])).find((x) => x !== null);
+      if (tok) return tok.cents;
+    }
+    const nextLine = texts[i + 1];
+    if (!nextLine || leadingDate(nextLine)) return null;
+    const amounts = [...nextLine.matchAll(MONEY_RE)].map((x) => parseMoney(x[0])).filter((x): x is NonNullable<typeof x> => x !== null);
+    if (!amounts.length) return null;
+    const labels = [...t.matchAll(SUMMARY_LABEL_RE)].map((x) => x[0]);
+    const pos = labels.findIndex((l) => re.test(l));
+    if (labels.length > 1 && labels.length === amounts.length && pos >= 0) return amounts[pos].cents;
+    return which === 'opening' ? amounts[0].cents : amounts[amounts.length - 1].cents;
   };
   texts.forEach((t, i) => {
-    if (sectionOf(t.toLowerCase(), kind) === 'skip') return;
-    if (opening === null && OPENING_RE.test(t)) opening = amountOn(i);
+    if (sectionOf(t.toLowerCase(), kind) === 'skip' && !OPENING_RE.test(t) && !CLOSING_RE.test(t)) return;
+    if (opening === null && OPENING_RE.test(t)) opening = amountOn(i, OPENING_RE, 'opening');
     if (CLOSING_RE.test(t)) {
-      const c = amountOn(i);
+      const c = amountOn(i, CLOSING_RE, 'closing');
       if (c !== null) closing = c;
     }
   });
@@ -412,6 +448,23 @@ export function parseStatementText(lines: StatementLine[], opts: { kind: Stateme
     last = row;
   }
 
+  // No balances printed (or not read): the running balance column still says them — the last
+  // row's balance is the ending balance, and the first row's balance less its amount the
+  // beginning one (only when that row's sign is known, not guessed).
+  const withBalance = rows.filter((r) => r.balance !== undefined);
+  if (closing === null && withBalance.length) {
+    closing = parseMoney(withBalance[withBalance.length - 1].balance!)?.cents ?? null;
+    if (closing !== null) warnings.push('The ending balance was taken from the last running balance on the statement; check it.');
+  }
+  const first = rows[0];
+  if (opening === null && first?.balance !== undefined && first.signFrom !== 'guess') {
+    const b = parseMoney(first.balance)?.cents;
+    const a = parseMoney(first.amount)?.cents;
+    if (b !== undefined && a !== undefined) {
+      opening = kind === 'bank' ? b - a : b + a;
+      warnings.push('The beginning balance was worked out from the first running balance on the statement; check it.');
+    }
+  }
   if (opening === null) warnings.push('No beginning balance found on the statement.');
   if (closing === null) warnings.push('No ending balance found on the statement.');
   const guesses = rows.filter((r) => r.signFrom === 'guess').length;

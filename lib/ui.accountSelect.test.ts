@@ -74,3 +74,21 @@ describe('Bank review: account Set Up and proactive rules', () => {
     expect(src).toContain("new URLSearchParams(window.location.search).get('bankAccountId')");
   });
 });
+
+describe('Statement review: fixing what OCR got wrong', () => {
+  it('± flips a row between money in and money out', async () => {
+    const { flipSign } = await import('@/components/StatementReview');
+    expect(flipSign('42.10')).toBe('-42.10');
+    expect(flipSign('-1,250.00')).toBe('1250.00');
+    expect(flipSign('(15.00)')).toBe('15.00');
+    expect(flipSign('abc')).toBe('abc');
+  });
+
+  it('offers Fix with AI (with the bank account) and Flip all signs', () => {
+    const src = read('components/StatementReview.tsx');
+    expect(src).toContain("api.post<AssistResult>('/api/import/statement-assist'");
+    expect(src).toContain('Undo AI changes');
+    expect(src).toContain('Flip all signs');
+    expect(read('app/banking/page.tsx')).toContain('bankAccountId={statementAccountId}');
+  });
+});

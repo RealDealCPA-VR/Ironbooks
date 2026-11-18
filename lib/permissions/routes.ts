@@ -255,6 +255,7 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/import': r('banking', 'POST'),
   '/api/import/csv-preview': r('banking', 'POST'),
   '/api/import/extract': r('banking', 'POST'),
+  '/api/import/statement-assist': r('banking', 'POST'),
   '/api/import/qb': r('file_utilities', 'POST'),
   '/api/import/rebuild': r('file_utilities', 'GET POST:modify'),
   '/api/qb-import': r('file_utilities', 'POST'),

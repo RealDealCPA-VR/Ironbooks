@@ -5,11 +5,16 @@
  * statement's own opening and closing balances drive a live TIE-OUT: opening + rows = closing
  * (for a card, whose balance is what you owe, opening − rows = closing). Import is offered when
  * it ties; otherwise only after ticking "Import anyway", which is recorded in the audit trail.
+ *
+ * When OCR misses or misreads rows: ± flips one row's sign, "Flip all signs" every row's, and
+ * "Fix with AI" (POST /api/import/statement-assist) has the company's AI compare the rows with the
+ * statement text and the person's note — its corrections replace the rows on screen, with Undo.
  */
 import { useMemo, useState } from 'react';
 import Decimal from 'decimal.js';
-import { CheckCircle2, Plus, Trash2, TriangleAlert } from 'lucide-react';
-import { Badge, Button, Input, Table, Td, Th, Tr } from '@/components/ui';
+import { ArrowUpDown, CheckCircle2, Plus, Sparkles, Trash2, TriangleAlert, Undo2 } from 'lucide-react';
+import { Badge, Button, Input, Table, Td, Th, Tr, toast } from '@/components/ui';
+import { api, ApiError } from '@/lib/client';
 import { formatCurrency } from '@/lib/money';
 import { tieOut, type StatementKind, type StatementRow } from '@/lib/statements/parse';
 
@@ -23,6 +28,16 @@ export interface StatementExtract {
   warnings: string[];
   method: 'text' | 'ocr' | 'ai';
   pages: number;
+  /** The statement text as read, for "Fix with AI". */
+  text?: string;
+}
+
+/** What "Fix with AI" returns (lib/services/statementImport.ts assistStatement). */
+interface AssistResult {
+  rows: StatementRow[];
+  openingBalance: string | null;
+  closingBalance: string | null;
+  notes: string;
 }
 
 export interface ReviewedStatement {
@@ -82,6 +97,13 @@ export interface ReviewRow {
   amount: string;
 }
 
+/** The amount with its sign flipped ("-42.10" ↔ "42.10"); text that isn't an amount is left as it is. */
+export function flipSign(raw: string): string {
+  const a = statementAmount(raw);
+  if (a === null || a === '0.00') return raw;
+  return a.startsWith('-') ? a.slice(1) : `-${a}`;
+}
+
 /** The rows that can be imported: a real date and a non-zero amount. */
 export function importableRows<R extends ReviewRow>(rows: R[]): R[] {
   return rows.filter((r) => {
@@ -112,11 +134,14 @@ export function reviewedPayload(
 
 export function StatementReview({
   extract,
+  bankAccountId,
   importing,
   onImport,
   onCancel,
 }: {
   extract: StatementExtract;
+  /** The bank account the statement is for ("Fix with AI" reads it as a bank or card statement). */
+  bankAccountId?: string;
   importing: boolean;
   onImport: (reviewed: ReviewedStatement) => void;
   onCancel: () => void;
@@ -134,6 +159,11 @@ export function StatementReview({
   const [opening, setOpening] = useState(extract.openingBalance ?? '');
   const [closing, setClosing] = useState(extract.closingBalance ?? '');
   const [ack, setAck] = useState(false);
+  // "Fix with AI": the note, the run, the AI's account of its changes, and what Undo restores.
+  const [aiNote, setAiNote] = useState('');
+  const [aiBusy, setAiBusy] = useState(false);
+  const [aiNotes, setAiNotes] = useState<string | null>(null);
+  const [beforeAi, setBeforeAi] = useState<{ rows: EditRow[]; opening: string; closing: string } | null>(null);
 
   const validRows = importableRows(rows);
   const t = useMemo(
@@ -150,6 +180,52 @@ export function StatementReview({
 
   function update(key: number, patch: Partial<EditRow>) {
     setRows((prev) => prev.map((r) => (r.key === key ? { ...r, ...patch, flagged: patch.amount !== undefined ? false : r.flagged } : r)));
+    setAck(false);
+  }
+
+  async function fixWithAi() {
+    if (!bankAccountId) return;
+    setAiBusy(true);
+    try {
+      const res = await api.post<AssistResult>('/api/import/statement-assist', {
+        bankAccountId,
+        text: extract.text ?? '',
+        rows: rows.map((r) => ({ date: r.date, description: r.description, amount: statementAmount(r.amount) ?? r.amount })),
+        openingBalance: statementAmount(opening),
+        closingBalance: statementAmount(closing),
+        instruction: aiNote.trim() || null,
+      });
+      setBeforeAi({ rows, opening, closing });
+      // Payees typed so far stay on rows the AI kept (same date, description and amount).
+      const payeeOf = new Map(rows.filter((r) => r.payee).map((r) => [`${r.date}|${r.description}|${statementAmount(r.amount)}`, r.payee]));
+      setRows(
+        res.rows.map((r, i) => ({
+          key: i,
+          date: r.date,
+          description: r.description,
+          payee: payeeOf.get(`${r.date}|${r.description}|${r.amount}`) ?? '',
+          amount: r.amount,
+          flagged: true,
+        })),
+      );
+      setOpening(res.openingBalance ?? '');
+      setClosing(res.closingBalance ?? '');
+      setAiNotes(res.notes || 'Done.');
+      setAck(false);
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'The AI could not check this statement.', 'danger');
+    } finally {
+      setAiBusy(false);
+    }
+  }
+
+  function undoAi() {
+    if (!beforeAi) return;
+    setRows(beforeAi.rows);
+    setOpening(beforeAi.opening);
+    setClosing(beforeAi.closing);
+    setBeforeAi(null);
+    setAiNotes(null);
     setAck(false);
   }
 
@@ -173,6 +249,46 @@ export function StatementReview({
             <li key={i}>{w}</li>
           ))}
         </ul>
+      )}
+
+      {bankAccountId && (
+        <div className="flex flex-col gap-2 rounded-lg border border-electric/20 bg-white p-3" data-statement-ai>
+          <div className="flex flex-wrap items-center gap-2">
+            <Sparkles className="h-4 w-4 text-electric" aria-hidden />
+            <span className="text-sm font-semibold text-navy">AI help</span>
+            <span className="text-xs text-navy/50">
+              Missing rows, misread amounts, wrong signs or balances? Your AI checks the rows against the statement text.
+            </span>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Input
+              aria-label="What is wrong (optional)"
+              className="flex-1 min-w-[240px]"
+              value={aiNote}
+              onChange={(e) => setAiNote(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  if (!aiBusy) void fixWithAi();
+                }
+              }}
+              placeholder="What's wrong? (optional) e.g. “the ending balance is 5,560.65” or “row 4 is a deposit”"
+            />
+            <Button type="button" size="sm" loading={aiBusy} onClick={() => void fixWithAi()}>
+              <Sparkles className="h-4 w-4" aria-hidden /> Fix with AI
+            </Button>
+            {beforeAi && (
+              <Button type="button" size="sm" variant="secondary" onClick={undoAi} disabled={aiBusy}>
+                <Undo2 className="h-4 w-4" aria-hidden /> Undo AI changes
+              </Button>
+            )}
+          </div>
+          {aiNotes && (
+            <p className="text-xs text-navy/70" role="status">
+              <b>AI:</b> {aiNotes} Rows the AI returned are highlighted — check them against the statement.
+            </p>
+          )}
+        </div>
       )}
 
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4 items-end">
@@ -209,6 +325,9 @@ export function StatementReview({
               <Th>Description</Th>
               <Th>Payee (optional)</Th>
               <Th numeric>Amount</Th>
+              <Th className="w-8">
+                <span className="sr-only">Flip sign</span>
+              </Th>
               <Th className="w-10" />
             </Tr>
           </thead>
@@ -233,6 +352,17 @@ export function StatementReview({
                     title={r.flagged ? 'Check the sign: money in is positive, money out negative.' : undefined}
                     className="w-28 text-right"
                   />
+                </Td>
+                <Td>
+                  <button
+                    type="button"
+                    aria-label="Flip sign (money in ↔ money out)"
+                    title="Flip sign (money in ↔ money out)"
+                    onClick={() => update(r.key, { amount: flipSign(r.amount) })}
+                    className="text-navy/40 hover:text-electric"
+                  >
+                    <ArrowUpDown className="h-4 w-4" />
+                  </button>
                 </Td>
                 <Td>
                   <button
@@ -267,6 +397,19 @@ export function StatementReview({
           }}
         >
           <Plus className="h-4 w-4" /> Add a row
+        </Button>
+        <Button
+          type="button"
+          variant="secondary"
+          size="sm"
+          disabled={rows.length === 0}
+          onClick={() => {
+            setRows((prev) => prev.map((r) => ({ ...r, amount: flipSign(r.amount), flagged: false })));
+            setAck(false);
+          }}
+          title="Money in becomes money out and the other way round, on every row"
+        >
+          <ArrowUpDown className="h-4 w-4" /> Flip all signs
         </Button>
         {invalid > 0 && <span className="text-xs text-red-600">{invalid} row{invalid === 1 ? ' needs' : 's need'} a date and a non-zero amount.</span>}
         {!t.ok && (

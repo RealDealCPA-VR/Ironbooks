@@ -82,8 +82,10 @@ export interface PdfDocumentContent {
   /** Every visual line of the pages read, in reading order, with x positions. */
   lines: PdfLine[];
   pages: number;
-  /** PNG images of scanned pages (pages with (almost) no text layer). */
+  /** PNG images of scanned pages (pages with (almost) no text layer): the largest image of each. */
   scans: Buffer[];
+  /** Page by page (pages read): the text layer's lines, and for a scanned page its images. */
+  pageList: Array<{ lines: PdfLine[]; scan: Buffer[] | null }>;
 }
 
 /**
@@ -110,6 +112,7 @@ export async function readPdfDocument(
   }
   const out: PdfLine[] = [];
   const scans: Buffer[] = [];
+  const pageList: PdfDocumentContent['pageList'] = [];
   try {
     const pages = Math.min(doc.numPages, limits.maxPages);
     for (let p = 1; p <= pages; p++) {
@@ -124,26 +127,45 @@ export async function readPdfDocument(
       }
       const lines = pdfLinesFromItems(items);
       out.push(...lines);
-      // A page without a text layer is a scan: hand its largest image to OCR.
-      if (lines.map((l) => l.text).join('').replace(/\s/g, '').length < 20 && scans.length < limits.maxScannedPages) {
-        const png = await largestImage(pdfjs, page);
-        if (png) scans.push(png);
+      // A page without a real text layer is a scan: hand its images to OCR. That is a page with
+      // (almost) no text, or one whose text has no amount at all — a scanner's stamp, a page
+      // number or a fax header on every page used to make a whole scanned statement count as
+      // "text" (and nothing was read).
+      const pageText = lines.map((l) => l.text).join(' ');
+      const looksScanned = pageText.replace(/\s/g, '').length < 20 || !/\d\.\d{2}/.test(pageText);
+      let scan: Buffer[] | null = null;
+      if (looksScanned && scans.length < limits.maxScannedPages) {
+        const pngs = await pageImages(pdfjs, page);
+        if (pngs.length) {
+          scan = pngs.map((p) => p.png);
+          scans.push([...pngs].sort((a, b) => b.area - a.area)[0].png);
+        }
       }
+      pageList.push({ lines, scan });
       page.cleanup();
     }
-    return { lines: out, pages: doc.numPages, scans };
+    return { lines: out, pages: doc.numPages, scans, pageList };
   } finally {
     await doc.destroy();
   }
 }
 
-async function largestImage(
+/**
+ * The images a scanned page is made of, as PNG, in drawing order (top to bottom for a scanner).
+ * Most scanners store a page as one image; some store it as several strips — every image at least
+ * a sixth the size of the largest is kept (logos and specks are not).
+ */
+async function pageImages(
   pdfjs: { OPS: Record<string, number> },
-  page: { getOperatorList(): Promise<{ fnArray: number[]; argsArray: unknown[][] }>; objs: { get(id: string, cb?: (v: unknown) => void): unknown } },
-): Promise<Buffer | null> {
+  page: {
+    getOperatorList(): Promise<{ fnArray: number[]; argsArray: unknown[][] }>;
+    objs: { get(id: string, cb?: (v: unknown) => void): unknown };
+    commonObjs?: { get(id: string, cb?: (v: unknown) => void): unknown };
+  },
+): Promise<Array<{ png: Buffer; area: number }>> {
   try {
     const ops = await page.getOperatorList();
-    let best: PdfImage | null = null;
+    const found: PdfImage[] = [];
     for (let i = 0; i < ops.fnArray.length; i++) {
       const fn = ops.fnArray[i];
       if (fn !== pdfjs.OPS.paintImageXObject && fn !== pdfjs.OPS.paintInlineImageXObject) continue;
@@ -154,7 +176,9 @@ async function largestImage(
         img = await new Promise<PdfImage | null>((resolve) => {
           const timer = setTimeout(() => resolve(null), 5000);
           try {
-            page.objs.get(arg, (v) => {
+            // An image used on several pages is kept in the document-wide store ("g_…" ids).
+            const store = arg.startsWith('g_') && page.commonObjs ? page.commonObjs : page.objs;
+            store.get(arg, (v) => {
               clearTimeout(timer);
               resolve((v as PdfImage) ?? null);
             });
@@ -164,10 +188,19 @@ async function largestImage(
           }
         });
       }
-      if (img?.data && (!best || img.width * img.height > best.width * best.height)) best = img;
+      if (img?.data && img.width && img.height) found.push(img);
     }
-    return best ? imageToPng(best) : null;
+    if (!found.length) return [];
+    const maxArea = Math.max(...found.map((f) => f.width * f.height));
+    const out: Array<{ png: Buffer; area: number }> = [];
+    for (const f of found) {
+      const area = f.width * f.height;
+      if (area * 6 < maxArea) continue;
+      const png = imageToPng(f);
+      if (png) out.push({ png, area });
+    }
+    return out;
   } catch {
-    return null;
+    return [];
   }
 }

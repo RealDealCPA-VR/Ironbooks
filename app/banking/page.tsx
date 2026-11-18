@@ -1156,6 +1156,7 @@ export default function BankingPage() {
               {statementExtract && (
                 <StatementReview
                   extract={statementExtract}
+                  bankAccountId={statementAccountId}
                   importing={importing}
                   onImport={importStatement}
                   onCancel={() => setStatementExtract(null)}

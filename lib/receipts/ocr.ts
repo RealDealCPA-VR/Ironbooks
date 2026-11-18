@@ -19,6 +19,12 @@ import path from 'node:path';
 export interface OcrEngine {
   /** Text of one image (JPEG / PNG / WebP bytes). */
   recognize(image: Buffer): Promise<string>;
+  /**
+   * Every word of one image with its box (bank statements: rows and columns are rebuilt from the
+   * positions, lib/statements/ocrLines.ts). A page scanned sideways or upside down is turned first.
+   * Optional: an engine without it is read as plain text.
+   */
+  recognizeWords?(image: Buffer): Promise<Array<{ text: string; x0: number; y0: number; x1: number; y1: number }>>;
 }
 
 /** Longest a single photo may take before we give up on it. */
@@ -44,8 +50,23 @@ export function ocrLanguageDir(): string | null {
   return null;
 }
 
+interface TesseractBox {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
 interface TesseractWorker {
-  recognize(image: Buffer, opts?: Record<string, unknown>): Promise<{ data: { text: string } }>;
+  recognize(
+    image: Buffer,
+    opts?: Record<string, unknown>,
+    output?: Record<string, boolean>,
+  ): Promise<{
+    data: {
+      text: string;
+      blocks?: Array<{ paragraphs?: Array<{ lines?: Array<{ words?: Array<{ text: string; bbox: TesseractBox }> }> }> }> | null;
+    };
+  }>;
   terminate(): Promise<unknown>;
 }
 interface TesseractModule {
@@ -106,38 +127,49 @@ export async function getOcrEngine(): Promise<OcrEngine | null> {
   if (!langPath) return null;
   const tess = await loadTesseract();
   if (!tess) return null;
+  /** Run one OCR job on the shared worker, one at a time, with the per-image time limit. */
+  function run<T>(read: (worker: TesseractWorker) => Promise<T>): Promise<T> {
+    const job = queue.then(async () => {
+      // The worker is busy from here on: the idle shutdown the previous job scheduled must not
+      // fire mid-read (a slow page used to be cut off after 60 s by the last page's timer).
+      if (idleTimer) {
+        clearTimeout(idleTimer);
+        idleTimer = null;
+      }
+      const worker = await getWorker(tess!, langPath!);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          read(worker),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => {
+              // A stuck job poisons the worker: drop it so the next photo gets a fresh one.
+              const p = workerPromise;
+              workerPromise = null;
+              p?.then((w) => w.terminate()).catch(() => {});
+              reject(new Error('Reading the photo took too long.'));
+            }, OCR_TIMEOUT_MS);
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+        scheduleShutdown();
+      }
+    });
+    queue = job.catch(() => {});
+    return job;
+  }
   return {
-    recognize(image: Buffer): Promise<string> {
-      const job = queue.then(async () => {
-        // The worker is busy from here on: the idle shutdown the previous job scheduled must not
-        // fire mid-read (a slow page used to be cut off after 60 s by the last page's timer).
-        if (idleTimer) {
-          clearTimeout(idleTimer);
-          idleTimer = null;
-        }
-        const worker = await getWorker(tess, langPath);
-        let timer: ReturnType<typeof setTimeout> | undefined;
-        try {
-          const res = await Promise.race([
-            worker.recognize(image),
-            new Promise<never>((_, reject) => {
-              timer = setTimeout(() => {
-                // A stuck job poisons the worker: drop it so the next photo gets a fresh one.
-                const p = workerPromise;
-                workerPromise = null;
-                p?.then((w) => w.terminate()).catch(() => {});
-                reject(new Error('Reading the photo took too long.'));
-              }, OCR_TIMEOUT_MS);
-            }),
-          ]);
-          return res.data.text ?? '';
-        } finally {
-          clearTimeout(timer);
-          scheduleShutdown();
-        }
-      });
-      queue = job.catch(() => {});
-      return job;
-    },
+    recognize: (image: Buffer) => run(async (w) => (await w.recognize(image)).data.text ?? ''),
+    recognizeWords: (image: Buffer) =>
+      run(async (w) => {
+        const res = await w.recognize(image, { rotateAuto: true }, { text: true, blocks: true });
+        const words: Array<{ text: string; x0: number; y0: number; x1: number; y1: number }> = [];
+        for (const b of res.data.blocks ?? [])
+          for (const p of b.paragraphs ?? [])
+            for (const l of p.lines ?? [])
+              for (const word of l.words ?? []) words.push({ text: word.text, ...word.bbox });
+        return words;
+      }),
   };
 }
