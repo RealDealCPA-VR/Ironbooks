@@ -19,7 +19,8 @@ describe('re-test 2: narrow-window search and menu switch', () => {
     expect(src).toMatch(/idPrefix = 'ss',\s*className = '[^']*\bhidden lg:block\b[^']*'/);
     const narrow = s.find((a) => /idPrefix=/.test(a));
     expect(narrow).toBeDefined();
-    expect(narrow).toMatch(/className="[^"]*\blg:hidden\b[^"]*"/);
+    // The top-bar copy is lg:hidden; it goes through rc() (lib/navRail.ts) so a collapsed menu shows it on wide windows too.
+    expect(narrow).toMatch(/className=\{rc\('[^']*\blg:hidden\b[^']*'\)\}/);
     expect(narrow).not.toMatch(/\bhidden lg:block\b/);
     expect(narrow).toMatch(/permissions=\{me\?\.permissions\}/);
     expect(narrow).toMatch(/hiddenPaths=\{hiddenPaths\}/);
