@@ -479,6 +479,10 @@ export default function BankingPage() {
   /** The account the statement under review was read for (its sign convention is that account's). */
   const [statementAccountId, setStatementAccountId] = useState('');
   const [extracting, setExtracting] = useState(false);
+  // Drag and drop a bank file onto the Import Transactions card (dragenter/leave fire for every
+  // child the pointer crosses: count them so the highlight doesn't flicker).
+  const [dropActive, setDropActive] = useState(false);
+  const dropDepth = useRef(0);
 
   // CSV preview (server-side dry run via /api/import/csv-preview)
   const [csvPreview, setCsvPreview] = useState<CsvPreviewResult | null>(null);
@@ -731,7 +735,17 @@ export default function BankingPage() {
     const file = e.target.files?.[0] ?? null;
     e.target.value = ''; // allow re-selecting the same file
     if (!file) return;
+    await loadFile(file);
+  }
+
+  /** A bank file chosen or dropped: statements / Excel are read on the server, the rest as text. */
+  async function loadFile(file: File, dropped = false) {
     const kind = fileTypeFromName(file.name);
+    // The file chooser also takes a .txt export (read as OFX text); a drop is anything at all.
+    if (!kind && dropped) {
+      toast('Drop a PDF or scan of a statement, an Excel, CSV, OFX, QFX or QBO file.', 'danger');
+      return;
+    }
     if (kind && BINARY_KINDS.includes(kind)) {
       await extractFile(file);
       return;
@@ -898,8 +912,45 @@ export default function BankingPage() {
       {/* ------------------------------------------------------------------ */}
       {/* Card 2: Import Transactions                                          */}
       {/* ------------------------------------------------------------------ */}
-      <Card className="p-6 mb-8">
+      <Card
+        className={`p-6 mb-8 relative ${dropActive ? 'ring-2 ring-electric ring-offset-2' : ''}`}
+        // Drop a statement PDF / scan, Excel, CSV, OFX, QFX or QBO file here. data-own-drop keeps
+        // the app-wide receipt drop zone (components/ReceiptDropZone.tsx) from taking it as a receipt.
+        data-own-drop
+        onDragEnter={(e) => {
+          if (!Array.from(e.dataTransfer.types).includes('Files')) return;
+          e.preventDefault();
+          dropDepth.current += 1;
+          setDropActive(true);
+        }}
+        onDragOver={(e) => {
+          if (!Array.from(e.dataTransfer.types).includes('Files')) return;
+          e.preventDefault();
+          e.dataTransfer.dropEffect = 'copy';
+        }}
+        onDragLeave={() => {
+          dropDepth.current = Math.max(0, dropDepth.current - 1);
+          if (dropDepth.current === 0) setDropActive(false);
+        }}
+        onDrop={(e) => {
+          if (!Array.from(e.dataTransfer.types).includes('Files')) return;
+          e.preventDefault();
+          dropDepth.current = 0;
+          setDropActive(false);
+          const files = Array.from(e.dataTransfer.files);
+          if (files.length > 1) toast(`Import one file at a time — reading ${files[0].name}.`, 'info');
+          if (files[0] && !extracting && !importing) void loadFile(files[0], true);
+        }}
+      >
+        {dropActive && (
+          <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center rounded-2xl border-2 border-dashed border-electric bg-electric/10">
+            <p className="rounded-lg bg-white px-4 py-2 text-sm font-semibold text-electric shadow">
+              Drop the statement here — PDF or scan, Excel, CSV, OFX, QFX or QBO
+            </p>
+          </div>
+        )}
         <h2 className="text-lg font-bold text-navy mb-4">Import Transactions</h2>
+        <p className="-mt-3 mb-4 text-xs text-navy/50">Tip: drag a statement file from your computer and drop it here.</p>
         <form onSubmit={handleImport} className="space-y-4">
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>

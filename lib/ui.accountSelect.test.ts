@@ -92,3 +92,14 @@ describe('Statement review: fixing what OCR got wrong', () => {
     expect(read('app/banking/page.tsx')).toContain('bankAccountId={statementAccountId}');
   });
 });
+
+describe('Banking: drop a bank file onto Import Transactions', () => {
+  it('the card is its own drop target (not a receipt) and reads the dropped file like a chosen one', () => {
+    const src = read('app/banking/page.tsx');
+    expect(src).toContain('data-own-drop');
+    expect(src).toContain("void loadFile(files[0], true)");
+    expect(src).toMatch(/async function handleBrowserFile[\s\S]*?await loadFile\(file\);/);
+    // The app-wide receipt drop zone steps aside for [data-own-drop].
+    expect(read('components/ReceiptDropZone.tsx')).toContain("[data-own-drop]");
+  });
+});
