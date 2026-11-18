@@ -741,6 +741,112 @@ export async function acceptOffer(
   return createBankRule(ctx, { ...offer.rule, mode: input.mode ?? 'suggest' });
 }
 
+/** What learnRuleFromChoice did: a rule saved for the line's payee, or one moved to the new account. */
+export interface LearnedRule {
+  action: 'created' | 'updated';
+  ruleId: string;
+  name: string;
+  pattern: string;
+  accountName: string;
+}
+
+/**
+ * Proactive rules (office feedback): the first time a bank line is categorized by hand (or a
+ * hand-picked bulk accept), save a rule for its payee right away, so the next statement comes in
+ * pre-filled instead of waiting for the same choice to be made LEARN_THRESHOLD times and an "Always
+ * categorize…?" click. The rule only SUGGESTS (mode 'suggest'): nothing posts without review.
+ *
+ *  - No rule covers the line's pattern (in that direction, on that bank account) → a learned rule
+ *    "<PATTERN> → <account>" is created (any bank account, money in or out as the line was).
+ *  - A learned suggest-mode rule made for exactly this pattern exists but the user chose another
+ *    account → the rule follows the latest choice (account, class, payee).
+ *  - Any other covering rule (one the user wrote, an 'auto' rule, a split) is left alone, as is a
+ *    pattern → account the user turned down ("No thanks"), and split lines.
+ * Returns null when nothing changed. Best effort for callers: a failure must not undo the post.
+ */
+export async function learnRuleFromChoice(ctx: ServiceContext, bankTransactionId: string): Promise<LearnedRule | null> {
+  const [h] = await ctx.db
+    .select({
+      pattern: bankCategorizationHistory.pattern,
+      direction: bankCategorizationHistory.direction,
+      accountId: bankCategorizationHistory.accountId,
+      classId: bankCategorizationHistory.classId,
+      payee: bankCategorizationHistory.payee,
+      split: bankCategorizationHistory.split,
+      source: bankCategorizationHistory.source,
+      bankAccountId: bankCategorizationHistory.bankAccountId,
+    })
+    .from(bankCategorizationHistory)
+    .where(
+      and(
+        eq(bankCategorizationHistory.companyId, ctx.companyId),
+        eq(bankCategorizationHistory.bankTransactionId, bankTransactionId),
+      ),
+    )
+    .orderBy(desc(bankCategorizationHistory.createdAt))
+    .limit(1);
+  if (!h || h.split || !h.pattern || (h.source !== 'user' && h.source !== 'bulk')) return null;
+  const pattern = h.pattern.slice(0, MAX_TEXT);
+  const direction: 'in' | 'out' = h.direction === 'in' ? 'in' : 'out';
+
+  const [dismissed] = await ctx.db
+    .select({ id: bankRuleDismissals.id })
+    .from(bankRuleDismissals)
+    .where(
+      and(
+        eq(bankRuleDismissals.companyId, ctx.companyId),
+        eq(bankRuleDismissals.pattern, pattern),
+        eq(bankRuleDismissals.direction, direction),
+        eq(bankRuleDismissals.accountId, h.accountId),
+      ),
+    )
+    .limit(1);
+  if (dismissed) return null;
+
+  const [acct] = await ctx.db
+    .select({ name: accounts.name, isActive: accounts.isActive })
+    .from(accounts)
+    .where(and(eq(accounts.id, h.accountId), eq(accounts.companyId, ctx.companyId)));
+  if (!acct || !acct.isActive) return null;
+  const payee = h.payee?.trim() || null;
+
+  // Probe the live rules with the pattern itself (amount bounds ignored), as ruleOffers does.
+  const rules = await activeBankRules(ctx);
+  const covering = pickRule(
+    rules.map((r) => ({ ...r, amountMin: null, amountMax: null })),
+    { description: pattern, payee: null, amount: direction === 'in' ? '1.00' : '-1.00', bankAccountId: h.bankAccountId },
+  );
+  if (covering) {
+    const own =
+      covering.learned &&
+      covering.mode === 'suggest' &&
+      !covering.splits?.length &&
+      covering.matchValue.trim().toUpperCase() === pattern.toUpperCase();
+    if (!own || covering.setAccountId === h.accountId) return null;
+    const rule = await updateBankRule(ctx, covering.id, {
+      name: `${pattern} → ${acct.name}`.slice(0, MAX_TEXT),
+      setAccountId: h.accountId,
+      setClassId: h.classId,
+      setPayee: payee,
+    });
+    return { action: 'updated', ruleId: rule.id, name: rule.name, pattern, accountName: acct.name };
+  }
+  const rule = await createBankRule(ctx, {
+    name: `${pattern} → ${acct.name}`.slice(0, MAX_TEXT),
+    matchField: 'any',
+    matchOperator: 'contains',
+    matchValue: pattern,
+    direction,
+    setAccountId: h.accountId,
+    setClassId: h.classId,
+    setPayee: payee,
+    mode: 'suggest',
+    enabled: true,
+    learned: true,
+  });
+  return { action: 'created', ruleId: rule.id, name: rule.name, pattern, accountName: acct.name };
+}
+
 /**
  * "No thanks" on a learning offer: never offer this pattern → account again in the same
  * direction (dismissing a money-out offer leaves a later money-in offer for the pattern alone).

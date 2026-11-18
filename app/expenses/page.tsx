@@ -44,6 +44,7 @@ import {
 } from '@/components/ui';
 import { Help } from '@/components/Help';
 import { TypeaheadSelect } from '@/components/TypeaheadSelect';
+import { AccountSelect } from '@/components/AccountSelect';
 import { NameField } from '@/components/NameField';
 import type { TypeaheadChoice } from '@/lib/typeahead';
 import { api } from '@/lib/client';
@@ -1104,12 +1105,14 @@ function ExpensesPageContent() {
                     {...fieldA11y('exp', `line-${idx}-item`, fieldErrors)}
                   />
                 ) : (
-                  <TypeaheadSelect
+                  <AccountSelect
                     aria-label={`Line ${idx + 1} account`}
                     placeholder="Account…"
                     value={line.accountId}
                     onChange={(id) => updateLine(idx, 'accountId', id)}
                     choices={lineAccountChoices}
+                    accounts={accounts}
+                    onAccountCreated={(a) => setAccounts((prev) => [...prev, a as unknown as Account])}
                     {...fieldA11y('exp', `line-${idx}-account`, fieldErrors)}
                   />
                 )}

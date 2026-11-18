@@ -25,7 +25,8 @@ process.env.BKA_DATA_DIR = TEST_DIR;
 process.env.BKA_AUTH_SECRET = 'bankrules-routes-secret';
 
 import { closeDb, getDb, type DB } from '@/lib/db';
-import { accounts, bankAccounts, bankTransactions, users } from '@/lib/db/schema';
+import { accounts, bankAccounts, bankTransactions, transactionRules, users } from '@/lib/db/schema';
+import { eq } from 'drizzle-orm';
 import { createSessionToken, hashPassword, SESSION_COOKIE } from '@/lib/auth';
 import { COMPANY_COOKIE } from '@/lib/context';
 import { ROUTE_METHOD_HEADER, ROUTE_PATH_HEADER } from '@/lib/permissions/routes';
@@ -148,14 +149,20 @@ describe('bank rules API', () => {
     expect(body.hits).toHaveLength(1);
   });
 
-  it('categorize returns a learning offer on the 2nd identical choice; accepting it creates a rule', async () => {
+  it('categorize saves a rule on the first choice; without it the 2nd identical choice is offered as a rule', async () => {
     const a = await feed('SHELL OIL 57444 HOUSTON TX', '-40.00');
     const b = await feed('SHELL OIL 12001 AUSTIN TX', '-41.00');
     as(ownerA, 'POST', '/api/bank-transactions/categorize', companyA);
     const r1 = await (await categorizePOST(req('POST', '/api/bank-transactions/categorize', { bankTransactionId: a, accountId: fuel }))).json();
+    // Proactive rules: the first choice already saves a suggest-only rule for the payee.
+    expect(r1.learnedRule).toMatchObject({ action: 'created', pattern: 'SHELL OIL', accountName: 'Fuel' });
     expect(r1.ruleOffer).toBeNull();
     const r2 = await (await categorizePOST(req('POST', '/api/bank-transactions/categorize', { bankTransactionId: b, accountId: fuel }))).json();
-    expect(r2.ruleOffer.question).toBe('Always categorize SHELL OIL as Fuel?');
+    expect(r2.learnedRule).toBeNull();
+    expect(r2.ruleOffer).toBeNull();
+
+    // With that rule deleted, the two choices make the "Always categorize…?" offer again.
+    await db.delete(transactionRules).where(eq(transactionRules.id, r1.learnedRule.ruleId));
 
     as(ownerA, 'GET', '/api/bank-rules/offers', companyA);
     expect((await (await offersGET()).json()).offers).toHaveLength(1);

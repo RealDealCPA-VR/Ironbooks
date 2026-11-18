@@ -245,6 +245,9 @@ export function AddAccountModal({ open, onClose, onCreated, accounts, initial }:
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
+    // Opened from inside another form (Write Checks' Account column, a register row): creating
+    // the account must not also submit that form (React events bubble to it, even through a portal).
+    e.stopPropagation();
     if (numberRequired && !form.code.trim()) { toast('Enter an account number. Your preferences require one.', 'danger'); return; }
     if (!form.name.trim()) { toast('Account name is required.', 'danger'); return; }
     setSaving(true);
@@ -343,6 +346,9 @@ export function AddAccountModal({ open, onClose, onCreated, accounts, initial }:
         {!nonPosting && (
           <TaxLineSelect id="acc-taxline" value={form.taxLine} onChange={(v) => set('taxLine', v)} form={taxForm} />
         )}
+        {/* Enter in a field creates the account: a form with several fields submits on Enter only
+            when it has a submit button, and "Create Account" lives in the dialog footer. */}
+        <button type="submit" className="sr-only" tabIndex={-1} aria-hidden="true" />
       </form>
     </Modal>
   );

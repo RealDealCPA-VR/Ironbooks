@@ -27,7 +27,7 @@
  * "Add automatically" run when the account is opened.
  */
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import { CheckCircle, CreditCard, Inbox, Link2, SlidersHorizontal, Sparkles } from 'lucide-react';
 import {
@@ -51,6 +51,7 @@ import { usePreferences } from '@/lib/usePreferences';
 import { formatCurrency } from '@/lib/money';
 import { formatDate } from '@/lib/dates';
 import { mergePrefills } from '@/lib/bankRules/core';
+import { AccountSelect } from '@/components/AccountSelect';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -140,10 +141,27 @@ interface RuleOffer {
   question: string;
 }
 
+/** A rule saved (or moved to the new account) when a payee was categorized (bankRules.learnRuleFromChoice). */
+interface LearnedRule {
+  action: 'created' | 'updated';
+  ruleId: string;
+  name: string;
+  pattern: string;
+  accountName: string;
+}
+
 interface BulkResult {
   accepted: { bankTransactionId: string }[];
   failed: { bankTransactionId: string; reason: string }[];
   offers: RuleOffer[];
+  learnedRules?: LearnedRule[];
+}
+
+/** "Rule saved: future SHELL OIL lines will suggest Fuel." */
+function learnedRuleMessage(r: LearnedRule): string {
+  return r.action === 'created'
+    ? `Rule saved: future ${r.pattern} lines will suggest ${r.accountName}.`
+    : `Rule updated: future ${r.pattern} lines will now suggest ${r.accountName}.`;
 }
 
 interface ClassRow {
@@ -176,6 +194,11 @@ function ConfidenceBadge({ c }: { c: MatchCandidate }) {
 export default function BankReviewPage() {
   const [bankAccounts, setBankAccounts] = useState<BankAccount[]>([]);
   const [allAccounts, setAllAccounts] = useState<Account[]>([]);
+  // Find-as-you-type account choices for each line (type a name or number, then Tab).
+  const accountChoices = useMemo(
+    () => allAccounts.map((a) => ({ id: a.id, label: `${a.code} — ${a.name}`, terms: [a.code, a.name] })),
+    [allAccounts],
+  );
   const [selectedBankAccountId, setSelectedBankAccountId] = useState('');
   const [transactions, setTransactions] = useState<BankTransaction[]>([]);
   const [tab, setTab] = useState<ReviewTab>('unreviewed');
@@ -230,7 +253,8 @@ export default function BankReviewPage() {
     try {
       const data = await api.get<BankAccount[]>('/api/bank-accounts');
       setBankAccounts(data);
-      setSelectedBankAccountId((prev) => prev || data[0]?.id || '');
+      const wanted = new URLSearchParams(window.location.search).get('bankAccountId');
+      setSelectedBankAccountId((prev) => prev || data.find((b) => b.id === wanted)?.id || data[0]?.id || '');
     } catch {
       toast('Failed to load bank accounts.', 'danger');
     } finally {
@@ -463,7 +487,7 @@ export default function BankReviewPage() {
     const keepsSuggestion = !!sg && sg.accountId === accountId;
     const classId = rowClassId[txn.id] || null;
     withBusy(txn.id, async () => {
-      const res = await api.post<{ transaction?: BankTransaction; ruleOffer: RuleOffer | null }>('/api/bank-transactions/categorize', {
+      const res = await api.post<{ transaction?: BankTransaction; ruleOffer: RuleOffer | null; learnedRule?: LearnedRule | null }>('/api/bank-transactions/categorize', {
         bankTransactionId: txn.id,
         accountId,
         ...(classId ? { classId } : {}),
@@ -476,6 +500,11 @@ export default function BankReviewPage() {
         ...(feedCurrency && fxRate.trim() ? { exchangeRate: fxRate.trim() } : {}),
       });
       toast('Transaction added to register.', 'success');
+      if (res?.learnedRule) {
+        toast(learnedRuleMessage(res.learnedRule), 'info');
+        // The other lines from this payee in the queue take the new rule's suggestion now.
+        void fetchSuggestions(selectedBankAccountId);
+      }
       if (res?.ruleOffer) {
         const offer = res.ruleOffer;
         setOffers((prev) => [offer, ...prev.filter((o) => !(o.pattern === offer.pattern && o.direction === offer.direction))]);
@@ -587,6 +616,14 @@ export default function BankReviewPage() {
         r.failed.length && !r.accepted.length ? 'danger' : 'success',
       );
       setBulkFailures(r.failed);
+      if (r.learnedRules?.length) {
+        toast(
+          r.learnedRules.length === 1
+            ? learnedRuleMessage(r.learnedRules[0])
+            : `${r.learnedRules.length} rules saved: future lines from these payees will be pre-filled.`,
+          'info',
+        );
+      }
       if (r.offers) setOffers(r.offers);
       await fetchTransactions(selectedBankAccountId);
     } catch (err) {
@@ -779,21 +816,23 @@ export default function BankReviewPage() {
         {/* Mode panel */}
         {mode === 'add' ? (
           <div className="flex items-center gap-2 flex-wrap">
-            <Select
-              className="min-w-[180px]"
-              value={rowAccountId[txn.id] ?? ''}
-              onChange={(e) => {
-                touchedAccount.current.add(txn.id);
-                setRowAccountId((prev) => ({ ...prev, [txn.id]: e.target.value }));
-              }}
-            >
-              <option value="">Select account…</option>
-              {allAccounts.map((a) => (
-                <option key={a.id} value={a.id}>
-                  {a.code} — {a.name}
-                </option>
-              ))}
-            </Select>
+            {/* Type to find an account; a name not in the chart opens Add Account (Set Up). */}
+            <div className="min-w-[220px]">
+              <AccountSelect
+                aria-label={`Account for ${txn.payee || txn.description || 'transaction'}`}
+                placeholder="Select account…"
+                value={rowAccountId[txn.id] ?? ''}
+                onChange={(id) => {
+                  touchedAccount.current.add(txn.id);
+                  setRowAccountId((prev) => ({ ...prev, [txn.id]: id }));
+                }}
+                choices={accountChoices}
+                accounts={allAccounts}
+                // Money in is usually income; money out an expense.
+                newAccountType={Number(txn.amount) > 0 ? 'income' : 'expense'}
+                onAccountCreated={(a) => setAllAccounts((prev) => [...prev, a as unknown as Account])}
+              />
+            </div>
             {classList.length > 0 && (classOn || !!rowClassId[txn.id]) && (
               <Select
                 aria-label="Class"

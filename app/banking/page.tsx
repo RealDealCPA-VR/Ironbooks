@@ -1,7 +1,8 @@
 'use client';
 
 import { useEffect, useState, useCallback, useRef } from 'react';
-import { Landmark, ListChecks, Plus } from 'lucide-react';
+import Link from 'next/link';
+import { ArrowRight, Landmark, ListChecks, Plus } from 'lucide-react';
 import {
   Button,
   Card,
@@ -606,6 +607,24 @@ export default function BankingPage() {
     await fetchAccounts();
   }
 
+  // Imported lines not yet added to the books (the review queue) for the selected account: the
+  // "Review & categorize" button shows whenever there are some, not only right after an import.
+  const [pendingReview, setPendingReview] = useState(0);
+  useEffect(() => {
+    if (!importBankAccountId) {
+      setPendingReview(0);
+      return;
+    }
+    let live = true;
+    api
+      .get<unknown[]>(`/api/bank-transactions?bankAccountId=${encodeURIComponent(importBankAccountId)}&filter=unreviewed`)
+      .then((rows) => live && setPendingReview(Array.isArray(rows) ? rows.length : 0))
+      .catch(() => live && setPendingReview(0));
+    return () => {
+      live = false;
+    };
+  }, [importBankAccountId, importSummary]);
+
   // Auto-select first bank account for import when list loads
   useEffect(() => {
     if (bankAccounts.length > 0 && !importBankAccountId) {
@@ -1177,7 +1196,7 @@ export default function BankingPage() {
             )}
           </div>
 
-          <div className={`flex items-center gap-4 ${importFileType === 'statement' && !importSummary ? 'hidden' : ''}`}>
+          <div className={`flex flex-wrap items-center gap-4 ${importFileType === 'statement' && !importSummary ? 'hidden' : ''}`}>
             <Button type="submit" loading={importing} className={BINARY_KINDS.includes(importFileType) ? 'hidden' : undefined}>
               {importFileType === 'csv' ? 'Commit Import' : 'Import'}
             </Button>
@@ -1193,6 +1212,25 @@ export default function BankingPage() {
               </div>
             )}
           </div>
+          {/* Next step: imported lines wait in Review bank transactions until each gets its
+              account — they are not in the books yet. Rules pre-fill the payees seen before. */}
+          {pendingReview > 0 && (
+            <div className="flex flex-wrap items-center gap-3 rounded-lg border border-electric/30 bg-electric/5 px-4 py-3">
+              <p className="text-sm text-navy">
+                <b>
+                  {pendingReview} imported transaction{pendingReview === 1 ? ' is' : 's are'} not in your books yet.
+                </b>{' '}
+                Give each one its account (and payee) to add it.
+              </p>
+              <Link
+                href={`/bank-review?bankAccountId=${encodeURIComponent(importBankAccountId)}`}
+                className="ml-auto inline-flex items-center gap-2 rounded-lg bg-electric px-4 py-2 text-sm font-semibold text-white shadow-sm hover:brightness-110 focus:outline-none focus:ring-2 focus:ring-electric/40"
+              >
+                Review &amp; categorize {pendingReview} transaction{pendingReview === 1 ? '' : 's'}
+                <ArrowRight className="h-4 w-4" aria-hidden />
+              </Link>
+            </div>
+          )}
         </form>
       </Card>
 

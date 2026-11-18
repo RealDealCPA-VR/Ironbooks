@@ -1,6 +1,6 @@
 'use client';
 
-import { Suspense, useEffect, useState, useCallback } from 'react';
+import { Suspense, useEffect, useState, useCallback, useMemo } from 'react';
 import AttachmentPanel from '@/components/AttachmentPanel'; // J9 Doc Center
 import { Landmark, Pencil, Plus, Trash2 } from 'lucide-react';
 import {
@@ -41,6 +41,7 @@ import { amountMessage, collectErrors, dateMessage, hasErrors, requiredMessage, 
 import { TransactionNav, useAdjacentTransactions } from '@/components/TransactionNav';
 // QB Make Deposits "Received From": any customer, vendor, employee or Other Name.
 import { TypeaheadSelect } from '@/components/TypeaheadSelect';
+import { AccountSelect } from '@/components/AccountSelect';
 import { loadNames } from '@/components/RegisterEntryRow';
 
 import {
@@ -90,6 +91,8 @@ interface MakeDepositModalProps {
   onCreated: () => void;
   bankAccounts: Account[];
   allAccounts: Account[];
+  /** An account was set up from an extra line's account ("Account Not Found — Set Up"). */
+  onAccountCreated?: (account: Account) => void;
   undepositedItems: UndepositedItem[];
   loadingItems: boolean;
   /** When set, the modal edits this saved deposit (PATCH). */
@@ -113,6 +116,7 @@ function MakeDepositModal({
   onCreated,
   bankAccounts,
   allAccounts,
+  onAccountCreated,
   undepositedItems: freeItems,
   loadingItems,
   editing,
@@ -136,6 +140,11 @@ function MakeDepositModal({
   const [methodFilter, setMethodFilter] = useState('all');
   const [extraLines, setExtraLines] = useState<ExtraLine[]>([]);
   const [nameChoices, setNameChoices] = useState<Array<{ id: string; label: string; hint: string }>>([]);
+  // Extra lines' "from account": find-as-you-type, and a name not in the chart sets one up.
+  const extraAccountChoices = useMemo(
+    () => allAccounts.map((a) => ({ id: a.id, label: `${a.code} — ${a.name}`, terms: [a.code, a.name] })),
+    [allAccounts],
+  );
   useEffect(() => {
     if (!open) return;
     const hints = { vendor: 'Vendor', customer: 'Customer', employee: 'Employee', other: 'Other' } as const;
@@ -605,19 +614,17 @@ function MakeDepositModal({
               {extraLines.map((l, idx) => (
                 <div key={idx} data-grid-row className="flex gap-2 items-center">
                   <div className="flex-1 min-w-0">
-                    <Select
+                    <AccountSelect
                       value={l.accountId}
-                      onChange={(e) => patchExtraLine(idx, { accountId: e.target.value })}
+                      onChange={(id) => patchExtraLine(idx, { accountId: id })}
                       aria-label={`Extra line ${idx + 1} account`}
+                      placeholder="From account…"
                       {...fieldA11y('dep', `extra-${idx}-account`, fieldErrors)}
-                    >
-                      <option value="">From account…</option>
-                      {allAccounts.map((a) => (
-                        <option key={a.id} value={a.id}>
-                          {a.code} — {a.name}
-                        </option>
-                      ))}
-                    </Select>
+                      choices={extraAccountChoices}
+                      accounts={allAccounts}
+                      newAccountType="income"
+                      onAccountCreated={(a) => onAccountCreated?.(a as unknown as Account)}
+                    />
                   </div>
                   <div className="flex-1 min-w-0">
                     <TypeaheadSelect
@@ -1032,6 +1039,7 @@ function DepositsPageContent() {
         prefill={prefill}
         bankAccounts={bankAccounts}
         allAccounts={accounts}
+        onAccountCreated={(a) => setAccounts((prev) => [...prev, a])}
         undepositedItems={undepositedItems}
         loadingItems={loadingItems}
       />

@@ -22,7 +22,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
 import { categorize } from '@/lib/services/bankCategorize';
-import { offerForTransaction } from '@/lib/services/bankRules';
+import { learnRuleFromChoice, offerForTransaction } from '@/lib/services/bankRules';
 import { splitSchema } from '@/lib/bankRules/schemas';
 import { serviceErrorStatus, requireJsonObject } from '@/lib/routeErrors';
 
@@ -62,9 +62,11 @@ export async function POST(req: NextRequest) {
       source: 'user',
     });
 
-    // bankrules: offer to turn a repeated choice into a rule (best effort — never fails the post).
-    const ruleOffer = await offerForTransaction(ctx, bankTransactionId).catch(() => null);
-    return NextResponse.json({ ...result, ruleOffer });
+    // Proactive rules: this payee gets a suggest-only rule now, so the next import is pre-filled
+    // (best effort — never fails the post). A choice a rule already covers may still be offered.
+    const learnedRule = await learnRuleFromChoice(ctx, bankTransactionId).catch(() => null);
+    const ruleOffer = learnedRule ? null : await offerForTransaction(ctx, bankTransactionId).catch(() => null);
+    return NextResponse.json({ ...result, ruleOffer, learnedRule });
   } catch (err) {
     if (err instanceof ServiceError) return errResponse(err);
     console.error('[POST /api/bank-transactions/categorize]', err);

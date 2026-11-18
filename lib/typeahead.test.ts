@@ -131,8 +131,10 @@ describe('transaction line grids use the find-as-you-type picker (review P2)', (
       const label = 'aria-label={`Line ${idx + 1} ' + c + '`}';
       const at = src.indexOf(label);
       expect(at, `${file}: ${c} picker`).toBeGreaterThan(0);
-      // The aria-label belongs to a TypeaheadSelect (it is the first prop after the tag).
-      expect(src.slice(src.lastIndexOf('<', at), at).trim()).toBe(opener);
+      // The aria-label belongs to a TypeaheadSelect (it is the first prop after the tag). The
+      // account column is an AccountSelect: a TypeaheadSelect with "Account Not Found — Set Up".
+      const tag = src.slice(src.lastIndexOf('<', at), at).trim();
+      expect(c === 'account' ? ['<AccountSelect', opener] : [opener]).toContain(tag);
     }
   });
 

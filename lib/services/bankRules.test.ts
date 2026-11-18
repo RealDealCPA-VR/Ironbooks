@@ -419,6 +419,11 @@ describe('bank rules that learn', () => {
     });
 
     it('accept all high-confidence takes only lines ≥ 90% (recomputed on the server)', async () => {
+      // The bulk accepts above saved a rule for STAPLES (proactive rules); without it the mixed
+      // STAPLES history is the low-confidence line this test needs.
+      await db
+        .delete(transactionRules)
+        .where(and(eq(transactionRules.companyId, ctx.companyId), eq(transactionRules.matchValue, 'STAPLES'), eq(transactionRules.learned, true)));
       const sure = await feed('SHELL OIL 4040 WACO TX', '-22.00', '2025-03-25');
       const unsure = await feed('STAPLES 0100', '-12.00', '2025-03-25');
       const before = await suggestForAccount(ctx, bankAccountId, { bankTransactionIds: [sure, unsure], localModel: false });
@@ -437,15 +442,19 @@ describe('bank rules that learn', () => {
       await expect(suggestForAccount(other, bankAccountId)).rejects.toThrow(/not found/);
     });
 
-    it('bulk-accepted (history) choices teach the engine; rule-based ones do not double count', async () => {
+    it('bulk-accepted (hand-picked) choices save a rule for the payee right away', async () => {
       const a = await feed('OFFICE DEPOT 1', '-5.00', '2025-03-26');
       const b = await feed('OFFICE DEPOT 2', '-6.00', '2025-03-26');
-      await bulkAccept(
+      const res = await bulkAccept(
         ctx,
         { items: [{ bankTransactionId: a, accountId: office }, { bankTransactionId: b, accountId: office }] },
         { localModel: false },
       );
-      expect((await ruleOffers(ctx)).some((o) => o.pattern === 'OFFICE DEPOT' && o.accountId === office)).toBe(true);
+      // One rule for the payee (the second line is already covered by it) — no offer left to click.
+      expect(res.learnedRules.filter((l) => l.pattern === 'OFFICE DEPOT')).toHaveLength(1);
+      const rule = (await listBankRules(ctx)).find((r) => r.matchValue === 'OFFICE DEPOT')!;
+      expect(rule).toMatchObject({ setAccountId: office, mode: 'suggest', learned: true });
+      expect((await ruleOffers(ctx)).some((o) => o.pattern === 'OFFICE DEPOT')).toBe(false);
     });
   });
 

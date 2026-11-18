@@ -22,7 +22,16 @@ import { accounts, bankAccounts, bankTransactions } from '@/lib/db/schema';
 import { Money } from '@/lib/money';
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
 import { categorize, resyncFeedMatches } from './bankCategorize';
-import { activeBankRules, loadHistory, noteRuleApplied, ruleOffers, type BankRule, type RuleOffer } from './bankRules';
+import {
+  activeBankRules,
+  learnRuleFromChoice,
+  loadHistory,
+  noteRuleApplied,
+  ruleOffers,
+  type BankRule,
+  type LearnedRule,
+  type RuleOffer,
+} from './bankRules';
 import {
   HIGH_CONFIDENCE,
   RULE_CONFIDENCE,
@@ -290,6 +299,8 @@ export interface BulkAcceptResult {
   failed: { bankTransactionId: string; reason: string; code: string }[];
   /** Learning offers that became available after this batch. */
   offers: RuleOffer[];
+  /** Rules saved (or moved to the newly chosen account) for the payees accepted by hand. */
+  learnedRules: LearnedRule[];
 }
 
 const MAX_BULK = 1000;
@@ -306,7 +317,7 @@ export async function bulkAccept(
   input: BulkAcceptInput,
   suggestOpts: Pick<SuggestOptions, 'localModel' | 'now'> = {},
 ): Promise<BulkAcceptResult> {
-  const result: BulkAcceptResult = { accepted: [], failed: [], offers: [] };
+  const result: BulkAcceptResult = { accepted: [], failed: [], offers: [], learnedRules: [] };
   type Plan = { item: BulkItem; suggestion: LineSuggestion | null; known: boolean };
   const plans: Plan[] = [];
 
@@ -400,6 +411,12 @@ export async function bulkAccept(
         code: err instanceof ServiceError ? err.code : 'ERROR',
       });
     }
+  }
+
+  // Proactive rules for the payees accepted here (not lines a rule already decided).
+  for (const a of result.accepted) {
+    const learned = await learnRuleFromChoice(ctx, a.bankTransactionId).catch(() => null);
+    if (learned) result.learnedRules.push(learned);
   }
 
   if (result.accepted.length > 0) {

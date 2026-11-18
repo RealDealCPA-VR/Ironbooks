@@ -36,6 +36,7 @@ import {
 } from '@/components/ui';
 import { Help } from '@/components/Help';
 import { TypeaheadSelect } from '@/components/TypeaheadSelect';
+import { AccountSelect } from '@/components/AccountSelect';
 import type { TypeaheadChoice } from '@/lib/typeahead';
 import { computeJournalBalance, journalPayloadLines } from '@/lib/journalBalance';
 import { api } from '@/lib/client';
@@ -191,6 +192,8 @@ interface EntryFormModalProps {
   editEntry: EntryDetail | null;
   /** QB's Previous / Next / Revert / Journal toolbar (components/TransactionNav.tsx). */
   nav?: React.ReactNode;
+  /** An account was set up from a line's Account column ("Account Not Found — Set Up"). */
+  onAccountCreated?: (account: Account) => void;
 }
 
 /** Which kind of name a line's account requires (QB: A/R needs a customer, A/P a vendor). */
@@ -203,7 +206,17 @@ function requiredNameKind(acct: Account | undefined): 'customer' | 'vendor' | nu
   return null;
 }
 
-function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, editEntry, nav = null }: EntryFormModalProps) {
+function EntryFormModal({
+  open,
+  onClose,
+  onSaved,
+  accounts,
+  classes,
+  names,
+  editEntry,
+  nav = null,
+  onAccountCreated,
+}: EntryFormModalProps) {
   const [date, setDate] = useState(todayISO());
   const [description, setDescription] = useState('');
   const [reference, setReference] = useState('');
@@ -555,12 +568,14 @@ function EntryFormModal({ open, onClose, onSaved, accounts, classes, names, edit
         <div className="flex flex-col gap-2" onKeyDown={grid.onKeyDown}>
           {lines.map((line, idx) => (
             <div key={line.id} data-grid-row className={`grid ${gridCols} gap-2 items-center`}>
-              <TypeaheadSelect
+              <AccountSelect
                 aria-label={`Line ${idx + 1} account`}
                 placeholder="— Select account —"
                 value={line.accountId}
                 onChange={(id) => updateLine(line.id, 'accountId', id)}
                 choices={accountChoices}
+                accounts={accounts}
+                onAccountCreated={(a) => onAccountCreated?.(a as unknown as Account)}
               />
 
               <TypeaheadSelect
@@ -1051,6 +1066,7 @@ function JournalPageContent() {
         }}
         onSaved={fetchEntries}
         accounts={accounts}
+        onAccountCreated={(a) => setAccounts((prev) => [...prev, a])}
         classes={classes}
         names={names}
         editEntry={editTarget}
