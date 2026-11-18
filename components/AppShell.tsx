@@ -41,7 +41,8 @@ import { openDialog, selectedRow } from '@/lib/keyboardTargets';
 import { COMPANY_RENAMED_EVENT, type CompanyRenamed } from '@/lib/companyRename';
 import { toast } from '@/components/ui';
 import { usePickerKeys } from '@/lib/menuKeys';
-import { Briefcase, Building2, ChevronDown, ChevronRight, LogOut, Search, Sparkles } from 'lucide-react';
+import { Briefcase, Building2, ChevronDown, ChevronRight, LogOut, PanelLeftClose, PanelLeftOpen, Search, Sparkles } from 'lucide-react';
+import { railClasses, railKey } from '@/lib/navRail';
 
 // Routes that render without the app chrome (full-screen).
 const BARE = ['/login', '/signup', '/onboarding', '/reset-password', '/portal', '/unlock', '/m', '/change-password'];
@@ -564,6 +565,7 @@ function NavItems({
   collapsed,
   onToggle,
   qbNames,
+  rail = false,
 }: {
   groups: NavGroup[];
   pathname: string;
@@ -572,7 +574,10 @@ function NavItems({
   onToggle: (heading: string) => void;
   /** My Preferences "Use QuickBooks names in the menu". */
   qbNames: boolean;
+  /** The menu is collapsed to its icons (lib/navRail.ts). */
+  rail?: boolean;
 }) {
+  const rc = (classes: string) => railClasses(classes, rail);
   const router = useRouter();
   // A plain click (or Enter) on a menu link asks before leaving a form being typed on the page;
   // Ctrl / Shift / middle clicks keep the browser's own behavior.
@@ -598,21 +603,21 @@ function NavItems({
                     aria-expanded={!isCollapsed}
                     aria-controls={listId}
                     onClick={() => onToggle(group.heading)}
-                    className="hidden lg:flex w-full items-center justify-between rounded px-3 pt-3 pb-1 text-[11px] font-semibold text-navy/40 hover:text-navy outline-none focus-visible:ring-2 focus-visible:ring-electric/50"
+                    className={rc('hidden lg:flex w-full items-center justify-between rounded px-3 pt-3 pb-1 text-[11px] font-semibold text-navy/40 hover:text-navy outline-none focus-visible:ring-2 focus-visible:ring-electric/50')}
                   >
                     {group.heading}
                     {isCollapsed ? <ChevronRight className="h-3 w-3" aria-hidden="true" /> : <ChevronDown className="h-3 w-3" aria-hidden="true" />}
                   </button>
                 ) : (
-                  <div className="hidden lg:block px-3 pt-3 pb-1 text-[11px] font-semibold text-navy/40">
+                  <div className={rc('hidden lg:block px-3 pt-3 pb-1 text-[11px] font-semibold text-navy/40')}>
                     {group.heading}
                   </div>
                 )}
                 {/* Collapsed mode: divider stands in for the group heading. */}
-                <div className="lg:hidden mx-2 my-2 border-t border-slate-200/70" aria-hidden="true" />
+                <div className={rc('lg:hidden mx-2 my-2 border-t border-slate-200/70')} aria-hidden="true" />
               </>
             )}
-            <div id={listId} className={isCollapsed ? 'lg:hidden' : ''}>
+            <div id={listId} className={rc(isCollapsed ? 'lg:hidden' : '')}>
               {group.links.map((nav) => {
                 const Icon = nav.icon;
                 const active = pathname === nav.path || pathname.startsWith(nav.path + '/');
@@ -630,14 +635,14 @@ function NavItems({
                           : nav.label
                     }
                     aria-current={active ? 'page' : undefined}
-                    className={`relative flex items-center justify-center lg:justify-start gap-2.5 px-2 lg:px-2.5 py-1.5 rounded-lg transition-colors cursor-pointer outline-none focus-visible:ring-2 focus-visible:ring-electric/50 ${
+                    className={rc(`relative flex items-center justify-center lg:justify-start gap-2.5 px-2 lg:px-2.5 py-1.5 rounded-lg transition-colors cursor-pointer outline-none focus-visible:ring-2 focus-visible:ring-electric/50 ${
                       active
                         ? 'bg-electric/[.13] text-electric font-medium'
                         : 'text-navy/80 hover:text-navy hover:bg-navy/[.05]'
-                    }`}
+                    }`)}
                   >
                     <Icon className={`h-[17px] w-[17px] shrink-0 ${active ? '' : 'text-electric/80'}`} />
-                    <span className="hidden lg:inline-block text-sm">{menuLabel(nav, qbNames)}</span>
+                    <span className={rc('hidden lg:inline-block text-sm')}>{menuLabel(nav, qbNames)}</span>
                     {nav.path === '/attention' && <AttentionBadge />}
                   </Link>
                 );
@@ -713,6 +718,19 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       return next;
     });
   }
+  // The left menu collapsed to its icons (the Collapse / Expand button at its top), remembered
+  // on this computer for this user. Narrow windows always show the icons.
+  const [rail, setRail] = React.useState(false);
+  React.useEffect(() => {
+    setRail(readLocal(railKey(me?.id)) === '1');
+  }, [me?.id]);
+  function toggleRail() {
+    setRail((prev) => {
+      writeLocal(railKey(me?.id), prev ? '0' : '1');
+      return !prev;
+    });
+  }
+  const rc = (classes: string) => railClasses(classes, rail);
   const visibleGroups = React.useMemo(
     () => visibleNavGroups(navMode, me?.permissions, hiddenPaths),
     [navMode, me?.permissions, hiddenPaths],
@@ -747,19 +765,46 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
     <div className="min-h-screen flex bg-offwhite">
       <aside
         data-shell-chrome
-        className="w-20 lg:w-60 sticky top-[var(--titlebar-h)] h-screen bg-chrome/80 backdrop-blur-xl z-10 flex flex-col pt-4 pb-3 px-2 lg:px-3 border-r border-slate-200/80"
+        data-nav-rail={rail ? 'collapsed' : 'expanded'}
+        className={rc('w-20 lg:w-60 sticky top-[var(--titlebar-h)] h-screen bg-chrome/80 backdrop-blur-xl z-10 flex flex-col pt-4 pb-3 px-2 lg:px-3 border-r border-slate-200/80')}
       >
-        <div className="flex items-center justify-center lg:justify-start gap-2.5 lg:px-2 mb-4 shrink-0">
+        <div className={rc('flex items-center justify-center lg:justify-start gap-2.5 lg:px-2 mb-4 shrink-0')}>
           <div className="rounded-[10px] bg-gradient-to-b from-electric/85 to-electric h-9 w-9 flex items-center justify-center shadow-sm">
             <Briefcase className="text-white h-[18px] w-[18px]" />
           </div>
-          <h1 className="text-navy font-semibold text-lg tracking-tight leading-tight hidden lg:block">
+          <h1 className={rc('text-navy font-semibold text-lg tracking-tight leading-tight hidden lg:block')}>
             Ironbooks
           </h1>
+          {/* Collapse the menu to its icons (wide windows; narrow ones always show the icons). */}
+          {!rail && (
+            <button
+              type="button"
+              onClick={toggleRail}
+              title="Collapse the menu"
+              aria-label="Collapse the menu"
+              aria-expanded="true"
+              className="hidden lg:flex ml-auto h-7 w-7 items-center justify-center rounded-md text-navy/40 hover:text-navy hover:bg-navy/[.06] outline-none focus-visible:ring-2 focus-visible:ring-electric/50"
+            >
+              <PanelLeftClose className="h-4 w-4" aria-hidden="true" />
+            </button>
+          )}
         </div>
-        <MenuModeToggle mode={navMode} onChange={changeMode} />
+        {rail && (
+          <button
+            type="button"
+            onClick={toggleRail}
+            title="Expand the menu"
+            aria-label="Expand the menu"
+            aria-expanded="false"
+            className="hidden lg:flex mx-auto -mt-2 mb-3 h-7 w-7 items-center justify-center rounded-md text-navy/40 hover:text-navy hover:bg-navy/[.06] outline-none focus-visible:ring-2 focus-visible:ring-electric/50"
+          >
+            <PanelLeftOpen className="h-4 w-4" aria-hidden="true" />
+          </button>
+        )}
+        {/* Collapsed: the menu switch and page search are in the top bar, as on a narrow window. */}
+        {!rail && <MenuModeToggle mode={navMode} onChange={changeMode} />}
         {/* prefsperms A2: My Preferences > Search "Show the search box in the menu". */}
-        {prefs.my.showSearchBox && (
+        {!rail && prefs.my.showSearchBox && (
           <SidebarSearch permissions={me?.permissions} hiddenPaths={hiddenPaths} everything={prefs.my.searchDefault === 'everything'} />
         )}
         <nav
@@ -773,27 +818,29 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             collapsed={collapsed}
             onToggle={toggleGroup}
             qbNames={prefs.my.quickBooksNames}
+            rail={rail}
           />
           {navMode === 'simple' && (
             <button
               type="button"
               onClick={() => changeMode('advanced')}
-              className="hidden lg:block mt-1 px-3 py-2 text-left text-xs font-semibold text-electric hover:underline outline-none focus-visible:ring-2 focus-visible:ring-electric/50 rounded"
+              className={rc('hidden lg:block mt-1 px-3 py-2 text-left text-xs font-semibold text-electric hover:underline outline-none focus-visible:ring-2 focus-visible:ring-electric/50 rounded')}
             >
               Show all menus…
             </button>
           )}
         </nav>
         <div className="shrink-0 pt-3 mt-1 border-t border-slate-200/70">
-          <BackupIndicator />
+          <BackupIndicator rail={rail} />
           <button
             onClick={logout}
-            className="flex items-center justify-center lg:justify-start gap-2.5 text-navy/60 hover:text-red-500 hover:bg-red-50 px-2 lg:px-2.5 py-1.5 rounded-lg w-full transition-colors outline-none focus-visible:ring-2 focus-visible:ring-electric/50"
+            title="Sign out"
+            className={rc('flex items-center justify-center lg:justify-start gap-2.5 text-navy/60 hover:text-red-500 hover:bg-red-50 px-2 lg:px-2.5 py-1.5 rounded-lg w-full transition-colors outline-none focus-visible:ring-2 focus-visible:ring-electric/50')}
           >
             <LogOut className="h-[17px] w-[17px] shrink-0" />
-            <span className="hidden lg:inline-block text-sm">Sign out</span>
+            <span className={rc('hidden lg:inline-block text-sm')}>Sign out</span>
           </button>
-          <div className="hidden lg:block px-2.5 pt-2 text-[10px] text-navy/35">
+          <div className={rc('hidden lg:block px-2.5 pt-2 text-[10px] text-navy/35')}>
             Ironbooks v{process.env.NEXT_PUBLIC_APP_VERSION}
           </div>
         </div>
@@ -816,11 +863,11 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
               permissions={me?.permissions}
               hiddenPaths={hiddenPaths}
               idPrefix="ts"
-              className="relative w-48 sm:w-64 lg:hidden"
+              className={rc('relative w-48 sm:w-64 lg:hidden')}
               everything={prefs.my.searchDefault === 'everything'}
             />
           )}
-          <MenuModeToggle mode={navMode} onChange={changeMode} className="flex lg:hidden w-40" />
+          <MenuModeToggle mode={navMode} onChange={changeMode} className={rc('flex lg:hidden w-40')} />
           <CommandBarButton />
           <button
             type="button"

@@ -11,6 +11,7 @@
  * also keeps the server's scheduled-backup timer running. People without File Utilities access
  * get a 403 and see neither.
  */
+import { railClasses } from '@/lib/navRail';
 import * as React from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
@@ -85,7 +86,7 @@ function useBackupStatus(): BackupStatusDto | null {
   return status;
 }
 
-export function BackupIndicator() {
+export function BackupIndicator({ rail = false }: { rail?: boolean } = {}) {
   const status = useBackupStatus();
   if (!status) return null;
   const warn = status.warn;
@@ -98,11 +99,12 @@ export function BackupIndicator() {
       title={detail}
       aria-label={`${text}${warn ? ' (needs attention)' : ''}. ${detail}`}
       className={cn(
-        'flex items-center justify-center lg:justify-start gap-2 px-2 lg:px-3 py-1.5 mb-1 rounded-lg text-xs font-medium transition-colors outline-none focus-visible:ring-2 focus-visible:ring-electric/50',
+        // Collapsed menu (lib/navRail.ts): the icon only, as on a narrow window.
+        railClasses('flex items-center justify-center lg:justify-start gap-2 px-2 lg:px-3 py-1.5 mb-1 rounded-lg text-xs font-medium transition-colors outline-none focus-visible:ring-2 focus-visible:ring-electric/50', rail),
         warn ? 'text-amber-700 bg-amber-50 hover:bg-amber-100' : 'text-navy/60 hover:bg-slate-50 hover:text-navy',
       )}
     >
-      <span className="hidden lg:inline truncate">{text}</span>
+      <span className={railClasses('hidden lg:inline truncate', rail)}>{text}</span>
       <Icon aria-hidden="true" className={cn('h-4 w-4 shrink-0', warn ? 'text-amber-600' : 'text-emerald-600')} />
     </Link>
   );
