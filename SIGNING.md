@@ -28,27 +28,40 @@ GitHub repository; with none, releases are built unsigned exactly as before.
    build while it builds. If only some of the settings are there, the release stops with a
    message naming the missing one instead of shipping unsigned.
 
-The publisher name is also written into the app's update settings: from the first signed
-release on, installed copies accept only updates signed by that publisher, so keep signing
-turned on for later releases. Copies of unsigned versions (1.6.0 and earlier) update to the
-signed release as usual. Azure's certificates last only a few days and renew themselves;
-nothing needs replacing each year.
+Azure's certificates last only a few days and renew themselves; nothing needs replacing each
+year.
 
 **SignPath Foundation (free for open source — the route this project applied for):**
 1. When the SignPath application is approved, create the project and a signing policy there.
 2. Repository → Settings → Secrets and variables → Actions:
    - secret `SIGNPATH_API_TOKEN` — a SignPath CI user's API token;
    - variable `SIGNPATH_ORGANIZATION_ID`;
+   - variable `SIGNPATH_PUBLISHER_NAME` — the publisher on the SignPath certificate, exactly as
+     the certificate shows it (its CN). SignPath signs after the build, so the workflow cannot
+     read the name from the certificate and needs it here. Check it against a file SignPath has
+     signed: `(Get-AuthenticodeSignature .\file.exe).SignerCertificate.Subject` shows `CN=…`.
+     A wrong name makes installed copies refuse every later update;
    - variables `SIGNPATH_PROJECT_SLUG` (default `Ironbooks`) and `SIGNPATH_SIGNING_POLICY_SLUG`
      (default `release-signing`) if yours differ.
-3. Tag a release as usual. The workflow builds the installers, has SignPath sign them, rebuilds
-   the update feed for the signed files (`scripts/refresh-update-info.mjs` — the sha512 and block
-   map change when a file is signed, and installed copies check them), then publishes.
+3. Tag a release as usual. The workflow builds the installers with the publisher name in the
+   app's update settings, has SignPath sign them, rebuilds the update feed for the signed files
+   (`scripts/refresh-update-info.mjs` — the sha512 and block map change when a file is signed,
+   and installed copies check them), then publishes. If `SIGNPATH_API_TOKEN` is set but
+   `SIGNPATH_PUBLISHER_NAME` is not, the release stops with a message instead of shipping.
 
 **A code-signing certificate you bought (OV/EV) as a .pfx file:**
 1. Secrets `WIN_CSC_LINK` (the .pfx, base64-encoded: `[Convert]::ToBase64String([IO.File]::ReadAllBytes("cert.pfx"))`)
    and `WIN_CSC_KEY_PASSWORD`.
-2. Tag a release: electron-builder signs every file while it builds.
+2. Tag a release: electron-builder signs every file while it builds, and reads the publisher
+   name (the certificate's CN) from the .pfx itself.
+
+**Updates check the publisher (all three routes).** The publisher name is written into the
+app's update settings when the release is built: `AZURE_PUBLISHER_NAME` for Azure,
+`SIGNPATH_PUBLISHER_NAME` for SignPath, the certificate's own name for a .pfx. From the first
+signed release on, installed copies accept only updates signed by that publisher, so keep
+signing turned on for later releases and keep the same publisher name: an update signed under a
+different name is refused too. Copies of earlier, unsigned versions update to the first signed
+release as usual.
 
 Signed downloads name the publisher instead of "Unknown publisher". SmartScreen also weighs how
 many people have downloaded a publisher's files, so for a brand-new publisher it can still show

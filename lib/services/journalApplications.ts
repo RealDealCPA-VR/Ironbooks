@@ -725,12 +725,16 @@ export async function applyJournalCredit(
     });
     let rows: ApplicationRow[];
     if (input.chargeLineId) {
+      // Only a line of THIS company's books: the id comes from the request body, and another
+      // company's line must not even tell which side (A/R or A/P) it is on.
       const [line] = await tx.db
         .select({ subtype: accounts.subtype })
         .from(journalEntryLines)
         .innerJoin(accounts, eq(journalEntryLines.accountId, accounts.id))
-        .where(eq(journalEntryLines.id, input.journalLineId));
-      const side: Side = line?.subtype === 'accounts_payable' ? 'ap' : 'ar';
+        .innerJoin(journalEntries, eq(journalEntryLines.journalEntryId, journalEntries.id))
+        .where(and(eq(journalEntryLines.id, input.journalLineId), eq(journalEntries.companyId, tx.companyId)));
+      if (!line) throw notFound('Journal credit');
+      const side: Side = line.subtype === 'accounts_payable' ? 'ap' : 'ar';
       if (opts.side && side !== opts.side) throw notFound('Journal credit');
       const item = await loadItem(tx, side, input.journalLineId);
       rows = await applyJournalOffsets(tx, {

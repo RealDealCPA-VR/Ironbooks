@@ -7,8 +7,10 @@ import { and, eq, sql } from 'drizzle-orm';
 import { requireRole } from './rbac';
 import { accounts, aiSettings, companies, currencies, users, userCompanies } from '@/lib/db/schema';
 import type { ServiceContext } from './_base';
-import { inTransaction, notFound, validation, writeAudit } from './_base';
+import { ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
 import { hashPassword, verifyPassword } from '@/lib/auth';
+import { getRequestOrigin } from '@/lib/net/requestInfo';
+import { GLOBAL_KEY_WEIGHT, attemptKeys, loginLimiter, tooManyAttempts } from '@/lib/net/rateLimit';
 import { assertWrite } from './rbac';
 import { requireEffectivePermission, requirePermission } from './access';
 import { stripSecrets } from '@/lib/permissions/mask';
@@ -422,15 +424,23 @@ export interface ClosingDateSettings {
   closingDate: string | null;
   /** Whether a closing-date password is configured. The hash itself is never returned. */
   hasPassword: boolean;
+  /**
+   * The caller must give the current closing-date password to move the date earlier or to change
+   * or remove the password (a password is set and the caller is not an Admin). Only answered for
+   * a signed-in caller (a context with `access`), so the Set Closing Date dialog knows to ask.
+   */
+  currentPasswordRequired?: boolean;
 }
 
 export async function getClosingDateSettings(ctx: ServiceContext): Promise<ClosingDateSettings> {
   const company = await getCompany(ctx);
   if (!company) throw notFound('company');
   const s = (company.settings ?? {}) as Record<string, unknown>;
+  const hasPassword = Boolean(s.closingDatePasswordHash);
   return {
     closingDate: typeof s.closingDate === 'string' ? s.closingDate : null,
-    hasPassword: Boolean(s.closingDatePasswordHash),
+    hasPassword,
+    ...(ctx.access ? { currentPasswordRequired: hasPassword && !ctx.access.isAdmin } : {}),
   };
 }
 
@@ -442,19 +452,102 @@ export interface SetClosingDateInput {
    * undefined keeps the existing one.
    */
   password?: string | null;
+  /**
+   * The closing-date password in force now. A caller who is not an Admin needs it, when a
+   * password is set, to move the closing date earlier, clear it, or change or remove the password.
+   */
+  currentPassword?: string | null;
 }
 
-/** Set or clear the company closing date + optional password. Admin/owner only. */
+/** Message when the current closing-date password is needed but was not given. */
+export const CLOSING_CURRENT_PASSWORD_NEEDED =
+  'Enter the current closing date password to move the closing date earlier or to change or remove the password. An Admin can do this without it.';
+/** Message when the current closing-date password given is wrong. */
+export const CLOSING_CURRENT_PASSWORD_WRONG = 'The current closing date password is not correct.';
+
+/**
+ * Does this change weaken what the closing-date password protects? Moving the closing date
+ * earlier or clearing it reopens closed books, and replacing or removing the password takes the
+ * protection itself: those need the current password (or an Admin). Keeping the password while
+ * moving the date later (month-end close does that every month) only closes more, so it doesn't.
+ */
+function closingChangeNeedsPassword(before: ClosingDateSettings, input: SetClosingDateInput): boolean {
+  if (!before.hasPassword) return false;
+  if (input.closingDate === null) return true;
+  if (input.password !== undefined) return true;
+  return before.closingDate !== null && input.closingDate < before.closingDate;
+}
+
+/**
+ * Check the current closing-date password given with a change. Guesses share the sign-in-style
+ * limiter and keys of the x-closing-password check in lib/context.ts (per person in this company,
+ * plus the global cap), so they can't be spread over the two ways in.
+ */
+async function assertCurrentClosingPassword(ctx: ServiceContext, hash: string, supplied: string | null | undefined): Promise<void> {
+  if (typeof supplied !== 'string' || supplied === '') {
+    throw new ServiceError('FORBIDDEN', CLOSING_CURRENT_PASSWORD_NEEDED, { currentPasswordRequired: true });
+  }
+  const origin = await getRequestOrigin();
+  const limiter = loginLimiter();
+  const keys = attemptKeys('closing-password', `${ctx.companyId}:${ctx.userId ?? ''}`, origin.addr).filter((k) => !k.includes(':addr:'));
+  const weights = { [keys[keys.length - 1]]: GLOBAL_KEY_WEIGHT };
+  const gate = limiter.begin(keys, Date.now(), weights);
+  if (!gate.allowed) {
+    const secs = Number(tooManyAttempts(gate.retryAfterMs).retryAfter);
+    throw new ServiceError(
+      'FORBIDDEN',
+      `Too many wrong closing-date passwords. Try again in ${secs < 90 ? `${secs} seconds` : `${Math.ceil(secs / 60)} minutes`}.`,
+      { rateLimited: true, retryAfterSeconds: secs },
+    );
+  }
+  try {
+    if (await verifyPassword(supplied, hash)) {
+      limiter.recordSuccess(keys.slice(0, -1));
+      return;
+    }
+    limiter.recordFailure(keys, Date.now(), weights);
+    throw new ServiceError('FORBIDDEN', CLOSING_CURRENT_PASSWORD_WRONG, { currentPasswordRequired: true });
+  } finally {
+    gate.release();
+  }
+}
+
+function closingPasswordHashOf(settings: unknown): string | null {
+  const h = (settings as Record<string, unknown> | null)?.closingDatePasswordHash;
+  return typeof h === 'string' && h ? h : null;
+}
+
+/**
+ * Set or clear the company closing date + optional password (Closing Date / Periods: modify).
+ * Once a password is set, only an Admin or someone who gives the current password may reopen
+ * closed books or change / remove the password (closingChangeNeedsPassword): the password exists
+ * to stop the other roles with this right (Accountant, External Accountant).
+ */
 export async function setClosingDate(
   ctx: ServiceContext,
   input: SetClosingDateInput,
 ): Promise<ClosingDateSettings> {
   // Enterprise roles: Closing Date / Periods — modify (Admin, Accountant, External Accountant,
   // custom roles), same rule as the route map for PATCH /api/company/closing-date.
-  await requireEffectivePermission(ctx, 'closing.closing_date', 'modify');
+  const access = await requireEffectivePermission(ctx, 'closing.closing_date', 'modify');
 
   if (input.closingDate !== null && !isCalendarDay(input.closingDate)) {
     throw validation('closingDate must be a real date in YYYY-MM-DD format (or null to clear).');
+  }
+
+  // The current password, when this change needs it — checked before the transaction (bcrypt is
+  // slow); the transaction then makes sure the password checked is still the one in force.
+  let checkedHash: string | null = null;
+  if (!access.isAdmin) {
+    const company = await getCompany(ctx);
+    if (!company) throw notFound('company');
+    const s = (company.settings ?? {}) as Record<string, unknown>;
+    const hash = closingPasswordHashOf(s);
+    const now: ClosingDateSettings = { closingDate: typeof s.closingDate === 'string' ? s.closingDate : null, hasPassword: Boolean(hash) };
+    if (hash && closingChangeNeedsPassword(now, input)) {
+      await assertCurrentClosingPassword(ctx, hash, input.currentPassword);
+      checkedHash = hash;
+    }
   }
 
   // Hash before the transaction (bcrypt is slow; the database stays free meanwhile).
@@ -474,6 +567,17 @@ export async function setClosingDate(
       closingDate: typeof settings.closingDate === 'string' ? (settings.closingDate as string) : null,
       hasPassword: Boolean(settings.closingDatePasswordHash),
     };
+    // A non-Admin's change is judged again against the settings as they are now: the password
+    // (or closing date) may have been changed since the check above.
+    if (!access.isAdmin && closingChangeNeedsPassword(before, input) && closingPasswordHashOf(settings) !== checkedHash) {
+      throw new ServiceError(
+        'CONFLICT',
+        checkedHash
+          ? 'The closing date password was just changed by someone else. Enter the current one and try again.'
+          : CLOSING_CURRENT_PASSWORD_NEEDED,
+        { currentPasswordRequired: true },
+      );
+    }
 
     let next: ReturnType<typeof sql>;
     if (input.closingDate === null) {
@@ -506,7 +610,7 @@ export async function setClosingDate(
       newValues: { closingDate: after.closingDate, hasPassword: after.hasPassword },
     });
 
-    return after;
+    return ctx.access ? { ...after, currentPasswordRequired: after.hasPassword && !access.isAdmin } : after;
   });
 }
 

@@ -73,11 +73,11 @@ const SEALED_PREFIX = 'sealed/';
  * an earlier save.
  */
 function isExcludedPath(rel) {
-  const p = rel.replace(/\\/g, '/');
+  // Compared the way Windows resolves a name (comparablePath): ".Auth-Secret", ".auth-secret." or
+  // "IRONBOOKS.LOCK" in a crafted file would otherwise land on the real file.
+  const p = comparablePath(rel);
   const base = p.split('/').pop() || '';
-  if (p === 'ironbooks.lock' || p === '.auth-secret' || p === '.ironbooks-sandbox.json' || p === '.ironbooks-protected' || p === 'postmaster.pid') {
-    return true;
-  }
+  if (EXCLUDED_ROOT_FILES.has(p)) return true;
   if (base.startsWith('.ironbooks-clock-')) return true;
   // A lock moved aside during a takeover (lib/db/dirLock.ts) that a crash left behind.
   if (p.startsWith('ironbooks.lock.takeover-')) return true;
@@ -85,7 +85,31 @@ function isExcludedPath(rel) {
   return false;
 }
 
-/** Zip entry names are relative, forward-slash paths with no "..", drive letters or NULs. */
+const EXCLUDED_ROOT_FILES = new Set(['ironbooks.lock', '.auth-secret', '.ironbooks-sandbox.json', '.ironbooks-protected', 'postmaster.pid']);
+
+/**
+ * A relative path as Windows resolves it, for comparing names: forward slashes, each segment
+ * lower-cased (NTFS ignores case), cut at a ':' (the rest names an alternate data stream of the
+ * same file) and without trailing dots and spaces (Windows drops them).
+ */
+function comparablePath(rel) {
+  return String(rel)
+    .replace(/\\/g, '/')
+    .split('/')
+    .map((s) => s.split(':')[0].replace(/[. ]+$/, '').toLowerCase())
+    .join('/');
+}
+
+/** Windows device names: "CON", "nul.txt", "COM1.log" … open a device, never a file. */
+const WINDOWS_DEVICE = /^(con|prn|aux|nul|conin\$|conout\$|com[1-9\u00b9\u00b2\u00b3]|lpt[1-9\u00b9\u00b2\u00b3])$/i;
+
+/**
+ * Zip entry names are relative, forward-slash paths with no "..", drive letters or NULs, and no
+ * segment Windows would read as something else: a ':' (an alternate data stream: "x:y" writes into
+ * "x"), a device name with or without an extension, or a trailing space. (A trailing dot is
+ * allowed: a document stored on another system may keep one — lib/services/attachments.ts
+ * diskSafeName — and it is compared without it in isExcludedPath.)
+ */
 function safeEntryName(name) {
   if (typeof name !== 'string' || !name || name.length > 1024) return null;
   const n = name.replace(/\\/g, '/');
@@ -94,6 +118,10 @@ function safeEntryName(name) {
   const isDir = n.endsWith('/');
   const segs = isDir ? parts.slice(0, -1) : parts;
   if (!segs.length || segs.some((s) => s === '' || s === '.' || s === '..')) return null;
+  for (const s of segs) {
+    if (s.includes(':') || s.endsWith(' ')) return null;
+    if (WINDOWS_DEVICE.test(s.split('.')[0].replace(/ +$/, ''))) return null;
+  }
   return n;
 }
 
@@ -145,6 +173,9 @@ function snapshotDir(dir, { lazyPrefixes = ['attachments/'] } = {}) {
     for (const d of names) {
       const childRel = rel ? `${rel}/${d.name}` : d.name;
       if (isExcludedPath(childRel)) continue;
+      // A name no company file may carry (only possible off Windows: "x:y", "name ", "aux") is
+      // left out, as opening the file would leave it out, instead of failing the save.
+      if (!safeEntryName(d.isDirectory() ? `${childRel}/` : childRel)) continue;
       const childAbs = path.join(abs, d.name);
       if (d.isDirectory()) {
         out.push({ name: `${childRel}/`, dir: true });
@@ -944,15 +975,37 @@ function tooBigError(what) {
   return new NotACompanyFileError(`${what} is larger than any company file can be — the file is damaged or was made to look like one`);
 }
 
-/** Refuse entries (and a whole set of them) that claim more than a company file can hold. */
+/**
+ * Unpacked size against the bytes actually stored. Under the caps above, a ~60 MB crafted file
+ * of zeros (deflate shrinks zeros about 1000 to 1) could still declare and really unpack 64 GB
+ * onto the disk. A real company file is a Postgres folder plus attachments: table data packs
+ * about 3 to 10 to 1, scanned receipts and PDFs barely at all, and only a little of it (empty
+ * WAL segments, free space maps) packs much tighter, so a whole file stays far below 20 to 1.
+ * Above MIN_RATIO_CHECK_BYTES, a file must not unpack to more than MAX_UNPACK_RATIO times what
+ * it stores (5 to 10 times the margin over any real file); below it nothing changes, so small
+ * files of any ratio still open. A hostile file then needs about 1 MB stored per 100 MB written.
+ */
+const MAX_UNPACK_RATIO = 100;
+const MIN_RATIO_CHECK_BYTES = 4 * 1024 * 1024 * 1024;
+
+/**
+ * Refuse entries (and a whole set of them) that claim more than a company file can hold. Entries
+ * that also give their stored size (`csize`) are checked against MAX_UNPACK_RATIO as a set.
+ */
 function checkSizes(entries, limit = MAX_ENTRY_BYTES) {
   let total = 0;
+  let stored = 0;
+  let allStored = true;
   for (const e of entries) {
     const size = Number(e && e.size) || 0;
     if (size < 0 || size > limit) throw tooBigError(e.name || 'An entry');
     total += size;
+    const csize = Number(e && e.csize);
+    if (Number.isFinite(csize) && csize >= 0) stored += csize;
+    else allStored = false;
   }
   if (total > maxTotalBytes()) throw tooBigError('What it unpacks to');
+  if (allStored && total > MIN_RATIO_CHECK_BYTES && total > MAX_UNPACK_RATIO * stored) throw tooBigError('What it unpacks to');
   return total;
 }
 
@@ -1288,7 +1341,12 @@ function sealedPlan(index, list, root) {
 async function extractInto(reader, files, root, notEmptyMessage, decode) {
   // Before anything is written: no entry, and not all of them together, may claim more than a
   // company file can hold (a sealed row's own size, and the encrypted entry that carries it).
-  checkSizes(files.filter((f) => !f.name.endsWith('/')).map((f) => (f.row ? { name: f.name, size: Math.max(Number(f.row.size) || 0, Number(f.e && f.e.size) || 0) } : f.e)));
+  // A sealed entry stores the deflated bytes encrypted, so its zip entry's size is what it stores.
+  checkSizes(
+    files
+      .filter((f) => !f.name.endsWith('/'))
+      .map((f) => (f.row ? { name: f.name, size: Math.max(Number(f.row.size) || 0, Number(f.e && f.e.size) || 0), csize: f.e && f.e.csize } : f.e)),
+  );
   const existed = fs.existsSync(root);
   fs.mkdirSync(root, { recursive: true });
   if (fs.readdirSync(root).length) throw new Error(`${notEmptyMessage}: ${root}`);
@@ -1520,7 +1578,11 @@ function unsealArchiveSync(buffer, fileKey) {
   // Every entry is inflated into memory: none, and not all together, may claim more than a company
   // file can hold (the index's own sizes, and the sealed entries that carry them).
   checkSizes(list);
-  checkSizes(index.entries.filter((r) => r && typeof r.name === 'string' && !r.dir).map((r) => ({ name: r.name, size: r.size })));
+  checkSizes(
+    index.entries
+      .filter((r) => r && typeof r.name === 'string' && !r.dir)
+      .map((r) => ({ name: r.name, size: r.size, csize: byZ.has(r.z) ? byZ.get(r.z).csize : undefined })),
+  );
   const entries = [];
   for (const row of index.entries) {
     if (!row || typeof row.name !== 'string') continue;
@@ -1603,6 +1665,7 @@ module.exports = {
   NotACompanyFileError,
   SealedFileError,
   isExcludedPath,
+  comparablePath,
   safeEntryName,
   crc32,
   snapshotDir,

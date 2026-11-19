@@ -11,7 +11,7 @@ This document lists everything that can leave the machine, and what controls it.
 | What | Leaves the machine? | Controlled by |
 | --- | --- | --- |
 | Company data (books, customers, vendors, payroll, attachments) | **Never stored remotely.** | — |
-| Multi-user hosting | Only to devices on **your** Tailscale tailnet, and only while hosting is on | File > Host multi-user access |
+| Multi-user hosting | Only to devices on **your** Tailscale tailnet, and only while hosting is on. Starting it asks Tailscale for an HTTPS certificate, which makes this computer's `*.ts.net` name public (see below). | File > Host multi-user access |
 | AI (assistant, categorization, AI Review "Analyze") | Model servers on this computer, your LAN or your tailnet by default; a cloud AI provider only if opted in (and then redacted) | AI & Automation (providers) + Privacy & Network → AI assistance |
 | Emailing an invoice | Only the message and PDF you send, to your SMTP server | Privacy & Network → Email |
 | Bank transactions | **Nothing.** Ironbooks never connects to your bank or a feed service; transactions come only from statement files you import. | — |
@@ -25,7 +25,11 @@ This document lists everything that can leave the machine, and what controls it.
 Each company has a network mode (Settings → **Privacy & Network**). Owners and admins can
 change it; every change is written to the audit trail.
 
-- **Offline** — nothing leaves the computer. Email, AI and update checks are off.
+- **Offline** — the app connects to nothing outside the computer. Email, AI and update checks are
+  off. One thing can still happen: if a `*.ts.net` address is saved or used in the app (an AI
+  model server, a mail server, your SearXNG), the app looks that name up through this computer's
+  normal DNS to check that it really is on your tailnet (see below). Only the name is looked up;
+  no connection to it is made.
 - **Local network + tailnet** (default) — the app may talk to:
   - this computer (`127.0.0.0/8`, `::1`, `localhost`),
   - your private LAN (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, IPv6 `fc00::/7`),
@@ -39,7 +43,9 @@ change it; every change is written to the audit trail.
   on; update checks stay on unless you turn them off.
 
 Hostnames other than `localhost` and `*.ts.net` are treated as public internet, because a
-name can resolve anywhere. Link-local and cloud-metadata addresses (`169.254.0.0/16`,
+name can resolve anywhere. A `*.ts.net` name counts as your tailnet only when it resolves to
+Tailscale addresses (Tailscale Funnel publishes public names under `ts.net` too), so the app
+looks such a name up before deciding. Link-local and cloud-metadata addresses (`169.254.0.0/16`,
 `fe80::/10`), multicast and other special ranges are never contacted.
 
 An administrator can cap a machine with the `BKA_NETWORK_MODE` environment variable
@@ -75,9 +81,13 @@ of that cap and the company setting. A value that is set but not recognised coun
     your own web browser.
   - Every request the window makes is filtered. Requests to other origins (CDNs, fonts,
     trackers, third-party bank widgets) are cancelled and logged.
-  - `contextIsolation`, `sandbox` and no Node integration are on. There is no `<webview>`, no
-    permission prompts (camera, microphone, location, notifications), and the spellchecker is
-    off, because Chromium would otherwise download dictionaries.
+  - `contextIsolation`, `sandbox` and no Node integration are on. There is no `<webview>` and
+    no permission prompts (camera, microphone, location, notifications).
+  - Spell check is on (each user can turn it off in My Preferences > Spelling). On Windows and
+    macOS it uses the operating system's own spell checker, so no dictionaries are downloaded.
+    On other systems the dictionary download address points at this computer, where nothing
+    answers, so nothing is downloaded and spell check works only with dictionaries already
+    installed.
   - The page also sends a strict Content-Security-Policy and related headers
     (`next.config.js`).
   - **Updates** are checked unless the company turns off the *App updates* purpose (or is in
@@ -98,9 +108,16 @@ at once (further sign-ins over the network are refused until someone logs out).
   `tailscale ip -4`, or from the network interfaces in `100.64.0.0/10`). The app never listens on
   every interface (`0.0.0.0`) unless you set `hosting.bindAll` in the app config yourself. Even
   then, connections from public addresses are refused.
-- If `tailscale cert` can issue a certificate for the computer's `*.ts.net` name, the host
-  serves HTTPS. Otherwise traffic is plain HTTP inside the tailnet, which Tailscale already
-  encrypts end to end.
+- Each time hosting starts, the app runs `tailscale cert` to get an HTTPS certificate for the
+  computer's `*.ts.net` name. If HTTPS certificates are turned on for your tailnet, Tailscale
+  contacts its own servers and Let's Encrypt to issue it, and the host serves HTTPS. Otherwise
+  traffic is plain HTTP inside the tailnet, which Tailscale already encrypts end to end.
+- **This makes the computer's tailnet name public.** Like every publicly trusted certificate,
+  the one Let's Encrypt issues is recorded in public Certificate Transparency logs, which anyone
+  can search. The computer's full `*.ts.net` name (for example `office-pc.tail1234.ts.net`, the
+  computer's name plus your tailnet's name) is then visible to anyone. Nothing from the company
+  file is in it. To avoid this, leave HTTPS certificates turned off for your tailnet in the
+  Tailscale admin console, or set `hosting.tls` to `false` in the app config.
 - Every request needs a sign-in with a personal user account. Sign-in is rate-limited per
   account, per address and overall (attempts still being checked count too), and the
   company-file password and employee portal sign-in are limited the same way. Failed attempts

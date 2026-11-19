@@ -32,6 +32,18 @@ export const ACTIVE_WINDOW_MS = 15 * 60 * 1000;
 export const TOUCH_INTERVAL_MS = 60 * 1000;
 /** QuickBooks Desktop Enterprise allows up to 40 simultaneous users per company file. */
 export const MAX_CONCURRENT_USERS = 40;
+/**
+ * How long one sign-in lasts at most, counted from the sign-in (the session cookie's own lifetime,
+ * lib/auth.ts, is the same). Enforced here too, on the server's record, so a copied cookie stops
+ * working when its session does, whatever the cookie itself claims.
+ */
+export const SESSION_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+/**
+ * A session not used for this long is ended. Deliberately as long as the sign-in itself: people
+ * keep the app open all day, over weekends and through holidays, and must not be signed out for
+ * walking away. It matters if the sign-in lifetime above is ever made longer.
+ */
+export const SESSION_IDLE_LIMIT_MS = 30 * 24 * 60 * 60 * 1000;
 
 export function isAdminRole(role: ServiceContext['role']): boolean {
   // undefined = trusted internal context (tests / system jobs).
@@ -124,6 +136,8 @@ export async function endUserSessions(
  * Validate a session id taken from a verified cookie and refresh its lastSeenAt (throttled).
  * Returns false when the session doesn't exist, belongs to someone else, or has been ended
  * (logout / signed out by an admin) — the caller then treats the request as signed out.
+ * A session older than SESSION_MAX_AGE_MS, or unused for SESSION_IDLE_LIMIT_MS, is ended here
+ * ('expired'), so it is over on the server too, not only in the cookie.
  */
 export async function touchSession(
   db: DB,
@@ -133,10 +147,22 @@ export async function touchSession(
 ): Promise<boolean> {
   if (!isUuid(sessionId)) return false;
   const [row] = await db
-    .select({ userId: userSessions.userId, endedAt: userSessions.endedAt, lastSeenAt: userSessions.lastSeenAt })
+    .select({
+      userId: userSessions.userId,
+      endedAt: userSessions.endedAt,
+      lastSeenAt: userSessions.lastSeenAt,
+      createdAt: userSessions.createdAt,
+    })
     .from(userSessions)
     .where(eq(userSessions.id, sessionId));
   if (!row || row.userId !== userId || row.endedAt) return false;
+  if (
+    now.getTime() - row.createdAt.getTime() > SESSION_MAX_AGE_MS ||
+    now.getTime() - row.lastSeenAt.getTime() > SESSION_IDLE_LIMIT_MS
+  ) {
+    await endSession(db, sessionId, 'expired');
+    return false;
+  }
   if (now.getTime() - row.lastSeenAt.getTime() >= TOUCH_INTERVAL_MS) {
     await db.update(userSessions).set({ lastSeenAt: now }).where(eq(userSessions.id, sessionId));
   }

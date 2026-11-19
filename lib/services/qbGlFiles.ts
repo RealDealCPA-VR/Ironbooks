@@ -22,6 +22,7 @@ import AdmZip from 'adm-zip';
 import { XMLParser } from 'fast-xml-parser';
 import Papa from 'papaparse';
 import { csvUnsafeText } from '@/lib/csv';
+import { MAX_IMAGE_PIXELS } from '@/lib/receipts/png';
 import { decodeText } from '@/lib/textDecode';
 import { ServiceError } from './_base';
 
@@ -165,6 +166,40 @@ function zipText(zip: AdmZip, entryPath: string): string | null {
  */
 export const XLSX_LIMITS = { entryBytes: 200 * 1024 * 1024, totalBytes: 400 * 1024 * 1024, entries: 5000 } as const;
 
+/**
+ * Grid guards. A cell or row number costs a few bytes of XML but is turned into that many array
+ * slots, so a 700-byte workbook naming row 2,000,000,000 (or column "ZZZZZZZ") used to fill
+ * memory until the process died — and a heap abort cannot be caught. Excel's own grid is
+ * 1,048,576 rows by 16,384 columns (A … XFD), so anything past that is not a real workbook.
+ *
+ * Inside that grid, gaps are still cheap to declare (a cell in column XFD on every row), so the
+ * whole workbook also gets a budget of materialised cells, counting the blank cells that pad a
+ * row out to its last cell and one per row (blank rows included). 20 million is far above any
+ * real export: a 100,000-line General Ledger with QuickBooks' spacer columns is about 3 million,
+ * and a sheet within the 200 MB part limit above holds at most about 7 million real cells
+ * (~30 bytes of XML each). At the cap the grid is a few hundred MB, which the server survives.
+ */
+export const XLSX_GRID_LIMITS = { maxRow: 1_048_576, maxColIndex: 16_383, cells: 20_000_000 } as const;
+
+/**
+ * A blank row standing in for every row a sheet skips. Callers number rows by their position
+ * (row N of the sheet is rows[N - 1], for messages like "Row 12: …"), so the gap must stay, but
+ * one shared frozen row makes it cost one array slot per skipped row instead of a new object.
+ */
+const BLANK_ROW: GridRow = Object.freeze({ cells: Object.freeze([]) as unknown as string[] });
+
+const outsideGrid = () =>
+  fail(
+    'This .xlsx workbook is damaged and could not be read (it refers to a row or column beyond what Excel allows). ' +
+      'Open it in Excel, save it again and upload it again — or export the report as CSV.',
+  );
+
+const tooManyCells = () =>
+  fail(
+    `This .xlsx workbook is too large to read (it holds more than ${XLSX_GRID_LIMITS.cells / 1_000_000} million cells). ` +
+      'Export a shorter date range, or save the report as CSV.',
+  );
+
 function assertReasonableXlsx(zip: AdmZip): void {
   const entries = zip.getEntries();
   if (entries.length > XLSX_LIMITS.entries) throw fail('This .xlsx workbook has too many parts to be a report export.');
@@ -253,6 +288,8 @@ function readWorkbook(zip: AdmZip): GridSheet[] {
 
   const sheetEntries = (workbook.sheets?.sheet ?? []) as Array<Record<string, string>>;
   const sheets: GridSheet[] = [];
+  // One cell budget for the whole workbook (see XLSX_GRID_LIMITS).
+  const budget = { cells: XLSX_GRID_LIMITS.cells };
   sheetEntries.forEach((s, i) => {
     const relId = s['@_id'];
     const partPath = rels.get(relId) ?? `xl/worksheets/sheet${i + 1}.xml`;
@@ -260,7 +297,7 @@ function readWorkbook(zip: AdmZip): GridSheet[] {
     if (!xml) return;
     const name = s['@_name'] ?? `Sheet${i + 1}`;
     const uncalculated: string[] = [];
-    sheets.push({ name, rows: readWorksheet(parser, xml, sharedStrings, dateStyles, date1904, uncalculated) });
+    sheets.push({ name, rows: readWorksheet(parser, xml, sharedStrings, dateStyles, date1904, uncalculated, budget) });
     // A formula whose result was never saved (a workbook written by a script, never opened in
     // Excel) has no value to read: reading it as blank would silently drop an amount.
     if (uncalculated.length) {
@@ -281,19 +318,28 @@ function readWorksheet(
   dateStyles: Set<number>,
   date1904: boolean,
   uncalculated: string[] = [],
+  budget: { cells: number } = { cells: XLSX_GRID_LIMITS.cells },
 ): GridRow[] {
   const ws = parser.parse(xml)?.worksheet ?? {};
   const rowNodes = (ws.sheetData?.row ?? []) as Array<Record<string, unknown>>;
   const out: GridRow[] = [];
+  // Charge the budget BEFORE allocating, so a hostile number is refused, never materialised.
+  const spend = (n: number) => {
+    budget.cells -= n;
+    if (budget.cells < 0) throw tooManyCells();
+  };
   let nextRow = 1;
   for (const rowNode of rowNodes) {
     const rowNum = Number(rowNode['@_r'] ?? nextRow) || nextRow;
+    if (rowNum > XLSX_GRID_LIMITS.maxRow) throw outsideGrid();
     nextRow = rowNum + 1;
     const cells: string[] = [];
     let nextCol = 0;
     for (const c of (rowNode.c ?? []) as Array<Record<string, unknown>>) {
       const ref = c['@_r'] ? parseCellRef(String(c['@_r'])) : null;
       const col = ref ? ref.col : nextCol;
+      // Also catches NaN / Infinity from an absurdly long column name.
+      if (!(col >= 0 && col <= XLSX_GRID_LIMITS.maxColIndex)) throw outsideGrid();
       nextCol = col + 1;
       const t = String(c['@_t'] ?? 'n');
       const raw = textOf(c.v);
@@ -322,10 +368,16 @@ function readWorksheet(
           if (Number.isFinite(serial)) value = excelSerialToDate(serial, date1904);
         }
       }
+      if (col >= cells.length) spend(col + 1 - cells.length);
       while (cells.length < col) cells.push('');
       cells[col] = value;
     }
-    while (out.length < rowNum - 1) out.push({ cells: [] });
+    const skipped = rowNum - 1 - out.length;
+    if (skipped > 0) {
+      spend(skipped);
+      for (let k = 0; k < skipped; k++) out.push(BLANK_ROW);
+    }
+    spend(1);
     out.push({ cells });
   }
   return out;
@@ -368,6 +420,8 @@ export async function readPdfLines(bytes: Uint8Array): Promise<PdfLine[][]> {
       isEvalSupported: false,
       useSystemFonts: false,
       disableFontFace: true,
+      // Only the text is read here; an image larger than this is never decoded (see png.ts).
+      maxImageSize: MAX_IMAGE_PIXELS,
       verbosity: 0,
     }).promise;
   } catch {

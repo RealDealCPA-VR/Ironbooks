@@ -539,6 +539,11 @@ export interface TransactionLogFilter {
   search?: string;
   /** Include the log_started/system records (default true). */
   includeSystem?: boolean;
+  /**
+   * The records the reader may see (lib/services/auditVisibility.ts canSeeLogRecord). The others
+   * are left out before anything is counted: rows, total, and the user and type lists.
+   */
+  visible?: (record: TransactionLogRecord) => boolean;
   limit?: number;
   offset?: number;
 }
@@ -557,8 +562,15 @@ export interface TransactionLogPage {
  * are not in it (the CSV export pages through it, so rows never shift or repeat).
  */
 export function matchTransactionLog(dataDir: string, filter: TransactionLogFilter = {}): TransactionLogRecord[] {
-  const { records } = readAllTransactionLog(dataDir);
-  return matchRecords(records.filter((r) => !filter.companyId || !r.companyId || r.companyId === filter.companyId), filter);
+  return matchRecords(scopeRecords(readAllTransactionLog(dataDir).records, filter), filter);
+}
+
+/** The records a filter's reader may see at all: their company's (or none) and `visible`. */
+function scopeRecords(records: TransactionLogRecord[], filter: TransactionLogFilter): TransactionLogRecord[] {
+  const visible = filter.visible;
+  return records.filter(
+    (r) => (!filter.companyId || !r.companyId || r.companyId === filter.companyId) && (!visible || visible(r)),
+  );
 }
 
 function matchRecords(scoped: TransactionLogRecord[], filter: TransactionLogFilter): TransactionLogRecord[] {
@@ -587,8 +599,7 @@ function matchRecords(scoped: TransactionLogRecord[], filter: TransactionLogFilt
  * genesis record — are always shown).
  */
 export function queryTransactionLog(dataDir: string, filter: TransactionLogFilter = {}): TransactionLogPage {
-  const { records } = readAllTransactionLog(dataDir);
-  const scoped = records.filter((r) => !filter.companyId || !r.companyId || r.companyId === filter.companyId);
+  const scoped = scopeRecords(readAllTransactionLog(dataDir).records, filter);
   const matches = matchRecords(scoped, filter);
   const offset = Math.max(0, filter.offset ?? 0);
   const limit = Math.max(1, Math.min(filter.limit ?? 100, 50_000));

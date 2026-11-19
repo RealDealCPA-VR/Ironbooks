@@ -54,6 +54,8 @@ import { getEmployee, payrollDefaultAccounts } from './payroll';
 import { defaultPayrollLiabilityAccountId } from './liabilityPayments';
 import { getPayrollItemsByIds, resolveItemTracking, type PayrollItem } from './payrollItems';
 import { inferEmployeeTaxTracking, inferEmployerTracking } from './payrollTaxTracking';
+import { maskForContext } from './access';
+import { isMaskedValue } from '@/lib/permissions/mask';
 
 type Dec = ReturnType<typeof Money.zero>;
 
@@ -529,12 +531,17 @@ export interface StateTaxSettingInput {
   accountNumber?: string | null;
 }
 
+/**
+ * The employer's state account numbers come back "••••6789" unless the caller may view full
+ * account numbers (maskForContext), as for vendors, other names and bank accounts.
+ */
 export async function listStateTaxSettings(ctx: ServiceContext) {
-  return ctx.db
+  const rows = await ctx.db
     .select()
     .from(payrollStateSettings)
     .where(eq(payrollStateSettings.companyId, ctx.companyId))
     .orderBy(asc(payrollStateSettings.state), desc(payrollStateSettings.year));
+  return maskForContext(ctx, rows);
 }
 
 /**
@@ -582,7 +589,8 @@ export async function upsertStateTaxSetting(ctx: ServiceContext, input: StateTax
     sdiWageBase: baseOf(input.sdiWageBase, 'Disability wage base'),
     accountNumber: input.accountNumber?.trim() || null,
   };
-  return inTransaction(ctx, async (tx) => {
+  const maskedNumber = isMaskedValue(values.accountNumber);
+  const saved = await inTransaction(ctx, async (tx) => {
     const [existing] = await tx.db
       .select()
       .from(payrollStateSettings)
@@ -593,6 +601,12 @@ export async function upsertStateTaxSetting(ctx: ServiceContext, input: StateTax
           eq(payrollStateSettings.year, input.year),
         ),
       );
+    // The masked number a role without "view full account numbers" was shown, sent back with the
+    // form: keep the stored one. It is never stored as if it were the real number.
+    if (maskedNumber) {
+      if (!existing) throw validation('Enter the full state account number (a masked number cannot be saved).');
+      values.accountNumber = existing.accountNumber;
+    }
     let row;
     if (existing) {
       [row] = await tx.db
@@ -615,10 +629,12 @@ export async function upsertStateTaxSetting(ctx: ServiceContext, input: StateTax
     });
     return row;
   });
+  return maskForContext(ctx, saved);
 }
 
 export async function deleteStateTaxSetting(ctx: ServiceContext, id: string) {
-  return inTransaction(ctx, async (tx) => {
+  // The removed row is answered like the list: account number masked for roles without the right.
+  return maskForContext(ctx, await inTransaction(ctx, async (tx) => {
     const [row] = await tx.db
       .select()
       .from(payrollStateSettings)
@@ -627,7 +643,7 @@ export async function deleteStateTaxSetting(ctx: ServiceContext, id: string) {
     await tx.db.delete(payrollStateSettings).where(eq(payrollStateSettings.id, id));
     await writeAudit(tx, { action: 'delete', entityType: 'payroll_state_setting', entityId: id, oldValues: row });
     return row;
-  });
+  }));
 }
 
 // ---------------------------------------------------------------------------

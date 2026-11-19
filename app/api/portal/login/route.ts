@@ -50,7 +50,7 @@ export async function POST(req: NextRequest) {
           return NextResponse.json({ error: integratedAppOffMessage('employeePortal'), code: 'FORBIDDEN' }, { status: 403 });
         }
         const res = NextResponse.json({ id: emp.id, name: `${emp.firstName} ${emp.lastName}` });
-        res.cookies.set(PORTAL_COOKIE, createPortalToken(emp.id, emp.portalPasswordHash), {
+        res.cookies.set(PORTAL_COOKIE, createPortalToken(emp.id, emp.portalPasswordHash, emp.portalTokenVersion ?? 0), {
           httpOnly: true,
           secure: cookieSecure(origin),
           sameSite: 'lax',

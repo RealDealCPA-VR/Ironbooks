@@ -36,7 +36,8 @@ import {
   SESSION_COOKIE,
   UNLOCK_COOKIE,
 } from '@/lib/auth';
-import { verifyTotp } from '@/lib/totp';
+import { acceptTotpCode } from '@/lib/services/totpCodes';
+import { clearChallengeFailures } from '@/lib/services/challengeLockout';
 import { consumeRecoveryCode, looksLikeRecoveryCode, recoveryCodesLeft } from '@/lib/services/recoveryCodes';
 import { ARCHIVED_ONLY_MESSAGE, COMPANY_COOKIE, DEACTIVATED_MESSAGE, isArchivedCompany } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
@@ -241,7 +242,8 @@ async function handlePost(req: NextRequest) {
         return NextResponse.json({ requires2fa: true });
       }
       const typed = String(totp);
-      if (!verifyTotp(user.totpSecret, typed, Date.now())) {
+      // A code is accepted once: one already used (or older) is refused like a wrong one.
+      if (!(await acceptTotpCode(db, user.id, user.totpSecret, typed))) {
         if (!looksLikeRecoveryCode(typed) || !(await consumeRecoveryCode(db, user.id, typed))) {
           return fail('Invalid authentication code.');
         }
@@ -263,6 +265,9 @@ async function handlePost(req: NextRequest) {
       if (haveKey) await refreshSlotAtSignIn(db, user, password);
     }
     limiter.recordSuccess(keys.slice(0, -1)); // keep the global counter
+    // Signing in with the password proves who this is: wrong challenge answers counted against
+    // "I forgot my password" (and any lockout) are forgotten (lib/services/challengeLockout.ts).
+    await clearChallengeFailures(db, user);
 
     // Find a company for this user (ACTIVE membership first, else owned).
     // Archived (soft-deleted) companies are never picked (same rule as getServerContext).

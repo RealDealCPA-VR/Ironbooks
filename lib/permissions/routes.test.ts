@@ -170,6 +170,8 @@ describe('API permission map coverage', () => {
         '/api/file-protection',
         '/api/file-protection/file-key',
         '/api/file-protection/recovery-key',
+        // The desktop shell's start-up check: a keyed hash of its own nonce, nothing from the file.
+        '/api/handshake',
         '/api/portal/login',
         '/api/portal/logout',
         '/api/portal/me',

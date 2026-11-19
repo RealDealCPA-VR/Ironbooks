@@ -15,6 +15,9 @@ const { installOllama, checkSignature, allowedUrl, downloadTo, signedByOllama } 
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ib-ollama-'));
 afterAll(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
+/** What main.js passes: each download goes into a fresh ironbooks-ollama-XXXXXX folder beside it. */
+const installDir = path.join(tmpDir, 'ironbooks-ollama');
+const downloadFolders = () => fs.readdirSync(tmpDir).filter((n) => n.startsWith('ironbooks-ollama'));
 
 function fakeDownload(bytes: Uint8Array, opts: { url?: string; length?: number; status?: number } = {}) {
   return vi.fn(async () => {
@@ -28,7 +31,7 @@ describe('installOllama', () => {
   it('macOS / Linux: opens the download page, runs nothing', async () => {
     const openPage = vi.fn(async () => undefined);
     const launch = vi.fn();
-    expect(await installOllama({ platform: 'darwin', tmpDir, openPage, launch })).toEqual({ done: 'page-opened' });
+    expect(await installOllama({ platform: 'darwin', tmpDir: installDir, openPage, launch })).toEqual({ done: 'page-opened' });
     expect(openPage).toHaveBeenCalledWith('https://ollama.com/download');
     expect(launch).not.toHaveBeenCalled();
   });
@@ -38,7 +41,7 @@ describe('installOllama', () => {
     const progress: number[] = [];
     const r = await installOllama({
       platform: 'win32',
-      tmpDir,
+      tmpDir: installDir,
       fetchImpl: fakeDownload(new Uint8Array(5000).fill(7)),
       checkSig: async () => ({ ok: true, status: 'Valid', subject: 'CN=Ollama Inc., O=Ollama Inc.' }),
       launch,
@@ -46,8 +49,12 @@ describe('installOllama', () => {
       onProgress: (p: { received: number }) => progress.push(p.received),
     });
     expect(r).toEqual({ done: 'installer-started' });
-    const file = path.join(tmpDir, 'OllamaSetup.exe');
-    expect(launch).toHaveBeenCalledWith(file);
+    expect(launch).toHaveBeenCalledTimes(1);
+    const [file, extra] = launch.mock.calls[0] as unknown as [string, { sha256: string }];
+    expect(path.dirname(path.dirname(file))).toBe(tmpDir);
+    expect(path.basename(path.dirname(file))).toMatch(/^ironbooks-ollama-[A-Za-z0-9]{6}$/);
+    expect(path.basename(file)).toBe('OllamaSetup.exe');
+    expect(extra.sha256).toMatch(/^[0-9a-f]{64}$/);
     expect(fs.statSync(file).size).toBe(5000);
     expect(progress.at(-1)).toBe(5000);
   });
@@ -57,7 +64,7 @@ describe('installOllama', () => {
     await expect(
       installOllama({
         platform: 'win32',
-        tmpDir,
+        tmpDir: installDir,
         fetchImpl: fakeDownload(new Uint8Array(10)),
         checkSig: async () => ({ ok: false, status: 'NotSigned', subject: '' }),
         launch,
@@ -65,11 +72,12 @@ describe('installOllama', () => {
       }),
     ).rejects.toThrow(/not signed by Ollama.*did not run it/);
     expect(launch).not.toHaveBeenCalled();
-    expect(fs.existsSync(path.join(tmpDir, 'OllamaSetup.exe'))).toBe(false);
+    // The earlier download's folder is cleared first; the refused one is removed with its file.
+    expect(downloadFolders()).toEqual([]);
   });
 
   it('Windows: a redirect off Ollama / GitHub, or a cut-off download, is refused', async () => {
-    const base = { platform: 'win32', tmpDir, checkSig: async () => ({ ok: true }), launch: vi.fn(), openPage: vi.fn() };
+    const base = { platform: 'win32', tmpDir: installDir, checkSig: async () => ({ ok: true }), launch: vi.fn(), openPage: vi.fn() };
     await expect(installOllama({ ...base, fetchImpl: fakeDownload(new Uint8Array(10), { url: 'https://evil.example/x.exe' }) })).rejects.toThrow(/redirected/);
     await expect(installOllama({ ...base, fetchImpl: fakeDownload(new Uint8Array(10), { length: 99 }) })).rejects.toThrow(/cut off/);
     expect(base.launch).not.toHaveBeenCalled();

@@ -120,7 +120,8 @@ describe('security review regressions', () => {
       const mine = await session(ownerId, companyA);
       const other = await session(ownerId, companyA);
       as(ownerId, 'POST', `/api/users/${ownerId}/reset-password`, mine.id, companyA);
-      await resetUserPassword(await getServerContext(), ownerId, 'ownerpass2');
+      // Security review 2.9: resetting your OWN password needs the current one (change-password rule).
+      await resetUserPassword(await getServerContext(), ownerId, 'ownerpass2', { currentPassword: 'ownerpass1' });
       as(ownerId, 'GET', '/api/accounts', mine.id, companyA);
       await expect(getServerContext()).resolves.toBeTruthy();
       as(ownerId, 'GET', '/api/accounts', other.id, companyA);

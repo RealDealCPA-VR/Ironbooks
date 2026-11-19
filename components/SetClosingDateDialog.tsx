@@ -6,7 +6,9 @@
  * sends the 'set-closing-date' menu action, components/DesktopBridge.tsx calls
  * openSetClosingDate) and from the Accountant Center, so setting the date never leaves the window
  * the bookkeeper is working in. Saving goes through PATCH /api/company/closing-date (Closing Date /
- * Periods: modify), which records the change in the audit trail.
+ * Periods: modify), which records the change in the audit trail. Once a password is set, someone
+ * who is not an Admin also types the current password to move the date earlier, remove it, or
+ * change or remove the password (the field shows only then; an Admin never sees it).
  *
  * Keyboard: the date field has focus when it opens; Enter saves, Escape cancels.
  */
@@ -25,6 +27,8 @@ export function openSetClosingDate(): void {
 interface ClosingDateSettings {
   closingDate: string | null;
   hasPassword: boolean;
+  /** A password is set and this person is not an Admin (lib/services/company.ts). */
+  currentPasswordRequired?: boolean;
 }
 
 /** The dialog host: renders nothing until openSetClosingDate() is called. */
@@ -43,6 +47,7 @@ export function SetClosingDateDialog({ onClose, suggestedDate = null }: { onClos
   const [date, setDate] = useState('');
   const [password, setPassword] = useState('');
   const [confirm, setConfirm] = useState('');
+  const [currentPassword, setCurrentPassword] = useState('');
   const [removePassword, setRemovePassword] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -75,9 +80,10 @@ export function SetClosingDateDialog({ onClose, suggestedDate = null }: { onClos
     }
     setBusy(true);
     try {
+      const current = loaded?.currentPasswordRequired && currentPassword ? { currentPassword } : {};
       const body = clear
-        ? { closingDate: null }
-        : { closingDate: date, ...(password ? { password } : removePassword ? { password: null } : {}) };
+        ? { closingDate: null, ...current }
+        : { closingDate: date, ...(password ? { password } : removePassword ? { password: null } : {}), ...current };
       const saved = await api.patch<ClosingDateSettings>('/api/company/closing-date', body);
       toast(
         saved.closingDate
@@ -133,9 +139,22 @@ export function SetClosingDateDialog({ onClose, suggestedDate = null }: { onClos
           <Label htmlFor="scd-date">Closing date</Label>
           <Input id="scd-date" type="date" autoFocus value={date} onChange={(e) => setDate(e.target.value)} />
         </div>
+        {loaded?.currentPasswordRequired && (
+          <div>
+            <Label htmlFor="scd-current">Current password</Label>
+            <Input
+              id="scd-current"
+              type="password"
+              autoComplete="current-password"
+              value={currentPassword}
+              placeholder="Needed to move the date earlier or change the password"
+              onChange={(e) => setCurrentPassword(e.target.value)}
+            />
+          </div>
+        )}
         <div className="grid grid-cols-2 gap-3">
           <div>
-            <Label htmlFor="scd-pw">Closing date password</Label>
+            <Label htmlFor="scd-pw">{loaded?.currentPasswordRequired ? 'New closing date password' : 'Closing date password'}</Label>
             <Input
               id="scd-pw"
               type="password"

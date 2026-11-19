@@ -12,7 +12,8 @@
  *    user who deletes the defaults never gets them back);
  *  - every mutation is audited (writeAudit → audit trail + transaction log).
  */
-import { requirePermission } from '../access';
+import { maskForContext, requirePermission } from '../access';
+import { isMaskedValue } from '@/lib/permissions/mask';
 import { and, asc, eq, sql } from 'drizzle-orm';
 import type { z } from 'zod';
 import {
@@ -344,11 +345,14 @@ export async function listEntries(
   const t = def.table;
   const conds = [eq(t.companyId, ctx.companyId)];
   if (!opts.includeInactive) conds.push(eq(t.isActive, true));
-  return (await ctx.db
+  const rows = (await ctx.db
     .select()
     .from(t)
     .where(and(...conds))
     .orderBy(asc(sql`lower(${t[def.nameField]})`))) as Row[];
+  // Other Names carry an account number: "••••6789" unless the caller may view full account
+  // numbers, exactly as vendors and bank accounts are answered (maskForContext).
+  return maskForContext(ctx, rows);
 }
 
 export async function getEntry(ctx: ServiceContext, key: SimpleListKey, id: string): Promise<Row> {
@@ -386,9 +390,14 @@ export async function createEntry(ctx: ServiceContext, key: SimpleListKey, body:
   await ensureSeeded(ctx, key);
   const def = DEFS[key];
   let data = parse(def, body, false);
+  // A role without "view full account numbers" only ever sees "••••6789"; never store that
+  // placeholder as if it were the real number.
+  if (isMaskedValue(data.accountNumber)) {
+    throw validation('Enter the full account number (a masked number cannot be saved).');
+  }
   // The duplicate-name check runs in the same transaction as the insert: a double-submitted
   // "New" must get the plain "already on the list" message, not the unique index's raw error.
-  return inTransaction(ctx, async (tx) => {
+  const created = await inTransaction(ctx, async (tx) => {
     if (def.finalize) data = await def.finalize(tx, data);
     await assertUniqueName(tx, def, String(data[def.nameField]));
     const inserted = (await tx.db
@@ -399,18 +408,22 @@ export async function createEntry(ctx: ServiceContext, key: SimpleListKey, body:
     await writeAudit(tx, { action: 'create', entityType: def.entityType, entityId: row.id, newValues: row });
     return row as Row;
   });
+  return maskForContext(ctx, created);
 }
 
 export async function updateEntry(ctx: ServiceContext, key: SimpleListKey, id: string, body: unknown): Promise<Row> {
   assertSalesTaxCodeRight(ctx, key, 'modify');
   // Read, check and write in one transaction (a rename racing another save of the list).
-  return inTransaction(ctx, (tx) => updateEntryInTx(tx, key, id, body));
+  return maskForContext(ctx, await inTransaction(ctx, (tx) => updateEntryInTx(tx, key, id, body)));
 }
 
 async function updateEntryInTx(ctx: ServiceContext, key: SimpleListKey, id: string, body: unknown): Promise<Row> {
   const def = DEFS[key];
   const before = await getEntry(ctx, key, id);
   const patch = parse(def, body, true);
+  // The masked number a role without "view full account numbers" was shown, sent back with the
+  // rest of the form: keep the stored number.
+  if (isMaskedValue(patch.accountNumber)) delete patch.accountNumber;
   if (key === 'other-names') await assertAccountantListEdit(ctx, 'other_name', before, patch); // Accountant's Copy (I1)
   // Making an entry inactive is how a list entry is deleted (Make inactive sends isActive: false):
   // refused like a delete while an Accountant's Copy is out (I1).

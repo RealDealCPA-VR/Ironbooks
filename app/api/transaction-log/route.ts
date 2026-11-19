@@ -5,6 +5,8 @@
  *        limit (default 200, max 5000), offset.
  * Response: { rows, total, users, entityTypes } — rows are full records incl. `data`.
  * Records of other companies sharing the data dir are hidden. Owner/admin/accountant only.
+ * Records about something the caller may not view (an employee's pay, a user account…) are left
+ * out of the rows, the total and the filter lists (lib/services/auditVisibility.ts).
  *
  * SECURITY: middleware excludes /api from the session check, so this handler fails closed
  * via getServerContext() before reading anything.
@@ -16,6 +18,7 @@ import { dataDirOf } from '@/lib/db/txHooks';
 import { queryTransactionLog } from '@/lib/services/transactionLog';
 import { ServiceError } from '@/lib/services/_base';
 import { maskForContext } from '@/lib/services/access';
+import { canSeeLogRecord, seesWholeLog } from '@/lib/services/auditVisibility';
 import { stripSecrets } from '@/lib/permissions/mask';
 import { serviceErrorStatus } from '@/lib/routeErrors';
 
@@ -67,6 +70,7 @@ export async function GET(req: NextRequest) {
       action: p.get('action') || undefined,
       entityId: p.get('entityId') || undefined,
       search: p.get('q') || undefined,
+      ...(seesWholeLog(ctx.access) ? {} : { visible: (r) => canSeeLogRecord(ctx.access, r) }),
       limit,
       offset,
     });

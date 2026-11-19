@@ -12,6 +12,14 @@
  * not be openable by anyone who can guess the Admin's user name. Otherwise always 200 with a
  * generic message to avoid user-name enumeration.
  *
+ * A token is made only when it is handed back (the desktop app on this computer): a request from
+ * anywhere else never creates one, so it can't replace a token someone is about to use. It is kept
+ * only as a fingerprint (lib/services/passwordReset.ts) and never written to the log.
+ *
+ * Wrong challenge answers are counted twice: in memory (the sign-in limiter, below) and on the
+ * user's row in the company file, with growing lockouts that survive restarting the app
+ * (lib/services/challengeLockout.ts).
+ *
  * A company file protected with passwords (lib/services/fileProtection.ts): the challenge answer
  * has its own key slot, so the answer is what opens the file here too — before the sign-in, while
  * the server is sealed (lib/db/sealed.ts), the question comes from the file's slots and the right
@@ -20,7 +28,6 @@
  * password or with the recovery key (/api/auth/recover) — never by the single-user rule.
  */
 import { NextRequest, NextResponse } from 'next/server';
-import crypto from 'node:crypto';
 import { eq, ne } from 'drizzle-orm';
 import { needsSignInToRecover, recoverSealedWorkingCopy } from '@/lib/services/workingCopyRecovery';
 import { getDb, resolveDataDir, sealedMode, withSealedAccess } from '@/lib/db';
@@ -31,6 +38,8 @@ import { originFromHeaders } from '@/lib/net/requestInfo';
 import { GLOBAL_KEY_WEIGHT, attemptKeys, resetLimiter, tooManyResets } from '@/lib/net/rateLimit';
 import { invalidJsonBody, readJsonObject } from '@/lib/routeErrors';
 import { normalizeChallengeAnswer } from '@/lib/challengeQuestions';
+import { challengeLockRemainingMs, clearChallengeFailures, recordChallengeFailure } from '@/lib/services/challengeLockout';
+import { newResetToken, storedResetToken, type ResetVia } from '@/lib/services/passwordReset';
 import {
   finishKeyUnseal,
   loadKeyFromChallenge,
@@ -79,6 +88,8 @@ export async function POST(req: NextRequest) {
     const offlineLocal = process.env.BKA_OFFLINE === '1' && !origin.remote;
     let sealed = sealedMode();
     let db;
+    // The answer already opened the encrypted company file (its own key slot): it is right.
+    let answerOpenedFile = false;
     /**
      * Not decrypted yet (or the working copy here will not start): the question is in the file's
      * challenge slot, and only the answer that opens the company file goes on. Returns the key, or
@@ -113,6 +124,7 @@ export async function POST(req: NextRequest) {
         const got = await keyFromFileChallenge();
         if ('response' in got) return got.response;
         sealed = await recoverSealedWorkingCopy(got.key);
+        answerOpenedFile = true;
         if (sealed === 'extract' || sealed === 'conflict') {
           await unsealCompanyFile(got.key);
           limiter.recordSuccess(keys.slice(0, -1));
@@ -124,6 +136,7 @@ export async function POST(req: NextRequest) {
     } else if (sealed === 'extract' || sealed === 'conflict') {
       const got = await keyFromFileChallenge();
       if ('response' in got) return got.response;
+      answerOpenedFile = true;
       await unsealCompanyFile(got.key);
       limiter.recordSuccess(keys.slice(0, -1));
       db = await getDb();
@@ -148,14 +161,25 @@ export async function POST(req: NextRequest) {
     // (/api/users/[id]/reset-password, which enforces assertCanManageUser).
     const [user] = await db.select().from(users).where(eq(users.email, email));
     const hasChallenge = Boolean(user?.challengeQuestion && user?.challengeAnswerHash);
+    let via: ResetVia = 'single';
     if (offlineLocal && hasChallenge) {
       // Self-recovery by challenge question: ask it, then check the answer (the rate limit above
       // counts every attempt, so the answer can't be guessed quickly).
       if (!challengeAnswer.trim()) {
         return NextResponse.json({ ok: false, challengeQuestion: user!.challengeQuestion });
       }
+      // Locked out by earlier wrong answers (kept in the company file, so a restart doesn't end
+      // it): the answer is not even checked. One the encrypted file's own key slot has just
+      // accepted is right, and is treated as such.
+      const lockedMs = answerOpenedFile ? 0 : challengeLockRemainingMs(user!);
+      if (lockedMs > 0) {
+        fail();
+        const { body: tooMany, retryAfter } = tooManyResets(lockedMs);
+        return NextResponse.json(tooMany, { status: 429, headers: { 'Retry-After': retryAfter } });
+      }
       if (!(await verifyPassword(normalizeChallengeAnswer(challengeAnswer), user!.challengeAnswerHash!))) {
         fail();
+        await recordChallengeFailure(db, user!.id);
         return NextResponse.json(
           { error: WRONG_ANSWER_MESSAGE, code: 'FORBIDDEN', challengeQuestion: user!.challengeQuestion },
           { status: 403 },
@@ -170,6 +194,8 @@ export async function POST(req: NextRequest) {
         await finishKeyUnseal(db);
       }
       limiter.recordSuccess(keys.slice(0, -1));
+      await clearChallengeFailures(db, user!);
+      via = 'challenge';
     } else if (offlineLocal && (sealed === 'key' || (await readProtection(db)))) {
       // A protected file is never reopened by the single-user rule: only a secret that opens it.
       fail();
@@ -192,21 +218,20 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(generic);
     }
 
-    const token = crypto.randomBytes(24).toString('hex');
+    // SECURITY: the token is only ever handed back to the desktop app on this computer. A request
+    // relayed from another machine (multi-user hosting), or any deployment that is not the offline
+    // desktop build, gets the generic answer, and no token is made or stored for it: it can't
+    // replace (and so cancel) a token the person at this computer is about to use.
+    if (!offlineLocal) {
+      fail();
+      return NextResponse.json(generic);
+    }
+    const token = newResetToken();
     await db
       .update(users)
-      .set({ resetToken: token, resetExpires: new Date(Date.now() + 60 * 60 * 1000) })
+      .set({ resetToken: storedResetToken(token, via), resetExpires: new Date(Date.now() + 60 * 60 * 1000) })
       .where(eq(users.id, user.id));
-
-    // SECURITY: never return the reset token in the HTTP response on a networked deployment —
-    // anyone who knows an email could take over the account. The token is logged server-side so
-    // a local operator can retrieve it; a hosted deployment should email a reset link instead.
-    console.log(`[auth/request-reset] reset token for ${user.email}: ${token}`);
-    // Multi-user hosting: a request relayed from another machine is NOT local, so it never gets
-    // the token even in the desktop build (anyone on the tailnet could otherwise take over).
-    if (offlineLocal) return NextResponse.json({ ...generic, token });
-    fail();
-    return NextResponse.json(generic);
+    return NextResponse.json({ ...generic, token });
   } finally {
     gate.release();
   }

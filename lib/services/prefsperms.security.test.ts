@@ -211,7 +211,9 @@ describe('recovery codes: the way back for a sole Admin who lost their authentic
     const bad = await recoveryPOST(req('POST', '/api/auth/2fa/recovery-codes', { token: '000000' }));
     expect(bad.status).toBe(400);
     asSolo('POST', '/api/auth/2fa/recovery-codes');
-    const ok = await recoveryPOST(req('POST', '/api/auth/2fa/recovery-codes', { token: generateTotp(secret, Date.now()) }));
+    // Security review 2.6: a code is accepted once, and the one that turned 2FA on may still be the
+    // current one: use the next 30-second step's code (inside the clock-drift window).
+    const ok = await recoveryPOST(req('POST', '/api/auth/2fa/recovery-codes', { token: generateTotp(secret, Date.now() + 30_000) }));
     expect(ok.status).toBe(200);
     const fresh = ((await ok.json()) as { recoveryCodes: string[] }).recoveryCodes;
     expect(fresh).toHaveLength(10);

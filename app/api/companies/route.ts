@@ -10,7 +10,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import type { DB } from '@/lib/db';
 import { companies, users } from '@/lib/db/schema';
-import { getServerContext, getSessionGate } from '@/lib/context';
+import { getServerContext, getSessionGate, isLoopbackHostHeader } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
 import {
   listCompanies,
@@ -21,6 +21,7 @@ import {
 } from '@/lib/services/company';
 import { serviceErrorStatus } from '@/lib/routeErrors';
 import { stripSecrets } from '@/lib/permissions/mask';
+import { originFromHeaders } from '@/lib/net/requestInfo';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -31,8 +32,16 @@ function errorResponse(err: unknown) {
   return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
 }
 
-/** First-run carve-out: allow session-less access only before any user exists. */
-async function allowFirstRun(db: DB): Promise<boolean> {
+/**
+ * First-run carve-out: allow session-less access only before any user exists, and only to the app
+ * on this computer — the same rules as getServerContext's fallback (lib/context.ts).
+ */
+async function allowFirstRun(db: DB, req: NextRequest): Promise<boolean> {
+  // Never for a teammate's device through the multi-user host, nor for another program on this
+  // computer without the desktop shell's per-launch pass (lib/net/launchPass.ts).
+  if (originFromHeaders(req.headers).remote) return false;
+  // DNS rebinding: a web page whose name resolves to 127.0.0.1 arrives with ITS name as the Host.
+  if (!isLoopbackHostHeader(req.headers.get('host'))) return false;
   if (process.env.BKA_ALLOW_DEV_FALLBACK === '1') return true;
   // A single company file is set up by its Admin on /signup, never with a seeded demo company
   // (same rule as getServerContext in lib/context.ts).
@@ -54,7 +63,7 @@ export async function GET(req: NextRequest) {
         stripSecrets(await listCompaniesForUser(db, userId, { excludeArchived: !includeArchived })),
       );
     }
-    if (!(await allowFirstRun(db))) {
+    if (!(await allowFirstRun(db, req))) {
       return NextResponse.json({ error: 'Unauthorized', code: 'FORBIDDEN' }, { status: 401 });
     }
     await ensureDevCompany(db); // first run: guarantee at least one
@@ -67,7 +76,7 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   try {
     const { db, userId: sessionUserId } = await getSessionGate();
-    if (!sessionUserId && !(await allowFirstRun(db))) {
+    if (!sessionUserId && !(await allowFirstRun(db, req))) {
       return NextResponse.json({ error: 'Unauthorized', code: 'FORBIDDEN' }, { status: 401 });
     }
     const body = await req.json().catch(() => null);

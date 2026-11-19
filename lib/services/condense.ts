@@ -85,7 +85,7 @@ import { BACKUP_MANIFEST_ENTRY, FILE_LOCAL_FILES, createBackup, ensurePreOpBacku
 import format from '@/electron/companyFileFormat';
 import { protectionForDir, type SealProtection } from './fileProtection';
 import type { ArchiveCredentials } from './sealedArchives';
-import { recordBackup } from './backupHistory';
+import { condenseArchiveFolders, recordBackup } from './backupHistory';
 import { currentFingerprint } from './backupFingerprint';
 import { logTransaction } from './transactionLog';
 import { journalOpenItems } from './journal';
@@ -1159,21 +1159,8 @@ function countFiles(dir: string, root = false): number {
  * beside the .QBW, the archive goes where the company file is.
  */
 export function condenseArchiveDir(dataDir?: string): string {
-  const dir = resolveDataDir(dataDir);
-  return path.join(singleCompanyFileHome(dir) ?? path.dirname(dir), 'archives');
-}
-
-/**
- * The folder holding the open single company file when `dir` is its working copy's database
- * folder (electron/companySession.js: <working copy>/data next to state.json); else null.
- */
-function singleCompanyFileHome(dir: string): string | null {
-  const file = process.env.BKA_COMPANY_FILE;
-  const state = process.env.BKA_COMPANY_STATE;
-  if (!file || !state) return null;
-  const working = path.join(path.dirname(path.resolve(state)), 'data');
-  const same = process.platform === 'win32' ? working.toLowerCase() === dir.toLowerCase() : working === dir;
-  return same ? path.dirname(path.resolve(file)) : null;
+  // Worked out in backupHistory.ts, which needs it too: archive copies are in the backup history.
+  return condenseArchiveFolders(dataDir).current;
 }
 
 /**
@@ -1239,19 +1226,23 @@ export function listCondenseArchives(dataDir?: string): Array<CondenseArchive & 
   const dir = resolveDataDir(dataDir);
   const archDir = condenseArchiveDir(dir);
   const fileId = fileIdOf(dir);
-  const ours = (a: CondenseArchive) => (a.fileId && fileId ? a.fileId === fileId : path.resolve(a.dataDir) === dir);
-  // The archives folder as this computer reaches it (a share mapped to another drive letter here,
-  // or reached by its \\server name there).
+  const ours = (a: CondenseArchive) =>
+    Boolean(a) && typeof a === 'object' && (a.fileId && fileId ? a.fileId === fileId : typeof a.dataDir === 'string' && path.resolve(a.dataDir) === dir);
+  // The copy in the folder its index is in, as this computer reaches that folder (a share mapped to
+  // another drive letter here, or reached by its \\server name there): every copy is recorded in the
+  // index of its own folder. The path written in the index is never looked at: it was written on
+  // another computer (or by whoever crafted the index, which lies beside a company file people send
+  // and share), and merely looking at a network path makes Windows offer that server the signed-in
+  // person's credentials.
   const located = (folder: string) => (a: CondenseArchive) => {
-    const here = path.join(folder, path.basename(a.filename || a.path));
-    const p = fs.existsSync(a.path) ? a.path : here;
-    return { ...a, path: p, available: fs.existsSync(p) };
+    const p = archiveFileIn(folder, a);
+    return { ...a, path: p ?? '', available: p !== null && fs.existsSync(p) };
   };
   const list = readArchiveIndex(archDir).filter(ours).map(located(archDir));
   // A single company file condensed by v1.6.0 had its archive copies (and their index) beside its
   // working copy, <working copy>/archives: they stay listed and restorable from there.
-  const legacyDir = path.join(path.dirname(dir), 'archives');
-  if (singleCompanyFileHome(dir) !== null && !samePath(legacyDir, archDir)) {
+  const legacyDir = condenseArchiveFolders(dir).legacy;
+  if (legacyDir !== null) {
     const seen = new Set(list.map((a) => a.id));
     for (const a of readArchiveIndex(legacyDir).filter(ours).map(located(legacyDir))) {
       if (!seen.has(a.id)) {
@@ -1263,10 +1254,16 @@ export function listCondenseArchives(dataDir?: string): Array<CondenseArchive & 
   return list.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
 }
 
-function samePath(a: string, b: string): boolean {
-  const x = path.resolve(a);
-  const y = path.resolve(b);
-  return process.platform === 'win32' ? x.toLowerCase() === y.toLowerCase() : x === y;
+/**
+ * Where an index entry's archive copy is in `folder` (this computer's archives folder): under the
+ * plain file name it was recorded with; null when the entry names none.
+ */
+function archiveFileIn(folder: string, a: CondenseArchive): string | null {
+  const recorded = typeof a.filename === 'string' && a.filename ? a.filename : typeof a.path === 'string' ? a.path : '';
+  // Either kind of separator: the index may have been written on another operating system.
+  const name = recorded.split(/[\\/]/).pop() ?? '';
+  if (!name || name === '.' || name === '..' || name.includes(':') || name.includes('\0')) return null;
+  return path.join(folder, name);
 }
 
 /**

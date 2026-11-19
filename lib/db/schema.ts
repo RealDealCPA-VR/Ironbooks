@@ -48,6 +48,17 @@ export const users = pgTable('users', {
    * hashes only, with when each was used. Null while two-factor sign-in is off.
    */
   totpRecoveryCodes: jsonb('totp_recovery_codes').$type<Array<{ hash: string; usedAt: string | null }>>(),
+  /**
+   * 0094: wrong challenge answers since the last right one (or sign-in), kept in the company file
+   * so restarting the app does not reset the count (lib/services/challengeLockout.ts).
+   */
+  challengeFailedAttempts: integer('challenge_failed_attempts').notNull().default(0),
+  /** 0094: lockouts so far; each one lasts twice as long as the one before (capped). */
+  challengeLockouts: integer('challenge_lockouts').notNull().default(0),
+  /** 0094: no challenge answer is checked before this moment. */
+  challengeLockedUntil: timestamp('challenge_locked_until'),
+  /** 0094: 30-second step of the last two-factor code accepted (a code is never accepted twice). */
+  totpLastStep: integer('totp_last_step'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });
@@ -997,6 +1008,8 @@ export const employees = pgTable('employees', {
   payRate: decimal('pay_rate', { precision: 15, scale: 2 }).notNull().default('0'),
   ssn: text('ssn'), // encrypted at rest
   portalPasswordHash: text('portal_password_hash'), // employee self-service login
+  /** 0094: raised by portal sign-out, which ends every portal sign-in made before it (lib/auth.ts). */
+  portalTokenVersion: integer('portal_token_version').notNull().default(0),
   w4: jsonb('w4').$type<Record<string, unknown>>(),
   /** Mailing address for W-2/pay stubs: { line1, line2, city, state, zip }. */
   address: jsonb('address').$type<Record<string, unknown>>(),

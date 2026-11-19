@@ -118,6 +118,8 @@ interface Company {
 interface ClosingDateSettings {
   closingDate: string | null;
   hasPassword: boolean;
+  /** A password is set and this person is not an Admin (lib/services/company.ts). */
+  currentPasswordRequired?: boolean;
 }
 
 interface Member {
@@ -377,6 +379,9 @@ export default function SettingsPage() {
   const [closingDate, setClosingDate] = useState('');
   const [closingHasPassword, setClosingHasPassword] = useState(false);
   const [closingPassword, setClosingPassword] = useState('');
+  // Not an Admin, and a password is set: the current one is asked to reopen books or change it.
+  const [closingNeedsCurrent, setClosingNeedsCurrent] = useState(false);
+  const [closingCurrent, setClosingCurrent] = useState('');
   const [savingClosing, setSavingClosing] = useState(false);
 
   // Users & roles
@@ -435,6 +440,7 @@ export default function SettingsPage() {
       .then((data) => {
         setClosingDate(data.closingDate ?? '');
         setClosingHasPassword(data.hasPassword);
+        setClosingNeedsCurrent(Boolean(data.currentPasswordRequired));
       })
       .catch(() => {});
 
@@ -484,10 +490,13 @@ export default function SettingsPage() {
       const updated = await api.patch<ClosingDateSettings>('/api/company/closing-date', {
         closingDate,
         ...(closingPassword ? { password: closingPassword } : {}),
+        ...(closingNeedsCurrent && closingCurrent ? { currentPassword: closingCurrent } : {}),
       });
       setClosingDate(updated.closingDate ?? '');
       setClosingHasPassword(updated.hasPassword);
+      setClosingNeedsCurrent(Boolean(updated.currentPasswordRequired));
       setClosingPassword('');
+      setClosingCurrent('');
       toast('Closing date saved. Transactions on or before this date are now protected.', 'success');
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Failed to save closing date', 'danger');
@@ -501,10 +510,13 @@ export default function SettingsPage() {
     try {
       const updated = await api.patch<ClosingDateSettings>('/api/company/closing-date', {
         closingDate: null,
+        ...(closingNeedsCurrent && closingCurrent ? { currentPassword: closingCurrent } : {}),
       });
       setClosingDate(updated.closingDate ?? '');
       setClosingHasPassword(updated.hasPassword);
+      setClosingNeedsCurrent(Boolean(updated.currentPasswordRequired));
       setClosingPassword('');
+      setClosingCurrent('');
       toast('Closing date cleared', 'success');
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Failed to clear closing date', 'danger');
@@ -782,6 +794,19 @@ export default function SettingsPage() {
                         <p className="mt-1 text-xs text-navy/50">No closing date is currently set.</p>
                       )}
                     </div>
+                    {closingNeedsCurrent && (
+                      <div>
+                        <Label htmlFor="closing-current">Current Password</Label>
+                        <Input
+                          id="closing-current"
+                          type="password"
+                          value={closingCurrent}
+                          onChange={(e) => setClosingCurrent(e.target.value)}
+                          placeholder="Needed to move the date earlier or change the password"
+                          autoComplete="current-password"
+                        />
+                      </div>
+                    )}
                     <div>
                       <Label htmlFor="closing-password">Closing Date Password</Label>
                       <Input

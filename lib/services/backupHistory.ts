@@ -133,8 +133,10 @@ function mappedDriveLetters(): Set<string> {
   if (mappedDrives && Date.now() - mappedDrives.at < 60_000) return mappedDrives.letters;
   const letters = new Set<string>();
   try {
-    // Lists this user's network connections without connecting to them.
-    const out = execFileSync('net', ['use'], { encoding: 'utf8', timeout: 3000, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
+    // Lists this user's network connections without connecting to them. By full path: a bare name
+    // is looked up in the CURRENT folder first on Windows, where a planted net.exe would run instead.
+    const net = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'net.exe');
+    const out = execFileSync(net, ['use'], { encoding: 'utf8', timeout: 3000, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
     for (const m of out.matchAll(/(?:^|\s)([A-Za-z]):\s+\\\\/gm)) letters.add(m[1].toUpperCase());
   } catch {
     /* no network client: nothing mapped */
@@ -243,8 +245,12 @@ function folderHoldsOwnBackups(folder: string, dataDir?: string): boolean {
   }
   return readBackupHistory(dataDir).some((r) => {
     if (!r.path || r.prunedAt || r.kind !== 'full' || !VERSION_FILE_NAME.test(r.filename) || path.basename(r.path) !== r.filename) return false;
+    // Only a record whose path, as written, is directly in this (local) folder is looked at: the
+    // history travels inside the company file, so its paths may name anything (backupPathHere).
+    const p = backupPathHere(r.path, [folder]);
+    if (!p) return false;
     try {
-      const real = fs.realpathSync(r.path);
+      const real = fs.realpathSync(p);
       if (folderKey(path.dirname(real)) !== realFolder) return false;
       const st = fs.statSync(real);
       return st.isFile() && (typeof r.sizeBytes !== 'number' || st.size === r.sizeBytes);
@@ -294,33 +300,162 @@ export function backupFoldersHere(dataDir?: string): string[] {
 
 /** The file names Ironbooks gives versioned backups (backupSchedule.ts versionFilename). */
 export const VERSION_FILE_NAME = /^(auto-)?backup-.*\.bka$/;
+/** Pre-operation safety copies (backup.ts ensurePreOpBackup). */
+const PRE_OP_FILE_NAME = /^preop-.*\.bka$/;
+/** Archive copies written before condensing (condense.ts writeCondenseArchive). */
+const CONDENSE_ARCHIVE_FILE_NAME = /^condense-archive-.*\.bka$/;
 
 /**
- * Is the file a record points at really one of this company file's versioned backups on this
- * computer? The history travels inside the company file, so a record is only trusted to delete a
- * file that is named like a backup, has exactly the recorded name, sits directly in a folder this
- * computer backs up to (its real path: no links out), and has the recorded size.
+ * Folder of the pre-operation safety copies: backup.ts preOpBackupDir, a sibling of the data dir
+ * (not imported from there: backup.ts imports this module).
  */
-export function isOwnBackupFile(rec: BackupRecord, dataDir?: string): boolean {
-  if (!rec.path || !VERSION_FILE_NAME.test(rec.filename) || path.basename(rec.path) !== rec.filename) return false;
-  let real: string;
-  let st: fs.Stats;
+export function preOpFolder(dataDir?: string): string {
+  return path.join(path.dirname(resolveDataDir(dataDir)), 'pre-op-backups');
+}
+
+/**
+ * The folder holding the open single company file when `dir` is its working copy's database
+ * folder (electron/companySession.js: <working copy>/data next to state.json); else null.
+ */
+export function singleCompanyFileHome(dir: string): string | null {
+  const file = process.env.BKA_COMPANY_FILE;
+  const state = process.env.BKA_COMPANY_STATE;
+  if (!file || !state) return null;
+  const working = path.join(path.dirname(path.resolve(state)), 'data');
+  const same = process.platform === 'win32' ? working.toLowerCase() === dir.toLowerCase() : working === dir;
+  return same ? path.dirname(path.resolve(file)) : null;
+}
+
+/**
+ * Folders holding condense archive copies of this company file (condense.ts condenseArchiveDir):
+ * `archives` next to the open single company file, else next to the data dir; and for a single
+ * company file also `<working copy>/archives`, where v1.6.0 put them (`legacy`, null otherwise).
+ */
+export function condenseArchiveFolders(dataDir?: string): { current: string; legacy: string | null } {
+  const dir = resolveDataDir(dataDir);
+  const home = singleCompanyFileHome(dir);
+  const current = path.join(home ?? path.dirname(dir), 'archives');
+  const legacy = path.join(path.dirname(dir), 'archives');
+  return { current, legacy: home !== null && folderKey(legacy) !== folderKey(current) ? legacy : null };
+}
+
+/**
+ * May the file a backup-history record names be looked at on THIS computer? Decided from the text
+ * of its path alone, before anything touches it: only an absolute path directly inside one of
+ * `folders` is (returned resolved); anything else is null. The history travels inside the company
+ * file, which people send to each other, so its paths were written on another computer or by
+ * whoever crafted the file — and merely looking at a network path (\\server\share\…, //server/…,
+ * \\?\UNC\…, a mapped drive) makes Windows connect to that server and offer it the signed-in
+ * person's credentials. Every folder passed here was chosen on this computer or is derived from
+ * where this computer opened the company file, never taken from the file, so a record on a network
+ * share is only touched when its folder is one this computer trusts (an office that backs up to its
+ * own server share keeps working); a device path (\\.\…, \\?\…) never matches one.
+ */
+export function backupPathHere(p: unknown, folders: readonly string[]): string | null {
+  if (typeof p !== 'string' || !p || p.includes('\0') || !path.isAbsolute(p)) return null;
+  const abs = path.resolve(p);
+  const name = path.basename(abs);
+  // A plain file name: no alternate data stream ("x.bka:stream").
+  if (!name || name.includes(':')) return null;
+  const parent = folderKey(path.dirname(abs));
+  return folders.some((f) => folderKey(f) === parent) ? abs : null;
+}
+
+/** A folder this company file's backups are kept in on this computer, and how they are named there. */
+interface BackupPlace {
+  folder: string;
+  names: RegExp;
+  /** The folder's real path, looked up once (undefined: not yet; null: it cannot be reached). */
+  real?: string | null;
+}
+
+/**
+ * What a backup file is checked for: 'delete' (rotation) trusts only versions in the folders this
+ * computer backs up to; 'read' (the history list, preview, restore) also the folder versions go to
+ * here now (backupFolder: a local folder this file already used before the list was kept), the
+ * pre-operation safety copies and the condense archive copies — every kind the history records.
+ */
+export type BackupFilePurpose = 'delete' | 'read';
+
+/** Where this company file's backups are on this computer (backupFilePurpose). */
+function backupPlacesHere(dataDir: string | undefined, purpose: BackupFilePurpose): BackupPlace[] {
+  const dir = resolveDataDir(dataDir);
+  const versions = backupFoldersHere(dir);
+  if (purpose === 'delete') return versions.map((folder) => ({ folder, names: VERSION_FILE_NAME }));
+  let inUse: string | null = null;
   try {
-    real = fs.realpathSync(rec.path);
-    st = fs.statSync(real);
+    inUse = backupFolder(readBackupSettings(dir), dir);
   } catch {
-    return false;
+    inUse = null;
   }
-  if (!st.isFile() || path.basename(real) !== rec.filename) return false;
-  if (typeof rec.sizeBytes === 'number' && st.size !== rec.sizeBytes) return false;
-  const parent = folderKey(path.dirname(real));
-  return backupFoldersHere(dataDir).some((f) => {
+  const archives = condenseArchiveFolders(dir);
+  return [
+    ...[...versions, ...(inUse ? [inUse] : [])].map((folder) => ({ folder, names: VERSION_FILE_NAME })),
+    { folder: preOpFolder(dir), names: PRE_OP_FILE_NAME },
+    ...[archives.current, ...(archives.legacy ? [archives.legacy] : [])].map((folder) => ({ folder, names: CONDENSE_ARCHIVE_FILE_NAME })),
+  ];
+}
+
+/**
+ * A check for "is the file this record points at really one of this company file's own backups on
+ * this computer?", with the folders looked up once (for checking many records). The history travels
+ * inside the company file, so a record is only trusted when its path, as written, sits directly in
+ * one of those folders (backupPathHere: nothing else is ever looked at), the file is named like
+ * that kind of backup, has exactly the recorded name, really is in that folder (its real path: no
+ * links out), and has the recorded size.
+ */
+export function ownBackupFileCheck(dataDir?: string, purpose: BackupFilePurpose = 'delete'): (rec: BackupRecord) => boolean {
+  let places: BackupPlace[] | null = null;
+  return (rec) => {
+    if (!rec.path || typeof rec.filename !== 'string') return false;
+    places ??= backupPlacesHere(dataDir, purpose);
+    const fitting = places.filter((pl) => pl.names.test(rec.filename));
+    const p = backupPathHere(rec.path, fitting.map((pl) => pl.folder));
+    if (!p || path.basename(p) !== rec.filename) return false;
+    let real: string;
+    let st: fs.Stats;
     try {
-      return folderKey(fs.realpathSync(f)) === parent;
+      real = fs.realpathSync(p);
+      st = fs.statSync(real);
     } catch {
       return false;
     }
-  });
+    if (!st.isFile() || path.basename(real) !== rec.filename) return false;
+    if (typeof rec.sizeBytes === 'number' && st.size !== rec.sizeBytes) return false;
+    const parent = folderKey(path.dirname(real));
+    return fitting.some((pl) => {
+      if (pl.real === undefined) {
+        try {
+          pl.real = folderKey(fs.realpathSync(pl.folder));
+        } catch {
+          pl.real = null;
+        }
+      }
+      return pl.real === parent;
+    });
+  };
+}
+
+/**
+ * Is the file a record points at really one of this company file's backups on this computer
+ * (ownBackupFileCheck)? For deleting (rotation, the default) only a versioned backup in a folder
+ * this computer backs up to counts; for reading, any backup the history records (BackupFilePurpose).
+ */
+export function isOwnBackupFile(rec: BackupRecord, dataDir?: string, purpose: BackupFilePurpose = 'delete'): boolean {
+  return ownBackupFileCheck(dataDir, purpose)(rec);
+}
+
+/**
+ * fs.existsSync for a backup-history path, only once its text says it may be looked at on this
+ * computer (backupPathHere, against every folder this file's backups are kept in here).
+ */
+function fileExistsHere(dataDir?: string): (p: string) => boolean {
+  let folders: string[] | null = null;
+  return (p) => {
+    folders ??= backupPlacesHere(dataDir, 'read').map((pl) => pl.folder);
+    const here = backupPathHere(p, folders);
+    return here !== null && fs.existsSync(here);
+  };
 }
 
 /** Write JSON atomically (temp file + rename) so a crash never leaves half a file. */
@@ -350,7 +485,11 @@ function isRecord(v: unknown): v is BackupRecord {
   );
 }
 
-/** Every recorded backup of this company file, newest first. A missing/corrupt file reads as []. */
+/**
+ * Every recorded backup of this company file, newest first. A missing/corrupt file reads as [].
+ * Paths are as written — on whichever computer made each backup, or by whoever crafted the file —
+ * so nothing may look at one before isOwnBackupFile (or backupPathHere) has vetted it.
+ */
 export function readBackupHistory(dataDir?: string): BackupRecord[] {
   let raw: unknown;
   try {
@@ -376,12 +515,14 @@ export function readBackupHistory(dataDir?: string): BackupRecord[] {
 /**
  * Trim the history to BACKUP_HISTORY_LIMIT records, oldest first — but never drop a record whose
  * file is still on disk (it could then never be found, previewed or rotated again). Only records
- * without a file (downloads, pruned or deleted versions) make room.
+ * without a file (downloads, pruned or deleted versions) make room. A record whose path may not be
+ * looked at on this computer (fileExistsHere) counts as without a file here, as one on another
+ * computer always has.
  */
 export function trimHistory(
   records: BackupRecord[],
   limit: number = BACKUP_HISTORY_LIMIT,
-  fileExists: (p: string) => boolean = fs.existsSync,
+  fileExists: (p: string) => boolean = fileExistsHere(),
 ): BackupRecord[] {
   const sorted = [...records].sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
   if (sorted.length <= limit) return sorted;
@@ -395,7 +536,7 @@ export function trimHistory(
 }
 
 function writeBackupHistory(records: BackupRecord[], dataDir?: string): void {
-  writeJsonAtomic(historyPath(dataDir), { version: 1, records: trimHistory(records) });
+  writeJsonAtomic(historyPath(dataDir), { version: 1, records: trimHistory(records, BACKUP_HISTORY_LIMIT, fileExistsHere(dataDir)) });
 }
 
 export type NewBackupRecord = Omit<BackupRecord, 'id' | 'at'> & { at?: string };
@@ -514,19 +655,53 @@ export function normalizeBackupSettings(
   return out;
 }
 
+/** Refusal of a backup-folder change asked for from another computer (saveBackupSettings). */
+export const REMOTE_FOLDER_CHANGE_MESSAGE = 'The backup folder can only be changed on the computer that holds the company file.';
+
+/**
+ * `input` (a folder from a settings form) leaves the backup folder as it is on this computer: the
+ * same setting, and already the folder backups go to here (saving one that came in with the
+ * company file would approve it on this computer).
+ */
+function folderUnchangedHere(input: unknown, current: BackupSettings, dir: string): boolean {
+  let wanted: string | null;
+  try {
+    wanted = normalizeBackupSettings({ folder: input }, current).folder;
+  } catch {
+    return false;
+  }
+  if (!wanted || !current.folder) return wanted === current.folder;
+  return folderKey(wanted) === folderKey(current.folder) && !backupFolderIgnoredHere(current, dir);
+}
+
 /**
  * Save settings. A custom folder is created and test-written first so a typo or a read-only
  * drive is reported now instead of silently breaking every scheduled backup.
+ *
+ * `remote`: the request came from another computer through multi-user hosting. The folder can then
+ * not be changed (FORBIDDEN): it decides where THIS computer writes every full backup, and a
+ * remote Admin could otherwise point it at a share on their own computer (which this computer
+ * would then also offer the signed-in person's credentials). Schedule and versions kept still save;
+ * a form that sends the folder as it is gets no error.
  */
 export function saveBackupSettings(
   patch: Partial<Record<keyof BackupSettings, unknown>>,
   dataDir?: string,
+  opts: { remote?: boolean } = {},
 ): BackupSettings {
   const dir = resolveDataDir(dataDir);
-  const next = normalizeBackupSettings(patch, readBackupSettings(dir));
+  const current = readBackupSettings(dir);
+  let changes = patch;
+  if (opts.remote && patch.folder !== undefined) {
+    if (!folderUnchangedHere(patch.folder, current, dir)) throw new ServiceError('FORBIDDEN', REMOTE_FOLDER_CHANGE_MESSAGE);
+    // Unchanged: nothing about the folder is checked, created or approved from another computer.
+    changes = { ...patch };
+    delete changes.folder;
+  }
+  const next = normalizeBackupSettings(changes, current);
   // The folder is checked and taken as chosen on this computer only when the person set it now:
   // saving the schedule must never approve a folder that came in with the company file.
-  const folderSetNow = patch.folder !== undefined && Boolean(next.folder);
+  const folderSetNow = changes.folder !== undefined && Boolean(next.folder);
   if (folderSetNow && next.folder) {
     // Check BEFORE creating anything: a folder made inside the data directory would travel inside
     // every backup.

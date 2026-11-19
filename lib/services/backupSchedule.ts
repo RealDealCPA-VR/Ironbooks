@@ -42,6 +42,7 @@ import {
   isOwnBackupFile,
   markPruned,
   nextBackupDueAt,
+  ownBackupFileCheck,
   planRotation,
   readBackupHistory,
   readBackupSettings,
@@ -124,13 +125,16 @@ export function rotateVersions(keep: number, dataDir?: string, now: Date = new D
   // computer that has them, where they were then never rotated again).
   // And only records that really are this file's backups here (isOwnBackupFile): the history
   // travels inside the company file, so a crafted one could otherwise name any file on this
-  // computer to delete. Records that are not are left out of the rotation altogether.
-  const visible = readBackupHistory(dir).filter((r) => !r.path || (fs.existsSync(r.path) && isOwnBackupFile(r, dir)));
+  // computer to delete. Records that are not are left out of the rotation altogether — and their
+  // files are never even looked at (isOwnBackupFile judges a path's text first: merely looking at a
+  // network path makes Windows offer that server the person's credentials).
+  const own = ownBackupFileCheck(dir, 'delete');
+  const visible = readBackupHistory(dir).filter((r) => !r.path || own(r));
   const stale = planRotation(visible, keep);
   const pruned: string[] = [];
   for (const rec of stale) {
     try {
-      if (rec.path && fs.existsSync(rec.path) && isOwnBackupFile(rec, dir)) fs.rmSync(rec.path, { force: true });
+      if (rec.path && own(rec)) fs.rmSync(rec.path, { force: true });
       pruned.push(rec.id);
     } catch (err) {
       console.warn('[backup] could not delete old version (will retry next time):', err);
@@ -350,23 +354,33 @@ export interface BackupVersionRow extends BackupRecord {
   available: boolean;
 }
 
-/** History rows for the Backup page, newest first, with whether each file is still on disk. */
+/**
+ * History rows for the Backup page, newest first, with whether each file is still on disk here.
+ * Available only when it is one of this company file's own backups on this computer
+ * (isOwnBackupFile for reading): a version another computer made, or a path a crafted file names,
+ * is "not available here" — and never looked at.
+ */
 export function listBackupHistory(dataDir?: string, limit = 200): BackupVersionRow[] {
-  return readBackupHistory(dataDir)
+  const dir = resolveDataDir(dataDir);
+  const own = ownBackupFileCheck(dir, 'read');
+  return readBackupHistory(dir)
     .slice(0, limit)
     .map((r) => ({
       ...r,
-      available: Boolean(r.kind === 'full' && r.path && !r.prunedAt && fs.existsSync(r.path)),
+      available: Boolean(r.kind === 'full' && r.path && !r.prunedAt && own(r)),
     }));
 }
 
 /**
  * Bytes of a version from this company file's backup history (only files the history recorded
- * — never an arbitrary path from the request).
+ * — never an arbitrary path from the request — and only when the file really is one of this
+ * company file's own backups on this computer: the history travels inside the company file, so a
+ * record could otherwise name any file, or a network share, for preview and restore to read).
  */
 export function readBackupVersion(id: string, dataDir?: string): Buffer {
-  const rec = findBackupRecord(id, dataDir);
-  if (!rec || rec.kind !== 'full' || !rec.path || rec.prunedAt || !fs.existsSync(rec.path)) {
+  const dir = resolveDataDir(dataDir);
+  const rec = findBackupRecord(id, dir);
+  if (!rec || rec.kind !== 'full' || !rec.path || rec.prunedAt || !isOwnBackupFile(rec, dir, 'read')) {
     throw new ServiceError('NOT_FOUND', 'That backup is no longer in the backup folder.');
   }
   return fs.readFileSync(rec.path);

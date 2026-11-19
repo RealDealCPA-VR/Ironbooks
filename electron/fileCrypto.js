@@ -334,6 +334,18 @@ async function burnKdf(secret, kdf = currentKdf()) {
 }
 
 /**
+ * Slot limits for a manifest that may have been crafted. A real company file's manifest holds one
+ * password slot and at most one challenge slot per user (lib/services/fileProtection.ts keeps one
+ * of each per user) and one recovery slot. Each try costs up to half a GiB and seconds of scrypt
+ * (MAX_N / MAX_R / MAX_P), so a file listing hundreds of slots under one user name made a sign-in
+ * run them all. At most MAX_SLOT_TRIES slots are tried per kind and user name (four times what a
+ * real file has), and a manifest's slot list is read no further than MAX_SLOTS entries (over 2,000
+ * users' worth). Neither changes the slot format or its cost, so every real file opens as before.
+ */
+const MAX_SLOT_TRIES = 4;
+const MAX_SLOTS = 4096;
+
+/**
  * The slots of `encryption` (a manifest's block) for one kind and, for user slots, one tag.
  * @param {any} encryption
  * @param {string} kind
@@ -341,7 +353,7 @@ async function burnKdf(secret, kdf = currentKdf()) {
  * @returns {Array<Record<string, any>>}
  */
 function findSlots(encryption, kind, tag = null) {
-  const slots = encryption && Array.isArray(encryption.slots) ? encryption.slots : [];
+  const slots = encryption && Array.isArray(encryption.slots) ? encryption.slots.slice(0, MAX_SLOTS) : [];
   return slots.filter((s) => s && s.kind === kind && (kind === 'recovery' || (tag && s.tag === tag)));
 }
 
@@ -355,7 +367,7 @@ function findSlots(encryption, kind, tag = null) {
  */
 async function unlockWith(encryption, { kind, login = null, secret }) {
   const tag = kind === 'recovery' ? null : lookupTag(encryption && encryption.lookupSalt, login || '');
-  const candidates = findSlots(encryption, kind, tag).filter(wellFormedSlot);
+  const candidates = findSlots(encryption, kind, tag).filter(wellFormedSlot).slice(0, MAX_SLOT_TRIES);
   if (!candidates.length) return burnKdf(secret, kdfFor(kind));
   for (const slot of candidates) {
     const key = await openSlot(slot, secret);
@@ -568,6 +580,8 @@ module.exports = {
   MAX_N,
   MAX_R,
   MAX_P,
+  MAX_SLOT_TRIES,
+  MAX_SLOTS,
   SEAL_VERSION,
   currentKdf,
   kdfFor,

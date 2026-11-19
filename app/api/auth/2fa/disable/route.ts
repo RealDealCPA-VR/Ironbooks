@@ -7,7 +7,7 @@ import { eq } from 'drizzle-orm';
 import { users } from '@/lib/db/schema';
 import { getSessionGate } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
-import { verifyTotp } from '@/lib/totp';
+import { acceptTotpCode } from '@/lib/services/totpCodes';
 import { logTransaction } from '@/lib/services/transactionLog';
 import { consumeRecoveryCode, looksLikeRecoveryCode } from '@/lib/services/recoveryCodes';
 import { originFromHeaders } from '@/lib/net/requestInfo';
@@ -44,7 +44,7 @@ export async function POST(req: NextRequest) {
       // prefsperms: a one-time recovery code also works (the authenticator is lost).
       const typed = String(token ?? '');
       if (
-        !verifyTotp(user.totpSecret, typed, Date.now()) &&
+        !(await acceptTotpCode(db, userId, user.totpSecret, typed)) &&
         !(looksLikeRecoveryCode(typed) && (await consumeRecoveryCode(db, userId, typed)))
       ) {
         limiter.recordFailure(keys, Date.now(), weights);
@@ -55,7 +55,7 @@ export async function POST(req: NextRequest) {
       gate.release();
     }
   }
-  await db.update(users).set({ totpEnabled: false, totpSecret: null, totpRecoveryCodes: null }).where(eq(users.id, userId));
+  await db.update(users).set({ totpEnabled: false, totpSecret: null, totpRecoveryCodes: null, totpLastStep: null }).where(eq(users.id, userId));
   await logTransaction(db, {
     userId,
     action: 'update',

@@ -11,17 +11,19 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { cookies } from 'next/headers';
 import bcrypt from 'bcryptjs';
-import { eq } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import { getDb, isSealedDir, resolveDataDir } from '@/lib/db';
 import { companies, employees, users } from '@/lib/db/schema';
-import { touchSession } from '@/lib/services/sessions';
+import { SESSION_MAX_AGE_MS, touchSession } from '@/lib/services/sessions';
 import { getRequestOrigin } from '@/lib/net/requestInfo';
 import { integratedAppAllowed } from '@/lib/preferences';
 
 export const SESSION_COOKIE = 'bka_session';
 export const PORTAL_COOKIE = 'bka_portal'; // employee self-service session
 export const UNLOCK_COOKIE = 'bka_unlock'; // file-open password (QB-style company file lock)
-const SESSION_TTL_MS = 1000 * 60 * 60 * 24 * 30; // 30 days
+// 30 days: the same as SESSION_MAX_AGE_MS, at which the server ends the session row too
+// (lib/services/sessions.ts touchSession). Read when a token is made, not when this module loads.
+const sessionTtlMs = () => SESSION_MAX_AGE_MS;
 const UNLOCK_TTL_MS = 1000 * 60 * 60 * 12; // 12h within a single launch
 
 function secret(): string {
@@ -111,7 +113,7 @@ export function createSessionToken(userId: string, kind: TokenKind = 'user', sid
     userId,
     kind,
     fid: companyFileId(),
-    exp: Date.now() + SESSION_TTL_MS,
+    exp: Date.now() + sessionTtlMs(),
     ...(sid ? { sid } : {}),
     ...(ln ? { ln: launchBinding(ln) } : {}),
   });
@@ -326,22 +328,26 @@ export async function getCurrentUser() {
 }
 
 /**
- * Portal password version: a keyed digest of the employee's current portal password hash.
- * Portal tokens carry it, so setting a new portal password (or removing it) invalidates every
- * portal session minted under the old one. Keyed so the cookie reveals nothing about the hash.
+ * Portal password version: a keyed digest of the employee's current portal password hash and
+ * their portal sign-out count (employees.portal_token_version). Portal tokens carry it, so setting
+ * a new portal password (or removing it), or signing out of the portal, invalidates every portal
+ * session minted before. Keyed so the cookie reveals nothing about the hash. Version 0 (never
+ * signed out) gives the same digest as before the count existed, so sign-ins made by an older
+ * version keep working until the next sign-out.
  */
-export function portalPasswordVersion(portalPasswordHash: string): string {
-  return crypto.createHmac('sha256', secret()).update(`portal-pv:${portalPasswordHash}`).digest('base64url').slice(0, 22);
+export function portalPasswordVersion(portalPasswordHash: string, tokenVersion = 0): string {
+  const versioned = tokenVersion ? `${portalPasswordHash}:signout:${tokenVersion}` : portalPasswordHash;
+  return crypto.createHmac('sha256', secret()).update(`portal-pv:${versioned}`).digest('base64url').slice(0, 22);
 }
 
-/** Mint an employee self-service portal token bound to the current portal password. */
-export function createPortalToken(employeeId: string, portalPasswordHash: string): string {
+/** Mint an employee self-service portal token bound to the current portal password and sign-out count. */
+export function createPortalToken(employeeId: string, portalPasswordHash: string, tokenVersion = 0): string {
   const payload = JSON.stringify({
     userId: employeeId,
     kind: 'portal',
     fid: companyFileId(),
-    pv: portalPasswordVersion(portalPasswordHash),
-    exp: Date.now() + SESSION_TTL_MS,
+    pv: portalPasswordVersion(portalPasswordHash, tokenVersion),
+    exp: Date.now() + sessionTtlMs(),
   });
   const body = Buffer.from(payload).toString('base64url');
   return `${body}.${sign(body)}`;
@@ -378,6 +384,7 @@ export async function getPortalEmployeeId(): Promise<string | null> {
       id: employees.id,
       isActive: employees.isActive,
       portalPasswordHash: employees.portalPasswordHash,
+      portalTokenVersion: employees.portalTokenVersion,
       companySettings: companies.settings,
     })
     .from(employees)
@@ -389,8 +396,41 @@ export async function getPortalEmployeeId(): Promise<string | null> {
   // prefsperms A2: Preferences > Integrated Applications can turn the employee portal off; that
   // also ends sessions already signed in.
   if (!integratedAppAllowed(emp.companySettings, 'employeePortal')) return null;
-  const expected = Buffer.from(portalPasswordVersion(emp.portalPasswordHash));
+  const expected = Buffer.from(portalPasswordVersion(emp.portalPasswordHash, emp.portalTokenVersion ?? 0));
   const got = Buffer.from(token.pv);
   if (got.length !== expected.length || !crypto.timingSafeEqual(got, expected)) return null;
   return emp.id;
+}
+
+/**
+ * Portal sign-out: the employee's portal sign-out count goes up, so the token just used — and any
+ * copy of it, or another portal sign-in of the same employee — no longer matches
+ * (portalPasswordVersion). Returns whether a valid portal session was ended.
+ */
+export async function endPortalSessions(): Promise<boolean> {
+  let token: { userId: string; pv?: string } | null;
+  try {
+    const store = await cookies();
+    token = verifySessionToken(store.get(PORTAL_COOKIE)?.value, 'portal');
+  } catch {
+    return false;
+  }
+  if (!token?.pv) return false;
+  const db = await getDb();
+  const [emp] = await db
+    .select({ id: employees.id, hash: employees.portalPasswordHash, version: employees.portalTokenVersion })
+    .from(employees)
+    .where(eq(employees.id, token.userId));
+  if (!emp?.hash) return false;
+  // Only a token that is still current may sign the employee out (not a stale copy, which would
+  // otherwise sign out whoever signed in after it). Unlike getPortalEmployeeId, signing out also
+  // works while the portal is turned off or the employee inactive, so it holds when they return.
+  const expected = Buffer.from(portalPasswordVersion(emp.hash, emp.version ?? 0));
+  const got = Buffer.from(token.pv);
+  if (got.length !== expected.length || !crypto.timingSafeEqual(got, expected)) return false;
+  await db
+    .update(employees)
+    .set({ portalTokenVersion: sql`${employees.portalTokenVersion} + 1` })
+    .where(eq(employees.id, emp.id));
+  return true;
 }

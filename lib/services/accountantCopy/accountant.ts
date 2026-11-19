@@ -21,6 +21,7 @@
 import fs from 'node:fs';
 import AdmZip from 'adm-zip';
 import { and, asc, eq, isNotNull, sql } from 'drizzle-orm';
+import format from '@/electron/companyFileFormat';
 import { closeDb, getDb } from '@/lib/db';
 import {
   accountantCopies,
@@ -92,6 +93,13 @@ export function readTransferManifest(buffer: Buffer): TransferManifest {
     zip = new AdmZip(buffer);
   } catch {
     throw new ServiceError('VALIDATION', "This is not an Accountant's Copy transfer file (.ibac): it could not be read.");
+  }
+  // The size check every other archive reader makes before inflating anything: a small crafted
+  // file must not unpack into gigabytes (electron/companyFileFormat.js).
+  try {
+    format.checkSizes(zip.getEntries().map((e) => ({ name: e.entryName, size: e.header.size, csize: e.header.compressedSize })));
+  } catch {
+    throw new ServiceError('VALIDATION', "The Accountant's Copy transfer file is damaged (it unpacks to more than any company file can hold).");
   }
   const entry = zip.getEntry(TRANSFER_ENTRY);
   if (!entry) {

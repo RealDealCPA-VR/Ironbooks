@@ -238,6 +238,9 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/company-file/close': kind('public', 'POST'),
   '/api/company-file/save-as': kind('public', 'POST'),
   '/api/company-file/info': kind('public', 'GET'),
+  // The desktop shell's start-up check that the port answers with the server it started: a keyed
+  // hash of the shell's own nonce, nothing from the company file (lib/net/internalToken.ts).
+  '/api/handshake': kind('public', 'GET'),
   // Keyboard (F2 / Ctrl+1): Product Information — version, company file and list totals.
   '/api/product-info': kind('member', 'GET'),
   '/api/transaction-log': r('reports_financial', 'GET'),

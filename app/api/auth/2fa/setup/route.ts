@@ -67,7 +67,8 @@ export async function POST(req: NextRequest) {
   const secret = generateSecret();
   const updated = await db
     .update(users)
-    .set({ totpSecret: secret })
+    // A new secret starts with no code used yet (lib/services/totpCodes.ts).
+    .set({ totpSecret: secret, totpLastStep: null })
     .where(and(eq(users.id, userId), eq(users.totpEnabled, false)))
     .returning({ id: users.id });
   if (!updated.length) {

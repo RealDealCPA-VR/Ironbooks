@@ -7,8 +7,10 @@
  * answers from its plain manifest only (the company name and file id are all it shows): the
  * sign-in itself decrypts it. `protected` lets the screen offer the recovery key.
  *
- * Public, read-only. The file's location on disk is only shared with this computer, never with
- * teammates connecting through multi-user hosting.
+ * Public, read-only. The file's location on disk is only shared with the app on this computer,
+ * never with teammates connecting through multi-user hosting, nor with another program on this
+ * computer that lacks the desktop shell's per-launch pass (both count as remote:
+ * lib/net/requestInfo.ts). A web page naming another host never gets here (middleware.ts).
  */
 import path from 'node:path';
 import { NextResponse } from 'next/server';

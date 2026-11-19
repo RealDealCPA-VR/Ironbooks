@@ -17,9 +17,10 @@ jobs:
       #    Azure Trusted Signing; electron-builder signs every file while it builds.
       #  - WIN_CSC_LINK (base64 .pfx) + WIN_CSC_KEY_PASSWORD: a code-signing certificate;
       #    electron-builder signs every file while it builds.
-      #  - SIGNPATH_API_TOKEN (+ repository variables SIGNPATH_ORGANIZATION_ID, and optionally
-      #    SIGNPATH_PROJECT_SLUG / SIGNPATH_SIGNING_POLICY_SLUG): SignPath signs the finished
-      #    installers, then the update feed is rebuilt for the signed files.
+      #  - SIGNPATH_API_TOKEN (+ repository variables SIGNPATH_ORGANIZATION_ID,
+      #    SIGNPATH_PUBLISHER_NAME, and optionally SIGNPATH_PROJECT_SLUG /
+      #    SIGNPATH_SIGNING_POLICY_SLUG): SignPath signs the finished installers, then the update
+      #    feed is rebuilt for the signed files.
       AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
       AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
       AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
@@ -27,13 +28,13 @@ jobs:
       CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
       SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: '24' # the Node bundled in Electron 41 (the installed app's server runs on it)
       - run: npm ci --legacy-peer-deps
       # Next.js build cache: faster builds, and no "No build cache found" notice.
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: .next/cache
           key: nextjs-${{ runner.os }}-${{ hashFiles('package-lock.json') }}-${{ hashFiles('app/**', 'components/**', 'lib/**') }}
@@ -81,11 +82,23 @@ jobs:
       # --- SignPath: build, sign the installers, rebuild the update feed, publish ---
       - name: Build the installers for signing
         if: env.SIGNPATH_API_TOKEN != ''
-        run: npm run build && npx electron-builder --win nsis portable --publish never
+        shell: bash
+        env:
+          SIGNPATH_PUBLISHER_NAME: ${{ vars.SIGNPATH_PUBLISHER_NAME }}
+        run: |
+          # The files are signed after the build, so electron-builder never sees the certificate and
+          # cannot read the publisher from it. Without the name in the app's update settings,
+          # installed copies would go on accepting unsigned updates. Stop rather than ship that.
+          [ -n "$SIGNPATH_PUBLISHER_NAME" ] || { echo "::error::SignPath: SIGNPATH_PUBLISHER_NAME is not set (see SIGNING.md)"; exit 1; }
+          npm run build
+          # publisherName is written into the app's update settings: installed copies then accept
+          # only updates signed by this publisher.
+          npx electron-builder --win nsis portable --publish never \
+            -c.win.signtoolOptions.publisherName="$SIGNPATH_PUBLISHER_NAME"
       - name: Hand the installers to SignPath
         if: env.SIGNPATH_API_TOKEN != ''
         id: unsigned
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: unsigned-installers
           path: |
@@ -94,7 +107,7 @@ jobs:
           if-no-files-found: error
       - name: Sign with SignPath
         if: env.SIGNPATH_API_TOKEN != ''
-        uses: signpath/github-action-submit-signing-request@v2
+        uses: signpath/github-action-submit-signing-request@c92b958760219087e01f8d67a1669ed57afe2627 # v2
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
           organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}

@@ -99,7 +99,7 @@ import { currentFingerprint } from './backupFingerprint';
 import { APP_VERSION } from '@/lib/appVersion';
 import { UnstartableBooksError, dataDirProblem } from './workingCopyRecovery';
 import type { EffectiveAccess } from '@/lib/permissions/model';
-import { isMaskedValue, isSensitiveKey, maskSensitive } from '@/lib/permissions/mask';
+import { isMaskedValue, isSensitiveKey, maskSensitive, stripSecrets } from '@/lib/permissions/mask';
 
 /** Name of the manifest entry embedded at the root of every .bka archive. */
 export const BACKUP_MANIFEST_ENTRY = 'bookkeeper-manifest.json';
@@ -540,7 +540,32 @@ export async function openBackupBuffer(
       manifest = null;
     }
   }
-  return { key: null, manifest, extractTo: (dir) => zip.extractAllTo(dir, /* overwrite */ true) };
+  return {
+    key: null,
+    manifest,
+    extractTo: (dir) => {
+      // The names a company file may hold (format.safeEntryName): never "x:y" (an alternate data
+      // stream of x), a Windows device name ("CON", "nul.txt") or a name ending in a space. No
+      // backup the app made has one; a crafted entry is left out rather than written.
+      for (const name of zip.getEntries().map((e) => e.entryName)) {
+        if (!format.safeEntryName(name)) zip.deleteEntry(name);
+      }
+      zip.extractAllTo(dir, /* overwrite */ true);
+    },
+  };
+}
+
+/**
+ * A small crafted archive must not unpack into gigabytes: every entry's declared size is capped
+ * (adm-zip stops inflating at it), and so are their total and its ratio to the bytes stored
+ * (electron/companyFileFormat.js). Run before any entry of a backup without passwords is read.
+ */
+function checkBackupZipSizes(zip: AdmZip): void {
+  try {
+    format.checkSizes(zip.getEntries().map((e) => ({ name: e.entryName, size: e.header.size, csize: e.header.compressedSize })));
+  } catch {
+    throw notABackup('it unpacks to more than any company file can hold');
+  }
 }
 
 /**
@@ -566,13 +591,7 @@ export function validateBackupZip(buffer: Buffer): AdmZip {
   } catch {
     throw notABackup('could not read zip archive');
   }
-  // A small crafted archive must not unpack into gigabytes: every entry's declared size is capped
-  // (adm-zip stops inflating at it), and so is their total (electron/companyFileFormat.js).
-  try {
-    format.checkSizes(zip.getEntries().map((e) => ({ name: e.entryName, size: e.header.size })));
-  } catch {
-    throw notABackup('it unpacks to more than any company file can hold');
-  }
+  checkBackupZipSizes(zip);
   if (!entryNames.length) throw notABackup('archive is empty');
 
   const manifestEntry = zip.getEntry(BACKUP_MANIFEST_ENTRY);
@@ -1243,7 +1262,18 @@ export interface CompanyExportData {
   tables: Record<string, Array<Record<string, unknown>>>;
 }
 
-/** Pull every row belonging to one company across all registered tables. */
+/**
+ * Pull every row belonging to one company across all registered tables.
+ *
+ * Without credential material (stripSecrets, the rule for every API answer): the closing-date
+ * password hash, the file-password hash and employees' portal password hashes stay in the file.
+ * A per-company backup only needs the Accountant-level "create backup" right, and a bcrypt hash
+ * can be cracked offline — the closing-date password exists precisely to stop those roles. The
+ * same goes for any hash inside audit-trail values. Restoring it always creates a NEW company
+ * (restoreCompanyBackup), so no existing password is ever replaced or cleared: the restored
+ * company keeps its closing date, and its closing-date password, and any employee portal
+ * passwords, are set again there by an Admin.
+ */
 export async function exportCompanyData(db: DB, companyId: string): Promise<CompanyExportData> {
   const [company] = await db.select().from(companies).where(eq(companies.id, companyId));
   if (!company) throw new ServiceError('NOT_FOUND', 'Company not found');
@@ -1254,10 +1284,10 @@ export async function exportCompanyData(db: DB, companyId: string): Promise<Comp
     let q: any = db.select({ row: spec.table }).from(spec.table);
     for (const j of spec.joins) q = q.innerJoin(j.table, eq(j.on[0], j.on[1]));
     const rows: Array<{ row: Record<string, unknown> }> = await q.where(eq(spec.companyCol, companyId));
-    tables[spec.name] = rows.map((r) => r.row);
+    tables[spec.name] = rows.map((r) => stripSecrets(r.row));
   }
   return {
-    company: { id: company.id, name: company.name, settings: company.settings ?? null },
+    company: { id: company.id, name: company.name, settings: stripSecrets(company.settings ?? null) },
     tables,
   };
 }
@@ -1350,6 +1380,8 @@ function readCompanyBackupFiles(buffer: Buffer): Map<string, Buffer> {
   } catch {
     return new Map();
   }
+  // Every entry is inflated below: the same size check as every other backup reader first.
+  checkBackupZipSizes(zip);
   return companyBackupFilesOf(
     zip.getEntries().map((e) => (e.isDirectory ? { name: e.entryName, dir: true } : { name: e.entryName, data: e.getData() })),
   );
@@ -1407,6 +1439,7 @@ export function readCompanyBackup(buffer: Buffer): CompanyExportData {
   } catch {
     throw notABackup('could not read zip archive');
   }
+  checkBackupZipSizes(zip);
   const manifestEntry = zip.getEntry(BACKUP_MANIFEST_ENTRY);
   if (!manifestEntry) throw notABackup('missing manifest — is this a full backup?');
   let manifest: Partial<BackupManifest>;

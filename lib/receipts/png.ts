@@ -29,11 +29,26 @@ function chunk(type: string, data: Buffer): Buffer {
   return Buffer.concat([len, body, crc]);
 }
 
+/**
+ * Largest image (in pixels) read out of a PDF. A page image is decoded and copied at full size,
+ * so an 18 KB PDF declaring a 12,000 x 12,000 image used 550 MB, on the server that also hosts
+ * the database. A 600-dpi scan of a Letter or A4 page is about 5,100 x 6,600 = 34 million pixels;
+ * 40 million keeps that and refuses anything larger. Also passed to pdf.js as `maxImageSize`, so
+ * such an image is dropped before it is decoded at all.
+ */
+export const MAX_IMAGE_PIXELS = 40_000_000;
+
+/** True when width x height is a real image size within MAX_IMAGE_PIXELS. */
+export function imageSizeOk(width: number, height: number): boolean {
+  return Number.isInteger(width) && Number.isInteger(height) && width >= 1 && height >= 1 && width * height <= MAX_IMAGE_PIXELS;
+}
+
 /** channels: 1 = gray, 3 = RGB, 4 = RGBA. `pixels` is row-major, `width * height * channels` bytes. */
 export function encodePng(width: number, height: number, pixels: Uint8Array, channels: 1 | 3 | 4): Buffer {
   if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1) {
     throw new Error('Invalid image size.');
   }
+  if (!imageSizeOk(width, height)) throw new Error('Image too large.');
   const stride = width * channels;
   if (pixels.length < stride * height) throw new Error('Not enough pixel data.');
   const raw = Buffer.alloc((stride + 1) * height);
@@ -59,6 +74,8 @@ export function encodePng(width: number, height: number, pixels: Uint8Array, cha
 
 /** Expand pdf.js 1-bit-per-pixel grayscale (kind 1) to 8-bit gray. */
 export function expand1bpp(width: number, height: number, data: Uint8Array): Uint8Array {
+  // Checked before allocating: the size comes from the PDF, not from the data actually present.
+  if (!imageSizeOk(width, height)) throw new Error('Image too large.');
   const out = new Uint8Array(width * height);
   const rowBytes = (width + 7) >> 3;
   for (let y = 0; y < height; y++) {

@@ -17,7 +17,10 @@
  * tailnet peer guessing the owner's password can't lock the owner out at the host.
  *
  * In-memory by design: the host server is a single process, and a restart clearing the
- * counters is acceptable (it does not reset faster than a lockout would).
+ * counters is acceptable (it does not reset faster than a lockout would). The one secret that is
+ * short enough for that to matter, the "I forgot my password" challenge answer, is also counted
+ * in the company file with lockouts that survive a restart (lib/services/challengeLockout.ts);
+ * this limiter stays its first line.
  */
 
 export interface RateLimitOptions {

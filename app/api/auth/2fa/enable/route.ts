@@ -12,7 +12,7 @@ import { eq } from 'drizzle-orm';
 import { users } from '@/lib/db/schema';
 import { getSessionGate } from '@/lib/context';
 import { ServiceError } from '@/lib/services/_base';
-import { verifyTotp } from '@/lib/totp';
+import { acceptTotpCode } from '@/lib/services/totpCodes';
 import { logTransaction } from '@/lib/services/transactionLog';
 import { issueRecoveryCodes } from '@/lib/services/recoveryCodes';
 import { originFromHeaders } from '@/lib/net/requestInfo';
@@ -49,7 +49,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json(body, { status: 429, headers: { 'Retry-After': retryAfter } });
   }
   try {
-    if (!verifyTotp(user.totpSecret, String(token ?? ''), Date.now())) {
+    if (!(await acceptTotpCode(db, userId, user.totpSecret, String(token ?? '')))) {
       limiter.recordFailure(keys, Date.now(), weights);
       return NextResponse.json({ error: 'Invalid code', code: 'FORBIDDEN' }, { status: 400 });
     }

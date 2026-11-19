@@ -16,37 +16,61 @@ Privacy & Network, and Offline mode blocks them.
 - **Update granularity:** electron-updater swaps the **entire installed package** — the Electron shell,
   the bundled Next.js standalone server, and the `drizzle/` migrations all update together atomically.
 
-## One-time setup
+## How a release is made
 
-1. **GitHub token.** Create a fine-grained or classic PAT with **`repo`** scope (it needs to create
-   releases and upload assets on `RealDealCPA-VR/Ironbooks`). Keep it out of git.
-2. Make the repo's **Releases public** (the repo can be private, but a private repo's update feed
-   requires every client to ship a token — for a normal distributable app, use public releases).
+Releases are built and published only by GitHub Actions. Pushing a tag `v<version>` starts
+[`.github/workflows/release.yml`](./.github/workflows/release.yml), which runs on a Windows
+runner and:
+
+1. installs the dependencies (`npm ci`);
+2. creates a **draft** GitHub Release for the tag, which installed copies cannot see yet;
+3. builds the app and uploads into that draft the NSIS installer
+   (`Ironbooks-Setup-<version>.exe`), its `.blockmap` (for smaller, delta downloads), the
+   portable `Ironbooks-<version>.exe` and the `latest.yml` update feed. When signing is set up
+   (`SIGNING.md`) the files are signed first;
+4. checks that all four files are on the release, then publishes it and marks it **Latest**.
+   Installed copies pick it up from that moment.
+
+The workflow uploads with the token GitHub Actions gives each run (`GITHUB_TOKEN`, which can
+write releases for this repository only). No personal access token is needed. Pushing a tag is
+the only supported way to publish: do not run `npm run desktop:publish` (the command the
+workflow uses) on your own computer.
+
+The update feed is this repository's public GitHub Releases, so installed copies read it without
+a token.
+
+## Before tagging
+
+- **CI on `main` must be green for the exact commit you are tagging** (Actions → CI). The release
+  workflow builds the installers but does not run the tests.
+- `package.json` `"version"` (and `package-lock.json`) must already hold the new version, and the
+  tag must be that version with a `v` in front. The files are named after `package.json`'s
+  version (and electron-builder uploads to the release of that name), so with a mismatch the
+  tag's own release never gets its files and is never published.
+- The version must be higher than the last release: installed copies compare it with their own.
+- A release that changes the database layout ships its new `drizzle/` migration files.
 
 ## Cut a release
 
 ```powershell
-# 1. Bump the version (this is what clients compare against — it MUST increase every release).
-#    Edit package.json "version", or:
-npm version patch        # 1.0.0 -> 1.0.1   (use minor / major as appropriate)
+# 1. Bump the version in package.json and package-lock.json (patch / minor / major as fits),
+#    commit it and push it to main.
+npm version patch --no-git-tag-version
+git commit -am "Version 1.2.3"
+git push origin main
 
-# 2. Build installers + upload them (and latest.yml / .blockmap) to a GitHub Release.
-$env:GH_TOKEN = "<your PAT>"
-npm run desktop:publish
+# 2. When CI has passed on that commit, tag it and push the tag. This starts the release.
+git tag v1.2.3
+git push origin v1.2.3
 ```
 
-`electron-builder --publish always` builds the NSIS installer + portable exe (per the `win.target`
-config), generates the **`latest.yml`** feed file and a **`.blockmap`** (enables delta downloads),
-and uploads all of them to a GitHub Release tagged `v<version>`. The publish config sets
-`"releaseType": "release"`, so the release is published **live immediately** — there is no draft
-step, and clients can pick it up as soon as the upload finishes.
+Follow the run under Actions → Release. When it finishes, the release is live and existing
+installs offer the update at their next check.
 
-> If you'd rather review release notes before clients see it, change
-> `build.publish[0].releaseType` back to `"draft"` and click **Publish** on the GitHub release
-> when ready.
-
-That's the whole loop: **bump version → `npm run desktop:publish`.** Existing installs pick it up on
-their next launch.
+If the workflow fails, nothing is published: the release stays a draft that installed copies
+never see. If the failure was temporary (a network error, for example), re-run the workflow from
+the Actions page; it reuses the same draft. If the code needs a fix, delete the draft release and
+release the fix under the next version number.
 
 ## What happens on the user's machine
 
@@ -73,16 +97,21 @@ their next launch.
 
 - **Windows:** auto-update works **unsigned**, but SmartScreen warns on first run of each new version,
   and on Windows 11 with Smart App Control **On** an unsigned installer is blocked outright (no "Run
-  anyway"; Windows Security > App & browser control > Smart App Control). Sign with an EV/OV
-  code-signing cert (see `SIGNING.md`) to remove the warning.
+  anyway"; Windows Security > App & browser control > Smart App Control). Turn on signing for
+  releases (`SIGNING.md`: Azure Trusted Signing, SignPath or a certificate) to remove the warning.
+  From the first signed release on, installed copies accept only updates signed by the same
+  publisher.
 - **macOS:** auto-update **requires** a properly **signed + notarized** build. The self-signed pipeline
   in `SIGNING.md` is enough to run locally but will **not** auto-update on macOS — you need an Apple
   Developer ID cert + notarization for the `.dmg`/`.zip` feed.
 - **Linux:** AppImage auto-updates via the same feed; `.deb` does not (users update via apt/manual).
+- The release workflow builds the Windows installers only; macOS and Linux builds are not
+  published today.
 
-## Testing the update flow before a real release
+## Checking the update flow
 
-1. Build `1.0.0` and install it.
-2. Bump to `1.0.1`, `npm run desktop:publish`, publish the draft release.
-3. Relaunch the installed `1.0.0` — it should detect, download, and toast within a few seconds.
+1. Install the current release from GitHub (`Ironbooks-Setup-<version>.exe`).
+2. Release the next version with a tag, as above.
+3. When the release is live, start the installed copy (or Help → Check for Updates…). It should
+   offer the update within a few seconds, download it and install it.
    (Auto-update is disabled in `isDev`, so this only works against an installed build, not `npm run desktop`.)

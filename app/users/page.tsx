@@ -274,7 +274,17 @@ function UsersTab({
                 <Button size="sm" variant="ghost" onClick={() => setEditing(u)} title="Edit user">
                   <Pencil className="h-4 w-4" />
                 </Button>
-                <Button size="sm" variant="ghost" onClick={() => setResetting(u)} title="Reset password">
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  // Your own password is changed with the current one (lib/services/users.ts
+                  // resetUserPassword refuses a reset of your own without it).
+                  onClick={() => {
+                    if (u.userId === meId) window.location.href = '/change-password?next=/users';
+                    else setResetting(u);
+                  }}
+                  title={u.userId === meId ? 'Change your password' : 'Reset password'}
+                >
                   <KeyRound className="h-4 w-4" />
                 </Button>
                 <Button

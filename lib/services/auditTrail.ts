@@ -4,12 +4,18 @@
  * listAuditLogs: paginated, filterable list of audit_logs scoped to the company,
  *   with the acting user's name joined in. Newest-first.
  * getAuditLog: single record with oldValues/newValues for diff display.
+ *
+ * Both show only the entries the caller may view the record of (lib/services/auditVisibility.ts):
+ * the snapshots hold pay rates, W-4s, home addresses and user accounts, and the Audit Trail right
+ * alone (Reports — Financial) is held by roles with no payroll access. Hidden entries are left out
+ * of the total as well; one asked for by id is "not found", like an entry of another company.
  */
 import { and, asc, desc, eq, gte, lte, sql } from 'drizzle-orm';
 import { auditLogs, users } from '@/lib/db/schema';
 import { type ServiceContext, notFound } from './_base';
 import { maskForContext } from './access';
 import { stripSecrets } from '@/lib/permissions/mask';
+import { auditVisibilitySql, canSeeAuditEntry } from './auditVisibility';
 
 export interface AuditLogRow {
   id: string;
@@ -46,6 +52,8 @@ export async function listAuditLogs(
   if (action) conds.push(eq(auditLogs.action, action as never));
   if (from) conds.push(gte(auditLogs.createdAt, from));
   if (to) conds.push(lte(auditLogs.createdAt, to));
+  const visible = auditVisibilitySql(ctx.access);
+  if (visible) conds.push(visible);
 
   const where = and(...conds);
 
@@ -107,6 +115,8 @@ export async function getAuditLog(ctx: ServiceContext, id: string): Promise<Audi
     .where(and(eq(auditLogs.id, id), eq(auditLogs.companyId, ctx.companyId)));
 
   if (!row) throw notFound('Audit log entry');
+  // An entry about a record the caller may not view is answered like one that does not exist.
+  if (!canSeeAuditEntry(ctx.access, row.entityType, row.oldValues, row.newValues)) throw notFound('Audit log entry');
 
   return {
     id: row.id,

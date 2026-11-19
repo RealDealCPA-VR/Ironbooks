@@ -217,6 +217,14 @@ function isCalendarDay(y: number, m: number, d: number): boolean {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type OFXNode = Record<string, any>;
 
+/**
+ * Deepest nesting of container tags accepted. A real bank or credit-card file nests under 10
+ * levels (OFX › BANKMSGSRSV1 › STMTTRNRS › STMTRS › BANKTRANLIST › STMTTRN › …), and an empty
+ * SGML leaf left open adds one level only until its parent closes. A file nested deeper is not a
+ * statement: refusing it keeps a hostile file from tying up the server.
+ */
+export const OFX_MAX_DEPTH = 64;
+
 function parseOFXSgml(content: string): OFXNode {
   // Strip the text header that QuickBooks / most banks emit before <OFX>.
   const idx = content.search(/<OFX[\s>]/i);
@@ -247,7 +255,15 @@ function parseOFXSgml(content: string): OFXNode {
     const closeMatch = line.match(/^<\/([A-Z0-9_.]+)>$/i);
     if (closeMatch) {
       const tag = closeMatch[1].toUpperCase();
-      const idx = stack.map((f) => f.tag).lastIndexOf(tag);
+      // Search from the top of the stack in place (copying the stack's tags for every close tag
+      // made a deeply nested file quadratic).
+      let idx = -1;
+      for (let k = stack.length - 1; k >= 0; k--) {
+        if (stack[k].tag === tag) {
+          idx = k;
+          break;
+        }
+      }
       if (idx !== -1) {
         stack.length = idx;
         current = stack.length > 0 ? stack[stack.length - 1].obj : root;
@@ -275,6 +291,9 @@ function parseOFXSgml(content: string): OFXNode {
     // Container opening tag: <TAG> alone on a line
     const openMatch = line.match(/^<([A-Z0-9_.]+)>$/i);
     if (openMatch) {
+      if (stack.length >= OFX_MAX_DEPTH) {
+        throw new Error(`its sections are nested more than ${OFX_MAX_DEPTH} levels deep, so it is not a bank statement file`);
+      }
       const tag = openMatch[1].toUpperCase();
       const newObj: OFXNode = {};
       const existing = current[tag];

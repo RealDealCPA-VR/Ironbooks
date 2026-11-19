@@ -1,9 +1,13 @@
 /**
  * POST /api/auth/reset — complete a password reset with a valid, unexpired token.
  * Body: { token, password }
+ *
+ * The company file keeps only a fingerprint of the token (lib/services/passwordReset.ts): the
+ * token presented is fingerprinted and looked up. A reset earned with the challenge question is
+ * recorded in the audit trail and leaves a note for the user and the Admins.
  */
 import { NextRequest, NextResponse } from 'next/server';
-import { and, eq, gt } from 'drizzle-orm';
+import { and, gt, inArray } from 'drizzle-orm';
 import { getDb, sealedMode } from '@/lib/db';
 import { users } from '@/lib/db/schema';
 import { hasValidUnlockCookie, MIN_PASSWORD_LENGTH } from '@/lib/auth';
@@ -15,6 +19,7 @@ import { logTransaction } from '@/lib/services/transactionLog';
 import { originFromHeaders } from '@/lib/net/requestInfo';
 import { GLOBAL_KEY_WEIGHT, attemptKeys, resetLimiter, tooManyResets } from '@/lib/net/rateLimit';
 import { invalidJsonBody, readJsonObject } from '@/lib/routeErrors';
+import { recordChallengeReset, resetTokenCandidates, resetVia } from '@/lib/services/passwordReset';
 
 export async function POST(req: NextRequest) {
   const body = await readJsonObject(req);
@@ -65,7 +70,7 @@ export async function POST(req: NextRequest) {
     const [user] = await db
       .select()
       .from(users)
-      .where(and(eq(users.resetToken, token), gt(users.resetExpires, new Date())));
+      .where(and(inArray(users.resetToken, resetTokenCandidates(token)), gt(users.resetExpires, new Date())));
     if (!user) {
       limiter.recordFailure(keys, Date.now(), weights);
       return NextResponse.json({ error: 'Invalid or expired reset token.', code: 'FORBIDDEN' }, { status: 400 });
@@ -79,18 +84,22 @@ export async function POST(req: NextRequest) {
       }
       throw err;
     }
+    const byChallenge = resetVia(user.resetToken) === 'challenge';
     // New hash + change date; clears the token and any "must change" flag.
     await storeUserPassword(db, user.id, password);
     // Whoever held the old password is signed out everywhere (server-side session rows).
     await endUserSessions(db, user.id, 'password_reset');
+    // The challenge question is the weakest way in: the audit trail says so, and the user and the
+    // Admins find a note in Needs attention at their next sign-in (lib/services/passwordReset.ts).
+    if (byChallenge) await recordChallengeReset(db, user);
     // Running transaction log: user/security changes are logged (never the password itself).
     await logTransaction(db, {
       userId: user.id,
       action: 'update',
       entityType: 'user',
       entityId: user.id,
-      summary: `Reset the password for user "${user.name}"`,
-      data: { new: { email: user.email, passwordChanged: true } },
+      summary: `Reset the password for user "${user.name}"${byChallenge ? ' with the challenge question' : ''}`,
+      data: { new: { email: user.email, passwordChanged: true, ...(byChallenge ? { resetWith: 'challenge_question' } : {}) } },
     });
     return NextResponse.json({ ok: true });
   } finally {

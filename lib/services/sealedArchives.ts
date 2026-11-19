@@ -96,10 +96,15 @@ export function writeUnsealedEntries(entries: UnsealedArchive['entries'], root: 
   const abs = path.resolve(root);
   fs.mkdirSync(abs, { recursive: true });
   if (fs.readdirSync(abs).length) throw new ServiceError('INTERNAL', 'The folder to restore into is not empty.');
+  // Names are compared the way Windows resolves them (format.comparablePath: any case, no trailing
+  // dots or spaces), so ".Auth-Secret" in a crafted archive is held back like ".auth-secret".
+  const left = new Set([format.COMPANY_MANIFEST_ENTRY, format.BACKUP_MANIFEST_ENTRY, ...skip].map((n) => format.comparablePath(n)));
   for (const e of entries) {
     const name = format.safeEntryName(e.name) as string | null;
     if (!name) continue;
-    if (name === format.COMPANY_MANIFEST_ENTRY || name === format.BACKUP_MANIFEST_ENTRY || skip.includes(name)) continue;
+    // Also never this location's own files (the session-signing key, the locks, the markers):
+    // the same list a company file leaves out (format.isExcludedPath).
+    if (left.has(format.comparablePath(name)) || format.isExcludedPath(name)) continue;
     const target = path.resolve(abs, ...name.split('/').filter(Boolean));
     if (target !== abs && !target.startsWith(abs + path.sep)) continue;
     if (e.dir || name.endsWith('/')) {

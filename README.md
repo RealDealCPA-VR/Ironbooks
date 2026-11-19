@@ -327,6 +327,9 @@ user, turn that feature on. Update checks (app version and platform only) are th
 connection on by default, and you can turn them off in Privacy & Network. The full list of
 what can leave your computer, and the switch for each, is in [`PRIVACY.md`](./PRIVACY.md).
 
+**Security:** please report a vulnerability privately, as described in
+[`SECURITY.md`](./SECURITY.md), not in a public issue.
+
 ## ⚠️ Disclaimer
 
 Accounting, tax and payroll features (including tax tables and wage bases) are provided as-is.

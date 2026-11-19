@@ -314,11 +314,22 @@ export async function renameMemorizedGroup(ctx: ServiceContext, id: string, inpu
   });
 }
 
-/** Delete a group; its reports are kept (moved to "no group"), its schedules are removed. */
+/**
+ * Delete a group; its reports are kept (moved to "no group"), its schedules are removed. Removing
+ * schedules needs the right that deleting a schedule itself needs (Scheduled Reports: delete),
+ * so a group with schedules can't be used to take them away without it.
+ */
 export async function deleteMemorizedGroup(ctx: ServiceContext, id: string) {
   requireAnyReportAccess(ctx);
   const g = await getGroup(ctx, id);
   return inTransaction(ctx, async (tx) => {
+    // Checked in the transaction that deletes them, so a schedule added meanwhile counts too.
+    const [scheduled] = await tx.db
+      .select({ id: reportSchedules.id })
+      .from(reportSchedules)
+      .where(and(eq(reportSchedules.companyId, tx.companyId), eq(reportSchedules.groupId, id)))
+      .limit(1);
+    if (scheduled) requireActivity(ctx, 'file_utilities.schedules', 'delete');
     await tx.db.update(memorizedReports).set({ groupId: null }).where(and(eq(memorizedReports.companyId, tx.companyId), eq(memorizedReports.groupId, id)));
     await tx.db.delete(reportSchedules).where(and(eq(reportSchedules.companyId, tx.companyId), eq(reportSchedules.groupId, id)));
     await tx.db.delete(memorizedReportGroups).where(eq(memorizedReportGroups.id, id));

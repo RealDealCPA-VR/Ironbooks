@@ -129,7 +129,9 @@ export async function resolveLineRef(
   const entryIds = new Set<string>();
   if (ref.owner?.type === 'journal_entry') {
     entryIds.add(mapId(ref.entryId)!);
-  } else if (ref.owner && OWNER_TABLES[ref.owner.type]) {
+  } else if (ref.owner && typeof ref.owner.type === 'string' && Object.hasOwn(OWNER_TABLES, ref.owner.type)) {
+    // Own keys only: the type comes from an imported file, and "constructor" / "__proto__" would
+    // otherwise find Object's own members and put them into the SQL below as a table name.
     if (ref.owner.type === 'transfer' && idMap.has(ref.entryId)) entryIds.add(idMap.get(ref.entryId)!);
     const res = await ctx.db.execute(
       sql`SELECT posted_entry_id::text AS id FROM ${sql.raw(OWNER_TABLES[ref.owner.type])} WHERE company_id = ${ctx.companyId}::uuid AND id = ${mapId(ref.owner.id)}::uuid`,

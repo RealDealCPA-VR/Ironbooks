@@ -661,6 +661,10 @@ describe('review4: round-trip fidelity of every way data leaves and re-enters a 
     const res = await restoreCompanyBackup(db, buffer, { ownerId: ctx.userId!, name: 'RT Restored' });
     const F = await fingerprint({ db, companyId: res.companyId, userId: ctx.userId }, dir);
     F.meta.companyName = COMPANY;
+    // Security 2.5: a per-company backup no longer carries the closing-date password hash (the
+    // closing date itself travels); the restored company's Admin sets the password again.
+    expect(F.meta.closingDatePassword).toBeNull();
+    F.meta.closingDatePassword = F0.meta.closingDatePassword;
     expect.soft(compare(F0, F, BOOKS)).toEqual([]);
     // The source company of the same file is untouched.
     expect.soft(compare(F0, await fingerprint(ctx, dir, { users: true }), ALL)).toEqual([]);
@@ -674,6 +678,9 @@ describe('review4: round-trip fidelity of every way data leaves and re-enters a 
     const [me] = await db.insert(S.users).values({ email: 'restorer@review4.test', name: 'Restorer', passwordHash: 'x' }).returning();
     const res = await restoreCompanyBackup(db, buffer, { ownerId: me.id });
     const F = await fingerprint({ db, companyId: res.companyId, userId: me.id }, dir);
+    // Security 2.5: no closing-date password hash in a per-company backup (see 2a).
+    expect(F.meta.closingDatePassword).toBeNull();
+    F.meta.closingDatePassword = F0.meta.closingDatePassword;
     expect.soft(compare(F0, F, BOOKS)).toEqual([]);
   });
 

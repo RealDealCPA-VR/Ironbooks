@@ -35,6 +35,7 @@ import { type ServiceContext, notFound, validation, writeAudit } from './_base';
 import { getPreferences } from './company';
 import { docRef } from './docNumbers';
 import { assertWrite } from './rbac';
+import { canSeeBalances, permissionDenied } from './access';
 import { foreignCode } from './fxLines';
 import { effectiveHomeCurrency } from './multiCurrency';
 
@@ -231,6 +232,8 @@ export interface Recipient {
   invoiceList: string | null;
   /** Customers: unapplied credit memos + unapplied payments already deducted from `balance`. */
   credits?: string | null;
+  /** Balances were left out: the caller has no View Balance there (same flag as hideBalances). */
+  balanceHidden?: boolean;
 }
 
 export interface ListRecipientsOptions {
@@ -253,8 +256,21 @@ function daysBetween(fromIso: string, toIso: string): number {
   return Math.round((Date.parse(`${toIso}T00:00:00Z`) - Date.parse(`${fromIso}T00:00:00Z`)) / 86_400_000);
 }
 
+/**
+ * QB "View Balance" (lib/permissions/balances.ts): the Customer / Vendor Center activity a
+ * recipient type's balances belong to. Without View Balance there, recipients come back without
+ * balances (and letters merge them blank), and filtering by balance is refused — a filter would
+ * tell the balance just as well.
+ */
+const BALANCE_ACTIVITY = { customer: 'customers.center', vendor: 'vendors.center' } as const;
+
 export async function listRecipients(ctx: ServiceContext, opts: ListRecipientsOptions): Promise<Recipient[]> {
   if (!RECIPIENT_TYPES.includes(opts.type)) throw validation('Unknown recipient type.');
+  const balanceActivity = opts.type === 'customer' || opts.type === 'vendor' ? BALANCE_ACTIVITY[opts.type] : null;
+  const showBalances = !balanceActivity || canSeeBalances(ctx, balanceActivity);
+  if (!showBalances && (opts.overdueDays !== undefined || (opts.minBalance !== undefined && opts.minBalance !== ''))) {
+    throw permissionDenied(opts.type === 'customer' ? 'customers' : 'vendors', 'view_balance', balanceActivity!);
+  }
   const prefs = await getPreferences(ctx);
   const today = opts.today ?? todayInTimeZone(prefs.timezone);
   const idFilter = opts.ids && opts.ids.length > 0 ? new Set(opts.ids) : null;
@@ -448,6 +464,9 @@ export async function listRecipients(ctx: ServiceContext, opts: ListRecipientsOp
     list = list.filter((r) => r.balance !== null && Money.gte(r.balance, min));
   }
   if (idFilter) list = list.filter((r) => idFilter.has(r.id));
+  if (!showBalances) {
+    list = list.map((r) => ({ ...r, balance: null, overdueBalance: null, daysOverdue: null, invoiceList: null, ...(r.credits !== undefined ? { credits: null } : {}), balanceHidden: true }));
+  }
   return list;
 }
 

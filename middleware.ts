@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
 import { ROUTE_METHOD_HEADER, ROUTE_PATH_HEADER } from '@/lib/permissions/headers';
 import { isMobileReceiptPage } from '@/lib/receipts/mobilePath';
+import { isLoopbackHostHeader, isProxiedRequest } from '@/lib/net/loopbackHost';
 
 /**
  * Route protection. Edge-safe: only checks for the presence of the session cookie (signature is
@@ -24,7 +25,6 @@ function pass(req: NextRequest) {
   return NextResponse.next({ request: { headers: h } });
 }
 
-const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
 function refuse(message: string) {
@@ -40,8 +40,14 @@ export function middleware(req: NextRequest) {
   // own name to 127.0.0.1 to reach the books as if it were the app. Refuse the latter. A page can
   // add x-bka-remote-addr itself, so the proxy also stamps sec-bka-proxy: browsers never let a
   // page set a "Sec-" header.
-  const proxied = Boolean(req.headers.get('x-bka-remote-addr')) && req.headers.get('sec-bka-proxy') === '1';
-  if (!LOOPBACK_HOSTS.has(req.nextUrl.hostname.toLowerCase()) && !proxied) {
+  //
+  // The name the request used is the Host header. req.nextUrl is NOT: Next.js builds it from the
+  // address the server listens on, so it always says localhost, whatever the page asked for.
+  // No Host header at all passes (isLoopbackHostHeader): every browser sends one, so a missing
+  // Host is never a rebinding page, only a program that already reaches 127.0.0.1 directly — and
+  // such a program gets no more trust than a teammate's device unless it has the per-launch pass
+  // (lib/net/launchPass.ts).
+  if (!isProxiedRequest(req.headers) && !isLoopbackHostHeader(req.headers.get('host'))) {
     return refuse('This address is not the Ironbooks app on this computer.');
   }
 

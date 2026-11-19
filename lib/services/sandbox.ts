@@ -46,7 +46,7 @@ import { requireFileAdmin } from './access';
 import { assertExclusiveAccess } from './sessions';
 import format from '@/electron/companyFileFormat';
 import { APP_VERSION } from '@/lib/appVersion';
-import { BACKUP_HISTORY_FILE } from './backupHistory';
+import { BACKUP_HISTORY_FILE, isNetworkPath } from './backupHistory';
 import { isMarkedProtected, protectionForDir, readProtection, shareFileKey, type SealProtection } from './fileProtection';
 import {
   SANDBOX_MARKER_SCHEMA,
@@ -71,6 +71,11 @@ export {
 
 /** Marks a folder under sandboxRoot() as a container this module created (safe to delete). */
 export const SANDBOX_CONTAINER_MARKER = '.ironbooks-sandbox-container';
+/**
+ * In the container (beside the copy, never inside it, so it never travels with it): the real
+ * company file the copy was made from, recorded on this computer when it was made.
+ */
+export const SANDBOX_SOURCE_RECORD = '.ironbooks-sandbox-source.json';
 /** Desktop company-file manifest (mirrors electron/companyFile.js). */
 const COMPANY_FILE_MANIFEST = 'bookkeeper-company.json';
 const COMPANY_FILE_SCHEMA = 'bookkeeper-company/v1';
@@ -131,6 +136,58 @@ function fileDisplayName(dir: string, fallback?: string): string {
   const base = path.basename(dir).replace(/\.(ironbooks|bookkeeper)$/i, '');
   return base && base !== 'default' ? base : fallback ?? base ?? 'Company';
 }
+
+/** Sandboxes this server entered (startSandbox / resumeSandbox): copy's folder → real data dir. */
+const g = globalThis as typeof globalThis & { __ironbooksSandboxesEntered?: Map<string, string> };
+function enteredHere(): Map<string, string> {
+  // On globalThis so a hot reload in `next dev` keeps it.
+  g.__ironbooksSandboxesEntered ??= new Map();
+  return g.__ironbooksSandboxesEntered;
+}
+const dirKey = (p: string) => (process.platform === 'win32' ? path.resolve(p).toLowerCase() : path.resolve(p));
+
+/**
+ * Where this computer recorded the copy in `sandboxDir` was made from: when this server entered it,
+ * or in its container when the container is in this computer's own sandbox folder (the desktop
+ * shell's BKA_SANDBOX_ROOT — never a folder that came with a company file). Null: no record (a copy
+ * made by an earlier version, or one that did not come from this computer).
+ */
+function recordedRealDataDir(sandboxDir: string): string | null {
+  const entered = enteredHere().get(dirKey(sandboxDir));
+  if (entered) return entered;
+  const root = process.env.BKA_SANDBOX_ROOT;
+  const container = path.dirname(path.resolve(sandboxDir));
+  if (!root || !samePath(path.dirname(container), root)) return null;
+  try {
+    if (!fs.existsSync(path.join(container, SANDBOX_CONTAINER_MARKER))) return null;
+    const raw = JSON.parse(fs.readFileSync(path.join(container, SANDBOX_SOURCE_RECORD), 'utf8')) as { realDataDir?: unknown };
+    return typeof raw?.realDataDir === 'string' && raw.realDataDir ? raw.realDataDir : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The real company file's data directory the sandbox copy in `sandboxDir` was made from, when this
+ * computer can take the marker's word for it; else null. The marker is a file inside the copy, and
+ * a "copy" can reach this computer from elsewhere (a company file crafted to carry one): leaving the
+ * sandbox opens a database at that path, and merely looking at a network path (\\server\share\…)
+ * makes Windows offer that server the signed-in person's credentials. So, before anything touches
+ * it: when this computer recorded where the copy came from, the marker must name exactly that;
+ * without a record (a copy made by an earlier version) it must be an absolute path that is not on
+ * the network.
+ */
+export function realDataDirHere(marker: SandboxMarker, sandboxDir: string = resolveDataDir()): string | null {
+  const claimed = marker.realDataDir;
+  if (typeof claimed !== 'string' || !claimed || claimed.includes('\0') || !path.isAbsolute(claimed)) return null;
+  const recorded = recordedRealDataDir(sandboxDir);
+  if (recorded) return samePath(recorded, claimed) ? path.resolve(claimed) : null;
+  return isNetworkPath(claimed) ? null : path.resolve(claimed);
+}
+
+/** Leaving is refused: the copy's marker names a company file this computer cannot trust. */
+const NOT_FROM_HERE =
+  'This sandbox was not made from a company file on this computer, so there is no real company file here to go back to. Open your company file instead.';
 
 function removeContainer(container: string): void {
   // Only ever delete a folder this module created.
@@ -285,13 +342,16 @@ export function listLeftoverSandboxes(realDataDir: string = resolveDataDir()): L
 export function getSandboxStatus(): SandboxStatus {
   const marker = activeSandbox();
   if (marker) {
+    // Only a sandbox is left back to its real file; a training file (which people pass around) never
+    // looks for it. Nothing is looked at that this computer cannot trust (realDataDirHere).
+    const real = marker.kind === 'sandbox' ? realDataDirHere(marker) : null;
     return {
       active: true,
       kind: marker.kind,
       sourceName: marker.sourceName,
       createdAt: marker.createdAt,
       trainingName: marker.trainingName ?? null,
-      realFileFound: fs.existsSync(marker.realDataDir),
+      realFileFound: marker.kind === 'sandbox' ? real !== null && fs.existsSync(real) : null,
       leftovers: [],
     };
   }
@@ -374,6 +434,9 @@ export async function startSandbox(ctx: ServiceContext, opts: { now?: Date } = {
   const dir = path.join(container, path.basename(realDir));
   fs.mkdirSync(container, { recursive: true });
   fs.writeFileSync(path.join(container, SANDBOX_CONTAINER_MARKER), createdAt, 'utf8');
+  // Where the copy came from, as this computer knows it (realDataDirHere): the desktop shell
+  // relaunches into the copy, so the next server can check the copy's marker against it.
+  fs.writeFileSync(path.join(container, SANDBOX_SOURCE_RECORD), JSON.stringify({ realDataDir: path.resolve(realDir) }), 'utf8');
 
   // Consistent snapshot: release the real file's handle (PGlite checkpoints + flushes on close),
   // then copy synchronously so no request runs until the copy is complete. The real file is held
@@ -387,6 +450,7 @@ export async function startSandbox(ctx: ServiceContext, opts: { now?: Date } = {
     // A company file protected with passwords: the copy has the same file key (filecrypto).
     shareFileKey(realDir, dir);
     await openAndVerify(dir, realDir, container);
+    enteredHere().set(dirKey(dir), path.resolve(realDir));
   } finally {
     release();
   }
@@ -445,17 +509,21 @@ async function leaveToRealFile(
   ctx: ServiceContext,
   precheck?: (marker: SandboxMarker) => void,
 ): Promise<ActiveSandboxInfo> {
-  const marker = readSandboxMarker();
-  if (!marker || marker.kind !== 'sandbox') {
+  const found = readSandboxMarker();
+  if (!found || found.kind !== 'sandbox') {
     throw new ServiceError('CONFLICT', 'You are not working in the sandbox.');
   }
+  const dir = resolveDataDir();
+  // The real file as this computer knows it, before anything looks at the path (realDataDirHere).
+  const realDataDir = realDataDirHere(found, dir);
+  if (!realDataDir) throw new ServiceError('CONFLICT', NOT_FROM_HERE);
+  const marker: SandboxMarker = { ...found, realDataDir };
   if (!fs.existsSync(marker.realDataDir)) {
     throw new ServiceError(
       'CONFLICT',
       `Your real company file is no longer at ${marker.realDataDir}. Reconnect the drive it is on, then try again.`,
     );
   }
-  const dir = resolveDataDir();
   // Check the caller against the REAL file through an explicit handle BEFORE switching: the
   // active data dir (which every other request's getDb() and session lookup follow) must stay on
   // the sandbox until the leave is certain, or a refused leave would let concurrent sandbox
@@ -477,6 +545,7 @@ async function leaveToRealFile(
     throw err;
   }
   switchActiveDataDir(marker.realDataDir);
+  enteredHere().delete(dirKey(dir));
   await closeDb(dir);
   return { dir, container: path.dirname(dir), marker, realDb };
 }
@@ -669,6 +738,8 @@ export async function resumeSandbox(ctx: ServiceContext, id: unknown): Promise<S
       await closeDb(hit.dir).catch(() => undefined);
       throw err instanceof ServiceError ? err : new ServiceError('INTERNAL', `That copy could not be opened: ${(err as Error).message}`);
     }
+    // A copy of the file this server had open (locateSandboxes matched its marker to it).
+    enteredHere().set(dirKey(hit.dir), realDir);
   } finally {
     release();
   }

@@ -3,7 +3,7 @@
  * thread, no network). A PDF with no text — a phone "scan to PDF" or a scanner output — has its
  * page images pulled out and encoded as PNG so the offline OCR engine can read them.
  */
-import { encodePng, expand1bpp } from './png';
+import { MAX_IMAGE_PIXELS, encodePng, expand1bpp, imageSizeOk } from './png';
 
 /** Pages read from one receipt PDF (receipts are short). Bank statements pass their own limits. */
 const MAX_PAGES = 5;
@@ -61,10 +61,13 @@ function pdfLinesFromItems(items: Item[]): PdfLine[] {
     .filter((l) => l.text);
 }
 
-type PdfImage = { width: number; height: number; data?: Uint8Array | Uint8ClampedArray; kind?: number };
+export type PdfImage = { width: number; height: number; data?: Uint8Array | Uint8ClampedArray; kind?: number };
 
-function imageToPng(img: PdfImage): Buffer | null {
+/** A page image as PNG; null for an image that is not readable or larger than MAX_IMAGE_PIXELS. */
+export function imageToPng(img: PdfImage): Buffer | null {
   if (!img?.data || !img.width || !img.height) return null;
+  // Skipped, never allocated: the declared size is the PDF's say-so (see MAX_IMAGE_PIXELS).
+  if (!imageSizeOk(img.width, img.height)) return null;
   const data = img.data instanceof Uint8Array ? img.data : new Uint8Array(img.data.buffer, img.data.byteOffset, img.data.byteLength);
   if (img.kind === GRAYSCALE_1BPP) return encodePng(img.width, img.height, expand1bpp(img.width, img.height, data), 1);
   if (img.kind === RGB_24BPP) return encodePng(img.width, img.height, data, 3);
@@ -105,6 +108,8 @@ export async function readPdfDocument(
       useSystemFonts: false,
       disableFontFace: true,
       isOffscreenCanvasSupported: false,
+      // pdf.js drops a larger image before decoding it (the page then reads as text only).
+      maxImageSize: MAX_IMAGE_PIXELS,
       verbosity: 0,
     }).promise;
   } catch {
@@ -155,7 +160,7 @@ export async function readPdfDocument(
  * Most scanners store a page as one image; some store it as several strips — every image at least
  * a sixth the size of the largest is kept (logos and specks are not).
  */
-async function pageImages(
+export async function pageImages(
   pdfjs: { OPS: Record<string, number> },
   page: {
     getOperatorList(): Promise<{ fnArray: number[]; argsArray: unknown[][] }>;
@@ -188,7 +193,9 @@ async function pageImages(
           }
         });
       }
-      if (img?.data && img.width && img.height) found.push(img);
+      // An image over the size cap is left out here too (pdf.js normally drops it already), so
+      // it is never expanded and does not make the page's real images look small next to it.
+      if (img?.data && img.width && img.height && imageSizeOk(img.width, img.height)) found.push(img);
     }
     if (!found.length) return [];
     const maxArea = Math.max(...found.map((f) => f.width * f.height));

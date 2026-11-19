@@ -10,9 +10,13 @@
  *    The log file is shared by every company in the company file and cannot be filtered without
  *    breaking its chain: the raw download is for someone who manages every company it records
  *    (owner, Admin or a role that may export the file, in each of them — checked on the
- *    effective roles, not the legacy role column), like a full copy of the file.
+ *    effective roles, not the legacy role column), like a full copy of the file, AND may view
+ *    every record in it (lib/services/auditVisibility.ts): it holds the same snapshots as the
+ *    page (pay rates, user accounts, settings snapshots of older builds), which the page and the
+ *    CSV leave out for that person.
  *  - A CSV of the filtered, plain-language log with NO row cap, streamed in batches (the page
- *    shows the newest 5,000; the export used to stop there too).
+ *    shows the newest 5,000; the export used to stop there too). Like the page, it leaves out
+ *    the records the person may not view.
  */
 import fs from 'node:fs';
 import { createHash } from 'node:crypto';
@@ -24,6 +28,7 @@ import { dataDirOf } from '@/lib/db/txHooks';
 import { csvQuoted } from '@/lib/csv';
 import { ServiceError, notFound, type ServiceContext } from './_base';
 import { requireFileAdmin, resolveAccess } from './access';
+import { canSeeLogRecord, seesWholeLog } from './auditVisibility';
 import {
   entityLabel,
   matchTransactionLog,
@@ -57,6 +62,9 @@ function mayTakeRawLog(r: { isOwner?: boolean; access: EffectiveAccess }): boole
   return !!r.isOwner || r.access.isAdmin || canActivity(r.access, 'file_utilities.export', 'create');
 }
 
+const RAW_LOG_HIDDEN_RECORDS =
+  'This company file’s transaction log also records changes you can’t view (for example payroll or user accounts), and the log cannot be split without breaking its fingerprints. Ask an Admin, or export the log as CSV instead.';
+
 const RAW_LOG_DENIED =
   'This company file’s transaction log also records another company you do not manage, and the log cannot be split without breaking its fingerprints. Ask that company’s owner, or export the log as CSV instead.';
 
@@ -70,8 +78,14 @@ async function requireAllCompanies(ctx: ServiceContext, dir: string): Promise<vo
   if (ctx.access && !mayTakeRawLog({ access: ctx.access })) {
     throw new ServiceError('FORBIDDEN', 'Only the owner, an Admin or someone who may export the company file can download the transaction log.');
   }
+  const records = readAllTransactionLog(dir).records;
+  // Every record of this company (and the file-wide ones: users, the log's start) must be one the
+  // caller may view: the download can't leave any out.
+  if (!seesWholeLog(ctx.access) && records.some((r) => (!r.companyId || r.companyId === ctx.companyId) && !canSeeLogRecord(ctx.access, r))) {
+    throw new ServiceError('FORBIDDEN', RAW_LOG_HIDDEN_RECORDS);
+  }
   const others = new Set<string>();
-  for (const r of readAllTransactionLog(dir).records) if (r.companyId && r.companyId !== ctx.companyId) others.add(r.companyId);
+  for (const r of records) if (r.companyId && r.companyId !== ctx.companyId) others.add(r.companyId);
   if (!others.size) return;
   if (!ctx.userId) throw new ServiceError('FORBIDDEN', 'Sign in to download the transaction log.');
   const ids = [...others];
@@ -80,6 +94,10 @@ async function requireAllCompanies(ctx: ServiceContext, dir: string): Promise<vo
     if (!existing.has(id)) continue;
     const r = await resolveAccess(ctx.db, id, ctx.userId);
     if (!r.member || !r.active || !mayTakeRawLog(r)) throw new ServiceError('FORBIDDEN', RAW_LOG_DENIED);
+    // …and the same rule as above for that company's records, with the caller's rights there.
+    if (!r.access.isAdmin && records.some((rec) => rec.companyId === id && !canSeeLogRecord(r.access, rec))) {
+      throw new ServiceError('FORBIDDEN', RAW_LOG_HIDDEN_RECORDS);
+    }
   }
   if (ids.some((id) => !existing.has(id))) {
     try {
@@ -239,7 +257,11 @@ export function streamTransactionLogCsv(ctx: ServiceContext, filter: LogExportFi
   return new ReadableStream<Uint8Array>({
     pull(controller) {
       if (!records) {
-        records = matchTransactionLog(dir, { ...filter, companyId: ctx.companyId });
+        records = matchTransactionLog(dir, {
+          ...filter,
+          companyId: ctx.companyId,
+          ...(seesWholeLog(ctx.access) ? {} : { visible: (r: TransactionLogRecord) => canSeeLogRecord(ctx.access, r) }),
+        });
         controller.enqueue(enc.encode('﻿' + CSV_HEADER.map(csvQuoted).join(',') + '\r\n'));
         return;
       }

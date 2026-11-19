@@ -15,7 +15,9 @@
  */
 import { and, eq } from 'drizzle-orm';
 import { companies, companyRoles, userCompanies, userRoleAssignments, users } from '@/lib/db/schema';
-import { hashPassword } from '@/lib/auth';
+import { hashPassword, verifyPassword } from '@/lib/auth';
+import { getRequestOrigin } from '@/lib/net/requestInfo';
+import { GLOBAL_KEY_WEIGHT, attemptKeys, loginLimiter, tooManyAttempts } from '@/lib/net/rateLimit';
 import { assertPasswordAllowed, storeUserPassword } from './passwordPolicy';
 import { endUserSessions } from './sessions';
 import { requestFileKeyRotation, syncPasswordSlot } from './fileProtection';
@@ -494,16 +496,50 @@ export async function setUserRoles(
   return updateUser(ctx, userId, { roleKeys });
 }
 
+/** Refusal when a signed-in person resets their OWN password here without the current one. */
+export const OWN_PASSWORD_RESET_MESSAGE =
+  'To change your own password, use Change Password: it asks for your current password.';
+
+/**
+ * Resetting your OWN password follows the change-password rule (app/api/auth/change-password):
+ * the current password is needed, and wrong guesses share that route's limiter. Otherwise a
+ * session left open (or a copied cookie) with the Users right could take the account over.
+ */
+async function assertOwnCurrentPassword(ctx: ServiceContext, userId: string, currentPassword: string | undefined): Promise<void> {
+  if (typeof currentPassword !== 'string' || currentPassword === '') {
+    throw new ServiceError('FORBIDDEN', OWN_PASSWORD_RESET_MESSAGE, { currentPasswordRequired: true });
+  }
+  const origin = await getRequestOrigin();
+  const limiter = loginLimiter();
+  const keys = attemptKeys('change-password', userId, origin.addr);
+  const weights = { [keys[keys.length - 1]]: GLOBAL_KEY_WEIGHT };
+  const attempt = limiter.begin(keys, Date.now(), weights);
+  if (!attempt.allowed) {
+    throw new ServiceError('FORBIDDEN', String(tooManyAttempts(attempt.retryAfterMs).body.error), { rateLimited: true });
+  }
+  try {
+    const [u] = await ctx.db.select({ hash: users.passwordHash }).from(users).where(eq(users.id, userId));
+    if (!u || !(await verifyPassword(currentPassword, u.hash))) {
+      limiter.recordFailure(keys, Date.now(), weights);
+      throw new ServiceError('FORBIDDEN', 'The current password is not correct.');
+    }
+    limiter.recordSuccess(keys.slice(0, -1));
+  } finally {
+    attempt.release();
+  }
+}
+
 /**
  * Admin-initiated password reset (the new password is never logged). `turnOffTwoFactor` also
  * turns off the user's two-factor sign-in — the only way back in for someone who lost their
- * phone or authenticator app (turning it off themselves needs a code from it).
+ * phone or authenticator app (turning it off themselves needs a code from it). A signed-in person
+ * resetting their own password must give `currentPassword` (assertOwnCurrentPassword).
  */
 export async function resetUserPassword(
   ctx: ServiceContext,
   userId: string,
   password: string,
-  opts: { requireChange?: boolean; turnOffTwoFactor?: boolean } = {},
+  opts: { requireChange?: boolean; turnOffTwoFactor?: boolean; currentPassword?: string } = {},
 ): Promise<void> {
   requirePermission(ctx, 'users.users', 'modify');
   if (!(await getMembership(ctx, userId))) throw notFound('User');
@@ -526,6 +562,9 @@ export async function resetUserPassword(
     }
   }
   if (typeof password !== 'string') throw validation('A new password is required.');
+  if (ctx.access && ctx.userId && ctx.userId === userId) {
+    await assertOwnCurrentPassword(ctx, userId, opts.currentPassword);
+  }
   // gapsb K: the file's password policy, including "don't reuse the last N passwords".
   await assertPasswordAllowed(ctx.db, password, { userId });
   await inTransaction(ctx, async (tx) => {

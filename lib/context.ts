@@ -24,6 +24,7 @@ import { assertSessionAllowed } from '@/lib/services/sessions';
 import { assertPasswordChangeNotRequired } from '@/lib/services/passwordPolicy';
 import { PASSWORD_CHANGE_REQUIRED_MESSAGE } from '@/lib/passwordPolicy';
 import { getRequestOrigin } from '@/lib/net/requestInfo';
+import { isLoopbackHostHeader } from '@/lib/net/loopbackHost';
 import { GLOBAL_KEY_WEIGHT, attemptKeys, loginLimiter, tooManyAttempts } from '@/lib/net/rateLimit';
 import { ServiceError, type ServiceContext } from '@/lib/services/_base';
 import { ensureSandboxEnvSynced } from '@/lib/services/sandboxState';
@@ -55,15 +56,10 @@ export const CLOSING_PASSWORD_HEADER = 'x-closing-password';
 
 /**
  * True when the request's Host header names a loopback host (localhost / 127.x / [::1], any
- * port). No Host header (outside a request scope, scripts, tests) counts as loopback.
+ * port). No Host header (outside a request scope, scripts, tests) counts as loopback. Lives in an
+ * edge-safe module so middleware.ts applies the very same rule to every request.
  */
-export function isLoopbackHostHeader(host: string | null | undefined): boolean {
-  if (host === null || host === undefined) return true;
-  const h = host.trim().toLowerCase();
-  const name = h.startsWith('[') ? h.slice(0, h.indexOf(']') + 1) : h.replace(/:\d*$/, '');
-  if (name === 'localhost' || name === '[::1]') return true;
-  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(name);
-}
+export { isLoopbackHostHeader };
 
 async function requestHostIsLoopback(): Promise<boolean> {
   try {
@@ -280,6 +276,8 @@ export async function getServerContext(): Promise<ServiceContext> {
   //
   // Requests from OTHER machines (through the multi-user host proxy) never get the first-run /
   // dev fallback — the host must be set up locally, with a real account, before it is shared.
+  // Neither do other programs on this computer: without the desktop shell's per-launch pass they
+  // count as remote too (lib/net/launchPass.ts).
   if ((await getRequestOrigin()).remote) {
     throw new ServiceError('FORBIDDEN', 'Authentication required.');
   }

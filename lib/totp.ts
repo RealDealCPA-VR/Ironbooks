@@ -43,14 +43,35 @@ export function generateTotp(secret: string, timeMs: number, step = 30): string 
   return (bin % 1_000_000).toString().padStart(6, '0');
 }
 
-/** Verify a token within ±window steps to tolerate clock drift. */
-export function verifyTotp(secret: string, token: string, timeMs: number, window = 1, step = 30): boolean {
-  if (!secret || !/^\d{6}$/.test(token?.trim() ?? '')) return false;
-  const t = token.trim();
+/** The time step (RFC 6238 counter) a unix-ms time falls in. */
+export function totpStepAt(timeMs: number, step = 30): number {
+  return Math.floor(timeMs / 1000 / step);
+}
+
+/**
+ * The time step a token was made for, within ±window steps of `timeMs` (clock drift), or null when
+ * it matches none. The newest matching step wins. Every candidate is compared in constant time, so
+ * how long a check takes says nothing about how close a guess was.
+ *
+ * A code is valid for about 90 seconds; callers that sign someone in remember the step they
+ * accepted and refuse any step that is not newer (lib/services/totpCodes.ts), so a code that was
+ * seen once can't be used again.
+ */
+export function matchTotpStep(secret: string, token: string, timeMs: number, window = 1, step = 30): number | null {
+  if (!secret || typeof token !== 'string' || !/^\d{6}$/.test(token.trim())) return null;
+  const typed = Buffer.from(token.trim());
+  const now = totpStepAt(timeMs, step);
+  let found: number | null = null;
   for (let w = -window; w <= window; w++) {
-    if (generateTotp(secret, timeMs + w * step * 1000, step) === t) return true;
+    const expected = Buffer.from(generateTotp(secret, (now + w) * step * 1000, step));
+    if (crypto.timingSafeEqual(expected, typed)) found = now + w;
   }
-  return false;
+  return found;
+}
+
+/** Verify a token within ±window steps to tolerate clock drift (no memory of codes already used). */
+export function verifyTotp(secret: string, token: string, timeMs: number, window = 1, step = 30): boolean {
+  return matchTotpStep(secret, token, timeMs, window, step) !== null;
 }
 
 /** otpauth:// URI for QR provisioning. */

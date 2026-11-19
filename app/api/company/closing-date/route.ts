@@ -1,8 +1,10 @@
 /**
  * GET   /api/company/closing-date — current closing date + whether a password is set.
- * PATCH /api/company/closing-date — set/clear the closing date and password (admin/owner).
- *   Body: { closingDate: 'YYYY-MM-DD' | null, password?: string | null }
+ * PATCH /api/company/closing-date — set/clear the closing date and password (Closing Date: modify).
+ *   Body: { closingDate: 'YYYY-MM-DD' | null, password?: string | null, currentPassword?: string }
  *   (closingDate null clears both; password undefined keeps existing, null/'' removes it)
+ *   Once a password is set, someone who is not an Admin gives `currentPassword` to move the date
+ *   earlier, clear it, or change or remove the password (GET answers currentPasswordRequired).
  *
  * QB Desktop parity: Company > Set Closing Date + Closing Date Password. Postings dated
  * on/before the closing date are blocked unless the request carries a valid
@@ -43,7 +45,10 @@ export async function PATCH(req: NextRequest) {
     if (!parsed.success) {
       return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
-    const settings = await setClosingDate(ctx, parsed.data);
+    // The current password travels beside the validated fields (never logged, never stored).
+    const raw = body as { currentPassword?: unknown } | null;
+    const currentPassword = typeof raw?.currentPassword === 'string' ? raw.currentPassword : undefined;
+    const settings = await setClosingDate(ctx, { ...parsed.data, currentPassword });
     return NextResponse.json(settings);
   } catch (err) {
     return errorResponse(err);

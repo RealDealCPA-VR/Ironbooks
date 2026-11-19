@@ -41,6 +41,14 @@ const { app, BrowserWindow, Menu, dialog, ipcMain, nativeTheme, shell, session }
     // Fall back to the default (new) userData location.
   }
 })();
+// "localhost" by exact address. The app server listens on 127.0.0.1 only, but Chromium tries
+// "localhost" over IPv6 (::1) first, so another program listening on [::1]:<port> would receive
+// the window's traffic. Inside the app the name localhost now always means 127.0.0.1: the window
+// keeps its http://localhost:<port> origin (startNextServer explains why it must) but connects
+// over IPv4 only. Only that one name is mapped — a multi-user host's address (a LAN or tailnet IP,
+// a *.ts.net name) and the update feed resolve as before. Must be set before the app is ready.
+// (The shell's own calls use Node's fetch, which this does not affect: see shellFetch.)
+app.commandLine.appendSwitch('host-resolver-rules', 'MAP localhost 127.0.0.1');
 const { buildSectionMenus, buildUtilitiesMenu } = require('./menuRoutes');
 const spelling = require('./spelling');
 const windowTheme = require('./windowTheme');
@@ -63,6 +71,8 @@ const { promptForHost } = require('./connectPrompt');
 const { promptForFilePassword } = require('./passwordPrompt');
 const fileCrypto = require('./fileCrypto');
 const { pruneLegacyAutoBackups } = require('./legacyBackups');
+const localServer = require('./localServer');
+const saveTypes = require('./saveTypes');
 
 const isDev = !app.isPackaged;
 // Window / taskbar icon. The packaged Windows .exe already embeds build/icon.ico, but dev runs
@@ -156,6 +166,64 @@ let remotePin = null;
 // authenticated "system" calls (e.g. the launch-time recurring run). The server is bound to
 // 127.0.0.1 and the token never leaves this machine.
 const internalToken = crypto.randomBytes(32).toString('hex');
+
+// Per-launch pass for this launch's window (lib/net/launchPass.ts). Anything on this computer can
+// reach 127.0.0.1 — another program, another Windows account — so the server only treats a request
+// as the app itself when it carries this value: the window as an HttpOnly cookie (set before its
+// first page loads, see setLaunchPassCookie), the shell's own calls as a header (shellFetch). The
+// server learns it from its environment, never the command line. Every company switch relaunches
+// the app, so each server process gets a new pass and the window the matching cookie.
+const launchPass = crypto.randomBytes(32).toString('hex');
+/**
+ * The pass cookie is on the window's session, so the company server may insist on the pass. If
+ * setting it failed, the server is started without it (as before this check existed) rather than
+ * locking the person out of their own books.
+ */
+let launchPassOnWindow = false;
+
+/**
+ * fetch() from the shell to its own app server on this computer: by exact address (127.0.0.1 —
+ * Node's fetch tries "localhost" over IPv6 first, where another program could be listening on the
+ * same port) and with the shell's credentials (the internal token and this launch's pass). Never to
+ * a multi-user host: any other address is refused before anything is sent.
+ */
+function shellFetch(baseUrl, route, init = {}) {
+  const target = localServer.directUrl(baseUrl, route);
+  if (!target || (remoteHostOrigin && localServer.directUrl(remoteHostOrigin, route) === target)) {
+    return Promise.reject(new Error('That is not the Ironbooks server on this computer.'));
+  }
+  return fetch(target, { ...init, headers: { ...(init.headers || {}), ...localServer.shellHeaders(internalToken, launchPass) } });
+}
+
+/**
+ * Put this launch's pass on the window's session before its first page loads. Cookies are not
+ * tied to a port, so one cookie for "localhost" covers the company server and any pop-up it opens
+ * (they share this session). HttpOnly: the page's scripts never see it. SameSite=Strict: a request
+ * another site starts never carries it. The session's request filter (security.js) keeps the
+ * window's pages off any other address. Resolves false when it could not be set.
+ */
+async function setLaunchPassCookie() {
+  try {
+    await session.defaultSession.cookies.set({
+      url: 'http://localhost/',
+      name: localServer.LAUNCH_PASS_COOKIE,
+      value: launchPass,
+      path: '/',
+      httpOnly: true,
+      secure: false,
+      sameSite: 'strict',
+    });
+    return true;
+  } catch (err) {
+    console.error('[launch-pass] could not set the window cookie:', err?.message || err);
+    return false;
+  }
+}
+
+/** Client mode: no pass of ours on the window, not even one left from an earlier launch. */
+async function clearLaunchPassCookie() {
+  await session.defaultSession.cookies.remove('http://localhost/', localServer.LAUNCH_PASS_COOKIE).catch(() => {});
+}
 
 // --- single instance lock ---
 if (!app.requestSingleInstanceLock()) {
@@ -575,9 +643,8 @@ async function runAutoBackup() {
   // Sandbox mode: auto-backups are of the REAL file only, never of a practice copy (the server
   // refuses too). The real file is backed up as usual once the user leaves the sandbox.
   if (sandboxActive()) return;
-  const res = await fetch(`${serverUrl}/api/dashboard/auto-backup?save=1`, {
+  const res = await shellFetch(serverUrl, '/api/dashboard/auto-backup?save=1', {
     method: 'POST',
-    headers: { 'x-bka-internal': internalToken },
     signal: AbortSignal.timeout(60000),
   });
   if (!res.ok) {
@@ -973,8 +1040,7 @@ async function openSingleFileForLaunch(filePath) {
 async function companySaveStatus() {
   if (!serverUrl || remoteHostOrigin) return null;
   try {
-    const res = await fetch(`${serverUrl}/api/company-file/status`, {
-      headers: { 'x-bka-internal': internalToken },
+    const res = await shellFetch(serverUrl, '/api/company-file/status', {
       signal: AbortSignal.timeout(5000),
     });
     return res.ok ? await res.json() : null;
@@ -1329,9 +1395,8 @@ async function closeOpenCompanyFile() {
     // Someone else has it now: nothing of ours to release or save into it. The server still
     // records what is only here as unsaved (the next open here keeps it as a separate copy).
     if (serverUrl && !isDev) {
-      await fetch(`${serverUrl}/api/company-file/close`, {
+      await shellFetch(serverUrl, '/api/company-file/close', {
         method: 'POST',
-        headers: { 'x-bka-internal': internalToken },
         signal: AbortSignal.timeout(60_000),
       }).catch(() => {});
     }
@@ -1345,9 +1410,8 @@ async function closeOpenCompanyFile() {
     let data = {};
     let ok = false;
     try {
-      const res = await fetch(`${serverUrl}/api/company-file/close`, {
+      const res = await shellFetch(serverUrl, '/api/company-file/close', {
         method: 'POST',
-        headers: { 'x-bka-internal': internalToken },
         signal: AbortSignal.timeout(10 * 60_000),
       });
       data = await res.json().catch(() => ({}));
@@ -1528,9 +1592,9 @@ async function saveCopyAsFlow({ convert = false } = {}) {
     return;
   }
   try {
-    const r = await fetch(`${serverUrl}/api/company-file/save-as?target=${encodeURIComponent(target)}`, {
+    const r = await shellFetch(serverUrl, `/api/company-file/save-as?target=${encodeURIComponent(target)}`, {
       method: 'POST',
-      headers: { 'x-bka-internal': internalToken, 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ companyName: name, convert }),
       signal: AbortSignal.timeout(30 * 60_000),
     });
@@ -1561,9 +1625,8 @@ async function saveCopyAsFlow({ convert = false } = {}) {
 async function saveNowFlow() {
   if (!openFile || !serverUrl) return;
   try {
-    const r = await fetch(`${serverUrl}/api/company-file/save`, {
+    const r = await shellFetch(serverUrl, '/api/company-file/save', {
       method: 'POST',
-      headers: { 'x-bka-internal': internalToken },
       signal: AbortSignal.timeout(10 * 60_000),
     });
     const data = await r.json().catch(() => ({}));
@@ -1615,73 +1678,84 @@ function spawnScratch(...args) {
 async function startNextServer() {
   if (isDev) return 'http://localhost:3000';
 
-  const port = await findFreePort();
   const serverEntry = path.join(process.resourcesPath, 'app', 'server.js'); // .next/standalone/server.js
-  serverProcess = spawn(process.execPath, [serverEntry], {
-    env: {
-      ...process.env,
-      NODE_ENV: 'production',
-      PORT: String(port),
-      HOSTNAME: '127.0.0.1',
-      BKA_DATA_DIR: activeCompanyDir(),
-      // A single company file: the server saves its working copy back to it
-      // (lib/services/companyFileSave.ts) and checks this computer still holds its lock.
-      BKA_COMPANY_FILE: openFile ? openFile.path : '',
-      BKA_COMPANY_STATE: openFile ? path.join(openFile.workDir, companySession.STATE_FILE) : '',
-      BKA_COMPANY_LOCK: openFile ? openFile.lock.dir : '',
-      BKA_COMPANY_LOCK_TOKEN: openFile ? openFile.lock.token : '',
-      // Protected with passwords (lib/db/sealed.ts): what the sign-in must do before the books open.
-      // Never a key or a password — only the open plan.
-      BKA_COMPANY_SEALED: openFile && openFile.sealed ? openFile.sealed : '',
-      // Where the real company file lives (training copies are kept next to it), also in the sandbox.
-      BKA_REAL_COMPANY_FILE: openFile ? openFile.path : (loadConfig().sandbox && loadConfig().sandbox.realFile) || '',
-      // Scheduled report exports of a single company file go next to the company file, as they do
-      // next to a company folder ("Report Exports/<name>") — never into its working copy in this
-      // computer's local app data, which nobody looks in and which is cleared when unused.
-      BKA_REPORT_EXPORT_DIR:
-        process.env.BKA_REPORT_EXPORT_DIR ||
-        (openFile ? path.join(path.dirname(openFile.path), 'Report Exports', companyFileFormat.companyFileBaseName(openFile.path)) : ''),
-      // Sandbox mode: where "Try it on a copy" puts copies, and the PDF "SANDBOX" stamp flag.
-      BKA_SANDBOX_ROOT: sandboxRoot(),
-      BKA_SANDBOX: sandboxActive() ? '1' : '',
-      BKA_MIGRATIONS_DIR: migrationsDir(),
-      // Offline desktop build: the server is bound to 127.0.0.1 only, so it is safe to
-      // surface a password-reset token directly in the local HTTP response.
-      BKA_OFFLINE: '1',
-      BKA_INTERNAL_TOKEN: internalToken,
-      // Versioned automatic backups go to the existing backups folder unless the company file
-      // chooses another one (Back Up & Restore page).
-      BKA_BACKUP_DIR: backupsDir(),
-      BKA_BACKUP_INTERVAL_HOURS: legacyBackupIntervalEnv(),
-      ELECTRON_RUN_AS_NODE: '1',
-      // Local-only: no Next.js telemetry (it is build/CLI-time, but make sure).
-      NEXT_TELEMETRY_DISABLED: '1',
-    },
-    stdio: 'inherit',
+  // On a free port, and checked to be this server before the window or any call with the internal
+  // token goes there (startVerifiedServer: another program could take the port first).
+  const { port } = await startVerifiedServer('server', (port) => {
+    serverProcess = spawn(process.execPath, [serverEntry], {
+      env: {
+        // What this computer's environment passes on (the installed app drops developer switches:
+        // electron/localServer.js inheritedServerEnv), then everything the server needs from us.
+        ...localServer.inheritedServerEnv(process.env, { packaged: !isDev }),
+        NODE_ENV: 'production',
+        PORT: String(port),
+        HOSTNAME: '127.0.0.1',
+        BKA_DATA_DIR: activeCompanyDir(),
+        // A single company file: the server saves its working copy back to it
+        // (lib/services/companyFileSave.ts) and checks this computer still holds its lock.
+        BKA_COMPANY_FILE: openFile ? openFile.path : '',
+        BKA_COMPANY_STATE: openFile ? path.join(openFile.workDir, companySession.STATE_FILE) : '',
+        BKA_COMPANY_LOCK: openFile ? openFile.lock.dir : '',
+        BKA_COMPANY_LOCK_TOKEN: openFile ? openFile.lock.token : '',
+        // Protected with passwords (lib/db/sealed.ts): what the sign-in must do before the books open.
+        // Never a key or a password — only the open plan.
+        BKA_COMPANY_SEALED: openFile && openFile.sealed ? openFile.sealed : '',
+        // Where the real company file lives (training copies are kept next to it), also in the sandbox.
+        BKA_REAL_COMPANY_FILE: openFile ? openFile.path : (loadConfig().sandbox && loadConfig().sandbox.realFile) || '',
+        // Scheduled report exports of a single company file go next to the company file, as they do
+        // next to a company folder ("Report Exports/<name>") — never into its working copy in this
+        // computer's local app data, which nobody looks in and which is cleared when unused.
+        BKA_REPORT_EXPORT_DIR:
+          process.env.BKA_REPORT_EXPORT_DIR ||
+          (openFile ? path.join(path.dirname(openFile.path), 'Report Exports', companyFileFormat.companyFileBaseName(openFile.path)) : ''),
+        // Sandbox mode: where "Try it on a copy" puts copies, and the PDF "SANDBOX" stamp flag.
+        BKA_SANDBOX_ROOT: sandboxRoot(),
+        BKA_SANDBOX: sandboxActive() ? '1' : '',
+        BKA_MIGRATIONS_DIR: migrationsDir(),
+        // Offline desktop build: the server is bound to 127.0.0.1 only, so it is safe to
+        // surface a password-reset token directly in the local HTTP response.
+        BKA_OFFLINE: '1',
+        BKA_INTERNAL_TOKEN: internalToken,
+        // The window's per-launch pass (lib/net/launchPass.ts): insisted on only once the window has
+        // it as a cookie (setLaunchPassCookie), so a failure there never locks anyone out.
+        BKA_LAUNCH_PASS: launchPassOnWindow ? launchPass : '',
+        // Versioned automatic backups go to the existing backups folder unless the company file
+        // chooses another one (Back Up & Restore page).
+        BKA_BACKUP_DIR: backupsDir(),
+        BKA_BACKUP_INTERVAL_HOURS: legacyBackupIntervalEnv(),
+        ELECTRON_RUN_AS_NODE: '1',
+        // Local-only: no Next.js telemetry (it is build/CLI-time, but make sure).
+        NEXT_TELEMETRY_DISABLED: '1',
+      },
+      stdio: 'inherit',
+    });
+    // A server that stops while the app runs (a crash) is said at once — it used to go unnoticed
+    // until the quit-time save failed. A spawn failure was an uncaught 'error' event.
+    const started = serverProcess;
+    started.once('error', (err) => console.error('[server] could not start:', err?.message || err));
+    started.once('exit', (code, signal) => {
+      if (serverProcess !== started || quittingAfterBackup) return; // stopped on purpose
+      serverProcess = null;
+      console.error(`[server] stopped unexpectedly (code ${code}, signal ${signal}).`);
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        dialog.showErrorBox(
+          'Ironbooks stopped working',
+          'The part of Ironbooks that keeps your books stopped unexpectedly. Close Ironbooks and start it again — your company file was saved as of the last change.',
+        );
+      }
+    });
+    return started;
+  }, (child) => {
+    // Not ours on that port: this child is stopped on purpose (no "stopped working" message).
+    if (serverProcess === child) serverProcess = null;
+    return stopChild(child);
   });
-  // A server that stops while the app runs (a crash) is said at once — it used to go unnoticed
-  // until the quit-time save failed. A spawn failure was an uncaught 'error' event.
-  const started = serverProcess;
-  started.once('error', (err) => console.error('[server] could not start:', err?.message || err));
-  started.once('exit', (code, signal) => {
-    if (serverProcess !== started || quittingAfterBackup) return; // stopped on purpose
-    serverProcess = null;
-    console.error(`[server] stopped unexpectedly (code ${code}, signal ${signal}).`);
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      dialog.showErrorBox(
-        'Ironbooks stopped working',
-        'The part of Ironbooks that keeps your books stopped unexpectedly. Close Ironbooks and start it again — your company file was saved as of the last change.',
-      );
-    }
-  });
-
-  // wait until the port is accepting connections
-  await waitForServer(port);
   // The window (and every origin check against serverUrl) uses "localhost", not 127.0.0.1: Next.js
   // spells loopback as "localhost" in the URLs middleware sees (NextURL), so its /unlock and /login
   // redirects point at http://localhost:<port>/. Loaded from 127.0.0.1, that first redirect is a
   // different origin, the navigation guard (security.js) cancels it, and the window stays blank.
-  // The server itself still listens on 127.0.0.1 only.
+  // The server itself still listens on 127.0.0.1 only, and the window reaches it there: inside the
+  // app "localhost" resolves to 127.0.0.1 only (the host-resolver rule at the top of this file).
   return `http://localhost:${port}`;
 }
 
@@ -1701,6 +1775,53 @@ function waitForServer(port, timeoutMs = 20000) {
       });
     };
     tryConnect();
+  });
+}
+
+/** Ports tried before giving up when another program keeps answering on the one chosen. */
+const SERVER_START_ATTEMPTS = 3;
+
+/**
+ * Start an app server on a free port and make sure the program answering there IS that server
+ * before anything is sent to it. findFreePort releases the port before the server binds it and
+ * waitForServer accepts any program that answers, so another program could be listening there
+ * instead (our server then fails to bind and stops). The proof: a keyed answer to a random nonce
+ * that only a server holding this launch's internal token can give (localServer.isOwnServer,
+ * GET /api/handshake). If it fails, that child is stopped (`discard`, which resolves once it is
+ * gone) and another port is tried; after SERVER_START_ATTEMPTS the usual start-up error is shown.
+ * A server that never answers fails exactly as before (waitForServer's time limit).
+ * `spawnOne(port)` starts one server and returns its child process. Resolves { port, child }.
+ */
+async function startVerifiedServer(label, spawnOne, discard = (child) => stopChild(child)) {
+  for (let attempt = 1; ; attempt++) {
+    const port = await findFreePort();
+    const child = spawnOne(port);
+    await waitForServer(port);
+    // A first answer can be slow on a busy computer; only a wrong (or no) answer counts.
+    if (await localServer.isOwnServer(port, internalToken, { timeoutMs: 30_000 })) return { port, child };
+    console.error(`[${label}] another program answered on port ${port} (attempt ${attempt} of ${SERVER_START_ATTEMPTS}).`);
+    // Never two servers on one company folder: the next one starts only once this one is gone.
+    if (!(await discard(child))) throw new Error('Ironbooks could not stop its server to try again.');
+    if (attempt >= SERVER_START_ATTEMPTS) {
+      throw new Error('Another program on this computer is using the connection Ironbooks needs for its server.');
+    }
+  }
+}
+
+/** Stop a server child and wait until it has gone (true), or give up after a while (false). */
+function stopChild(child, timeoutMs = 10000) {
+  return new Promise((resolve) => {
+    if (!child || child.exitCode !== null || child.signalCode !== null) return resolve(true);
+    const timer = setTimeout(() => resolve(false), timeoutMs);
+    child.once('exit', () => {
+      clearTimeout(timer);
+      resolve(true);
+    });
+    try {
+      child.kill();
+    } catch {
+      /* already gone: 'exit' follows */
+    }
   });
 }
 
@@ -2006,9 +2127,9 @@ async function openPortableFlow(filePath) {
   // (packAs): the books of a protected file are written encrypted with the key that travelled
   // inside the password-protected portable file — this shell never has it.
   const restore = async (password) => {
-    const headers = { 'x-bka-internal': internalToken, 'content-type': 'application/octet-stream' };
+    const headers = { 'content-type': 'application/octet-stream' };
     if (password) headers['x-ironbooks-password'] = Buffer.from(password, 'utf8').toString('base64url');
-    const res = await fetch(`${baseUrl}/api/portable/restore?target=${encodeURIComponent(scratch)}&packAs=${encodeURIComponent(target)}`, {
+    const res = await shellFetch(baseUrl, `/api/portable/restore?target=${encodeURIComponent(scratch)}&packAs=${encodeURIComponent(target)}`, {
       method: 'POST',
       headers,
       body: bytes,
@@ -2120,9 +2241,9 @@ async function openAccountantCopyFlow(filePath) {
   let baseUrl = serverUrl;
   let scratchServer = null;
   const open = async (password) => {
-    const headers = { 'x-bka-internal': internalToken, 'content-type': 'application/octet-stream' };
+    const headers = { 'content-type': 'application/octet-stream' };
     if (password) headers['x-ironbooks-password'] = Buffer.from(password, 'utf8').toString('base64url');
-    const res = await fetch(`${baseUrl}/api/accountant-copy/open?target=${encodeURIComponent(scratch)}&packAs=${encodeURIComponent(target)}`, {
+    const res = await shellFetch(baseUrl, `/api/accountant-copy/open?target=${encodeURIComponent(scratch)}&packAs=${encodeURIComponent(target)}`, {
       method: 'POST',
       headers,
       body: bytes,
@@ -2190,36 +2311,38 @@ async function openAccountantCopyFlow(filePath) {
  */
 async function startScratchServer(dataDir) {
   fs.mkdirSync(dataDir, { recursive: true });
-  const port = await findFreePort();
-  const child = spawnScratch(process.execPath, [path.join(process.resourcesPath, 'app', 'server.js')], {
-    env: {
-      ...process.env,
-      NODE_ENV: 'production',
-      PORT: String(port),
-      HOSTNAME: '127.0.0.1',
-      BKA_DATA_DIR: dataDir,
-      BKA_COMPANY_FILE: '',
-      BKA_COMPANY_STATE: '',
-      BKA_COMPANY_LOCK: '',
-      BKA_COMPANY_LOCK_TOKEN: '',
-      BKA_COMPANY_SEALED: '',
-      BKA_MIGRATIONS_DIR: migrationsDir(),
-      BKA_OFFLINE: '1',
-      BKA_INTERNAL_TOKEN: internalToken,
-      ELECTRON_RUN_AS_NODE: '1',
-      NEXT_TELEMETRY_DISABLED: '1',
-    },
-    stdio: 'inherit',
-  });
-  const stop = () =>
-    new Promise((resolve) => {
-      if (child.exitCode !== null || child.signalCode !== null) return resolve();
-      child.once('exit', () => resolve());
-      child.kill();
-      setTimeout(resolve, 5000); // never hang the flow on a stuck child
-    });
+  let child = null;
+  // Never hang the flow on a stuck child (5 seconds at most).
+  const stop = () => stopChild(child, 5000).then(() => undefined);
+  let port;
   try {
-    await waitForServer(port);
+    // Checked to be this server before the shell sends it anything (startVerifiedServer).
+    ({ port } = await startVerifiedServer('scratch-server', (p) => {
+      child = spawnScratch(process.execPath, [path.join(process.resourcesPath, 'app', 'server.js')], {
+        env: {
+          ...localServer.inheritedServerEnv(process.env, { packaged: !isDev }),
+          NODE_ENV: 'production',
+          PORT: String(p),
+          HOSTNAME: '127.0.0.1',
+          BKA_DATA_DIR: dataDir,
+          BKA_COMPANY_FILE: '',
+          BKA_COMPANY_STATE: '',
+          BKA_COMPANY_LOCK: '',
+          BKA_COMPANY_LOCK_TOKEN: '',
+          BKA_COMPANY_SEALED: '',
+          BKA_MIGRATIONS_DIR: migrationsDir(),
+          BKA_OFFLINE: '1',
+          BKA_INTERNAL_TOKEN: internalToken,
+          // Only the shell talks to a scratch server (shellFetch sends the pass as a header), so it
+          // always insists on this launch's pass.
+          BKA_LAUNCH_PASS: launchPass,
+          ELECTRON_RUN_AS_NODE: '1',
+          NEXT_TELEMETRY_DISABLED: '1',
+        },
+        stdio: 'inherit',
+      });
+      return child;
+    }));
   } catch (err) {
     await stop();
     throw err;
@@ -2936,6 +3059,10 @@ async function createWindow() {
     }
   }
   if (remotePin) installPinnedCertificate(remoteHostOrigin, remotePin);
+  // This launch's pass goes on the window before its server starts (the server then insists on
+  // it); a window showing a multi-user host never carries one of ours.
+  if (remote) await clearLaunchPassCookie();
+  else launchPassOnWindow = await setLaunchPassCookie();
   const url = remote ? remote.url : await startNextServer();
   serverUrl = url;
 
@@ -3099,9 +3226,9 @@ async function createWindow() {
 // the main process has no session cookie.
 function runDueRecurring(url) {
   try {
-    fetch(`${url}/api/recurring/run`, {
+    shellFetch(url, '/api/recurring/run', {
       method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-bka-internal': internalToken },
+      headers: { 'content-type': 'application/json' },
       body: '{}',
     })
       .then(async (res) => {
@@ -3138,9 +3265,9 @@ let scheduledReportsTimer = null;
 let recurringTimer = null;
 
 function runDueScheduledReports(url) {
-  return fetch(`${url}/api/reports/schedules/run-due`, {
+  return shellFetch(url, '/api/reports/schedules/run-due', {
     method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-bka-internal': internalToken },
+    headers: { 'content-type': 'application/json' },
     body: '{}',
   })
     .then(async (res) => {
@@ -3161,9 +3288,8 @@ function runDueScheduledReports(url) {
 // Start the server's scheduled-backup timer at launch, whoever signs in (the backup status route
 // also starts it, but only after a page load). Internal token, like the recurring run.
 function startBackupScheduler(url) {
-  fetch(`${url}/api/dashboard/auto-backup?start=1`, {
+  shellFetch(url, '/api/dashboard/auto-backup?start=1', {
     method: 'POST',
-    headers: { 'x-bka-internal': internalToken },
   })
     .then(async (res) => {
       if (!res.ok) {
@@ -3327,7 +3453,9 @@ ipcMain.handle('dialog:openFile', async (e, filters) => {
   const res = await dialog.showOpenDialog(mainWindow, { properties: ['openFile'], filters: filters || [] });
   if (res.canceled || !res.filePaths[0]) return null;
   const filePath = res.filePaths[0];
-  return { filePath, content: decodeTextFile(fs.readFileSync(filePath)) };
+  // A multi-user host's page only needs the file's name (lib/bankFileClient.ts), never where it
+  // is on this computer.
+  return { filePath: remoteHostOrigin ? path.basename(filePath) : filePath, content: decodeTextFile(fs.readFileSync(filePath)) };
 });
 
 /**
@@ -3352,28 +3480,30 @@ ipcMain.handle('file:saveBytes', async (e, opts) => {
   if (!fromAppOrigin(e)) return null;
   const { defaultName, filters, data } = opts || {};
   // The page names the file and its type, but only from the kinds of file Ironbooks exports (a
-  // host's page in client mode must not offer "Invoice.exe" under a "PDF Document" filter).
-  const SAVE_TYPES = new Set(['bkp', 'csv', 'ibac', 'ibcx', 'ofx', 'qfx', 'pdf', 'qbo', 'txt', 'xlsx', 'iif', 'json', 'zip', 'xml', 'html']);
-  const safeFilters = (Array.isArray(filters) ? filters : [])
-    .map((f) => ({
-      name: String((f && f.name) || 'File').slice(0, 80),
-      extensions: (Array.isArray(f && f.extensions) ? f.extensions : []).map((x) => String(x).toLowerCase()).filter((x) => SAVE_TYPES.has(x)),
-    }))
-    .filter((f) => f.extensions.length > 0);
-  let base = path.basename(String(defaultName || 'export'));
-  const ext = path.extname(base).slice(1).toLowerCase();
-  if (ext && !SAVE_TYPES.has(ext)) base = base.slice(0, -(ext.length + 1));
+  // host's page in client mode must not offer "Invoice.exe" under a "PDF Document" filter), and
+  // the type is checked again on the path finally written — with or without filters, and after
+  // Windows' own clean-up of the name ("Invoice.exe." would be saved as Invoice.exe).
+  const plan = saveTypes.planSave({ defaultName, filters });
   const res = await dialog.showSaveDialog(mainWindow, {
-    defaultPath: path.join(app.getPath('documents'), base),
-    filters: safeFilters,
+    defaultPath: path.join(app.getPath('documents'), plan.base),
+    filters: plan.filters,
   });
-  if (!res.canceled && res.filePath && safeFilters.length) {
-    const chosen = path.extname(res.filePath).slice(1).toLowerCase();
-    if (!safeFilters.some((f) => f.extensions.includes(chosen))) res.filePath = `${res.filePath}.${safeFilters[0].extensions[0]}`;
-  }
   if (res.canceled || !res.filePath) return null;
-  fs.writeFileSync(res.filePath, Buffer.from(new Uint8Array(data)));
-  return res.filePath;
+  const target = saveTypes.finalSavePath(res.filePath, plan);
+  if (!target) {
+    console.warn('[security] refused to save a file as a kind of file Ironbooks does not save');
+    dialog.showMessageBox(mainWindow, {
+      type: 'warning',
+      noLink: true,
+      message: `Ironbooks did not save ${path.basename(res.filePath).slice(0, 120)}`,
+      detail: 'Save it again with one of the file types offered in the Save dialog.',
+      buttons: ['OK'],
+    });
+    return null;
+  }
+  fs.writeFileSync(target, Buffer.from(new Uint8Array(data)));
+  // The full path only to this computer's own pages, as dialog:openFile does.
+  return remoteHostOrigin ? path.basename(target) : target;
 });
 
 ipcMain.handle('portable:open', (e) => { if (fromLocalApp(e)) openPortableFlow(); return true; });
@@ -3422,8 +3552,7 @@ async function installOllamaFlow(e) {
   if (response !== 0) return { ok: false, cancelled: true };
   try {
     const q = new URLSearchParams({ purpose: 'updates', url: 'https://ollama.com/download' });
-    const res = await fetch(`${serverUrl}/api/network-policy/check?${q}`, {
-      headers: { 'x-bka-internal': internalToken },
+    const res = await shellFetch(serverUrl, `/api/network-policy/check?${q}`, {
       signal: AbortSignal.timeout(5000),
     });
     const d = res.ok ? await res.json() : null;
@@ -3695,8 +3824,7 @@ async function updatesAllowed() {
   if (!serverUrl) return { allowed: false, reason: 'The app has not finished starting.' };
   try {
     const q = new URLSearchParams({ purpose: 'updates', url: updateFeedUrl() });
-    const res = await fetch(`${serverUrl}/api/network-policy/check?${q}`, {
-      headers: { 'x-bka-internal': internalToken },
+    const res = await shellFetch(serverUrl, `/api/network-policy/check?${q}`, {
       signal: AbortSignal.timeout(5000),
     });
     const d = res.ok ? await res.json() : null;

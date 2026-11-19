@@ -59,6 +59,7 @@ import { POST as changePOST } from '@/app/api/auth/change-password/route';
 import { GET as policyGET } from '@/app/api/auth/password-policy/route';
 import { PUT as adminPolicyPUT } from '@/app/api/users/password-policy/route';
 import { POST as resetPOST } from '@/app/api/auth/reset/route';
+import { storedResetToken } from './passwordReset';
 import { POST as twoFaSetupPOST } from '@/app/api/auth/2fa/setup/route';
 import { POST as selectCompanyPOST } from '@/app/api/companies/select/route';
 import { POST as logoutPOST } from '@/app/api/auth/logout/route';
@@ -217,7 +218,8 @@ describe('enforced wherever a password is set', () => {
   it('reset by token follows the rules', async () => {
     const [u] = await db
       .insert(users)
-      .values({ email: 'token@pp.local', name: 'Token', passwordHash: await hashPassword('tokenpass1'), resetToken: 't'.repeat(48), resetExpires: new Date(Date.now() + 3600_000) })
+      // Security review 2.9: a token is stored only as its fingerprint (lib/services/passwordReset.ts).
+      .values({ email: 'token@pp.local', name: 'Token', passwordHash: await hashPassword('tokenpass1'), resetToken: storedResetToken('t'.repeat(48), 'single'), resetExpires: new Date(Date.now() + 3600_000) })
       .returning();
     as(null, 'POST', '/api/auth/reset');
     const bad = await resetPOST(jsonRequest('/api/auth/reset', { token: 't'.repeat(48), password: 'onlyletters' }));
