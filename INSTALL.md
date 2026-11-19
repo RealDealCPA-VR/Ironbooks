@@ -16,11 +16,12 @@ embedded database internally).
    - launches the app when it finishes.
 3. From then on, just double-click the **Ironbooks** desktop icon to open it. That's it.
 
-**Windows blocks it?** Until the installer is code-signed, Windows SmartScreen says "Windows
-protected your PC": choose **More info**, then **Run anyway**. On Windows 11 with **Smart App
-Control** turned **On**, unsigned apps are blocked outright, with no "Run anyway" button. Check
-Windows Security > App & browser control > Smart App Control settings. If it is On, talk to whoever
-looks after the computer before changing it.
+**Windows warns about it?** The installer is signed by **RealDealCPA.Ai LLC** (from version
+1.7.19). Windows SmartScreen also weighs how many people have downloaded a publisher's files, so it
+can still say "Windows protected your PC" for a while: check that the publisher reads
+RealDealCPA.Ai LLC, then choose **More info** and **Run anyway**. Versions up to 1.7.18 were not
+signed; on Windows 11 with **Smart App Control** turned **On**, those are blocked outright, with no
+"Run anyway" button (Windows Security > App & browser control > Smart App Control).
 
 To uninstall: Settings → Apps → Ironbooks → Uninstall. Your company files and backups are not
 deleted.

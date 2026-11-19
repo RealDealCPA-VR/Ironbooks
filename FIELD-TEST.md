@@ -131,10 +131,10 @@ Use a PC that has never had Ironbooks, if you have one.
 
 - [ ] In Edge, download **Ironbooks-Setup-1.7.18.exe** from
   [the latest release](https://github.com/RealDealCPA-VR/Ironbooks/releases/latest). Note exactly
-  what the browser and Windows say. Until signing is set up, Windows shows "Windows protected your
-  PC": choose **More info**, then **Run anyway**. If there is no **Run anyway** at all, check
-  Windows Security > App & browser control > Smart App Control: when it is On, Windows 11 blocks
-  unsigned apps outright. Note what it says.
+  what the browser and Windows say. The installer is signed, so the publisher should read
+  **RealDealCPA.Ai LLC**. Windows can still show "Windows protected your PC" while the publisher is
+  new: choose **More info**, then **Run anyway**. Note what it says, and whether Smart App Control
+  (Windows Security > App & browser control) is On.
 - [ ] The installer finishes without errors, and Ironbooks opens to the welcome screen.
 - [ ] Double-clicking a `.ironbooks` file in File Explorer opens it in Ironbooks.
 - [ ] Once the winget listing is approved, `winget install RealDealCPA-VR.Ironbooks` in a terminal

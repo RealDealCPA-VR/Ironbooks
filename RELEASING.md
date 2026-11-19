@@ -95,12 +95,11 @@ release the fix under the next version number.
 
 ## Signing caveats
 
-- **Windows:** auto-update works **unsigned**, but SmartScreen warns on first run of each new version,
-  and on Windows 11 with Smart App Control **On** an unsigned installer is blocked outright (no "Run
-  anyway"; Windows Security > App & browser control > Smart App Control). Turn on signing for
-  releases (`SIGNING.md`: Azure Artifact Signing, SignPath or a certificate) to remove the warning.
-  From the first signed release on, installed copies accept only updates signed by the same
-  publisher.
+- **Windows:** releases are signed by RealDealCPA.Ai LLC through Azure Artifact Signing from 1.7.19
+  (`SIGNING.md`). Installed copies accept only updates signed by that publisher, so every later
+  release must stay signed under the same name: run Actions → Signing check if the set-up was
+  touched. SmartScreen can still warn while the publisher is new. An unsigned build is blocked
+  outright on Windows 11 with Smart App Control **On**.
 - **macOS:** auto-update **requires** a properly **signed + notarized** build. The self-signed pipeline
   in `SIGNING.md` is enough to run locally but will **not** auto-update on macOS — you need an Apple
   Developer ID cert + notarization for the `.dmg`/`.zip` feed.
