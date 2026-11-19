@@ -299,7 +299,7 @@ PARITY.md            QuickBooks Desktop Enterprise parity gap matrix
   every open, with a challenge question for a forgotten password; QuickBooks' keyboard shortcuts
   throughout; a welcome screen on first run; clean builds
 - [ ] The remaining partial rows and P2 follow-ups in [`PARITY.md`](./PARITY.md)
-- [ ] Signed Windows installers (Azure Trusted Signing; the release workflow is ready — [`SIGNING.md`](./SIGNING.md))
+- [ ] Signed Windows installers (Azure Artifact Signing; the release workflow is ready — [`SIGNING.md`](./SIGNING.md))
 
 ## 📜 License
 
@@ -313,7 +313,7 @@ Free code signing provided by [SignPath.io](https://signpath.io), certificate by
 Windows installers are built from this repository by GitHub Actions
 ([`release.yml`](./.github/workflows/release.yml)) and signed only after a maintainer approves
 each release. Releases up to and including 1.6.0 were published unsigned; the workflow signs
-with Azure Trusted Signing (or SignPath, or a certificate) as soon as its credentials are added —
+with Azure Artifact Signing (or SignPath, or a certificate) as soon as its credentials are added —
 see [`SIGNING.md`](./SIGNING.md). Until a release is signed,
 Windows may show "Windows protected your PC": choose **More info → Run anyway**.
 

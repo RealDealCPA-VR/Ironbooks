@@ -7,8 +7,10 @@ GitHub repository; with none, releases are built unsigned exactly as before.
 
 ## Turn on signing for releases (GitHub)
 
-**Azure Trusted Signing (Microsoft's signing service — the route chosen for this project):**
-1. In the Azure portal (an Azure subscription is needed): create a **Trusted Signing account**.
+**Azure Artifact Signing (Microsoft's signing service, formerly "Trusted Signing" — the route
+this project uses):**
+1. In the Azure portal (a paid Azure subscription is needed): create an **Artifact Signing
+   account**.
    Note its region's endpoint, for example `https://eus.codesigning.azure.net/` (East US).
 2. In the account: **Identity validation** → New → Public. Microsoft checks the name that will
    appear as the publisher (an organization, or an individual developer where offered). This can
@@ -17,19 +19,24 @@ GitHub repository; with none, releases are built unsigned exactly as before.
 4. Microsoft Entra ID → **App registrations** → New registration (for example
    `ironbooks-release-signing`) → Certificates & secrets → New client secret. Note the
    Directory (tenant) ID, Application (client) ID and the secret's value.
-5. Back on the Trusted Signing account → Access control (IAM) → Add role assignment →
-   **Trusted Signing Certificate Profile Signer** → the app registration from step 4.
+5. Back on the Artifact Signing account → Access control (IAM) → Add role assignment →
+   **Artifact Signing Certificate Profile Signer** → the app registration from step 4.
 6. GitHub → the repository → Settings → Secrets and variables → Actions:
    - secrets `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` (step 4);
-   - variables `AZURE_SIGNING_ENDPOINT` (step 1), `AZURE_SIGNING_ACCOUNT` (the Trusted Signing
+   - variables `AZURE_SIGNING_ENDPOINT` (step 1), `AZURE_SIGNING_ACCOUNT` (the Artifact Signing
      account's name), `AZURE_CERT_PROFILE` (step 3's profile name) and `AZURE_PUBLISHER_NAME`
      (the validated name, exactly as the certificate shows it — the CN).
-7. Tag a release as usual. electron-builder signs the app, the installer and the portable
+7. Prove the set-up before a release depends on it: Actions → **Signing check** → Run workflow
+   (`.github/workflows/signing-check.yml`). It signs a test build, checks the signature and that
+   the publisher name matches `AZURE_PUBLISHER_NAME`, and publishes nothing.
+8. Tag a release as usual. electron-builder signs the app, the installer and the portable
    build while it builds. If only some of the settings are there, the release stops with a
    message naming the missing one instead of shipping unsigned.
 
 Azure's certificates last only a few days and renew themselves; nothing needs replacing each
-year.
+year. Two things do expire: the app registration's client secret (24 months at most — create a
+new one and set `AZURE_CLIENT_SECRET` again) and the identity validation (Microsoft sends
+reminders from 60 days before).
 
 **SignPath Foundation (free for open source — the route this project applied for):**
 1. When the SignPath application is approved, create the project and a signing policy there.
