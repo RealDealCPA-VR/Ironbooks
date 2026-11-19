@@ -1,0 +1,63 @@
+name: Signing check
+# Run by hand (Actions → Signing check → Run workflow) to prove the code-signing set-up before a
+# release depends on it (SIGNING.md). It builds the app folder, signs Ironbooks.exe the same way a
+# release does (Azure Artifact Signing through electron-builder), and checks the signature and the
+# publisher name. It builds no installer and publishes nothing.
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: windows-latest
+    env:
+      NEXT_TELEMETRY_DISABLED: '1'
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      AZURE_SIGNING_ENDPOINT: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+      AZURE_SIGNING_ACCOUNT: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+      AZURE_CERT_PROFILE: ${{ vars.AZURE_CERT_PROFILE }}
+      AZURE_PUBLISHER_NAME: ${{ vars.AZURE_PUBLISHER_NAME }}
+    steps:
+      - name: Check every signing setting is there
+        shell: bash
+        run: |
+          missing=0
+          for v in AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_CLIENT_SECRET AZURE_SIGNING_ENDPOINT AZURE_SIGNING_ACCOUNT AZURE_CERT_PROFILE AZURE_PUBLISHER_NAME; do
+            [ -n "${!v}" ] || { echo "::error::$v is not set (see SIGNING.md)"; missing=1; }
+          done
+          exit $missing
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '24'
+      - run: npm ci --legacy-peer-deps
+      - run: npm run build
+      - name: Build the app folder and sign it (no installer, nothing published)
+        shell: bash
+        run: |
+          npx electron-builder --dir --publish never \
+            -c.win.azureSignOptions.endpoint="$AZURE_SIGNING_ENDPOINT" \
+            -c.win.azureSignOptions.codeSigningAccountName="$AZURE_SIGNING_ACCOUNT" \
+            -c.win.azureSignOptions.certificateProfileName="$AZURE_CERT_PROFILE" \
+            -c.win.azureSignOptions.publisherName="$AZURE_PUBLISHER_NAME"
+      - name: Check the signature and the publisher name
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature 'release\win-unpacked\Ironbooks.exe'
+          if (-not $sig.SignerCertificate) { Write-Output '::error::Ironbooks.exe is not signed'; exit 1 }
+          $name = $sig.SignerCertificate.GetNameInfo('SimpleName', $false)
+          Write-Output "Status:      $($sig.Status)"
+          Write-Output "Publisher:   $name"
+          Write-Output "Subject:     $($sig.SignerCertificate.Subject)"
+          Write-Output "Issued by:   $($sig.SignerCertificate.Issuer)"
+          Write-Output "Timestamped: $([bool]$sig.TimeStamperCertificate)"
+          if ($sig.Status -ne 'Valid') { Write-Output "::error::The signature is not valid: $($sig.StatusMessage)"; exit 1 }
+          if (-not $sig.TimeStamperCertificate) { Write-Output '::error::The signature has no timestamp, so it would stop being trusted when the certificate expires'; exit 1 }
+          # Installed copies accept only updates whose publisher is exactly this name.
+          if ($name -cne $env:AZURE_PUBLISHER_NAME) {
+            Write-Output "::error::AZURE_PUBLISHER_NAME is '$($env:AZURE_PUBLISHER_NAME)' but the certificate says '$name'. Set the variable to the certificate's name."
+            exit 1
+          }
+          Write-Output 'Signing works, and the publisher name matches.'
