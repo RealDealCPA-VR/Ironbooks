@@ -1,50 +1,65 @@
 <div align="center">
 
-# 📒 Ironbooks
+<img src="./site/assets/icon-256.png" width="136" alt="Ironbooks">
 
-### QuickBooks Desktop Enterprise power. Your machine. Your AI. No subscription.
+# Ironbooks
 
-**The desktop accounting system you own outright. Open source, signed, and built on a ledger
-that the database itself refuses to let go out of balance.**
+### Stop renting your own books.
+
+**QuickBooks Desktop Enterprise power. Your machine. Your AI. No subscription. Ever.**
 
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![tests](https://img.shields.io/badge/tests-9%2C100%2B%20passing-brightgreen)
-![typecheck](https://img.shields.io/badge/tsc-clean-blue)
 ![signed](https://img.shields.io/badge/Windows%20installer-signed-success)
 ![local-first](https://img.shields.io/badge/data-100%25%20local-success)
 ![AI](https://img.shields.io/badge/AI-local%20first-purple)
-![stack](https://img.shields.io/badge/Next.js%2015%20%C2%B7%20Electron%20%C2%B7%20Postgres-black)
+![price](https://img.shields.io/badge/price-%240%20forever-blue)
 
-**[⬇ Download for Windows](https://github.com/RealDealCPA-VR/Ironbooks/releases/latest)** · [Website](https://realdealcpa-vr.github.io/Ironbooks/)
+<a href="https://github.com/RealDealCPA-VR/Ironbooks/releases/latest"><img src="https://img.shields.io/badge/Download%20for%20Windows-0A66FF?style=for-the-badge" alt="Download for Windows"></a>
+&nbsp;
+<a href="https://realdealcpa-vr.github.io/Ironbooks/"><img src="https://img.shields.io/badge/Visit%20the%20website-1B2A44?style=for-the-badge" alt="Visit the website"></a>
 
-[Why](#-why-ironbooks) · [Features](#-everything-a-real-set-of-books-needs) · [The company file](#-a-company-file-that-works-like-a-qbw) · [Switching from QuickBooks](#-switching-from-quickbooks) · [AI](#-ai-that-stays-home) · [Security](#-security-you-never-notice) · [Quick start](#-quick-start) · [Code signing policy](#-code-signing-policy)
+[Why](#-why-ironbooks) · [A morning in Ironbooks](#-a-monday-morning-in-ironbooks) · [Features](#-everything-a-real-set-of-books-needs) · [The company file](#-a-company-file-that-works-like-a-qbw) · [Switching](#-switching-from-quickbooks) · [AI](#-ai-that-stays-home) · [Security](#-security-you-never-notice) · [Quick start](#-quick-start)
 
 </div>
 
 ---
 
-Your accounting software raised its price again. Your client's books live on a server you have
-never seen. The desktop product you trained your whole staff on is being retired one edition at
+Your accounting software raised its price again. Your client's ledger lives on a server you have
+never seen. The desktop product you trained your whole office on is being retired one edition at
 a time.
 
-**Ironbooks is the way out.** Install it, open a company file, and work the way you already know:
-registers you type into, the same keyboard shortcuts, the same Centers, the same reports. Nothing
-to rent, no account to create, and nothing leaves your computer unless you switch it on.
+**Ironbooks hands the books back to you.** A full desktop accounting system that feels like the
+one you already know: registers you type into, the same keyboard shortcuts, the same Centers, the
+same reports. Install it, open your company file and get to work. No account to create. No card
+on file. Nothing leaves your computer unless you switch it on.
+
+<table>
+<tr>
+<td align="center" width="25%"><h3>$0</h3>No seats, no tiers,<br>no renewal date</td>
+<td align="center" width="25%"><h3>1 file</h3>Your whole company,<br>yours to copy and keep</td>
+<td align="center" width="25%"><h3>0 clouds</h3>Works with the<br>network cable unplugged</td>
+<td align="center" width="25%"><h3>9,100+</h3>Automated tests guarding<br>every dollar</td>
+</tr>
+</table>
 
 ## 💡 Why Ironbooks
 
-- 🔒 **You own the books.** The company file is one file on your disk, like a .QBW. No account, no
-  telemetry, no lock-in. Copy it, back it up, hand it to your accountant.
-- ⚖️ **Out-of-balance books are impossible, not just unlikely.** The ledger rules run as
-  **database triggers**. An unbalanced entry, a hand-edited balance or a change to a posted line
-  is rejected at commit, whatever code path tries it.
-- 🤖 **AI that works for you, on your hardware.** Local models categorize, suggest entries and
-  catch mistakes. Cloud AI is opt-in, and listed names and identifiers are replaced before
-  anything is sent.
-- 🧾 **Built by working through QuickBooks Desktop Enterprise screen by screen**, from account
-  types to the Accountant Center. If your bookkeeper knows QuickBooks, they already know
-  Ironbooks.
-- 💸 **Free. Really.** MIT licensed. No seats, no tiers, no renewal date.
+There are three ways to keep books today. Rent a desktop product that costs more every year.
+Hand your ledger to someone else's cloud. Or own it. **Ironbooks is the third one.**
+
+- 🔒 **Your books. Your disk. Full stop.** The company file is one file you own, like a .QBW. No
+  account, no telemetry, no lock-in. Copy it, back it up, hand it to your accountant.
+- ⚖️ **A ledger that cannot go out of balance.** Not "shouldn't". Cannot. The rules live in the
+  **database itself**, so an unbalanced entry, a hand-edited balance or a change to a posted line
+  is refused at the door, whatever tries it.
+- 🤖 **An AI bookkeeper that never phones home.** Local models categorize, draft entries and
+  catch mistakes on your own hardware. Cloud AI is opt-in, and names and identifiers are swapped
+  out before anything is sent.
+- 🧾 **Your staff already knows how to use it.** Ironbooks was built by working through QuickBooks
+  Desktop Enterprise screen by screen, from account types to the Accountant Center. Day one feels
+  like year ten.
+- 💸 **Free means free.** MIT licensed and open source. Read the code, fork it, ship it.
 
 ## 🆚 At a glance
 
@@ -60,7 +75,30 @@ to rent, no account to create, and nothing leaves your computer unless you switc
 | Multi-user | ✅ | ✅ | ✅ (office network or your tailnet) |
 | Works with no internet at all | ✅ | ❌ | ✅ |
 
+## ☕ A Monday morning in Ironbooks
+
+**8:05** · You open the company file from the office server. The home screen has already lined up
+what needs you: bank lines to categorize, overdue invoices, a bill due this week. One list, most
+urgent first.
+
+**8:07** · You drop last month's bank statement PDF onto the window. Ironbooks reads it, checks
+every row against the statement's opening and closing balances, and only then imports. No bank
+login. No connection to keep alive.
+
+**8:12** · Most lines are already categorized, because Ironbooks learned your payees the last time
+you did this. You accept the high-confidence ones in a single click and glance at the rest.
+
+**8:20** · A client calls. `Ctrl+K`, then type *invoice Acme 3 hours consulting*. The invoice
+opens filled in. You check it, press Enter, done.
+
+**8:31** · The owner asks why profit is down. You click the number, and Ironbooks shows what it is
+made of and **why it changed**.
+
+**8:40** · Month-end: a checklist, a closing date, a PDF report pack. Your coffee is still warm.
+
 ## 🚀 Everything a real set of books needs
+
+Not a starter edition. The whole thing.
 
 <table>
 <tr><td width="50%" valign="top">
@@ -117,77 +155,75 @@ transactions · reminders · calendar · Lead Center · Doc Center · letters & 
 </td></tr>
 </table>
 
-## ✨ Fast where it counts
+## ✨ Built for people who do this all day
 
-**Type it, don't hunt for it**
-- **Ctrl+K command bar that understands plain English.** "invoice Acme 3 hours consulting",
-  "show unpaid bills over 60 days", "what did we spend on fuel in Q3?". Forms open prefilled for
-  you to confirm, and nothing is saved without you.
-- **QuickBooks' keys, all of them.** Ctrl+W Write Checks, Ctrl+I Invoice, Ctrl+J Customer Center,
+**Your hands never leave the keyboard**
+- **Ctrl+K understands plain English.** "invoice Acme 3 hours consulting", "show unpaid bills
+  over 60 days", "what did we spend on fuel in Q3?". Forms open prefilled for you to confirm.
+  Nothing is saved without you.
+- **Every QuickBooks key you know.** Ctrl+W Write Checks, Ctrl+I Invoice, Ctrl+J Customer Center,
   Ctrl+A Chart of Accounts, Ctrl+R Register, Ctrl+F Find, Ctrl+M memorize, Alt+S Save & New, the
   date keys (+ − T W K M H Y R), and lists you drive with arrows and type-ahead. Press `?` to see
-  every shortcut.
-- **Registers on every account.** Type a row, press Enter, and it saves as the right check,
+  them all.
+- **A register on every account.** Type a row, press Enter, and it saves as the right check,
   deposit, transfer, card charge or journal entry. A new payee asks "Customer, Vendor, Employee
-  or Other?" on the spot.
-- **Enter many transactions at once** in a grid, with paste from Excel.
+  or Other?" right there.
+- **Enter many transactions at once** in a grid, with paste straight from Excel.
 
 **It tells you what needs you**
-- **Needs attention home.** One prioritized list: bank lines to categorize, overdue invoices,
-  bills due, reconciliations behind, payroll deposits, flagged errors and stale backups. Fix each
-  one where it is listed.
-- **Errors with Fix buttons.** "Debits are $40 more than credits. Add $40 to line 3?"
-- **Every report number explains itself.** Hover to see what it is made of, click to drill down,
-  and read a one-line summary at the top. **"Why did this number change?"** answers the question
-  every owner asks.
-- **Undo for 30 seconds** after any save, void or delete.
+- **Needs attention.** One prioritized list: bank lines, overdue invoices, bills due,
+  reconciliations behind, payroll deposits, flagged errors, stale backups. Fix each one where it
+  is listed.
+- **Errors that come with a Fix button.** "Debits are $40 more than credits. Add $40 to line 3?"
+- **Numbers that explain themselves.** Hover to see what a figure is made of, click to drill
+  down, and ask **"Why did this number change?"**
+- **Undo for 30 seconds** after any save, void or delete. Everyone needs it once.
 
 **The busywork does itself**
-- **Bank statements without a bank connection.** Import a statement PDF (scans and photos go
-  through offline OCR), an Excel file or a CSV. Every row is checked against the statement's
-  opening and closing balances before anything is imported.
-- **Bank rules that learn.** Categorize the same payee twice and Ironbooks offers a rule.
-  Suggestions show their confidence, and high-confidence ones can be accepted in bulk.
-- **Receipt capture.** Drop a photo or PDF anywhere, or upload it from your phone over your
-  tailnet. Offline OCR fills in the expense.
-- **Smart defaults.** The last account, class, terms and items per vendor or customer, the next
-  check number, the last date you used.
+- **Bank statements with no bank connection.** PDF, scan, phone photo, Excel or CSV. Offline OCR
+  reads it, and every row is proved against the statement's balances before it lands.
+- **Bank rules that learn.** Categorize a payee twice and Ironbooks offers a rule, with its
+  confidence shown.
+- **Receipt capture.** Drop a photo or PDF anywhere, or send it from your phone over your tailnet.
+  The expense fills itself in.
+- **Smart defaults.** The last account, class, terms and items for each vendor and customer, the
+  next check number, the last date you used.
 - **Guided month-end close.** A checklist, then the closing date, then a PDF report pack.
 
-**Details people notice**
-- **Checks on any pre-cut stock.** Voucher, standard 3-per-page or wallet, the check at the top,
-  middle or bottom of the sheet, every field position adjustable.
-- **Light, dark or auto, with your accent color.** A clean look with a themed window and the
-  menus in the title bar. Printed forms always print on white.
-- **Sandbox.** "Try it on a copy" for practice and training. Your real books are never touched.
-- **Backups you can see.** "Last backup 2 hours ago ✓", scheduled versioned backups, a preview
-  before restoring, and a warning after 7 days without one.
+**The details people notice**
+- **Checks on any pre-cut stock.** Voucher, 3-per-page or wallet, check at the top, middle or
+  bottom, every field position adjustable.
+- **Light, dark or auto, in your accent color.** A clean, modern window with the menus in the
+  title bar. Printed forms always print on white.
+- **A sandbox.** "Try it on a copy" for practice and training. Your real books are never touched.
+- **Backups you can see.** "Last backup 2 hours ago ✓", scheduled versions, a preview before
+  restoring, and a nudge after 7 days without one.
 
-## 🗄️ A company file that works like a .QBW
+## 📁 A company file that works like a .QBW
 
-- **One file, wherever you want it.** `ABC Company.ironbooks` on this computer, a USB drive or the
-  office file server. Double-click to open it.
-- **Built for a shared drive.** While someone is in the file it is locked, and anyone else who
+Everything is in one file, and that file behaves the way an office expects.
+
+- **Put it anywhere.** `ABC Company.ironbooks` on this computer, a USB drive or the office file
+  server. Double-click to open.
+- **Made for a shared drive.** While someone is in the file it is locked, and anyone else who
   opens it sees who has it and on which computer. They can **ask to come in**, and the person in
   the file chooses **Let Them In** (multi-user mode, each person with their own user name),
   **Hand It Over** or **Not Now**.
-- **Saved as you go, never half-written.** Every change lands in the company file seconds after
-  you make it, with a new copy swapped in all at once, so a dropped connection or a power cut
-  cannot leave a damaged file. Unsaved work on a computer that crashed is recovered the next time
-  the file opens there.
+- **Saved as you go, never half-written.** Every change lands in the file seconds after you make
+  it, with a new copy swapped in all at once. A dropped connection or a power cut cannot leave a
+  damaged file, and unsaved work on a computer that crashed is recovered the next time it opens.
 - **Passwords belong to the file.** Each person signs in with their own user name and password
-  every time it opens. Users, roles and permissions travel inside the file, so a copy is just as
+  every time. Users, roles and permissions travel inside the file, so a copy is just as
   protected.
-- **A running transaction log** inside the file records every change, tamper-evident, like
-  QuickBooks' TLG.
-- **Easy to share.** Save Copy As, a portable copy (like a .QBM), or an Excel/PDF ledger for your
-  accountant.
-- **Backups that restore in full**, an automatic backup before risky operations, and **Condense
+- **A running transaction log** records every change, tamper-evident, like QuickBooks' TLG.
+- **Easy to hand over.** Save Copy As, a portable copy (like a .QBM), or an Excel/PDF ledger for
+  your accountant.
+- **Backups that restore in full**, an automatic backup before anything risky, and **Condense
   Data** that writes a restorable archive first.
 
 ## 🔄 Switching from QuickBooks
 
-Bring your history with you:
+You are not starting over. Bring your history with you:
 
 1. **Import your General Ledger** from a QuickBooks GL report in **PDF, Excel or CSV**. It
    reconciles to the penny against the trial balance *before* anything is committed.
@@ -196,9 +232,13 @@ Bring your history with you:
 3. **Import open invoices and bills as real documents**, then receive payments and pay bills on
    day one. A/R and A/P still tie to the imported GL.
 
-Want out again? Lists and transactions export to **IIF, CSV and Excel**. No hostage data.
+And if you ever want to leave, the door is open: lists and transactions export to **IIF, CSV and
+Excel**. Software that is confident in itself does not hold your data hostage.
 
 ## 🤖 AI that stays home
+
+Most "AI accounting" means shipping your client's ledger to someone else's servers. Ironbooks
+starts from the other end: the model comes to your books.
 
 | Where the model runs | Default? | What leaves the machine |
 |---|:---:|---|
@@ -220,17 +260,18 @@ Use both and the local model answers first, with ChatGPT taking over when it can
 services (Anthropic, Google Gemini, Groq, OpenRouter, Mistral, xAI, DeepSeek, Azure OpenAI, any
 OpenAI-compatible server) are available with an API key, billed by the service per use.
 
-The AI learns your categorization, suggests journal entries for **your approval**, picks an
-account for a payee it has never seen and says why, and reviews the books for unbalanced,
-duplicate or miscategorized entries. It only ever suggests. [`PRIVACY.md`](./PRIVACY.md) lists
-exactly what can leave the machine and the switch for each.
+What it does for you: learns how you categorize, drafts journal entries for **your approval**,
+picks an account for a payee it has never seen and says why, and reviews the books for
+unbalanced, duplicate or miscategorized entries. **It suggests. You decide.**
+[`PRIVACY.md`](./PRIVACY.md) lists exactly what can leave the machine, and the switch for each.
 
-## 🛡️ Security you never notice
+## 🔐 Security you never notice
 
-Protection that works without prompts, pop-ups or extra passwords:
+The best protection is the kind that never interrupts you. No extra prompts, no extra passwords,
+no pop-ups.
 
 - **Signed by its publisher.** The Windows installer and the app carry the signature of
-  **RealDealCPA.Ai LLC**, issued through Microsoft's signing service, and installed copies accept
+  **RealDealCPA.Ai LLC**, issued through Microsoft's signing service. Installed copies accept
   only updates signed by that same publisher.
 - **Nothing listens to the outside world.** The app talks only to itself on your computer. The
   one exception is multi-user mode, which you turn on, and which serves only your office network
@@ -240,8 +281,8 @@ Protection that works without prompts, pop-ups or extra passwords:
 - **A file password encrypts the whole company file** (AES-256), with a recovery key for the day
   someone forgets.
 - **Saved keys stay yours.** AI keys and the mail password are never stored in plain text.
-- **A company file from someone else is treated as a guest.** Its internet settings stay off on
-  your computer until an Admin there allows them.
+- **A company file from someone else arrives as a guest.** Its internet settings stay off on your
+  computer until an Admin there allows them.
 - **Roles and permissions on everything**, a closing date with its own password, and an audit
   trail of who changed what.
 
@@ -249,9 +290,10 @@ Found a weakness? Please report it privately: [`SECURITY.md`](./SECURITY.md).
 
 ## ⚡ Quick start
 
-**Just want to use it?** [Download the Windows installer](https://github.com/RealDealCPA-VR/Ironbooks/releases/latest)
+**Just want to use it?**
+[Download the Windows installer](https://github.com/RealDealCPA-VR/Ironbooks/releases/latest)
 (`Ironbooks-Setup-x.y.z.exe`, or the portable `Ironbooks-x.y.z.exe` that needs no install). It
-updates itself, and asks before it does. More in [`INSTALL.md`](./INSTALL.md).
+keeps itself up to date, and asks before it does. More in [`INSTALL.md`](./INSTALL.md).
 
 **Build it yourself** (also the route for macOS and Linux today):
 
@@ -268,6 +310,8 @@ More: [`GETTING_STARTED.md`](./GETTING_STARTED.md) · [`DESKTOP.md`](./DESKTOP.m
 
 ## 🧪 Tested like the money matters
 
+Because it does.
+
 ```bash
 npm test          # 850 files · 9,100+ tests: unit, integration, adversarial
 npm run typecheck # tsc --noEmit
@@ -275,7 +319,7 @@ npm run build     # Next standalone production build
 ```
 
 Every feature area was built by a **doer**, attacked by an **independent adversarial tester** and
-signed off by a **reviewer**. The tests check that the trial balance and balance sheet stay
+signed off by a **reviewer**. The tests prove that the trial balance and balance sheet stay
 balanced and each subledger matches its control account after every operation. They also cover
 closing-date rules, permissions, rollback and hostile files. End-to-end tests drive the packaged
 app itself, single-user and multi-user. On a busy machine, run `npx vitest run --maxWorkers=3`.
@@ -287,6 +331,9 @@ Electron shell ──► Next.js 15 (React 19 UI + API routes) ──► lib/ser
  native menus,                                                 posting, documents, reports,          embedded Postgres,
  the company file                                              payroll, import/export, AI            ledger rules as triggers
 ```
+
+<details>
+<summary><strong>Where things live, and how to contribute</strong></summary>
 
 ```
 electron/            Desktop shell (main process + preload bridge)
@@ -301,13 +348,15 @@ drizzle/             Hand-written SQL migrations
 PARITY.md            QuickBooks Desktop Enterprise parity matrix
 ```
 
-### 🤝 Contributing
+**Contributing**
 - Work on `main` and keep branches short-lived.
 - **Never write account balances directly.** Post through `lib/services/posting.ts`; the database
   will reject anything else.
 - Map every new API route in `lib/permissions/routes.ts`. A test fails if you forget.
 - Write migrations by hand as the next `drizzle/00NN_*.sql` plus a `_journal.json` entry. Don't
   run drizzle-kit generate.
+
+</details>
 
 ## 📜 License
 
@@ -354,3 +403,6 @@ what can leave your computer, and the switch for each, is in [`PRIVACY.md`](./PR
 Accounting, tax and payroll features (including tax tables and wage bases) are provided as-is.
 Verify them against current regulations before filing. This is open-source software, not
 professional accounting advice.
+
+QuickBooks is a registered trademark of Intuit Inc. Ironbooks is an independent open-source
+project and is not affiliated with, endorsed by or sponsored by Intuit.
