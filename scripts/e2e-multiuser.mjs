@@ -132,6 +132,10 @@ async function main() {
   assert(holder && Array.isArray(holder.owner.host?.urls) && /^[0-9a-f]{64}$/.test(holder.owner.host?.fingerprint || ''),
     `the lock now says multi-user, with A's office-network address and certificate (${holder?.owner?.host?.urls?.join(', ')})`);
 
+  // B has never joined this file: it shows the host's connection code to check first.
+  const codeChecked = await clickNativeButton(EXE, 'The code matches — Join', 60);
+  assert(codeChecked, "B: shown the host's connection code before joining, and confirms it");
+
   // 4. B is a client of A now (relaunched): sign in as Bob.
   const pageB = await connect(PORT_B, (u) => /^https:\/\/[\d.]+:\d+\//.test(u), 120_000);
   const atLogin = await until(() => pageB.eval(`!!document.getElementById('login-password')`), 60_000);

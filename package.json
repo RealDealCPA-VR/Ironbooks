@@ -85,7 +85,7 @@
     "electronFuses": {
       "runAsNode": true,
       "enableCookieEncryption": true,
-      "enableNodeOptionsEnvironmentVariable": false,
+      "enableNodeOptionsEnvironmentVariable": true,
       "enableNodeCliInspectArguments": false,
       "enableEmbeddedAsarIntegrityValidation": true,
       "onlyLoadAppFromAsar": true,

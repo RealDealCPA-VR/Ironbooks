@@ -20,7 +20,7 @@ describe('4.4: Electron fuses', () => {
     expect(fuses).toEqual({
       runAsNode: true,
       enableCookieEncryption: true,
-      enableNodeOptionsEnvironmentVariable: false,
+      enableNodeOptionsEnvironmentVariable: true,
       enableNodeCliInspectArguments: false,
       enableEmbeddedAsarIntegrityValidation: true,
       onlyLoadAppFromAsar: true,
@@ -40,13 +40,20 @@ describe('4.4: Electron fuses', () => {
     expect(main.match(/ELECTRON_RUN_AS_NODE: '1'/g)?.length).toBeGreaterThanOrEqual(2);
   });
 
-  it('NODE_OPTIONS and --inspect are off: nobody can load code into, or attach a debugger to, the app', () => {
-    // NODE_OPTIONS (--require …) and --inspect / SIGUSR1 are debugging hooks the installed app never
-    // uses. The same fuse also covers NODE_EXTRA_CA_CERTS (Electron's documentation), so the
-    // packaged Ironbooks.exe ignores that one too: an extra certificate authority for a company
-    // network is no longer picked up from it.
-    expect(fuses.enableNodeOptionsEnvironmentVariable).toBe(false);
+  it("--inspect is off; NODE_OPTIONS stays at Electron's default so a company network's certificates keep working", () => {
+    // --inspect / SIGUSR1 are debugging hooks the installed app never uses: off.
+    //
+    // The NODE_OPTIONS fuse is deliberately left ON. Turning it off also makes Ironbooks.exe drop
+    // NODE_EXTRA_CA_CERTS (checked in the packaged app: the server child no longer saw it), which
+    // an office behind its own certificate authority needs for AI and mail. It would add little:
+    // the packaged app's own process only honours a short safe list of NODE_OPTIONS, the server
+    // is never handed NODE_OPTIONS at all (inheritedServerEnv, checked below), and runAsNode has
+    // to stay on anyway.
+    expect(fuses.enableNodeOptionsEnvironmentVariable).toBe(true);
     expect(fuses.enableNodeCliInspectArguments).toBe(false);
+    const { inheritedServerEnv } = require(path.join(root, 'electron', 'localServer.js'));
+    const env = inheritedServerEnv({ NODE_OPTIONS: '--require x', node_options: '--inspect', NODE_EXTRA_CA_CERTS: 'ca.pem', PATH: 'p' }, { packaged: true });
+    expect(env).toEqual({ NODE_EXTRA_CA_CERTS: 'ca.pem', PATH: 'p' });
     for (const f of electronFiles) expect(read(`electron/${f}`), f).not.toMatch(/--inspect|execArgv/);
     // The desktop end-to-end tests drive the packaged app through Chromium's remote debugging
     // switch, which is not a Node inspect argument and keeps working.

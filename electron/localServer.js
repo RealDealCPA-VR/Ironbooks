@@ -111,8 +111,8 @@ const SHELL_ONLY = new Set([
 /**
  * NODE_* settings about reaching the internet through a company network (extra certificate
  * authorities, the system's certificates, a proxy): kept, they are not debugging switches.
- * (The packaged Ironbooks.exe itself ignores NODE_EXTRA_CA_CERTS while its nodeOptions fuse is off:
- * package.json build.electronFuses, test/security4.fuses.test.ts.)
+ * (This is also why the packaged app's nodeOptions fuse stays on: off, Ironbooks.exe would drop
+ * NODE_EXTRA_CA_CERTS itself. package.json build.electronFuses, test/security4.fuses.test.ts.)
  */
 const NODE_KEPT = new Set(['NODE_EXTRA_CA_CERTS', 'NODE_USE_SYSTEM_CA', 'NODE_USE_ENV_PROXY']);
 
