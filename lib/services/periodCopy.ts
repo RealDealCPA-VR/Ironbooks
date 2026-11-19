@@ -843,11 +843,12 @@ export async function createPeriodCopy(ctx: ServiceContext, input: PeriodCopyInp
     fs.rmSync(path.join(work, TRANSACTION_LOG_FILE), { force: true });
     resetTransactionLogCache(work);
 
-    // prefsperms: an auditor / lender copy never carries the file's own secrets (AI keys, mail).
-    // filecrypto: with a password the whole .bkp is encrypted; a protected file's copy carries its
-    // OWN new file key (never this file's), every slot re-wrapped for it — restored, it opens with
-    // the same user names, passwords and recovery key as this file.
-    const out = await createPortableCompanyFile(wctx, { dataDir: work, omitFileSecrets: true, password });
+    // An auditor / lender copy never carries the file's own secrets (AI keys, mail), and of the
+    // client's credentials only what signing in to it needs (security plan 1.3: portableFile.ts
+    // OUTSIDER_VIEWS). filecrypto: with a password the whole .bkp is encrypted; a protected file's
+    // copy carries its OWN new file key (never this file's), the password and recovery slots
+    // re-wrapped for it — restored, it opens with the same user names, passwords and recovery key.
+    const out = await createPortableCompanyFile(wctx, { dataDir: work, outsider: true, password });
     const safe = co.name.replace(/[\\/:*?"<>|\u0000-\u001F]/g, '-').replace(/\s+/g, ' ').trim() || 'Company';
     result = {
       buffer: out.buffer,

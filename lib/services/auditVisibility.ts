@@ -8,6 +8,11 @@
  * is mapped to the permission activity (or area) that owns it — the record kinds notes, to-dos and
  * attachments already use (lib/permissions/recordActivities.ts), plus the kinds only the logs know.
  *
+ *  - Or to someone who may run the reports that already show those records (REPORT_FALLBACK): the
+ *    General Ledger and the sales reports show the invoices, the payroll reports the employees and
+ *    their pay. So the Reports Only role (report rights, no entry rights) reads the audit trail of
+ *    what its reports cover. Kinds about users, roles, sign-in, sessions, file protection and the
+ *    company's security settings have no such report: only their own area (in practice Admins).
  *  - An entry of a kind not listed here (a kind added later, or one an older version wrote) is
  *    shown only to an Admin: fail closed.
  *  - Notes, to-dos, documents and undo records are about another record (their snapshot names
@@ -19,7 +24,7 @@
  */
 import { and, eq, inArray, or, sql, type SQL } from 'drizzle-orm';
 import { auditLogs } from '@/lib/db/schema';
-import { canRef, type AccessRef, type EffectiveAccess } from '@/lib/permissions/model';
+import { canRef, refArea, type AccessRef, type Area, type EffectiveAccess } from '@/lib/permissions/model';
 import { RECORD_ACTIVITY, recordActivity } from '@/lib/permissions/recordActivities';
 
 /**
@@ -171,6 +176,71 @@ export const AUDIT_LINKED_KINDS: Record<string, { unlinked: AccessRef | 'all' | 
   undo: { unlinked: 'none' },
 };
 
+/**
+ * The report categories (lib/permissions/model.ts REPORT_AREAS) that show the records of an entry
+ * area: being allowed to VIEW one of them (the whole category, as the model checks an area) is
+ * enough to read the audit entries of that area's records. By area, then finer by activity (Lists
+ * and Company mix bookkeeping lists with set-up screens) and by kind. An area, activity or kind
+ * with no entry here has no report fallback: users and roles, sign-in, file utilities (backups,
+ * restores, the company file), the company's security settings (AI keys, network, mail server),
+ * documents, letters and form templates, and Time & Mileage (its reports belong to its own area).
+ */
+const AREA_REPORTS: Partial<Record<Area, Area[]>> = {
+  banking: ['reports_financial'],
+  accounting: ['reports_financial'],
+  closing: ['reports_financial'],
+  sales_tax: ['reports_financial'],
+  customers: ['reports_sales'],
+  vendors: ['reports_purchases'],
+  payroll: ['reports_payroll'],
+  inventory: ['reports_inventory'],
+};
+
+const ACTIVITY_REPORTS: Record<string, Area[]> = {
+  'lists.chart_of_accounts': ['reports_financial'],
+  'lists.classes': ['reports_financial'],
+  'lists.locations': ['reports_financial'],
+  'lists.other_lists': ['reports_financial'],
+  'lists.memorized': ['reports_financial'],
+  'lists.fixed_assets': ['reports_financial'],
+  'lists.currencies': ['reports_financial'],
+  'lists.items': ['reports_sales', 'reports_purchases', 'reports_inventory'],
+  'lists.price_levels': ['reports_sales'],
+  'lists.sales_reps': ['reports_sales'],
+  'lists.billing_rates': ['reports_sales'],
+  'lists.uom': ['reports_inventory'],
+  'inventory.item_receipts': ['reports_inventory', 'reports_purchases'],
+  'company.preferences': ['reports_financial'],
+  'company.budgets': ['reports_financial'],
+  // Users & Roles, File Utilities, Time & Mileage, Doc Center, letters, form templates, AI /
+  // network / mail-server settings, document numbers, the company file: none (see above).
+  'lists.doc_center': [],
+  'lists.letters': [],
+  'lists.type_lists': [],
+  'company.templates': [],
+  'company.ai': [],
+  'company.network': [],
+  'company.send_forms': [],
+  'company.company_file': [],
+  'company.doc_numbers': [],
+};
+
+/** Kinds whose report category is not their activity's (Customer & Vendor Types share one). */
+const KIND_REPORTS: Record<string, Area[]> = {
+  customer_type: ['reports_sales'],
+  vendor_type: ['reports_purchases'],
+};
+
+/** The report categories whose view right also shows a kind's audit entries (none: [] ). */
+export function auditReportFallback(entityType: string): Area[] {
+  if (Object.prototype.hasOwnProperty.call(KIND_REPORTS, entityType)) return KIND_REPORTS[entityType];
+  const ref = auditEntityRef(entityType);
+  if (!ref) return [];
+  if (Object.prototype.hasOwnProperty.call(ACTIVITY_REPORTS, ref)) return ACTIVITY_REPORTS[ref];
+  const area = refArea(ref);
+  return (area === 'lists' || area === 'company' ? undefined : AREA_REPORTS[area]) ?? [];
+}
+
 /** Kinds with nothing in them that is anyone's business: the log's own start record. */
 export const AUDIT_OPEN_KINDS = new Set(['transaction_log']);
 
@@ -203,11 +273,16 @@ function linkedKind(v: unknown): string | null {
   return typeof t === 'string' && t ? t : null;
 }
 
-/** A record kind's own visibility (a linked record's kind, or a plain kind). */
+/**
+ * A record kind's own visibility (a linked record's kind, or a plain kind): its entry area, or a
+ * report category that shows its records (auditReportFallback). Unknown kinds: neither.
+ */
 function canSeeKind(access: EffectiveAccess, kind: string): boolean {
   if (AUDIT_OPEN_KINDS.has(kind)) return true;
   const ref = auditEntityRef(kind);
-  return ref !== null && canSeeRef(access, ref);
+  if (ref === null) return false;
+  if (canSeeRef(access, ref)) return true;
+  return auditReportFallback(kind).some((reportArea) => canRef(access, reportArea, 'view'));
 }
 
 /**

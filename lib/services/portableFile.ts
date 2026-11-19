@@ -181,17 +181,37 @@ async function listTables(q: Queryable): Promise<TableInfo[]> {
 }
 
 /**
+ * How a table is written into a file for someone outside the company (OUTSIDER_VIEWS): column
+ * values replaced by SQL expressions (in the column's own output form: text, or JSON for a JSON
+ * column), every row left out (`none`), or the rows read from another source (`from`, whose
+ * columns are qualified by the table's name; `params` for its placeholders).
+ */
+interface DumpView {
+  columns?: Record<string, string>;
+  none?: boolean;
+  from?: string;
+  params?: unknown[];
+}
+
+/**
  * Every row of a table as canonical JSON text, deterministically ordered. Non-JSON columns
  * are rendered with Postgres' own text output (exact for numeric/timestamp/uuid/enum/array).
  */
-async function dumpTable(q: Queryable, table: TableInfo, columnNames?: string[]): Promise<string[]> {
+async function dumpTable(q: Queryable, table: TableInfo, columnNames?: string[], view: DumpView = {}): Promise<string[]> {
+  if (view.none) return [];
   const cols = columnNames
     ? columnNames.map((n) => table.columns.find((c) => c.name === n) ?? { name: n, type: 'text', json: false })
     : table.columns;
   if (!cols.length) return [];
-  const exprs = cols.map((c) => (c.json ? `${qi(c.name)} AS ${qi(c.name)}` : `${qi(c.name)}::text AS ${qi(c.name)}`));
+  const t = qi(table.name);
+  const exprs = cols.map((c) => {
+    const replaced = view.columns?.[c.name];
+    if (replaced) return `${replaced} AS ${qi(c.name)}`;
+    return c.json ? `${t}.${qi(c.name)} AS ${qi(c.name)}` : `${t}.${qi(c.name)}::text AS ${qi(c.name)}`;
+  });
   const res = await q.query<{ r: string }>(
-    `SELECT row_to_json(x)::text AS r FROM (SELECT ${exprs.join(', ')} FROM ${qi(table.name)}) x ORDER BY 1`,
+    `SELECT row_to_json(x)::text AS r FROM (SELECT ${exprs.join(', ')} FROM ${view.from ?? t}) x ORDER BY 1`,
+    view.params ?? [],
   );
   return res.rows.map((row) => row.r);
 }
@@ -292,11 +312,78 @@ export function portableFilename(companyName: string): string {
 }
 
 /**
- * Tables of the company FILE's own secrets (lib/ai/keyVault.ts: the vault secret that seals the AI
- * provider keys and the Send Forms mail password). A file handed to someone outside the company
- * leaves them out (`omitFileSecrets`), so the sealed values in it can't be opened anywhere.
+ * Tables of the company FILE's own secrets (lib/ai/keyVault.ts: the vault secret that sealed the
+ * AI provider keys and the Send Forms mail password before they moved to each computer, and still
+ * does in a file protected with passwords). A file handed to someone outside the company leaves
+ * them out (`omitFileSecrets` / `outsider`), so the sealed values in it can't be opened anywhere.
  */
 export const FILE_SECRET_TABLES = ['file_secrets'] as const;
+
+/** A user who may sign in (fileProtection.ts activeUserIds): an active membership, or an owner with none. */
+const ACTIVE_USER_SQL = `(EXISTS (SELECT 1 FROM "user_companies" uc WHERE uc."user_id" = "users"."id" AND uc."is_active" IS NOT FALSE)
+  OR (NOT EXISTS (SELECT 1 FROM "user_companies" uc WHERE uc."user_id" = "users"."id")
+      AND EXISTS (SELECT 1 FROM "companies" co WHERE co."owner_id" = "users"."id")))`;
+
+/**
+ * What a copy for someone OUTSIDE the company (Accountant's Copy, Period Copy: `outsider`) carries
+ * of the client's credentials (security plan 1.3). The recipient restores it as a new company file
+ * and signs in there with a user name and password FROM THIS FILE (the client gives the accountant
+ * one, usually the External Accountant user), the file password when the file has one, and the
+ * closing date password to change a closed period. So those stay, and only those:
+ *   - kept: active users' password hashes (sign-in), the company-file password and the closing date
+ *     password (inside companies.settings: opening the copy, and the closing date rule that still
+ *     applies in it), the users' names, roles and "must change password" flags;
+ *   - blanked: deactivated users' password hashes (they can't sign in anyway: '' never matches),
+ *     two-factor secrets and recovery codes (two-factor is off for the copy's users: the secret is
+ *     the client's second factor itself), challenge questions and answers, password-reset tokens,
+ *     challenge lockout counters, employees' portal passwords, and the sealed AI provider keys and
+ *     mail password (ciphertext of the client's keys, useless to the recipient);
+ *   - left out: sign-in sessions, phone receipt-upload tokens, earlier password hashes, the file's
+ *     own secrets, and the key slots of this file's key (a copy of a protected file carries its own
+ *     re-wrapped ones instead: createPortableCompanyFile).
+ * The owner's own backups and portable file are not changed by this. Importing the accountant's
+ * changes (.ibcx) never carries users, employees' logins or settings back, so nothing blanked here
+ * can reach the client's file (lib/services/accountantCopy/format.ts).
+ */
+const OUTSIDER_VIEWS: Record<string, DumpView> = {
+  users: {
+    columns: {
+      password_hash: `CASE WHEN ${ACTIVE_USER_SQL} THEN "users"."password_hash" ELSE '' END`,
+      reset_token: 'NULL',
+      reset_expires: 'NULL',
+      totp_secret: 'NULL',
+      totp_enabled: `'false'`,
+      totp_recovery_codes: 'NULL::jsonb',
+      totp_last_step: 'NULL',
+      challenge_question: 'NULL',
+      challenge_answer_hash: 'NULL',
+      challenge_failed_attempts: `'0'`,
+      challenge_lockouts: `'0'`,
+      challenge_locked_until: 'NULL',
+    },
+  },
+  employees: { columns: { portal_password_hash: 'NULL' } },
+  ai_settings: {
+    columns: {
+      providers: `CASE WHEN jsonb_typeof("ai_settings"."providers") = 'array' THEN COALESCE((
+          SELECT jsonb_agg(CASE WHEN jsonb_typeof(e.p) = 'object' AND (e.p -> 'apiKeyEnc') IS NOT NULL
+                                THEN jsonb_set(e.p, '{apiKeyEnc}', 'null'::jsonb) ELSE e.p END ORDER BY e.i)
+            FROM jsonb_array_elements("ai_settings"."providers") WITH ORDINALITY AS e(p, i)), '[]'::jsonb)
+        ELSE "ai_settings"."providers" END`,
+    },
+  },
+  company_email_settings: { columns: { password_enc: 'NULL' } },
+  user_sessions: { none: true },
+  receipt_upload_tokens: { none: true },
+  password_history: { none: true },
+  file_secrets: { none: true },
+  file_key_slots: { none: true },
+};
+
+/** Columns and tables OUTSIDER_VIEWS rewrites (tests check that every one exists). */
+export const OUTSIDER_SCRUBBED = Object.fromEntries(
+  Object.entries(OUTSIDER_VIEWS).map(([table, v]) => [table, v.none ? null : Object.keys(v.columns ?? {})]),
+) as Record<string, string[] | null>;
 
 /**
  * Build `<Company>.bkp` for the company file (data directory) behind `ctx`.
@@ -317,6 +404,12 @@ export async function createPortableCompanyFile(
     carryFileKey?: boolean;
     /** Leave the file's own secret tables out (Accountant's Copy / Period Copy). */
     omitFileSecrets?: boolean;
+    /**
+     * A copy for someone outside the company (Accountant's Copy / Period Copy): only the sign-in
+     * material the recipient needs, nothing else of the client's credentials (OUTSIDER_VIEWS);
+     * implies omitFileSecrets.
+     */
+    outsider?: boolean;
   } = {},
 ): Promise<PortableFileResult> {
   if (opts.password != null) assertFilePassword(opts.password);
@@ -339,13 +432,28 @@ export async function createPortableCompanyFile(
     checksums.push([sha256(data), entry]);
   };
 
+  const outsider = opts.outsider === true;
+  const carryKey = Boolean(opts.password || opts.carryFileKey);
+  // A copy for outsiders of a protected file: its own key and re-wrapped slots are made first, so
+  // the copy's tables hold those slots (and that key check) — never the slots of this file's key.
+  const outsiderKey = outsider && carryKey ? await copyKeyFor(db, dataDir, ctx.userId ?? null, { outsider: true }) : null;
+  const views: Record<string, DumpView> = outsider ? { ...OUTSIDER_VIEWS } : {};
+  if (outsiderKey) {
+    views.file_key_slots = {
+      from: `"file_key_slots" JOIN json_to_recordset($1::json) AS c(id uuid, slot jsonb) ON c.id = "file_key_slots"."id"`,
+      columns: { slot: 'c.slot' },
+      params: [JSON.stringify(outsiderKey.slots.map((s) => ({ id: s.id, slot: s.slot })))],
+    };
+    views.file_protection = { columns: { key_check: '$1::text', previous_key_check: 'NULL' }, params: [outsiderKey.keyCheck] };
+  }
+
   // One snapshot: the PGlite transaction holds the connection, so no other request can
   // commit between table dumps. The ledger + log are read inside the same window.
   const snapshot = await client.transaction(async (tx) => {
     const tables: PortableManifest['tables'] = {};
     for (const t of await listTables(tx)) {
-      const omit = opts.omitFileSecrets === true && (FILE_SECRET_TABLES as readonly string[]).includes(t.name);
-      const lines = omit ? [] : await dumpTable(tx, t);
+      const omit = (opts.omitFileSecrets === true || outsider) && (FILE_SECRET_TABLES as readonly string[]).includes(t.name);
+      const lines = omit ? [] : await dumpTable(tx, t, undefined, views[t.name]);
       const text = lines.join('\n');
       tables[t.name] = { rows: lines.length, columns: t.columns.map((c) => c.name), sha256: sha256(text) };
       add(`data/${t.name}.jsonl`, Buffer.from(text, 'utf8'));
@@ -391,8 +499,8 @@ export async function createPortableCompanyFile(
   // A protected company file: the copy gets its OWN file key, with every slot that opens this
   // file re-wrapped for it (same user names, passwords and recovery key) — carried only inside an
   // encrypted portable / transfer file. This file's own key never leaves it.
-  if (opts.password || opts.carryFileKey) {
-    const carried = await copyKeyFor(db, dataDir, ctx.userId ?? null);
+  if (carryKey) {
+    const carried = outsider ? outsiderKey : await copyKeyFor(db, dataDir, ctx.userId ?? null);
     if (carried) add(PORTABLE_KEY_ENTRY, Buffer.from(JSON.stringify(carried), 'utf8'));
   }
   zip.addFile(

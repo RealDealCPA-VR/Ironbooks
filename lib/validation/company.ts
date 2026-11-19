@@ -177,6 +177,15 @@ export const updateCompanyBodySchema = companySettingsSchema
   });
 export type UpdateCompanyBody = z.infer<typeof updateCompanyBodySchema>;
 
+/**
+ * The closing-date password in force now, given by someone who is not an Admin to move the closing
+ * date earlier, clear it, or change or remove the password (lib/services/company.ts setClosingDate).
+ * Checked there, never stored or logged. Also accepted by the month-end close
+ * (app/api/month-end-close/close/route.ts). No length cap: the password it is checked against
+ * was set through `password` below, which has none either.
+ */
+export const zCurrentClosingPassword = z.string().nullish();
+
 /** PATCH /api/company/closing-date body. */
 export const setClosingDateSchema = z.object({
   closingDate: z
@@ -184,5 +193,6 @@ export const setClosingDateSchema = z.object({
     .regex(/^\d{4}-\d{2}-\d{2}$/, "closingDate must be 'YYYY-MM-DD' or null")
     .nullable(),
   password: z.string().nullish(),
+  currentPassword: zCurrentClosingPassword,
 });
 export type SetClosingDateBody = z.infer<typeof setClosingDateSchema>;

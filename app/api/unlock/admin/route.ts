@@ -17,8 +17,8 @@ import { eq } from 'drizzle-orm';
 import { getDb, sealedMode, withDamagedFileAccess } from '@/lib/db';
 import { users } from '@/lib/db/schema';
 import { UNLOCK_COOKIE, createUnlockToken, verifyPasswordTimed } from '@/lib/auth';
-import { verifyTotp } from '@/lib/totp';
 import { requireFileAdmin } from '@/lib/services/access';
+import { acceptTotpCode } from '@/lib/services/totpCodes';
 import { getFileLockStatus, removeFilePasswordAsFileAdmin } from '@/lib/services/fileLock';
 import { readProtection } from '@/lib/services/fileProtection';
 import { logTransaction } from '@/lib/services/transactionLog';
@@ -76,7 +76,9 @@ async function handlePost(req: NextRequest) {
     }
     if (user.totpEnabled && user.totpSecret) {
       if (!totp) return NextResponse.json({ requires2fa: true });
-      if (!verifyTotp(user.totpSecret, totp, Date.now())) return fail('Invalid authentication code.');
+      // Each code is accepted once (lib/services/totpCodes.ts), as at sign-in: a code seen over
+      // someone's shoulder or read from a request can't be used again within its 90 seconds.
+      if (!(await acceptTotpCode(db, user.id, user.totpSecret, totp))) return fail('Invalid authentication code.');
     }
     try {
       await requireFileAdmin({ db, userId: user.id });

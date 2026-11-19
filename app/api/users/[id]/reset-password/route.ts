@@ -1,7 +1,9 @@
 /**
- * POST /api/users/[id]/reset-password — { password, requireChange?, turnOffTwoFactor? } set a new
- * password for a user (and optionally turn off their two-factor sign-in, for a lost authenticator).
- * Users & Roles 'modify'; a non-Admin cannot reset the password of a user with more access.
+ * POST /api/users/[id]/reset-password — { password, requireChange?, turnOffTwoFactor?, currentPassword? }
+ * set a new password for a user (and optionally turn off their two-factor sign-in, for a lost
+ * authenticator). Users & Roles 'modify'; a non-Admin cannot reset the password of a user with more
+ * access. Resetting your OWN password needs your current one (`currentPassword`), as Change
+ * Password does.
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
@@ -30,6 +32,7 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ id:
     await resetUserPassword(ctx, id, parsed.data.password, {
       requireChange: parsed.data.requireChange,
       turnOffTwoFactor: parsed.data.turnOffTwoFactor,
+      currentPassword: parsed.data.currentPassword,
     });
     return NextResponse.json({ ok: true });
   } catch (err) {

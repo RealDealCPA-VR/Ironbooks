@@ -4,7 +4,9 @@
  *
  * Security:
  *  - API keys are encrypted at rest (lib/ai/keyVault) and are write-only through this
- *    service: `getPublicSettings` returns `hasApiKey`, never the key.
+ *    service: `getPublicSettings` returns `hasApiKey`, never the key. A key belongs to the
+ *    computer it was entered on (each computer that opens the file enters it once), except in a
+ *    company file protected with passwords, where it stays in the (encrypted) file.
  *  - Changing settings or testing a connection requires admin/owner.
  *  - Cloud calls are opt-in per company (`cloudEnabled`, default false) and always redacted
  *    with a company-aware Redactor built from the customer/vendor/employee lists.
@@ -19,7 +21,7 @@ import { AiRouter } from '@/lib/ai/router';
 import { createProvider, localityOf, type ProviderDeps, pullOllamaModel } from '@/lib/ai/providers';
 import { classifyEndpoint } from '@/lib/ai/tailnet';
 import { verifyTailnetUrls } from '@/lib/net/tailnetVerify';
-import { isLegacyBlob, migrateLegacySecrets, openStoredSecret, readVaultSecret, sealForFile } from '@/lib/ai/keyVault';
+import { migrateStoredSecrets, needsMoveHere, openStoredSecret, readVaultSecret, sealStoredSecret } from '@/lib/ai/keyVault';
 import { Redactor, addressEntities, type KnownEntity } from '@/lib/ai/redact';
 import { parseCredentials } from '@/lib/ai/chatgpt';
 import {
@@ -99,8 +101,9 @@ function openKey(p: StoredProviderConfig, companyId: string): string | null {
 
 /**
  * Load the raw settings record (defaults when the company has none yet). It only writes to move
- * keys saved by an older version (encrypted with this computer's own key, which never travels
- * with the company file) to the company file's key — lib/ai/keyVault.ts migrateLegacySecrets.
+ * keys this computer can read to where they belong here (lib/ai/keyVault.ts migrateStoredSecrets):
+ * keys that still travel with the company file move to this computer's own secret, and keys saved
+ * by an older version with this computer's .auth-secret move too.
  */
 // The daily cap and today's count live in companies.settings (no schema change): keys
 // `aiCloudCap` (number) and `aiCloudUsage` ({ day: 'YYYY-MM-DD', calls }), merged one key at a time.
@@ -156,8 +159,8 @@ export async function loadSettings(ctx: ServiceContext): Promise<SettingsRecord>
   if (!row) return { ...DEFAULTS, taskPolicies: { ...DEFAULTS.taskPolicies }, cloudDailyCap: cap };
   const stored = (row.providers as unknown as StoredProviderConfig[]) ?? [];
   if (
-    stored.some((p) => isLegacyBlob(p?.apiKeyEnc)) &&
-    (await migrateLegacySecrets(ctx.db, { companyId: ctx.companyId })) > 0
+    stored.some((p) => needsMoveHere(p?.apiKeyEnc)) &&
+    (await migrateStoredSecrets(ctx.db, { companyId: ctx.companyId })) > 0
   ) {
     [row] = await ctx.db.select().from(aiSettings).where(eq(aiSettings.companyId, ctx.companyId));
   }
@@ -277,6 +280,8 @@ export async function updateSettings(ctx: ServiceContext, input: UpdateSettingsI
   const next: SettingsRecord = { ...current };
   /** New plaintext keys by provider id, sealed inside the transaction below. */
   const newKeys = new Map<string, string>();
+  /** The stored key each new one replaces (null: none for this endpoint). */
+  const replacedKeys = new Map<string, string | null>();
 
   if (body.providers) {
     const byId = new Map(current.providers.map((p) => [p.id, p]));
@@ -293,7 +298,10 @@ export async function updateSettings(ctx: ServiceContext, input: UpdateSettingsI
       if (p.clearApiKey) apiKeyEnc = null;
       if (p.apiKey !== undefined && p.apiKey.trim() !== '') {
         newKeys.set(id, p.apiKey.trim());
-        apiKeyEnc = null; // sealed below with the company file's own key
+        // Sealed below; the key it replaces (same endpoint only) decides whether other computers'
+        // copies are kept (first set-up here) or dropped (a change) — lib/ai/keyVault.ts.
+        replacedKeys.set(id, apiKeyEnc);
+        apiKeyEnc = null;
       }
       if (p.kind === 'chatgpt' && !apiKeyEnc && p.enabled) {
         throw validation(`${p.label}: click "Continue with ChatGPT" to sign in first.`);
@@ -340,13 +348,17 @@ export async function updateSettings(ctx: ServiceContext, input: UpdateSettingsI
   });
 
   await inTransaction(ctx, async (tx) => {
-    // New keys are sealed with the company FILE's own key (lib/ai/keyVault.ts), so they still
-    // work when the file is opened on another computer.
+    // New keys are sealed for this computer (in a file protected with passwords: with the
+    // company file's own key) — lib/ai/keyVault.ts.
     if (newKeys.size) {
       const sealed: StoredProviderConfig[] = [];
       for (const p of next.providers) {
         const plain = newKeys.get(p.id);
-        sealed.push(plain === undefined ? p : { ...p, apiKeyEnc: await sealForFile(tx.db, plain, tx.companyId) });
+        sealed.push(
+          plain === undefined
+            ? p
+            : { ...p, apiKeyEnc: await sealStoredSecret(tx.db, plain, tx.companyId, { entered: replacedKeys.get(p.id) ?? null }) },
+        );
       }
       next.providers = sealed;
     }

@@ -11,7 +11,7 @@ This document lists everything that can leave the machine, and what controls it.
 | What | Leaves the machine? | Controlled by |
 | --- | --- | --- |
 | Company data (books, customers, vendors, payroll, attachments) | **Never stored remotely.** | — |
-| Multi-user hosting | Only to devices on **your** Tailscale tailnet, and only while hosting is on. Starting it asks Tailscale for an HTTPS certificate, which makes this computer's `*.ts.net` name public (see below). | File > Host multi-user access |
+| Multi-user hosting | Only to devices on **your** Tailscale tailnet, or in office-network mode to devices on your private network, and only while hosting is on. Starting tailnet hosting asks Tailscale for an HTTPS certificate, which makes this computer's `*.ts.net` name public (see below). | File > Host multi-user access; File > Switch to Multi-user Mode (office network) |
 | AI (assistant, categorization, AI Review "Analyze") | Model servers on this computer, your LAN or your tailnet by default; a cloud AI provider only if opted in (and then redacted) | AI & Automation (providers) + Privacy & Network → AI assistance |
 | Emailing an invoice | Only the message and PDF you send, to your SMTP server | Privacy & Network → Email |
 | Bank transactions | **Nothing.** Ironbooks never connects to your bank or a feed service; transactions come only from statement files you import. | — |
@@ -23,7 +23,8 @@ This document lists everything that can leave the machine, and what controls it.
 ## Network modes
 
 Each company has a network mode (Settings → **Privacy & Network**). Owners and admins can
-change it; every change is written to the audit trail.
+change it on the computer that holds the company file; every change is written to the audit
+trail.
 
 - **Offline** — the app connects to nothing outside the computer. Email, AI and update checks are
   off. One thing can still happen: if a `*.ts.net` address is saved or used in the app (an AI
@@ -98,17 +99,37 @@ of that cap and the company setting. A value that is set but not recognised coun
 User actions that open your system browser are not data transfers by the app. These are
 **Help → Ironbooks on the web** and the IRS FIRE upload link.
 
-## Multi-user hosting (tailnet only)
+## Multi-user hosting
 
 Like QuickBooks Enterprise, one computer can **host** a company file for up to 40 people logged in
 at once (further sign-ins over the network are refused until someone logs out).
 
 - **File > Host multi-user access** keeps the app server on `127.0.0.1`. It adds a small
-  forwarding service on this computer's **Tailscale address** only (detected with
-  `tailscale ip -4`, or from the network interfaces in `100.64.0.0/10`). The app never listens on
-  every interface (`0.0.0.0`) unless you set `hosting.bindAll` in the app config yourself. Even
-  then, connections from public addresses are refused.
-- Each time hosting starts, the app runs `tailscale cert` to get an HTTPS certificate for the
+  forwarding service on this computer's **Tailscale address** only. An address counts as the
+  Tailscale address only when Tailscale itself reports it (`tailscale status --json`, or
+  `tailscale ip -4`) and it is on one of this computer's network adapters. Some internet providers
+  hand out addresses in Tailscale's range (`100.64.0.0/10`) too, so an address in that range is
+  never taken as Tailscale's on its own. When Tailscale is not installed, stopped or signed out,
+  hosting does not start and says Tailscale is not running.
+- **Office-network mode** (File > Switch to Multi-user Mode, or letting someone on the same network
+  into a company file on a shared drive) also keeps the app server on `127.0.0.1`. The forwarding
+  service listens only on this computer's own network addresses that it shows to teammates, plus
+  its Tailscale address when Tailscale confirms one. It can be reached by devices on your private
+  network that can route to those addresses (another subnet of the office, a VPN between sites);
+  connections from public internet addresses are refused before anything is read. Every teammate
+  still has to sign in, over an HTTPS connection that uses this computer's own certificate, which
+  their Ironbooks recognises by its fingerprint. If the computer's address changes on the same
+  network (Wi-Fi reconnecting, a new address from the router), the service follows it. If the
+  computer moves to a different network, it stops listening on the old address (once the address
+  has been gone for two checks, about 10 to 20 seconds) and does not listen on the new network
+  until multi-user mode is turned off and on again there.
+- The app never listens on every interface (`0.0.0.0`) unless you set `hosting.bindAll` in the app
+  config yourself. Even then, connections from public addresses are refused.
+- The forwarding service answers only to the addresses and names it shares with teammates, so a
+  web page that renames itself to this computer's address is refused. It allows each device 20
+  connections at once (400 in all) and closes a connection that has not finished starting a
+  request within about 10 seconds (the upload that follows, such as a backup, may take longer).
+- Each time tailnet hosting starts, the app runs `tailscale cert` to get an HTTPS certificate for the
   computer's `*.ts.net` name. If HTTPS certificates are turned on for your tailnet, Tailscale
   contacts its own servers and Let's Encrypt to issue it, and the host serves HTTPS. Otherwise
   traffic is plain HTTP inside the tailnet, which Tailscale already encrypts end to end.
@@ -118,11 +139,24 @@ at once (further sign-ins over the network are refused until someone logs out).
   computer's name plus your tailnet's name) is then visible to anyone. Nothing from the company
   file is in it. To avoid this, leave HTTPS certificates turned off for your tailnet in the
   Tailscale admin console, or set `hosting.tls` to `false` in the app config.
-- Every request needs a sign-in with a personal user account. Sign-in is rate-limited per
-  account, per address and overall (attempts still being checked count too), and the
-  company-file password and employee portal sign-in are limited the same way. Failed attempts
-  from other computers never lock out sign-in on the host computer itself. Remote devices cannot use the no-account first-run mode. They
-  cannot create accounts, and they never receive password-reset tokens.
+- Every request needs a sign-in with a personal user account. Sign-in is rate-limited (attempts
+  still being checked count too), and the company-file password and employee portal sign-in are
+  limited the same way. Wrong passwords from one device lock only that device out of that account
+  (5 tries, then a wait that grows from 1 minute to an hour). Wrong passwords for one account from
+  many devices, and from everyone together, slow further tries down (after 30 for one account,
+  one try every 5 minutes; after 50 in all, one a minute) but never lock anyone out for longer.
+  A device that has already signed in to an account is not slowed down by other devices' wrong
+  passwords. Failed attempts from other computers, or from other programs on this computer, never
+  lock out sign-in in Ironbooks on the host computer itself. Remote devices cannot use the
+  no-account first-run mode. They cannot create accounts, and they never receive password-reset
+  tokens.
+- From another computer, even an Admin cannot add an AI server or change its address, turn on
+  cloud AI, test AI connections, download AI models or list the host's tailnet. They cannot set
+  up, change or remove the mail server, or test mail settings they typed, and they cannot change
+  Privacy & Network. These settings decide where the host computer connects, so they are changed
+  on the computer that holds the company file. Others can still see them (passwords and keys stay
+  hidden), switch saved AI on or off and choose its model, and send a test email through the
+  saved mail server.
 - The host is the only computer that writes to the company file. If two people edit the same
   invoice, bill, journal entry, customer, vendor or item, the second save is refused with
   *"This record was changed by … at …. Reload to see the latest."*

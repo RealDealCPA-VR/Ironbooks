@@ -1,7 +1,8 @@
 'use client';
 /**
  * Company > Security: the company file's own passwords (filecrypto: protect the file, who can
- * open it, the recovery key), your challenge question, and two-factor sign-in.
+ * open it, the recovery key) with a line on whether Windows encrypts the drive it is on, your
+ * challenge question, and two-factor sign-in.
  * ?protect=1 (an Admin just signed in to an unprotected file) highlights the protection offer;
  * ?challenge=1 asks for a challenge question. ?next= continues afterwards.
  */
@@ -12,6 +13,7 @@ import { QRCodeSVG } from 'qrcode.react';
 import { Button, Card, Input, Label, PageHeader, Spinner, toast } from '@/components/ui';
 import { ChallengeQuestionCard } from '@/components/ChallengeQuestionCard';
 import { FileProtectionCard } from '@/components/FileProtectionCard';
+import { DriveEncryptionStatus } from '@/components/FileProtection';
 import { ApiError, api } from '@/lib/client';
 // Only same-app paths for ?next= (never an open redirect).
 import { safeNext } from '@/lib/safeNext';
@@ -168,6 +170,7 @@ export default function SecurityPage() {
           highlight={Boolean(protectPrompt)}
           onDone={protectPrompt ? () => (window.location.href = protectPrompt.next) : undefined}
         />
+        <DriveEncryptionStatus />
         {protectPrompt && (
           <p className="mt-2 max-w-xl text-sm">
             <Link href={protectPrompt.next} className="text-electric hover:underline">

@@ -7,7 +7,7 @@
 // The active company file is a local data directory; we set BKA_DATA_DIR before starting the
 // server so lib/db persists there. This keeps all financial data on the user's machine (offline).
 
-const { app, BrowserWindow, Menu, dialog, ipcMain, nativeTheme, shell, session } = require('electron');
+const { app, BrowserWindow, Menu, dialog, ipcMain, nativeTheme, shell, session, safeStorage } = require('electron');
 
 // --- legacy userData location (product rename BookKeeper AI -> Ironbooks) ---
 // Electron derives app.getPath('userData') from the app name: build.productName for packaged
@@ -73,6 +73,7 @@ const fileCrypto = require('./fileCrypto');
 const { pruneLegacyAutoBackups } = require('./legacyBackups');
 const localServer = require('./localServer');
 const saveTypes = require('./saveTypes');
+const deviceVault = require('./deviceVault');
 
 const isDev = !app.isPackaged;
 // Window / taskbar icon. The packaged Windows .exe already embeds build/icon.ico, but dev runs
@@ -218,6 +219,34 @@ async function setLaunchPassCookie() {
     console.error('[launch-pass] could not set the window cookie:', err?.message || err);
     return false;
   }
+}
+
+/**
+ * This Windows account's secret for saved keys of outside services (AI, ChatGPT, mail): kept in
+ * userData wrapped by the operating system (electron/deviceVault.js), unwrapped once per launch
+ * and handed to every server the shell starts in its environment (BKA_DEVICE_VAULT; never on
+ * the command line, never logged). '' when the operating system cannot protect it or anything
+ * fails: the server then keeps the company file's own key, as before. Only after app ready
+ * (safeStorage needs it): every server is started from createWindow or later.
+ */
+let deviceVaultCache = null;
+function deviceVaultSecret() {
+  if (deviceVaultCache === null) {
+    deviceVaultCache = deviceVault.loadOrCreateDeviceSecret({ dir: app.getPath('userData'), safeStorage });
+  }
+  return deviceVaultCache;
+}
+
+/**
+ * This computer's record of the real company file a sandbox copy was made from (config.sandbox,
+ * written by sandbox:entered), for the server opening that copy: a copy made by an earlier version
+ * has no record of its own, and lib/services/sandbox.ts refuses to leave it for a real file on a
+ * network drive without one. '' for anything but the sandbox copy config.sandbox describes.
+ */
+function sandboxRecordFor(dataDir) {
+  const sb = loadConfig().sandbox;
+  if (!sb || typeof sb.dir !== 'string' || typeof sb.realDir !== 'string' || !sb.realDir) return { dir: '', realDir: '' };
+  return samePath(sb.dir, dataDir) ? { dir: sb.dir, realDir: sb.realDir } : { dir: '', realDir: '' };
 }
 
 /** Client mode: no pass of ours on the window, not even one left from an earlier launch. */
@@ -1223,10 +1252,17 @@ function probePinnedHost(origin, pin) {
 }
 
 /** Connect to the computer hosting `filePath` (multi-user mode) and relaunch as its client. */
-/** The short code both computers show for a host certificate (the start of its fingerprint). */
+/**
+ * The code both computers show for a host certificate: the start of its fingerprint, 20 hex
+ * characters (80 bits — far beyond what anyone could match by making certificates until one
+ * fits) in groups of five for reading aloud. The host's Company → Multi-user page shows the same
+ * string (hostingStatus). Pins saved in config.json hold the whole fingerprint, so nothing saved
+ * changes.
+ */
+const CONNECTION_CODE_CHARS = 20;
 function connectionCode(pin) {
-  const hex = String(pin || '').replace(/[^0-9a-f]/gi, '').toUpperCase().slice(0, 12);
-  return hex.match(/.{1,4}/g)?.join('-') || '';
+  const hex = String(pin || '').replace(/[^0-9a-f]/gi, '').toUpperCase().slice(0, CONNECTION_CODE_CHARS);
+  return hex.match(/.{1,5}/g)?.join('-') || '';
 }
 
 /**
@@ -1679,6 +1715,8 @@ async function startNextServer() {
   if (isDev) return 'http://localhost:3000';
 
   const serverEntry = path.join(process.resourcesPath, 'app', 'server.js'); // .next/standalone/server.js
+  const dataDir = activeCompanyDir();
+  const sandboxRecord = sandboxRecordFor(dataDir);
   // On a free port, and checked to be this server before the window or any call with the internal
   // token goes there (startVerifiedServer: another program could take the port first).
   const { port } = await startVerifiedServer('server', (port) => {
@@ -1690,7 +1728,7 @@ async function startNextServer() {
         NODE_ENV: 'production',
         PORT: String(port),
         HOSTNAME: '127.0.0.1',
-        BKA_DATA_DIR: activeCompanyDir(),
+        BKA_DATA_DIR: dataDir,
         // A single company file: the server saves its working copy back to it
         // (lib/services/companyFileSave.ts) and checks this computer still holds its lock.
         BKA_COMPANY_FILE: openFile ? openFile.path : '',
@@ -1711,6 +1749,11 @@ async function startNextServer() {
         // Sandbox mode: where "Try it on a copy" puts copies, and the PDF "SANDBOX" stamp flag.
         BKA_SANDBOX_ROOT: sandboxRoot(),
         BKA_SANDBOX: sandboxActive() ? '1' : '',
+        // This computer's record of where the open sandbox copy came from (lib/services/sandbox.ts).
+        BKA_SANDBOX_DIR: sandboxRecord.dir,
+        BKA_SANDBOX_REAL_DIR: sandboxRecord.realDir,
+        // Saved keys of outside services are sealed for this Windows account (electron/deviceVault.js).
+        BKA_DEVICE_VAULT: deviceVaultSecret(),
         BKA_MIGRATIONS_DIR: migrationsDir(),
         // Offline desktop build: the server is bound to 127.0.0.1 only, so it is safe to
         // surface a password-reset token directly in the local HTTP response.
@@ -2330,6 +2373,10 @@ async function startScratchServer(dataDir) {
           BKA_COMPANY_LOCK: '',
           BKA_COMPANY_LOCK_TOKEN: '',
           BKA_COMPANY_SEALED: '',
+          BKA_SANDBOX_DIR: '',
+          BKA_SANDBOX_REAL_DIR: '',
+          // A restored file's saved keys are moved to this Windows account's secret right away.
+          BKA_DEVICE_VAULT: deviceVaultSecret(),
           BKA_MIGRATIONS_DIR: migrationsDir(),
           BKA_OFFLINE: '1',
           BKA_INTERNAL_TOKEN: internalToken,
@@ -2473,11 +2520,16 @@ async function setHostingNow(enable, { quiet = false, lan = false } = {}) {
     try {
       const upstreamPort = Number(new URL(serverUrl).port);
       const certDir = path.join(app.getPath('userData'), 'tls');
+      // Its private key stays wrapped by Windows on disk (safeStorage) and is unwrapped here, in memory.
       const lanCert = lan
-        ? selfSignedCert.loadOrCreate(certDir, {
-            names: [require('node:os').hostname()],
-            ips: hostingCore.lanIPv4s(require('node:os').networkInterfaces()),
-          })
+        ? selfSignedCert.loadOrCreate(
+            certDir,
+            {
+              names: [require('node:os').hostname()],
+              ips: hostingCore.lanIPv4s(require('node:os').networkInterfaces()),
+            },
+            { protect: safeStorage },
+          )
         : null;
       hostingState = await hosting.startHosting({
         upstreamPort,

@@ -11,6 +11,10 @@
  *    local-then-cloud or cloud-only. Listed names and identifiers are replaced in cloud calls.
  *  - Automation: learned bank-feed auto-apply threshold and LLM second opinions.
  *  - Learned categorizer status + retrain.
+ *  - Used from another computer (multi-user hosting, `hostOnly`): adding an AI, its type and
+ *    server address, connection tests, model downloads, tailnet discovery, ChatGPT sign-in and
+ *    turning cloud AI on are done only on the computer that holds the company file (the server
+ *    refuses them: app/api/ai/settings/route.ts). Those controls are shown read-only.
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
@@ -77,7 +81,12 @@ interface Settings {
   llmSuggestEnabled: boolean;
   /** PUT only: why cloud AI is still blocked by Privacy & Network (offline mode, a machine ceiling). */
   networkNotice?: string | null;
+  /** The page is used from another computer: the host-only controls are read-only. */
+  hostOnly?: boolean;
 }
+
+/** Shown on (and beside) the controls that only the computer holding the company file can use. */
+const HOST_ONLY = 'This can only be changed on the computer that holds the company file.';
 
 /** Privacy & Network's verdict for cloud AI (GET /api/network-policy, purposes[ai].cloud). */
 interface CloudVerdict {
@@ -626,6 +635,9 @@ export default function AiSettingsPage() {
 
   if (!settings) return <PageSkeleton />;
 
+  const hostOnly = !!settings.hostOnly;
+  const hostOnlyTitle = hostOnly ? HOST_ONLY : undefined;
+
   const hasLocal = drafts.some((d) => d.enabled && d.kind !== 'anthropic' && d.kind !== 'chatgpt');
   /** A saved, enabled model on this computer / the local network (the free path is done). */
   const freeAiReady = settings.providers.some((p) => p.enabled && p.locality === 'local');
@@ -653,6 +665,13 @@ export default function AiSettingsPage() {
         }
       />
 
+      {hostOnly && (
+        <p className="mb-6 rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-navy/70" role="note">
+          {HOST_ONLY} That covers adding an AI, its server address, connection tests and turning on cloud AI. You can
+          still switch saved AI on or off, choose its model and change the other settings here.
+        </p>
+      )}
+
       <Card className="p-6 mb-6 bg-navy/[0.03]">
         <p className="text-sm text-navy/80 leading-relaxed">
           <strong>Use the AI you already have.</strong> Sign in with your ChatGPT Plus or Pro plan (no API key, no
@@ -665,7 +684,8 @@ export default function AiSettingsPage() {
           <button
             type="button"
             onClick={connectChatGpt}
-            disabled={!!chatgptAttempt || !!chatgptRow}
+            disabled={hostOnly || !!chatgptAttempt || !!chatgptRow}
+            title={hostOnlyTitle}
             className="flex items-start gap-3 rounded-xl border border-slate-200 bg-white p-4 text-left hover:border-electric hover:bg-electric/5 disabled:cursor-default disabled:hover:border-slate-200 disabled:hover:bg-white focus-visible:ring-2 focus-visible:ring-electric outline-none"
           >
             <Cloud className="mt-0.5 h-5 w-5 shrink-0 text-electric" />
@@ -683,7 +703,8 @@ export default function AiSettingsPage() {
           <button
             type="button"
             onClick={setupFreeAi}
-            disabled={!!freeAiStep || freeAiReady}
+            disabled={hostOnly || !!freeAiStep || freeAiReady}
+            title={hostOnlyTitle}
             className="flex items-start gap-3 rounded-xl border border-slate-200 bg-white p-4 text-left hover:border-electric hover:bg-electric/5 disabled:cursor-default disabled:hover:border-slate-200 disabled:hover:bg-white focus-visible:ring-2 focus-visible:ring-electric outline-none"
           >
             <Cpu className="mt-0.5 h-5 w-5 shrink-0 text-electric" />
@@ -731,10 +752,10 @@ export default function AiSettingsPage() {
             <Cpu className="h-5 w-5 text-electric" /> AI models
           </h2>
           <div className="flex flex-wrap gap-2">
-            <Button variant="secondary" size="sm" onClick={discover} loading={discovering}>
+            <Button variant="secondary" size="sm" onClick={discover} loading={discovering} disabled={hostOnly} title={hostOnlyTitle}>
               <Network className="h-4 w-4" /> Find models on other computers (Tailscale)
             </Button>
-            <Button size="sm" onClick={openPicker}>
+            <Button size="sm" onClick={openPicker} disabled={hostOnly} title={hostOnlyTitle}>
               <Plus className="h-4 w-4" /> Add AI…
             </Button>
           </div>
@@ -889,10 +910,10 @@ export default function AiSettingsPage() {
               Sign in with your ChatGPT plan or add a free model on this computer for smarter help.
             </p>
             <div className="mt-4 flex flex-wrap justify-center gap-2">
-              <Button onClick={connectChatGpt} loading={!!chatgptAttempt}>
+              <Button onClick={connectChatGpt} loading={!!chatgptAttempt} disabled={hostOnly} title={hostOnlyTitle}>
                 <Cloud className="h-4 w-4" /> Continue with ChatGPT
               </Button>
-              <Button variant="secondary" onClick={setupFreeAi} loading={!!freeAiStep}>
+              <Button variant="secondary" onClick={setupFreeAi} loading={!!freeAiStep} disabled={hostOnly} title={hostOnlyTitle}>
                 <Cpu className="h-4 w-4" /> Set up free AI on this computer
               </Button>
             </div>
@@ -910,8 +931,8 @@ export default function AiSettingsPage() {
                       <div className="md:col-span-4">
                         <Label>ChatGPT plan</Label>
                         <div className="text-sm text-navy">
-                          {d.apiKeyUnreadable ? (
-                            'Sign-in unreadable on this computer — sign in again'
+                          {d.apiKeyUnreadable || !d.hasApiKey ? (
+                            'Not signed in on this computer yet — sign in once here'
                           ) : d.account ? (
                             <>
                               Signed in as <strong>{d.account}</strong>
@@ -935,9 +956,11 @@ export default function AiSettingsPage() {
                         ) : (
                           <div className="flex items-center gap-2 text-sm text-navy">
                             <span>{d.model || 'Not chosen'}</span>
-                            <button type="button" className="text-xs text-electric hover:underline" onClick={() => test(d)}>
-                              Change…
-                            </button>
+                            {!hostOnly && (
+                              <button type="button" className="text-xs text-electric hover:underline" onClick={() => test(d)}>
+                                Change…
+                              </button>
+                            )}
                           </div>
                         )}
                       </div>
@@ -946,10 +969,17 @@ export default function AiSettingsPage() {
                           <input type="checkbox" checked={d.enabled} onChange={(e) => patchDraft(d.key, { enabled: e.target.checked })} />
                           Enabled
                         </label>
-                        <Button variant="secondary" size="sm" loading={t === 'running'} onClick={() => test(d)}>
+                        <Button variant="secondary" size="sm" loading={t === 'running'} onClick={() => test(d)} disabled={hostOnly} title={hostOnlyTitle}>
                           Test connection
                         </Button>
-                        <Button size="sm" variant={d.apiKeyUnreadable ? 'primary' : 'secondary'} loading={!!chatgptAttempt} onClick={connectChatGpt}>
+                        <Button
+                          size="sm"
+                          variant={d.apiKeyUnreadable ? 'primary' : 'secondary'}
+                          loading={!!chatgptAttempt}
+                          onClick={connectChatGpt}
+                          disabled={hostOnly}
+                          title={hostOnlyTitle}
+                        >
                           Sign in again
                         </Button>
                         <Button variant="ghost" size="sm" onClick={disconnectChatGpt}>
@@ -973,7 +1003,7 @@ export default function AiSettingsPage() {
                   <div className="grid grid-cols-1 md:grid-cols-12 gap-3 items-end">
                     <div className="md:col-span-3">
                       <Label>Type</Label>
-                      <Select value={d.kind} onChange={(e) => patchDraft(d.key, { kind: e.target.value as Kind })}>
+                      <Select value={d.kind} disabled={hostOnly} title={hostOnlyTitle} onChange={(e) => patchDraft(d.key, { kind: e.target.value as Kind })}>
                         {MANUAL_KINDS.map((k) => (
                           <option key={k} value={k}>
                             {KIND_LABELS[k]}
@@ -989,6 +1019,8 @@ export default function AiSettingsPage() {
                       <Label>{d.kind === 'anthropic' ? 'Base URL (optional)' : 'Server URL'}</Label>
                       <Input
                         value={d.baseUrl}
+                        disabled={hostOnly}
+                        title={hostOnlyTitle}
                         placeholder={
                           d.kind === 'ollama'
                             ? 'http://gpu-box.tail1234.ts.net:11434'
@@ -1027,7 +1059,7 @@ export default function AiSettingsPage() {
                         value={d.apiKey}
                         placeholder={
                           d.apiKeyUnreadable
-                            ? 'Saved key unreadable — re-enter'
+                            ? 'Enter the key once on this computer'
                             : d.hasApiKey && !d.clearApiKey
                               ? '•••••••• saved (type to replace)'
                               : 'Not set'
@@ -1054,7 +1086,7 @@ export default function AiSettingsPage() {
                         <input type="checkbox" checked={d.enabled} onChange={(e) => patchDraft(d.key, { enabled: e.target.checked })} />
                         Enabled
                       </label>
-                      <Button variant="secondary" size="sm" loading={t === 'running'} onClick={() => test(d)}>
+                      <Button variant="secondary" size="sm" loading={t === 'running'} onClick={() => test(d)} disabled={hostOnly} title={hostOnlyTitle}>
                         Test connection
                       </Button>
                       <Button
@@ -1109,7 +1141,15 @@ export default function AiSettingsPage() {
           <Cloud className="h-5 w-5 text-electric" /> Where AI runs
         </h2>
         <label className="flex items-start gap-3 mb-5 cursor-pointer">
-          <input type="checkbox" className="mt-1" checked={cloudEnabled} onChange={(e) => setCloudEnabled(e.target.checked)} />
+          <input
+            type="checkbox"
+            className="mt-1"
+            checked={cloudEnabled}
+            // From another computer cloud AI can be turned off, not on (it also opens Privacy & Network).
+            disabled={hostOnly && !settings.cloudEnabled}
+            title={hostOnly && !settings.cloudEnabled ? HOST_ONLY : undefined}
+            onChange={(e) => setCloudEnabled(e.target.checked)}
+          />
           <span>
             <span className="font-semibold text-navy text-sm">Allow cloud AI for this company</span>
             <span className="block text-xs text-navy/60">

@@ -11,6 +11,9 @@
  *    explains a failure in plain words. Without the set-up right the test goes to your own
  *    address only (My Preferences > Send Forms).
  *  - A mail server on the internet needs the company's opt-in for email (Privacy & Network).
+ *  - Used from another computer (multi-user hosting), the set-up is shown read-only: it is saved
+ *    and tested with typed settings only on the computer that holds the company file
+ *    (lib/net/hostOnly.ts). The saved settings can still be tested.
  */
 import * as React from 'react';
 import Link from 'next/link';
@@ -29,6 +32,8 @@ interface EmailSetupView {
   username: string;
   hasPassword: boolean;
   passwordReadable: boolean;
+  /** Connection security None to a server outside this computer / network that signs in: sends are refused. */
+  insecureConnection?: boolean;
   fromName: string;
   fromEmail: string;
   replyTo: string;
@@ -36,6 +41,8 @@ interface EmailSetupView {
   useSenderAddress: boolean;
   lastTest: { at: string; ok: boolean; message: string } | null;
   environment: { host: string; port: number; from: string } | null;
+  /** Used from another computer: changed only on the computer that holds the company file. */
+  hostOnly?: boolean;
 }
 
 interface TestResult {
@@ -205,7 +212,8 @@ export default function EmailServerSetup({ canEdit = true }: { canEdit?: boolean
     );
   }
 
-  const readOnly = !canEdit || forbidden;
+  const hostOnly = !!view?.hostOnly;
+  const readOnly = !canEdit || forbidden || hostOnly;
   const portNum = Number(draft.port);
   const portOk = Number.isInteger(portNum) && portNum >= 1 && portNum <= 65535;
   const ready = draft.host.trim() !== '' && portOk && draft.fromEmail.trim() !== '';
@@ -238,8 +246,8 @@ export default function EmailServerSetup({ canEdit = true }: { canEdit?: boolean
       </div>
       <p className="mb-5 text-sm text-navy/50">
         Ironbooks emails invoices, estimates, statements, purchase orders and payment reminders through your own
-        email account. The settings are saved in this company file, so they work on every computer that opens it.
-        The password is stored encrypted and is never shown again.
+        email account. The settings are saved in this company file. The password is stored encrypted on the computer
+        where it is typed, so each computer that opens this file needs it typed once. It is never shown again.
       </p>
 
       {forbidden && (
@@ -250,10 +258,25 @@ export default function EmailServerSetup({ canEdit = true }: { canEdit?: boolean
         </p>
       )}
 
+      {hostOnly && !forbidden && (
+        <p className="mb-5 rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-navy/70" role="note">
+          This can only be changed on the computer that holds the company file. You can still send a test email
+          through the saved set-up below.
+        </p>
+      )}
+
       {view && view.hasPassword && !view.passwordReadable && (
         <p className="mb-5 rounded-lg border border-gold/40 bg-gold/10 p-3 text-sm text-navy/80" role="alert">
-          The mail server password was saved in another copy of this company file and cannot be read here (for
-          example, this is an Accountant&apos;s Copy). Type the password again and save.
+          The mail server password is kept on the computer where it was typed. To send email from this computer,
+          type the password once and save.
+        </p>
+      )}
+
+      {view && view.insecureConnection && (
+        <p className="mb-5 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-navy/80" role="alert">
+          Email is not being sent: Connection security is &quot;None&quot;, and {view.host} is not on this computer or
+          your own network, so the mailbox password would cross the internet without encryption. Choose STARTTLS or
+          SSL/TLS below (your email provider&apos;s settings say which), type the password and save.
         </p>
       )}
 

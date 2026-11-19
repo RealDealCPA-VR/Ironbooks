@@ -4,7 +4,10 @@
  *                           and recent outbound activity (host + purpose + verdict only).
  * PUT /api/network-policy — replace the policy. Body: { mode, cloudOptIn: { ai, email,
  *                           'vendor-lookup', updates }, vendorLookupUrl }. Owner/admin only;
- *                           audited.
+ *                           audited. Only from the computer that holds the company file
+ *                           (lib/net/hostOnly.ts): the mode, the cloud opt-ins and the vendor
+ *                           lookup address decide where the host connects. From another
+ *                           computer GET answers canEdit: false and hostOnly: true.
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
@@ -22,6 +25,7 @@ import {
   type OutboundPurpose,
 } from '@/lib/net/policy';
 import { serviceErrorStatus } from '@/lib/routeErrors';
+import { hostOnlyResponse, isRemoteRequest } from '@/lib/net/hostOnly';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -40,11 +44,13 @@ const SAMPLE_CLOUD_URL: Record<OutboundPurpose, string> = {
   updates: 'https://github.com/',
 };
 
-function describe(policy: NetworkPolicy, companyId: string, canEdit: boolean) {
+function describe(policy: NetworkPolicy, companyId: string, canEdit: boolean, hostOnly = false) {
   const ceiling = envModeCeiling();
   return {
     policy,
     canEdit,
+    /** An admin using another computer: the page says these are changed on the host. */
+    hostOnly,
     ceiling: ceiling ?? null,
     effectiveMode: effectiveMode(policy.mode, ceiling),
     purposes: OUTBOUND_PURPOSES.map((p) => ({
@@ -57,10 +63,12 @@ function describe(policy: NetworkPolicy, companyId: string, canEdit: boolean) {
   };
 }
 
-export async function GET() {
+export async function GET(req: NextRequest) {
   try {
     const ctx = await getServerContext();
-    return NextResponse.json(describe(await getNetworkPolicy(ctx), ctx.companyId, isAdminRole(ctx.role)));
+    const remote = isRemoteRequest(req);
+    const admin = isAdminRole(ctx.role);
+    return NextResponse.json(describe(await getNetworkPolicy(ctx), ctx.companyId, admin && !remote, admin && remote));
   } catch (err) {
     return errorResponse(err);
   }
@@ -69,6 +77,7 @@ export async function GET() {
 export async function PUT(req: NextRequest) {
   try {
     const ctx = await getServerContext();
+    if (isRemoteRequest(req)) return hostOnlyResponse();
     const body = await req.json().catch(() => ({}));
     const policy = await setNetworkPolicy(ctx, body);
     return NextResponse.json(describe(policy, ctx.companyId, true));

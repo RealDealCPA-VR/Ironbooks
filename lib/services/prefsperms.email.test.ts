@@ -377,6 +377,7 @@ describe("a copy of the file without its secret (Accountant's Copy)", () => {
     const view = await getEmailSetup(ctx);
     expect(view).toMatchObject({ hasPassword: true, passwordReadable: false, configured: false });
     expect(await isConfigured(ctx)).toBe(false);
-    await expect(resolveMailConfig(ctx)).rejects.toMatchObject({ message: expect.stringMatching(/Enter it again/) });
+    // security plan 1.3: the password is kept on the computer where it was typed — type it once here.
+    await expect(resolveMailConfig(ctx)).rejects.toMatchObject({ message: expect.stringMatching(/type it once/) });
   });
 });

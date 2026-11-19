@@ -451,16 +451,35 @@ export function openDb(dataDir?: string): DbHandle {
       }
     }
     await noteFirstOpenPosition(client, dir);
-    // AI provider keys saved by older versions were encrypted with this computer's .auth-secret,
-    // which never travels with the company file: re-encrypt the ones this computer can still read
-    // with the file's own key (lib/ai/keyVault.ts). After the first-open position on purpose, so
-    // the change is saved to the single company file like any other. Never blocks the open.
+    // Saved keys of outside services (AI providers, ChatGPT, the mail password) belong to the
+    // computer that entered them (lib/ai/keyVault.ts): the ones this computer can read are moved
+    // to its own secret and the file's vault secret is deleted — or, with no such secret or for a
+    // file protected with passwords, legacy keys move to the file's key as before. After the
+    // first-open position on purpose, so the change is saved to the single company file like any
+    // other. Never blocks the open (a failure leaves everything as it was: one transaction).
     if (fs.existsSync(MIGRATIONS_FOLDER) && !opened.damage) {
       try {
-        const { migrateLegacySecrets } = await import('@/lib/ai/keyVault');
-        await migrateLegacySecrets(db, { dataDir: dir });
+        const { MOVED_SECRET_TABLES, migrateStoredSecrets } = await import('@/lib/ai/keyVault');
+        await migrateStoredSecrets(db, {
+          dataDir: dir,
+          // PGlite never vacuums, and the write-ahead log keeps whole copies of changed pages: without
+          // this the old vault secret and blobs stay in the folder (and every copy of it). Rewrite
+          // the tables, then start a new log segment and let the checkpoint delete the old one
+          // (deleted, not recycled: a recycled segment keeps its old bytes). Separate statements:
+          // VACUUM can't run inside the implicit transaction of a multi-statement exec.
+          compact: async () => {
+            await client.exec(`VACUUM FULL ${MOVED_SECRET_TABLES.join(', ')}`);
+            await client.exec('SET wal_recycle = off');
+            try {
+              await client.query('SELECT pg_switch_wal()');
+              await client.exec('CHECKPOINT');
+            } finally {
+              await client.exec('RESET wal_recycle');
+            }
+          },
+        });
       } catch (err) {
-        console.warn('[db] could not move AI keys to the company file key:', (err as Error)?.message ?? err);
+        console.warn('[db] could not move saved keys to this computer:', (err as Error)?.message ?? err);
       }
     }
   })().catch(async (err) => {

@@ -159,7 +159,12 @@ export const bankAccounts = pgTable('bank_accounts', {
   companyId: uuid('company_id').references(() => companies.id).notNull(),
   accountId: uuid('account_id').references(() => accounts.id).notNull(),
   bankName: varchar('bank_name', { length: 255 }).notNull(),
-  accountNumber: text('account_number').notNull(), // Should be encrypted
+  /**
+   * Plain text: not encrypted on its own. Protected by the file password when one is set (the whole
+   * company file is then encrypted) and masked in API responses per role (lib/services/access.ts
+   * accountNumberFor / maskForContext).
+   */
+  accountNumber: text('account_number').notNull(),
   lastReconciledDate: timestamp('last_reconciled_date'),
   lastReconciledBalance: decimal('last_reconciled_balance', { precision: 15, scale: 2 }),
   createdAt: timestamp('created_at').defaultNow().notNull(),
@@ -440,7 +445,12 @@ export const vendors = pgTable('vendors', {
   address: jsonb('address').$type<Record<string, string>>(),
   terms: varchar('terms', { length: 50 }).default('net_30'),
   is1099: boolean('is_1099').notNull().default(false),
-  taxId: text('tax_id'), // encrypted at rest
+  /**
+   * Plain text: not encrypted on its own. Protected by the file password when one is set (the whole
+   * company file is then encrypted) and masked in API responses per role (lib/services/access.ts
+   * taxIdFor / maskForContext).
+   */
+  taxId: text('tax_id'),
   defaultExpenseAccountId: uuid('default_expense_account_id').references(() => accounts.id),
   balance: decimal('balance', { precision: 15, scale: 2 }).notNull().default('0'),
   notes: text('notes'),
@@ -1006,7 +1016,12 @@ export const employees = pgTable('employees', {
   email: varchar('email', { length: 255 }),
   payType: payTypeEnum('pay_type').notNull().default('hourly'),
   payRate: decimal('pay_rate', { precision: 15, scale: 2 }).notNull().default('0'),
-  ssn: text('ssn'), // encrypted at rest
+  /**
+   * Plain text ('123-45-6789', lib/services/payroll.ts): not encrypted on its own. Protected by the
+   * file password when one is set (the whole company file is then encrypted) and masked in API
+   * responses per role (lib/services/access.ts taxIdFor / maskForContext).
+   */
+  ssn: text('ssn'),
   portalPasswordHash: text('portal_password_hash'), // employee self-service login
   /** 0094: raised by portal sign-out, which ends every portal sign-in made before it (lib/auth.ts). */
   portalTokenVersion: integer('portal_token_version').notNull().default(0),

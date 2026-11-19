@@ -193,6 +193,11 @@ export interface MonthEndChecklist {
   version: string | null;
   closingDate: string | null;
   hasClosingPassword: boolean;
+  /**
+   * Setting a new closing-date password or removing it needs the current one: a password is set
+   * and the signed-in user is not an Admin (lib/services/company.ts setClosingDate).
+   */
+  currentPasswordRequired: boolean;
   /** Whether the signed-in user may set the closing date (Closing Date / Periods: modify). */
   canClose: boolean;
   scanRanAt: string | null;
@@ -983,6 +988,7 @@ export async function getMonthEndChecklist(ctx: ServiceContext, periodEndInput: 
     version: row ? row.updatedAt.toISOString() : null,
     closingDate: closing.closingDate,
     hasClosingPassword: closing.hasPassword,
+    currentPasswordRequired: closing.currentPasswordRequired === true,
     canClose: await canSetClosingDate(ctx),
     scanRanAt: row?.scanRanAt ? row.scanRanAt.toISOString() : null,
     steps,
@@ -1130,6 +1136,11 @@ export interface CloseMonthInput {
    * null or '' removes it, undefined keeps the current one.
    */
   password?: string | null;
+  /**
+   * The closing-date password in force now: needed from someone who is not an Admin to set a new
+   * one or remove it (passed to setClosingDate, which checks it; never stored or logged).
+   */
+  currentPassword?: string | null;
   version?: string | null;
 }
 
@@ -1199,7 +1210,7 @@ export async function closeMonth(ctx: ServiceContext, input: CloseMonthInput): P
         { outstanding: stillOpen.map((st) => st.key) },
       );
     }
-    const s = await setClosingDate(tx, { closingDate: periodEnd, password: input.password });
+    const s = await setClosingDate(tx, { closingDate: periodEnd, password: input.password, currentPassword: input.currentPassword });
     const saved = await saveRow(tx, periodEnd, row, { status: 'closed', closedAt: new Date(), closedBy: tx.userId });
     await writeAudit(tx, {
       action: row ? 'update' : 'create',

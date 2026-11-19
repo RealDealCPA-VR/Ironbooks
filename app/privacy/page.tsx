@@ -38,6 +38,8 @@ interface LogEntry {
 interface PolicyResponse {
   policy: { mode: Mode; cloudOptIn: Record<Purpose, boolean>; vendorLookupUrl: string | null };
   canEdit: boolean;
+  /** An admin using the company from another computer: changed only on the host computer. */
+  hostOnly?: boolean;
   ceiling: Mode | null;
   effectiveMode: Mode;
   purposes: PurposeRow[];
@@ -150,7 +152,10 @@ export default function PrivacyNetworkPage() {
         <p className="text-sm text-navy/60 mt-1">
           Ironbooks keeps the company file on this machine and never stores client data in the
           cloud. These settings decide whether the app may connect to anything else, and for what.
-          {readOnly && ' Only an owner or admin can change them.'}
+          {readOnly &&
+            (data.hostOnly
+              ? ' They can only be changed on the computer that holds the company file.'
+              : ' Only an owner or admin can change them.')}
         </p>
         {data.ceiling && (
           <p className="text-sm mt-3 rounded-lg bg-gold/15 text-yellow-900 px-3 py-2">

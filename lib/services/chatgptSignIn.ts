@@ -8,7 +8,7 @@
  *     the page opens in the person's own browser. Ironbooks never sees their password.
  *  2. OpenAI redirects the browser to the listener with a one-time code (state-checked); the
  *     code is traded for credentials, the "use my plan" permission is confirmed, and a ChatGPT
- *     provider is saved — credentials sealed with the company file's key (lib/ai/keyVault), the
+ *     provider is saved — credentials sealed for this computer (lib/ai/keyVault), the
  *     model set to the plan's first listed model, cloud AI turned on for this company, and
  *     "local only" tasks moved to "local first, then cloud" so a local model still goes first.
  *  3. The page polls status() until the attempt is done.
@@ -21,7 +21,7 @@ import http from 'node:http';
 import { eq, sql } from 'drizzle-orm';
 import { aiSettings, companies } from '@/lib/db/schema';
 import { policyFetch } from '@/lib/net/guard';
-import { openStoredSecret, readVaultSecret, sealForFile } from '@/lib/ai/keyVault';
+import { openStoredSecret, readVaultSecret, sealStoredSecret } from '@/lib/ai/keyVault';
 import {
   CHATGPT_CALLBACK_PATH,
   CHATGPT_CALLBACK_PORT,
@@ -111,7 +111,9 @@ export async function saveChatGptConnection(ctx: ServiceContext, creds: ChatGptC
     const current = await loadSettings(tx);
     const existing = current.providers.find((p) => p.kind === 'chatgpt');
     const id = existing?.id ?? crypto.randomUUID();
-    const sealed = await sealForFile(tx.db, JSON.stringify(creds), tx.companyId);
+    // A fresh sign-in: a change where this computer was signed in (other computers sign in
+    // again), this computer's own sign-in beside theirs where it was not (lib/ai/keyVault.ts).
+    const sealed = await sealStoredSecret(tx.db, JSON.stringify(creds), tx.companyId, { entered: existing?.apiKeyEnc ?? null });
     const entry: StoredProviderConfig = {
       id,
       kind: 'chatgpt',
@@ -152,7 +154,9 @@ export async function saveChatGptConnection(ctx: ServiceContext, creds: ChatGptC
 /**
  * Save rotated credentials for an existing ChatGPT provider (token refresh). No audit entry. In
  * one transaction, and only over the SAME connection with older tokens: a disconnect, or a
- * reconnect to another account, is never undone by a refresh that was already in flight.
+ * reconnect to another account, is never undone by a refresh that was already in flight. Only
+ * this computer's own sign-in changes: another computer sharing the company file keeps its own
+ * token chain (lib/ai/keyVault.ts "refreshed").
  */
 export async function persistChatGptCredentials(ctx: Pick<ServiceContext, 'db' | 'companyId'>, providerId: string, creds: ChatGptCredentials): Promise<void> {
   await ctx.db.transaction(async (txRaw) => {
@@ -164,7 +168,7 @@ export async function persistChatGptCredentials(ctx: Pick<ServiceContext, 'db' |
     if (!p) return;
     const cur = p.apiKeyEnc ? parseCredentials(openStoredSecret(p.apiKeyEnc, ctx.companyId, await readVaultSecret(tx))) : null;
     if (cur && (cur.clientId !== creds.clientId || cur.subject !== creds.subject || cur.expiresAt >= creds.expiresAt)) return;
-    const sealed = await sealForFile(tx, JSON.stringify(creds), ctx.companyId);
+    const sealed = await sealStoredSecret(tx, JSON.stringify(creds), ctx.companyId, { refreshed: p.apiKeyEnc ?? null });
     const next = providers.map((x) => (x.id === providerId ? { ...x, apiKeyEnc: sealed } : x));
     await tx.update(aiSettings).set({ providers: next as unknown as Record<string, unknown>[] }).where(eq(aiSettings.id, row.id));
   });

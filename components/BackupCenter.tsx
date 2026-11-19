@@ -45,6 +45,8 @@ interface BackupsResponse {
   /** The folder set in the company file was chosen on another computer: not used here until confirmed. */
   folderIgnoredHere?: boolean;
   canManage: boolean;
+  /** Used from another computer: the folder can only be changed on the computer that holds the file. */
+  remote?: boolean;
   status: BackupStatusDto;
   history: BackupHistoryRow[];
 }
@@ -124,7 +126,8 @@ export function BackupCenter({ onPreviewVersion }: { onPreviewVersion: (row: Bac
         schedule: form.schedule,
         everyHours: Number(form.everyHours),
         keep: Number(form.keep),
-        ...(folderEdited ? { folder: form.folder.trim() || null } : {}),
+        // From another computer the folder is never sent: the server refuses a change from there.
+        ...(folderEdited && !data?.remote ? { folder: form.folder.trim() || null } : {}),
       });
       toast('Automatic backup settings saved.', 'success');
       notifyBackupChanged();
@@ -137,7 +140,7 @@ export function BackupCenter({ onPreviewVersion }: { onPreviewVersion: (row: Bac
 
   /** Use the folder set in the company file on this computer too (the person confirms it here). */
   async function useFolderHere() {
-    if (!data?.settings.folder) return;
+    if (!data?.settings.folder || data.remote) return;
     setSaving(true);
     try {
       await api.put('/api/backups', { folder: data.settings.folder });
@@ -258,33 +261,46 @@ export function BackupCenter({ onPreviewVersion }: { onPreviewVersion: (row: Bac
               />
             </div>
           </div>
-          <div>
-            <Label htmlFor="backup-folder">Backup folder (leave empty for the usual folder)</Label>
-            <Input
-              id="backup-folder"
-              value={form.folder}
-              placeholder={data?.defaultFolder ?? ''}
-              onChange={(e) => {
-                setFolderEdited(true);
-                setForm((f) => ({ ...f, folder: e.target.value }));
-              }}
-              aria-describedby="backup-folder-hint"
-            />
-            {data?.folderIgnoredHere && !folderEdited && (
-              <div role="status" className="mt-2 rounded-md border border-amber-200 bg-amber-50 p-2 text-xs text-amber-900">
-                <p>
-                  This folder was chosen on another computer, so backups made on this computer go to{' '}
-                  <span className="font-mono break-all">{data.folder}</span> instead. Use it here too only if you know it.
-                </p>
-                <Button type="button" variant="secondary" className="mt-2" onClick={useFolderHere} loading={saving}>
-                  Use this folder on this computer
-                </Button>
-              </div>
-            )}
-            <p id="backup-folder-hint" className="mt-1 text-xs text-navy/50">
-              Tip: choose a folder on a different drive or a synced folder so a copy survives if this computer fails.
-            </p>
-          </div>
+          {data?.remote ? (
+            // Used from another computer: the folder decides where the computer that holds the file
+            // writes its backups, so it is shown here but can only be changed there (PUT /api/backups
+            // refuses it). Schedule and versions kept still save from here.
+            <div>
+              <p className="text-sm font-medium text-navy">Backup folder</p>
+              {data.folder && <p className="mt-1 text-sm font-mono text-navy/70 break-all">{data.folder}</p>}
+              <p className="mt-1 text-xs text-navy/50">
+                The backup folder can only be changed on the computer that holds the company file.
+              </p>
+            </div>
+          ) : (
+            <div>
+              <Label htmlFor="backup-folder">Backup folder (leave empty for the usual folder)</Label>
+              <Input
+                id="backup-folder"
+                value={form.folder}
+                placeholder={data?.defaultFolder ?? ''}
+                onChange={(e) => {
+                  setFolderEdited(true);
+                  setForm((f) => ({ ...f, folder: e.target.value }));
+                }}
+                aria-describedby="backup-folder-hint"
+              />
+              {data?.folderIgnoredHere && !folderEdited && (
+                <div role="status" className="mt-2 rounded-md border border-amber-200 bg-amber-50 p-2 text-xs text-amber-900">
+                  <p>
+                    This folder was chosen on another computer, so backups made on this computer go to{' '}
+                    <span className="font-mono break-all">{data.folder}</span> instead. Use it here too only if you know it.
+                  </p>
+                  <Button type="button" variant="secondary" className="mt-2" onClick={useFolderHere} loading={saving}>
+                    Use this folder on this computer
+                  </Button>
+                </div>
+              )}
+              <p id="backup-folder-hint" className="mt-1 text-xs text-navy/50">
+                Tip: choose a folder on a different drive or a synced folder so a copy survives if this computer fails.
+              </p>
+            </div>
+          )}
           <div>
             <Button type="submit" variant="secondary" loading={saving}>
               Save settings

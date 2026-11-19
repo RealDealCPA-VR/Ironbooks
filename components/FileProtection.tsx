@@ -7,12 +7,14 @@
  *  - FilePasswordFields: "Protect this file with a password" (on by default) for portable company
  *    files (.bkp) and Accountant's Copy transfer files (.ibac);
  *  - CredentialsModal: the user name + password (or recovery key) of the company file a protected
- *    backup was made from, asked when the server says it needs them.
+ *    backup was made from, asked when the server says it needs them;
+ *  - DriveEncryptionStatus: Company > Security's line about Windows drive encryption.
  * Every control is a native form element: keyboard operable, labelled, Enter submits.
  */
 import * as React from 'react';
 import { Download, KeyRound, Printer, ShieldCheck } from 'lucide-react';
 import { Button, Input, Label, Modal } from '@/components/ui';
+import { driveEncryptionLine, type DeviceSecurityDto } from '@/lib/deviceSecurityText';
 
 /** The shortest password a portable or transfer file may be given (lib/services/portableFile.ts). */
 export const MIN_FILE_PASSWORD = 8;
@@ -175,6 +177,28 @@ export function useFileIsProtected(): boolean {
     };
   }, []);
   return isProtected;
+}
+
+/**
+ * Company > Security: one quiet, read-only line saying whether Windows encrypts the drive that
+ * holds the company file (lib/deviceSecurityText.ts). Asked for on its own after the page has
+ * rendered, so it never holds the page up; nothing is shown until there is a sure answer, and
+ * nothing at all on another computer, off Windows, or when the state can't be told.
+ */
+export function DriveEncryptionStatus() {
+  const [line, setLine] = React.useState<string | null>(null);
+  React.useEffect(() => {
+    let alive = true;
+    fetch('/api/device-security', { cache: 'no-store' })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((s: DeviceSecurityDto | null) => alive && setLine(driveEncryptionLine(s)))
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, []);
+  if (!line) return null;
+  return <p className="mt-3 max-w-xl text-sm text-navy/60">{line}</p>;
 }
 
 /**

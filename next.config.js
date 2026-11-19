@@ -78,6 +78,10 @@ const nextConfig = {
   },
   // No "X-Powered-By: Next.js" fingerprint on a server that may be shared on the tailnet.
   poweredByHeader: false,
+  // No image optimizer: /_next/image answers 404 instead of fetching the image it is asked for
+  // with a request of its own, which carries none of the caller's headers (so the server could
+  // not tell where it came from). The app does not use next/image; plain <img> is unaffected.
+  images: { unoptimized: true },
   async headers() {
     return [{ source: '/:path*', headers: securityHeaders }]
   },

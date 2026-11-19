@@ -423,6 +423,15 @@ export async function refreshSlotAtSignIn(db: DB, user: { id: string; passwordHa
 }
 
 /**
+ * The slots one sign-in tries, at most fileCrypto.MAX_SLOT_TRIES (each costs up to seconds of
+ * scrypt; this file keeps one password and one challenge slot per user): a database listing
+ * hundreds of slots for one user must not hang the sign-in — the same cap as the company file's
+ * own slot list (electron/fileCrypto.js unlockWith).
+ */
+const slotsToTry = <T extends { slot: unknown }>(rows: T[]): T[] =>
+  rows.filter((r) => fileCrypto.wellFormedSlot(r.slot)).slice(0, fileCrypto.MAX_SLOT_TRIES);
+
+/**
  * Sign-in to a protected database whose file key is not in memory yet (the working copy that was
  * already on this computer; a sandbox or training copy): unwrap it from the user's own slot.
  * Returns true when the key is now known.
@@ -432,7 +441,9 @@ export async function loadKeyFromPassword(db: DB, dataDir: string, userId: strin
   if (!prot) return false;
   const have = fileKeyFor(dataDir);
   if (have && fileCrypto.keyCheckOf(have) === prot.keyCheck) return true;
-  const rows = await db.select({ slot: fileKeySlots.slot }).from(fileKeySlots).where(and(eq(fileKeySlots.kind, 'password'), eq(fileKeySlots.userId, userId)));
+  const rows = slotsToTry(
+    await db.select({ slot: fileKeySlots.slot }).from(fileKeySlots).where(and(eq(fileKeySlots.kind, 'password'), eq(fileKeySlots.userId, userId))),
+  );
   if (!rows.length) {
     await fileCrypto.burnKdf(password);
     return false;
@@ -452,7 +463,9 @@ export async function loadKeyFromPassword(db: DB, dataDir: string, userId: strin
 export async function loadKeyFromChallenge(db: DB, dataDir: string, userId: string, answer: string): Promise<boolean> {
   const prot = await readProtection(db);
   if (!prot) return false;
-  const rows = await db.select({ slot: fileKeySlots.slot }).from(fileKeySlots).where(and(eq(fileKeySlots.kind, 'challenge'), eq(fileKeySlots.userId, userId)));
+  const rows = slotsToTry(
+    await db.select({ slot: fileKeySlots.slot }).from(fileKeySlots).where(and(eq(fileKeySlots.kind, 'challenge'), eq(fileKeySlots.userId, userId))),
+  );
   for (const r of rows) {
     const key = await fileCrypto.openSlot(r.slot, normalizeChallengeAnswer(answer));
     if (key && fileCrypto.keyCheckOf(key) === prot.keyCheck) {
@@ -834,8 +847,20 @@ export async function changeFileKey(ctx: { db: DB; userId: string | null }, inpu
  * copy opens with the same user names, passwords and recovery key, while the copy (and whoever
  * holds its password) never learns this file's key. `userId` (who makes the copy) must keep
  * opening it. Null for a file without passwords.
+ *
+ * `outsider` (Accountant's Copy, Period Copy): only what the copy needs to be opened — the users'
+ * password slots (the accountant or auditor signs in with a user name and password from this file)
+ * and the recovery slot (a random key nobody can guess; the client can still open the copy with
+ * it). Challenge-answer slots are left out: an answer is short enough to be guessed offline from
+ * a slot, which would hand whoever holds the copy the answer to this file's "I forgot my password"
+ * question (the copy's users have their questions cleared too: portableFile.ts).
  */
-export async function copyKeyFor(db: DB, dataDir: string, userId: string | null): Promise<CarriedCopyKey | null> {
+export async function copyKeyFor(
+  db: DB,
+  dataDir: string,
+  userId: string | null,
+  opts: { outsider?: boolean } = {},
+): Promise<CarriedCopyKey | null> {
   // One consistent read (a key change can't land between the protection record and the slots).
   const snap = await db.transaction(async (txRaw) => {
     const tx = txRaw as unknown as DB;
@@ -852,6 +877,7 @@ export async function copyKeyFor(db: DB, dataDir: string, userId: string | null)
   let mine = false;
   for (const r of snap.rows) {
     if (healthOf(r, active) !== 'ok') continue;
+    if (opts.outsider && r.kind === 'challenge') continue;
     const re = fileCrypto.rewrapSlot(r.slot, key, next);
     if (!re) continue;
     slots.push({ id: r.id, slot: re });

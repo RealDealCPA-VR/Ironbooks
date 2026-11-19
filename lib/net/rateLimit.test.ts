@@ -43,11 +43,16 @@ describe('LoginRateLimiter', () => {
     expect(lockOnce()).toBeLessThanOrEqual(40_000); // capped
   });
 
-  it('an account stays locked even when the attacker changes address', () => {
-    const rl = new LoginRateLimiter(opts);
-    const w = { 'login:global': 10 };
-    for (let i = 0; i < 3; i++) rl.recordFailure(attemptKeys('login', 'Boss@Co.com', `100.64.0.${i}`), i, w);
-    expect(rl.check(attemptKeys('login', 'boss@co.com', '100.64.9.9'), 10).allowed).toBe(false);
+  // Was: "an account stays locked even when the attacker changes address" — a hard lock any device
+  // could put on a teammate's account (security plan 3.4). Changing address still does not give
+  // unlimited guesses: past a burst, every address together is slowed to one guess per interval.
+  it('an attacker who changes address is slowed per account, not given unlimited guesses', () => {
+    const rl = new LoginRateLimiter({ ...opts, accountThrottle: { burst: 4, intervalMs: 30_000 }, globalThrottle: { burst: 100, intervalMs: 1_000 } });
+    for (let i = 0; i < 4; i++) rl.recordFailure(attemptKeys('login', 'Boss@Co.com', `100.64.0.${i}`), i);
+    const v = rl.check(attemptKeys('login', 'boss@co.com', '100.64.9.9'), 10);
+    expect(v.allowed).toBe(false);
+    expect(v.retryAfterMs).toBeLessThanOrEqual(30_000); // a short wait, never an hour
+    expect(rl.check(attemptKeys('login', 'boss@co.com', '100.64.9.9'), 30_010).allowed).toBe(true);
     // A different account from a fresh address is unaffected.
     expect(rl.check(attemptKeys('login', 'clerk@co.com', '100.64.9.9'), 10).allowed).toBe(true);
   });
@@ -90,8 +95,10 @@ describe('LoginRateLimiter', () => {
 
   it('network peers cannot lock out sign-in on the host machine itself', () => {
     const rl = new LoginRateLimiter(opts);
-    for (let i = 0; i < 5; i++) rl.recordFailure(attemptKeys('login', 'owner@co.com', `100.64.1.${i}`), i, {});
-    expect(rl.check(attemptKeys('login', 'owner@co.com', '100.64.9.9'), 10).allowed).toBe(false);
+    // Was: five failures from five addresses locked the account for every network device; now
+    // each device locks only itself (3 here), and the host is never affected.
+    for (let i = 0; i < 5; i++) for (let j = 0; j < 3; j++) rl.recordFailure(attemptKeys('login', 'owner@co.com', `100.64.1.${i}`), i, {});
+    expect(rl.check(attemptKeys('login', 'owner@co.com', '100.64.1.0'), 10).allowed).toBe(false);
     expect(rl.check(attemptKeys('login', 'owner@co.com', 'local'), 10).allowed).toBe(true);
   });
 

@@ -86,6 +86,9 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/unlock': kind('public', 'POST'),
   '/api/unlock/admin': kind('public', 'POST'), // forgotten file password: a file Admin's own sign-in removes it (unencrypted files, local only)
   '/api/file-lock': { GET: 'member', ...r('users', 'POST:modify') },
+  // Company > Security: whether Windows encrypts the drive holding the file (a yes / no / don't
+  // know, nothing from the books; 'unknown' for another computer).
+  '/api/device-security': kind('member', 'GET'),
   '/api/portal/login': kind('public', 'POST'),
   '/api/portal/logout': kind('public', 'POST'),
   '/api/portal/me': kind('self', 'GET'),

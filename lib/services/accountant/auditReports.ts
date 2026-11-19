@@ -8,12 +8,18 @@
  *  - Voided/Deleted Transactions Summary & Detail (J12): every void / delete of a transaction from
  *    the audit trail, who did it and when, with the document number/date/amount and (detail) the
  *    original values.
+ *
+ * Both read the audit trail, whose snapshots can hold what the reader may not see (a paycheck's
+ * pay and deductions, for someone with no payroll access): the rows they show follow the Audit
+ * Trail's rule (lib/services/auditVisibility.ts), so each entry is shown only to someone who may
+ * view the record it is about. Admins see everything, as before.
  */
 import { and, asc, desc, eq, gte, inArray, lt, lte, or, sql } from 'drizzle-orm';
 import { accounts, auditLogs, classes, companies, journalEntries, journalEntryLines, users } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import type { ServiceContext } from '../_base';
 import { maskForContext } from '../access';
+import { auditVisibilitySql } from '../auditVisibility';
 import { companyDayBound } from '../preferences';
 import { resolveEntityNames } from '../journal';
 
@@ -330,6 +336,9 @@ export async function closingDateExceptionReport(
   const conds = [eq(auditLogs.companyId, ctx.companyId), eq(auditLogs.entityType, 'closing_date_exception')];
   if (range.from) conds.push(gte(auditLogs.createdAt, range.from));
   if (range.to) conds.push(lte(auditLogs.createdAt, range.to));
+  // Only the exceptions this person may read in the Audit Trail (Closing Date: view).
+  const visible = auditVisibilitySql(ctx.access);
+  if (visible) conds.push(visible);
   const logs = await ctx.db
     .select({ id: auditLogs.id, entityId: auditLogs.entityId, newValues: auditLogs.newValues, createdAt: auditLogs.createdAt, user: users.name })
     .from(auditLogs)
@@ -363,6 +372,11 @@ export async function closingDateExceptionReport(
   //    again) is not an exception;
   //  - one imported while January was closed stays one after February is closed and reopened;
   //  - a save that kept the same date (a password change) changes nothing.
+  // The company audit rows read here are not filtered by who may see them: only their closing
+  // date is used, which this report shows anyway, and leaving some out would put entries in the
+  // wrong closed period. The same goes for the journal-entry rows exceptionGroups reads (a General
+  // Journal edit's replacement and the accounts a reclassify changed: nothing the entry's own lines
+  // on this report do not show).
   if (cd) {
     const setLogs = await ctx.db
       .select({ createdAt: auditLogs.createdAt, newValues: auditLogs.newValues })
@@ -569,6 +583,11 @@ export async function voidedDeletedTransactions(
   ];
   if (opts.from) conds.push(gte(auditLogs.createdAt, opts.from));
   if (opts.to) conds.push(lte(auditLogs.createdAt, opts.to));
+  // Only voids and deletes of records this person may view (a paycheck needs payroll access): the
+  // number, name, amount and original values all come from the audit row. Filtered in SQL, so the
+  // row limit and count agree with what is shown.
+  const visible = auditVisibilitySql(ctx.access);
+  if (visible) conds.push(visible);
   const fetched = await ctx.db
     .select({
       id: auditLogs.id,

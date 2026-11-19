@@ -218,29 +218,43 @@ describe('electron/security.js — renderer filtering', () => {
 });
 
 describe('login rate limiter — keying', () => {
+  // Network sign-ins lock per account AND address (security plan 3.4): the tests below used to
+  // spread failures over several addresses and expect the account locked for everyone; the
+  // shared account and overall limits are throttles now (lib/net/security3.rateLimit.test.ts).
   it('email case / whitespace variants share one account bucket', () => {
-    const l = new LoginRateLimiter({ maxFailures: 3, windowMs: 60_000, lockoutMs: 60_000, maxLockoutMs: 60_000 });
+    const l = new LoginRateLimiter({ maxFailures: 3, windowMs: 60_000, lockoutMs: 60_000, maxLockoutMs: 60_000, accountThrottle: { burst: 3, intervalMs: 60_000 } });
     const t = 1_000_000;
     l.recordFailure(attemptKeys('login', 'Boss@Firm.com', '100.64.0.2'), t);
-    l.recordFailure(attemptKeys('login', '  boss@firm.com ', '100.64.0.3'), t);
-    l.recordFailure(attemptKeys('login', 'BOSS@FIRM.COM', '100.64.0.4'), t);
-    expect(l.check(attemptKeys('login', 'boss@firm.com', '100.64.0.9'), t + 1).allowed).toBe(false);
+    l.recordFailure(attemptKeys('login', '  boss@firm.com ', '100.64.0.2'), t);
+    l.recordFailure(attemptKeys('login', 'BOSS@FIRM.COM', '100.64.0.2'), t);
+    // Locked from that address...
+    expect(l.check(attemptKeys('login', 'boss@firm.com', '100.64.0.2'), t + 1).allowed).toBe(false);
+    // ...and the account's every-address throttle filled under one key too.
+    const other = new LoginRateLimiter({ maxFailures: 3, windowMs: 60_000, lockoutMs: 60_000, maxLockoutMs: 60_000, accountThrottle: { burst: 3, intervalMs: 60_000 } });
+    other.recordFailure(attemptKeys('login', 'Boss@Firm.com', '100.64.0.2'), t);
+    other.recordFailure(attemptKeys('login', '  boss@firm.com ', '100.64.0.3'), t);
+    other.recordFailure(attemptKeys('login', 'BOSS@FIRM.COM', '100.64.0.4'), t);
+    expect(other.check(attemptKeys('login', 'boss@firm.com', '100.64.0.9'), t + 1).allowed).toBe(false);
   });
 
   it('login, unlock and portal counters are independent', () => {
     const l = new LoginRateLimiter({ maxFailures: 2, windowMs: 60_000, lockoutMs: 60_000, maxLockoutMs: 60_000 });
     l.recordFailure(attemptKeys('portal', 'a@b.c', 'x'), 0);
     l.recordFailure(attemptKeys('portal', 'a@b.c', 'x'), 0);
-    expect(l.check(attemptKeys('portal', 'a@b.c', 'y'), 1).allowed).toBe(false);
+    expect(l.check(attemptKeys('portal', 'a@b.c', 'x'), 1).allowed).toBe(false);
+    // Another device is not locked out of that account (was: refused).
+    expect(l.check(attemptKeys('portal', 'a@b.c', 'y'), 1).allowed).toBe(true);
     expect(l.check(attemptKeys('login', 'a@b.c', 'x'), 1).allowed).toBe(true);
   });
 
-  it('a success does not reset an active lockout on another key (global still counts)', () => {
-    const l = new LoginRateLimiter({ maxFailures: 2, windowMs: 60_000, lockoutMs: 60_000, maxLockoutMs: 60_000 });
+  it('a success does not reset the overall limit (the global throttle still counts)', () => {
+    const l = new LoginRateLimiter({ maxFailures: 2, windowMs: 60_000, lockoutMs: 60_000, maxLockoutMs: 60_000, globalThrottle: { burst: 2, intervalMs: 5_000 } });
     const keys = attemptKeys('login', 'a@b.c', 'x');
-    l.recordFailure(keys, 0, { [keys[2]]: 1 });
-    l.recordFailure(keys, 0, { [keys[2]]: 1 });
+    l.recordFailure(keys, 0, { [keys[keys.length - 1]]: 1 });
+    l.recordFailure(keys, 0, { [keys[keys.length - 1]]: 1 });
     l.recordSuccess(keys.slice(0, -1));
-    expect(l.check(attemptKeys('login', 'other@b.c', 'z'), 1).allowed).toBe(false); // global locked
+    const v = l.check(attemptKeys('login', 'other@b.c', 'z'), 1);
+    expect(v.allowed).toBe(false); // overall throttle full...
+    expect(v.retryAfterMs).toBeLessThanOrEqual(5_000); // ...for one interval, not a lockout
   });
 });

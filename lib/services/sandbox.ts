@@ -147,14 +147,19 @@ function enteredHere(): Map<string, string> {
 const dirKey = (p: string) => (process.platform === 'win32' ? path.resolve(p).toLowerCase() : path.resolve(p));
 
 /**
- * Where this computer recorded the copy in `sandboxDir` was made from: when this server entered it,
- * or in its container when the container is in this computer's own sandbox folder (the desktop
+ * Where this computer recorded the copy in `sandboxDir` was made from: when this server entered it;
+ * the desktop shell's own record (its config.sandbox, passed to the server it started on this very
+ * copy as BKA_SANDBOX_DIR + BKA_SANDBOX_REAL_DIR — a copy made by an earlier version has no record
+ * of its own); or in its container when the container is in this computer's own sandbox folder (the
  * shell's BKA_SANDBOX_ROOT — never a folder that came with a company file). Null: no record (a copy
- * made by an earlier version, or one that did not come from this computer).
+ * made by an earlier version outside the shell, or one that did not come from this computer).
  */
 function recordedRealDataDir(sandboxDir: string): string | null {
   const entered = enteredHere().get(dirKey(sandboxDir));
   if (entered) return entered;
+  const shellDir = process.env.BKA_SANDBOX_DIR;
+  const shellReal = process.env.BKA_SANDBOX_REAL_DIR;
+  if (shellDir && shellReal && path.isAbsolute(shellReal) && samePath(shellDir, sandboxDir)) return shellReal;
   const root = process.env.BKA_SANDBOX_ROOT;
   const container = path.dirname(path.resolve(sandboxDir));
   if (!root || !samePath(path.dirname(container), root)) return null;

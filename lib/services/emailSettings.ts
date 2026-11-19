@@ -7,21 +7,29 @@
  * set with environment variables, which a desktop user can't reach; they still work as a fallback
  * when the file has no mail server of its own (a server deployment).
  *
- *  - The password is sealed with the company FILE's own vault secret (lib/ai/keyVault.ts
- *    sealForFile — the same secret as the AI provider keys), so it works on whichever computer
- *    opens the file, is never returned by the API, and can't be opened from an Accountant's Copy
- *    or Period Copy (those leave the secret out: portableFile.ts omitFileSecrets).
+ *  - The password belongs to the computer it was typed on (lib/ai/keyVault.ts sealStoredSecret —
+ *    like the AI provider keys): each computer that opens the file types it once; a copy of the
+ *    file, a backup or a portable file carries nothing that opens it. In a company file protected
+ *    with passwords it is sealed with the file's own vault secret instead (the encrypted file then
+ *    keeps it for every computer). It is never returned by the API, and copies for outsiders
+ *    (Accountant's Copy, Period Copy) leave it out altogether (portableFile.ts `outsider`).
+ *  - "None" (no encryption) is only for a mail server on this computer or the office network /
+ *    tailnet when the server signs in: a mailbox password must never cross the internet in plain
+ *    text. Saving it for another server is refused; a set-up saved before this rule existed is
+ *    refused at send and test time, and the Send Forms page says what to change.
  *  - Each user may send from their own name and address (My Preferences > Send Forms); the
  *    company's address is used otherwise. Replies come back to the sender.
  *  - Test sends a short message through the saved (or the typed, not yet saved) settings and
  *    explains a failure in plain words. The network policy applies to the test like to any send:
  *    a mail server on the internet needs the company's opt-in for email (Privacy & Network).
  */
+import dns from 'node:dns';
 import nodemailer from 'nodemailer';
 import { eq } from 'drizzle-orm';
 import { companyEmailSettings, users } from '@/lib/db/schema';
-import { openStoredSecret, readVaultSecret, sealForFile } from '@/lib/ai/keyVault';
+import { migrateStoredSecrets, needsMoveHere, openStoredSecret, readVaultSecret, sealStoredSecret } from '@/lib/ai/keyVault';
 import { assertOutboundAllowed } from '@/lib/net/guard';
+import { classifyHost, isPrivateClass, normalizeHost, parseIPv4, parseIPv6 } from '@/lib/net/cidr';
 import { canActivity } from '@/lib/permissions/model';
 import { type ServiceContext, ServiceError, inTransaction, validation, writeAudit } from './_base';
 import { requireActivity } from './access';
@@ -36,6 +44,10 @@ export const MAIL_SECURITY_LABELS: Record<MailSecurity, string> = {
   starttls: 'STARTTLS (usually port 587)',
   none: 'None (a mail relay on your own network, usually port 25)',
 };
+
+/** The saved mail password can't be opened on this computer (typed on another one, or another copy). */
+export const PASSWORD_NOT_HERE_MESSAGE =
+  'The mail server password is kept on the computer where it was typed. To send from this computer, type it once under Preferences > Send Forms and save.';
 
 /** Plain message when no mail server is set up (shown by every email action). */
 export const EMAIL_NOT_SET_UP_MESSAGE =
@@ -52,10 +64,15 @@ export interface EmailSetupView {
   username: string;
   hasPassword: boolean;
   /**
-   * False when a password is saved but this copy of the file can't open it (it came from an
-   * Accountant's Copy or another file): it has to be typed again.
+   * False when a password is saved but this computer can't open it (it was typed on another
+   * computer that opens this file, or the file came from someone else): type it once here.
    */
   passwordReadable: boolean;
+  /**
+   * True when Connection security is None, the server signs in, and it is not on this computer or
+   * your own network: sending is refused until STARTTLS or SSL/TLS is chosen.
+   */
+  insecureConnection: boolean;
   fromName: string;
   fromEmail: string;
   replyTo: string;
@@ -142,7 +159,12 @@ function envConfig(): MailConfig | null {
 }
 
 async function storedRow(ctx: ServiceContext) {
-  const [row] = await ctx.db.select().from(companyEmailSettings).where(eq(companyEmailSettings.companyId, ctx.companyId));
+  let [row] = await ctx.db.select().from(companyEmailSettings).where(eq(companyEmailSettings.companyId, ctx.companyId));
+  // A password that still travels with the company file (or an older version's): moved to this
+  // computer's own secret first (lib/ai/keyVault.ts migrateStoredSecrets; no-op when not possible).
+  if (row && needsMoveHere(row.passwordEnc) && (await migrateStoredSecrets(ctx.db)) > 0) {
+    [row] = await ctx.db.select().from(companyEmailSettings).where(eq(companyEmailSettings.companyId, ctx.companyId));
+  }
   return row ?? null;
 }
 
@@ -167,10 +189,7 @@ export async function resolveMailConfig(ctx: ServiceContext): Promise<MailConfig
   if (rowComplete(row)) {
     const password = await openPassword(ctx, row);
     if (row.passwordEnc && password === null) {
-      throw new ServiceError(
-        'VALIDATION',
-        'The mail server password was saved in another copy of this company file and cannot be read here. Enter it again under Preferences > Send Forms.',
-      );
+      throw new ServiceError('VALIDATION', PASSWORD_NOT_HERE_MESSAGE);
     }
     return {
       host: row.host,
@@ -196,7 +215,7 @@ export async function isEmailConfigured(ctx: ServiceContext): Promise<boolean> {
   return envConfig() !== null;
 }
 
-function view(row: StoredRow | null, passwordReadable: boolean): EmailSetupView {
+function view(row: StoredRow | null, passwordReadable: boolean, insecureConnection = false): EmailSetupView {
   const env = envConfig();
   const fileReady = rowComplete(row) && (!row.passwordEnc || passwordReadable);
   return {
@@ -208,6 +227,7 @@ function view(row: StoredRow | null, passwordReadable: boolean): EmailSetupView 
     username: row?.username ?? '',
     hasPassword: Boolean(row?.passwordEnc),
     passwordReadable: row?.passwordEnc ? passwordReadable : true,
+    insecureConnection,
     fromName: row?.fromName ?? '',
     fromEmail: row?.fromEmail ?? '',
     replyTo: row?.replyTo ?? '',
@@ -246,7 +266,7 @@ export async function getEmailStatus(ctx: ServiceContext): Promise<EmailStatus> 
 export async function getEmailSetup(ctx: ServiceContext): Promise<EmailSetupView> {
   requireActivity(ctx, 'company.send_forms', 'view');
   const row = await storedRow(ctx);
-  return view(row, (await openPassword(ctx, row)) !== null);
+  return view(row, (await openPassword(ctx, row)) !== null, await savedConnectionInsecure(row));
 }
 
 function cleanInput(input: EmailSetupInput) {
@@ -314,12 +334,17 @@ export const RETYPE_PASSWORD_MESSAGE =
 export async function saveEmailSetup(ctx: ServiceContext, input: EmailSetupInput): Promise<EmailSetupView> {
   requireActivity(ctx, 'company.send_forms', 'modify');
   const clean = cleanInput(input);
+  // Before anything is written: never a mailbox password over the internet without encryption.
+  await assertPlainMailAllowed(clean, 'save');
   return inTransaction(ctx, async (tx) => {
     const before = await storedRow(tx);
     let passwordEnc = before?.passwordEnc ?? null;
     let passwordChange: 'kept' | 'set' | 'removed' = 'kept';
     if (typeof input.password === 'string' && input.password !== '') {
-      passwordEnc = await sealForFile(tx.db, input.password, tx.companyId);
+      // Sealed for this computer. The password it replaces (for this very server and sign-in only)
+      // decides whether other computers' copies are kept or dropped (lib/ai/keyVault.ts).
+      const replaced = before?.passwordEnc && sameMailServer(before, clean) ? before.passwordEnc : null;
+      passwordEnc = await sealStoredSecret(tx.db, input.password, tx.companyId, { entered: replaced });
       passwordChange = 'set';
     } else if (input.password === null || input.password === '') {
       passwordEnc = null;
@@ -370,7 +395,7 @@ export async function saveEmailSetup(ctx: ServiceContext, input: EmailSetupInput
       oldValues: publicOf(before),
       newValues: { ...publicOf(row), ...(passwordChange !== 'kept' ? { password: passwordChange } : {}) },
     });
-    return view(row, (await openPassword(tx, row)) !== null);
+    return view(row, (await openPassword(tx, row)) !== null, await savedConnectionInsecure(row));
   });
 }
 
@@ -416,9 +441,78 @@ export function transportOptions(cfg: MailConfig): Record<string, unknown> {
   };
 }
 
-/** Network policy: a LAN / tailnet relay is fine; a public mail provider needs the email opt-in. */
-export async function assertMailServerAllowed(ctx: ServiceContext, cfg: Pick<MailConfig, 'host' | 'port' | 'security'>) {
+/**
+ * Network policy: a LAN / tailnet relay is fine; a public mail provider needs the email opt-in.
+ * And a server that signs in with Connection security None must be on this computer or your own
+ * network (assertPlainMailAllowed). Every send and test goes through here.
+ */
+export async function assertMailServerAllowed(ctx: ServiceContext, cfg: Pick<MailConfig, 'host' | 'port' | 'security' | 'username'>) {
   await assertOutboundAllowed(`${cfg.security === 'ssl' ? 'smtps' : 'smtp'}://${hostForUrl(cfg.host)}:${cfg.port}`, 'email', ctx);
+  await assertPlainMailAllowed(cfg, 'send');
+}
+
+// ---------------------------------------------------------------------------
+// Connection security "None"
+// ---------------------------------------------------------------------------
+
+/** Name lookups for the "None" check (tests replace `lookup`). Addresses only. */
+export const mailDns = {
+  lookup: async (host: string): Promise<string[]> => (await dns.promises.lookup(host, { all: true, verbatim: true })).map((a) => a.address),
+};
+
+const MAIL_DNS_TIMEOUT_MS = 3000;
+
+/**
+ * True when `host` is this computer or on your own network (LAN / tailnet) — the only places a
+ * mail server may be reached without encryption. An address is classified as it is
+ * (lib/net/cidr.ts). A name ("relay.office.local", "SERVER01") counts when every address it
+ * resolves to here is private; a name that can't be resolved does not.
+ */
+export async function mailServerIsLocal(host: string): Promise<boolean> {
+  const cls = classifyHost(host);
+  if (isPrivateClass(cls)) return true;
+  if (cls !== 'public') return false;
+  const h = normalizeHost(host);
+  if (parseIPv4(h) !== null || parseIPv6(h) !== null) return false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const addrs = await Promise.race([
+      mailDns.lookup(h),
+      new Promise<string[]>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('timed out')), MAIL_DNS_TIMEOUT_MS);
+      }),
+    ]);
+    return addrs.length > 0 && addrs.every((a) => isPrivateClass(classifyHost(a)));
+  } catch {
+    return false;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/** A set-up that would send a sign-in without encryption to a server outside your own network. */
+async function plainSignInOutside(cfg: { host: string; security: string; username?: string | null }): Promise<boolean> {
+  return cfg.security === 'none' && Boolean(cfg.username) && !(await mailServerIsLocal(cfg.host));
+}
+
+/** Refuse Connection security None for a server that signs in and is not on your own network. */
+export async function assertPlainMailAllowed(
+  cfg: { host: string; security: string; username?: string | null },
+  when: 'save' | 'send',
+): Promise<void> {
+  if (!(await plainSignInOutside(cfg))) return;
+  throw new ServiceError(
+    'VALIDATION',
+    when === 'save'
+      ? `Connection security "None" sends the mailbox password without encryption, so Ironbooks only allows it for a mail server on this computer or your own network, and ${cfg.host} is not one. Choose STARTTLS or SSL/TLS.`
+      : `Email was not sent: the mail server ${cfg.host} is set up with Connection security "None", which would send the mailbox password over the internet without encryption. Change Connection security to STARTTLS or SSL/TLS under Preferences > Send Forms.`,
+    { insecureConnection: true },
+  );
+}
+
+/** The saved set-up is one sends now refuse (shown on the Send Forms page). */
+async function savedConnectionInsecure(row: StoredRow | null): Promise<boolean> {
+  return rowComplete(row) ? plainSignInOutside({ host: row.host, security: row.security, username: row.username }) : false;
 }
 
 export interface SenderIdentity {

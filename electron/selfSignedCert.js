@@ -115,25 +115,117 @@ function fingerprintOf(pem) {
 }
 
 /**
- * This computer's office-network certificate (made once, kept in `dir`). Renewed when it is
- * within 30 days of expiring or unreadable. Returns { cert, key, fingerprint }.
+ * The certificate's private key never sits in the roaming profile as a plain file when the
+ * operating system can protect it (security plan 4.8): it is kept wrapped by Electron safeStorage
+ * (DPAPI on Windows, the Keychain on macOS) in `lan-host.key.sealed` and unwrapped in memory when
+ * hosting starts. A plain `lan-host.key` left by an earlier version is wrapped on its next use and
+ * then deleted — the certificate itself is kept, so teammates who pinned its fingerprint keep
+ * joining. Without safeStorage (Linux's plain-text fallback, tests) the key stays a plain file as
+ * before. `protect` is Electron's safeStorage (or null).
  */
-function loadOrCreate(dir, opts = {}) {
+const KEY_FILE = 'lan-host.key';
+const SEALED_KEY_FILE = 'lan-host.key.sealed';
+
+function canProtect(protect, platform = process.platform) {
+  try {
+    if (!protect || typeof protect.isEncryptionAvailable !== 'function' || !protect.isEncryptionAvailable()) return false;
+    if (platform === 'linux' && typeof protect.getSelectedStorageBackend === 'function') {
+      const backend = protect.getSelectedStorageBackend();
+      if (backend === 'basic_text' || backend === 'unknown') return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isPrivateKeyPem(pem) {
+  if (typeof pem !== 'string' || !pem.includes('PRIVATE KEY')) return false;
+  try {
+    crypto.createPrivateKey(pem);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** The sealed key, unwrapped (null when it is missing or this account cannot unwrap it). */
+function readSealedKey(dir, protect) {
+  try {
+    const pem = protect.decryptString(fs.readFileSync(path.join(dir, SEALED_KEY_FILE)));
+    return isPrivateKeyPem(pem) ? pem : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Write `pem` wrapped, checked by unwrapping it again before anything plain is removed. Returns
+ * true when the sealed file now holds exactly this key.
+ */
+function writeSealedKey(dir, pem, protect) {
+  try {
+    const sealed = protect.encryptString(pem);
+    if (protect.decryptString(sealed) !== pem) return false;
+    const file = path.join(dir, SEALED_KEY_FILE);
+    const tmp = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, sealed, { mode: 0o600 });
+    fs.renameSync(tmp, file);
+    return readSealedKey(dir, protect) === pem;
+  } catch {
+    return false;
+  }
+}
+
+function removePlainKey(dir) {
+  try {
+    fs.rmSync(path.join(dir, KEY_FILE), { force: true });
+  } catch {
+    /* tried again at the next use */
+  }
+}
+
+/**
+ * This computer's office-network certificate (made once, kept in `dir`). Renewed when it is
+ * within 30 days of expiring or unreadable. Returns { cert, key, fingerprint } (the key as PEM, in
+ * memory only). `{ protect }`: Electron safeStorage, to keep the key wrapped (see above).
+ */
+function loadOrCreate(dir, opts = {}, { protect = null, platform = process.platform } = {}) {
   const certFile = path.join(dir, 'lan-host.crt');
-  const keyFile = path.join(dir, 'lan-host.key');
+  const keyFile = path.join(dir, KEY_FILE);
+  const wrap = canProtect(protect, platform);
   try {
     const cert = fs.readFileSync(certFile, 'utf8');
-    const key = fs.readFileSync(keyFile, 'utf8');
     const x = new crypto.X509Certificate(cert);
-    if (Date.parse(x.validTo) - Date.now() > 30 * 24 * 3600 * 1000) return { cert, key, fingerprint: fingerprintOf(cert) };
+    // The wrapped key first; a plain one (an earlier version, or no safeStorage) otherwise.
+    let key = wrap ? readSealedKey(dir, protect) : null;
+    let plain = false;
+    if (!key && fs.existsSync(keyFile)) {
+      key = fs.readFileSync(keyFile, 'utf8');
+      plain = true;
+    }
+    if (key && Date.parse(x.validTo) - Date.now() > 30 * 24 * 3600 * 1000) {
+      // Wrap a plain key now (same certificate, same fingerprint), and only then delete the file.
+      if (wrap && (plain ? writeSealedKey(dir, key, protect) : true)) removePlainKey(dir);
+      return { cert, key, fingerprint: fingerprintOf(cert) };
+    }
   } catch {
     /* missing or unreadable: make a new one */
   }
   const made = generateCertificate(opts);
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(keyFile, made.key, { mode: 0o600 });
+  if (wrap && writeSealedKey(dir, made.key, protect)) {
+    removePlainKey(dir);
+  } else {
+    fs.writeFileSync(keyFile, made.key, { mode: 0o600 });
+    try {
+      fs.rmSync(path.join(dir, SEALED_KEY_FILE), { force: true });
+    } catch {
+      /* the plain key is read only when the sealed one does not unwrap */
+    }
+  }
   fs.writeFileSync(certFile, made.cert);
   return { ...made, fingerprint: fingerprintOf(made.cert) };
 }
 
-module.exports = { generateCertificate, fingerprintOf, loadOrCreate };
+module.exports = { generateCertificate, fingerprintOf, loadOrCreate, KEY_FILE, SEALED_KEY_FILE };

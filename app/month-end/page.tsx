@@ -335,6 +335,10 @@ function ClosePanel({
   const [mode, setMode] = useState<'keep' | 'set' | 'remove'>(checklist.hasClosingPassword ? 'keep' : 'set');
   const [password, setPassword] = useState('');
   const [confirmPw, setConfirmPw] = useState('');
+  // Someone who is not an Admin types the password in force now to replace or remove it
+  // (lib/services/company.ts setClosingDate); keeping it while closing a later month needs nothing.
+  const [currentPw, setCurrentPw] = useState('');
+  const needsCurrent = checklist.currentPasswordRequired && (mode === 'set' || mode === 'remove');
   const [confirming, setConfirming] = useState(false);
   const [closing, setClosing] = useState(false);
   const pretty = formatDate(checklist.periodEnd);
@@ -347,6 +351,15 @@ function ClosePanel({
       toast(problem, 'danger');
       return false;
     }
+    if (needsCurrent && !currentPw) {
+      toast(
+        mode === 'remove'
+          ? 'Type the current closing date password to remove it, or choose Keep the current password.'
+          : 'Type the current closing date password to replace it, or choose Keep the current password.',
+        'danger',
+      );
+      return false;
+    }
     return true;
   }
 
@@ -356,6 +369,7 @@ function ClosePanel({
       const body: Record<string, unknown> = { periodEnd: checklist.periodEnd, version: checklist.version };
       if (mode === 'set' && password) body.password = password;
       if (mode === 'remove') body.password = null;
+      if (needsCurrent) body.currentPassword = currentPw;
       await api.post('/api/month-end-close/close', body);
       toast(`The books are closed through ${pretty}.`, 'success');
       setConfirming(false);
@@ -440,6 +454,18 @@ function ClosePanel({
               {checklist.hasClosingPassword ? 'Remove the password' : 'No password'}
             </label>
           </fieldset>
+          {needsCurrent && (
+            <div className="max-w-xs">
+              <Label htmlFor="close-pw-current">Current closing date password</Label>
+              <Input
+                id="close-pw-current"
+                type="password"
+                autoComplete="current-password"
+                value={currentPw}
+                onChange={(e) => setCurrentPw(e.target.value)}
+              />
+            </div>
+          )}
           {mode === 'set' && (
             <div className="grid sm:grid-cols-2 gap-3">
               <div>

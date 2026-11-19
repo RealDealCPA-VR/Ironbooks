@@ -23,6 +23,7 @@ import { createPortableCompanyFile } from '@/lib/services/portableFile';
 import { assertCopyPasswordGiven } from '@/lib/services/fileProtection';
 import { ServiceError } from '@/lib/services/_base';
 import { readJsonObject, serviceErrorStatus } from '@/lib/routeErrors';
+import { fileResponse } from '@/lib/fileDownload';
 
 function errorResponse(err: unknown) {
   if (err instanceof ServiceError) {
@@ -32,12 +33,6 @@ function errorResponse(err: unknown) {
   // Do not leak raw error text (may contain absolute data-dir paths / OS details).
   console.error('[portable] unexpected error:', err);
   return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
-}
-
-/** RFC 5987 filename* so names with spaces/accents survive the download. */
-function contentDisposition(filename: string): string {
-  const ascii = filename.replace(/[^\x20-\x7E]/g, '_').replace(/"/g, "'");
-  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(filename)}`;
 }
 
 export async function GET() {
@@ -67,14 +62,9 @@ async function download(password: string | null) {
       dataDir: dataDirOf(ctx.db) ?? resolveDataDir(),
       password,
     });
-    return new NextResponse(new Uint8Array(buffer), {
-      status: 200,
-      headers: {
-        'Content-Type': 'application/octet-stream',
-        'Content-Disposition': contentDisposition(filename),
-        'Content-Length': String(buffer.byteLength),
-      },
-    });
+    // The shared download helper: its file name header never throws (a company name cut in the
+    // middle of an emoji) and is always well formed.
+    return fileResponse(buffer, filename);
   } catch (err) {
     return errorResponse(err);
   }

@@ -22,7 +22,10 @@ describe('tailnet detection', () => {
     expect(core.parseTailscaleIpOutput('')).toBeNull();
   });
 
-  it('falls back to a 100.64.0.0/10 interface address', () => {
+  // Was: "falls back to a 100.64.0.0/10 interface address". An interface address in that range is
+  // no longer enough on its own (internet providers use it for carrier-grade NAT): Tailscale must
+  // confirm it (security plan 3.2).
+  it('takes a 100.64.0.0/10 interface address only when Tailscale confirms it', () => {
     const ifaces = {
       Ethernet: [{ address: '192.168.1.20', family: 'IPv4', internal: false }],
       lo: [{ address: '127.0.0.1', family: 'IPv4', internal: true }],
@@ -31,8 +34,11 @@ describe('tailnet detection', () => {
         { address: '100.88.1.2', family: 'IPv4', internal: false },
       ],
     };
-    expect(core.pickTailnetIPv4FromInterfaces(ifaces)).toBe('100.88.1.2');
-    expect(core.pickTailnetIPv4FromInterfaces({ eth0: [{ address: '100.128.0.1', family: 'IPv4' }] })).toBeNull();
+    expect(core.confirmTailnetIPv4({ ifaces })).toBeNull();
+    const status = core.parseTailscaleStatus(JSON.stringify({ BackendState: 'Running', Self: { TailscaleIPs: ['100.88.1.2', 'fd7a:115c:a1e0::1'] } }));
+    expect(core.confirmTailnetIPv4({ status, ifaces })).toBe('100.88.1.2');
+    expect(core.confirmTailnetIPv4({ ipOutput: '100.88.1.2\n', ifaces })).toBe('100.88.1.2');
+    expect(core.confirmTailnetIPv4({ ipOutput: '100.128.0.1\n', ifaces: { eth0: [{ address: '100.128.0.1', family: 'IPv4' }] } })).toBeNull();
   });
 });
 

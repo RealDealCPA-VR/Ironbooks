@@ -47,6 +47,11 @@ export const resetPasswordSchema = z.object({
    * authenticator app; without this nobody could ever let them back in).
    */
   turnOffTwoFactor: z.boolean().optional(),
+  /**
+   * Your own password, when resetting your own: the same rule as Change Password, so a session
+   * left signed in can't be used to take over the account (lib/services/users.ts resetUserPassword).
+   */
+  currentPassword: z.string().max(200).optional(),
 });
 
 /** gapsb K: POST /api/auth/change-password (a person changing their own password). */
