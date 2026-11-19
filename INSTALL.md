@@ -6,7 +6,7 @@ embedded database internally).
 
 ## Option A — Installer (recommended; creates a Desktop icon)
 
-1. Get **`Ironbooks-Setup-1.7.17.exe`** from the
+1. Get **`Ironbooks-Setup-1.7.18.exe`** from the
    [latest release](https://github.com/RealDealCPA-VR/Ironbooks/releases/latest) (or the `release/`
    folder after a build).
 2. Double-click it. The installer:
@@ -27,7 +27,7 @@ deleted.
 
 ## Option B — Portable (no install)
 
-Use **`Ironbooks-1.7.17.exe`** (the portable build). Double-click to run it directly — nothing is
+Use **`Ironbooks-1.7.18.exe`** (the portable build). Double-click to run it directly — nothing is
 installed. To get an icon, right-click it → *Send to → Desktop (create shortcut)*, or drag it to the
 taskbar to pin it.
 
