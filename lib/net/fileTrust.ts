@@ -41,6 +41,10 @@
  *    of the settings that reach out (nothing in it came from anywhere else), so it is stamped;
  *  - a file whose own settings reach nothing on the internet: stamped the first time an Admin at
  *    this computer saves its network, AI or mail settings (approveQuietFileHere).
+ *
+ * A per-company backup restored into an approved file would bring its company's network policy and
+ * emailing schedules in past that approval; it carries its own proof of the computer that made it
+ * instead (see "Per-company backups" at the end of this file).
  */
 import crypto from 'node:crypto';
 import path from 'node:path';
@@ -51,7 +55,7 @@ import { deviceKey, type DeviceKey } from '@/lib/ai/keyVault';
 import { CHATGPT_RESOURCE } from '@/lib/ai/chatgpt';
 import { type ServiceContext, inTransaction, writeAudit } from '@/lib/services/_base';
 import { classifyHost, normalizeHost } from './cidr';
-import { normalizeLookupUrl, normalizePolicy, PURPOSE_INFO } from './policy';
+import { DEFAULT_NETWORK_POLICY, normalizeLookupUrl, normalizePolicy, PURPOSE_INFO } from './policy';
 import { verifyTailnetUrls } from './tailnetVerify';
 
 /** The file_secrets row holding the approvals. */
@@ -388,4 +392,158 @@ export async function approveQuietFileHere(ctx: ServiceContext, opts: { remote: 
     }
     return wrote;
   });
+}
+
+// ---------------------------------------------------------------------------
+// Per-company backups ("Back up this company", lib/services/backup.ts)
+// ---------------------------------------------------------------------------
+//
+// Restoring one company from a per-company backup adds it to the OPEN company file, which is
+// usually approved on this computer already, so the approval above never looks at what it brings:
+// that company's network policy (mode, cloud opt-ins, vendor lookup address) and its report
+// schedules with their recipients. A crafted backup could switch internet services on that way.
+// So the export, when there is a device secret, adds a proof of the computer that made it
+// (company-data.json `madeOn`): HMAC-SHA256 under that computer's device secret over a fixed label,
+// the proof's own id and time, the company id and a digest of exactly those settings. It cannot be
+// made without the secret, nor moved onto other settings. At restore:
+//   - a valid proof of THIS computer: everything comes back as it was (as before);
+//   - no proof, another computer's, a broken one, or no device secret here while the backup has a
+//     proof: the network policy comes back no wider than the app's default and the schedules that
+//     email come back paused, and the restore says so (BACKUP_OUTSIDE_SETTINGS_NOTICE);
+//   - no device secret here and no proof (tests, `next dev`, scripts): exactly as before.
+
+const BACKUP_PROOF_LABEL = 'ironbooks/company-backup-origin/v1';
+
+/** The proof a per-company backup made on a computer with a device secret carries. */
+export interface CompanyBackupProof {
+  v: 1;
+  /** Which computer made it (not secret). */
+  keyId: string;
+  id: string;
+  createdAt: string;
+  /** HMAC-SHA256 (hex) over the label, id, createdAt and the settings digest. */
+  mac: string;
+}
+
+/** The parts of a per-company backup's company data looked at here (lib/services/backup.ts CompanyExportData). */
+export interface CompanyBackupContent {
+  company: { id: string; settings: unknown };
+  tables: Record<string, Array<Record<string, unknown>> | undefined>;
+  madeOn?: unknown;
+}
+
+/** Said after restoring a per-company backup whose outside settings were left off. */
+export const BACKUP_OUTSIDE_SETTINGS_NOTICE =
+  'Internet services and emailed report schedules in this backup were left switched off; turn them on under Privacy & Network and Report Schedules if you want them.';
+
+/** JSON with object keys in a fixed order: the same text for the same settings before and after the backup's round trip. */
+function canonicalJson(value: unknown): string {
+  const walk = (v: unknown): string => {
+    if (Array.isArray(v)) return `[${v.map(walk).join(',')}]`;
+    if (v && typeof v === 'object') {
+      const o = v as Record<string, unknown>;
+      return `{${Object.keys(o)
+        .sort()
+        .map((k) => `${JSON.stringify(k)}:${walk(o[k])}`)
+        .join(',')}}`;
+    }
+    return JSON.stringify(v);
+  };
+  return walk(value === undefined ? null : JSON.parse(JSON.stringify(value)));
+}
+
+/** Digest of what the proof covers: the company id, its network policy, every schedule's recipients and whether it runs. */
+function outsideSettingsDigest(data: CompanyBackupContent): string {
+  const s = data.company.settings;
+  const policy = s && typeof s === 'object' && !Array.isArray(s) ? ((s as Record<string, unknown>).networkPolicy ?? null) : null;
+  const schedules = (data.tables.reportSchedules ?? [])
+    .map((r) => [String(r.id ?? ''), typeof r.emailTo === 'string' ? r.emailTo : null, r.isActive !== false] as const)
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  return crypto
+    .createHash('sha256')
+    .update(canonicalJson({ company: String(data.company.id), networkPolicy: policy, schedules }))
+    .digest('hex');
+}
+
+function backupProofMac(secret: string, id: string, createdAt: string, digest: string): string {
+  return crypto.createHmac('sha256', Buffer.from(secret, 'hex')).update(`${BACKUP_PROOF_LABEL}\n${id}\n${createdAt}\n${digest}`).digest('hex');
+}
+
+/** This computer's proof for a per-company backup's company data; null without a device secret. */
+export function companyBackupProof(data: CompanyBackupContent, now: Date = new Date()): CompanyBackupProof | null {
+  const dk = deviceKey();
+  if (!dk) return null;
+  const id = crypto.randomUUID();
+  const createdAt = now.toISOString();
+  return { v: 1, keyId: dk.keyId, id, createdAt, mac: backupProofMac(dk.secret, id, createdAt, outsideSettingsDigest(data)) };
+}
+
+/**
+ * True when the per-company backup was made on THIS computer with exactly these outside settings;
+ * false when it was not (no proof, another computer's, a proof that does not match, or a proof but
+ * no device secret here); null when there is neither a device secret here nor a proof (restore as
+ * before).
+ */
+export function companyBackupMadeHere(data: CompanyBackupContent): boolean | null {
+  const dk = deviceKey();
+  const p = data.madeOn && typeof data.madeOn === 'object' ? (data.madeOn as Partial<CompanyBackupProof>) : null;
+  if (!dk) return p ? false : null;
+  if (!p || p.v !== 1 || p.keyId !== dk.keyId) return false;
+  if (typeof p.id !== 'string' || !ID_RE.test(p.id) || typeof p.createdAt !== 'string' || p.createdAt.length > 64) return false;
+  if (typeof p.mac !== 'string' || !MAC_RE.test(p.mac)) return false;
+  const want = Buffer.from(backupProofMac(dk.secret, p.id, p.createdAt, outsideSettingsDigest(data)), 'hex');
+  const got = Buffer.from(p.mac, 'hex');
+  return got.length === want.length && crypto.timingSafeEqual(got, want);
+}
+
+/**
+ * A stored network policy narrowed to reach no further than the app's default
+ * (lib/net/policy.ts DEFAULT_NETWORK_POLICY): Offline stays Offline, any other mode becomes the
+ * default one, every cloud opt-in is off and there is no vendor lookup address. The update-check
+ * choice and its stored revision are kept (update checks send no company data), so a company that
+ * had them off keeps them off.
+ */
+export function policyNoWiderThanDefault(raw: unknown): Record<string, unknown> {
+  const r = raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
+  const opt = r.cloudOptIn && typeof r.cloudOptIn === 'object' ? (r.cloudOptIn as Record<string, unknown>) : {};
+  return {
+    mode: r.mode === 'offline' ? 'offline' : DEFAULT_NETWORK_POLICY.mode,
+    cloudOptIn: {
+      ai: false,
+      email: false,
+      'vendor-lookup': false,
+      ...(typeof opt.updates === 'boolean' ? { updates: opt.updates } : {}),
+    },
+    vendorLookupUrl: DEFAULT_NETWORK_POLICY.vendorLookupUrl,
+    ...(r.rev !== undefined ? { rev: r.rev } : {}),
+  };
+}
+
+/**
+ * For a per-company backup not made here (companyBackupMadeHere false): the company settings to
+ * restore (the network policy no wider than the default) and the ids of the schedules to restore
+ * paused (those that email). `changed` is false when the backup brought nothing that reaches out;
+ * then nothing is changed and nothing is said.
+ */
+export function holdBackupOutsideSettings(data: CompanyBackupContent): {
+  settings: unknown;
+  pauseScheduleIds: Set<string>;
+  changed: boolean;
+} {
+  let settings = data.company.settings;
+  let changed = false;
+  const s = settings && typeof settings === 'object' && !Array.isArray(settings) ? (settings as Record<string, unknown>) : null;
+  if (s && s.networkPolicy !== undefined && s.networkPolicy !== null) {
+    const narrowed = policyNoWiderThanDefault(s.networkPolicy);
+    if (canonicalJson(normalizePolicy(narrowed)) !== canonicalJson(normalizePolicy(s.networkPolicy))) {
+      settings = { ...s, networkPolicy: narrowed };
+      changed = true;
+    }
+  }
+  const pauseScheduleIds = new Set<string>();
+  for (const r of data.tables.reportSchedules ?? []) {
+    if (typeof r.id === 'string' && typeof r.emailTo === 'string' && r.emailTo.trim() && r.isActive !== false) pauseScheduleIds.add(r.id);
+  }
+  if (pauseScheduleIds.size) changed = true;
+  return { settings, pauseScheduleIds, changed };
 }

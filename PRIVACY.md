@@ -158,6 +158,9 @@ at once (further sign-ins over the network are refused until someone logs out).
   computer's name plus your tailnet's name) is then visible to anyone. Nothing from the company
   file is in it. To avoid this, leave HTTPS certificates turned off for your tailnet in the
   Tailscale admin console, or set `hosting.tls` to `false` in the app config.
+- The private keys of the hosting certificates (the tailnet certificate and this computer's own
+  office-network certificate) are kept wrapped by the operating system where it can protect them
+  (Windows' data protection for your Windows account), not as plain files.
 - Every request needs a sign-in with a personal user account. Sign-in is rate-limited (attempts
   still being checked count too), and the company-file password and employee portal sign-in are
   limited the same way. Wrong passwords from one device lock only that device out of that account
@@ -221,8 +224,10 @@ at once (further sign-ins over the network are refused until someone logs out).
 - The file key changes whenever a password is changed or reset, a challenge answer is changed, a
   user is made inactive or a new recovery key is made (and on request, Company > Security): older
   copies of the file and replaced passwords then open nothing saved afterwards.
-- A challenge answer opens a protected file only when it is at least 10 characters long: a short
-  answer to a known question could be guessed offline from a copy of the file.
+- A challenge answer opens a protected file only when it is at least 10 characters long (a short
+  answer to a known question could be guessed offline from a copy of the file), and only on a
+  computer that has opened the file before. On any other computer the file opens with a password
+  or the recovery key.
 - The plain listing (company name, file id, save dates, app version, user-name lookup tags) is
   readable without a password, and a guessed user name can be confirmed against a copy of the file.
 - "Try it on a copy" sandboxes are kept in `%LOCALAPPDATA%\Ironbooks\Sandboxes` (never the roaming

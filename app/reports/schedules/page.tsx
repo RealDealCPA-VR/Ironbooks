@@ -36,6 +36,16 @@ interface Option {
 
 const today = () => todayISO();
 
+/**
+ * A schedule's last result: red only when it failed. "held" (an emailing schedule waiting until
+ * internet services are allowed for this file on this computer) is a wait, not an error.
+ */
+function lastStatusTone(status: string | null): 'success' | 'warning' | 'danger' {
+  if (status === 'ok') return 'success';
+  if (status === 'partial' || status === 'held') return 'warning';
+  return 'danger';
+}
+
 export default function ScheduledReportsPage() {
   const [schedules, setSchedules] = useState<Schedule[]>([]);
   const [folder, setFolder] = useState('');
@@ -95,7 +105,11 @@ export default function ScheduledReportsPage() {
     try {
       const d = await api.post<{ results: { name: string; status: string; files: string[]; message?: string }[] }>('/api/report-schedules/run-due');
       if (d.results.length === 0) toast('Nothing is due right now.', 'info');
-      else toast(d.results.map((r) => `${r.name}: ${r.status === 'ok' ? `${r.files.length} file(s) saved` : r.message}`).join(' · '), d.results.every((r) => r.status === 'ok') ? 'success' : 'danger');
+      else
+        toast(
+          d.results.map((r) => `${r.name}: ${r.status === 'ok' ? `${r.files.length} file(s) saved` : r.message}`).join(' · '),
+          d.results.every((r) => r.status === 'ok') ? 'success' : d.results.every((r) => r.status === 'ok' || r.status === 'held') ? 'info' : 'danger',
+        );
       await load();
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Could not run the schedules.', 'danger');
@@ -190,10 +204,14 @@ export default function ScheduledReportsPage() {
                   <Td>{new Date(s.nextRunAt).toLocaleDateString()}</Td>
                   <Td>
                     {s.lastRunAt ? (
-                      <span title={s.lastMessage ?? ''}>
-                        {new Date(s.lastRunAt).toLocaleDateString()}{' '}
-                        <Badge tone={s.lastStatus === 'ok' ? 'success' : s.lastStatus === 'partial' ? 'warning' : 'danger'}>{s.lastStatus}</Badge>
-                      </span>
+                      <>
+                        <span title={s.lastMessage ?? ''}>
+                          {new Date(s.lastRunAt).toLocaleDateString()}{' '}
+                          <Badge tone={lastStatusTone(s.lastStatus)}>{s.lastStatus}</Badge>
+                        </span>
+                        {/* Held is not a failure: it waits for internet services to be allowed on this computer. */}
+                        {s.lastStatus === 'held' && s.lastMessage && <p className="mt-1 max-w-[18rem] text-xs text-navy/70">{s.lastMessage}</p>}
+                      </>
                     ) : (
                       '—'
                     )}

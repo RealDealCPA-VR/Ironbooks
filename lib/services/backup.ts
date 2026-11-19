@@ -97,6 +97,13 @@ import {
 import { backupManifestOf, sealedHeadOf, unsealArchive, writeUnsealedEntries, type ArchiveCredentials } from './sealedArchives';
 import { currentFingerprint } from './backupFingerprint';
 import { APP_VERSION } from '@/lib/appVersion';
+import {
+  BACKUP_OUTSIDE_SETTINGS_NOTICE,
+  companyBackupMadeHere,
+  companyBackupProof,
+  holdBackupOutsideSettings,
+  type CompanyBackupProof,
+} from '@/lib/net/fileTrust';
 import { UnstartableBooksError, dataDirProblem } from './workingCopyRecovery';
 import type { EffectiveAccess } from '@/lib/permissions/model';
 import { isMaskedValue, isSensitiveKey, maskSensitive, stripSecrets } from '@/lib/permissions/mask';
@@ -1260,6 +1267,12 @@ const USER_REF_KEYS = new Set([
 export interface CompanyExportData {
   company: { id: string; name: string; settings: unknown };
   tables: Record<string, Array<Record<string, unknown>>>;
+  /**
+   * Made on a computer with a device secret: that computer's proof over the company's network
+   * policy and schedule recipients (lib/net/fileTrust.ts companyBackupProof). A restore anywhere
+   * else brings those back switched off.
+   */
+  madeOn?: CompanyBackupProof;
 }
 
 /**
@@ -1286,10 +1299,13 @@ export async function exportCompanyData(db: DB, companyId: string): Promise<Comp
     const rows: Array<{ row: Record<string, unknown> }> = await q.where(eq(spec.companyCol, companyId));
     tables[spec.name] = rows.map((r) => stripSecrets(r.row));
   }
-  return {
+  const data: CompanyExportData = {
     company: { id: company.id, name: company.name, settings: stripSecrets(company.settings ?? null) },
     tables,
   };
+  // Which computer made it, over the settings that reach out (restored as they are only there).
+  const madeOn = companyBackupProof(data);
+  return madeOn ? { ...data, madeOn } : data;
 }
 
 /**
@@ -1574,6 +1590,11 @@ export interface RestoreCompanyResult {
   companyId: string;
   name: string;
   tableCounts: Record<string, number>;
+  /**
+   * Plain-language notes for the person restoring, e.g. that the backup's internet services and
+   * emailed report schedules were left switched off (it was not made on this computer).
+   */
+  notices?: string[];
 }
 
 /**
@@ -1584,6 +1605,10 @@ export interface RestoreCompanyResult {
  *  - Every id is remapped to a fresh UUID, so restoring the same file twice (or restoring
  *    into the original source database) can never collide with existing rows.
  *  - The whole restore runs in one transaction: a bad archive leaves nothing behind.
+ *  - It goes into the OPEN company file, which this computer has usually approved for internet
+ *    services (lib/net/fileTrust.ts). So unless the backup proves it was made on this computer,
+ *    the company's network policy comes back no wider than the default and its schedules that
+ *    email come back paused, and the result says so (`notices`).
  *
  * @param db       Database handle.
  * @param buffer   Raw bytes of a per-company .bka file.
@@ -1603,6 +1628,8 @@ export async function restoreCompanyBackup(
   },
 ): Promise<RestoreCompanyResult> {
   const { data, files } = await openCompanyBackup(buffer, { credentials: opts.credentials, dataDir: opts.dataDir });
+  // Not made on this computer (or no longer provably so): its outside settings stay switched off.
+  const held = companyBackupMadeHere(data) === false ? holdBackupOutsideSettings(data) : null;
 
   // Backup-before-destructive: company restore only inserts a brand-new company,
   // but it still mutates the shared data dir — snapshot it first (best-effort; a protected file's
@@ -1632,7 +1659,7 @@ export async function restoreCompanyBackup(
   try {
     // A bulk load into the shared file: fresh planner statistics afterwards (best-effort).
     return await withPlannerStats(db, 'company restore', () =>
-      restoreCompanyRows(db, data, idMap, name, opts, attachmentsDataDir, copiedFiles, files),
+      restoreCompanyRows(db, data, idMap, name, opts, attachmentsDataDir, copiedFiles, files, held),
     );
   } catch (err) {
     for (const f of copiedFiles) {
@@ -1655,7 +1682,10 @@ async function restoreCompanyRows(
   attachmentsDataDir: string,
   copiedFiles: string[],
   files: Map<string, Buffer> = new Map(),
+  held: ReturnType<typeof holdBackupOutsideSettings> | null = null,
 ): Promise<RestoreCompanyResult> {
+  // Outside settings left switched off only when there was something to switch off.
+  const hold = held && held.changed ? held : null;
   return db.transaction(async (tx) => {
     // Re-inserting a backup's posted ledger is a sanctioned rewrite (lines are added to
     // entries that were not created "now"). Every restored posted entry is still verified
@@ -1667,7 +1697,7 @@ async function restoreCompanyRows(
       .values({
         name,
         ownerId: opts.ownerId,
-        settings: (remapEmbeddedIds(data.company.settings ?? null, idMap) ?? null) as never,
+        settings: (remapEmbeddedIds((hold ? hold.settings : data.company.settings) ?? null, idMap) ?? null) as never,
       })
       .returning();
     await tx
@@ -1682,6 +1712,12 @@ async function restoreCompanyRows(
       // Cached balances are never restored verbatim: accounts start at zero and the DB
       // balance triggers rebuild them from the restored posted journal lines.
       if (spec.name === 'accounts') for (const r of revived) r.balance = '0.00';
+      // Schedules that email, from a backup not made on this computer, come back paused.
+      if (spec.name === 'reportSchedules' && hold) {
+        revived.forEach((r, i) => {
+          if (hold.pauseScheduleIds.has(String(rows[i].id))) r.isActive = false;
+        });
+      }
       // Attachments: the stored path must stay inside the attachments folder, and the restored
       // company gets its own copy of every file present here (never a file shared with the
       // company it was backed up from, which deleting a document in either would destroy).
@@ -1713,7 +1749,7 @@ async function restoreCompanyRows(
       action: 'create',
       entityType: 'company_restore',
       entityId: company.id,
-      newValues: { restoredFrom: data.company.name, tableCounts },
+      newValues: { restoredFrom: data.company.name, tableCounts, ...(hold ? { internetServicesLeftOff: true } : {}) },
     });
     // Running transaction log: one bulk record covering every restored posted entry, so
     // verifyTransactionLog can account for them.
@@ -1731,6 +1767,6 @@ async function restoreCompanyRows(
       data: { new: { restoredFrom: data.company.name, tableCounts }, journalEntryIds },
     });
 
-    return { companyId: company.id, name, tableCounts };
+    return { companyId: company.id, name, tableCounts, ...(hold ? { notices: [BACKUP_OUTSIDE_SETTINGS_NOTICE] } : {}) };
   });
 }

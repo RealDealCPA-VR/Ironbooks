@@ -149,7 +149,13 @@ its passwords — and nobody else:
   answer is long enough (at least 10 characters with some variety — a short phrase; the slot costs
   N=2^17: a short one-word answer to a known question could be guessed offline from a copy of the
   file, so it still resets the password while the file is open but never opens the file), and one
-  for the **recovery key** — 24 characters in groups of four, shown once when the file is created
+  for the **recovery key**. The challenge slots cannot be read from the plain manifest: the desktop
+  app keeps them in one encrypted challenge set under the file's challenge key, which the manifest carries
+  only wrapped for each computer that has saved the file (its device secret, kept by Windows). So a
+  challenge answer opens the file only on a computer that has opened it before; anywhere else the
+  file opens with a password or the recovery key (`lib/services/fileProtection.ts`; without a
+  device secret — tests, scripts — the challenge slots are written in plain text as before). The
+  recovery key is 24 characters in groups of four, shown once when the file is created
   or protected (Print / Save to a File; printed from the page itself). It is the only way back in if
   every password is lost. Slots are found by an HMAC of the user name with the file's random salt,
   so the manifest does not list user names — but someone with a copy of the file can confirm a

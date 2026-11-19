@@ -10,7 +10,8 @@
 //    can compute (GET /api/handshake, lib/net/internalToken.ts serverCheckProof). The port is
 //    picked free and released before the server binds it, so something else could take it first.
 //  - The server's environment: the installed app does not pass developer switches set on this
-//    computer (BKA_ALLOW_DEV_FALLBACK, BKA_AUTH_SECRET, NODE_OPTIONS…) on to its server.
+//    computer (BKA_ALLOW_DEV_FALLBACK, BKA_AUTH_SECRET, NODE_OPTIONS…) on to its server, nor
+//    same-named copies of the variables only the shell sets (the open file, secrets, tokens).
 //
 // Pure helpers (fetch injected) so they can be unit-tested without Electron.
 
@@ -78,24 +79,57 @@ async function isOwnServer(port, token, { fetchImpl = fetch, timeoutMs = 15000, 
 /** Developer switches the installed app never hands to its server. */
 const DEV_SWITCHES = new Set(['BKA_ALLOW_DEV_FALLBACK', 'BKA_AUTH_SECRET', 'BKA_TEST_FAST_KDF']);
 /**
+ * Variables only the shell itself is meant to set (main.js startNextServer / startScratchServer):
+ * the open file and its lock, this computer's secrets, the launch's pass and tokens, the sandbox
+ * record, backup and migration folders. A server that is not given one of them (a scratch server
+ * sets fewer than the company server) must see it unset, never a same-named value planted in this
+ * computer's environment. Deliberately kept: BKA_DATA_DIR and BKA_REPORT_EXPORT_DIR, which main.js
+ * reads from its own environment as documented overrides and always sets for the server anyway,
+ * and BKA_NETWORK_MODE, the administrator's cap on internet use (PRIVACY.md).
+ */
+const SHELL_ONLY = new Set([
+  'BKA_FILE_KNOWN_HERE',
+  'BKA_DEVICE_VAULT',
+  'BKA_PROXY_SECRET',
+  'BKA_LAUNCH_PASS',
+  'BKA_INTERNAL_TOKEN',
+  'BKA_SANDBOX_DIR',
+  'BKA_SANDBOX_REAL_DIR',
+  'BKA_COMPANY_SEALED',
+  'BKA_COMPANY_FILE',
+  'BKA_COMPANY_STATE',
+  'BKA_COMPANY_LOCK',
+  'BKA_COMPANY_LOCK_TOKEN',
+  'BKA_OFFLINE',
+  'BKA_SANDBOX',
+  'BKA_SANDBOX_ROOT',
+  'BKA_REAL_COMPANY_FILE',
+  'BKA_MIGRATIONS_DIR',
+  'BKA_BACKUP_DIR',
+  'BKA_BACKUP_INTERVAL_HOURS',
+]);
+/**
  * NODE_* settings about reaching the internet through a company network (extra certificate
  * authorities, the system's certificates, a proxy): kept, they are not debugging switches.
+ * (The packaged Ironbooks.exe itself ignores NODE_EXTRA_CA_CERTS while its nodeOptions fuse is off:
+ * package.json build.electronFuses, test/security4.fuses.test.ts.)
  */
 const NODE_KEPT = new Set(['NODE_EXTRA_CA_CERTS', 'NODE_USE_SYSTEM_CA', 'NODE_USE_ENV_PROXY']);
 
 /**
  * The part of this process's environment the app server inherits. Development runs pass
- * everything on; the installed app drops the developer switches above and every NODE_* variable
- * (NODE_OPTIONS can load code into the server or open a debugger) except NODE_KEPT. Names are
- * compared without regard to case, as Windows does. Everything the shell sets for the server
- * itself is added afterwards (main.js), so nothing it needs is lost here.
+ * everything on; the installed app drops the developer switches above, the variables only the
+ * shell sets (SHELL_ONLY) and every NODE_* variable (NODE_OPTIONS can load code into the server or
+ * open a debugger) except NODE_KEPT. Names are compared without regard to case, as Windows does.
+ * Everything the shell sets for the server itself is added afterwards (main.js), so nothing it
+ * needs is lost here.
  */
 function inheritedServerEnv(env, { packaged }) {
   const out = { ...env };
   if (!packaged) return out;
   for (const key of Object.keys(out)) {
     const k = key.toUpperCase();
-    if (DEV_SWITCHES.has(k) || (k.startsWith('NODE_') && !NODE_KEPT.has(k))) delete out[key];
+    if (DEV_SWITCHES.has(k) || SHELL_ONLY.has(k) || (k.startsWith('NODE_') && !NODE_KEPT.has(k))) delete out[key];
   }
   return out;
 }
@@ -110,4 +144,5 @@ module.exports = {
   handshakeProof,
   isOwnServer,
   inheritedServerEnv,
+  SHELL_ONLY,
 };

@@ -45,10 +45,8 @@ export async function PATCH(req: NextRequest) {
     if (!parsed.success) {
       return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     }
-    // The current password travels beside the validated fields (never logged, never stored).
-    const raw = body as { currentPassword?: unknown } | null;
-    const currentPassword = typeof raw?.currentPassword === 'string' ? raw.currentPassword : undefined;
-    const settings = await setClosingDate(ctx, { ...parsed.data, currentPassword });
+    // currentPassword is one of the validated fields (never logged, never stored).
+    const settings = await setClosingDate(ctx, parsed.data);
     return NextResponse.json(settings);
   } catch (err) {
     return errorResponse(err);

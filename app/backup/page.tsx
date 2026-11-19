@@ -32,6 +32,8 @@ interface RestoreCompanyResult {
   companyId: string;
   name: string;
   tableCounts: Record<string, number>;
+  /** Plain-language notes from the restore (e.g. internet services left switched off). */
+  notices?: string[];
 }
 
 interface CondenseResult {
@@ -294,6 +296,7 @@ export default function BackupPage() {
       }
       const result = (await res.json()) as RestoreCompanyResult;
       toast(`Restored as new company "${result.name}". Switch to it from the company picker.`, 'success');
+      if (result.notices?.length) toast(result.notices.join(' '), 'info');
       setCompanyRestoreModalOpen(false);
       setPendingCompanyFile(null);
       await loadCompanies();

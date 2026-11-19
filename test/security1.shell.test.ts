@@ -220,6 +220,47 @@ describe('2.8: developer switches stay out of the installed app', () => {
       expect(body).not.toMatch(/\.\.\.process\.env,/);
     }
   });
+
+  // The variables only the shell sets. A scratch server sets fewer of them than the company
+  // server; one it does not set must arrive unset, not as a value planted in the PC's environment.
+  const SHELL_ONLY = [
+    'BKA_FILE_KNOWN_HERE', 'BKA_DEVICE_VAULT', 'BKA_PROXY_SECRET', 'BKA_LAUNCH_PASS', 'BKA_INTERNAL_TOKEN',
+    'BKA_SANDBOX_DIR', 'BKA_SANDBOX_REAL_DIR', 'BKA_COMPANY_SEALED', 'BKA_COMPANY_FILE', 'BKA_COMPANY_STATE',
+    'BKA_COMPANY_LOCK', 'BKA_COMPANY_LOCK_TOKEN', 'BKA_OFFLINE', 'BKA_SANDBOX', 'BKA_SANDBOX_ROOT',
+    'BKA_REAL_COMPANY_FILE', 'BKA_MIGRATIONS_DIR', 'BKA_BACKUP_DIR', 'BKA_BACKUP_INTERVAL_HOURS',
+  ];
+  /** The names a server's env object in main.js sets itself (`NAME:` keys after the inherited part). */
+  const setByShell = (sig: string) => {
+    const body = fnBody(sig);
+    const after = body.slice(body.indexOf('...localServer.inheritedServerEnv('));
+    return new Set([...after.matchAll(/^\s*(BKA_[A-Z_]+):/gm)].map((m) => m[1]));
+  };
+
+  it('the installed app never inherits a variable only the shell sets', () => {
+    const planted: Record<string, string> = { PATH: 'C:\\Windows', BKA_NETWORK_MODE: 'offline', BKA_DATA_DIR: 'D:\\Books', BKA_REPORT_EXPORT_DIR: 'D:\\Exports' };
+    for (const k of SHELL_ONLY) planted[k] = 'planted';
+    planted.bka_file_known_here = 'C:\\crafted'; // Windows names are not case-sensitive
+    expect([...localServer.SHELL_ONLY].sort()).toEqual([...SHELL_ONLY].sort());
+    const env = localServer.inheritedServerEnv(planted, { packaged: true });
+    expect(env).toEqual({ PATH: 'C:\\Windows', BKA_NETWORK_MODE: 'offline', BKA_DATA_DIR: 'D:\\Books', BKA_REPORT_EXPORT_DIR: 'D:\\Exports' });
+    expect(localServer.inheritedServerEnv(planted, { packaged: false })).toEqual(planted);
+  });
+
+  it('nothing is lost: the company server sets every one of them itself, and main.js never reads them as overrides', () => {
+    const company = setByShell('async function startNextServer() {');
+    for (const k of SHELL_ONLY) expect(company.has(k), `company server sets ${k}`).toBe(true);
+    // The scratch server sets what it needs; the rest now arrive unset there.
+    const scratch = setByShell('async function startScratchServer(dataDir) {');
+    for (const k of ['BKA_DATA_DIR', 'BKA_COMPANY_FILE', 'BKA_DEVICE_VAULT', 'BKA_INTERNAL_TOKEN', 'BKA_LAUNCH_PASS', 'BKA_PROXY_SECRET', 'BKA_MIGRATIONS_DIR', 'BKA_OFFLINE']) {
+      expect(scratch.has(k), `scratch server sets ${k}`).toBe(true);
+    }
+    expect(scratch.has('BKA_FILE_KNOWN_HERE')).toBe(false); // the gap this closes
+    // The documented overrides main.js does read are not in the list (they would be dropped).
+    const readByMain = new Set([...main.matchAll(/process\.env\.(BKA_[A-Z_]+)/g)].map((m) => m[1]));
+    expect(readByMain.has('BKA_DATA_DIR')).toBe(true);
+    expect(readByMain.has('BKA_REPORT_EXPORT_DIR')).toBe(true);
+    for (const k of SHELL_ONLY) expect(readByMain.has(k), `main.js reads ${k} from its environment`).toBe(false);
+  });
 });
 
 describe('4.1: the request filter', () => {

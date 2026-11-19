@@ -35,7 +35,8 @@ crash reporting. The app's built-in server listens only on this computer (`127.0
 connection it makes goes through one network policy (Offline, local network and tailnet, or
 cloud services you switch on one at a time), and the desktop window loads only the app itself,
 with Chromium's sandbox and a strict Content-Security-Policy. [`PRIVACY.md`](./PRIVACY.md) lists
-everything that can leave the computer and the switch for each.
+everything that can leave the computer and the switch for each. Saved keys for outside services
+(AI providers, the mail server password) are kept for the Windows account that entered them.
 
 A company file can be protected with a password. The file is then encrypted with a random key
 that only its users' passwords, challenge answers or its recovery key can unlock, and its

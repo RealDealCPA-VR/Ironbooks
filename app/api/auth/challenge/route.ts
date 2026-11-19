@@ -4,8 +4,9 @@
  *  POST /api/auth/challenge  { currentPassword, question, answer } -> { ok: true, question }
  *
  * Setting it needs the current password (like changing the password), rate-limited like sign-in.
- * In a company file protected with passwords the answer also gets its own key slot
- * (lib/services/fileProtection.ts), so "I forgot my password" can open the file on any computer.
+ * In a company file protected with passwords a long enough answer also gets its own key slot
+ * (lib/services/fileProtection.ts), so "I forgot my password" can open the file on a computer that
+ * has opened it before; anywhere else the file opens with a password or the recovery key.
  * The answer is stored hashed (lib/challengeQuestions.ts normalizes case and spacing). Acts on
  * the USER, so it goes through getSessionGate ('self' in lib/permissions/routes.ts).
  */

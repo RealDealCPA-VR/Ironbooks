@@ -17,6 +17,7 @@ import fs from 'node:fs';
 import * as schema from './schema';
 import { instrumentDb } from './txHooks';
 import { translatePgErrors } from './pgErrors';
+import { installDriverErrors } from './driverErrors';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { ServiceError } from '@/lib/services/errors';
 import { OPEN_BLOCKING, checkLedgerHealth, ensureLedgerGuards, type LedgerProblem } from './ledgerGuards';
@@ -29,6 +30,10 @@ export { CompanyFileInUseError, LOCK_FILE } from './dirLock';
 export { isSealedDir, sealedMode, withSealedAccess } from './sealed';
 
 export type DB = PgliteDatabase<typeof schema>;
+
+// Query errors reach the app as Postgres raised them (ServiceErrors from translatePgErrors, the
+// ledger guards' codes), never wrapped by drizzle (lib/db/driverErrors.ts).
+installDriverErrors();
 
 interface DbHandle {
   client: PGlite;
