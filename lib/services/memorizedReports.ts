@@ -23,6 +23,7 @@ import { requireActivity, requirePermission, resolveAccess } from './access';
 import { reportActivity } from '@/lib/reports/catalog';
 import { requireAnyReportAccess } from './reportsAccess';
 import { assertNotSandbox } from './sandboxState';
+import { internetHeldHere } from '@/lib/net/fileTrust';
 import { sendMail } from './email';
 import { getCompany, getPreferences } from './company';
 import { fillMergeFields } from '@/lib/preferences';
@@ -671,10 +672,17 @@ export async function deleteReportSchedule(ctx: ServiceContext, id: string) {
 export interface ScheduleRunResult {
   scheduleId: string;
   name: string;
-  status: 'ok' | 'partial' | 'failed' | 'skipped';
+  status: 'ok' | 'partial' | 'failed' | 'skipped' | 'held';
   files: string[];
   message?: string;
 }
+
+/**
+ * Why a schedule that emails waits in a company file this computer has not approved
+ * (lib/net/fileTrust.ts). Recorded once as the schedule's last result; the run stays due.
+ */
+export const SCHEDULE_HELD_MESSAGE =
+  'Held: internet services are off for this file on this computer. An Admin here can allow them in Settings → Privacy & Network; the schedule then runs by itself.';
 
 /**
  * Run every active schedule whose next run is due (≤ now): run its report(s), write the export
@@ -691,6 +699,12 @@ export interface ScheduleRunResult {
  *  - A signed-in user ("Run due reports now"): that user's access. A schedule that would run a
  *    report the user can't view is skipped and left due (not marked failed, nextRunAt unchanged),
  *    so the timer or its owner still runs it and that period's export is not lost.
+ *
+ * In a company file this computer has not approved (lib/net/fileTrust.ts: it came from another
+ * computer), a schedule that emails is held: its recipients were chosen wherever the file came
+ * from, and it runs with nobody at the keyboard. It is not run and stays due (nextRunAt unchanged),
+ * "held" is recorded once (not rewritten every time the timer asks), and the first run after an
+ * Admin here allows the file runs it like any other. Schedules that only save files run as before.
  */
 export async function runDueSchedules(
   ctx: ServiceContext,
@@ -706,6 +720,7 @@ export async function runDueSchedules(
     .where(and(eq(reportSchedules.companyId, ctx.companyId), eq(reportSchedules.isActive, true), lte(reportSchedules.nextRunAt, now)));
   const results: ScheduleRunResult[] = [];
   const creatorAccess = new Map<string, EffectiveAccess | null>();
+  let heldHere: boolean | undefined;
   for (const s of due) {
     if (ctx.access && !canRunReportTypes(ctx.access, await scheduleReportTypes(ctx, s))) {
       results.push({
@@ -715,6 +730,19 @@ export async function runDueSchedules(
         files: [],
         message: 'You do not have permission to run this report. It stays due and will run for someone who can.',
       });
+      continue;
+    }
+    if (s.emailTo && (heldHere ??= await internetHeldHere(ctx.db))) {
+      if (s.lastStatus !== 'held') {
+        await inTransaction(ctx, async (tx) => {
+          await tx.db
+            .update(reportSchedules)
+            .set({ lastRunAt: now, lastStatus: 'held', lastMessage: SCHEDULE_HELD_MESSAGE })
+            .where(eq(reportSchedules.id, s.id));
+          await writeAudit(tx, { action: 'update', entityType: 'report_schedule', entityId: s.id, newValues: { held: now, reason: SCHEDULE_HELD_MESSAGE } });
+        });
+      }
+      results.push({ scheduleId: s.id, name: s.name, status: 'held', files: [], message: SCHEDULE_HELD_MESSAGE });
       continue;
     }
     const files: string[] = [];

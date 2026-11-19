@@ -202,8 +202,13 @@ its passwords — and nobody else:
 - *Upgrading*: a file without passwords opens as before; an Admin signing in is offered "Protect
   this company file with passwords". Users who have not signed in since are listed as "needs to
   sign in once, or an Admin resets their password".
-- *Nothing machine-bound*: stored AI provider keys are sealed with a vault secret inside the file
-  (`lib/ai/keyVault.ts`); only the session-signing key (`.auth-secret`) is per computer.
+- *Saved keys of outside services*: in a protected file, AI provider keys, the
+  ChatGPT sign-in and the mail password are sealed with a vault secret inside the encrypted file
+  (`lib/ai/keyVault.ts`), so they keep working on every computer that opens it. In a file without
+  passwords they are sealed for the Windows account that entered them instead (a device secret in
+  the shell's `userData`, `electron/deviceVault.js`) and do not work from a copy of the file on
+  another computer: there they are set up once. The session-signing key (`.auth-secret`) is per
+  computer either way.
 
 **Older company folders** (`*.ironbooks` folders from earlier versions) still open (File > Open
 Company Folder (Older Format)); File > Save as a Single Company File converts one.

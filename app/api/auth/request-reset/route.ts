@@ -24,6 +24,9 @@
  * has its own key slot, so the answer is what opens the file here too — before the sign-in, while
  * the server is sealed (lib/db/sealed.ts), the question comes from the file's slots and the right
  * answer decrypts the file; then the reset goes on as usual (and the new password gets its slot).
+ * Those slots are readable only on a computer that has opened the file before (security plan 2.4:
+ * an encrypted challenge set, lib/services/fileProtection.ts); on any other computer the answer is
+ * that the file opens there with a password or the recovery key.
  * Without a challenge question, a protected file can only be reopened by an Admin resetting the
  * password or with the recovery key (/api/auth/recover) — never by the single-user rule.
  */
@@ -37,13 +40,14 @@ import { getFileLockStatus } from '@/lib/services/fileLock';
 import { originFromHeaders } from '@/lib/net/requestInfo';
 import { GLOBAL_KEY_WEIGHT, attemptKeys, resetLimiter, tooManyResets } from '@/lib/net/rateLimit';
 import { invalidJsonBody, readJsonObject } from '@/lib/routeErrors';
-import { normalizeChallengeAnswer } from '@/lib/challengeQuestions';
+import { CHALLENGE_NOT_ON_THIS_COMPUTER_TEXT, normalizeChallengeAnswer } from '@/lib/challengeQuestions';
 import { challengeLockRemainingMs, clearChallengeFailures, recordChallengeFailure } from '@/lib/services/challengeLockout';
 import { newResetToken, storedResetToken, type ResetVia } from '@/lib/services/passwordReset';
 import {
   finishKeyUnseal,
   loadKeyFromChallenge,
   readProtection,
+  sealedChallengeNotHere,
   sealedChallengeQuestion,
   unlockFromFile,
   unsealCompanyFile,
@@ -99,6 +103,12 @@ export async function POST(req: NextRequest) {
       if (!offlineLocal) {
         fail();
         return { response: NextResponse.json(generic) };
+      }
+      // The file keeps its challenge slots in a set only the computers that opened it can read
+      // (security plan 2.4), and this is not one of them: the same answer for every user name.
+      if (sealedChallengeNotHere()) {
+        fail();
+        return { response: NextResponse.json({ error: CHALLENGE_NOT_ON_THIS_COMPUTER_TEXT, code: 'FORBIDDEN' }, { status: 403 }) };
       }
       const question = sealedChallengeQuestion(email);
       if (!question) {

@@ -35,6 +35,11 @@ interface LogEntry {
   allowed: boolean;
   reason: string;
 }
+interface HeldService {
+  purpose: string;
+  label: string;
+  hosts: string[];
+}
 interface PolicyResponse {
   policy: { mode: Mode; cloudOptIn: Record<Purpose, boolean>; vendorLookupUrl: string | null };
   canEdit: boolean;
@@ -43,6 +48,11 @@ interface PolicyResponse {
   ceiling: Mode | null;
   effectiveMode: Mode;
   purposes: PurposeRow[];
+  /** The company file came from another computer with internet services on: held here until allowed. */
+  heldForThisComputer?: boolean;
+  heldServices?: HeldService[];
+  /** An Admin at this computer may allow them. */
+  canAllowHere?: boolean;
   recent: LogEntry[];
 }
 
@@ -80,6 +90,7 @@ export default function PrivacyNetworkPage() {
   });
   const [lookupUrl, setLookupUrl] = useState('');
   const [saving, setSaving] = useState(false);
+  const [allowing, setAllowing] = useState(false);
   // A failed first load shows "could not be loaded / Try again" instead of an endless skeleton.
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -132,6 +143,20 @@ export default function PrivacyNetworkPage() {
     }
   }
 
+  /** "Allow on this computer": approve the internet services this company file came with. */
+  async function allowHere() {
+    setAllowing(true);
+    try {
+      const d = await api.put<PolicyResponse>('/api/network-policy', { allowOnThisComputer: true });
+      setData(d);
+      toast('Internet services are allowed for this company file on this computer.', 'success');
+    } catch (err) {
+      toast(err instanceof ApiError ? err.message : 'Could not allow them.', 'danger');
+    } finally {
+      setAllowing(false);
+    }
+  }
+
   if (!data) {
     return (
       <div className="p-8 max-w-4xl mx-auto w-full">
@@ -146,6 +171,34 @@ export default function PrivacyNetworkPage() {
   return (
     <div className="p-8 max-w-4xl mx-auto w-full">
       <PageHeader title="Privacy & Network" icon={Network} />
+
+      {data.heldForThisComputer && (
+        <Card className="p-5 mb-6">
+          <p className="text-sm text-navy">
+            This company file came from another computer with internet services already switched on.
+            Ironbooks is keeping them off on this computer until you allow them.
+          </p>
+          <ul className="text-sm text-navy/70 mt-2 space-y-0.5">
+            {(data.heldServices ?? []).map((s) => (
+              <li key={s.purpose}>
+                {s.label}
+                {s.hosts.length > 0 && <span className="font-mono text-xs text-navy/60">: {s.hosts.join(', ')}</span>}
+              </li>
+            ))}
+          </ul>
+          {data.canAllowHere ? (
+            <div className="mt-3">
+              <Button variant="secondary" loading={allowing} onClick={allowHere}>
+                Allow on this computer
+              </Button>
+            </div>
+          ) : (
+            <p className="text-xs text-navy/50 mt-2">
+              An owner or admin can allow them on the computer that holds the company file.
+            </p>
+          )}
+        </Card>
+      )}
 
       <Card className="p-6 mb-6">
         <p className="text-navy font-semibold">Your books stay on this computer.</p>

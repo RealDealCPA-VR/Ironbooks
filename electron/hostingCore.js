@@ -20,6 +20,16 @@
 
 const DEFAULT_HOSTING_PORT = 47800;
 
+/**
+ * The multi-user proxy's per-launch secret (lib/net/loopbackHost.ts): the shell hands it to every
+ * server it starts in this environment variable, and the proxy stamps it on every request it
+ * forwards in this header, so the app server can tell the proxy from another program on this
+ * computer that sends x-bka-remote-addr itself. The names must match that module
+ * (lib/net/security3.proxySecret.test.ts).
+ */
+const PROXY_SECRET_ENV = 'BKA_PROXY_SECRET';
+const PROXY_SECRET_HEADER = 'x-bka-proxy-secret';
+
 function parseIPv4(s) {
   if (typeof s !== 'string') return null;
   const parts = s.split('.');
@@ -513,6 +523,8 @@ function rewriteUpstreamLocation(location, upstreamPort, { secure, host }) {
 
 module.exports = {
   DEFAULT_HOSTING_PORT,
+  PROXY_SECRET_ENV,
+  PROXY_SECRET_HEADER,
   rewriteUpstreamLocation,
   parseIPv4,
   inCidr4,

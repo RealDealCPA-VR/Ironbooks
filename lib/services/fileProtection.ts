@@ -13,6 +13,17 @@
  * into the company file's plain manifest, so the file opens on any computer with a fresh install
  * for anyone who knows one of those secrets — and for nobody else.
  *
+ * Challenge slots are the exception (security plan 2.4): an answer is a few words to a question
+ * from a fixed list, so a challenge slot anyone can read from a copy of the file could be guessed
+ * offline. Where this server has a device secret (the desktop app: lib/ai/keyVault.ts deviceKey),
+ * every save writes them into one encrypted challenge set instead (electron/fileCrypto.js
+ * sealChallengeSet), under the file's random challenge key (file_secrets 'challenge-key', inside
+ * the encrypted books), which the manifest carries only wrapped for each computer that has saved
+ * the file. The answer then opens the file on those computers (each adds its own entry when it
+ * saves); elsewhere the password or the recovery key does. Without a device secret (tests,
+ * `next dev`, scripts, Linux without a keyring) the challenge slots are written in plain text
+ * exactly as before — a copy of such a file can still be attacked through them.
+ *
  * Keeping the slots in sync (every path that sets a secret calls in here):
  *   sign-in                       refreshSlotAtSignIn (creates a missing slot, re-wraps a stale one)
  *   password change / reset /     syncPasswordSlot (lib/services/passwordPolicy.ts storeUserPassword)
@@ -50,7 +61,8 @@ import format from '@/electron/companyFileFormat';
 import session from '@/electron/companySession';
 import { getDb, resolveDataDir, shippedSchemaStamp, withDamagedFileAccess, type DB } from '@/lib/db';
 import { markUnsealed, sealedDataDir, sealedMode } from '@/lib/db/sealed';
-import { companies, fileKeySlots, fileProtection, userCompanies, users } from '@/lib/db/schema';
+import { companies, fileKeySlots, fileProtection, fileSecrets, userCompanies, users } from '@/lib/db/schema';
+import { deviceKey } from '@/lib/ai/keyVault';
 import { verifyPassword } from '@/lib/auth';
 import { challengeAnswerOpensFile, normalizeChallengeAnswer } from '@/lib/challengeQuestions';
 import { APP_VERSION } from '@/lib/appVersion';
@@ -101,13 +113,16 @@ interface KeyState {
   rotate: Set<string>;
   /** Every file key held in this process by its key check (a slot made just before a key change finds the new key). */
   byCheck: Map<string, Buffer>;
+  /** The last challenge set seen or written, by its challenge key id (other computers' entries are kept from it). */
+  challengeSets: Map<string, Record<string, unknown>>;
 }
 
 const g = globalThis as typeof globalThis & { __ironbooksFileKeys?: KeyState };
 function keyState(): KeyState {
-  g.__ironbooksFileKeys ??= { keys: new Map(), cache: new Map(), unseal: null, conflictCopy: null, rotate: new Set(), byCheck: new Map() };
+  g.__ironbooksFileKeys ??= { keys: new Map(), cache: new Map(), unseal: null, conflictCopy: null, rotate: new Set(), byCheck: new Map(), challengeSets: new Map() };
   g.__ironbooksFileKeys.rotate ??= new Set();
   g.__ironbooksFileKeys.byCheck ??= new Map();
+  g.__ironbooksFileKeys.challengeSets ??= new Map();
   return g.__ironbooksFileKeys;
 }
 
@@ -149,7 +164,7 @@ export function forgetFileKey(dataDir: string): void {
 
 /** Tests: forget every key. */
 export function forgetFileKeys(): void {
-  g.__ironbooksFileKeys = { keys: new Map(), cache: new Map(), unseal: null, conflictCopy: null, rotate: new Set(), byCheck: new Map() };
+  g.__ironbooksFileKeys = { keys: new Map(), cache: new Map(), unseal: null, conflictCopy: null, rotate: new Set(), byCheck: new Map(), challengeSets: new Map() };
 }
 
 function writeMarker(dataDir: string, keyCheck: string): void {
@@ -277,9 +292,127 @@ export async function sealProtectionFor(db: DB, dataDir: string = resolveDataDir
   if (!key || fileCrypto.keyCheckOf(key) !== prot.keyCheck) {
     throw new ServiceError('FORBIDDEN', KEY_MISSING_MESSAGE, { fileKeyMissing: true });
   }
-  const sp: SealProtection = { fileKey: key, keyCheck: prot.keyCheck, lookupSalt: prot.lookupSalt, slots: await manifestSlots(db, prot.lookupSalt) };
+  const slots = await withChallengeSet(db, await manifestSlots(db, prot.lookupSalt));
+  const sp: SealProtection = { fileKey: key, keyCheck: prot.keyCheck, lookupSalt: prot.lookupSalt, slots };
   keyState().cache.set(dirKey(dataDir), sp);
   return sp;
+}
+
+// ---------------------------------------------------------------------------
+// Challenge slots tied to the computers that have opened the file (security plan 2.4)
+// ---------------------------------------------------------------------------
+
+/** The file_secrets row holding the file's challenge key (random, 32 bytes as hex). */
+export const CHALLENGE_KEY_NAME = 'challenge-key';
+
+const HEX_KEY = /^[0-9a-f]{64}$/i;
+
+async function readChallengeKey(db: DB): Promise<Buffer | null> {
+  const [row] = await db.select({ secret: fileSecrets.secret }).from(fileSecrets).where(eq(fileSecrets.name, CHALLENGE_KEY_NAME));
+  const hex = row?.secret?.trim() ?? '';
+  return HEX_KEY.test(hex) ? Buffer.from(hex, 'hex') : null;
+}
+
+/**
+ * The file's challenge key, created on first need (concurrent callers agree). It lives inside the
+ * encrypted books, so it travels with the file, its backups and the owner's portable file — never
+ * with a copy for someone outside the company (lib/services/portableFile.ts leaves file_secrets out).
+ */
+async function ensureChallengeKey(db: DB): Promise<Buffer | null> {
+  const [row] = await db.select({ secret: fileSecrets.secret }).from(fileSecrets).where(eq(fileSecrets.name, CHALLENGE_KEY_NAME));
+  if (row && HEX_KEY.test(row.secret.trim())) return Buffer.from(row.secret.trim(), 'hex');
+  const fresh = fileCrypto.newChallengeKey().toString('hex');
+  if (row) {
+    // Not a key at all (damaged): replaced — the challenge sets made with it could not be opened anyway.
+    await db.update(fileSecrets).set({ secret: fresh }).where(and(eq(fileSecrets.name, CHALLENGE_KEY_NAME), eq(fileSecrets.secret, row.secret)));
+  } else {
+    await db.insert(fileSecrets).values({ name: CHALLENGE_KEY_NAME, secret: fresh }).onConflictDoNothing();
+  }
+  return readChallengeKey(db);
+}
+
+/**
+ * Before a save takes its snapshot (lib/services/companyFileSave.ts): a protected file saved on a
+ * computer with a device secret has its challenge key in the database, so the save that first
+ * writes a challenge set also carries the key that opens it. Best effort; never throws (the save
+ * goes on, and sealProtectionFor tries again).
+ */
+export async function ensureChallengeKeyForSave(db: DB, dataDir: string = resolveDataDir()): Promise<void> {
+  try {
+    if (!deviceKey()) return;
+    const prot = await readProtection(db);
+    const key = fileKeyFor(dataDir);
+    if (!prot || !key || fileCrypto.keyCheckOf(key) !== prot.keyCheck) return;
+    await ensureChallengeKey(db);
+  } catch {
+    /* sealProtectionFor tries again */
+  }
+}
+
+/**
+ * The challenge set of the company file as it is on disk when it wraps the challenge key `id` —
+ * so every other computer's entry is kept when this one saves — else the last one seen or written
+ * here for that key (the file can't be read right now, or this is a copy). Null: none.
+ */
+function challengeSetToKeep(id: string): Record<string, unknown> | null {
+  const file = companyFileForProtection();
+  if (file) {
+    const m = format.readCompanyManifest(file) as Record<string, any> | null;
+    const set = m && format.isSealedManifest(m) ? fileCrypto.challengeSetOf(m.encryption) : null;
+    if (set && set.id === id) return set;
+  }
+  return keyState().challengeSets.get(id) ?? null;
+}
+
+/**
+ * The slot list a save, a backup or a copy writes. With a device secret here, the challenge slots
+ * go into one challenge set (their questions and lookup tags included), under the file's challenge
+ * key, with this computer's entry added or refreshed and other computers' entries kept — never in
+ * plain text. A set is written even when nobody has a challenge slot, so the file does not say
+ * whether anyone has. Without a device secret: the list as it is, exactly as before.
+ */
+async function withChallengeSet(db: DB, slots: Array<Record<string, unknown>>): Promise<Array<Record<string, unknown>>> {
+  const dk = deviceKey();
+  if (!dk) return slots;
+  const others = slots.filter((s) => s.kind !== 'challenge');
+  let challengeKey: Buffer | null = null;
+  try {
+    challengeKey = await ensureChallengeKey(db);
+  } catch {
+    challengeKey = null;
+  }
+  // The challenge key can't be read or made (a damaged or read-only database): this write has no
+  // challenge route — never plain challenge slots. The password and the recovery key open it.
+  if (!challengeKey) return others;
+  try {
+    const id = fileCrypto.challengeKeyId(challengeKey);
+    const set = fileCrypto.sealChallengeSet({
+      challengeKey,
+      slots: slots.filter((s) => s.kind === 'challenge'),
+      device: dk,
+      keep: challengeSetToKeep(id),
+    }) as Record<string, unknown>;
+    keyState().challengeSets.set(id, set);
+    return [...others, set];
+  } catch {
+    // Never in the way of a save: this write just has no challenge route.
+    return others;
+  }
+}
+
+/**
+ * The challenge slots of a sealed manifest's encryption block as THIS computer can read them: from
+ * its challenge set (this computer's entry opens it), or the plain ones of a file saved by an older
+ * version or without a device secret. Null when the file has a challenge set this computer can't
+ * open — never saved here, no device secret here, or the set was damaged or changed: the challenge
+ * route does not open the file on this computer (the password and the recovery key do).
+ */
+function readableChallengeSlots(enc: Record<string, any> | null | undefined): Array<Record<string, any>> | null {
+  if (!enc || typeof enc !== 'object') return null;
+  const set = fileCrypto.challengeSetOf(enc);
+  if (!set) return fileCrypto.plainChallengeSlots(enc);
+  const dk = deviceKey();
+  return dk ? fileCrypto.openChallengeSet(set, dk) : null;
 }
 
 /**
@@ -1040,16 +1173,39 @@ export async function unlockFromFile(input: { kind: 'password' | 'challenge' | '
     await fileCrypto.burnKdf(input.secret);
     return null;
   }
+  if (input.kind === 'challenge') {
+    // The challenge slots as this computer can read them (security plan 2.4); then exactly as before.
+    const slots = readableChallengeSlots(m.encryption);
+    if (!slots) {
+      await fileCrypto.burnKdf(input.secret, 'challenge');
+      return null;
+    }
+    return fileCrypto.unlockWith({ ...m.encryption, slots }, { kind: 'challenge', login: input.login ?? null, secret });
+  }
   return fileCrypto.unlockWith(m.encryption, { kind: input.kind, login: input.login ?? null, secret });
 }
 
-/** The challenge question of a user, from the sealed file's slots (null when they have none). */
+/** The challenge question of a user, from the sealed file's slots as this computer can read them (null when none). */
 export function sealedChallengeQuestion(login: string): string | null {
   const m = sealedManifest();
   if (!m) return null;
+  const slots = readableChallengeSlots(m.encryption);
+  if (!slots) return null;
   const tag = fileCrypto.lookupTag(m.encryption.lookupSalt, login);
-  const [slot] = fileCrypto.findSlots(m.encryption, 'challenge', tag);
+  const [slot] = fileCrypto.findSlots({ slots }, 'challenge', tag);
   return slot && typeof slot.question === 'string' ? slot.question : null;
+}
+
+/**
+ * True when the sealed company file keeps its challenge slots in a challenge set this computer
+ * can't open (security plan 2.4): the file was never saved here, there is no device secret here,
+ * or the set was damaged. "I forgot my password" then says the file opens here with a password or
+ * the recovery key (lib/challengeQuestions.ts CHALLENGE_NOT_ON_THIS_COMPUTER_TEXT) — the same for
+ * every user name, so it tells nobody who has a question.
+ */
+export function sealedChallengeNotHere(): boolean {
+  const m = sealedManifest();
+  return Boolean(m && readableChallengeSlots(m.encryption) === null);
 }
 
 /**
@@ -1170,13 +1326,27 @@ async function doUnseal(fileKey: Buffer): Promise<void> {
   } catch {
     /* not loaded */
   }
+  const set = fileCrypto.challengeSetOf(m.encryption);
+  if (set && typeof set.id === 'string') keyState().challengeSets.set(set.id, set);
   const db = await getDb(dataDir);
-  await adoptManifestProtection(db, protection);
+  await adoptManifestProtection(db, { ...protection, slots: slotsToAdopt(m.encryption) });
   await sealProtectionFor(db, dataDir).catch(() => null);
   // Damaged copies of these books that had to be kept in plain text (nobody had signed in yet):
   // encrypted now that the key is known (lib/services/workingCopyRecovery.ts).
   const { sealKeptDamagedCopies } = await import('./workingCopyRecovery');
   await sealKeptDamagedCopies(dataDir, protection, m.companyName);
+}
+
+/**
+ * The manifest slots a database adopts (adoptManifestProtection): a file with a challenge set gives
+ * its challenge slots as this computer can read them (none when it can't: those users set their
+ * question again); any other file its slot list exactly as before.
+ */
+function slotsToAdopt(enc: Record<string, any>): Array<Record<string, unknown>> {
+  const all: Array<Record<string, unknown>> = Array.isArray(enc.slots) ? enc.slots : [];
+  if (!fileCrypto.challengeSetOf(enc)) return all;
+  const rest = all.filter((s) => !fileCrypto.isChallengeSet(s) && !(s && s.kind === 'challenge'));
+  return [...rest, ...(readableChallengeSlots(enc) ?? [])];
 }
 
 /**

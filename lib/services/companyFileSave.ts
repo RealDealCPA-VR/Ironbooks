@@ -41,7 +41,15 @@ import { sealedMode } from '@/lib/db/sealed';
 import { currentFingerprint } from './backupFingerprint';
 import { BACKUP_HISTORY_FILE } from './backupHistory';
 import { isRestoreInProgress, whenRestoreDone } from './restoreState';
-import { KEY_MISSING_MESSAGE, applyPendingKeyRotation, cachedSealProtection, fileKeyRotationPending, sealProtectionFor, type SealProtection } from './fileProtection';
+import {
+  KEY_MISSING_MESSAGE,
+  applyPendingKeyRotation,
+  cachedSealProtection,
+  ensureChallengeKeyForSave,
+  fileKeyRotationPending,
+  sealProtectionFor,
+  type SealProtection,
+} from './fileProtection';
 import { APP_VERSION } from '@/lib/appVersion';
 import { UnstartableBooksError, isRecoveryInProgress, snapshotProblem, whenRecoveryDone } from './workingCopyRecovery';
 
@@ -502,6 +510,16 @@ async function doSave(s: SaveState, opts: { force?: boolean; final?: boolean }):
         rotated = Boolean((await applyPendingKeyRotation(await withDamagedFileAccess(() => getDb(dataDir)), dataDir))?.rotated);
       } catch (err) {
         console.warn('[company-file] could not change the file key (saving with the current one):', (err as Error).message);
+      }
+    }
+    // A protected file saved on a computer with a device secret writes its challenge slots inside a
+    // challenge set opened by the file's challenge key (security plan 2.4): that key goes into the
+    // database BEFORE the snapshot, so the save that first wraps it for this computer carries it too.
+    if (workingCopyActive(s) && isDbOpen(dataDir)) {
+      try {
+        await ensureChallengeKeyForSave(await withDamagedFileAccess(() => getDb(dataDir)), dataDir);
+      } catch {
+        /* never in the way of the save: sealProtectionFor tries again */
       }
     }
     // A checkpoint writes the database's pending changes into its table files, so the saved

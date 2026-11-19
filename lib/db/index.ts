@@ -482,6 +482,18 @@ export function openDb(dataDir?: string): DbHandle {
         console.warn('[db] could not move saved keys to this computer:', (err as Error)?.message ?? err);
       }
     }
+    // Internet services of a company file are held until this computer approves it
+    // (lib/net/fileTrust.ts): a file this computer already knew before (named by the desktop shell)
+    // or a brand-new one is approved here at its first open. After the first-open position, so the
+    // stamp is saved to the single company file like any other change. Never blocks the open.
+    if (fs.existsSync(MIGRATIONS_FOLDER)) {
+      try {
+        const { noteFileOpenedHere } = await import('@/lib/net/fileTrust');
+        await noteFileOpenedHere(db, dir, { damaged: Boolean(opened.damage) });
+      } catch (err) {
+        console.warn('[db] could not record this computer’s approval of the company file:', (err as Error)?.message ?? err);
+      }
+    }
   })().catch(async (err) => {
     // A failed open (folder unreachable for a moment, damaged PG_VERSION, a migration that threw)
     // must not stay cached: every later request would answer this error until the app restarted,

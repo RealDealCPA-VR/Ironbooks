@@ -17,6 +17,7 @@ import { ServiceError, type ServiceContext } from '@/lib/services/_base';
 import { getNetworkPolicy } from '@/lib/services/networkPolicy';
 import { decideOutbound, isOutboundPurpose } from '@/lib/net/policy';
 import { applySandboxToDecision } from '@/lib/services/sandboxState';
+import { internetHeldHere } from '@/lib/net/fileTrust';
 import { serviceErrorStatus } from '@/lib/routeErrors';
 import { isInternalRequest } from '@/lib/net/internalToken';
 
@@ -57,8 +58,11 @@ export async function GET(req: NextRequest) {
     }
     const ctx = internal ?? (await getServerContext());
     // A question, not a connection — decided without adding to the outbound activity log.
-    // Sandbox mode: update checks and email are off in a practice copy.
-    return NextResponse.json(applySandboxToDecision(decideOutbound(await getNetworkPolicy(ctx), url, purpose)));
+    // Sandbox mode: update checks and email are off in a practice copy. A company file this
+    // computer has not approved is held to the local network and tailnet (lib/net/fileTrust.ts),
+    // as in lib/net/guard.ts; update checks — what the shell asks about — keep their own rules.
+    const heldHere = await internetHeldHere(ctx.db);
+    return NextResponse.json(applySandboxToDecision(decideOutbound(await getNetworkPolicy(ctx), url, purpose, undefined, { heldHere })));
   } catch (err) {
     if (err instanceof ServiceError) {
       const status = serviceErrorStatus(err.code);

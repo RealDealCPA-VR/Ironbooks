@@ -9,6 +9,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { cancelChatGptSignIn, chatGptSignInStatus, disconnectChatGpt, startChatGptSignIn } from '@/lib/services/chatgptSignIn';
 import { validation } from '@/lib/services/_base';
+import { approveQuietFileHere } from '@/lib/net/fileTrust';
+import { isRemoteRequest } from '@/lib/net/hostOnly';
 import { aiErrorResponse } from '../_errors';
 
 export async function GET(req: NextRequest) {
@@ -27,6 +29,7 @@ export async function POST(req: NextRequest) {
     const body = (await req.json().catch(() => ({}))) as { action?: string; attemptId?: string };
     switch (body?.action) {
       case 'start':
+        await approveQuietFileHere(ctx, { remote: isRemoteRequest(req) }).catch((err) => console.warn('[file-trust] could not approve the company file on this computer:', (err as Error)?.message ?? err));
         return NextResponse.json(await startChatGptSignIn(ctx));
       case 'cancel':
         await cancelChatGptSignIn(ctx, String(body.attemptId ?? ''));

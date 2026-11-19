@@ -19,6 +19,7 @@ import { allowCloudPurpose } from '@/lib/services/networkPolicy';
 import { getServerContext } from '@/lib/context';
 import { getPublicSettings, updateSettings, updateSettingsSchema, type AiSettingsView } from '@/lib/services/aiSettings';
 import { hostOnlyResponse, isRemoteRequest } from '@/lib/net/hostOnly';
+import { approveQuietFileHere } from '@/lib/net/fileTrust';
 import { aiErrorResponse } from '../_errors';
 
 function normUrl(u: string | null | undefined): string {
@@ -55,6 +56,7 @@ export async function PUT(req: NextRequest) {
     const remote = isRemoteRequest(req);
     const body = await req.json().catch(() => ({}));
     if (remote && changesWhereHostConnects(body, await getPublicSettings(ctx))) return hostOnlyResponse();
+    await approveQuietFileHere(ctx, { remote }).catch((err) => console.warn('[file-trust] could not approve the company file on this computer:', (err as Error)?.message ?? err));
     const view = await updateSettings(ctx, body ?? {});
     // "Allow cloud AI for this company" is one switch: it also lets AI through the company's
     // Privacy & Network policy (lib/services/networkPolicy.ts allowCloudPurpose), so nobody has

@@ -1797,7 +1797,11 @@ export const userRoleAssignments = pgTable('user_role_assignments', {
 // model, an auditable log of AI auto-applied bank categorizations, and assistant write
 // proposals awaiting human approval. See lib/ai/* and lib/services/ai*.ts.
 
-/** Per-company AI settings. API keys inside `providers` are AES-GCM ciphertext (lib/ai/keyVault). */
+/**
+ * Per-company AI settings. API keys inside `providers` are AES-GCM ciphertext (lib/ai/keyVault):
+ * sealed for the Windows account that entered them in a file without passwords, with the file's
+ * own vault secret in a file protected with passwords.
+ */
 export const aiSettings = pgTable('ai_settings', {
   id: uuid('id').primaryKey().defaultRandom(),
   companyId: uuid('company_id').references(() => companies.id).notNull().unique(),
@@ -1819,8 +1823,13 @@ export const aiSettings = pgTable('ai_settings', {
 /**
  * 0072 (review round 5): random secrets that belong to the company FILE and travel with every copy
  * of it (company file, backup, portable file) — unlike the per-computer .auth-secret, which signs
- * sessions and never leaves this computer. 'vault' encrypts stored AI provider keys
- * (lib/ai/keyVault.ts "v2:" blobs). Never used for session signing.
+ * sessions and never leaves this computer. 'vault' seals saved keys of outside services (AI
+ * provider keys, the ChatGPT sign-in, the mail password: lib/ai/keyVault.ts "v2:" blobs) only while
+ * the file is protected with passwords (the file, and so this row, is encrypted) or where this
+ * computer has no device secret. In a file without passwords those keys are sealed for the Windows
+ * account that entered them instead (device secret, electron/deviceVault.js, "v3:"), and this row
+ * is deleted once they are moved, so copies of the file carry nothing that opens them. Never used
+ * for session signing.
  */
 export const fileSecrets = pgTable('file_secrets', {
   name: varchar('name', { length: 64 }).primaryKey(),
@@ -3047,8 +3056,11 @@ export const billingGroupMembers = pgTable('billing_group_members', {
 
 /**
  * 0079 prefsperms: Send Forms mail server, stored IN the company file (Preferences > Send Forms;
- * lib/services/emailSettings.ts). `passwordEnc` is sealed with the file's vault secret
- * (lib/ai/keyVault.ts sealForFile) and never returned; one row per company.
+ * lib/services/emailSettings.ts). `passwordEnc` is never returned; it is sealed by
+ * lib/ai/keyVault.ts sealStoredSecret: for the Windows account that entered it (device secret,
+ * "v3:") in a file without passwords, so it does not work from a copy of the file on another
+ * computer; with the file's vault secret ("v2:", file_secrets) in a file protected with passwords,
+ * where it stays inside the encrypted file as before. One row per company.
  */
 export const companyEmailSettings = pgTable('company_email_settings', {
   id: uuid('id').primaryKey().defaultRandom(),

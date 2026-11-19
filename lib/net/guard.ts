@@ -7,7 +7,8 @@
  *
  * policyFetch re-checks every redirect hop (a redirect can never bounce a request from an
  * allowed host to a disallowed one). Blocked calls throw ServiceError('FORBIDDEN') with a
- * plain-English reason the UI can show as-is.
+ * plain-English reason the UI can show as-is. A company file this computer has not approved is
+ * held to the local network and tailnet here (lib/net/fileTrust.ts, policy.ts holdForThisComputer).
  *
  * A small in-memory log of recent decisions (destination host + purpose + verdict — never
  * payloads, headers or query strings) backs the "Recent network activity" list on the
@@ -18,6 +19,7 @@ import { ServiceError } from '@/lib/services/_base';
 import { getNetworkPolicy } from '@/lib/services/networkPolicy';
 import { decideOutbound, type OutboundDecision, type OutboundPurpose } from './policy';
 import { verifyTailnetUrls } from './tailnetVerify';
+import { internetHeldHere } from './fileTrust';
 import { applySandboxToDecision } from '@/lib/services/sandboxState';
 
 export type PolicyCtx = Pick<ServiceContext, 'db' | 'companyId'>;
@@ -65,10 +67,13 @@ export async function checkOutbound(
   ctx: PolicyCtx,
 ): Promise<OutboundDecision> {
   const policy = await getNetworkPolicy(ctx);
+  // A company file this computer has not approved (it came from another computer, settings and
+  // all) never reaches the public internet until an Admin here allows it (lib/net/fileTrust.ts).
+  const heldHere = await internetHeldHere(ctx.db);
   // A *.ts.net name is tailnet only if it resolves to tailnet addresses (Funnel names are public).
   await verifyTailnetUrls([url]);
   // Sandbox mode: email and update checks stay off in a practice copy.
-  const decision = applySandboxToDecision(decideOutbound(policy, url, purpose));
+  const decision = applySandboxToDecision(decideOutbound(policy, url, purpose, undefined, { heldHere }));
   log(ctx.companyId, decision);
   return decision;
 }

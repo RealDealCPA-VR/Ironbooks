@@ -28,6 +28,8 @@ export function normalizeChallengeAnswer(answer: string): string {
  * is only made for an answer of at least this many characters (after the case and spacing are
  * evened out) with some variety in it: a short phrase rather than one word ("pip the gray cat").
  * A shorter answer still resets the password while the file is open; it just never opens the file.
+ * (The slot is also readable only on computers that have opened the file, where the desktop app
+ * has a device secret: lib/services/fileProtection.ts, security plan 2.4.)
  */
 export const MIN_CHALLENGE_SLOT_ANSWER = 10;
 
@@ -38,7 +40,15 @@ export function challengeAnswerOpensFile(answer: string): boolean {
 }
 
 /** What the challenge-question screens say about this in a protected company file. */
-export const CHALLENGE_SLOT_RULE_TEXT = `In a company file protected with passwords, an answer of at least ${MIN_CHALLENGE_SLOT_ANSWER} characters (a short phrase works well, like "pip the gray cat") also opens the file when you forget your password. A shorter answer still resets your password while the file is open on this or another computer, but it can't open the file by itself.`;
+export const CHALLENGE_SLOT_RULE_TEXT = `In a company file protected with passwords, an answer of at least ${MIN_CHALLENGE_SLOT_ANSWER} characters (a short phrase works well, like "pip the gray cat") also opens the file when you forget your password, on a computer where the file has been opened before. A shorter answer still resets your password while the file is open on this or another computer, but it can't open the file by itself.`;
+
+/**
+ * "I forgot my password" on a computer the protected company file has not been opened on (security
+ * plan 2.4): there the challenge answer does not open the file — so a copy of the file alone can't
+ * be attacked with a list of likely answers — and the password or the recovery key does.
+ */
+export const CHALLENGE_NOT_ON_THIS_COMPUTER_TEXT =
+  'On this computer, this company file opens only with a user name and password or with its recovery key. Your challenge question works on the computers where the file has been opened before.';
 
 export function isKnownChallengeQuestion(q: unknown): q is string {
   return typeof q === 'string' && (CHALLENGE_QUESTIONS as readonly string[]).includes(q);

@@ -12,10 +12,11 @@
  * the hostile name in the URL, which the real server never does, so they passed while the guard
  * let every rebinding page through (security plan 1.1a).
  */
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import { NextRequest } from 'next/server';
 import { middleware } from '../middleware';
 import { classifyHost } from '../lib/net/cidr';
+import { PROXY_SECRET_ENV, PROXY_SECRET_HEADER } from '../lib/net/loopbackHost';
 
 const SERVER = 'http://localhost:51234';
 
@@ -71,6 +72,47 @@ describe('middleware: DNS rebinding', () => {
     expect(
       middleware(req('/api/company-file/info', { host: 'evil.example:51234', headers: { 'sec-bka-proxy': '1' } })).status,
     ).toBe(403);
+  });
+});
+
+describe('middleware: the multi-user proxy secret (work package G3)', () => {
+  // Any program on this computer can send x-bka-remote-addr and sec-bka-proxy to 127.0.0.1 itself.
+  // While the shell has given the server a proxy secret, only the proxy's stamp of it makes a
+  // request "proxied" (exempt from the Host rule); anything else is held to the Host rule.
+  const SECRET = 'd2'.repeat(32);
+  const proxyHeaders = { 'x-bka-remote-addr': '192.168.1.20', 'sec-bka-proxy': '1' };
+  afterEach(() => {
+    delete process.env[PROXY_SECRET_ENV];
+  });
+
+  it('refuses forged proxy headers naming a hostile host when they lack the stamp', async () => {
+    process.env[PROXY_SECRET_ENV] = SECRET;
+    for (const stamp of [null, 'wrong', 'e3'.repeat(32), '']) {
+      const headers: Record<string, string> = { ...proxyHeaders };
+      if (stamp !== null) headers[PROXY_SECRET_HEADER] = stamp;
+      for (const host of ['evil.example:51234', 'office-pc:8443', '192.168.1.5:47800']) {
+        const res = middleware(req('/api/company-file/info', { host, headers }));
+        expect(res.status, `${host} ${stamp}`).toBe(403);
+        expect((await res.json()).code).toBe('FORBIDDEN');
+      }
+    }
+  });
+
+  it('forged proxy headers on a loopback Host pass the ordinary Host rule (and are classed remote later)', () => {
+    process.env[PROXY_SECRET_ENV] = SECRET;
+    expect(middleware(req('/api/company', { host: '127.0.0.1:51234', headers: proxyHeaders })).status).toBe(200);
+  });
+
+  it("lets the proxy's own requests through on the host name the teammate used", () => {
+    process.env[PROXY_SECRET_ENV] = SECRET;
+    const headers = { ...proxyHeaders, [PROXY_SECRET_HEADER]: SECRET };
+    for (const host of ['office-pc:8443', 'office-pc.tail1234.ts.net:47800', '192.168.1.5:47800']) {
+      expect(middleware(req('/api/company', { host, headers })).status, host).toBe(200);
+    }
+  });
+
+  it('no proxy secret configured: the two headers are enough, as before', () => {
+    expect(middleware(req('/api/company', { host: 'office-pc:8443', headers: proxyHeaders })).status).toBe(200);
   });
 });
 

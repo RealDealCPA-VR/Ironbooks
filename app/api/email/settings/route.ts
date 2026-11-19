@@ -14,6 +14,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { getEmailSetup, removeEmailSetup, saveEmailSetup } from '@/lib/services/emailSettings';
 import { hostOnlyResponse, isRemoteRequest } from '@/lib/net/hostOnly';
+import { approveQuietFileHere } from '@/lib/net/fileTrust';
 import { requireJsonObject, routeError } from '@/lib/routeErrors';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { emailSetupSchema } from '@/lib/validation/prefs';
@@ -33,6 +34,7 @@ export async function PUT(req: NextRequest) {
     if (isRemoteRequest(req)) return hostOnlyResponse();
     const parsed = emailSetupSchema.safeParse(await requireJsonObject(req));
     if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
+    await approveQuietFileHere(ctx, { remote: isRemoteRequest(req) }).catch((err) => console.warn('[file-trust] could not approve the company file on this computer:', (err as Error)?.message ?? err));
     return NextResponse.json({ ...(await saveEmailSetup(ctx, parsed.data)), hostOnly: false });
   } catch (err) {
     return routeError(err, 'PUT /api/email/settings');

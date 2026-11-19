@@ -105,9 +105,11 @@ describe('host proxy — header smuggling', () => {
         res.end('ok');
       }),
     );
-    const proxyPort = await listen(http.createServer(createProxyHandler(upstreamPort, { secure: true })));
+    const SECRET = 'a5'.repeat(32);
+    const proxyPort = await listen(http.createServer(createProxyHandler(upstreamPort, { secure: true, proxySecret: SECRET })));
 
     // Raw socket so we can send duplicate and oddly-cased headers verbatim.
+    let answer = '';
     await new Promise<void>((resolve, reject) => {
       const sock = net.connect(proxyPort, '127.0.0.1', () => {
         sock.write(
@@ -117,10 +119,13 @@ describe('host proxy — header smuggling', () => {
             'x-bka-remote-addr: local\r\n' +
             'X-Bka-Internal: stolen\r\n' +
             'X-Forwarded-Proto: http\r\n' +
+            // A guessed proxy secret, twice and oddly cased: never forwarded.
+            'X-BKA-Proxy-Secret: guessed\r\n' +
+            'x-bka-proxy-secret: guessed-again\r\n' +
             'Connection: close\r\n\r\n',
         );
       });
-      sock.on('data', () => {});
+      sock.on('data', (d) => (answer += d.toString()));
       sock.on('end', () => resolve());
       sock.on('error', reject);
     });
@@ -130,6 +135,11 @@ describe('host proxy — header smuggling', () => {
     expect(remote).toEqual([['x-bka-remote-addr', '127.0.0.1']]);
     expect(pairs.some(([k]) => k === 'x-bka-internal')).toBe(false);
     expect(pairs.filter(([k]) => k === 'x-forwarded-proto')).toEqual([['x-forwarded-proto', 'https']]);
+    // Exactly one proxy secret reaches the app server: the proxy's own.
+    expect(pairs.filter(([k]) => k === 'x-bka-proxy-secret')).toEqual([['x-bka-proxy-secret', SECRET]]);
+    // ...and it is not in what the client gets back.
+    expect(answer).toMatch(/^HTTP\/1\.1 200/);
+    expect(answer).not.toContain(SECRET);
   });
 });
 

@@ -16,6 +16,8 @@
 // slots — and every other entry encrypted with the file key under an opaque name:
 //
 //   ironbooks-company.json     the manifest, with `encryption` { sealId, keyCheck, lookupSalt, slots }
+//                              (challenge slots inside one encrypted challenge set where a device
+//                              secret exists: electron/fileCrypto.js sealChallengeSet)
 //   sealed/000001, …           one encrypted entry per file (AES-256-GCM: nonce | data | tag; the
 //                              sealId and the entry's opaque and real names are the additional data;
 //                              layout 2: under a subkey of the file key for this container alone)
@@ -334,7 +336,10 @@ function encryptionListing(enc) {
 /**
  * What of a sealed container's plain manifest is bound into its encrypted index (and so checked
  * once the file key is known): every plain field, the encryption details too — except the key
- * slots, which open the key and are themselves authenticated.
+ * slots, which open the key and are themselves authenticated. The challenge set (fileCrypto
+ * sealChallengeSet) is one entry of the slot list for that reason: its box and each computer's
+ * entry are authenticated by themselves, so an edited set only fails the challenge route — it
+ * never refuses a file the password or the recovery key opens.
  */
 function listingOf(manifest) {
   const out = { ...manifest };
@@ -622,7 +627,9 @@ function encryptionBlock(protection, sealId) {
     sealId,
     keyCheck: protection.keyCheck || fileCrypto.keyCheckOf(protection.fileKey),
     lookupSalt: protection.lookupSalt || null,
-    slots: Array.isArray(protection.slots) ? protection.slots : [],
+    // Challenge slots are never written in plain text next to a challenge set, nor where this
+    // process has a device secret (fileCrypto.slotsForManifest; security plan 2.4).
+    slots: fileCrypto.slotsForManifest(protection.slots),
   };
 }
 

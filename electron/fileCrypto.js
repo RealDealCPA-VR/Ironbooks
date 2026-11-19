@@ -9,7 +9,8 @@
 //
 //   password   one per user who has a password — the same user name + password that signs in
 //   challenge  one per user who set a challenge question — the normalized answer
-//                ("I forgot my password", lib/challengeQuestions.ts)
+//                ("I forgot my password", lib/challengeQuestions.ts); written inside an encrypted
+//                challenge set where a device secret exists (see sealChallengeSet)
 //   recovery   one printable recovery key, shown once — the way back in when every password is lost
 //
 // A slot is found by a lookup tag (an HMAC of the user name with the file's random lookup salt),
@@ -24,6 +25,12 @@
 // from the file key binds each slot's public key, so a slot pasted into a file is never re-wrapped
 // to. Entries are encrypted with a per-container subkey (HKDF of the file key and the sealId), so
 // one long-lived file key never approaches the GCM random-nonce limit.
+//
+// CHALLENGE SLOTS are not written in plain text where the computer has a device secret (security
+// plan 2.4): an answer is a few words to a question from a fixed list, so a slot anyone can read
+// from a copy of the file could be attacked offline with a word list. They go into ONE encrypted
+// entry of the slot list instead (sealChallengeSet below), which only the computers that have
+// opened the file can read.
 //
 // Pure Node (crypto): used by the desktop shell and the app server, and unit-tested from vitest
 // (test/fileCrypto.test.ts).
@@ -377,6 +384,221 @@ async function unlockWith(encryption, { kind, login = null, secret }) {
 }
 
 // ---------------------------------------------------------------------------
+// Challenge slots tied to the computers that have opened the file (security plan 2.4)
+//
+// A challenge slot written in plain text lets anyone with a COPY of the file read the question and
+// try a list of answers offline (a few thousand car models or cities at about 0.3 s each): one hit
+// yields the file key. So, wherever a device secret exists (the desktop app's server:
+// BKA_DEVICE_VAULT, electron/deviceVault.js, one per Windows account), the challenge slots are
+// written as ONE entry of the manifest's slot list:
+//
+//   { kind: 'challenge-set', v: 1, id, box, devices: [{ id: keyId, key }, ...] }
+//
+//   box      every challenge slot (questions and lookup tags included), AES-256-GCM under the
+//            file's random CHALLENGE KEY, padded to whole kilobytes (the length says little about
+//            how many there are). The challenge key itself is kept inside the encrypted database
+//            (lib/services/fileProtection.ts, file_secrets), so it travels with the books.
+//   devices  the challenge key wrapped for each computer that has saved the file: AES-256-GCM
+//            under a key derived (HKDF) from that computer's device secret, oldest first, at most
+//            MAX_CHALLENGE_DEVICES. Each computer adds or refreshes its own entry when it saves
+//            the file and keeps the others as they are. Only the 8-hex key id is readable.
+//   id       names the challenge key (an HMAC of it) and binds the box and every device entry to
+//            it. It is not the file id: a restored backup gets a new file id, and its challenge
+//            set must still open on the computers that opened the file it came from.
+//
+// A copy of the file alone then holds nothing to guess against: the answer opens the file only on
+// a computer that has opened it before (its device secret opens its entry, the challenge key opens
+// the box, and then the answer opens its slot exactly as before). Elsewhere the file opens with a
+// password or the recovery key. The entry lives in the slot list, not in a field of its own: the
+// slot list is not part of the listing bound into the encrypted index (each slot is authenticated
+// by itself), so an edited or damaged set can only make the challenge route fail, never refuse the
+// file; and an older Ironbooks, which ignores slot kinds it does not know, still opens the file.
+// ---------------------------------------------------------------------------
+
+const CHALLENGE_SET_KIND = 'challenge-set';
+/** Computers whose entry a challenge set keeps (the one that saved longest ago is dropped). */
+const MAX_CHALLENGE_DEVICES = 16;
+/** The largest box read from a manifest (a real one is about a kilobyte per user with a question). */
+const MAX_CHALLENGE_BOX_BYTES = 2 * 1024 * 1024;
+const CHALLENGE_BOX_BLOCK = 1024;
+const CHALLENGE_ID_RE = /^[A-Za-z0-9_-]{22}$/;
+const DEVICE_KEY_ID_RE = /^[0-9a-f]{8}$/;
+/** Same variable and shape as lib/ai/keyVault.ts deviceKey(). */
+const DEVICE_VAULT_ENV = 'BKA_DEVICE_VAULT';
+const DEVICE_SECRET_RE = /^[0-9a-f]{64}$/i;
+
+/**
+ * True when this process has a device secret (the desktop app's server). Without one (tests,
+ * `next dev`, scripts, Linux without a keyring) challenge slots are written in plain text exactly
+ * as before — the trade-off: there, a copy of the file can still be attacked through them.
+ */
+function deviceSecretPresent() {
+  return DEVICE_SECRET_RE.test(String(process.env[DEVICE_VAULT_ENV] || ''));
+}
+
+/** A device key as lib/ai/keyVault.ts deviceKey() gives it: { secret: 64 hex, keyId: 8 hex }. */
+function validDevice(device) {
+  return Boolean(device && typeof device.secret === 'string' && DEVICE_SECRET_RE.test(device.secret) && typeof device.keyId === 'string' && DEVICE_KEY_ID_RE.test(device.keyId));
+}
+
+/** A fresh random challenge key (32 bytes). */
+function newChallengeKey() {
+  return crypto.randomBytes(KEY_BYTES);
+}
+
+/** The non-secret id of a challenge key (what its box and device entries are bound to). */
+function challengeKeyId(challengeKey) {
+  return crypto.createHmac('sha256', challengeKey).update('ironbooks/challenge-key/id/v1').digest('base64url').slice(0, 22);
+}
+
+function challengeBoxKey(challengeKey) {
+  return hkdf(challengeKey, Buffer.alloc(0), 'ironbooks-challenge-box/v1');
+}
+
+function challengeBoxAad(id) {
+  return Buffer.from(`ironbooks-challenge-box/v1\n${id}`, 'utf8');
+}
+
+function deviceWrapKey(device, id) {
+  return hkdf(Buffer.from(device.secret.toLowerCase(), 'utf8'), Buffer.from('ironbooks/challenge-device/v1', 'utf8'), `ironbooks-challenge-device/v1\n${id}`);
+}
+
+function deviceWrapAad(id, keyId) {
+  return Buffer.from(`ironbooks-challenge-device/v1\n${id}\n${keyId}`, 'utf8');
+}
+
+/** True for the challenge-set entry of a slot list. */
+function isChallengeSet(s) {
+  return Boolean(s && typeof s === 'object' && s.kind === CHALLENGE_SET_KIND);
+}
+
+/** The challenge set of a manifest's encryption block, or null (a file saved without one). */
+function challengeSetOf(encryption) {
+  const slots = encryption && Array.isArray(encryption.slots) ? encryption.slots.slice(0, MAX_SLOTS) : [];
+  return slots.find(isChallengeSet) || null;
+}
+
+/** The challenge slots written in plain text (a file saved by an older version, or without a device secret). */
+function plainChallengeSlots(encryption) {
+  const slots = encryption && Array.isArray(encryption.slots) ? encryption.slots.slice(0, MAX_SLOTS) : [];
+  return slots.filter((s) => s && s.kind === 'challenge');
+}
+
+function wellFormedDeviceEntry(e) {
+  if (!e || typeof e !== 'object' || typeof e.id !== 'string' || !DEVICE_KEY_ID_RE.test(e.id) || typeof e.key !== 'string') return false;
+  const raw = unb64(e.key);
+  return Boolean(raw && raw.length === NONCE_BYTES + KEY_BYTES + TAG_BYTES);
+}
+
+/** The well-formed device entries of a set, oldest first (read no further than a few times the cap). */
+function deviceEntriesOf(set) {
+  const list = set && Array.isArray(set.devices) ? set.devices.slice(0, MAX_CHALLENGE_DEVICES * 4) : [];
+  return list.filter(wellFormedDeviceEntry).map((e) => ({ id: e.id, key: e.key }));
+}
+
+function wrapForDevice(challengeKey, id, device) {
+  const nonce = crypto.randomBytes(NONCE_BYTES);
+  const c = crypto.createCipheriv(CIPHER, deviceWrapKey(device, id), nonce);
+  c.setAAD(deviceWrapAad(id, device.keyId));
+  return { id: device.keyId, key: b64(Buffer.concat([nonce, c.update(challengeKey), c.final(), c.getAuthTag()])) };
+}
+
+function unwrapForDevice(entry, id, device) {
+  try {
+    const raw = unb64(entry.key);
+    const d = crypto.createDecipheriv(CIPHER, deviceWrapKey(device, id), raw.subarray(0, NONCE_BYTES));
+    d.setAAD(deviceWrapAad(id, device.keyId));
+    d.setAuthTag(raw.subarray(raw.length - TAG_BYTES));
+    const key = Buffer.concat([d.update(raw.subarray(NONCE_BYTES, raw.length - TAG_BYTES)), d.final()]);
+    return key.length === KEY_BYTES && challengeKeyId(key) === id ? key : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The challenge-set entry for a manifest: `slots` (the challenge slots; any other kind is left
+ * out) in a box under `challengeKey`, with this computer's entry (`device`) and — when `keep` is
+ * the set of the file as it is on disk and wraps the same challenge key — every other computer's
+ * entry kept as it is. A set made for another challenge key keeps nothing (its entries can't open
+ * this one).
+ * @param {{ challengeKey: Buffer, slots: Array<Record<string, any>>, device: { secret: string, keyId: string }, keep?: any }} opts
+ * @returns {Record<string, any>}
+ */
+function sealChallengeSet({ challengeKey, slots, device, keep = null }) {
+  if (!Buffer.isBuffer(challengeKey) || challengeKey.length !== KEY_BYTES) throw new Error('invalid challenge key');
+  if (!validDevice(device)) throw new Error("a challenge set needs this computer's device secret");
+  const id = challengeKeyId(challengeKey);
+  const list = (Array.isArray(slots) ? slots : []).filter((s) => s && typeof s === 'object' && s.kind === 'challenge');
+  const json = Buffer.from(JSON.stringify({ v: 1, slots: list }), 'utf8');
+  // Padded with spaces (JSON ignores them) to whole blocks: one slot more or less, or a longer
+  // question, does not show in the length.
+  const body = Buffer.alloc(Math.ceil((json.length + 1) / CHALLENGE_BOX_BLOCK) * CHALLENGE_BOX_BLOCK, 0x20);
+  json.copy(body);
+  const nonce = crypto.randomBytes(NONCE_BYTES);
+  const c = crypto.createCipheriv(CIPHER, challengeBoxKey(challengeKey), nonce);
+  c.setAAD(challengeBoxAad(id));
+  const box = b64(Buffer.concat([nonce, c.update(body), c.final(), c.getAuthTag()]));
+  const others = [];
+  if (isChallengeSet(keep) && keep.id === id) {
+    for (const e of deviceEntriesOf(keep)) {
+      if (e.id === device.keyId) continue;
+      const at = others.findIndex((o) => o.id === e.id);
+      if (at >= 0) others.splice(at, 1);
+      others.push(e);
+    }
+  }
+  const devices = [...others, wrapForDevice(challengeKey, id, device)].slice(-MAX_CHALLENGE_DEVICES);
+  return { kind: CHALLENGE_SET_KIND, v: 1, id, box, devices };
+}
+
+/**
+ * The challenge slots of a set, opened with this computer's device key: an array (possibly empty),
+ * or null when this computer has no entry in it, or the set was damaged or changed (every part is
+ * authenticated). Never throws.
+ * @param {any} set
+ * @param {{ secret: string, keyId: string } | null | undefined} device
+ * @returns {Array<Record<string, any>> | null}
+ */
+function openChallengeSet(set, device) {
+  try {
+    if (!isChallengeSet(set) || set.v !== 1 || typeof set.id !== 'string' || !CHALLENGE_ID_RE.test(set.id) || !validDevice(device)) return null;
+    if (typeof set.box !== 'string' || set.box.length > Math.ceil(((MAX_CHALLENGE_BOX_BYTES + NONCE_BYTES + TAG_BYTES) * 4) / 3) + 4) return null;
+    let challengeKey = null;
+    for (const e of deviceEntriesOf(set)) {
+      if (e.id !== device.keyId) continue;
+      challengeKey = unwrapForDevice(e, set.id, device);
+      if (challengeKey) break;
+    }
+    if (!challengeKey) return null;
+    const box = unb64(set.box);
+    if (!box || box.length < NONCE_BYTES + TAG_BYTES) return null;
+    const d = crypto.createDecipheriv(CIPHER, challengeBoxKey(challengeKey), box.subarray(0, NONCE_BYTES));
+    d.setAAD(challengeBoxAad(set.id));
+    d.setAuthTag(box.subarray(box.length - TAG_BYTES));
+    const body = Buffer.concat([d.update(box.subarray(NONCE_BYTES, box.length - TAG_BYTES)), d.final()]);
+    const parsed = JSON.parse(body.toString('utf8'));
+    if (!parsed || parsed.v !== 1 || !Array.isArray(parsed.slots)) return null;
+    return parsed.slots.slice(0, MAX_SLOTS).filter((s) => s && typeof s === 'object' && s.kind === 'challenge');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The slot list a manifest is written with (electron/companyFileFormat.js). Never a challenge slot
+ * in plain text next to a challenge set, nor anywhere a device secret exists: a copy made from a
+ * file of an older version (an "unsaved changes" copy, a damaged copy kept for support) then simply
+ * has no challenge route until it is saved — the password and the recovery key open it as before.
+ * Without a device secret the list is written exactly as given.
+ */
+function slotsForManifest(slots) {
+  const list = Array.isArray(slots) ? slots : [];
+  if (!list.some(isChallengeSet) && !deviceSecretPresent()) return list;
+  return list.filter((s) => !(s && s.kind === 'challenge'));
+}
+
+// ---------------------------------------------------------------------------
 // Recovery keys: 24 characters, Crockford base32 (no I, L, O, U), read in six groups of four
 // ("7K3Q-9XHD-…"). 120 random bits — far beyond guessing, even offline.
 // ---------------------------------------------------------------------------
@@ -602,6 +824,18 @@ module.exports = {
   burnKdf,
   findSlots,
   unlockWith,
+  CHALLENGE_SET_KIND,
+  MAX_CHALLENGE_DEVICES,
+  MAX_CHALLENGE_BOX_BYTES,
+  deviceSecretPresent,
+  newChallengeKey,
+  challengeKeyId,
+  isChallengeSet,
+  challengeSetOf,
+  plainChallengeSlots,
+  sealChallengeSet,
+  openChallengeSet,
+  slotsForManifest,
   generateRecoveryKey,
   normalizeRecoveryKey,
   formatRecoveryKey,

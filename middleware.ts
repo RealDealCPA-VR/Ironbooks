@@ -39,7 +39,10 @@ export function middleware(req: NextRequest) {
   // request carrying it is treated as REMOTE, with less trust) or from a web page that rebound its
   // own name to 127.0.0.1 to reach the books as if it were the app. Refuse the latter. A page can
   // add x-bka-remote-addr itself, so the proxy also stamps sec-bka-proxy: browsers never let a
-  // page set a "Sec-" header.
+  // page set a "Sec-" header. Any other program on this computer can send both, so while the shell
+  // has given this server a proxy secret, the proxy's stamp of it is needed too
+  // (lib/net/loopbackHost.ts); without it such a request is held to the Host rule below like any
+  // other request on this computer.
   //
   // The name the request used is the Host header. req.nextUrl is NOT: Next.js builds it from the
   // address the server listens on, so it always says localhost, whatever the page asked for.

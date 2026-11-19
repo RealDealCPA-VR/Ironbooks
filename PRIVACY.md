@@ -53,6 +53,25 @@ An administrator can cap a machine with the `BKA_NETWORK_MODE` environment varia
 (`offline`, `tailnet-only` or `allow-cloud`, any letter case). The effective mode is the stricter
 of that cap and the company setting. A value that is set but not recognised counts as `offline`.
 
+**A company file from another computer.** The network mode, the AI servers, the mail server and
+the report schedules travel inside the company file, so a file someone sends you could arrive with
+internet services already switched on. Until an Admin at this computer approves the file, it is
+capped at *Local network + tailnet* whatever its own settings say: AI, email and vendor lookup do
+not reach the public internet, and its report schedules that email wait (they then run by
+themselves). This computer, your LAN and your tailnet keep working as the file's settings say (a
+local AI, an office mail relay); Offline stays Offline; app update checks keep their own rule (they
+send no company data). If the file's own settings would reach the internet, Privacy & Network shows
+one note listing those destinations (host names only) with **Allow on this computer**. The approval
+is a stamp in the file that only this computer can make: an HMAC under the secret Windows keeps for
+this computer's Ironbooks (the one that seals saved AI and mail keys), which no file, copy or backup
+carries. A file is approved without asking when this computer already knew it before this
+rule existed (Recent Companies, files signed in to here), when it was made here as a new company
+file, when it is a copy of an approved file (Save Copy As, a sandbox or training file, this
+computer's own backup), or when its own settings reach nothing on the internet and an Admin here
+saves its network settings. An Accountant's Copy or a portable file made on another computer is
+not approved here until allowed. Where Ironbooks has no protected secret (Linux without a keyring),
+files are not held.
+
 ## How it is enforced
 
 - **Server:** every outbound call from the app server goes through one gate,

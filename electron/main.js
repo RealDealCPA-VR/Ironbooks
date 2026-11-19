@@ -514,6 +514,39 @@ function saveConfig(patch) {
   return next;
 }
 
+// Company files this computer already knew before company files needed its approval for internet
+// services (electron/knownFiles.js, lib/net/fileTrust.ts). Noted once, when this version first
+// starts — here, before anything below can add a file someone just sent (a double-clicked file is
+// put in Recent Companies at start-up) — and named to the company server of such a file.
+const knownFiles = require('./knownFiles');
+
+function noteFilesKnownBeforeApprovals() {
+  let cfg = {};
+  try {
+    if (fs.existsSync(configPath())) cfg = JSON.parse(fs.readFileSync(configPath(), 'utf8'));
+  } catch {
+    return; // there but unreadable right now: noted at a later start, never from an empty list
+  }
+  const patch = knownFiles.snapshotPatch(cfg, {
+    companiesRoot: companiesRoot(),
+    listDir: (dir) => (fs.existsSync(dir) ? fs.readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name) : []),
+  });
+  if (patch) saveConfig(patch);
+}
+noteFilesKnownBeforeApprovals();
+
+/** BKA_FILE_KNOWN_HERE for the company server on `dataDir`: that folder when it was known here, else ''. */
+function fileKnownHereEnv(dataDir) {
+  // Without this computer's secret nothing can be stamped: the entry waits for a later start.
+  if (!deviceVaultSecret()) return '';
+  const manifest = openFile ? companyFileFormat.readCompanyManifest(openFile.path) : null;
+  const r = knownFiles.knownHere(loadConfig(), openFile ? openFile.path : dataDir, {
+    saveId: manifest && typeof manifest.saveId === 'string' ? manifest.saveId : null,
+  });
+  if (r.patch) saveConfig(r.patch);
+  return r.known ? dataDir : '';
+}
+
 const RECENT_COMPANIES_KEEP = 8;
 
 /** Put `dir` at the front of the recent-companies list (deduped, capped). */
@@ -1754,6 +1787,9 @@ async function startNextServer() {
         BKA_SANDBOX_REAL_DIR: sandboxRecord.realDir,
         // Saved keys of outside services are sealed for this Windows account (electron/deviceVault.js).
         BKA_DEVICE_VAULT: deviceVaultSecret(),
+        // A company file this computer already knew before files needed its approval for internet
+        // services: the server approves it at its first open (electron/knownFiles.js).
+        BKA_FILE_KNOWN_HERE: fileKnownHereEnv(dataDir),
         BKA_MIGRATIONS_DIR: migrationsDir(),
         // Offline desktop build: the server is bound to 127.0.0.1 only, so it is safe to
         // surface a password-reset token directly in the local HTTP response.
@@ -1762,6 +1798,9 @@ async function startNextServer() {
         // The window's per-launch pass (lib/net/launchPass.ts): insisted on only once the window has
         // it as a cookie (setLaunchPassCookie), so a failure there never locks anyone out.
         BKA_LAUNCH_PASS: launchPassOnWindow ? launchPass : '',
+        // The multi-user proxy's per-launch secret (electron/hosting.js): only a request stamped with
+        // it counts as a teammate's, never a program on this computer that claims their address.
+        BKA_PROXY_SECRET: hosting.proxySecret(),
         // Versioned automatic backups go to the existing backups folder unless the company file
         // chooses another one (Back Up & Restore page).
         BKA_BACKUP_DIR: backupsDir(),
@@ -2383,6 +2422,9 @@ async function startScratchServer(dataDir) {
           // Only the shell talks to a scratch server (shellFetch sends the pass as a header), so it
           // always insists on this launch's pass.
           BKA_LAUNCH_PASS: launchPass,
+          // Never behind the multi-user proxy: a request claiming a teammate's address is a program
+          // on this computer (lib/net/requestInfo.ts).
+          BKA_PROXY_SECRET: hosting.proxySecret(),
           ELECTRON_RUN_AS_NODE: '1',
           NEXT_TELEMETRY_DISABLED: '1',
         },
@@ -2539,6 +2581,11 @@ async function setHostingNow(enable, { quiet = false, lan = false } = {}) {
         certDir,
         lan,
         lanCert,
+        // Stamped on every forwarded request; the company server was given the same one
+        // (BKA_PROXY_SECRET), so only these requests count as teammates'.
+        proxySecret: hosting.proxySecret(),
+        // The tailnet certificate's private key is kept wrapped by Windows too (obtainTlsCert).
+        protect: safeStorage,
       });
       hostingError = null;
       if (!lan) saveConfig({ hosting: { ...cfg, enabled: true } });

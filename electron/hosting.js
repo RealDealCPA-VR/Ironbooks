@@ -14,6 +14,14 @@
 //  - every forwarded request carries x-bka-remote-addr = the real peer address (any value the
 //    client sent is discarded), so the server knows the request is remote and applies the
 //    stricter rules (sign-in required, no first-run fallback, no reset tokens in responses);
+//  - every forwarded request also carries this launch's proxy secret (x-bka-proxy-secret, any
+//    value the client sent is discarded; proxySecret below). Any program on this computer can
+//    reach the app server on 127.0.0.1 and send x-bka-remote-addr itself: without the secret the
+//    server ignores the address it claims (lib/net/requestInfo.ts), so such a program can neither
+//    use up a teammate's sign-in attempts nor put a false address in the session and audit records.
+//    The secret only ever goes from this proxy to the app server on this computer: it is never in
+//    an answer to a teammate (the proxy's own answers are fixed text; upstream answers are passed
+//    on without request headers);
 //  - the internal shell token header (x-bka-internal) and the desktop window's per-launch pass
 //    (x-bka-launch header, bka_launch cookie) are stripped — remote clients can never present
 //    them;
@@ -26,10 +34,12 @@
 // TLS: when `tailscale cert` can issue a certificate for this machine's MagicDNS name, the
 // proxy serves HTTPS with it (teammates use https://<name>.ts.net:<port>). Otherwise plain HTTP
 // over the tailnet, which WireGuard already encrypts end to end — only on an address Tailscale
-// itself confirmed (hostingCore.confirmTailnetIPv4).
+// itself confirmed (hostingCore.confirmTailnetIPv4). The certificate's private key is kept wrapped
+// by the operating system when it can (obtainTlsCert).
 
 'use strict';
 
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -38,10 +48,12 @@ const https = require('node:https');
 const { execFile } = require('node:child_process');
 const core = require('./hostingCore');
 const { LAUNCH_PASS_COOKIE, LAUNCH_PASS_HEADER } = require('./localServer');
+const { osProtectionAvailable } = require('./deviceVault');
 
 const STRIP_REQUEST_HEADERS = [
   'x-bka-remote-addr',
   'sec-bka-proxy',
+  core.PROXY_SECRET_HEADER,
   'x-bka-internal',
   LAUNCH_PASS_HEADER,
   'x-forwarded-for',
@@ -79,6 +91,18 @@ const LIMITS = {
 };
 
 const REFUSED_HOST_MESSAGE = 'This address is not served by the Ironbooks host. Use the address shown on the computer that has the company file open.';
+
+let launchProxySecret = null;
+/**
+ * This launch's proxy secret: a random value made once per run of the desktop shell (every
+ * company switch relaunches it). main.js hands it to every server it starts in the environment
+ * (core.PROXY_SECRET_ENV, never on the command line, never logged) and to startHosting
+ * (opts.proxySecret), which stamps it on every request it forwards.
+ */
+function proxySecret() {
+  if (!launchProxySecret) launchProxySecret = crypto.randomBytes(32).toString('hex');
+  return launchProxySecret;
+}
 
 function tailscaleCandidates() {
   // Windows: the installed copy by full path only (a bare name is looked up in the current
@@ -150,14 +174,66 @@ async function detectTailnetIPv4() {
   return (await tailscaleSelf()).ip;
 }
 
-/** Ask Tailscale for a TLS certificate for this machine. Returns { cert, key, dnsName } or null. */
-async function obtainTlsCert(certDir, log, dnsName) {
+/**
+ * Keep `key` (PEM) wrapped by safeStorage in `file`, checked by unwrapping it again (in memory and
+ * from disk) before the caller removes anything plain. Throws on any failure.
+ */
+function writeSealedKey(file, key, protect) {
+  const pem = Buffer.isBuffer(key) ? key.toString('utf8') : String(key);
+  const sealed = protect.encryptString(pem);
+  if (protect.decryptString(sealed) !== pem) throw new Error('the wrapped key did not read back');
+  const tmp = `${file}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmp, sealed, { mode: 0o600 });
+    fs.renameSync(tmp, file);
+  } finally {
+    fs.rmSync(tmp, { force: true });
+  }
+  if (protect.decryptString(fs.readFileSync(file)) !== pem) throw new Error('the wrapped key did not read back from disk');
+}
+
+/**
+ * The certificate and wrapped key an earlier start kept, when they can still be served: the key
+ * unwraps here, belongs to that certificate, and the certificate has not expired. Null otherwise.
+ */
+function keptTlsCert(certFile, sealedFile, protect, nowMs) {
+  try {
+    const cert = fs.readFileSync(certFile);
+    const pem = protect.decryptString(fs.readFileSync(sealedFile));
+    const x = new crypto.X509Certificate(cert);
+    if (!(Date.parse(x.validTo) > nowMs)) return null;
+    if (!x.checkPrivateKey(crypto.createPrivateKey(pem))) return null;
+    return { cert, key: Buffer.from(pem, 'utf8') };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Ask Tailscale for a TLS certificate for this machine. Returns { cert, key, dnsName } or null.
+ *
+ * `tailscale cert` writes `<name>.crt` and `<name>.key` into `certDir` (userData/tls, in the
+ * roaming profile). When the operating system can protect it (`deps.protect`: Electron
+ * safeStorage, DPAPI on Windows, the Keychain on macOS), the private key does not stay there as a
+ * plain file (security plan 4.8, as selfSignedCert.js does for the office-network certificate): it
+ * is read into memory, kept wrapped in `<name>.key.sealed`, and the plain file is deleted. Every
+ * start still asks Tailscale first (that renews the certificate); when it fails, the certificate
+ * and wrapped key an earlier start kept are served while the certificate has not expired, and plain
+ * HTTP otherwise, as before. Without safeStorage (Linux's plain-text fallback, tests) the files
+ * stay exactly as `tailscale cert` wrote them; a failure anywhere in wrapping leaves them so too,
+ * with one log line, and never stops hosting.
+ * deps: { protect, runCert (the tailscale CLI; injected by tests), platform, now }.
+ */
+async function obtainTlsCert(certDir, log, dnsName, { protect = null, runCert = runTailscale, platform = process.platform, now = Date.now } = {}) {
   if (!dnsName) return null;
+  const certFile = path.join(certDir, `${dnsName}.crt`);
+  const keyFile = path.join(certDir, `${dnsName}.key`);
+  const sealedFile = `${keyFile}.sealed`;
+  const wrap = osProtectionAvailable(protect, platform);
+  let material;
   try {
     fs.mkdirSync(certDir, { recursive: true });
-    const certFile = path.join(certDir, `${dnsName}.crt`);
-    const keyFile = path.join(certDir, `${dnsName}.key`);
-    await runTailscale(['cert', '--cert-file', certFile, '--key-file', keyFile, dnsName], {
+    await runCert(['cert', '--cert-file', certFile, '--key-file', keyFile, dnsName], {
       cwd: certDir,
       timeoutMs: 60000,
     });
@@ -166,19 +242,35 @@ async function obtainTlsCert(certDir, log, dnsName) {
     } catch {
       /* best effort (no-op on Windows) */
     }
-    return { cert: fs.readFileSync(certFile), key: fs.readFileSync(keyFile), dnsName };
+    material = { cert: fs.readFileSync(certFile), key: fs.readFileSync(keyFile), dnsName };
   } catch (err) {
+    const kept = wrap ? keptTlsCert(certFile, sealedFile, protect, now()) : null;
+    if (kept) {
+      log(`[hosting] tailscale cert unavailable (${err.message}); serving HTTPS with the certificate from an earlier start`);
+      return { ...kept, dnsName };
+    }
     log(`[hosting] tailscale cert unavailable (${err.message}); serving plain HTTP over the tailnet`);
     return null;
   }
+  if (wrap) {
+    try {
+      writeSealedKey(sealedFile, material.key, protect);
+      fs.rmSync(keyFile, { force: true });
+    } catch (err) {
+      log(`[hosting] could not wrap the certificate key (${(err && (err.code || err.message)) || err}); it stays a plain file for now`);
+    }
+  }
+  return material;
 }
 
 /**
  * Request handler that forwards to the local app server with sanitized headers.
- * Options: { secure, servesHost?(req) -> boolean, onForward?(req) }. With `servesHost`, a request
- * naming a host the proxy does not serve is answered 421 and never forwarded.
+ * Options: { secure, servesHost?(req) -> boolean, onForward?(req), proxySecret? }. With `servesHost`,
+ * a request naming a host the proxy does not serve is answered 421 and never forwarded. With
+ * `proxySecret` (this launch's, see proxySecret()), every forwarded request carries it; without
+ * one, requests are forwarded as before (the app server then expects none).
  */
-function createProxyHandler(upstreamPort, { secure, servesHost = null, onForward = null }) {
+function createProxyHandler(upstreamPort, { secure, servesHost = null, onForward = null, proxySecret: stamp = null }) {
   return (req, res) => {
     if (servesHost && !servesHost(req)) {
       res.writeHead(421, { 'content-type': 'text/plain; charset=utf-8', connection: 'close' });
@@ -200,6 +292,9 @@ function createProxyHandler(upstreamPort, { secure, servesHost = null, onForward
     // request naming a non-loopback host as proxied only with it, so a DNS-rebinding page that adds
     // its own x-bka-remote-addr is still refused (middleware.ts).
     headers['sec-bka-proxy'] = '1';
+    // This launch's proxy secret: a program on this computer can send the two headers above to the
+    // app server itself, but cannot know this (lib/net/requestInfo.ts originFromHeaders).
+    if (typeof stamp === 'string' && stamp) headers[core.PROXY_SECRET_HEADER] = stamp;
     headers['x-forwarded-for'] = peer || 'unknown';
     headers['x-forwarded-proto'] = secure ? 'https' : 'http';
     if (req.headers.host) headers['x-forwarded-host'] = req.headers.host;
@@ -208,6 +303,9 @@ function createProxyHandler(upstreamPort, { secure, servesHost = null, onForward
       { host: '127.0.0.1', port: upstreamPort, method: req.method, path: req.url, headers },
       (up) => {
         const outHeaders = { ...up.headers };
+        // The app server never answers with request headers; should anything ever echo this one
+        // back, it still does not reach the teammate.
+        delete outHeaders[core.PROXY_SECRET_HEADER];
         if (outHeaders.location) {
           outHeaders.location = core.rewriteUpstreamLocation(outHeaders.location, upstreamPort, {
             secure,
@@ -383,7 +481,11 @@ async function refreshLanListeners(state, ifaces = os.networkInterfaces()) {
 }
 
 /**
- * Start hosting. Options: { upstreamPort, port, tls, bindAll, certDir, log, lan, lanCert }.
+ * Start hosting. Options: { upstreamPort, port, tls, bindAll, certDir, log, lan, lanCert,
+ * proxySecret?, protect? }. `proxySecret`: this launch's (proxySecret()), stamped on every
+ * forwarded request; the app server must have been given the same one in its environment.
+ * `protect`: Electron safeStorage, to keep the tailnet certificate's key wrapped (obtainTlsCert).
+ * Either left out: as before.
  * Resolves the hosting state (servers + share URLs) or rejects with a user-facing message.
  */
 async function startHosting(opts) {
@@ -405,7 +507,7 @@ async function startHosting(opts) {
     ? { cert: opts.lanCert.cert, key: opts.lanCert.key, dnsName: null }
     : opts.tls === false
       ? null
-      : await obtainTlsCert(opts.certDir, log, self.dnsName);
+      : await obtainTlsCert(opts.certDir, log, self.dnsName, { protect: opts.protect || null });
   const secure = Boolean(tlsMaterial);
   // When each other computer last used the file (File > Switch to Single-user Mode asks first).
   const peers = new Map();
@@ -443,6 +545,7 @@ async function startHosting(opts) {
     servesHost: (req) =>
       core.isServedHost(req.headers.host, { names: rt.served, localAddress: req.socket.localAddress, localPort: req.socket.localPort }),
     onForward: (req) => peers.set(req.socket.remoteAddress, Date.now()),
+    proxySecret: opts.proxySecret || null,
   });
   rt.ctx = { port, tlsMaterial, handler, conns: core.createConnectionLimiter({ maxTotal: limits.maxConnections, maxPerPeer: limits.maxPerPeer }), limits, log };
 
@@ -506,6 +609,8 @@ module.exports = {
   stopHosting,
   activePeerCount,
   detectTailnetIPv4,
+  proxySecret,
+  obtainTlsCert,
   createProxyHandler,
   openListener,
   openListeners,

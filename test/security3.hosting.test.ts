@@ -6,7 +6,9 @@
  *    lanListenerChanges);
  *  - 3.2 a 100.64.0.0/10 address counts as Tailscale's only when Tailscale confirms it;
  *  - 3.4 / 3.5 proxy robustness: Host header check, per-device connection cap, header and
- *    handshake timeouts, the desktop window's launch pass never forwarded (electron/hosting.js).
+ *    handshake timeouts, the desktop window's launch pass never forwarded (electron/hosting.js);
+ *  - G3: the proxy stamps this launch's proxy secret on every forwarded request, drops a copy a
+ *    client sent, and never hands it back to a teammate.
  * The decisions are pure functions tested directly; the listener wiring runs on 127.0.0.1.
  */
 import { afterAll, describe, expect, it, vi } from 'vitest';
@@ -421,6 +423,72 @@ describe('listener wiring', () => {
     expect(seen['x-bka-remote-addr']).toBe('127.0.0.1');
     await fetch(`http://127.0.0.1:${port}/x`, { headers: { cookie: 'bka_launch=stolen' } });
     expect(seen.cookie).toBeUndefined();
+  });
+
+  it("stamps this launch's proxy secret on every forwarded request and drops one a client sent (G3)", async () => {
+    const SECRET = '7c'.repeat(32);
+    let seen: http.IncomingHttpHeaders = {};
+    const up = await upstream((q, r) => {
+      seen = q.headers;
+      r.end('ok');
+    });
+    const { port } = await listener(
+      { host: '127.0.0.1', kind: 'all' },
+      { handler: hosting.createProxyHandler(up, { secure: false, proxySecret: SECRET }) },
+    );
+    await fetch(`http://127.0.0.1:${port}/x`, { headers: { 'x-bka-proxy-secret': 'guessed', 'x-bka-remote-addr': '100.64.0.99', 'sec-bka-proxy': '1' } });
+    expect(seen['x-bka-proxy-secret']).toBe(SECRET);
+    expect(seen['x-bka-remote-addr']).toBe('127.0.0.1');
+    expect(seen['sec-bka-proxy']).toBe('1');
+    await fetch(`http://127.0.0.1:${port}/x`);
+    expect(seen['x-bka-proxy-secret']).toBe(SECRET);
+  });
+
+  it('without a proxy secret (an older caller): none is forwarded, and a client-sent one is still dropped', async () => {
+    let seen: http.IncomingHttpHeaders = {};
+    const up = await upstream((q, r) => {
+      seen = q.headers;
+      r.end('ok');
+    });
+    const { port } = await listener({ host: '127.0.0.1', kind: 'all' }, { handler: hosting.createProxyHandler(up, { secure: false }) });
+    await fetch(`http://127.0.0.1:${port}/x`, { headers: { 'x-bka-proxy-secret': 'guessed' } });
+    expect(seen['x-bka-proxy-secret']).toBeUndefined();
+    expect(seen['x-bka-remote-addr']).toBe('127.0.0.1');
+  });
+
+  it('the proxy secret never reaches a teammate: not in answers, error pages or refusals', async () => {
+    const SECRET = '8d'.repeat(32);
+    // An app server that (wrongly) echoes it back in a header: the proxy drops that header.
+    const echo = await upstream((q, r) => {
+      r.setHeader('x-bka-proxy-secret', String(q.headers['x-bka-proxy-secret']));
+      r.setHeader('x-other', 'kept');
+      r.end('ok');
+    });
+    const served = (req: http.IncomingMessage) =>
+      core.isServedHost(req.headers.host, { names: new Set(), localAddress: req.socket.localAddress, localPort: req.socket.localPort });
+    const a = await listener({ host: '127.0.0.1', kind: 'all' }, { handler: hosting.createProxyHandler(echo, { secure: false, proxySecret: SECRET, servesHost: served }) });
+    const ok = await raw(a.port, `GET / HTTP/1.1\r\nHost: 127.0.0.1:${a.port}\r\nConnection: close\r\n\r\n`);
+    expect(ok.data).toMatch(/^HTTP\/1\.1 200/);
+    expect(ok.data).toMatch(/x-other: kept/i);
+    expect(ok.data).not.toContain(SECRET);
+    // A host the proxy does not serve: 421, fixed text.
+    const refused = await raw(a.port, `GET / HTTP/1.1\r\nHost: rebind.evil.example\r\nConnection: close\r\n\r\n`);
+    expect(refused.data).toMatch(/^HTTP\/1\.1 421/);
+    expect(refused.data).not.toContain(SECRET);
+    // The app server is not answering: 502, fixed text.
+    const gone = await upstream((_q, r) => r.end());
+    const goneServer = open[open.length - 1];
+    await new Promise((r) => goneServer.close(() => r(null)));
+    const b = await listener({ host: '127.0.0.1', kind: 'all' }, { handler: hosting.createProxyHandler(gone, { secure: false, proxySecret: SECRET }) });
+    const down = await raw(b.port, `GET / HTTP/1.1\r\nHost: 127.0.0.1:${b.port}\r\nConnection: close\r\n\r\n`);
+    expect(down.data).toMatch(/^HTTP\/1\.1 502/);
+    expect(down.data).not.toContain(SECRET);
+  });
+
+  it("proxySecret(): one random value per launch of the shell", () => {
+    const s = hosting.proxySecret();
+    expect(s).toMatch(/^[0-9a-f]{64}$/);
+    expect(hosting.proxySecret()).toBe(s);
   });
 
   it('a LAN listener serves a device outside its own subnet, as before (here: loopback vs a /24)', async () => {

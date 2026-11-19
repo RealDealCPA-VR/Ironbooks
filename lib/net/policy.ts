@@ -21,6 +21,11 @@
  * A machine-wide ceiling can be set with BKA_NETWORK_MODE; the effective mode is the more
  * restrictive of the company's mode and the ceiling (an operator can force 'offline').
  *
+ * A company file this computer has not approved (lib/net/fileTrust.ts: it came from another
+ * computer, settings and all) gets the same kind of cap: at most 'tailnet-only', with every cloud
+ * purpose off, until an Admin at this computer allows it (decideOutbound's `heldHere`). Update
+ * checks keep their own rules: they send no company data.
+ *
  * This file is pure (no I/O) so the rules are unit-testable; see lib/net/guard.ts for the
  * enforcement wrapper and lib/services/networkPolicy.ts for persistence.
  */
@@ -164,15 +169,59 @@ export interface OutboundDecision {
 /** Protocols an outbound call may use. Everything else (file:, data:, ftp:, …) is refused. */
 const ALLOWED_PROTOCOLS = new Set(['http:', 'https:', 'smtp:', 'smtps:']);
 
+export interface OutboundOptions {
+  /**
+   * The open company file has not been approved on this computer (lib/net/fileTrust.ts): it is
+   * held to 'tailnet-only' with every cloud purpose off, whatever its own settings say.
+   */
+  heldHere?: boolean;
+}
+
+/** Why a call was refused for a company file this computer has not approved (shown as is). */
+export const HELD_FOR_THIS_COMPUTER =
+  'This company file came from another computer, so Ironbooks keeps its internet services off on this computer until an Admin here allows them in Settings → Privacy & Network.';
+
 /**
  * Decide whether a server-side call to `target` for `purpose` is allowed under `policy`.
- * Pure: pass `ceiling` explicitly (defaults to the BKA_NETWORK_MODE env ceiling).
+ * Pure: pass `ceiling` explicitly (defaults to the BKA_NETWORK_MODE env ceiling), and
+ * `opts.heldHere` when the company file is not approved on this computer.
  */
 export function decideOutbound(
   policy: NetworkPolicy,
   target: string | URL,
   purpose: OutboundPurpose,
   ceiling: NetworkMode | undefined = envModeCeiling(),
+  opts: OutboundOptions = {},
+): OutboundDecision {
+  const decision = decideByPolicy(policy, target, purpose, ceiling);
+  return opts.heldHere ? holdForThisComputer(decision) : decision;
+}
+
+/**
+ * The cap for a company file this computer has not approved, applied to a decision made by the
+ * file's own policy: the effective mode goes down to 'tailnet-only' at most and cloud purposes
+ * count as off. Only what the file's own settings would have let out is refused here, so a call
+ * its settings refuse anyway keeps that reason (it says what to change); Offline stays Offline.
+ * This computer, the LAN and the tailnet are unaffected, except vendor lookup, whose SearXNG
+ * passes the names on to public search engines. Update checks keep their own rules: they send
+ * no company data, and holding them would stop updates for someone who only works in files
+ * received from others.
+ */
+export function holdForThisComputer(d: OutboundDecision): OutboundDecision {
+  const mode: NetworkMode = MODE_RANK[d.mode] > MODE_RANK['tailnet-only'] ? 'tailnet-only' : d.mode;
+  if (!d.allowed || d.purpose === 'updates') return { ...d, mode };
+  if (RELAYING_PURPOSES.has(d.purpose)) {
+    return { ...d, mode, allowed: false, reason: `${PURPOSE_INFO[d.purpose].label} passes what it looks up on to public search engines. ${HELD_FOR_THIS_COMPUTER}` };
+  }
+  if (isPrivateClass(d.hostClass)) return { ...d, mode };
+  return { ...d, mode, allowed: false, reason: `${PURPOSE_INFO[d.purpose].label} would contact ${d.host} on the internet. ${HELD_FOR_THIS_COMPUTER}` };
+}
+
+function decideByPolicy(
+  policy: NetworkPolicy,
+  target: string | URL,
+  purpose: OutboundPurpose,
+  ceiling: NetworkMode | undefined,
 ): OutboundDecision {
   const mode = effectiveMode(policy.mode, ceiling);
   let url: URL;
