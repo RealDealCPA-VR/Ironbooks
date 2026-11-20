@@ -400,7 +400,9 @@ function defaultStartApp(env) {
   const cmd = appStartCommand(env);
   if (!cmd) return null;
   return () => {
-    const child = spawn(cmd.command, cmd.args, { detached: true, stdio: 'ignore', windowsHide: true, env: appStartEnv(env) });
+    // Never Windows' hide flag: Ironbooks hides its own window. That flag would make Windows swallow the
+    // first "show", so a person starting Ironbooks would not see the window (electron/agentService.js).
+    const child = spawn(cmd.command, cmd.args, { detached: true, stdio: 'ignore', env: appStartEnv(env) });
     child.on('error', () => {});
     child.unref();
   };

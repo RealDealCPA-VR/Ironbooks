@@ -343,6 +343,13 @@ describe('starting Ironbooks when it is closed', () => {
     expect(env).toEqual({ PATH: 'x' });
   });
 
+  it('starts the app detached, and never asks Windows to hide it (that would also hide the window a person opens)', () => {
+    const src = fs.readFileSync(path.resolve(__dirname, '..', '..', 'mcp', 'client.mjs'), 'utf8');
+    const body = src.slice(src.indexOf('function defaultStartApp('));
+    expect(body).toContain("spawn(cmd.command, cmd.args, { detached: true, stdio: 'ignore', env: appStartEnv(env) })");
+    expect(body).not.toMatch(/windowsHide\s*:/);
+  });
+
   it('a connector that may not start it behaves exactly as before', async () => {
     const c = client({ startApp: null });
     expect((await failure(c.get('/api/accounts'))).message).toBe(NOT_CONNECTED_MESSAGE);

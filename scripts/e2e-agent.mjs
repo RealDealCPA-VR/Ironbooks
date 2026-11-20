@@ -34,7 +34,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { appCount, connect, makeAssert, powershell, ownProcs, sleep, stopApps, until } from './e2e-helpers.mjs';
+import { connect, dumpWindows, makeAssert, powershell, ownProcs, sleep, stopApps, until } from './e2e-helpers.mjs';
 
 const require = createRequire(import.meta.url);
 const root = process.cwd();
@@ -87,14 +87,24 @@ function launch(p, args = [`--remote-debugging-port=${PORT}`]) {
   return spawn(EXE, args, { env: appEnv(p), stdio: 'ignore', detached: false });
 }
 
-const running = async () => (await appCount(EXE)) > 0;
+/**
+ * Is the test build's APP running? The connector runs as the same program (Ironbooks.exe as Node,
+ * with ironbooks-mcp.mjs on its command line), so it is left out of the count.
+ */
+async function running() {
+  const exe = EXE.replace(/'/g, "''");
+  const r = await powershell(
+    `(Get-CimInstance Win32_Process -Filter "Name='Ironbooks.exe'" | Where-Object { $_.ExecutablePath -eq '${exe}' -and $_.CommandLine -notmatch 'ironbooks-mcp\\.mjs' } | Measure-Object).Count`,
+  );
+  return Number(r.out) > 0;
+}
 /** Does the test build show a window? (A process with a main window handle.) */
 async function windowShown() {
   const r = await powershell(`(${ownProcs(EXE)} | Where-Object { $_.MainWindowHandle -ne 0 } | Measure-Object).Count`);
   return Number(r.out) > 0;
 }
 /** Ask the window to close, the way the X button does (the app saves and quits). */
-const closeWindow = () => powershell(`${ownProcs(EXE)} | Where-Object { $_.MainWindowHandle -ne 0 } | ForEach-Object { $_.CloseMainWindow() | Out-Null }`);
+const closeWindow = () => powershell(`${ownProcs(EXE)} | Where-Object { $_.MainWindowHandle -ne 0 } | ForEach-Object { "$($_.Id) [$($_.MainWindowTitle)] $($_.CloseMainWindow())" }`);
 
 // --- the connector, started the way the Agents tab's settings say -------------------------------
 class Connector {
@@ -233,10 +243,15 @@ async function main() {
   assert(info.ok && info.data?.company?.name === 'Agent Test Co' && info.data?.agent?.name === 'Reader', 'the reading agent sees which books these are and who it is');
   const accounts = await r.tool('list_accounts');
   assert(accounts.ok && accounts.data?.accounts?.length > 10, 'and reads the chart of accounts');
-  const byCode = (code) => accounts.data.accounts.find((a) => a.code === code)?.id;
+  const byCode = (code) => accounts.data.accounts.find((a) => String(a.number) === code)?.id;
   const cash = byCode('1000');
-  const supplies = byCode('6300') ?? accounts.data.accounts.find((a) => a.type === 'expense')?.id;
+  const supplies = byCode('6300') ?? accounts.data.accounts.find((a) => /expense/i.test(String(a.type)))?.id;
   assert(cash && supplies, 'the accounts the test enters into exist');
+  /** The journal entries whose memo or description has this text (distinct ids). */
+  const entriesWith = async (c, text) => {
+    const out = await c.tool('find_transactions', { memo: text, date_from: '2026-01-01', date_to: '2026-12-31' });
+    return new Set((out.data?.rows ?? []).filter((row) => row.journal_entry_id).map((row) => row.journal_entry_id));
+  };
   const je = (amount, description) => ({ date: '2026-03-02', description, lines: [{ account_id: supplies, debit: amount }, { account_id: cash, credit: amount }] });
 
   // 3. Read only means read only.
@@ -252,10 +267,8 @@ async function main() {
   assert(first.ok && first.data?.outcome === 'posted', `the posting agent enters a journal entry (${first.text.slice(0, 120)})`);
   const again = await w.tool('enter_journal_entry', { ...je('64.20', 'Supplies from the agent'), request_id: 'e2e-je-1' });
   assert(again.ok && again.data?.repeated === true && again.data?.result?.id === first.data?.result?.id, 'the same request id returns the first answer');
-  const found = await w.tool('find_transactions', { from: '2026-03-01', to: '2026-03-31' });
-  const names = JSON.stringify(found.data ?? {});
-  assert(found.ok && names.includes('Supplies from the agent') && !names.includes('Dry run only') && !names.includes('Should not exist'), 'the books hold that entry once, and nothing from the dry run or the refusal');
-  assert(names.split('Supplies from the agent').length - 1 === 1, 'exactly once');
+  const once = await entriesWith(w, 'Supplies from the agent');
+  assert(once.size === 1 && (await entriesWith(w, 'Dry run only')).size === 0 && (await entriesWith(w, 'Should not exist')).size === 0, `the books hold that entry once, and nothing from the dry run or the refusal (${once.size})`);
   const noId = await w.tool('enter_journal_entry', je('7.00', 'No request id'));
   assert(!noId.ok && /request_id/.test(noId.text), 'a change without a request id is not sent');
 
@@ -264,15 +277,13 @@ async function main() {
   await d.start();
   const proposed = await d.tool('enter_journal_entry', { ...je('18.75', 'Drafted by the agent'), request_id: 'e2e-prop-1' });
   assert(proposed.ok && proposed.data?.outcome === 'proposed', `the proposing agent's entry waits for approval (${proposed.text.slice(0, 120)})`);
-  const before = await w.tool('find_transactions', { from: '2026-03-01', to: '2026-03-31' });
-  assert(!JSON.stringify(before.data).includes('Drafted by the agent'), 'nothing is in the books yet');
+  assert((await entriesWith(w, 'Drafted by the agent')).size === 0, 'nothing is in the books yet');
   const waiting = await inPage(page, `return await fetch('/api/ai/proposals').then(j);`);
-  const mine = (waiting.proposals ?? waiting).find?.((x) => JSON.stringify(x).includes('Drafted by the agent'));
+  const mine = (waiting.proposals ?? []).find((x) => JSON.stringify(x).includes('Drafted by the agent'));
   assert(mine && JSON.stringify(mine).includes('Drafter'), 'the Admin sees it under Waiting for your approval, with the agent\'s name');
   const approved = mine ? await inPage(page, `const r = await post('/api/ai/proposals/${mine?.id}', { action: 'approve' }); return { status: r.status, body: await j(r) };`) : { status: 0 };
   assert(approved.status === 200, `the Admin approves it (${JSON.stringify(approved.body ?? {}).slice(0, 160)})`);
-  const after = await w.tool('find_transactions', { from: '2026-03-01', to: '2026-03-31' });
-  assert(JSON.stringify(after.data).includes('Drafted by the agent'), 'and then it is entered');
+  assert((await entriesWith(w, 'Drafted by the agent')).size === 1, 'and then it is entered');
   const outcome = await d.tool('list_my_proposals');
   assert(outcome.ok && /approved|posted/.test(JSON.stringify(outcome.data)), 'the agent can see what became of its proposal');
 
@@ -352,16 +363,33 @@ async function main() {
 
   // 10. A person starting Ironbooks while it runs for an agent gets its window.
   for (const c of connectors.splice(0)) c.stop();
+  // 10a. Started by the connector, exactly as for a real agent.
   const w3 = connector(poster.body.connection, poster.body.token, A);
   await w3.start();
   const woke2 = await w3.tool('list_accounts');
   assert(woke2.ok && (await running()) && !(await windowShown()), 'started again for the agent, with no window');
+  const holderPid = companyLock.readHolder(A.companyFile)?.owner?.pid;
   launch(A, []); // a person double-clicks Ironbooks
-  assert(await until(windowShown, 60_000), 'a person starting Ironbooks gets the window of the one already running');
+  const shownBy = await until(async () => {
+    const r = await powershell(`${ownProcs(EXE)} | Where-Object { $_.MainWindowHandle -ne 0 } | ForEach-Object { "$($_.Id)|$($_.MainWindowTitle)" }`);
+    return r.out.split(/\r?\n/).filter(Boolean).find((line) => Number(line.split('|')[0]) === holderPid) ?? null;
+  }, 60_000);
+  assert(shownBy, `a person starting Ironbooks gets the window of the one already running (${shownBy ?? (await powershell(`${ownProcs(EXE)} | Where-Object { $_.MainWindowHandle -ne 0 } | ForEach-Object { "$($_.Id)|$($_.MainWindowTitle)" }`)).out})`);
+  await sleep(3000);
+  const others = (await powershell(`${ownProcs(EXE)} | Where-Object { $_.MainWindowHandle -ne 0 -and $_.Id -ne ${holderPid ?? 0} } | ForEach-Object { "$($_.Id)|$($_.MainWindowTitle)" }`)).out;
+  // Not checked: the person's own second launch may leave an "Ironbooks could not start" box. That
+  // happens on any second launch of Ironbooks (main and 1.7.19 too, no agents involved) and is
+  // tracked separately; it is not part of agent access.
+  if (others) console.log(`    (note: the second launch also showed: ${others.replace(/\r?\n/g, '; ')})`);
   assert((await w3.tool('list_accounts')).ok, 'the agent keeps working');
   await sleep(1500);
-  await closeWindow();
-  assert(await until(async () => !(await running()), 120_000), 'closing that window saves and quits as usual');
+  const asked = await closeWindow();
+  const quit = await until(async () => !(await running()), 120_000);
+  if (!quit) {
+    console.log(`    (close asked: ${JSON.stringify(asked)}; window shown: ${await windowShown()}; lock: ${JSON.stringify(companyLock.readHolder(A.companyFile)?.owner ?? null)})`);
+    console.log((await dumpWindows(EXE)).split('\n').slice(0, 30).map((x) => `    | ${x}`).join('\n'));
+  }
+  assert(quit, 'closing that window saves and quits as usual');
   assert(companyLock.readHolder(A.companyFile) === null, 'and releases the company file');
   for (const c of connectors.splice(0)) c.stop();
 
