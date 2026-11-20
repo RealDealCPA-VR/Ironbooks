@@ -338,9 +338,10 @@ const ACTIVE_USER_SQL = `(EXISTS (SELECT 1 FROM "user_companies" uc WHERE uc."us
  *     the client's second factor itself), challenge questions and answers, password-reset tokens,
  *     challenge lockout counters, employees' portal passwords, and the sealed AI provider keys and
  *     mail password (ciphertext of the client's keys, useless to the recipient);
- *   - left out: sign-in sessions, phone receipt-upload tokens, agents, earlier password hashes, the file's
- *     own secrets, and the key slots of this file's key (a copy of a protected file carries its own
- *     re-wrapped ones instead: createPortableCompanyFile).
+ *   - left out: sign-in sessions, phone receipt-upload tokens, agents (with their policies, requests
+ *     and standing permissions), earlier password hashes, the file's own secrets, and the key slots
+ *     of this file's key (a copy of a protected file carries its own re-wrapped ones instead:
+ *     createPortableCompanyFile).
  * The owner's own backups and portable file are not changed by this. Importing the accountant's
  * changes (.ibcx) never carries users, employees' logins or settings back, so nothing blanked here
  * can reach the client's file (lib/services/accountantCopy/format.ts).
@@ -377,6 +378,9 @@ const OUTSIDER_VIEWS: Record<string, DumpView> = {
   receipt_upload_tokens: { none: true },
   agents: { none: true },
   agent_requests: { none: true },
+  agent_policies: { none: true },
+  agent_permission_requests: { none: true },
+  agent_grants: { none: true },
   password_history: { none: true },
   file_secrets: { none: true },
   file_key_slots: { none: true },
@@ -710,6 +714,33 @@ function carriedRelative(rel: string): string {
 const JSON_CHUNK_BYTES = 4 * 1024 * 1024;
 
 /**
+ * Agent access is given at one computer to the books as they are (lib/services/agents.ts), so
+ * restored books start with none, and what the agents were waiting on goes with it: a request not
+ * yet carried out is cancelled (nothing runs for them in this copy) and standing permission ends.
+ * Run by every restore: the portable file here and a full backup (lib/services/backup.ts), so a
+ * request answered after the copy was made never comes back as waiting, and an agent proposal an
+ * older copy's upgrade turned into a request (drizzle/0097) is never approved in it. Policies stay:
+ * they are only settings of agents that no longer have access. Each table is checked first, as
+ * books from before the agents existed have none of them.
+ */
+export async function endAgentAccessInRestoredBooks(db: DB): Promise<void> {
+  await rawClient(db).exec(
+    `DO $$ BEGIN
+       IF to_regclass('agents') IS NOT NULL THEN
+         UPDATE agents SET revoked_at = now() WHERE revoked_at IS NULL;
+       END IF;
+       IF to_regclass('agent_permission_requests') IS NOT NULL THEN
+         UPDATE agent_permission_requests SET status = 'cancelled', decided_at = COALESCE(decided_at, now())
+          WHERE status IN ('pending', 'approved');
+       END IF;
+       IF to_regclass('agent_grants') IS NOT NULL THEN
+         UPDATE agent_grants SET revoked_at = now() WHERE revoked_at IS NULL;
+       END IF;
+     END $$;`,
+  );
+}
+
+/**
  * Recreate the company file from a .bkp into `targetDir`, which must not exist or be empty.
  * Verifies checksums before writing, then verifies the restored database against the manifest
  * (row counts + content hashes per table, ledger checksums, balanced trial balance, carried
@@ -933,15 +964,8 @@ export async function restorePortableCompanyFile(
       `UPDATE user_sessions SET ended_at = now(), end_reason = 'expired' WHERE ended_at IS NULL;
        DELETE FROM single_user_mode;`,
     );
-    // Agent access is given at one computer to the books as they are (lib/services/agents.ts): a
-    // restored copy starts with none.
-    await client.exec(
-      `DO $$ BEGIN
-         IF to_regclass('agents') IS NOT NULL THEN
-           UPDATE agents SET revoked_at = now() WHERE revoked_at IS NULL;
-         END IF;
-       END $$;`,
-    );
+    // A restored copy starts with no agent access, and nothing the agents were waiting on runs in it.
+    await endAgentAccessInRestoredBooks(db);
 
     // Make the folder a self-describing desktop company file.
     fs.writeFileSync(

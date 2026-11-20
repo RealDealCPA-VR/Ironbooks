@@ -57,6 +57,8 @@ export interface ServiceContext {
     id: string;
     name: string;
     mode: 'read_only' | 'propose' | 'post';
+    /** The policy preset (lib/agent/policy.ts). Absent on contexts built by older code: treat as the mode's preset. */
+    preset?: 'read_only' | 'ask_every_change' | 'trusted_bookkeeper' | 'full_with_asks';
     /**
      * The person answerable for what the agent enters: the Admin who let it in, or the person who
      * approved its proposal. Fills the few "entered by" columns that must name a person
@@ -64,6 +66,12 @@ export interface ServiceContext {
      */
     onBehalfOf?: string | null;
   };
+  /**
+   * Agent full access: set by the route bridge (lib/agent/bridge.ts) on an agent's run. `writeAudit`
+   * records it on every audit row (audit_logs.approved_by / agent_request_id / agent_grant_id): the
+   * person who approved the change, and the request or standing permission it ran under.
+   */
+  approval?: { approvedBy: string | null; requestId: string | null; grantId: string | null };
   /**
    * True for a context that must not change the books: `db` is then a read-only handle
    * (lib/db/readOnly.ts) and services that would save defaults on a first read skip that.

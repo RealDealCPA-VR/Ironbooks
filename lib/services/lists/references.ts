@@ -38,7 +38,12 @@ async function rows<T>(db: Db, query: ReturnType<typeof sql>): Promise<T[]> {
 }
 
 /** Tables whose contents never count as a "use" of a record. */
-const IGNORED_TABLES = new Set(['audit_logs', 'list_seeds', 'transaction_log_anchor', 'user_sessions', 'single_user_mode', 'undo_actions', 'agents', 'agent_requests']);
+const IGNORED_TABLES = new Set([
+  'audit_logs', 'list_seeds', 'transaction_log_anchor', 'user_sessions', 'single_user_mode', 'undo_actions',
+  // What agents asked for or were given names records (a request's input, a grant's customer)
+  // without using them: an agent asking to delete a customer must not keep it from being deleted.
+  'agents', 'agent_requests', 'agent_policies', 'agent_permission_requests', 'agent_grants',
+]);
 
 interface CatalogColumns {
   uuidCols: ColumnRef[];

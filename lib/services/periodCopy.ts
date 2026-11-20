@@ -375,7 +375,8 @@ async function trimCopy(db: DB, companyId: string, to: string): Promise<TrimCoun
     // undo tokens carry snapshots of records, the receipt inbox holds receipts not yet entered
     // (their unfiled image attachments go with them; a receipt already entered stays attached
     // to its transaction, kept or removed with it), phone upload links are live credentials,
-    // and "Needs attention" snoozes / the backup log describe the original file.
+    // agents (with their policies, requests and standing permissions) were let in to the original
+    // file only, and "Needs attention" snoozes / the backup log describe the original file.
     if (cols.has('receipt_scans')) {
       await tx.query(
         `DELETE FROM attachments a USING receipt_scans r
@@ -383,7 +384,8 @@ async function trimCopy(db: DB, companyId: string, to: string): Promise<TrimCoun
       );
       await tx.exec('DELETE FROM receipt_scans');
     }
-    for (const t of ['undo_actions', 'receipt_upload_tokens', 'agents', 'agent_requests', 'attention_item_states', 'backup_log']) {
+    const agentTables = ['agents', 'agent_requests', 'agent_policies', 'agent_permission_requests', 'agent_grants'];
+    for (const t of ['undo_actions', 'receipt_upload_tokens', ...agentTables, 'attention_item_states', 'backup_log']) {
       if (cols.has(t)) await tx.exec(`DELETE FROM ${qi(t)}`);
     }
     // Month-end close reviews of months after the period.

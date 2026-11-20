@@ -540,6 +540,13 @@
       "when": 1781400096000,
       "tag": "0096_agent_actions",
       "breakpoints": true
+    },
+    {
+      "idx": 97,
+      "version": "7",
+      "when": 1781400097000,
+      "tag": "0097_agent_full_access",
+      "breakpoints": true
     }
   ]
 }

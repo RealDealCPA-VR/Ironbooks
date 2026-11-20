@@ -1,5 +1,7 @@
 import { pgTable, uuid, varchar, text, timestamp, boolean, decimal, integer, jsonb, pgEnum, index } from 'drizzle-orm/pg-core';
 import { relations, sql } from 'drizzle-orm';
+// Types only (erased at runtime): the shape of the agent tables' jsonb columns, from the shared contract.
+import type { ApprovalNeeds, GrantConstraints } from '@/lib/agent/operations/types';
 
 // Enums
 export const accountTypeEnum = pgEnum('account_type', ['asset', 'liability', 'equity', 'revenue', 'expense']);
@@ -287,6 +289,12 @@ export const auditLogs = pgTable('audit_logs', {
   llmReasoning: text('llm_reasoning'),
   /** The agent behind the change (agents.id, drizzle/0095), next to a null userId. No FK. */
   agentId: uuid('agent_id'),
+  /** The person who approved the agent's change (drizzle/0097); null when nobody had to. No FK. */
+  approvedBy: uuid('approved_by'),
+  /** The permission request the change was approved through (agent_permission_requests.id, drizzle/0097). No FK. */
+  agentRequestId: uuid('agent_request_id'),
+  /** The standing permission the change ran under (agent_grants.id, drizzle/0097). No FK. */
+  agentGrantId: uuid('agent_grant_id'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -3106,7 +3114,10 @@ export const agents = pgTable('agents', {
   companyId: uuid('company_id').references(() => companies.id).notNull(),
   name: varchar('name', { length: 100 }).notNull(),
   roleKeys: jsonb('role_keys').$type<string[]>().notNull().default([]),
-  /** 'read_only' | 'propose' | 'post' (every agent only reads until write tools ship). */
+  /**
+   * 'read_only' | 'propose' | 'post': the agent's mode before policy presets. Kept because older
+   * code still reads it; `preset` (drizzle/0097) is what the policy uses.
+   */
   mode: varchar('mode', { length: 16 }).notNull().default('read_only'),
   tokenHash: varchar('token_hash', { length: 64 }).notNull().unique(),
   /** The first characters of the token, for the Agents list only. */
@@ -3119,6 +3130,25 @@ export const agents = pgTable('agents', {
   revokedBy: uuid('revoked_by'),
   /** May work while the file is open but nobody is signed in (drizzle/0096). Off unless an Admin turns it on. */
   unattended: boolean('unattended').notNull().default(false),
+  /**
+   * The policy preset (drizzle/0097): 'read_only' | 'ask_every_change' | 'trusted_bookkeeper' |
+   * 'full_with_asks' (AGENT_PRESETS in lib/agent/operations/types.ts). It decides what the agent
+   * may do without asking; agent_policies rows adjust it per class and area. A new agent asks for
+   * every change. Agents made before it got the preset of their `mode`.
+   */
+  preset: varchar('preset', { length: 24 }).notNull().default('ask_every_change'),
+  /** Most records one 'bulk' request may change; null = not capped. */
+  bulkCap: integer('bulk_cap'),
+  /** Amount above which two different people must approve; null = one approval is enough. */
+  twoPersonOver: decimal('two_person_over', { precision: 15, scale: 2 }),
+  /** Days a request waits for an answer before it expires. */
+  requestExpiryDays: integer('request_expiry_days').notNull().default(7),
+  /** Folders the agent may read files from or save files to. */
+  folders: jsonb('folders').$type<string[]>().notNull().default([]),
+  /** Email the Admin when this agent asks while nobody is signed in. Off unless an Admin turns it on (it is an outside send). */
+  notifyEmail: boolean('notify_email').notNull().default(false),
+  /** When an Admin paused the agent; a paused agent is refused everything until it is resumed. */
+  pausedAt: timestamp('paused_at'),
 });
 
 /**
@@ -3136,5 +3166,91 @@ export const agentRequests = pgTable('agent_requests', {
   inputHash: varchar('input_hash', { length: 64 }).notNull(),
   outcome: varchar('outcome', { length: 16 }).notNull(),
   result: jsonb('result'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+/**
+ * 0097 agent full access: one Allow / Ask / Never of an agent's policy that differs from its
+ * preset (lib/agent/policy.ts). `class` is a risk class and `setting` a policy setting
+ * (RISK_CLASSES, POLICY_SETTINGS in lib/agent/operations/types.ts); `area` null means the class
+ * everywhere, an area key only within that area. At most one row per agent, class and area, a
+ * null area counted as one value (unique index agent_policies_key_idx, NULLS NOT DISTINCT). No FK
+ * to agents: a record must outlive the agent it names. Never travels with a copy of the company.
+ */
+export const agentPolicies = pgTable('agent_policies', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  agentId: uuid('agent_id').notNull(),
+  class: varchar('class', { length: 24 }).notNull(),
+  area: varchar('area', { length: 40 }),
+  /** 'allow' | 'ask' | 'never'. */
+  setting: varchar('setting', { length: 8 }).notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+/**
+ * 0097 agent full access: something an agent asked a person to approve (lib/services/agentRequests.ts),
+ * kept whatever the answer. Built by the server when the policy says Ask: the agent gives only the
+ * operation, its input and its `reason`; the server adds the plain-words `summary`, the `preview`
+ * (ledger, record changes, effects, warnings), what the approver `needs`, and the `stalenessKey`
+ * (the touched records' versions at preview time). `input` never holds a secret: the service
+ * strips them before saving. `status`: 'pending' | 'approved' | 'denied' | 'expired' | 'cancelled'
+ * | 'failed' | 'executed' (REQUEST_STATUSES). `requestKey` is the agent's request id, unique per
+ * agent, so asking again finds the same request. `grantId` names the standing permission it was
+ * given with, `secondApprover` the second person above the two-person amount. `proposalId` is the
+ * ai_proposals row (kind 'agent_action') it was copied from when the app was upgraded; that row
+ * stays as it was. No FK to agents, people, grants or proposals: a record must outlive what it
+ * names. Never travels with a copy of the company.
+ */
+export const agentPermissionRequests = pgTable('agent_permission_requests', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  agentId: uuid('agent_id').notNull(),
+  requestKey: varchar('request_key', { length: 120 }).notNull(),
+  /** The operation id ("invoices.create"); "action:<name>" for one copied from a proposal. */
+  operation: varchar('operation', { length: 160 }).notNull(),
+  class: varchar('class', { length: 24 }).notNull(),
+  input: jsonb('input'),
+  /** The agent's own words, shown to the approver as the agent's, not as fact. */
+  reason: text('reason'),
+  summary: text('summary').notNull(),
+  preview: jsonb('preview'),
+  needs: jsonb('needs').$type<ApprovalNeeds>(),
+  stalenessKey: varchar('staleness_key', { length: 128 }),
+  status: varchar('status', { length: 16 }).notNull().default('pending'),
+  decidedBy: uuid('decided_by'),
+  secondApprover: uuid('second_approver'),
+  decidedAt: timestamp('decided_at'),
+  /** The approver's note to the agent (most often with a denial). */
+  note: text('note'),
+  result: jsonb('result'),
+  error: text('error'),
+  grantId: uuid('grant_id'),
+  proposalId: uuid('proposal_id'),
+  expiresAt: timestamp('expires_at').notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+/**
+ * 0097 agent full access: standing permission a person gave while approving ("this and similar
+ * ones for the next hour"): the same `operation` within the ticked `constraints` (GrantConstraints
+ * in lib/agent/operations/types.ts) until `expiresAt`, unless revoked first. `givenBy` is the
+ * approving person, `requestId` the request it was given with, `uses` how many requests ran under
+ * it. Only some classes may have one (GRANTABLE). No FK to agents, people or requests: a record
+ * must outlive what it names. Never travels with a copy of the company.
+ */
+export const agentGrants = pgTable('agent_grants', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  agentId: uuid('agent_id').notNull(),
+  operation: varchar('operation', { length: 160 }).notNull(),
+  class: varchar('class', { length: 24 }).notNull(),
+  constraints: jsonb('constraints').$type<GrantConstraints>().notNull().default({}),
+  givenBy: uuid('given_by').notNull(),
+  requestId: uuid('request_id'),
+  expiresAt: timestamp('expires_at').notNull(),
+  revokedAt: timestamp('revoked_at'),
+  revokedBy: uuid('revoked_by'),
+  uses: integer('uses').notNull().default(0),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });

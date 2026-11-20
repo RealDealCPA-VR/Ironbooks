@@ -14,7 +14,9 @@
  *    mail provider needs the company's opt-in for email (Privacy & Network);
  *  - comes from the sending user's own name and address when they set one (My Preferences >
  *    Send Forms) and the company allows it, else from the company's sender with replies to them;
- *  - explains a mail server failure in plain words.
+ *  - explains a mail server failure in plain words;
+ *  - goes through the effects outbox (lib/effects.ts): sent at once for a person, recorded in an
+ *    agent's preview, and sent after the save in an agent's real run.
  */
 import type { Attachment } from 'nodemailer/lib/mailer';
 import { and, eq } from 'drizzle-orm';
@@ -29,6 +31,7 @@ import { fillMergeFields } from '@/lib/preferences';
 import { formatCurrency } from '@/lib/money';
 import { assertNotSandbox } from './sandboxState';
 import { getHomeCurrencyCode } from './currencies';
+import { effects } from '@/lib/effects';
 import {
   EMAIL_NOT_SET_UP_MESSAGE,
   assertMailServerAllowed,
@@ -74,7 +77,8 @@ export interface MailOptions {
 
 /**
  * Send one email through the company's mail server, from the signed-in user's sender identity.
- * Returns the addresses used.
+ * Returns the addresses used. Inside an effects scope (an agent's preview or real run) the same
+ * answer comes back while the email is only recorded or queued, so the caller carries on.
  */
 export async function sendMail(opts: MailOptions, ctx: ServiceContext): Promise<{ from: string; to: string }> {
   // Sandbox mode: nothing leaves a practice copy (checked first, even before the mail set-up).
@@ -87,21 +91,31 @@ export async function sendMail(opts: MailOptions, ctx: ServiceContext): Promise<
   await assertMailServerAllowed(ctx, cfg);
 
   const sender = await senderFor(ctx, cfg);
-  const transport = mailTransport.create(transportOptions(cfg));
-  try {
-    await transport.sendMail({
-      from: sender.from.name ? { name: sender.from.name, address: sender.from.address } : sender.from.address,
-      to: opts.to,
-      ...(sender.replyTo ? { replyTo: sender.replyTo } : {}),
-      ...(sender.bcc.length ? { bcc: sender.bcc } : {}),
-      subject: opts.subject,
-      text: opts.text,
-      html: opts.html,
-      attachments: opts.attachments,
-    });
-  } catch (err) {
-    throw new ServiceError('VALIDATION', explainMailError(err, { host: cfg.host, port: cfg.port, fromEmail: sender.from.address }));
-  }
+  const message = {
+    from: sender.from.name ? { name: sender.from.name, address: sender.from.address } : sender.from.address,
+    to: opts.to,
+    ...(sender.replyTo ? { replyTo: sender.replyTo } : {}),
+    ...(sender.bcc.length ? { bcc: sender.bcc } : {}),
+    subject: opts.subject,
+    text: opts.text,
+    html: opts.html,
+    attachments: opts.attachments,
+  };
+  // Every form, statement, reminder and scheduled report is handed to the mail server here, through
+  // the effects outbox (lib/effects.ts), so each caller gets the same treatment without a change of
+  // its own. A person's request sends at once, as always. An agent's preview only records the
+  // email (recipients, subject, attachment names), and an agent's real run sends it after its
+  // changes were saved. The checks above still run in every case, so a preview fails where the
+  // send would. Not yet through here: the test email (sendTestEmail in emailSettings.ts), which
+  // makes its own transport.
+  await effects.email(message, async (m) => {
+    const transport = mailTransport.create(transportOptions(cfg));
+    try {
+      return await transport.sendMail(m);
+    } catch (err) {
+      throw new ServiceError('VALIDATION', explainMailError(err, { host: cfg.host, port: cfg.port, fromEmail: sender.from.address }));
+    }
+  });
   return { from: sender.from.address, to: opts.to };
 }
 

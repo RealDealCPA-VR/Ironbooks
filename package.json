@@ -8,7 +8,10 @@
   "main": "electron/main.js",
   "scripts": {
     "dev": "next dev",
+    "prebuild": "node scripts/agent-registry.mjs",
     "build": "next build",
+    "agent:registry": "node scripts/agent-registry.mjs",
+    "agent:registry:check": "node scripts/agent-registry.mjs --check",
     "start": "next start",
     "lint": "next lint",
     "db:generate": "drizzle-kit generate",

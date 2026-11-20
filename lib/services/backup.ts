@@ -855,9 +855,15 @@ async function restoreBackupInto(dir: string, buffer: Buffer, opts: { credential
 
     // Agent access is given at this computer to the books as they are now. Restored books start
     // with none, so an agent whose access was taken away does not come back with an older copy.
+    // What the agents were waiting on goes too, as in a restored portable file: a request that was
+    // waiting when the backup was made (even one a person has answered since), or an agent proposal
+    // this restore's upgrade turned into a request, is cancelled, and standing permission ends.
     try {
+      const restoredDb = await withDamagedFileAccess(() => getDb(dir));
       const { revokeAllAgents } = await import('./agents');
-      await revokeAllAgents(await withDamagedFileAccess(() => getDb(dir)));
+      await revokeAllAgents(restoredDb);
+      const { endAgentAccessInRestoredBooks } = await import('./portableFile');
+      await endAgentAccessInRestoredBooks(restoredDb);
     } catch (err) {
       console.error('[backup] agent access could not be turned off in the restored books:', err);
       await rollBack();
@@ -1210,6 +1216,9 @@ export const COMPANY_BACKUP_EXCLUDED_TABLES: Record<string, string> = {
   receipt_upload_tokens: 'short-lived phone-upload tokens; must not be replayable elsewhere',
   agents: 'agent access is given on one computer for one company file; a restored company starts with none',
   agent_requests: 'the record of what each agent already asked for; it belongs to agents that do not travel',
+  agent_policies: 'what each agent may do without asking; it belongs to agents that do not travel',
+  agent_permission_requests: 'what agents asked a person to approve; it belongs to agents that do not travel, and a request must never be approved in another copy of the books',
+  agent_grants: 'standing permission given to agents; it belongs to agents that do not travel, and must never come back to life in another copy of the books',
   accountant_copies: "Accountant's Copy transfer state belongs to the source file",
   ai_settings:
     "AI provider config holds API keys and the ChatGPT sign-in, sealed for the computer that entered them (device secret, lib/ai/keyVault.ts \"v3:\") or, in a file protected with passwords, with the source company file's own key (file_secrets); either way bound to the source company's id, and a per-company restore makes a new company (and does not carry file_secrets)",
