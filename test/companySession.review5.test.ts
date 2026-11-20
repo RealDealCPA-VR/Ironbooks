@@ -151,7 +151,7 @@ describe('switching or closing company files (source pins)', () => {
 
   it('a launch that cannot start says so and quits instead of running with no window', () => {
     const ready = main.slice(main.indexOf('app.whenReady().then(async () => {'));
-    expect(ready.slice(0, 900)).toMatch(/try \{\s*await createWindow\(\);\s*\} catch \(err\) \{[\s\S]*dialog\.showErrorBox\([\s\S]*app\.quit\(\);/);
+    expect(ready.slice(0, 1100)).toMatch(/try \{\s*await createWindow\(\);\s*\} catch \(err\) \{[\s\S]*dialog\.showErrorBox\([\s\S]*app\.quit\(\);/);
   });
 });
 
