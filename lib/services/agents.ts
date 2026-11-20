@@ -6,9 +6,13 @@
  * re-checks access from a user id finds none and refuses. It has:
  *
  *  - a name, shown wherever its work is listed;
- *  - the role keys an Admin gave it: the same roles people have, never Admin. Its access is those
- *    roles' access with the agent limits on top (lib/permissions/agentAccess.ts);
- *  - a mode (Read only / Propose / Post). In this version every mode only reads;
+ *  - the role keys an Admin gave it: the same roles people have, Admin included (D1 of the full
+ *    access plan). Its access is those roles' access with the agent limits on top
+ *    (lib/permissions/agentAccess.ts): its ceiling. An Admin role is a ceiling only; the policy
+ *    never lets Admin, company-file or password work run without a person's yes;
+ *  - a preset: what it may do without asking (lib/agent/policy.ts; the Admin adjusts it in the
+ *    Agents tab, lib/services/agentPolicies.ts). A new agent asks for every change (D2). The older
+ *    mode (Read only / Propose / Post) is kept in step with the preset for code that still reads it;
  *  - an access token, shown ONCE when the agent is made. Only a digest is stored.
  *
  * The digest is keyed with this computer's device secret when it has one (the secret that seals
@@ -19,8 +23,12 @@
  *
  * Making and removing agents is for an Admin, at the computer that holds the company file (the
  * routes refuse other computers), and both are written to the audit trail with the Admin as the
- * one who did it. Restoring a backup removes every agent's access (revokeAllAgents), so a token
- * that was taken away cannot come back with an older copy of the books.
+ * one who did it. The list is for anyone who may see Users & Roles, the same people who may open an
+ * agent's page (lib/services/agentPolicies.ts). An agent, and any work running inside an agent's
+ * bridged run, never makes, lists or removes agents (plan 4.6, D9). Restoring a backup removes
+ * every agent's access (revokeAllAgents, and
+ * endAgentAccessInRestoredBooks in lib/services/portableFile.ts), so a token that was taken away
+ * cannot come back with an older copy of the books.
  */
 import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
@@ -29,11 +37,15 @@ import { agents, companies, users } from '@/lib/db/schema';
 import { companyFileId } from '@/lib/auth';
 import { deviceKey } from '@/lib/ai/keyVault';
 import { AGENT_TOKEN_RE } from '@/lib/net/agentToken';
-import { unionRoles, type EffectiveAccess } from '@/lib/permissions/model';
-import { AGENT_MODES, clampForAgent, includesAdminRole, isAgentMode, type AgentMode } from '@/lib/permissions/agentAccess';
+import { canActivity, unionRoles, type EffectiveAccess } from '@/lib/permissions/model';
+import { AGENT_MODES, AGENT_MODE_LABELS, clampForAgent, isAgentMode, type AgentMode } from '@/lib/permissions/agentAccess';
+import { DEFAULT_PRESET, isAgentPreset, presetBulkCap, presetForMode } from '@/lib/agent/policy';
+import { AGENT_PRESET_LABELS, type AgentPreset } from '@/lib/agent/operations/types';
 import { endpointPublished, personSignedIn, publishEndpoint, withdrawEndpoint } from '@/lib/agent/endpointFile';
+// The scope module, not lib/context.ts: it holds no database or service imports (no cycle).
+import { inServiceScope } from '@/lib/serviceScope';
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
-import { definitionsFor, listRoleDefinitions } from './access';
+import { definitionsFor, listRoleDefinitions, permissionDenied, resolveAccess } from './access';
 import { SIMPLE_LIST_KEYS, ensureSeeded } from './lists/simpleLists';
 import { getFileLockStatus } from './fileLock';
 
@@ -52,7 +64,12 @@ export interface AgentView {
   roleKeys: string[];
   /** Role names for display; a role that no longer exists is left out. */
   roleNames: string[];
+  /** What it may do without asking (lib/agent/policy.ts). */
+  preset: AgentPreset;
+  /** The older word for the same choice, kept in step with the preset. */
   mode: AgentMode;
+  /** ISO time a person paused it, or null. */
+  pausedAt: string | null;
   /** The first characters of the token, to tell agents apart. Never the token. */
   tokenPrefix: string;
   createdAt: string;
@@ -67,12 +84,41 @@ export interface AgentView {
 export interface CreateAgentInput {
   name: string;
   roleKeys: string[];
-  mode: AgentMode;
+  /**
+   * What the agent may do without asking. Left out: the preset of `mode` when one is given (the
+   * older form), otherwise "Ask for every change" (DEFAULT_PRESET, D2).
+   */
+  preset?: AgentPreset;
+  /** The older choice. Sent with a preset, it must be that preset's own (modeForPreset). */
+  mode?: AgentMode;
   /** May work while Ironbooks has the file open but nobody is signed in. Off unless asked for. */
   unattended?: boolean;
 }
 
 type AgentRow = typeof agents.$inferSelect;
+
+/**
+ * The older mode that goes with a preset, for code that still reads `agents.mode`
+ * (lib/agent/actions.ts): Read only stays Read only, "Ask for every change" proposes, and both
+ * presets that enter work themselves post. The reverse of presetForMode (lib/agent/policy.ts).
+ */
+export function modeForPreset(preset: AgentPreset): AgentMode {
+  if (preset === 'read_only') return 'read_only';
+  if (preset === 'ask_every_change') return 'propose';
+  return 'post';
+}
+
+/**
+ * The stored preset. One Ironbooks does not know (only a hand-edited file holds one) is read as
+ * the default, the same way the policy engine reads it (resolvePolicy), so a screen never shows
+ * another preset than the one the decisions use.
+ */
+export function presetOfRow(row: Pick<AgentRow, 'preset'>): AgentPreset {
+  return isAgentPreset(row.preset) ? row.preset : DEFAULT_PRESET;
+}
+
+const PRESET_CHOICE =
+  'Choose what the agent may do: Read only, Ask for every change, Trusted bookkeeper or Full, with asks.';
 
 // ---------------------------------------------------------------------------
 // Token
@@ -108,15 +154,63 @@ function newToken(): string {
 // Guards
 // ---------------------------------------------------------------------------
 
+/** The Users & Roles activity the agents routes are mapped to (lib/permissions/routeActivities.ts). */
+const MANAGE_AGENTS = 'users.users';
+
+/**
+ * An agent never manages agents (it cannot reach these routes either), whatever context it holds,
+ * and neither does work inside an agent's bridged run, even one handed a person's context: the
+ * same rule lib/services/agentPolicies.ts keeps for changing an agent (D9).
+ */
+function refuseAgentWork(ctx: ServiceContext, message: string): void {
+  if (ctx.agent || inServiceScope()) throw new ServiceError('FORBIDDEN', message);
+}
+
 function assertAdminPerson(ctx: ServiceContext, what: string): void {
-  // An agent never manages agents (it cannot reach these routes either).
-  if (ctx.agent) throw new ServiceError('FORBIDDEN', `${what} is for an Admin.`);
+  refuseAgentWork(ctx, `${what} is for an Admin.`);
   // No `access` = trusted internal context (tests, system jobs), as everywhere else.
   if (ctx.access && !ctx.access.isAdmin) throw new ServiceError('FORBIDDEN', `${what} is for an Admin.`);
 }
 
+/**
+ * The list of agents: a person who may see Users & Roles, as for an agent's own page
+ * (lib/services/agentPolicies.ts), so a user manager who may open, pause or change an agent can
+ * also find it. A context built without access is checked from the company file; a trusted
+ * internal context (no access, nobody signed in) passes.
+ */
+async function assertMaySeeAgents(ctx: ServiceContext): Promise<void> {
+  refuseAgentWork(ctx, 'An agent cannot list agents. It can read its own permissions with get_my_permissions.');
+  if (!ctx.access && !ctx.userId) return;
+  let access = ctx.access;
+  if (!access) {
+    const r = await resolveAccess(ctx.db, ctx.companyId, ctx.userId ?? '');
+    if (!r.member || !r.active) throw new ServiceError('FORBIDDEN', 'You do not have access to this company.');
+    access = r.access;
+  }
+  if (!canActivity(access, MANAGE_AGENTS, 'view')) throw permissionDenied('users', 'view', MANAGE_AGENTS);
+}
+
 function applicationsBlocked(settings: unknown): boolean {
   return Boolean(settings && typeof settings === 'object' && (settings as { integratedAppsBlocked?: unknown }).integratedAppsBlocked === true);
+}
+
+/**
+ * The preset a new agent gets: the one asked for, else the preset of the older mode when only
+ * that was sent (an older Agents tab or script), else "Ask for every change" (D2). A mode sent
+ * with a preset must be the preset's own; a mismatch is refused rather than guessed.
+ */
+function presetOfInput(input: Pick<CreateAgentInput, 'preset' | 'mode'>): AgentPreset {
+  const mode = input.mode;
+  if (mode !== undefined && mode !== null && !isAgentMode(mode)) throw validation('Choose Read only, Propose or Post.');
+  const preset = input.preset;
+  if (preset === undefined || preset === null) return mode ? presetForMode(mode) : DEFAULT_PRESET;
+  if (!isAgentPreset(preset)) throw validation(PRESET_CHOICE);
+  if (mode && modeForPreset(preset) !== mode) {
+    throw validation(
+      `The mode "${AGENT_MODE_LABELS[mode]}" does not go with "${AGENT_PRESET_LABELS[preset]}". Send the preset alone: the mode follows it.`,
+    );
+  }
+  return preset;
 }
 
 /** True when Preferences > Integrated Applications lets nothing but people reach this company. */
@@ -136,7 +230,9 @@ function toView(row: AgentRow, roleNames: Map<string, string>, createdByName: st
     name: row.name,
     roleKeys: keys,
     roleNames: keys.map((k) => roleNames.get(k)).filter((n): n is string => Boolean(n)),
+    preset: presetOfRow(row),
     mode: isAgentMode(row.mode) ? row.mode : 'read_only',
+    pausedAt: row.pausedAt ? row.pausedAt.toISOString() : null,
     tokenPrefix: row.tokenPrefix,
     createdAt: row.createdAt.toISOString(),
     createdByName,
@@ -162,11 +258,13 @@ export async function createAgent(ctx: ServiceContext, input: CreateAgentInput):
   const name = typeof input.name === 'string' ? input.name.trim() : '';
   if (!name) throw validation('Give the agent a name.');
   if (name.length > 100) throw validation('The name can be at most 100 characters.');
-  if (!isAgentMode(input.mode)) throw validation('Choose Read only, Propose or Post.');
+  const preset = presetOfInput(input);
+  const mode = modeForPreset(preset);
 
+  // Any role a person can have, Admin included (D1): the role is the agent's ceiling, and the
+  // policy keeps Admin, company-file and password work on Ask at the most (lib/agent/policy.ts).
   const roleKeys = [...new Set((Array.isArray(input.roleKeys) ? input.roleKeys : []).filter((k) => typeof k === 'string' && k))];
   if (!roleKeys.length) throw validation('Choose at least one role for the agent.');
-  if (includesAdminRole(roleKeys)) throw validation('An agent cannot be an Admin. Choose another role.');
   const names = await roleNameMap(ctx.db, ctx.companyId);
   const unknown = roleKeys.filter((k) => !names.has(k));
   if (unknown.length) throw validation('One of the chosen roles does not exist in this company.');
@@ -189,7 +287,11 @@ export async function createAgent(ctx: ServiceContext, input: CreateAgentInput):
         companyId: tx.companyId,
         name,
         roleKeys,
-        mode: input.mode,
+        preset,
+        mode,
+        // Only "Full, with asks" lets bulk work run unasked, and then always within a count cap;
+        // it is written down so the Agents tab shows the number the decisions use.
+        bulkCap: presetBulkCap(preset),
         tokenHash: digest.hash,
         tokenPrefix: token.slice(0, 18),
         keyId: digest.keyId,
@@ -201,7 +303,7 @@ export async function createAgent(ctx: ServiceContext, input: CreateAgentInput):
       action: 'create',
       entityType: 'agent',
       entityId: created.id,
-      newValues: { name, roleKeys, mode: input.mode, tokenPrefix: created.tokenPrefix, unattended: created.unattended },
+      newValues: { name, roleKeys, preset, mode, tokenPrefix: created.tokenPrefix, unattended: created.unattended },
     });
     return created;
   });
@@ -209,9 +311,9 @@ export async function createAgent(ctx: ServiceContext, input: CreateAgentInput):
   return { agent: toView(row, names, null, null), token };
 }
 
-/** The company's agents, newest first. Never the digest. */
+/** The company's agents, newest first, for anyone who may see Users & Roles. Never the digest. */
 export async function listAgents(ctx: ServiceContext): Promise<AgentView[]> {
-  assertAdminPerson(ctx, 'The list of agents');
+  await assertMaySeeAgents(ctx);
   const rows = await ctx.db
     .select({ agent: agents, createdByName: users.name })
     .from(agents)
@@ -220,6 +322,18 @@ export async function listAgents(ctx: ServiceContext): Promise<AgentView[]> {
     .orderBy(desc(agents.createdAt));
   const names = await roleNameMap(ctx.db, ctx.companyId);
   return rows.map((r) => toView(r.agent, names, r.createdByName ?? null, lastUsedOf(r.agent)));
+}
+
+/**
+ * How many agents of this company are not removed (paused ones count: they can be turned back on).
+ * A number only, for the title bar, which shows "Pause all agents" whenever any agent exists.
+ */
+export async function agentCount(db: DB, companyId: string): Promise<number> {
+  const [row] = await db
+    .select({ n: sql<number>`count(*)::int` })
+    .from(agents)
+    .where(and(eq(agents.companyId, companyId), isNull(agents.revokedAt)));
+  return Number(row?.n ?? 0);
 }
 
 /** Take an agent's access away. Its token stops working with the next request. */
@@ -250,7 +364,8 @@ export async function revokeAgent(ctx: ServiceContext, id: string): Promise<Agen
 
 /**
  * Take every agent's access away, in every company of the file. Run on restored books
- * (lib/services/backup.ts, lib/services/portableFile.ts): agent access is given at this computer
+ * (lib/services/backup.ts; a Portable restore uses endAgentAccessInRestoredBooks in
+ * lib/services/portableFile.ts, which backup.ts runs too): agent access is given at this computer
  * to the books as they are now, and a restore must not bring back one that was removed.
  */
 export async function revokeAllAgents(db: DB): Promise<number> {
@@ -267,7 +382,14 @@ export interface ActiveAgent {
   companyId: string;
   name: string;
   roleKeys: string[];
+  /** What it may do without asking (lib/agent/policy.ts). */
+  preset: AgentPreset;
   mode: AgentMode;
+  /**
+   * ISO time a person paused it, or null. A paused agent still has its token (so the door can tell
+   * it why it is refused); the policy refuses everything it asks (lib/agent/policy.ts decide).
+   */
+  pausedAt: string | null;
   /** The Admin who let the agent in: the person answerable for what it enters. */
   createdBy: string | null;
   /** May work while the file is open but nobody is signed in. */
@@ -292,15 +414,21 @@ export async function findAgentByToken(db: DB, token: string): Promise<ActiveAge
     companyId: row.companyId,
     name: row.name,
     roleKeys: Array.isArray(row.roleKeys) ? row.roleKeys : [],
+    preset: presetOfRow(row),
     mode: isAgentMode(row.mode) ? row.mode : 'read_only',
+    pausedAt: row.pausedAt ? row.pausedAt.toISOString() : null,
     createdBy: row.createdBy ?? null,
     unattended: row.unattended === true,
   };
 }
 
-/** An agent's access: its roles (never Admin) with the agent limits applied. */
+/**
+ * An agent's access, its ceiling: every role it was given, Admin included (D1), with the agent
+ * limits of lib/permissions/agentAccess.ts applied (clampForAgent decides what of an Admin role an
+ * agent keeps). A role that no longer exists gives nothing.
+ */
 export async function agentAccess(db: DB, agent: Pick<ActiveAgent, 'companyId' | 'roleKeys'>): Promise<EffectiveAccess> {
-  const keys = agent.roleKeys.filter((k) => !includesAdminRole([k]));
+  const keys = (Array.isArray(agent.roleKeys) ? agent.roleKeys : []).filter((k) => typeof k === 'string' && k);
   return clampForAgent(unionRoles(await definitionsFor(db, agent.companyId, keys)));
 }
 
@@ -310,7 +438,8 @@ const LAST_USED_SAVE_MS = 24 * 60 * 60 * 1000;
 const gl = globalThis as typeof globalThis & { __ironbooksAgentLastUsed?: Map<string, Date> };
 const lastUsed: Map<string, Date> = (gl.__ironbooksAgentLastUsed ??= new Map());
 
-function lastUsedOf(row: AgentRow): Date | null {
+/** When the agent last worked: the time kept in memory this run, or the saved one if later. */
+export function lastUsedOf(row: Pick<AgentRow, 'id' | 'lastUsedAt'>): Date | null {
   const mem = lastUsed.get(row.id) ?? null;
   if (mem && (!row.lastUsedAt || mem > row.lastUsedAt)) return mem;
   return row.lastUsedAt ?? null;

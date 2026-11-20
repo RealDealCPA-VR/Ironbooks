@@ -4,16 +4,19 @@
  *  - an Admin makes an agent and gets the token once; the database holds only a digest;
  *  - nothing listed or returned afterwards contains the token or the digest;
  *  - a token finds its agent until the agent is removed, and never on another computer's key;
- *  - only an Admin makes or removes agents, an agent is never an Admin, and both are audited
- *    with the Admin as the one who did it;
- *  - an agent's access is its roles' access without Admin, Users & Roles, File Utilities and the
- *    sensitive flags;
+ *  - only an Admin makes or removes agents, and both are audited with the Admin as the one who
+ *    did it; anyone who may see Users & Roles lists them; an agent, or work inside an agent's
+ *    bridged run, does none of it. An agent may hold any role, Admin included (D1): the role is
+ *    its ceiling;
+ *  - a new agent asks for every change unless the Admin chose otherwise (D2), and the older mode
+ *    follows its preset;
+ *  - an agent's access is its roles' access through the agent limits (clampForAgent);
  *  - what an agent does is recorded under its own name (audit trail and transaction log);
  *  - the agents table never travels in copies, and restoring a backup removes every agent's access.
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { eq } from 'drizzle-orm';
 
 const ROOT = path.resolve(process.cwd(), '.bookkeeper-data', 'test-agents');
@@ -24,21 +27,33 @@ process.env.BKA_AUTH_SECRET = 'agents-test-secret';
 process.env.IRONBOOKS_AGENT_ENDPOINT_DIR = path.join(ROOT, 'endpoints');
 delete process.env.BKA_DEVICE_VAULT;
 
+// Another unit's module, replaced here: whether code runs inside an agent's bridged run.
+const scope = vi.hoisted(() => ({ inside: false }));
+vi.mock('@/lib/serviceScope', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  inServiceScope: () => scope.inside,
+}));
+
 import { getDb, closeDb, type DB } from '@/lib/db';
 import { agents, auditLogs, companies, users } from '@/lib/db/schema';
-import { builtinRole, fullAccess, unionRoles } from '@/lib/permissions/model';
+import { builtinRole, fullAccess, unionRoles, type RoleDefinition } from '@/lib/permissions/model';
 import { canActivity } from '@/lib/permissions/model';
+import { clampForAgent } from '@/lib/permissions/agentAccess';
+import { presetForMode } from '@/lib/agent/policy';
 import { AGENT_TOKEN_RE } from '@/lib/net/agentToken';
 import { stripSecrets } from '@/lib/permissions/mask';
+import { createAgentSchema } from '@/lib/validation/agents';
 import { createCompany } from './company';
 import { ServiceError, type ServiceContext, writeAudit } from './_base';
 import {
   agentAccess,
+  agentCount,
   agentFileTag,
   agentTokenDigest,
   createAgent,
   findAgentByToken,
   listAgents,
+  modeForPreset,
   revokeAgent,
   revokeAllAgents,
 } from './agents';
@@ -51,6 +66,7 @@ import { createRole } from './users';
 let db: DB;
 let admin: ServiceContext;
 let bookkeeper: ServiceContext;
+let manager: ServiceContext;
 let adminId: string;
 
 async function expectError(p: Promise<unknown>, code: string, message?: RegExp) {
@@ -74,6 +90,20 @@ beforeAll(async () => {
   const company = await createCompany(db, { name: 'Agents Co', ownerId: owner.id });
   admin = { db, companyId: company.id, userId: owner.id, role: 'owner', access: fullAccess() };
   bookkeeper = { db, companyId: company.id, userId: other.id, role: 'accountant', access: unionRoles([builtinRole('bookkeeper')!]) };
+  // Manages users but is not an Admin.
+  const usersRole: RoleDefinition = {
+    key: 'user_manager',
+    name: 'User manager',
+    description: 'test',
+    builtin: false,
+    permissions: { users: ['view', 'create', 'modify'] },
+    flags: {},
+  };
+  manager = { db, companyId: company.id, userId: other.id, role: 'accountant', access: unionRoles([builtinRole('bookkeeper')!, usersRole]) };
+});
+
+beforeEach(() => {
+  scope.inside = false;
 });
 
 afterAll(async () => {
@@ -92,7 +122,15 @@ describe('making an agent', () => {
     agentId = made.agent.id;
     expect(token).toMatch(AGENT_TOKEN_RE);
     expect(token.slice(5, 13)).toBe(agentFileTag());
-    expect(made.agent).toMatchObject({ name: 'Month-end helper', roleKeys: ['bookkeeper'], roleNames: ['Bookkeeper'], mode: 'read_only', status: 'active' });
+    expect(made.agent).toMatchObject({
+      name: 'Month-end helper',
+      roleKeys: ['bookkeeper'],
+      roleNames: ['Bookkeeper'],
+      preset: 'read_only',
+      mode: 'read_only',
+      pausedAt: null,
+      status: 'active',
+    });
 
     const [row] = await db.select().from(agents).where(eq(agents.id, agentId));
     expect(row.tokenHash).toMatch(/^[0-9a-f]{64}$/);
@@ -126,7 +164,14 @@ describe('making an agent', () => {
   });
 
   it('finds the agent by its token, and nothing by a wrong one', async () => {
-    expect(await findAgentByToken(db, token)).toMatchObject({ id: agentId, name: 'Month-end helper', mode: 'read_only', roleKeys: ['bookkeeper'] });
+    expect(await findAgentByToken(db, token)).toMatchObject({
+      id: agentId,
+      name: 'Month-end helper',
+      preset: 'read_only',
+      mode: 'read_only',
+      pausedAt: null,
+      roleKeys: ['bookkeeper'],
+    });
     const wrong = `${token.slice(0, -4)}${token.endsWith('AAAA') ? 'BBBB' : 'AAAA'}`;
     expect(await findAgentByToken(db, wrong)).toBeNull();
     expect(await findAgentByToken(db, 'ibka_short')).toBeNull();
@@ -171,25 +216,104 @@ describe('making an agent', () => {
 });
 
 describe('who may make agents, and what an agent may be', () => {
-  it('only an Admin makes, lists or removes agents', async () => {
+  it('only an Admin makes or removes agents; anyone who may see Users & Roles lists them', async () => {
     await expectError(createAgent(bookkeeper, { name: 'Sneaky', roleKeys: ['view_only'], mode: 'read_only' }), 'FORBIDDEN', /Admin/);
-    await expectError(listAgents(bookkeeper), 'FORBIDDEN', /Admin/);
+    await expectError(listAgents(bookkeeper), 'FORBIDDEN', /permission to view Users/);
     const made = await createAgent(admin, { name: 'To remove', roleKeys: ['view_only'], mode: 'read_only' });
     await expectError(revokeAgent(bookkeeper, made.agent.id), 'FORBIDDEN', /Admin/);
+    // A user manager who is not an Admin finds the agents they may open and pause, but makes and
+    // removes none.
+    expect((await listAgents(manager)).map((a) => a.id)).toContain(made.agent.id);
+    await expectError(createAgent(manager, { name: 'Managed', roleKeys: ['view_only'] }), 'FORBIDDEN', /Admin/);
+    await expectError(revokeAgent(manager, made.agent.id), 'FORBIDDEN', /Admin/);
+    // A person whose context was built without access is checked from the company file.
+    expect((await listAgents({ db, companyId: admin.companyId, userId: adminId })).length).toBeGreaterThan(0);
     // An agent cannot manage agents either, even with an Admin's access handed to it.
     const asAgent: ServiceContext = { ...admin, userId: null, agent: { id: made.agent.id, name: 'To remove', mode: 'post' } };
     await expectError(createAgent(asAgent, { name: 'Child', roleKeys: ['view_only'], mode: 'read_only' }), 'FORBIDDEN');
+    await expectError(listAgents(asAgent), 'FORBIDDEN', /An agent cannot list agents/);
     await expectError(revokeAgent(asAgent, made.agent.id), 'FORBIDDEN');
+    // Nor does work inside an agent's bridged run, even when handed the Admin's own context (D9).
+    scope.inside = true;
+    await expectError(createAgent(admin, { name: 'Bridged', roleKeys: ['view_only'] }), 'FORBIDDEN');
+    await expectError(listAgents(admin), 'FORBIDDEN');
+    await expectError(revokeAgent(admin, made.agent.id), 'FORBIDDEN');
+    scope.inside = false;
+    expect((await listAgents(admin)).find((a) => a.id === made.agent.id)?.status).toBe('active');
     await revokeAgent(admin, made.agent.id);
   });
 
-  it('an agent is never an Admin and needs a real role', async () => {
-    await expectError(createAgent(admin, { name: 'Boss', roleKeys: ['admin'], mode: 'read_only' }), 'VALIDATION', /cannot be an Admin/);
-    await expectError(createAgent(admin, { name: 'Boss', roleKeys: ['bookkeeper', 'admin'], mode: 'read_only' }), 'VALIDATION', /cannot be an Admin/);
+  it('an agent may hold the Admin role (D1), and needs a real role', async () => {
+    // The role is a ceiling; the policy keeps Admin, company-file and password work on Ask.
+    const boss = await createAgent(admin, { name: 'Boss', roleKeys: ['admin'] });
+    expect(boss.agent).toMatchObject({ roleKeys: ['admin'], roleNames: ['Admin'], preset: 'ask_every_change', mode: 'propose' });
+    const both = await createAgent(admin, { name: 'Boss two', roleKeys: ['bookkeeper', 'admin'], mode: 'read_only' });
+    expect(both.agent.roleNames).toEqual(['Bookkeeper', 'Admin']);
+    // Its access goes through the agent limits like any other role's.
+    const access = await agentAccess(db, { companyId: admin.companyId, roleKeys: ['admin'] });
+    expect(access).toEqual(clampForAgent(fullAccess()));
+    await revokeAgent(admin, boss.agent.id);
+    await revokeAgent(admin, both.agent.id);
+
     await expectError(createAgent(admin, { name: 'Nobody', roleKeys: [], mode: 'read_only' }), 'VALIDATION', /at least one role/);
     await expectError(createAgent(admin, { name: 'Ghost', roleKeys: ['no_such_role'], mode: 'read_only' }), 'VALIDATION', /does not exist/);
     await expectError(createAgent(admin, { name: '   ', roleKeys: ['view_only'], mode: 'read_only' }), 'VALIDATION', /name/);
     await expectError(createAgent(admin, { name: 'Odd', roleKeys: ['view_only'], mode: 'everything' as never }), 'VALIDATION');
+  });
+
+  it('a new agent asks for every change unless told otherwise (D2), and its mode follows its preset', async () => {
+    const plain = await createAgent(admin, { name: 'Default', roleKeys: ['view_only'] });
+    expect(plain.agent).toMatchObject({ preset: 'ask_every_change', mode: 'propose', pausedAt: null });
+    expect(await findAgentByToken(db, plain.token)).toMatchObject({ preset: 'ask_every_change', mode: 'propose', pausedAt: null });
+
+    // The preset decides, and the older mode is written to match it.
+    const full = await createAgent(admin, { name: 'Full', roleKeys: ['bookkeeper'], preset: 'full_with_asks' });
+    expect(full.agent).toMatchObject({ preset: 'full_with_asks', mode: 'post' });
+    const [row] = await db.select().from(agents).where(eq(agents.id, full.agent.id));
+    // "Full, with asks" lets bulk work run unasked, so it comes with its count cap written down.
+    expect(row).toMatchObject({ preset: 'full_with_asks', mode: 'post', bulkCap: 200 });
+    const trusted = await createAgent(admin, { name: 'Trusted', roleKeys: ['bookkeeper'], preset: 'trusted_bookkeeper', mode: 'post' });
+    expect(trusted.agent).toMatchObject({ preset: 'trusted_bookkeeper', mode: 'post' });
+    const [trustedRow] = await db.select().from(agents).where(eq(agents.id, trusted.agent.id));
+    expect(trustedRow.bulkCap).toBeNull();
+
+    // The older form with a mode alone still works and gets that mode's preset.
+    const old = await createAgent(admin, { name: 'Older form', roleKeys: ['bookkeeper'], mode: 'post' });
+    expect(old.agent).toMatchObject({ preset: 'trusted_bookkeeper', mode: 'post' });
+
+    // A mode that is not the preset's own is refused, not guessed; so is an unknown preset.
+    await expectError(
+      createAgent(admin, { name: 'Mixed', roleKeys: ['bookkeeper'], preset: 'read_only', mode: 'post' }),
+      'VALIDATION',
+      /does not go with/,
+    );
+    await expectError(createAgent(admin, { name: 'Odd', roleKeys: ['bookkeeper'], preset: 'everything' as never }), 'VALIDATION', /Choose what the agent may do/);
+
+    // The audit row and the list name the preset.
+    const [audit] = await db.select().from(auditLogs).where(eq(auditLogs.entityId, full.agent.id));
+    expect(audit.newValues).toMatchObject({ preset: 'full_with_asks', mode: 'post' });
+    const listed = (await listAgents(admin)).find((a) => a.id === full.agent.id);
+    expect(listed).toMatchObject({ preset: 'full_with_asks', mode: 'post', pausedAt: null });
+
+    // A paused agent keeps its token, so the door can say why it is refused.
+    const when = new Date('2026-11-20T10:00:00.000Z');
+    await db.update(agents).set({ pausedAt: when }).where(eq(agents.id, plain.agent.id));
+    expect(await findAgentByToken(db, plain.token)).toMatchObject({ id: plain.agent.id, pausedAt: when.toISOString() });
+
+    for (const a of [plain, full, trusted, old]) await revokeAgent(admin, a.agent.id);
+  });
+
+  it('modeForPreset is the reverse of presetForMode', () => {
+    for (const mode of ['read_only', 'propose', 'post'] as const) expect(modeForPreset(presetForMode(mode))).toBe(mode);
+    expect(modeForPreset('full_with_asks')).toBe('post');
+  });
+
+  it('the request schema takes a preset, the older mode, or neither', () => {
+    expect(createAgentSchema.safeParse({ name: 'A', roleKeys: ['admin'], preset: 'full_with_asks' }).success).toBe(true);
+    expect(createAgentSchema.safeParse({ name: 'A', roleKeys: ['bookkeeper'], mode: 'post' }).success).toBe(true);
+    expect(createAgentSchema.safeParse({ name: 'A', roleKeys: ['bookkeeper'] }).success).toBe(true);
+    expect(createAgentSchema.safeParse({ name: 'A', roleKeys: ['bookkeeper'], preset: 'everything' }).success).toBe(false);
+    expect(createAgentSchema.safeParse({ name: 'A', roleKeys: ['bookkeeper'], preset: 'read_only', extra: 1 }).success).toBe(false);
   });
 
   it('two active agents cannot share a name', async () => {
@@ -200,9 +324,9 @@ describe('who may make agents, and what an agent may be', () => {
     await revokeAgent(admin, again.agent.id);
   });
 
-  it("an agent's access is its roles' access without the things no agent gets", async () => {
-    // A custom role that grants everything a role can: an agent with it still gets no Admin,
-    // no Users & Roles, no File Utilities and none of the sensitive flags.
+  it("an agent's access is its roles' access through the agent limits", async () => {
+    // Every role it was given counts, Admin included (D1). What the agent limits keep and take away
+    // (lib/permissions/agentAccess.ts clampForAgent) is checked here by value.
     const everything = Object.fromEntries(Object.keys(fullAccess().permissions).map((a) => [a, ['view', 'create', 'modify', 'delete', 'print']]));
     const role = await createRole(admin, {
       name: 'Nearly everything',
@@ -211,19 +335,45 @@ describe('who may make agents, and what an agent may be', () => {
       flags: { sensitivePayroll: true, fullAccountNumbers: true, closedPeriod: true },
     });
     const access = await agentAccess(db, { companyId: admin.companyId, roleKeys: [role.key, 'admin'] });
-    expect(access.isAdmin).toBe(false);
-    expect(access.roleKeys).not.toContain('admin');
-    expect(access.permissions.users).toEqual([]);
-    expect(access.permissions.file_utilities).toEqual([]);
-    expect(access.flags).toEqual({ sensitivePayroll: false, fullAccountNumbers: false, closedPeriod: false });
-    expect(canActivity(access, 'users.users', 'create')).toBe(false);
-    expect(canActivity(access, 'file_utilities.backup', 'create')).toBe(false);
-    // What the role gives elsewhere is kept, View Balance included.
+    // With the Admin role, the agent's ceiling is an Admin's: both roles count.
+    expect(access.isAdmin).toBe(true);
+    expect([...access.roleKeys].sort()).toEqual([role.key, 'admin'].sort());
+    // Without the Admin role an agent is never an Admin, whatever its other roles give.
+    const noAdmin = await agentAccess(db, { companyId: admin.companyId, roleKeys: [role.key] });
+    expect(noAdmin.isAdmin).toBe(false);
+    expect(noAdmin.roleKeys).toEqual([role.key]);
+    // What the role gives is kept, View Balance included. Users & Roles and File Utilities stay (a
+    // direct request still never reaches them: their work is the admin and file classes, which a
+    // person approves), and so do the View flags and the closed-period right, which the policy
+    // checks before an agent may even ask to reveal data or work in a closed period.
     expect(access.permissions.banking).toContain('view');
     expect(canActivity(access, 'banking.registers', 'view_balance')).toBe(true);
+    expect(noAdmin.permissions.users).toEqual(expect.arrayContaining(['view', 'modify']));
+    expect(noAdmin.permissions.file_utilities.length).toBeGreaterThan(0);
+    expect(noAdmin.flags).toEqual({ sensitivePayroll: true, fullAccountNumbers: true, closedPeriod: true });
+    // A role without a flag gives none.
+    const plain = await agentAccess(db, { companyId: admin.companyId, roleKeys: ['bookkeeper'] });
+    expect(plain.isAdmin).toBe(false);
+    expect(plain.flags.closedPeriod).toBe(false);
+    // The ceiling is a copy: changing it never changes the next agent's.
+    access.permissions.banking.length = 0;
+    expect((await agentAccess(db, { companyId: admin.companyId, roleKeys: [role.key, 'admin'] })).permissions.banking).toContain('view');
     // A role that no longer exists gives nothing.
     const none = await agentAccess(db, { companyId: admin.companyId, roleKeys: ['00000000-0000-4000-8000-000000000000'] });
     expect(Object.values(none.permissions).every((a) => a.length === 0)).toBe(true);
+  });
+
+  it('counts the agents that are not removed, paused ones included', async () => {
+    const start = await agentCount(db, admin.companyId);
+    const a = await createAgent(admin, { name: 'Counted', roleKeys: ['view_only'] });
+    const b = await createAgent(admin, { name: 'Counted too', roleKeys: ['view_only'] });
+    await db.update(agents).set({ pausedAt: new Date() }).where(eq(agents.id, b.agent.id));
+    expect(await agentCount(db, admin.companyId)).toBe(start + 2);
+    await revokeAgent(admin, a.agent.id);
+    expect(await agentCount(db, admin.companyId)).toBe(start + 1);
+    await revokeAgent(admin, b.agent.id);
+    expect(await agentCount(db, admin.companyId)).toBe(start);
+    expect(await agentCount(db, '00000000-0000-4000-8000-000000000000')).toBe(0);
   });
 
   it('Integrated Applications "no applications" stops new agents', async () => {

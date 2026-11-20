@@ -1,6 +1,7 @@
 /**
- * Agent full access: the service-context scope (lib/context.ts runWithServiceContext,
- * requestHeaders, inServiceScope, outsideServiceScope; plan §5.2 item 1).
+ * Agent full access: the service-context scope (lib/serviceScope.ts runWithServiceContext,
+ * requestHeaders, inServiceScope, outsideServiceScope, re-exported by lib/context.ts; plan §5.2
+ * item 1 and §11.3).
  *
  * The real getServerContext / getSessionGate run here, on a real company file, with next/headers
  * standing in for a request the way lib/agentContext.test.ts does. The stand-in counts its reads,
@@ -10,19 +11,27 @@
  * What is proved:
  *  - inside a scope, the context is exactly the one given, and the request is never read;
  *  - a scope opens only for a whole agent context (access, role, agent), a known method, a path
- *    without a query, and headers from the short list: nothing that carries trust;
+ *    middleware could have stamped (no query, no "." / ".." / empty parts, no backslash), and
+ *    headers from the short list: nothing that carries trust;
+ *  - the context must stay as it was given: a role or access cleared, a right added inside the
+ *    access, the access swapped, is refused on the next read of the scope, and the route map is
+ *    checked against a frozen copy of the access taken when the scope opened;
  *  - inside a scope the route map, the feature switches and the Accountant's Copy gate are checked
- *    on the scope's own path and method, against the agent's access;
+ *    on the scope's own path and method, against the agent's access, and a scope whose checks
+ *    would read another request's path is refused;
  *  - nothing a request carries (headers, cookies) opens a scope or reaches a scoped context, and
- *    the module hands out no way to reach the scope store; a real request's forged origin label
- *    is dropped;
- *  - two scopes running at the same time each see only their own context and headers, and a
- *    person's request running alongside them still gets the person's context and real headers;
+ *    neither module exports the scope store (code inside the process can look it up through its
+ *    registered symbol, by design; a request cannot); a real request's forged origin label is
+ *    dropped, and could only lower its own trust;
+ *  - several scopes running at the same time each see only their own context, headers, origin and
+ *    route stamps, and a person's request running alongside them still gets the person's own;
+ *  - the request helpers (lib/net/requestInfo.ts getRequestOrigin, lib/permissions/enforce.ts
+ *    currentRequestInfo) see the scope's request, never the one the bridge runs in;
  *  - the scope is gone once its work settles (resolved or thrown), and work it left running is
- *    refused rather than taken for the request it ran in; outsideServiceScope starts work that
- *    does not carry it;
+ *    refused rather than taken for the request it ran in, and no longer reads the closing-date
+ *    password; outsideServiceScope starts work that does not carry it;
  *  - a scope cannot be opened inside another;
- *  - a second copy of the module (Next can load one twice) sees the same scope, and the store
+ *  - a second copy of the modules (Next can load one twice) sees the same scope, and the store
  *    cannot be swapped out;
  *  - requestHeaders() gives the synthetic set: stamped path and method, origin "agent", and an
  *    x-closing-password only when one was given;
@@ -69,13 +78,16 @@ delete process.env.BKA_ALLOW_DEV_FALLBACK;
 delete process.env.PORT;
 
 import { getDb, closeDb, type DB } from '@/lib/db';
-import { companies, users } from '@/lib/db/schema';
+import { accountantCopies, companies, users } from '@/lib/db/schema';
 import { createSessionToken, SESSION_COOKIE } from '@/lib/auth';
 import * as contextModule from '@/lib/context';
+import * as serviceScopeModule from '@/lib/serviceScope';
+import { currentRequestInfo } from '@/lib/permissions/enforce';
 import {
   CLOSING_PASSWORD_HEADER,
   COMPANY_COOKIE,
   SERVICE_ORIGIN_HEADER,
+  SERVICE_SCOPE_CHANGED_MESSAGE,
   SERVICE_SCOPE_ENDED_MESSAGE,
   getPageContext,
   getServerContext,
@@ -88,12 +100,12 @@ import {
   type SessionGate,
 } from '@/lib/context';
 import { AGENT_NOT_AVAILABLE_MESSAGE } from '@/lib/agentContext';
-import { ROUTE_METHOD_HEADER, ROUTE_PATH_HEADER } from '@/lib/permissions/routes';
+import { ROUTE_METHOD_HEADER, ROUTE_PATH_HEADER, apiRuleFor } from '@/lib/permissions/routes';
 import { fullAccess, withoutAreas } from '@/lib/permissions/model';
 import { PERMISSION_DENIED_PREFIX } from '@/lib/services/access';
-import { LAUNCH_PASS_HEADER } from '@/lib/net/launchPass';
+import { LAUNCH_PASS_ENV, LAUNCH_PASS_HEADER } from '@/lib/net/launchPass';
 import { PROXY_SECRET_HEADER } from '@/lib/net/loopbackHost';
-import { REMOTE_ADDR_HEADER } from '@/lib/net/requestInfo';
+import { REMOTE_ADDR_HEADER, UNVERIFIED_LOCAL_ADDR, getRequestOrigin, originFromHeaders } from '@/lib/net/requestInfo';
 import { createCompany } from '@/lib/services/company';
 import { resetAgentEndpointState } from '@/lib/agent/endpointFile';
 import { ServiceError, type ServiceContext } from '@/lib/services/_base';
@@ -260,6 +272,97 @@ describe('inside a scope', () => {
       expect(await getServerContext()).toBe(ctxB);
     });
   });
+
+  it("an Accountant's Copy refuses a save it cannot send back, in the scope company", async () => {
+    const copyCo = (await createCompany(db, { name: 'Accountant Copy Co', ownerId })).id;
+    await db.insert(accountantCopies).values({
+      companyId: copyCo,
+      side: 'accountant',
+      status: 'open',
+      dividingDate: '2026-12-31',
+      fileToken: 'context-scope-copy',
+    });
+    // The request around it is a save the copy would carry back: it must not count.
+    request('POST', '/api/estimates', { user: ownerId });
+    resetReads();
+    const expire = { path: '/api/estimates/expire', method: 'POST' };
+    await runWithServiceContext(agentCtx(copyCo), expire, async () => {
+      const err = await getServerContext().then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(ServiceError);
+      expect((err as ServiceError).code).toBe('FORBIDDEN');
+      expect((err as ServiceError).details).toMatchObject({ accountantCopy: true });
+    });
+    // What the copy carries back goes through, and reads stay open.
+    await runWithServiceContext(agentCtx(copyCo), OPTS, async () => {
+      expect((await getServerContext()).companyId).toBe(copyCo);
+    });
+    await runWithServiceContext(agentCtx(copyCo), { path: '/api/accounts', method: 'GET' }, async () => {
+      expect((await getServerContext()).companyId).toBe(copyCo);
+    });
+    // A company that is not in a copy keeps the route.
+    await runWithServiceContext(ctxB, expire, async () => {
+      expect(await getServerContext()).toBe(ctxB);
+    });
+    expectNoReads();
+  });
+
+  it('is refused when the route checks would read another request than the scope', async () => {
+    // A copy of lib/context.ts whose route checks read the request the bridge runs in (as they did
+    // through next/headers before lib/serviceScope.ts): the agent must not be judged on the
+    // person's route, which here would let a save through for an agent without Customers, and
+    // answer the gate on an area route because the person's route is a 'self' one.
+    vi.resetModules();
+    vi.doMock('@/lib/permissions/enforce', async (importOriginal) => {
+      const real = await importOriginal<typeof import('@/lib/permissions/enforce')>();
+      const { headers } = await import('next/headers');
+      const currentRequestInfo = async () => {
+        const hh = await headers();
+        return { path: hh.get(ROUTE_PATH_HEADER), method: (hh.get(ROUTE_METHOD_HEADER) || 'GET').toUpperCase() };
+      };
+      return {
+        ...real,
+        currentRequestInfo,
+        enforceRequestPermission: async (access: Parameters<typeof real.authorizeRequest>[1]) =>
+          real.authorizeRequest(await currentRequestInfo(), access),
+        enforceSelfRoute: async () => {
+          const { path, method } = await currentRequestInfo();
+          const rule = path ? apiRuleFor(path, method) : null;
+          if (rule !== 'self' && rule !== 'public') throw new Error(`${method} ${path} is not a self route.`);
+        },
+      };
+    });
+    try {
+      const copy = await import('@/lib/context');
+      request('GET', '/api/accounts', { user: ownerId });
+      const narrow = agentCtx(ctxA.companyId, { access: withoutAreas(fullAccess(), ['customers']) });
+      const err = await runWithServiceContext(narrow, OPTS, () =>
+        copy.getServerContext().then(
+          () => null,
+          (e: unknown) => e,
+        ),
+      );
+      // Another copy of the modules, so another ServiceError class: compare code and message.
+      expect(err).toMatchObject({
+        code: 'FORBIDDEN',
+        message: 'This agent request could not be checked against the route it stands for, so it was refused.',
+      });
+      const gate: SessionGate = { db, userId: null };
+      request('POST', '/api/auth/2fa/setup', { user: ownerId });
+      const gateErr = await runWithServiceContext(ctxA, { ...OPTS, gate }, () =>
+        copy.getSessionGate().then(
+          () => null,
+          (e: unknown) => e,
+        ),
+      );
+      expect(gateErr).toMatchObject({ code: 'FORBIDDEN', message: (err as Error).message });
+    } finally {
+      vi.doUnmock('@/lib/permissions/enforce');
+      vi.resetModules();
+    }
+  });
 });
 
 describe('opening a scope', () => {
@@ -271,6 +374,26 @@ describe('opening a scope', () => {
     await expect(runWithServiceContext({} as ServiceContext, OPTS, fn)).rejects.toThrow(/company context/);
     expect(fn).not.toHaveBeenCalled();
     expect(inServiceScope()).toBe(false);
+  });
+
+  it('needs a path middleware could have stamped: no "." or ".." parts, no empty parts, no backslash', async () => {
+    const fn = vi.fn(async () => 'ran');
+    // The route map skips empty parts and takes ".." for an id; a parsed URL never holds these.
+    const dots = ['/api/customers/../users', '/api/./customers', '/api/customers/%2e%2E/users', '/api/customers/.%2e', '/api/customers/%2E'];
+    const empty = ['/api//customers', '/api/customers/', '/'];
+    const raw = ['/api/customers\\..\\users', '/api/customers/a b', '/api/customers/a\u0000', '/api/customers/a\u007f'];
+    for (const p of dots) await expect(runWithServiceContext(ctxA, { path: p, method: 'GET' }, fn), p).rejects.toThrow('without "." or ".." parts');
+    for (const p of empty) await expect(runWithServiceContext(ctxA, { path: p, method: 'GET' }, fn), p).rejects.toThrow('without empty parts');
+    for (const p of raw) await expect(runWithServiceContext(ctxA, { path: p, method: 'GET' }, fn), p).rejects.toThrow('without backslashes');
+    expect(fn).not.toHaveBeenCalled();
+    expect(inServiceScope()).toBe(false);
+    // An encoded "/" or "\" inside a value (how lib/agent/bridge.ts buildPath writes one) stays in
+    // its one segment, as in a real request's pathname: let through, and judged as that route.
+    const stamped = await runWithServiceContext(ctxA, { path: '/api/customers/a%2Fb%5Cc', method: 'GET' }, async () => {
+      expect((await getServerContext()).companyId).toBe(ctxA.companyId);
+      return (await currentRequestInfo())?.path;
+    });
+    expect(stamped).toBe('/api/customers/a%2Fb%5Cc');
   });
 
   it("needs the agent's access, role and the agent itself: never a context read as trusted", async () => {
@@ -313,6 +436,109 @@ describe('opening a scope', () => {
     ).rejects.toThrow(/plain list of names and values/);
     expect(fn).not.toHaveBeenCalled();
     expect(inServiceScope()).toBe(false);
+  });
+});
+
+describe('the context must stay as it was given', () => {
+  /** A context of its own (never the shared ctxA), with an access narrower than full. */
+  const own = () => agentCtx(ctxA.companyId, { access: withoutAreas(fullAccess(), ['customers']) });
+  const refusedAsChanged = (p: Promise<unknown>) => refusedWith(p, SERVICE_SCOPE_CHANGED_MESSAGE);
+
+  it('a role or access cleared after the scope opened is refused, never read as trusted', async () => {
+    for (const clear of [
+      (c: ServiceContext) => void (c.role = undefined),
+      (c: ServiceContext) => void (c.access = undefined),
+      (c: ServiceContext) => void (c.agent = undefined),
+    ]) {
+      const ctx = own();
+      await runWithServiceContext(ctx, { path: '/api/accounts', method: 'GET' }, async () => {
+        expect(await getServerContext()).toBe(ctx);
+        clear(ctx);
+        await refusedAsChanged(getServerContext());
+        await refusedAsChanged(getPageContext('/invoices'));
+        expect(() => serviceScopeModule.currentServiceScope()).toThrow(SERVICE_SCOPE_CHANGED_MESSAGE);
+      });
+    }
+  });
+
+  it('a right added inside the access, or the access swapped for an equal one, is refused', async () => {
+    const widen = own();
+    await runWithServiceContext(widen, { path: '/api/accounts', method: 'GET' }, async () => {
+      expect(await getServerContext()).toBe(widen);
+      widen.access!.permissions.customers = ['view', 'create', 'modify', 'delete', 'print'];
+      await refusedAsChanged(getServerContext());
+    });
+    for (const change of [
+      (c: ServiceContext) => void (c.access!.isAdmin = !c.access!.isAdmin),
+      (c: ServiceContext) => void (c.access!.flags.fullAccountNumbers = !c.access!.flags.fullAccountNumbers),
+      (c: ServiceContext) => void c.access!.roleKeys.push('another-role'),
+    ]) {
+      const ctx = own();
+      await runWithServiceContext(ctx, { path: '/api/accounts', method: 'GET' }, async () => {
+        change(ctx);
+        await refusedAsChanged(getServerContext());
+      });
+    }
+    const swapped = own();
+    await runWithServiceContext(swapped, { path: '/api/accounts', method: 'GET' }, async () => {
+      swapped.access = structuredClone(swapped.access);
+      await refusedAsChanged(getServerContext());
+    });
+  });
+
+  it('who it runs as, its company, database, closing-date override and approval are sealed too', async () => {
+    const changes: Array<(c: ServiceContext) => void> = [
+      (c) => void (c.role = 'owner'),
+      (c) => void (c.companyId = companyId),
+      (c) => void (c.userId = ownerId),
+      (c) => void (c.closingDateOverride = true),
+      (c) => void (c.agent!.mode = 'post'),
+      (c) => void (c.agent!.id = 'another-agent'),
+      (c) => void (c.approval = { approvedBy: ownerId, requestId: null, grantId: null }),
+      (c) => void (c.db = {} as DB),
+    ];
+    for (const change of changes) {
+      const ctx = agentCtx(ctxA.companyId, { role: 'viewer', agent: { id: 'sealed-agent', name: 'Sealed', mode: 'read_only' } });
+      await runWithServiceContext(ctx, { path: '/api/accounts', method: 'GET' }, async () => {
+        change(ctx);
+        await refusedAsChanged(getServerContext());
+      });
+    }
+    // The gate refuses as well.
+    const gated = own();
+    await runWithServiceContext(gated, { path: '/api/auth/2fa/setup', method: 'POST', gate: { db, userId: null } }, async () => {
+      gated.role = undefined;
+      await refusedAsChanged(getSessionGate());
+    });
+  });
+
+  it('the route map is checked against a frozen copy of the access taken when the scope opened', async () => {
+    const ctx = own();
+    await runWithServiceContext(ctx, OPTS, async () => {
+      const scope = serviceScopeModule.currentServiceScope()!;
+      expect(scope.access).not.toBe(ctx.access);
+      expect(scope.access).toEqual(ctx.access);
+      expect(Object.isFrozen(scope.access)).toBe(true);
+      expect(Object.isFrozen(scope.access.permissions)).toBe(true);
+      expect(Object.isFrozen(scope.access.permissions.customers)).toBe(true);
+      expect(Reflect.set(scope.access.permissions, 'customers', ['view', 'create', 'modify', 'delete', 'print'])).toBe(false);
+      // Customers is still taken away: the save is refused on the route map, as at the start.
+      const err = await getServerContext().then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect((err as ServiceError).message.startsWith(PERMISSION_DENIED_PREFIX)).toBe(true);
+    });
+  });
+
+  it('a context left exactly as given keeps working, read after read', async () => {
+    const ctx = own();
+    await runWithServiceContext(ctx, { path: '/api/accounts', method: 'GET' }, async () => {
+      for (let i = 0; i < 3; i++) {
+        await sleep(1);
+        expect(await getServerContext()).toBe(ctx);
+      }
+    });
   });
 });
 
@@ -359,50 +585,96 @@ describe('nothing a request carries opens a scope', () => {
     await expect(getSessionGate()).resolves.toMatchObject({ userId: ownerId });
   });
 
-  it('the module hands out no way to reach the scope store', () => {
-    for (const [name, value] of Object.entries(contextModule)) {
-      expect(value instanceof AsyncLocalStorage, `lib/context exports ${name}`).toBe(false);
+  it('neither module exports the scope store', async () => {
+    // What is proved here is "not exported, and not reachable from a request". Code inside the
+    // process can still look the store up through its registered symbol (Symbol.for), by design:
+    // that is how every copy of lib/serviceScope.ts shares it (see 'one store for the whole process').
+    for (const [file, mod] of [
+      ['lib/context', contextModule],
+      ['lib/serviceScope', serviceScopeModule],
+    ] as const) {
+      for (const [name, value] of Object.entries(mod)) {
+        expect(value instanceof AsyncLocalStorage, `${file} exports ${name}`).toBe(false);
+      }
     }
+    // What lib/context.ts reads of an open scope cannot be changed by whoever reads it.
+    await runWithServiceContext(ctxA, OPTS, async () => {
+      const scope = serviceScopeModule.currentServiceScope();
+      expect(scope?.ctx).toBe(ctxA);
+      expect(Object.isFrozen(scope)).toBe(true);
+      expect(Reflect.set(scope as object, 'path', '/api/users')).toBe(false);
+      expect(serviceScopeModule.currentServiceScope()?.path).toBe(OPTS.path);
+    });
+    expect(serviceScopeModule.currentServiceScope()).toBeUndefined();
+  });
+
+  it("a forged origin label only ever lowers the forger's own trust", async () => {
+    // Read straight from a request's headers (no middleware, no requestHeaders()), it counts as an
+    // agent's, never the app's.
+    expect(originFromHeaders(new Headers({ [SERVICE_ORIGIN_HEADER]: 'agent' }))).toMatchObject({
+      remote: true,
+      addr: UNVERIFIED_LOCAL_ADDR,
+    });
+    // Through requestHeaders() it is dropped, so the request is judged as it would be without it.
+    request('GET', '/api/accounts', { headers: { [SERVICE_ORIGIN_HEADER]: 'agent' } });
+    expect(await getRequestOrigin()).toMatchObject({ remote: false, addr: 'local' });
   });
 });
 
-describe('two scopes at the same time', () => {
-  it("each sees only its own context and headers, and a person's request alongside sees only theirs", async () => {
-    request('GET', '/api/accounts', { user: ownerId });
+describe('several scopes at the same time', () => {
+  it("each sees only its own context, headers, origin and stamps, and a person's request alongside sees only theirs", async () => {
+    // The person's request is the app's own window, with this run's launch pass.
+    process.env[LAUNCH_PASS_ENV] = 'launch-pass-of-this-run';
+    request('GET', '/api/accounts', { user: ownerId, headers: { [LAUNCH_PASS_HEADER]: 'launch-pass-of-this-run' } });
     resetReads();
-    const run = (ctx: ServiceContext, routePath: string, delays: number[]) =>
-      runWithServiceContext(ctx, { path: routePath, method: 'GET', headers: { accept: `application/x-${ctx.companyId}` } }, async () => {
-        const seen: Array<[string, string | null, string | null]> = [];
+    type Seen = [string, string | null, string | null, string | null, string | null, boolean];
+    const run = (ctx: ServiceContext, routePath: string, method: string, delays: number[]) =>
+      runWithServiceContext(ctx, { path: routePath, method, headers: { accept: `application/x-${ctx.companyId}` } }, async () => {
+        const seen: Seen[] = [];
         for (const d of delays) {
           await sleep(d);
           const c = await getServerContext();
           const hh = await requestHeaders();
-          seen.push([c.companyId, hh.get('accept'), hh.get(ROUTE_PATH_HEADER)]);
+          const info = await currentRequestInfo();
+          const origin = await getRequestOrigin();
+          seen.push([c.companyId, hh.get('accept'), hh.get(ROUTE_PATH_HEADER), info?.path ?? null, info?.method ?? null, origin.remote]);
         }
         return seen;
       });
     // The person's request, in its own async chain, between the scopes' steps.
     const person = async (delays: number[]) => {
-      const seen: Array<[string | null, string, string | null, string | null, boolean]> = [];
+      const seen: Array<[string | null, string, string | null, string | null, string | null, boolean, boolean]> = [];
       for (const d of delays) {
         await sleep(d);
         const c = await getServerContext();
         const hh = await requestHeaders();
-        seen.push([c.userId, c.companyId, hh.get(ROUTE_PATH_HEADER), hh.get(SERVICE_ORIGIN_HEADER), inServiceScope()]);
+        const info = await currentRequestInfo();
+        const origin = await getRequestOrigin();
+        seen.push([c.userId, c.companyId, hh.get(ROUTE_PATH_HEADER), hh.get(SERVICE_ORIGIN_HEADER), info?.path ?? null, origin.remote, inServiceScope()]);
       }
       return seen;
     };
-    const all = Promise.all([
-      run(ctxA, '/api/accounts', [5, 1, 7, 0, 3]),
-      run(ctxB, '/api/customers', [1, 6, 0, 4, 2]),
-      person([2, 3, 1, 5, 0]),
-    ]);
-    // The caller, meanwhile, is not in either.
-    expect(inServiceScope()).toBe(false);
-    const [a, b, p] = await all;
-    expect(a).toEqual(Array(5).fill([ctxA.companyId, `application/x-${ctxA.companyId}`, '/api/accounts']));
-    expect(b).toEqual(Array(5).fill([ctxB.companyId, `application/x-${ctxB.companyId}`, '/api/customers']));
-    expect(p).toEqual(Array(5).fill([ownerId, companyId, '/api/accounts', null, false]));
+    // A third agent works in the person's own company, on a save.
+    const ctxC = agentCtx(companyId);
+    try {
+      const all = Promise.all([
+        run(ctxA, '/api/accounts', 'GET', [5, 1, 7, 0, 3]),
+        run(ctxB, '/api/customers', 'GET', [1, 6, 0, 4, 2]),
+        run(ctxC, '/api/estimates', 'POST', [3, 0, 4, 2, 6]),
+        person([2, 3, 1, 5, 0]),
+      ]);
+      // The caller, meanwhile, is not in any.
+      expect(inServiceScope()).toBe(false);
+      const [a, b, c, p] = await all;
+      const own = (ctx: ServiceContext, route: string, method: string) =>
+        Array(5).fill([ctx.companyId, `application/x-${ctx.companyId}`, route, route, method, true]);
+      expect(a).toEqual(own(ctxA, '/api/accounts', 'GET'));
+      expect(b).toEqual(own(ctxB, '/api/customers', 'GET'));
+      expect(c).toEqual(own(ctxC, '/api/estimates', 'POST'));
+      expect(p).toEqual(Array(5).fill([ownerId, companyId, '/api/accounts', null, '/api/accounts', false, false]));
+    } finally {
+      delete process.env[LAUNCH_PASS_ENV];
+    }
     // Only the person's chain read the request; the scopes never did.
     expect(h.reads.headers).toBeGreaterThan(0);
     expect(h.reads.cookies).toBeGreaterThan(0);
@@ -446,25 +718,44 @@ describe('the scope ends when its work settles', () => {
     request('GET', '/api/accounts', { user: ownerId });
     resetReads();
     let late!: Promise<Record<string, unknown>>;
-    await runWithServiceContext(ctxA, OPTS, async () => {
+    let during!: string | null;
+    const opened = { ...OPTS, headers: { [CLOSING_PASSWORD_HEADER]: 'typed by the approver', accept: 'application/json' } };
+    await runWithServiceContext(ctxA, opened, async () => {
+      during = (await requestHeaders()).get(CLOSING_PASSWORD_HEADER);
       late = new Promise((resolve) => {
         setTimeout(async () => {
+          const hh = await requestHeaders();
           resolve({
             inScope: inServiceScope(),
             ctx: await getServerContext().then(() => 'let through', (e: Error) => e.message),
             page: await getPageContext('/invoices').then(() => 'let through', (e: Error) => e.message),
             gate: await getSessionGate().then(() => 'let through', (e: Error) => e.message),
-            origin: (await requestHeaders()).get(SERVICE_ORIGIN_HEADER),
+            // Still the agent's request (origin and stamps), so still judged as the agent...
+            origin: hh.get(SERVICE_ORIGIN_HEADER),
+            path: hh.get(ROUTE_PATH_HEADER),
+            method: hh.get(ROUTE_METHOD_HEADER),
+            info: await currentRequestInfo(),
+            remote: (await getRequestOrigin()).remote,
+            // ...but the closing-date password was for the request, which is over.
+            password: hh.get(CLOSING_PASSWORD_HEADER),
+            accept: hh.get('accept'),
           });
         }, 20);
       });
     });
+    expect(during).toBe('typed by the approver');
     expect(await late).toEqual({
       inScope: true,
       ctx: SERVICE_SCOPE_ENDED_MESSAGE,
       page: SERVICE_SCOPE_ENDED_MESSAGE,
       gate: SERVICE_SCOPE_ENDED_MESSAGE,
       origin: 'agent',
+      path: OPTS.path,
+      method: OPTS.method,
+      info: { path: OPTS.path, method: OPTS.method },
+      remote: true,
+      password: null,
+      accept: 'application/json',
     });
     expectNoReads();
   });
@@ -496,17 +787,31 @@ describe('nesting', () => {
 });
 
 describe('one store for the whole process', () => {
-  it('a second copy of the module (Next can load one twice) sees the same scope, both ways', async () => {
+  it('a second copy of the modules (Next can load one twice) sees the same scope, both ways', async () => {
     vi.resetModules();
     const copy = await import('@/lib/context');
+    const scopeCopy = await import('@/lib/serviceScope');
+    const enforceCopy = await import('@/lib/permissions/enforce');
+    const originCopy = await import('@/lib/net/requestInfo');
     expect(copy.runWithServiceContext).not.toBe(runWithServiceContext);
+    expect(scopeCopy.requestHeaders).not.toBe(requestHeaders);
+    expect(enforceCopy.currentRequestInfo).not.toBe(currentRequestInfo);
+    // The request the bridge runs in is a signed-in person's, on another route.
     request('GET', '/api/accounts', { user: ownerId });
     resetReads();
     await runWithServiceContext(ctxA, OPTS, async () => {
       expect(copy.inServiceScope()).toBe(true);
+      expect(scopeCopy.inServiceScope()).toBe(true);
+      expect(scopeCopy.currentServiceScope()?.ctx).toBe(ctxA);
       expect(await copy.getServerContext()).toBe(ctxA);
       expect((await copy.requestHeaders()).get(SERVICE_ORIGIN_HEADER)).toBe('agent');
+      expect((await scopeCopy.requestHeaders()).get(ROUTE_PATH_HEADER)).toBe(OPTS.path);
+      expect(await enforceCopy.currentRequestInfo()).toEqual({ path: OPTS.path, method: OPTS.method });
+      expect((await originCopy.getRequestOrigin()).remote).toBe(true);
       await expect(copy.runWithServiceContext(ctxB, OPTS, async () => 'inner')).rejects.toThrow(
+        'One agent request cannot run inside another.',
+      );
+      await expect(scopeCopy.runWithServiceContext(ctxB, OPTS, async () => 'inner')).rejects.toThrow(
         'One agent request cannot run inside another.',
       );
     });
@@ -514,7 +819,13 @@ describe('one store for the whole process', () => {
       expect(inServiceScope()).toBe(true);
       expect(await getServerContext()).toBe(ctxB);
     });
+    await scopeCopy.runWithServiceContext(ctxB, { path: '/api/customers', method: 'GET' }, async () => {
+      expect(await getServerContext()).toBe(ctxB);
+      expect(await currentRequestInfo()).toEqual({ path: '/api/customers', method: 'GET' });
+      expect(await copy.getServerContext()).toBe(ctxB);
+    });
     expect(copy.inServiceScope()).toBe(false);
+    expect(scopeCopy.inServiceScope()).toBe(false);
     expectNoReads();
   });
 
@@ -577,6 +888,50 @@ describe('requestHeaders()', () => {
     const hh = await requestHeaders();
     expect(hh.get(CLOSING_PASSWORD_HEADER)).toBe('pw');
     expect(h.reads.headers).toBe(1);
+  });
+});
+
+describe('the request helpers inside a scope', () => {
+  it("origin and route stamps are the scope's own, never the request the bridge runs in", async () => {
+    process.env[LAUNCH_PASS_ENV] = 'launch-pass-of-this-run';
+    try {
+      // The request around it is the app's own window: this run's launch pass, a signed-in person,
+      // another route.
+      request('GET', '/api/accounts', {
+        user: ownerId,
+        headers: { [LAUNCH_PASS_HEADER]: 'launch-pass-of-this-run', 'user-agent': 'Ironbooks window' },
+      });
+      expect(await getRequestOrigin()).toEqual({ remote: false, addr: 'local', https: false, userAgent: 'Ironbooks window' });
+      expect(await currentRequestInfo()).toEqual({ path: '/api/accounts', method: 'GET' });
+      resetReads();
+      await runWithServiceContext(ctxA, { path: '/api/estimates', method: 'post' }, async () => {
+        // An agent's trust, as at the door: never the app window's.
+        expect(await getRequestOrigin()).toEqual({ remote: true, addr: UNVERIFIED_LOCAL_ADDR, https: false, userAgent: null });
+        expect(await currentRequestInfo()).toEqual({ path: '/api/estimates', method: 'POST' });
+      });
+      expectNoReads();
+    } finally {
+      delete process.env[LAUNCH_PASS_ENV];
+    }
+  });
+
+  it('the re-exports from lib/context are the very same as lib/serviceScope', () => {
+    for (const name of [
+      'CLOSING_PASSWORD_HEADER',
+      'SERVICE_ORIGIN_AGENT',
+      'SERVICE_ORIGIN_HEADER',
+      'SERVICE_SCOPE_CHANGED_MESSAGE',
+      'SERVICE_SCOPE_ENDED_MESSAGE',
+      'SERVICE_SCOPE_HEADERS',
+      'inServiceScope',
+      'outsideServiceScope',
+      'requestHeaders',
+      'runWithServiceContext',
+    ] as const) {
+      expect(contextModule[name], name).toBe(serviceScopeModule[name]);
+    }
+    expect(CLOSING_PASSWORD_HEADER).toBe('x-closing-password');
+    expect(serviceScopeModule.SERVICE_SCOPE_HEADERS).toContain(CLOSING_PASSWORD_HEADER);
   });
 });
 

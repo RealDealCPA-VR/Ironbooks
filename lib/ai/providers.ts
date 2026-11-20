@@ -15,12 +15,18 @@
  * public hosts are refused unless the company opted in to cloud AI (Privacy & Network). A
  * provider built without a policy context (`deps.policyCtx`) and without an injected test
  * transport refuses to make any call (fails closed).
+ *
+ * Effects outbox (lib/effects.ts, through lib/ai/outbound.ts): every provider built here, and a
+ * model download, sends its calls through effects.network, so an agent's preview contacts no
+ * model at all (it shows "Contact {host} for {purpose}") and an agent's real run records each
+ * call. For a person's request nothing changes.
  */
 import Anthropic from '@anthropic-ai/sdk';
 import { assertOutboundAllowed, policyFetch, type PolicyCtx } from '@/lib/net/guard';
 import { ServiceError } from '@/lib/services/_base';
 import { classifyEndpoint } from './tailnet';
 import { createChatGptProvider, type ChatGptCredentials } from './chatgpt';
+import { AI_CALL_PURPOSES, hostOf, outboundCall, withNetworkEffects } from './outbound';
 import {
   AiError,
   DEFAULT_ANTHROPIC_MODEL,
@@ -159,7 +165,7 @@ export function createOllamaProvider(cfg: ProviderRuntimeConfig, deps: ProviderD
   const headers: Record<string, string> = { 'content-type': 'application/json' };
   if (cfg.apiKey) headers.authorization = `Bearer ${cfg.apiKey}`; // reverse-proxy auth, optional
 
-  return {
+  return withNetworkEffects({
     id: cfg.id,
     kind: 'ollama',
     locality: localityOf(cfg),
@@ -196,7 +202,7 @@ export function createOllamaProvider(cfg: ProviderRuntimeConfig, deps: ProviderD
     health(o = {}) {
       return timeHealth(() => httpJson(fetchImpl, `${base}/api/tags`, { method: 'GET', headers, signal: o.signal }));
     },
-  };
+  }, hostOf(base, 'the Ollama server'));
 }
 
 /**
@@ -216,54 +222,58 @@ export async function pullOllamaModel(
   const headers: Record<string, string> = { 'content-type': 'application/json' };
   if (cfg.apiKey) headers.authorization = `Bearer ${cfg.apiKey}`;
   const url = `${trimSlash(cfg.baseUrl)}/api/pull`;
-  // Streamed: Ollama sends a progress line every moment, so a multi-gigabyte download on a slow
-  // connection never hits an idle/header timeout (a non-streamed pull answers only at the end).
-  let res: Response;
-  try {
-    res = await guardedFetch(deps)(url, { method: 'POST', headers, body: JSON.stringify({ model, stream: true }), signal });
-  } catch (err) {
-    if (err instanceof AiError) throw err;
-    throw new AiError('NETWORK', `Could not reach Ollama at ${new URL(url).host}: ${(err as Error)?.message ?? err}`);
-  }
-  if (!res.ok) {
-    const detail = await res.text().catch(() => '');
-    throw new AiError('HTTP', `HTTP ${res.status} from Ollama${detail ? `: ${detail.slice(0, 300)}` : ''}`, undefined, res.status);
-  }
-  let last = '';
-  let buffer = '';
-  const handle = (lineText: string) => {
-    const t = lineText.trim();
-    if (!t) return;
-    let ev: { status?: string; error?: string; completed?: number; total?: number };
+  // Through the effects outbox like every model call (lib/ai/outbound.ts): an agent's preview
+  // downloads nothing.
+  return outboundCall(AI_CALL_PURPOSES.download, hostOf(url, 'the Ollama server'), async () => {
+    // Streamed: Ollama sends a progress line every moment, so a multi-gigabyte download on a slow
+    // connection never hits an idle/header timeout (a non-streamed pull answers only at the end).
+    let res: Response;
     try {
-      ev = JSON.parse(t);
-    } catch {
-      return;
+      res = await guardedFetch(deps)(url, { method: 'POST', headers, body: JSON.stringify({ model, stream: true }), signal });
+    } catch (err) {
+      if (err instanceof AiError) throw err;
+      throw new AiError('NETWORK', `Could not reach Ollama at ${new URL(url).host}: ${(err as Error)?.message ?? err}`);
     }
-    if (ev.error) throw new AiError('HTTP', `Ollama could not download ${model}: ${ev.error}`);
-    if (ev.status) {
-      last = ev.status;
-      onProgress?.({ status: ev.status, completed: ev.completed, total: ev.total });
+    if (!res.ok) {
+      const detail = await res.text().catch(() => '');
+      throw new AiError('HTTP', `HTTP ${res.status} from Ollama${detail ? `: ${detail.slice(0, 300)}` : ''}`, undefined, res.status);
     }
-  };
-  if (res.body) {
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      let nl: number;
-      while ((nl = buffer.indexOf('\n')) >= 0) {
-        handle(buffer.slice(0, nl));
-        buffer = buffer.slice(nl + 1);
+    let last = '';
+    let buffer = '';
+    const handle = (lineText: string) => {
+      const t = lineText.trim();
+      if (!t) return;
+      let ev: { status?: string; error?: string; completed?: number; total?: number };
+      try {
+        ev = JSON.parse(t);
+      } catch {
+        return;
       }
+      if (ev.error) throw new AiError('HTTP', `Ollama could not download ${model}: ${ev.error}`);
+      if (ev.status) {
+        last = ev.status;
+        onProgress?.({ status: ev.status, completed: ev.completed, total: ev.total });
+      }
+    };
+    if (res.body) {
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let nl: number;
+        while ((nl = buffer.indexOf('\n')) >= 0) {
+          handle(buffer.slice(0, nl));
+          buffer = buffer.slice(nl + 1);
+        }
+      }
+      handle(buffer);
+    } else {
+      for (const l of (await res.text()).split('\n')) handle(l);
     }
-    handle(buffer);
-  } else {
-    for (const l of (await res.text()).split('\n')) handle(l);
-  }
-  if (last !== 'success') throw new AiError('HTTP', `Ollama stopped before ${model} finished downloading${last ? ` (last step: ${last})` : ''}.`);
+    if (last !== 'success') throw new AiError('HTTP', `Ollama stopped before ${model} finished downloading${last ? ` (last step: ${last})` : ''}.`);
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -411,7 +421,7 @@ export function createOpenAiCompatibleProvider(cfg: ProviderRuntimeConfig, deps:
     });
   }
 
-  return {
+  return withNetworkEffects({
     id: cfg.id,
     kind: 'openai-compatible',
     locality,
@@ -461,7 +471,7 @@ export function createOpenAiCompatibleProvider(cfg: ProviderRuntimeConfig, deps:
     health(o = {}) {
       return timeHealth(() => httpJson(fetchImpl, modelsUrl, { method: 'GET', headers, signal: o.signal }));
     },
-  };
+  }, hostOf(chatUrl, 'the AI server'));
 }
 
 // ---------------------------------------------------------------------------
@@ -529,7 +539,7 @@ export function createAnthropicProvider(cfg: ProviderRuntimeConfig, deps: Provid
     }
   }
 
-  return {
+  return withNetworkEffects({
     id: cfg.id,
     kind: 'anthropic',
     locality: 'cloud',
@@ -575,7 +585,7 @@ export function createAnthropicProvider(cfg: ProviderRuntimeConfig, deps: Provid
     health(o = {}) {
       return timeHealth(() => listModels(o));
     },
-  };
+  }, hostOf(endpoint, 'api.anthropic.com'));
 }
 
 /** Build a provider from runtime config. */

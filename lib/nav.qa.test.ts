@@ -72,7 +72,8 @@ describe('Simple and Advanced menus', () => {
               expect(hidden.has(l.path), `${r.key} ${mode} ${l.path}`).toBe(false);
             }
           }
-          if (mode === 'simple') expect(groups.flatMap((g) => g.links).length).toBeLessThanOrEqual(21);
+          // 22: Agent requests, which the sidebar shows only while the company has an agent.
+          if (mode === 'simple') expect(groups.flatMap((g) => g.links).length).toBeLessThanOrEqual(22);
         }
       }
     }

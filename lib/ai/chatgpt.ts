@@ -20,12 +20,21 @@
  * Locality is always 'cloud': calls are redacted, counted against the daily cloud limit and
  * need the company's cloud-AI permission like any other cloud provider. Every HTTP call goes
  * through the network-policy guard (purpose 'ai') via the `fetch` this module is handed.
+ *
+ * And through the effects outbox (lib/ai/outbound.ts): each exported step that reaches OpenAI is
+ * one recorded call, so an agent's preview contacts nothing. Inside this module the steps call the
+ * unwrapped helpers (discoverEndpoints, fetchChatGptModels), so one call is never recorded twice;
+ * renewing the sign-in is recorded on its own, because it reaches auth.openai.com, not the model.
  */
 import crypto from 'node:crypto';
+import { AI_CALL_PURPOSES, hostOf, outboundCall, withNetworkEffects } from './outbound';
 import { AiError, type AiProvider, type ChatMessage, type ChatOptions, type ModelInfo, type ProviderRuntimeConfig } from './types';
 
 export const CHATGPT_ISSUER = 'https://auth.openai.com';
 export const CHATGPT_RESOURCE = 'https://api.openai.com/v1';
+/** The computers the sign-in and the model calls reach, for the effects outbox. */
+const AUTH_HOST = hostOf(CHATGPT_ISSUER, 'auth.openai.com');
+const API_HOST = hostOf(CHATGPT_RESOURCE, 'api.openai.com');
 export const CHATGPT_SCOPES = 'openid profile email offline_access resource.invoke chatgpt.tokens.use.direct';
 export const CHATGPT_SHARING_SCOPE = 'chatgpt.tokens.use.direct';
 export const CHATGPT_FIRST_CLIENT_ID = 'dynamic_agent_client';
@@ -139,7 +148,12 @@ export interface ChatGptDiscovery {
   revocation_endpoint?: string;
 }
 
-export async function discover(fetchImpl: FetchLike): Promise<ChatGptDiscovery> {
+/** OpenAI's sign-in endpoints (starting a sign-in), through the effects outbox. */
+export function discover(fetchImpl: FetchLike): Promise<ChatGptDiscovery> {
+  return outboundCall(AI_CALL_PURPOSES.signInStart, AUTH_HOST, () => discoverEndpoints(fetchImpl));
+}
+
+async function discoverEndpoints(fetchImpl: FetchLike): Promise<ChatGptDiscovery> {
   const res = await call(fetchImpl, `${CHATGPT_ISSUER}/.well-known/openid-configuration`, { headers: { accept: 'application/json' } });
   const data = (await readJson(res)) as Record<string, unknown> | undefined;
   const sameOrigin = (v: unknown) => {
@@ -255,17 +269,19 @@ export async function exchangeCode(
   d: ChatGptDiscovery,
   p: { clientId: string; code: string; verifier: string; redirectUri: string; nonce: string },
 ): Promise<ChatGptCredentials> {
-  const data = await tokenRequest(
-    fetchImpl,
-    d,
-    new URLSearchParams({
-      grant_type: 'authorization_code',
-      client_id: p.clientId,
-      code: p.code,
-      code_verifier: p.verifier,
-      redirect_uri: p.redirectUri,
-      resource: CHATGPT_RESOURCE,
-    }),
+  const data = await outboundCall(AI_CALL_PURPOSES.signInFinish, AUTH_HOST, () =>
+    tokenRequest(
+      fetchImpl,
+      d,
+      new URLSearchParams({
+        grant_type: 'authorization_code',
+        client_id: p.clientId,
+        code: p.code,
+        code_verifier: p.verifier,
+        redirect_uri: p.redirectUri,
+        resource: CHATGPT_RESOURCE,
+      }),
+    ),
   );
   const who = verifyIdToken(data.id_token, p.clientId, p.nonce);
   return { v: 1, clientId: p.clientId, ...tokenFields(data), ...who };
@@ -299,14 +315,18 @@ export async function refreshCredentials(
   const running = inflight.get(key);
   if (running) return running;
   const p = (async () => {
-    if (!c.refreshToken) throw new AiError('HTTP', 'Your ChatGPT sign-in has expired. Sign in with ChatGPT again.', undefined, 401);
-    const d = await discover(fetchImpl);
-    const data = await tokenRequest(
-      fetchImpl,
-      d,
-      new URLSearchParams({ grant_type: 'refresh_token', client_id: c.clientId, refresh_token: c.refreshToken, resource: CHATGPT_RESOURCE }),
-      AbortSignal.timeout(30_000),
-    );
+    const refreshToken = c.refreshToken;
+    if (!refreshToken) throw new AiError('HTTP', 'Your ChatGPT sign-in has expired. Sign in with ChatGPT again.', undefined, 401);
+    // One recorded call to auth.openai.com (discovery and the token request together).
+    const data = await outboundCall(AI_CALL_PURPOSES.signInRenew, AUTH_HOST, async () => {
+      const d = await discoverEndpoints(fetchImpl);
+      return tokenRequest(
+        fetchImpl,
+        d,
+        new URLSearchParams({ grant_type: 'refresh_token', client_id: c.clientId, refresh_token: refreshToken, resource: CHATGPT_RESOURCE }),
+        AbortSignal.timeout(30_000),
+      );
+    });
     const f = tokenFields(data, c.scopes);
     const rotated: ChatGptCredentials = { ...c, ...f, refreshToken: f.refreshToken ?? c.refreshToken };
     latest.set(key, rotated);
@@ -327,16 +347,19 @@ export async function revokeCredentials(fetchImpl: FetchLike, c: ChatGptCredenti
   latest.delete(connKey(c));
   const token = c.refreshToken ?? c.accessToken;
   try {
-    const d = await discover(fetchImpl);
-    if (!d.revocation_endpoint) return false;
-    const res = await call(fetchImpl, d.revocation_endpoint, {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ token, token_type_hint: c.refreshToken ? 'refresh_token' : 'access_token', client_id: c.clientId }).toString(),
+    return await outboundCall(AI_CALL_PURPOSES.signOut, AUTH_HOST, async () => {
+      const d = await discoverEndpoints(fetchImpl);
+      if (!d.revocation_endpoint) return false;
+      const res = await call(fetchImpl, d.revocation_endpoint, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ token, token_type_hint: c.refreshToken ? 'refresh_token' : 'access_token', client_id: c.clientId }).toString(),
+      });
+      await res.body?.cancel().catch(() => undefined);
+      return res.status === 200;
     });
-    await res.body?.cancel().catch(() => undefined);
-    return res.status === 200;
   } catch {
+    // Best effort, also in an agent's preview: the outbox has recorded the call it did not make.
     return false;
   }
 }
@@ -345,7 +368,12 @@ export async function revokeCredentials(fetchImpl: FetchLike, c: ChatGptCredenti
 // Models and the Responses API
 // ---------------------------------------------------------------------------
 
-export async function listChatGptModels(fetchImpl: FetchLike, accessToken: string, signal?: AbortSignal): Promise<ModelInfo[]> {
+/** The models the signed-in plan offers (right after a sign-in), through the effects outbox. */
+export function listChatGptModels(fetchImpl: FetchLike, accessToken: string, signal?: AbortSignal): Promise<ModelInfo[]> {
+  return outboundCall(AI_CALL_PURPOSES.listModels, API_HOST, () => fetchChatGptModels(fetchImpl, accessToken, signal));
+}
+
+async function fetchChatGptModels(fetchImpl: FetchLike, accessToken: string, signal?: AbortSignal): Promise<ModelInfo[]> {
   const res = await call(fetchImpl, `${CHATGPT_RESOURCE}/models`, {
     headers: { authorization: `Bearer ${accessToken}`, accept: 'application/json' },
     signal,
@@ -462,14 +490,15 @@ export function createChatGptProvider(cfg: ProviderRuntimeConfig, deps: ChatGptP
   const listModels = async (o: { signal?: AbortSignal } = {}) => {
     const c = await fresh(false, o.signal);
     try {
-      return await listChatGptModels(deps.fetch, c.accessToken, o.signal);
+      return await fetchChatGptModels(deps.fetch, c.accessToken, o.signal);
     } catch (err) {
       if (!(err instanceof AiError && err.status === 401)) throw err;
-      return listChatGptModels(deps.fetch, (await fresh(true, o.signal)).accessToken, o.signal);
+      return fetchChatGptModels(deps.fetch, (await fresh(true, o.signal)).accessToken, o.signal);
     }
   };
 
-  return {
+  // Each call is one recorded call to the model's computer (lib/ai/outbound.ts).
+  return withNetworkEffects({
     id: cfg.id,
     kind: 'chatgpt',
     locality: 'cloud',
@@ -500,5 +529,5 @@ export function createChatGptProvider(cfg: ProviderRuntimeConfig, deps: ChatGptP
         return { ok: false, latencyMs: Date.now() - start, error: err instanceof Error ? err.message : String(err) };
       }
     },
-  };
+  }, API_HOST);
 }

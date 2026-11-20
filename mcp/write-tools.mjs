@@ -2,11 +2,16 @@
  * The tools that change the books, and the reads that go with them.
  *
  * Every change is one named action sent to Ironbooks (POST /api/agent/actions,
- * lib/agent/catalog.ts). What happens to it is decided there, by the mode an Admin gave the agent:
+ * lib/agent/catalog.ts). What happens to it is decided there, by the role and the policy an Admin
+ * gave the agent (AGENT_ACCESS.md):
  *
- *   - Read only: refused.
- *   - Propose:   checked, then put in a queue for a person to approve. Nothing is entered.
- *   - Post:      entered, within the agent's role.
+ *   - refused:            outside the role, or the policy says Never. Nothing is done.
+ *   - posted / done:      the policy says Allow (or a standing permission covers it): entered.
+ *   - asked:              the policy says Ask: a person approves or denies it in Ironbooks.
+ *                         Nothing is entered until then; wait_for_decision waits for the answer.
+ *   - needs_confirmation: Ironbooks raised a warning a person would have been asked about; the
+ *                         agent may send it again with the matching flag.
+ *   ('proposed' is the older word for 'asked', still answered for requests made before.)
  *
  * Two arguments are the same on every one of these tools:
  *
@@ -56,7 +61,8 @@ export function camelize(v) {
 
 /** The ledger lines of an answer, compact: one entry per posting, debits first. */
 function ledgerOf(answer) {
-  const entries = Array.isArray(answer?.ledger?.entries) ? answer.ledger.entries : [];
+  const source = answer?.ledger ?? answer?.preview?.ledger;
+  const entries = Array.isArray(source?.entries) ? source.entries : [];
   return entries.map((e) => ({
     journal_entry_id: e.journalEntryId,
     date: e.date,
@@ -65,18 +71,105 @@ function ledgerOf(answer) {
   }));
 }
 
-/** What Ironbooks said about a change, in the words an agent can act on. */
-export function shapeAnswer(answer) {
+/** What each outcome means for the agent, in one line. */
+const SAID = {
+  posted: 'Entered.',
+  done: 'Done. Nothing was posted to the ledger.',
+  proposed: 'Not entered. Waiting for a person to approve it in Ironbooks.',
+  dry_run: 'Not entered. This is what it would do.',
+  asked: 'Not done yet. A person must approve it in Ironbooks first.',
+  needs_confirmation: 'Not done. Ironbooks raised a warning that a person would have been asked about.',
+  refused: 'Refused. Nothing was done.',
+};
+
+/** Outcomes where nothing happened yet, so a preview shows what WOULD happen. */
+const NOT_YET = new Set(['dry_run', 'asked', 'needs_confirmation']);
+
+/** `allowDuplicateNumber` → `allow_duplicate_number`: the named tools' word for a flag. */
+export const snakeFlag = (/** @type {string} */ flag) => flag.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
+
+const SECRET_WORDS = {
+  closing_password: 'the closing-date password',
+  file_password: 'the company file password',
+  backup_password: "the backup file's password",
+  archive_credentials: "the archive's password",
+  new_user_password: "the new user's password",
+  mail_password: 'the mail password',
+  portal_password: 'the portal password',
+  recovery_key: 'the recovery key',
+  file_key: 'the file key',
+  capability_link: 'the private link',
+};
+const FLAG_WORDS = {
+  sensitivePayroll: 'see sensitive payroll data',
+  fullAccountNumbers: 'see full account numbers',
+  closedPeriod: 'work in the closed period',
+};
+
+/**
+ * Who must approve a request, in plain words (lib/agent/operations/types.ts ApprovalNeeds).
+ * @param {any} needs
+ * @returns {string | null}
+ */
+export function whoDecides(needs) {
+  if (!needs || typeof needs !== 'object') return null;
+  const who = needs.fileAdmin ? 'The Admin of the company file' : needs.admin ? 'An Admin' : 'A person who may do this themselves';
+  const flags = [...new Set([...(Array.isArray(needs.flags) ? needs.flags : []), ...(needs.flag ? [needs.flag] : [])])].map((f) => FLAG_WORDS[f] ?? f);
+  let out = `${who}${flags.length ? ` and may ${flags.join(' and ')}` : ''} must approve it${needs.hostOnly ? ', at the computer that holds the company file' : ''}.`;
+  if (needs.twoPerson) out += ' Two different people must approve it.';
+  const secrets = Array.isArray(needs.secrets) ? needs.secrets.map((s) => SECRET_WORDS[s] ?? 'a password') : [];
+  if (secrets.length) out += ` They type ${secrets.join(' and ')} on their own screen; you never see it, and must not ask for it.`;
+  return out;
+}
+
+/**
+ * How to send a warning's flag again with this tool. `fields`: the tool's own field names (the
+ * named tools), or 'confirm' for run_operation.
+ */
+function resendWith(flag, operation, fields) {
+  if (fields === 'confirm') return `confirm: ["${flag}"]`;
+  const field = snakeFlag(flag);
+  if (Array.isArray(fields) && fields.includes(field)) return `${field}: true`;
+  return operation ? `run_operation with operation "${operation}" and confirm: ["${flag}"]` : `the flag ${flag}`;
+}
+
+const MAX_PREVIEW_ROWS = 50;
+
+/**
+ * What Ironbooks said about a change, in the words an agent can act on: what happened, what would
+ * happen (a preview), and what to do next.
+ * @param {any} answer  lib/agent/contract.ts AgentOperationAnswer (or the older AgentActionAnswer)
+ * @param {{ fields?: string[] | 'confirm' }} [opts]  how a warning's flag is sent again
+ */
+export function shapeAnswer(answer, opts = {}) {
   const a = answer ?? {};
   const ledger = ledgerOf(a);
-  const said =
-    a.outcome === 'posted'
-      ? 'Entered.'
-      : a.outcome === 'proposed'
-        ? 'Not entered. Waiting for a person to approve it in Ironbooks.'
-        : a.outcome === 'dry_run'
-          ? 'Not entered. This is what it would do.'
-          : undefined;
+  const said = SAID[a.outcome];
+  const notYet = NOT_YET.has(a.outcome);
+  const preview = a.preview && typeof a.preview === 'object' ? a.preview : null;
+  const warnings = (Array.isArray(a.warnings) && a.warnings.length ? a.warnings : Array.isArray(preview?.warnings) ? preview.warnings : []).filter((w) => w && w.flag);
+  const effects = Array.isArray(preview?.effects) ? preview.effects : [];
+  const records = Array.isArray(preview?.records) ? preview.records : [];
+  const done = Array.isArray(a.effects) ? a.effects : [];
+  const who = a.outcome === 'asked' ? whoDecides(a.needs) : null;
+  const file = a.file && a.file.fileId ? { file_id: a.file.fileId, name: a.file.name, type: a.file.type, size: a.file.size } : null;
+
+  let next;
+  if (a.outcome === 'asked') {
+    next = a.requestId
+      ? `Call wait_for_decision with request_id "${a.requestId}" to wait for the person's answer. Do not send this request again: it is already waiting.`
+      : 'list_my_requests shows this request and, later, what the person decided. Do not send it again.';
+  } else if (a.outcome === 'proposed') {
+    next = 'A person decides in Ironbooks. list_my_requests shows what they decided.';
+  } else if (a.outcome === 'needs_confirmation') {
+    next =
+      'Check each warning. Only if it is right to go ahead, send the same request again with what resend_with says and a NEW request_id; a request sent with a confirmation may need a person to approve it. Otherwise stop and tell the person about the warning.';
+  } else if (a.outcome === 'refused') {
+    next = 'Do not send it again as it is. get_my_permissions shows what you may do; if the work still needs doing, tell the person what you wanted to do and why.';
+  } else if (file) {
+    next = `Call get_file with file_id "${file.file_id}" to read the file it made.`;
+  }
+
   return {
     outcome: a.outcome,
     ...(said ? { said } : {}),
@@ -84,21 +177,51 @@ export function shapeAnswer(answer) {
     ...(a.summary ? { summary: a.summary } : {}),
     ...(a.result !== undefined ? { result: a.result } : {}),
     ...(a.proposalId ? { proposal_id: a.proposalId } : {}),
-    ...(a.outcome === 'dry_run' ? { would_post: ledger } : ledger.length ? { ledger } : {}),
+    ...(a.requestId && (a.outcome === 'asked' || a.outcome === 'proposed') ? { request_id: a.requestId } : {}),
+    ...(a.status && a.outcome === 'asked' ? { status: a.status } : {}),
+    ...(who ? { who_decides: who } : {}),
+    ...(notYet ? (a.outcome === 'dry_run' || ledger.length ? { would_post: ledger } : {}) : ledger.length ? { ledger } : {}),
+    ...(records.length
+      ? { [notYet ? 'would_change' : 'changed']: records.slice(0, MAX_PREVIEW_ROWS).map((r) => ({ kind: r.kind, id: r.id, action: r.action, fields: r.fields })) }
+      : {}),
+    ...(effects.length ? { [notYet ? 'would_also' : 'also']: effects.map((e) => e.summary) } : {}),
+    ...(done.length ? { also_done: done.map((r) => ({ what: r.effect?.summary ?? null, status: r.status, ...(r.error ? { error: r.error } : {}) })) } : {}),
+    ...(preview?.loss ? { loss: preview.loss } : {}),
+    ...(preview?.routePreview !== undefined && preview?.routePreview !== null ? { route_preview: preview.routePreview } : {}),
+    ...(preview?.truncated || records.length > MAX_PREVIEW_ROWS ? { preview_cut_short: true } : {}),
+    ...(warnings.length ? { warnings: warnings.map((w) => ({ flag: w.flag, message: w.message, resend_with: resendWith(w.flag, a.operation, opts.fields) })) } : {}),
+    ...(file ? { file } : {}),
+    ...(a.grantId ? { under_standing_permission: a.grantId } : {}),
     ...(a.note ? { note: a.note } : {}),
+    ...(next ? { next } : {}),
   };
+}
+
+/**
+ * shapeAnswer, except that a refusal is a tool error: the agent reads why, and that nothing was done.
+ * @param {any} answer
+ * @param {{ fields?: string[] | 'confirm' }} [opts]
+ */
+export function settle(answer, opts = {}) {
+  const shaped = shapeAnswer(answer, opts);
+  if (shaped.outcome !== 'refused') return shaped;
+  const why = typeof shaped.note === 'string' && shaped.note.trim() ? shaped.note.trim() : 'Ironbooks did not allow this.';
+  throw new ToolError(`Refused: ${/[.!?]$/.test(why) ? why : `${why}.`} Nothing was done. ${shaped.next}`);
 }
 
 function schema(properties, required = []) {
   return { type: 'object', properties: { ...properties, dry_run: DRY_RUN, request_id: REQUEST_ID }, required, additionalProperties: false };
 }
 
-/** Send one change. `input` is already in the app's field names. */
-async function send(client, action, input, args) {
+/**
+ * Send one change. `input` is already in the app's field names. `fields`: the tool's own field
+ * names, so a warning can say which of them sends its confirmation.
+ */
+async function send(client, action, input, args, fields) {
   if (args.dry_run !== true && !args.request_id) {
     throw new ToolError('Give a request_id (your own name for this one change), or set dry_run to true to only check it.');
   }
-  return shapeAnswer(await client.act({ action, input, ...(args.dry_run === true ? { dryRun: true } : { requestId: args.request_id }) }));
+  return settle(await client.act({ action, input, ...(args.dry_run === true ? { dryRun: true } : { requestId: args.request_id }) }), { fields });
 }
 
 /** A tool that enters one new record. `rename` maps tool fields whose app name is not the camelCase of theirs. */
@@ -119,7 +242,7 @@ function enterTool({ name, title, description, action, properties, required, ren
           delete input[from];
         }
       }
-      return send(client, action, input, args);
+      return send(client, action, input, args, Object.keys(properties));
     },
   };
 }
@@ -651,13 +774,7 @@ const READS = [
     inputSchema: { type: 'object', additionalProperties: false, properties: {} },
     handler: async (_a, c) => shapeRecord(await c.get('/api/deposits/undeposited')),
   },
-  {
-    name: 'list_my_proposals',
-    title: 'My proposals',
-    description: 'What you have proposed for a person to approve, newest first, and what they decided (pending, approved or rejected). Only for an agent in Propose mode.',
-    inputSchema: { type: 'object', additionalProperties: false, properties: { limit: { type: 'integer', minimum: 1, maximum: 200, description: 'How many (default 50).' } } },
-    handler: async (a, c) => (await c.act({ action: 'list_my_proposals', input: a.limit ? { limit: a.limit } : {} }))?.result ?? { proposals: [] },
-  },
+  // list_my_proposals is now an alias of list_my_requests (mcp/operations-tools.mjs).
 ];
 
 export const WRITE_TOOLS = [...ENTER, ...EDIT];

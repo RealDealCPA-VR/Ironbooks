@@ -20,8 +20,13 @@
  * Remote requests are held to stricter rules: legacy session cookies without a server-side
  * session are refused, the first-run fallback is closed, password-reset tokens are never
  * returned in the response, and cookies are marked Secure when the host serves HTTPS.
+ *
+ * An agent's request the bridge runs in-process (lib/serviceScope.ts) is judged on the scope's
+ * synthetic header set, never on the request the bridge happens to run in (perhaps the approving
+ * person's window, with its launch pass): requestHeaders() hands that set out inside a scope, and
+ * its origin label gets an agent's trust, like an agent at the door.
  */
-import { headers } from 'next/headers';
+import { SERVICE_ORIGIN_HEADER, requestHeaders } from '@/lib/serviceScope';
 import { carriesLaunchPass } from '@/lib/net/launchPass';
 import { carriesProxySecret } from '@/lib/net/loopbackHost';
 import { hasAuthorization } from '@/lib/net/agentToken';
@@ -69,17 +74,22 @@ export function originFromHeaders(h: HeaderSource): RequestOrigin {
   // An Authorization header marks an agent (lib/net/agentToken.ts), never the app: the window and
   // the shell do not send one. Remote-level trust under the same address as any other program on
   // this computer, even if the launch pass came along, so host-only settings stay closed to it and
-  // it gets no sign-in attempt counters of its own.
-  if (hasAuthorization(h) || !carriesLaunchPass(h)) {
+  // it gets no sign-in attempt counters of its own. The same for a service scope's origin label
+  // (an agent's request run by the bridge): no request can bring it here, and if one ever did, it
+  // would only lower its own trust.
+  if (hasAuthorization(h) || Boolean(h.get(SERVICE_ORIGIN_HEADER)) || !carriesLaunchPass(h)) {
     return { remote: true, addr: UNVERIFIED_LOCAL_ADDR, https: false, userAgent };
   }
   return { remote: false, addr: 'local', https: false, userAgent };
 }
 
-/** Request origin for the current server render / route (next/headers). */
+/**
+ * Request origin for the current server render / route (next/headers), or, inside an agent's
+ * service scope, for the scope's synthetic request (lib/serviceScope.ts requestHeaders).
+ */
 export async function getRequestOrigin(): Promise<RequestOrigin> {
   try {
-    return originFromHeaders(await headers());
+    return originFromHeaders(await requestHeaders());
   } catch {
     // Outside a request scope (scripts/tests): treat as local.
     return { remote: false, addr: 'local', https: false, userAgent: null };

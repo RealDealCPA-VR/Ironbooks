@@ -9,6 +9,7 @@ import {
   Banknote,
   Bookmark,
   BookOpen,
+  Bot,
   Boxes,
   Building2,
   CalendarClock,
@@ -84,6 +85,7 @@ const ACCOUNTANT_REPORTS: ReportCardProps[] = [
   { href: '/reports/std/income-tax-detail', icon: ListChecks, name: 'Income Tax Detail', description: 'The accounts behind each tax form line.' },
   { href: '/reports/voided-deleted', icon: Ban, name: 'Voided/Deleted Transactions', description: 'Every transaction voided or deleted, who did it and when.' },
   { href: '/reports/closing-date-exceptions', icon: ShieldAlert, name: 'Closing Date Exceptions', description: 'Changes made on or before the closing date with the closing date password.' },
+  { href: '/reports/std/agent-activity', icon: Bot, name: 'Agent Activity', description: 'Every request an agent made for approval, who decided and what became of it.' },
   { href: '/audit-trail', icon: History, name: 'Audit Trail', description: 'Every change to every transaction and list record.' },
   { href: '/transaction-log', icon: ClipboardList, name: 'Transaction Log', description: 'The tamper-evident log of every saved change, with download and verification.' },
 ];

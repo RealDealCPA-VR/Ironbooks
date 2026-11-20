@@ -15,15 +15,23 @@
  *    Voids carry one too, so two-person approval (D8) covers voiding a large document as it covers
  *    entering one: the void answers with the record, whose total (or a payment's amount) stays as it
  *    was; only balanceDue or unapplied is set to zero, and neither is used.
- *  - A bulk route that enters one invoice per customer or order has no single amount (each invoice's
- *    total is in a list in the answer), so it sets no amountField and two-person approval cannot apply
- *    to it; the bulk cap limits how many records, not how much money. Each says so in its "why".
+ *  - A bulk route that enters one invoice per customer or order lists each invoice's total in its
+ *    answer, and a '*' path adds them up (created.*.total, results.*.total, assessed.*.charge), so
+ *    two-person approval and a grant's maxAmount see the whole run. Each posts one ledger entry per
+ *    invoice, and without the '*' path the bridge would judge the run by its largest single invoice.
+ *    The Income Tracker's 'convert' answers no totals, so it alone still has that gap; its "why" says so.
  *  - Every GET here only reads. Two of them (GET /api/customers/bulk and GET /api/payments/discounts)
  *    reach ensureSeeded (lists/simpleLists.ts: the Terms and Sales Tax Code defaults), which saves
  *    nothing for a read-only context such as an agent's read; each says so in its "why".
- *  - A body with no amount (an action that has none) counts as over every amount limit
- *    (policy.ts: the grant maxAmount check and needsTwoPerson), so a missing amount never
- *    loosens a limit.
+ *  - Amounts, the same rule in every bucket: amountField names the money the route's ANSWER carries
+ *    (lib/agent/facts.ts takes the larger of the body's and the answer's figure). A request with no
+ *    amount counts as over every amount limit (policy.ts: the grant maxAmount check and
+ *    needsTwoPerson) until its dry run. After it the bridge (lib/agent/bridge.ts factsFor) takes the
+ *    larger of that figure and the largest SINGLE ledger entry the run posted (with no amountField,
+ *    the entry alone). One entry is the true size of a request that posts one, and only the largest
+ *    row of one that posts an entry per row.
+ *  - `id` names an operation where the id rule (registry.ts operationIdFor) would give the neutral
+ *    ".post" or a word that misleads, with a short verb: customers.bulk.save, invoices.post-draft.
  */
 import type { ClassificationMap } from '../types';
 
@@ -60,6 +68,7 @@ export const SALES_CLASSES: ClassificationMap = {
   },
   'POST /api/customers/bulk': {
     class: 'bulk',
+    id: 'customers.bulk.save',
     describe: 'Add or edit several customers at once',
     why: 'One request saves every row (new customers, and edits of existing ones when a row has an id).',
     countField: 'rows',
@@ -135,6 +144,8 @@ export const SALES_CLASSES: ClassificationMap = {
   },
   'POST /api/invoices/[id]/post': {
     class: 'change',
+    // The rule's "invoices.post" reads like the neutral ".post" every other bucket names away.
+    id: 'invoices.post-draft',
     describe: 'Post draft invoice {id} to the books',
     why: 'Posts an existing draft (pending) invoice to the ledger; it creates no new record.',
     confirmFlags: ['overrideCreditLimit', 'allowOverBilling'],
@@ -150,15 +161,18 @@ export const SALES_CLASSES: ClassificationMap = {
     class: 'bulk',
     describe: 'Batch invoicing: bill the same lines to several customers',
     why:
-      'One request enters one invoice per customer picked (up to 500). There is no single amount (each ' +
-      "invoice's total is listed under created in the answer), so two-person approval cannot apply to it.",
+      'One request enters one invoice per customer picked (up to 500). The amount is the sum of the ' +
+      "invoices: each invoice's total is listed under created in the answer, and created.*.total adds them " +
+      'up (a skipped customer has none).',
     countField: 'customerIds',
     confirmFlags: ['overrideCreditLimit'],
+    amountField: 'created.*.total',
   },
   'GET /api/invoices/custom-fields': { class: 'read', describe: 'List the custom fields of invoices' },
   'GET /api/invoices/retainage': { class: 'read', describe: 'Show retainage held and billed by customer' },
   'POST /api/invoices/retainage': {
     class: 'enter',
+    id: 'invoices.retainage.bill',
     describe: 'Bill released retainage to customer {customerId}',
     confirmFlags: ['allowDuplicateNumber', 'overrideCreditLimit'],
     // Not the body's 'amount': it is optional (left out, all the retainage still held is billed),
@@ -207,7 +221,7 @@ export const SALES_CLASSES: ClassificationMap = {
       "One door for 'convert' and 'progress' (a new invoice from the estimate) and 'void'; classed by its riskiest " +
       "action, voiding. 'convert' answers with the new invoice and 'void' with the estimate, both with a total; " +
       "'progress' answers { invoice, estimate, overBilled }, with no total at the top, so its amount counts as " +
-      'over every amount limit.',
+      "over every amount limit until the dry run, whose one ledger entry (the new invoice's) then gives it.",
     confirmFlags: ['overrideCreditLimit', 'allowOverBilling'],
     amountField: 'total',
   },
@@ -257,11 +271,14 @@ export const SALES_CLASSES: ClassificationMap = {
   'GET /api/fulfillment': { class: 'read', describe: 'Show the sales order fulfillment worksheet' },
   'POST /api/fulfillment': {
     class: 'bulk',
+    id: 'fulfillment.invoice',
     describe: 'Invoice what can ship on the selected sales orders',
     why:
-      'One request enters one invoice per sales order selected. There is no single amount (each ' +
-      "invoice's total is listed under results in the answer), so two-person approval cannot apply to it.",
+      'One request enters one invoice per sales order selected. The amount is the sum of the invoices: ' +
+      "each invoice's total is listed under results in the answer (lib/services/fulfillment.ts " +
+      'batchInvoiceSalesOrders), and results.*.total adds them up (an order that could not be invoiced has none).',
     countField: 'selections',
+    amountField: 'results.*.total',
   },
   'GET /api/fulfillment/packing-slips': {
     class: 'read',
@@ -347,6 +364,7 @@ export const SALES_CLASSES: ClassificationMap = {
   },
   'POST /api/payments/journal-items': {
     class: 'change',
+    id: 'payments.journal-items.apply',
     describe: 'General Journal items: {action} for a customer',
     why: "Applies (or unapplies) an existing General Journal credit or payment to invoices or General Journal charges. It creates no new transaction. 'amount' is in the body for 'apply_credit' only; 'apply_payment' (items[].amount) and 'unapply' have none, and a missing amount counts as over every amount limit.",
     amountField: 'amount',
@@ -390,8 +408,9 @@ export const SALES_CLASSES: ClassificationMap = {
   'POST /api/finance-charges': {
     class: 'bulk',
     describe: 'Assess finance charges as of {asOf}',
-    why: 'One request enters one finance-charge invoice per customer with an overdue balance. customerIds narrows it; without it every customer in the preview is charged, so the count then comes from the dry run. A "settings" override in the body applies to this run only and only for someone who may change company preferences. There is no single amount (each charge is listed under assessed in the answer), so two-person approval cannot apply to it.',
+    why: 'One request enters one finance-charge invoice per customer with an overdue balance. customerIds narrows it; without it every customer in the preview is charged, so the count then comes from the dry run. A "settings" override in the body applies to this run only and only for someone who may change company preferences. The amount is the sum of the charges: each is listed under assessed in the answer, and assessed.*.charge adds them up.',
     countField: 'customerIds',
+    amountField: 'assessed.*.charge',
   },
   'GET /api/finance-charges/preview': {
     class: 'read',
@@ -427,7 +446,7 @@ export const SALES_CLASSES: ClassificationMap = {
   'POST /api/income-tracker/actions': {
     class: 'outside',
     describe: 'Income Tracker: {action} the selected rows',
-    why: "One door for 'email' (emails each selected form), 'queue_print' and 'queue_email' (marks forms to send later) and 'convert' (one invoice per estimate, sales order or customer's unbilled time). Classed by its riskiest action, the email. There is no single amount ('convert' answers with done and failed lists, no totals), so two-person approval cannot apply to it.",
+    why: "One door for 'email' (emails each selected form), 'queue_print' and 'queue_email' (marks forms to send later) and 'convert' (one invoice per estimate, sales order or customer's unbilled time). Classed by its riskiest action, the email. No amountField: 'convert' answers with done and failed lists and no totals, so nothing can add them up. It posts one ledger entry per invoice, so after the dry run the two-person rule and a grant's maxAmount see only the largest single invoice, not the total; the bulk cap still limits how many.",
     effects: ['email'],
     countField: 'items',
     confirmFlags: ['overrideCreditLimit'],
@@ -479,6 +498,7 @@ export const SALES_CLASSES: ClassificationMap = {
   'GET /api/sales-forms/queue': { class: 'read', describe: 'List the forms waiting to be printed or emailed' },
   'POST /api/sales-forms/queue': {
     class: 'outside',
+    id: 'sales-forms.queue.run',
     describe: 'Print Forms / Send Forms: {action} for the selected forms',
     why: "One door for 'send_emails' (emails every selected form) and 'mark_printed' (clears their \"to be printed\" mark). Classed by its riskiest action, the email.",
     effects: ['email'],

@@ -4,7 +4,8 @@
  *    through the multi-user proxy (which always stamps x-bka-remote-addr and sec-bka-proxy);
  *  - CSRF: a state-changing API request from another site or another port on localhost (same
  *    site, different origin) is refused; the app's own same-origin requests and non-browser
- *    callers (no Sec-Fetch-Site) are not.
+ *    callers (no Sec-Fetch-Site) are not;
+ *  - agent full access: an incoming x-bka-origin (an agent scope's label) is removed.
  *
  * Requests are built the way the real server hands them to middleware: the standalone server
  * listens on 127.0.0.1, and Next.js builds req.nextUrl from THAT address (it always says
@@ -17,6 +18,8 @@ import { NextRequest } from 'next/server';
 import { middleware } from '../middleware';
 import { classifyHost } from '../lib/net/cidr';
 import { PROXY_SECRET_ENV, PROXY_SECRET_HEADER } from '../lib/net/loopbackHost';
+import { ROUTE_PATH_HEADER } from '../lib/permissions/headers';
+import { SERVICE_ORIGIN_AGENT, SERVICE_ORIGIN_HEADER } from '../lib/serviceScope';
 
 const SERVER = 'http://localhost:51234';
 
@@ -128,6 +131,36 @@ describe('middleware: cross-site requests', () => {
     expect(middleware(req('/api/users', { method: 'POST', headers: { 'sec-fetch-site': 'same-origin' } })).status).toBe(200);
     expect(middleware(req('/api/users', { method: 'POST', host: '127.0.0.1:51234' })).status).toBe(200);
     expect(middleware(req('/api/users', { headers: { 'sec-fetch-site': 'cross-site' } })).status).toBe(200);
+  });
+});
+
+describe("middleware: an agent scope's origin label (agent full access)", () => {
+  // lib/serviceScope.ts puts x-bka-origin only on the synthetic request of an agent's work run
+  // in-process. A real request that sends it loses it here, like a forged route stamp.
+  const forwarded = (res: Response) => (res.headers.get('x-middleware-override-headers') ?? '').split(',');
+
+  it('removes an incoming x-bka-origin from API and page requests, keeping the rest', () => {
+    for (const [route, method] of [
+      ['/api/accounts', 'GET'],
+      ['/api/estimates', 'POST'],
+      ['/unlock', 'GET'],
+    ] as const) {
+      const res = middleware(req(route, { method, headers: { [SERVICE_ORIGIN_HEADER]: SERVICE_ORIGIN_AGENT, 'x-other': 'kept' } }));
+      expect(res.status, route).toBe(200);
+      expect(res.headers.get('x-middleware-next'), route).toBe('1');
+      expect(forwarded(res), route).not.toContain(SERVICE_ORIGIN_HEADER);
+      expect(res.headers.get(`x-middleware-request-${SERVICE_ORIGIN_HEADER}`), route).toBeNull();
+      expect(forwarded(res), route).toContain('x-other');
+      expect(res.headers.get(`x-middleware-request-${ROUTE_PATH_HEADER}`), route).toBe(route);
+    }
+  });
+
+  it('also from an agent at the door', () => {
+    const res = middleware(
+      req('/api/accounts', { headers: { authorization: `Bearer ibka_0123abcd_${'A'.repeat(43)}`, [SERVICE_ORIGIN_HEADER]: 'agent' } }),
+    );
+    expect(res.headers.get('x-middleware-next')).toBe('1');
+    expect(forwarded(res)).not.toContain(SERVICE_ORIGIN_HEADER);
   });
 });
 

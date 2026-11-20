@@ -112,6 +112,7 @@ import {
   voidedDeletedDetailStd,
   voidedDeletedSummaryStd,
 } from './reportsMore';
+import { agentActivityReport } from './auditTrail';
 import { getPreferences } from './company';
 import { companies } from '@/lib/db/schema';
 import { eq } from 'drizzle-orm';
@@ -230,6 +231,8 @@ export const REPORT_RUNNERS: Record<string, Runner> = {
   'voided-deleted-summary': voidedDeletedSummaryStd,
   'voided-deleted-detail': voidedDeletedDetailStd,
   'closing-date-exceptions': closingDateExceptionsStd,
+  // Agent full access (plan §7.3): every permission request an agent made.
+  'agent-activity': agentActivityReport,
 };
 
 /** True when `key` is a runnable standard report. */

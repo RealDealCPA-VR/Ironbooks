@@ -17,6 +17,10 @@
  * field layout, check height, paper size — drizzle/0047) and builds the data
  * a check PDF needs: "print on check as" name, vendor account number on the memo line, voucher
  * detail (expense lines / bills paid / paycheck lines).
+ *
+ * That memo line carries the payee's full account number ("Acct # …"). The PDF prints it in full;
+ * the queue listing (listPrintQueue) masks it to the last 4 digits for a caller without "view full
+ * account numbers" (checkMemoFor, plan 5.9 / D6).
  */
 import { isBankAccount } from '@/lib/accountTypes';
 import { and, asc, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
@@ -81,7 +85,7 @@ import { markExpensePrinted } from './expenses';
 import { billPaymentMemoRename, markBillPaymentPrinted } from './billPayments';
 import { renameLineMemos } from './entryLineMemos';
 import { type CheckNumberUse, allocateCheckNumber, findDuplicateCheckNumbers } from './checkNumbers';
-import { markPaymentCheckPrinted } from './liabilityPayments';
+import { checkMemoFor, markPaymentCheckPrinted } from './liabilityPayments';
 import { assertClosedPeriodEdit } from './postedEdit';
 import { requirePermission } from './access';
 import { getPreferences } from './company';
@@ -168,7 +172,8 @@ function expensePayee(
 
 /**
  * QB prints the payee's account number on the memo line when the memo is blank. The payee is a
- * vendor or an Other Names entry (B3); both lists carry an account number.
+ * vendor or an Other Names entry (B3); both lists carry an account number. This is the printed
+ * text, in full: an answer to a caller passes it through checkMemoFor first.
  */
 function expenseMemo(
   e: { memo: string | null },
@@ -180,7 +185,10 @@ function expenseMemo(
   return acct ? `Acct # ${acct}` : (e.memo ?? null);
 }
 
-/** Everything waiting to be printed, oldest first (optionally for one bank account). */
+/**
+ * Everything waiting to be printed, oldest first (optionally for one bank account). Each memo is
+ * shown as the caller may see it: "Acct # ••••6789" without "view full account numbers".
+ */
 export async function listPrintQueue(
   ctx: ServiceContext,
   opts?: { paymentAccountId?: string },
@@ -209,7 +217,7 @@ export async function listPrintQueue(
       date: r.e.date,
       payee: expensePayee(r.e, r.v, r.o, ''),
       amount: toAmountString(await amountFromBank(ctx, r.e, Money.of(r.e.total).abs())),
-      memo: expenseMemo(r.e, r.v, r.o),
+      memo: checkMemoFor(ctx, expenseMemo(r.e, r.v, r.o)),
       paymentAccountId: r.e.paymentAccountId,
       paymentAccountName: r.acctName ?? null,
     });
@@ -235,7 +243,7 @@ export async function listPrintQueue(
       date: r.p.date,
       payee: vendorCheckName(r.v, 'Vendor'),
       amount: toAmountString(await amountFromBank(ctx, r.p, Money.of(r.p.amount))),
-      memo: r.v?.accountNumber ? `Acct # ${r.v.accountNumber}` : null,
+      memo: checkMemoFor(ctx, r.v?.accountNumber ? `Acct # ${r.v.accountNumber}` : null),
       paymentAccountId: r.p.paymentAccountId,
       paymentAccountName: r.acctName ?? null,
     });
@@ -262,7 +270,8 @@ export async function listPrintQueue(
       date: r.c.date,
       payee: r.c.payeeName,
       amount: toAmountString(r.c.amount),
-      memo: r.c.memo,
+      // Sales Tax Payment checks store "Acct # <agency account number>" as their default memo.
+      memo: checkMemoFor(ctx, r.c.memo),
       paymentAccountId: r.c.paymentAccountId,
       paymentAccountName: r.acctName ?? null,
     });
@@ -859,6 +868,11 @@ function scaleVoucher<T extends { amount: string }>(voucher: T[], docAmount: Ret
   });
 }
 
+/**
+ * What goes on the check paper (POST /api/checks/pdf). The memo keeps the payee's full account
+ * number for every caller: it is the printed text, and the payee needs it to apply the payment.
+ * This is not a listing; do not answer it as JSON (listPrintQueue is the masked listing).
+ */
 export async function checkPrintData(
   ctx: ServiceContext,
   source: PrintSource,
@@ -1014,6 +1028,11 @@ export async function checkPrintData(
     }
     const label =
       c.kind === 'sales_tax' ? 'Sales Tax Payment' : c.kind === 'payroll_liability' ? 'Liability Check' : 'Refund';
+    // A Sales Tax Payment to an agency has one voucher line (Dr 2200), which prints the check's
+    // memo: the account number when the memo was left blank. The journal line no longer carries
+    // that number (paySalesTaxAgencies keeps it off the ledger), so the stub reads it from the
+    // check and prints what it always has. Older checks hold the same text in both places.
+    const voucherMemo = c.kind === 'sales_tax' && c.agencyId ? c.memo : null;
     return {
       payee: c.payeeName,
       amount: toAmountString(c.amount),
@@ -1026,7 +1045,7 @@ export async function checkPrintData(
         lines.length > 0
           ? lines.map((l) => ({
               account: `${l.code} – ${l.name}`,
-              description: l.memo ?? (row.agencyName ? `${label} — ${row.agencyName}` : label),
+              description: voucherMemo ?? l.memo ?? (row.agencyName ? `${label} — ${row.agencyName}` : label),
               amount: toAmountString(l.debit ?? '0'),
             }))
           : [{ account: label, description: c.memo, amount: toAmountString(c.amount) }],

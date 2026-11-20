@@ -13,14 +13,22 @@
  *                      physical key counts, so a Cyrillic or Greek layout opens them too)
  *   Alt alone          the menu bar takes the keyboard, its letters underlined: Left / Right move,
  *                      Down / Enter / Space or the letter open a menu, Esc or Alt go back to the page
+ *
+ * On the right, while a person is signed in (agent full access, plan 7.1 and 7.2): the agent
+ * requests waiting for them (components/AgentRequestsBadge.tsx) and Pause all agents
+ * (components/PauseAllAgents.tsx), each shown only when it has something to say.
  */
 import * as React from 'react';
+import { usePathname } from 'next/navigation';
 import { Briefcase } from 'lucide-react';
 import { chromeBridge } from '@/lib/useTheme';
 import { cn } from '@/lib/utils';
 import { MENU_MNEMONICS, menuForKey, menuForLetter } from '@/lib/shortcuts';
 import { formShortcutTarget } from './FormShortcuts';
 import { CompanyFileStatus } from './CompanyFileStatus';
+import { isBarePath } from './AppShell';
+import { TitleBarAgentRequests } from './AgentRequestsBadge';
+import PauseAllAgents from './PauseAllAgents';
 
 /** A menu's label with its letter underlined while the menu bar shows its keys. */
 function MenuLabel({ label, show }: { label: string; show: boolean }) {
@@ -63,6 +71,8 @@ export default function WindowTitleBar() {
   /** Where the keyboard was before the menu bar took it. */
   const returnTo = React.useRef<HTMLElement | null>(null);
   const title = useDocumentTitle();
+  // Sign-in and the other pages without the app's menus: nobody to ask, nothing to poll.
+  const signedInPage = !isBarePath(usePathname() || '');
 
   React.useEffect(() => {
     const bridge = chromeBridge();
@@ -229,8 +239,13 @@ export default function WindowTitleBar() {
         <div className="ml-auto hidden min-w-0 truncate pl-4 text-xs text-navy/45 xl:block" title={title}>
           {pageTitle}
         </div>
-        {/* Saved / Saving… / Not saved for a single company file (nothing for older folders). */}
-        <CompanyFileStatus className={cn('shrink-0', 'ml-auto xl:ml-2')} />
+        <div className="ml-auto flex shrink-0 items-center gap-1 xl:ml-2">
+          {/* Agent requests waiting for this person, then Pause all agents (each hidden while it has nothing to say). */}
+          <TitleBarAgentRequests enabled={signedInPage} />
+          <PauseAllAgents enabled={signedInPage} />
+          {/* Saved / Saving… / Not saved for a single company file (nothing for older folders). */}
+          <CompanyFileStatus className="shrink-0" />
+        </div>
       </div>
     </div>
   );

@@ -18,9 +18,11 @@ import { HOST, IronbooksClient, IronbooksError, expectedProof } from '../../mcp/
 import { DATE_PRESETS, OTHER_LISTS, READ_TOOLS, TOOLS, TXN_TYPES, shapeReport } from '../../mcp/tools.mjs';
 import { LIST_TYPES, TRANSACTION_TYPES, WRITE_READ_TOOLS, WRITE_TOOLS, camelize, shapeAnswer, shapeRecord } from '../../mcp/write-tools.mjs';
 import { BANKING_READ_TOOLS, BANKING_WRITE_TOOLS } from '../../mcp/banking-tools.mjs';
+import { OPERATION_TOOLS } from '../../mcp/operations-tools.mjs';
+import { FILE_TOOLS } from '../../mcp/files-tools.mjs';
 import { ALL_AGENT_ACTIONS as AGENT_ACTIONS, AGENT_LIST_TYPES, AGENT_TRANSACTION_TYPES } from '@/lib/agent/catalog';
-import { AGENT_ACTION_ROUTE } from '@/lib/permissions/agentAccess';
-import { AGENT_READ_ROUTES } from '@/lib/permissions/agentAccess';
+import { AGENT_ACTION_ROUTE, agentRouteAllowed } from '@/lib/permissions/agentAccess';
+import { operationForPath } from '@/lib/agent/operations/registry';
 import { matchRoutePattern } from '@/lib/permissions/routes';
 import { SIMPLE_LIST_KEYS } from '@/lib/services/lists/simpleLists';
 import { reportParamsSchema } from '@/lib/validation/reports';
@@ -78,8 +80,23 @@ async function call(client: unknown, name: string, args: Any = {}): Promise<{ is
   return { isError: res.result.isError, text, data };
 }
 
+/**
+ * The routes the named read tools call. It was the agent allow-list (AGENT_READ_ROUTES); with full
+ * access, what an agent may read directly is decided by lib/permissions/agentAccess.ts
+ * agentRouteAllowed and the operation registry, which every route here must pass.
+ */
+const NAMED_TOOL_READ_ROUTES = [
+  '/api/agent/whoami', '/api/accounts', '/api/customers', '/api/vendors', '/api/items', '/api/classes', '/api/employees', '/api/lists/[list]',
+  '/api/tax-rates', '/api/search', '/api/find', '/api/registers', '/api/registers/[accountId]', '/api/journal-entries/[id]', '/api/reports/std/[report]',
+  '/api/invoices', '/api/invoices/[id]', '/api/sales-receipts/[id]', '/api/payments/[id]', '/api/bills', '/api/bills/[id]', '/api/bill-payments/[id]',
+  '/api/expenses/[id]', '/api/deposits/[id]', '/api/deposits/undeposited', '/api/transfers/[id]', '/api/customers/[id]', '/api/vendors/[id]',
+  '/api/accounts/[id]', '/api/items/[id]', '/api/bank-accounts', '/api/bank-transactions', '/api/bank-transactions/matches', '/api/reconciliations',
+  '/api/reconciliations/[id]', '/api/reconciliations/[id]/clearable', '/api/reconciliations/info',
+];
+const registryLookup = (p: string) => operationForPath('GET', p)?.operation ?? null;
+
 describe('the tools and the app agree on names', () => {
-  it('every tool reads only routes on the agent list, and changes go to the one action route', async () => {
+  it('every tool reads only routes an agent may read, and changes go to the one action route', async () => {
     const used = new Set<string>();
     const acted: string[] = [];
     const client = {
@@ -90,7 +107,8 @@ describe('the tools and the app agree on names', () => {
       async get(p: string) {
         const pattern = matchRoutePattern(p);
         expect(pattern, p).not.toBeNull();
-        expect(AGENT_READ_ROUTES, p).toContain(pattern);
+        expect(NAMED_TOOL_READ_ROUTES, p).toContain(pattern);
+        expect(agentRouteAllowed(p, 'GET', registryLookup), `an agent may read ${p}`).toBe(true);
         used.add(pattern!);
         if (p === '/api/registers') return { accounts: [{ id: ID, code: '1000', name: 'Checking', type: 'asset' }] };
         if (p === '/api/bank-transactions') return [{ id: ID, date: '2026-01-05T00:00:00.000Z', description: 'x', amount: '-1.00', matched: false, excluded: false }];
@@ -115,12 +133,17 @@ describe('the tools and the app agree on names', () => {
       const r = await call(client, 'get_transaction', { type, id: ID });
       expect(r.isError, `get_transaction ${type}: ${r.text}`).toBe(false);
     }
-    expect([...used].sort()).toEqual([...AGENT_READ_ROUTES].sort());
-    // The only reads that go through the action route: the agent's own proposals, and bank feed
-    // suggestions (the plain route for those may ask an AI service; the action never does).
-    expect(acted.sort()).toEqual(['bank_feed_suggestions', 'list_my_proposals']);
-    // The tools are the reads plus the tools that change the books, each named once.
-    expect(TOOLS.length).toBe(READ_TOOLS.length + WRITE_READ_TOOLS.length + BANKING_READ_TOOLS.length + WRITE_TOOLS.length + BANKING_WRITE_TOOLS.length);
+    expect([...used].sort()).toEqual([...NAMED_TOOL_READ_ROUTES].sort());
+    // The generic door's own reads (wait_for_decision, the request resource) are the agent's own routes.
+    for (const p of ['/api/agent/requests', `/api/agent/requests/${ID}`, '/api/agent/requests/my-own-key']) expect(agentRouteAllowed(p, 'GET', null), p).toBe(true);
+    // The only read of the named tools that goes through the action route: bank feed suggestions
+    // (the plain route for those may ask an AI service; the action never does). list_my_proposals
+    // is now an alias of list_my_requests, a verb (mcp/operations-tools.mjs, test/mcp/operations.test.ts).
+    expect(acted.sort()).toEqual(['bank_feed_suggestions']);
+    // The tools are the reads, the tools that change the books, the generic door and files, each named once.
+    expect(TOOLS.length).toBe(
+      READ_TOOLS.length + WRITE_READ_TOOLS.length + BANKING_READ_TOOLS.length + WRITE_TOOLS.length + BANKING_WRITE_TOOLS.length + OPERATION_TOOLS.length + FILE_TOOLS.length,
+    );
     expect(new Set(TOOLS.map((t) => t.name)).size).toBe(TOOLS.length);
     expect(AGENT_ACTION_ROUTE).toBe('/api/agent/actions');
   });
@@ -536,6 +559,87 @@ describe('tools that change the books', () => {
     expect(shapeAnswer({ outcome: 'posted', result: { id: ID }, ledger: { entries: [], changes: [] } })).toEqual({ outcome: 'posted', said: 'Entered.', result: { id: ID } });
     expect(shapeAnswer({ outcome: 'proposed', proposalId: ID2, ledger })).toMatchObject({ outcome: 'proposed', said: 'Not entered. Waiting for a person to approve it in Ironbooks.', proposal_id: ID2 });
     expect(shapeAnswer({ outcome: 'posted', replayed: true, result: { id: ID } })).toMatchObject({ repeated: true, note_repeat: expect.stringMatching(/Nothing was entered again/) });
+  });
+
+  it('asked: nothing entered yet, who decides, and wait_for_decision with the request id', async () => {
+    const needs = { admin: false, fileAdmin: false, hostOnly: false, flag: 'closedPeriod', flags: ['closedPeriod'], secrets: ['closing_password'], twoPerson: true, grantable: 'no' };
+    const ledger = { entries: [{ journalEntryId: ID, date: '2026-01-05', description: 'x', lines: [{ accountCode: '6400', accountName: 'Rent', debit: '5.00', credit: null }] }], changes: [] };
+    const { client } = acting({ outcome: 'asked', requestId: ID2, status: 'pending', needs, ledger, summary: 'Transfer $5.00' });
+    const r = await call(client, 'transfer_funds', { date: '2026-01-05', from_account_id: ID, to_account_id: ID2, amount: '5.00', request_id: 't-ask' });
+    expect(r.isError).toBe(false);
+    expect(r.data).toMatchObject({ outcome: 'asked', said: 'Not done yet. A person must approve it in Ironbooks first.', request_id: ID2, status: 'pending', summary: 'Transfer $5.00' });
+    expect(r.data.would_post[0].lines).toEqual([{ account: '6400 Rent', debit: '5.00', credit: null }]);
+    expect(r.data).not.toHaveProperty('ledger');
+    expect(r.data.next).toMatch(new RegExp(`wait_for_decision with request_id "${ID2}"`));
+    expect(r.data.next).toMatch(/Do not send this request again/);
+    expect(r.data.who_decides).toMatch(/may work in the closed period must approve it/);
+    expect(r.data.who_decides).toMatch(/Two different people/);
+    expect(r.data.who_decides).toMatch(/type the closing-date password on their own screen; you never see it, and must not ask for it/);
+  });
+
+  it('needs_confirmation: the warning, the field that accepts it, and to resend with a new request id', async () => {
+    const warnings = [{ flag: 'allowDuplicateNumber', message: 'Bill B-1 from Paper Co is already entered.' }, { flag: 'allowReconciledEdit', message: 'It is reconciled.' }];
+    const { client } = acting({ operation: 'bills.create', outcome: 'needs_confirmation', warnings });
+    const r = await call(client, 'enter_bill', { vendor_id: ID, bill_number: 'B-1', date: '2026-01-05', lines: [{ account_id: ID2, amount: '1.00' }], request_id: 'b-dup' });
+    expect(r.isError).toBe(false);
+    expect(r.data.said).toMatch(/Not done. Ironbooks raised a warning/);
+    expect(r.data.warnings).toEqual([
+      // enter_bill has a field for this one ...
+      { flag: 'allowDuplicateNumber', message: 'Bill B-1 from Paper Co is already entered.', resend_with: 'allow_duplicate_number: true' },
+      // ... and not for this one: the generic door takes it.
+      { flag: 'allowReconciledEdit', message: 'It is reconciled.', resend_with: 'run_operation with operation "bills.create" and confirm: ["allowReconciledEdit"]' },
+    ]);
+    expect(r.data.next).toMatch(/Only if it is right to go ahead/);
+    expect(r.data.next).toMatch(/NEW request_id/);
+    expect(r.data.next).toMatch(/Otherwise stop/);
+  });
+
+  it('refused: a tool error that says nothing was done and not to send it again', async () => {
+    const { client } = acting({ outcome: 'refused', note: 'An Admin has not allowed agents to enter bills' });
+    const r = await call(client, 'enter_bill', { vendor_id: ID, date: '2026-01-05', lines: [{ account_id: ID2, amount: '1.00' }], request_id: 'b-no' });
+    expect(r.isError).toBe(true);
+    expect(r.text).toBe(
+      'Refused: An Admin has not allowed agents to enter bills. Nothing was done. Do not send it again as it is. get_my_permissions shows what you may do; if the work still needs doing, tell the person what you wanted to do and why.',
+    );
+    // The banking tools answer the same way.
+    const b = await call(client, 'match_bank_line', { bank_transaction_id: ID, journal_entry_id: ID2, request_id: 'm-no' });
+    expect(b.isError).toBe(true);
+    expect(b.text).toMatch(/^Refused: An Admin has not allowed agents to enter bills\. Nothing was done\./);
+  });
+
+  it('a preview from the generic door: changes, what leaves the computer, what is lost, the file made', () => {
+    const preview = {
+      ledger: null,
+      records: [{ action: 'update', kind: 'invoice', id: ID, fields: [{ field: 'memo', before: 'a', after: 'b' }] }],
+      effects: [{ kind: 'email', summary: 'Email to billing@acme.test: Invoice 1042', detail: {} }],
+      warnings: [],
+      loss: 'Invoice 1042 is gone for good.',
+      routePreview: null,
+      truncated: false,
+    };
+    expect(shapeAnswer({ outcome: 'dry_run', preview }, { fields: 'confirm' })).toEqual({
+      outcome: 'dry_run',
+      said: 'Not entered. This is what it would do.',
+      would_post: [],
+      would_change: [{ kind: 'invoice', id: ID, action: 'update', fields: [{ field: 'memo', before: 'a', after: 'b' }] }],
+      would_also: ['Email to billing@acme.test: Invoice 1042'],
+      loss: 'Invoice 1042 is gone for good.',
+    });
+    const posted = shapeAnswer({
+      outcome: 'posted',
+      result: { ok: true },
+      file: { fileId: 'f'.repeat(32), name: 'Invoice 1042.pdf', type: 'application/pdf', size: 1200 },
+      effects: [{ effect: preview.effects[0], status: 'failed', error: 'The mail server refused it.', ranDuringOperation: false }],
+      grantId: ID2,
+    });
+    expect(posted).toMatchObject({
+      file: { file_id: 'f'.repeat(32), name: 'Invoice 1042.pdf', type: 'application/pdf', size: 1200 },
+      also_done: [{ what: 'Email to billing@acme.test: Invoice 1042', status: 'failed', error: 'The mail server refused it.' }],
+      under_standing_permission: ID2,
+    });
+    expect(posted.next).toMatch(/get_file with file_id "f{32}"/);
+    expect(shapeAnswer({ outcome: 'needs_confirmation', warnings: [{ flag: 'allowZero', message: 'x' }] }, { fields: 'confirm' }).warnings[0].resend_with).toBe('confirm: ["allowZero"]');
+    expect(shapeAnswer({ outcome: 'done' }).said).toBe('Done. Nothing was posted to the ledger.');
   });
 
   it('a refusal from Ironbooks reaches the agent as it was said', async () => {

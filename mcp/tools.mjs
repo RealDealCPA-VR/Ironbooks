@@ -13,6 +13,9 @@
 import { ToolError } from './protocol.mjs';
 import { WRITE_READ_TOOLS, WRITE_TOOLS } from './write-tools.mjs';
 import { BANKING_READ_TOOLS, BANKING_WRITE_TOOLS } from './banking-tools.mjs';
+import { OPERATION_TOOLS, REQUEST_TEMPLATE, REQUEST_URI_PREFIX, readRequestResource } from './operations-tools.mjs';
+import { FILE_TEMPLATE, FILE_TOOLS, FILE_URI_PREFIX, readFileResource } from './files-tools.mjs';
+import { GUIDE_PROMPT, GUIDE_PROMPT_NAME, GUIDE_RESOURCE, GUIDE_URI, guideContents, guidePrompt } from './guide.mjs';
 
 const DATE = { type: 'string', pattern: '^\\d{4}-\\d{2}-\\d{2}$', patternHint: 'must be a date as YYYY-MM-DD' };
 const ID = { type: 'string', pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$', patternHint: 'must be an id returned by another tool' };
@@ -133,7 +136,7 @@ export const READ_TOOLS = [
     name: 'get_company_info',
     title: 'Company information',
     description:
-      'Start here. Which company these books belong to and how to read them: company name, fiscal year end, report basis (accrual or cash), home currency, the closing date (nothing on or before it can change), the time zone and today\'s date there, and which features the company uses (classes, inventory, sales tax, payroll, multiple currencies). Also says who you are in these books: your agent name, your role and whether you can change anything (in this version you can only read).',
+      'Start here. Which company these books belong to and how to read them: company name, fiscal year end, report basis (accrual or cash), home currency, the closing date (nothing on or before it can change without a person approving it), the time zone and today\'s date there, and which features the company uses (classes, inventory, sales tax, payroll, multiple currencies). Also says who you are in these books: your agent name and your role. get_my_permissions shows exactly what you may do on your own and what a person must approve.',
     inputSchema: schema({}),
     handler: (_a, c) => c.get('/api/agent/whoami'),
   },
@@ -457,14 +460,41 @@ export const READ_TOOLS = [
   },
 ];
 
-/** Every tool: the reads, then the tools that change the books (mcp/write-tools.mjs). @type {import('./protocol.mjs').Tool[]} */
-export const TOOLS = [...READ_TOOLS, ...WRITE_READ_TOOLS, ...BANKING_READ_TOOLS, ...WRITE_TOOLS, ...BANKING_WRITE_TOOLS];
+/**
+ * Every tool: the reads, the tools that change the books (mcp/write-tools.mjs, banking-tools.mjs),
+ * then the generic door to every other operation (operations-tools.mjs) and files (files-tools.mjs).
+ * @type {import('./protocol.mjs').Tool[]}
+ */
+export const TOOLS = [...READ_TOOLS, ...WRITE_READ_TOOLS, ...BANKING_READ_TOOLS, ...WRITE_TOOLS, ...BANKING_WRITE_TOOLS, ...OPERATION_TOOLS, ...FILE_TOOLS];
 
 export const INSTRUCTIONS = [
-  'Ironbooks is a desktop accounting system (a double-entry ledger, like QuickBooks Desktop). These tools work in one company\'s books.',
-  'Start with get_company_info: it says which company this is, the closing date, and what you may do. An Admin gave you one of three modes. Read only: you can look, and every change is refused. Propose: a change you ask for is checked and put in a queue for a person to approve; nothing is entered until they do (list_my_proposals shows what they decided). Post: your changes are entered, within your role.',
+  'Ironbooks is a desktop accounting system (a double-entry ledger, like QuickBooks Desktop). These tools work in one company\'s books. The full guide is the resource ironbooks://guide (also the prompt ironbooks_guide): read it before your first change.',
+  'Start with get_company_info (which company, the closing date, who you are) and get_my_permissions (what you may do on your own, what a person must approve, what is not allowed).',
   'Before entering anything, look: use find_transactions or search to make sure it is not already there, and list_accounts, list_customers or list_vendors for the ids you need.',
-  'Every tool that changes the books takes dry_run and request_id. dry_run true checks the change and shows the ledger lines it would post, without entering anything: use it whenever you are not sure. request_id is your own name for one change; asking again with the same request_id never enters it twice, so repeat a request with the SAME request_id after a timeout, and use a NEW one for each new change.',
-  'Nothing is ever deleted: a mistake is voided (void_transaction) or corrected (edit_transaction). Nothing dated on or before the closing date can be entered or changed. Dates are YYYY-MM-DD and amounts are text with two decimals ("1250.00").',
-  'If a tool says Ironbooks is not ready, the person needs to open the company file in Ironbooks and sign in.',
+  'The named tools cover everyday bookkeeping. For anything else, find_operations, then describe_operation, then run_operation: every operation a person can do in Ironbooks has an id.',
+  'Every tool that changes the books takes dry_run and request_id. dry_run true checks the change and shows what it would post, without keeping anything: use it whenever you are not sure. request_id is your own name for one change; asking again with the same request_id never does it twice, so repeat a request with the SAME request_id after a timeout, and use a NEW one for each new change.',
+  'When an answer says "asked", a person must approve it in Ironbooks: call wait_for_decision with its request_id, and do not send it again. "needs_confirmation" is a warning a person would have been asked about: go ahead only if it is right, as the answer says. "Refused" means stop.',
+  'The named tools never delete: a mistake is voided (void_transaction) or corrected (edit_transaction). Deleting for good, closed-period work, sending anything outside this computer and settings always need a person. Dates are YYYY-MM-DD and amounts are text with two decimals ("1250.00").',
+  'Never ask the person for a password, code or key, and never send one: when an operation needs one, the person types it on their own screen.',
+  'If a tool says Ironbooks is not ready, the person needs to open the company file in Ironbooks and sign in. If Ironbooks stops answering, it may be restarting: wait a minute, then read what you need again.',
 ].join(' ');
+
+/** The resources this server serves: the guide, and (by template) the agent's requests and files. */
+export const RESOURCES = {
+  list: () => [GUIDE_RESOURCE],
+  templates: () => [REQUEST_TEMPLATE, FILE_TEMPLATE],
+  /** @param {string} uri @param {any} client */
+  read: async (uri, client) => {
+    if (uri === GUIDE_URI) return guideContents();
+    if (uri.startsWith(REQUEST_URI_PREFIX)) return readRequestResource(uri, client);
+    if (uri.startsWith(FILE_URI_PREFIX)) return readFileResource(uri, client);
+    return null;
+  },
+};
+
+/** The prompts this server serves: the guide. */
+export const PROMPTS = {
+  list: () => [GUIDE_PROMPT],
+  /** @param {string} name */
+  get: (name) => (name === GUIDE_PROMPT_NAME ? guidePrompt() : null),
+};

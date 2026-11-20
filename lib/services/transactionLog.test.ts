@@ -21,6 +21,8 @@ import {
   transactionLogPath,
   verifyTransactionLog,
   describeChange,
+  agentActorName,
+  agentLabel,
 } from './transactionLog';
 
 const TEST_DIR = path.resolve(process.cwd(), '.bookkeeper-data', 'test-transaction-log');
@@ -251,6 +253,21 @@ describe('running transaction log', () => {
     );
     expect(describeChange('update', 'customer', { old: { displayName: 'A', phone: '1' }, new: { displayName: 'A', phone: '2' } })).toBe(
       'Changed customer "A" (changed: phone)',
+    );
+  });
+
+  it('names an agent and how its change was allowed (plan §7.3)', () => {
+    const actor = agentLabel('Ledger bot');
+    expect(actor).toBe('Ledger bot (agent)');
+    expect(agentActorName(actor)).toBe('Ledger bot (agent)');
+    expect(agentActorName(actor, { approvedBy: 'Pat Approver' })).toBe('Ledger bot (agent), approved by Pat Approver');
+    expect(agentActorName(actor, { grant: { givenBy: 'Gina Giver', until: '2026-11-20 17:30' } })).toBe(
+      'Ledger bot (agent), under permission from Gina Giver until 2026-11-20 17:30',
+    );
+    expect(agentActorName(actor, { grant: { givenBy: null, until: null } })).toBe('Ledger bot (agent), under standing permission');
+    // A person who said yes to this very change wins over a grant.
+    expect(agentActorName(actor, { approvedBy: 'Pat Approver', grant: { givenBy: 'Gina Giver', until: '2026-11-20 17:30' } })).toBe(
+      'Ledger bot (agent), approved by Pat Approver',
     );
   });
 });

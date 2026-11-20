@@ -10,9 +10,35 @@
  * (paystub, W-3/941/940 as read_sensitive): the stub carries only names and pay a payroll user
  * already sees on the paycheck, and W-3/941/940 carry only the company's EIN.
  *
+ * Amounts (two-person approval, D8, and a grant's maxAmount), the same rule in every bucket:
+ * amountField names the money the route's ANSWER carries (lib/agent/facts.ts takes the larger of
+ * the body's and the answer's figure, so a typed figure the route ignores cannot lower it). Where the
+ * answer lists one figure per row, a '*' path adds them up. A request with no amount counts as over
+ * every amount limit until its dry run. After it the bridge (lib/agent/bridge.ts factsFor) takes the
+ * larger of that figure and the largest SINGLE ledger entry the run posted (with no amountField, the
+ * entry alone; an amountField it cannot read stays over every limit). One entry is the true size of
+ * a request that posts one (a paycheck void, an adjustment), but only the largest row of one that
+ * posts an entry per row, so a per-row route names its rows with '*'.
+ *
  * Paychecks: writing or editing one pays a person, so both always ask, like a pay run. Their
  * amountField is the gross pay in the route's ANSWER (the preview or dry run), never the body:
- * the service ignores a typed grossPay whenever earnings lines are sent.
+ * the service ignores a typed grossPay whenever earnings lines are sent. A pay run adds up the gross
+ * pay of every check it wrote (results.*.grossPay), never one check's. Voiding a liability check
+ * names its amount (the void answers with the check, its amount as it was). Where no answer field
+ * holds the money (an adjustment's money sits in grossPay for a year-to-date one but in totalTaxes
+ * and totalDeductions for a liability one, whose grossPay is 0, and the paycheck void takes
+ * adjustments too), no amountField is set rather than one that could read low: each posts one entry,
+ * so after the dry run its ledger entry is the amount.
+ *
+ * Payroll items (the cross-bucket rule, with planning.ts): an item edit stays 'change', since plan
+ * §8 lists payroll items with the list entries and an item's rate is not what paychecks charge. But
+ * its tax tracking, pre-tax mark and posting accounts decide the taxable wages, W-2 boxes and
+ * accounts of every later paycheck, so an edit always asks. One route carries every field, so every
+ * edit asks.
+ *
+ * `id` names an operation where the id rule (registry.ts operationIdFor) would give the neutral
+ * ".post" or a word that misleads: GET /api/pay-liabilities only shows what is due
+ * (pay-liabilities.due), its POST pays (pay-liabilities.pay).
  */
 import type { ClassificationMap } from '../types';
 
@@ -72,8 +98,9 @@ export const PAYROLL_CLASSES: ClassificationMap = {
   },
   'PATCH /api/payroll-items/[id]': {
     class: 'change',
-    describe: 'Change payroll item {id}',
-    why: "An entry of the payroll item list (plan §8 lists payroll items with the list entries, not with payroll setup). Unlike a workers' comp code, an item's rate is not what paychecks charge: taxes come from the tax tables and the state settings. The item's accounts, pre-tax mark and tax tracking do steer later paychecks, which each still ask before they post.",
+    describe: 'Change payroll item {id} (its tax tracking, pre-tax mark or accounts steer every later paycheck)',
+    why: "An entry of the payroll item list (plan §8 lists payroll items with the list entries, not with payroll setup). Unlike a workers' comp code, an item's rate is not what paychecks charge: taxes come from the tax tables and the state settings. But the item's tax tracking, pre-tax mark and accounts decide the taxable wages, W-2 boxes and posting accounts of every later paycheck, so an edit always asks, never runs on its own policy or a standing permission. The route takes every field in one body, so a rename asks too.",
+    alwaysAsk: true,
   },
 
   // Paychecks: one check at a time. Pay runs are below.
@@ -103,19 +130,22 @@ export const PAYROLL_CLASSES: ClassificationMap = {
   'DELETE /api/payroll/[id]': {
     class: 'change',
     describe: 'Void paycheck {id}',
-    why: 'Voids the paycheck and its ledger entry; the check stays on file marked void. Nothing is deleted.',
+    why: "Voids the paycheck and its ledger entry; the check stays on file marked void. Nothing is deleted. No amountField: voidPaycheck takes any payroll row, a payroll adjustment too, and a liability adjustment's grossPay is 0, so the answer's grossPay could read a large void as 0. The amount stays unknown until the ledger preview shows it and counts as over every amount limit.",
   },
 
   // Pay runs: many paychecks in one request.
   'GET /api/payroll/pay-runs': {
     class: 'read',
+    id: 'payroll.pay-runs.list',
     describe: 'List pay runs',
   },
   'POST /api/payroll/pay-runs': {
     class: 'bulk',
+    id: 'payroll.pay-runs.create',
     describe: 'Run payroll dated {payDate} for the employees listed',
-    why: 'One paycheck per employee listed, each posted on its own (a refused employee does not stop the others).',
+    why: "One paycheck per employee listed, each posted on its own (a refused employee does not stop the others). The amount is the total gross pay of the run: the answer lists each paycheck's grossPay under results, and results.*.grossPay adds them up (a refused employee has none). Each check posts its own ledger entry, so without this path the bridge would judge the run by its largest single check. Before the dry run has answered, the amount is unknown and counts as over every amount limit.",
     countField: 'employees',
+    amountField: 'results.*.grossPay',
     alwaysAsk: true,
   },
 
@@ -143,13 +173,13 @@ export const PAYROLL_CLASSES: ClassificationMap = {
   'POST /api/payroll/adjustments': {
     class: 'enter',
     describe: 'Enter a payroll adjustment ({type}) for employee {employeeId} dated {date}',
-    why: "Year-to-date amounts land on the employee's W-2, the 941 and 940, and the wage bases of later checks. With affectsAccounts, a year-to-date adjustment posts net pay out of a bank account like a paycheck, and a liability adjustment moves what payroll owes. So it always asks, like a paycheck.",
+    why: "Year-to-date amounts land on the employee's W-2, the 941 and 940, and the wage bases of later checks. With affectsAccounts, a year-to-date adjustment posts net pay out of a bank account like a paycheck, and a liability adjustment moves what payroll owes. So it always asks, like a paycheck. No amountField: a year-to-date adjustment answers its money as grossPay, but a liability adjustment answers grossPay 0 with the money in totalTaxes and totalDeductions, so one path would read a large liability adjustment as 0. The amount stays unknown until the ledger preview shows it and counts as over every amount limit.",
     alwaysAsk: true,
   },
   'DELETE /api/payroll/adjustments/[id]': {
     class: 'change',
     describe: 'Void payroll adjustment {id}',
-    why: 'Voids the adjustment (and its ledger entry when it has one); it stays on file marked void. Nothing is deleted.',
+    why: 'Voids the adjustment (and its ledger entry when it has one); it stays on file marked void. Nothing is deleted. No amountField, for the same reason as entering one: a liability adjustment answers grossPay 0, so the amount counts as over every amount limit.',
   },
 
   // Payroll setup: state tax rates, workers' comp codes, sick and vacation accruals (plan §8).
@@ -240,10 +270,12 @@ export const PAYROLL_CLASSES: ClassificationMap = {
   // Payroll liabilities: paying what payroll owes, and the liability checks that pay it.
   'GET /api/pay-liabilities': {
     class: 'read',
+    id: 'pay-liabilities.due',
     describe: 'Show payroll liabilities due',
   },
   'POST /api/pay-liabilities': {
     class: 'enter',
+    id: 'pay-liabilities.pay',
     describe: 'Pay {amount} of payroll liabilities from account {paymentAccountId}',
     confirmFlags: ['allowDuplicateNumber'],
     amountField: 'amount',
@@ -254,9 +286,11 @@ export const PAYROLL_CLASSES: ClassificationMap = {
   },
   'POST /api/pay-liabilities/by-item': {
     class: 'enter',
+    id: 'pay-liabilities.by-item.pay',
     describe: 'Pay payroll liabilities by item from account {paymentAccountId} dated {date}',
-    why: 'Pays out of a bank account, but there is no single amount to read: the total is the sum of items[].amount (the route ignores a body "amount"), and the answer is the journal entry. No amountField, so the bridge has to total the items for the two-person rule; a typed "amount" would be ignored by the route and could be made up.',
+    why: 'Pays out of a bank account. The total is the sum of items[].amount (the route ignores a body "amount", so a typed one could be made up), and items.*.amount adds them up. The answer is the one journal entry (credit the bank for the total), so after the dry run its ledger entry gives the same figure.',
     confirmFlags: ['allowDuplicateNumber'],
+    amountField: 'items.*.amount',
   },
   'GET /api/pay-liabilities/checks': {
     class: 'read',
@@ -265,7 +299,8 @@ export const PAYROLL_CLASSES: ClassificationMap = {
   'POST /api/pay-liabilities/checks/[id]': {
     class: 'change',
     describe: 'Void payroll liability check {id}',
-    why: 'The only action is "void": the check and its ledger entry are voided and the check stays on file marked void.',
+    why: 'The only action is "void": the check and its ledger entry are voided and the check stays on file marked void. The answer is the voided check with its amount as it was.',
+    amountField: 'amount',
   },
   'GET /api/pay-liabilities/sales-tax': {
     class: 'read',

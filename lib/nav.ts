@@ -42,6 +42,7 @@ import { ArchiveRestore } from 'lucide-react'; // team backups
 import { CalendarCheck } from 'lucide-react'; // month-end close
 import { KeyRound } from 'lucide-react'; // gapsb K: Change My Password
 import { FlaskConical } from 'lucide-react'; // sandbox mode: Try it on a copy
+import { Bot } from 'lucide-react'; // agent full access: Agent requests
 
 export interface NavLink {
   icon: ComponentType<{ className?: string }>;
@@ -62,12 +63,20 @@ export interface NavGroup {
 
 export type NavMode = 'simple' | 'advanced';
 
+/**
+ * Agent full access (plan §7.2): "Agent requests", the approval center, sits under Needs attention
+ * in both menu styles. The sidebar hides it while the company has no agent
+ * (components/AppShell.tsx adds it to the hidden paths) and shows the count waiting for this person.
+ */
+const AGENT_REQUESTS_KEYWORDS = 'agents approve approval waiting asked deny';
+
 export const navGroups: NavGroup[] = [
   {
     heading: '',
     links: [
       { icon: PieChart, label: 'Home', path: '/dashboard', qb: 'Home page', keywords: 'dashboard start overview' },
       { icon: Inbox, label: 'Needs attention', path: '/attention', qb: 'Company Snapshot alerts', keywords: 'inbox alerts urgent caught up' },
+      { icon: Bot, label: 'Agent requests', path: '/agent-requests', keywords: AGENT_REQUESTS_KEYWORDS }, // agent full access (shown while the company has an agent)
       { icon: ClipboardCheck, label: 'To Do list', path: '/todos', qb: 'To Do List', keywords: 'task reminder call follow up' },
     ],
   },
@@ -246,6 +255,7 @@ export const simpleNavGroups: NavGroup[] = [
     links: [
       { icon: Home, label: 'Home', path: '/dashboard', qb: 'Home page', keywords: 'dashboard start' },
       { icon: Inbox, label: 'Needs attention', path: '/attention', qb: 'Company Snapshot alerts', keywords: 'inbox alerts urgent caught up' },
+      { icon: Bot, label: 'Agent requests', path: '/agent-requests', keywords: AGENT_REQUESTS_KEYWORDS }, // agent full access (shown while the company has an agent)
       { icon: ScanLine, label: 'Receipts', path: '/receipts', qb: 'Doc Center (receipts)', keywords: 'receipt photo scan snap phone' },
     ],
   },

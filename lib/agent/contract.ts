@@ -617,7 +617,7 @@ export const SHELL_TICKET_SECONDS = 120;
 // ---------------------------------------------------------------------------
 //
 //   GET    /api/agent-requests?status=&agentId=      → { requests: AgentRequestForPerson[] }
-//   GET    /api/agent-requests/count                 → { pending: number }
+//   GET    /api/agent-requests/count                 → AgentRequestCount
 //   GET    /api/agent-requests/[id]                  → { request: AgentRequestForPerson }
 //   POST   /api/agent-requests/[id]/approve          ApproveInput → ApproveResult
 //   POST   /api/agent-requests/[id]/deny             { note?: string } → { request: AgentRequestForPerson }
@@ -661,4 +661,18 @@ export interface AgentActivityRow {
   /** Link target in the audit trail, when there is one. */
   auditId: string | null;
   requestId: string | null;
+}
+
+/** What the title bar polls: the badge, and whether to show Pause all agents. */
+export interface AgentRequestCount {
+  /** Pending requests this person could approve. */
+  pending: number;
+  /** The newest of them, for the desktop notice (summary only, never the agent's own words). */
+  newest: { id: string; agentName: string; summary: string; createdAt: string } | null;
+  /** Agents of this company that are not removed. */
+  agents: number;
+  /** Integrated Applications is switched off: every agent is paused. */
+  allPaused: boolean;
+  /** This person may pause all agents. */
+  canPauseAll: boolean;
 }

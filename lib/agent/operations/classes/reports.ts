@@ -24,9 +24,14 @@
  *  - Report schedules save files to disk unattended and can email them: creating or changing one is
  *    'outside' (the schedule is the standing permission the approver sees), and running the due
  *    ones is 'outside' with effects file and email. Their emails and files are not yet behind the
- *    effects outbox (plan 5.4), so a run has no dry run. A schedule an agent makes records no
- *    person today, so the desktop timer runs it as the company file's owner with nothing masked;
- *    the schedule entries say so to the approver.
+ *    effects outbox (plan 5.4), so a run has no dry run. A schedule records the person of the
+ *    request that made it (createdBy = the context's userId) and later runs with that person's
+ *    current access. An approved request runs as the approver, so the schedule becomes theirs; a
+ *    request that runs with no person (under a standing permission) records none, and the desktop
+ *    timer then runs it as the company file's owner with nothing masked. The schedule entries say
+ *    so to the approver.
+ *  - Where the request switches the answer to a download (format "xlsx", ?format=csv), the output
+ *    is the download's kind ('file'), so a caller never parses a workbook as JSON.
  *  - The one-line report summary can ask the company's AI to phrase it (?ai=1): 'outside'.
  *  - The 1099 e-file needs full tax IDs and is refused without "view sensitive payroll data":
  *    'read_sensitive'. The 1099 account mapping is a company setting: 'settings'.
@@ -199,14 +204,19 @@ export const REPORTS_CLASSES: ClassificationMap = {
   },
   'POST /api/report-schedules': {
     class: 'outside',
-    describe: 'Schedule {name} to run {frequency} with nobody at the keyboard and nothing masked, saving report files and emailing them to {emailTo} when set',
-    why: "A schedule saves report files to disk and, with recipients, emails them, later and with nobody at the keyboard. The approval is the standing permission for every later run, so it is classed by those sends; creating it only writes the schedule row. Who the runs act as: a schedule a person makes runs with that person's current access. A schedule an agent makes records no person (an agent's request carries none today), so the desktop timer runs it as the company file's owner with full access: every report area, nothing masked (full SSNs, tax IDs and account numbers), written into the report-export folder next to the company file and emailed to its recipients. That stays true until agent-made schedules record who they act for and run with the agent's own limits.",
+    // Most important first: the card line is cut at 200 characters (lib/agent/describe.ts), so whose
+    // access the runs use and the recipients come before the ids and the folder. A "(label: )" left
+    // empty is removed. "No approver" is a request run under a standing permission (see the why).
+    describe:
+      'Schedule {name} to run {frequency} as its approver (no approver: as the file owner, unmasked) (email to: {emailTo}) (report: {memorizedReportId}) (group: {groupId}), saving {format} files (folder: {folder})',
+    why: "A schedule saves report files to disk and, with recipients, emails them, later and with nobody at the keyboard. The approval is the standing permission for every later run, so it is classed by those sends; creating it only writes the schedule row. The name is free text: what runs is the memorized report or report group the card names by id, so check that, not the name. Who the runs act as: the schedule records the person of the request that made it (createdBy is the context's userId) and runs with that person's current access. An approved request runs as the approver, so the schedule becomes the approver's. A request that runs with no person, under a standing permission, records none, and the desktop timer then runs it as the company file's owner with full access: every report area, nothing masked (full SSNs, tax IDs and account numbers), written into the report-export folder next to the company file and emailed to its recipients. That stays true until agent-made schedules record who they act for and run with the agent's own limits.",
     effects: ['file', 'email'],
   },
   'PATCH /api/report-schedules/[id]': {
     class: 'outside',
-    describe: 'Change report schedule {id}: name, how often, on or off, file type or email recipients',
-    why: "Can add or change who the scheduled reports are emailed to, or turn a schedule back on: the same standing sends as creating one. A change keeps the schedule's creator: a person's schedule runs with that person's current access, and a schedule an agent made runs as the company file's owner with nothing masked (full SSNs, tax IDs and account numbers).",
+    describe:
+      "Change report schedule {id}, which keeps its creator's access (email to: {emailTo}) (turned on: {isActive}) (how often: {frequency}) (file type: {format}) (name: {name})",
+    why: "Can add or change who the scheduled reports are emailed to (emailTo), or turn a schedule back on (isActive: true): the same standing sends as creating one. A change keeps the schedule's creator: it runs with that person's current access, and a schedule made with no person recorded (under a standing permission) runs as the company file's owner with nothing masked (full SSNs, tax IDs and account numbers).",
     effects: ['file', 'email'],
   },
   'DELETE /api/report-schedules/[id]': { class: 'remove', describe: 'Delete report schedule {id}' },
@@ -224,7 +234,7 @@ export const REPORTS_CLASSES: ClassificationMap = {
   'POST /api/memorized-reports': {
     class: 'outside',
     describe: 'Memorize report {name} ({reportType}) in group {groupId} when set, which a schedule of that group saves and emails',
-    why: "Classed by its worst case, not as 'prepare': a saved report definition never reaches the ledger, but with a groupId it joins that group, and every schedule of the group then saves it into the report-export folder and emails it to the schedule's recipients at the next run, with nobody asked. That run uses the schedule creator's access (full SSNs when that person may see them; the file owner's full access for a schedule an agent made), so memorizing employee-contact-list into such a group would send full SSNs. 'prepare' can be Allow, which would let an agent change what an approved standing send carries. Without a groupId it is harmless, but one route has one class. It can go back to 'prepare' once the bridge escalates only when the group has an active schedule.",
+    why: "Classed by its worst case, not as 'prepare': a saved report definition never reaches the ledger, but with a groupId it joins that group, and every schedule of the group then saves it into the report-export folder and emails it to the schedule's recipients at the next run, with nobody asked. That run uses the schedule creator's access (full SSNs when that person may see them; the file owner's full access for a schedule made with no person recorded), so memorizing employee-contact-list into such a group would send full SSNs. 'prepare' can be Allow, which would let an agent change what an approved standing send carries. Without a groupId it is harmless, but one route has one class. It can go back to 'prepare' once the bridge escalates only when the group has an active schedule.",
     effects: ['file', 'email'],
   },
   'GET /api/memorized-reports/[id]': {
@@ -237,7 +247,7 @@ export const REPORTS_CLASSES: ClassificationMap = {
   'PATCH /api/memorized-reports/[id]': {
     class: 'outside',
     describe: 'Change memorized report {id}: its name, saved settings or group {groupId} when set; a schedule that runs it saves and emails the new version',
-    why: "Classed by its worst case, not as 'prepare': a saved report definition never reaches the ledger, but a schedule that runs this report (or its new group, with a groupId) saves it into the report-export folder and emails it with the new settings at the next run, with nobody asked, under the schedule creator's access (the file owner's full access, nothing masked, for a schedule an agent made). 'prepare' can be Allow, which would let an agent change what an approved standing send carries. A rename alone is harmless, but one route has one class. It can go back to 'prepare' once the bridge escalates only when the report or its new group has an active schedule.",
+    why: "Classed by its worst case, not as 'prepare': a saved report definition never reaches the ledger, but a schedule that runs this report (or its new group, with a groupId) saves it into the report-export folder and emails it with the new settings at the next run, with nobody asked, under the schedule creator's access (the file owner's full access, nothing masked, for a schedule made with no person recorded). 'prepare' can be Allow, which would let an agent change what an approved standing send carries. A rename alone is harmless, but one route has one class. It can go back to 'prepare' once the bridge escalates only when the report or its new group has an active schedule.",
     effects: ['file', 'email'],
   },
   'DELETE /api/memorized-reports/[id]': {
@@ -263,9 +273,10 @@ export const REPORTS_CLASSES: ClassificationMap = {
   'POST /api/memorized-reports/process': {
     class: 'read',
     describe: 'Run several memorized reports at once (Process Multiple Reports)',
-    why: `A POST only because the group or list of reports is a body; it runs them and writes nothing. format "xlsx" answers one workbook file instead of JSON. ${STD_REVEAL_WHY}`,
+    why: `A POST only because the group or list of reports is a body; it runs them and writes nothing. format "xlsx" answers one workbook file (an attachment) instead of JSON, so the output is marked "file": a caller must go by the answer's content type, never parse it as JSON unseen. ${STD_REVEAL_WHY}`,
     reveal: 'ssn',
     sensitiveFields: ['results.*.report.rows.*.cells.ssn', 'results.*.report.rows.*.cells.original'],
+    output: 'file',
   },
 
   // ---- Commented reports (a masked snapshot of a report with notes) ----

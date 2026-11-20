@@ -10,8 +10,9 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import type { AddressInfo } from 'node:net';
-import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import {
+  AWAY_MESSAGE,
   BAD_TOKEN_MESSAGE,
   HOST,
   IronbooksClient,
@@ -431,6 +432,218 @@ describe('starting Ironbooks when it is closed', () => {
     } finally {
       dropper.closeAllConnections();
       await new Promise<void>((resolve) => dropper.close(() => resolve()));
+    }
+  });
+});
+
+describe('when Ironbooks restarts (a company file switched or restored, an update installed)', () => {
+  const endpointFile = () => path.join(DIR, `${TAG}.json`);
+  const quick = { reconnectFirstPauseMs: 20, reconnectMaxPauseMs: 80 };
+
+  it('a connector Ironbooks answered looks for it again with growing pauses, and sends only after the new one proves itself', async () => {
+    const before = await stub();
+    let started = 0;
+    try {
+      writeEndpoint(before.port);
+      const c = client({ startApp: () => void started++, startPollMs: 10, startWaitMs: 100, reconnectWaitMs: 5000, ...quick });
+      expect(await c.get('/api/accounts')).toEqual({ ok: true });
+      // It goes away: the port closes and its endpoint file goes. It comes back a moment later on another port.
+      await before.close();
+      fs.rmSync(endpointFile(), { force: true });
+      setTimeout(() => writeEndpoint(app.port), 200);
+      app.reply = { status: 200, body: JSON.stringify({ back: true }) };
+      expect(await c.get('/api/accounts')).toEqual({ back: true });
+      // The new one proved itself before the token went out, on that same connection.
+      expect(app.seen.map((r) => [r.url.split('?')[0], r.auth ? 'token' : 'none'])).toEqual([
+        ['/api/agent/hello', 'none'],
+        ['/api/accounts', 'token'],
+      ]);
+      expect(app.seen[1].socket).toBe(app.seen[0].socket);
+      // A restart is waited out: no second Ironbooks is started meanwhile.
+      expect(started).toBe(0);
+    } finally {
+      await before.close();
+    }
+  });
+
+  it('when it does not come back in time, the agent is told plainly; later asks look once, until it is back', async () => {
+    const before = await stub();
+    try {
+      writeEndpoint(before.port);
+      const c = client({ startApp: null, reconnectWaitMs: 250, ...quick });
+      await c.get('/api/accounts');
+      await before.close();
+      fs.rmSync(endpointFile(), { force: true });
+      let t = Date.now();
+      expect((await failure(c.get('/api/accounts'))).message).toBe(AWAY_MESSAGE);
+      expect(Date.now() - t).toBeGreaterThanOrEqual(150);
+      t = Date.now();
+      const again = await failure(c.act({ action: 'enter_journal_entry', input: {}, requestId: 'r-away' }));
+      expect(again.message).toBe(AWAY_MESSAGE);
+      expect(again.notConnected).toBe(true);
+      expect(Date.now() - t).toBeLessThan(150);
+      // Back: the next ask goes through, and a later loss is waited out again.
+      writeEndpoint(app.port);
+      expect(await c.get('/api/accounts')).toEqual({ ok: true });
+      expect(AWAY_MESSAGE).toMatch(/restarting/);
+      expect(AWAY_MESSAGE).toMatch(/Nothing was sent/);
+      expect(AWAY_MESSAGE).not.toContain(TOKEN);
+    } finally {
+      await before.close();
+    }
+  });
+
+  it('the pauses between looks grow, twice as long each time, up to the longest pause', async () => {
+    writeEndpoint(app.port);
+    const c = client({ startApp: null, reconnectWaitMs: 1500, reconnectFirstPauseMs: 40, reconnectMaxPauseMs: 320 });
+    await c.get('/api/accounts');
+    // From here every look finds nothing, and says when it looked.
+    const looks: number[] = [];
+    (c as unknown as { _send: () => Promise<never> })._send = async () => {
+      looks.push(Date.now());
+      throw new IronbooksError('gone', { notConnected: true });
+    };
+    // The pauses asked for, exactly (the clock itself is too rough on a busy machine to compare them).
+    const timer = vi.spyOn(globalThis, 'setTimeout');
+    let pauses: unknown[] = [];
+    try {
+      expect((await failure(c.get('/api/accounts'))).message).toBe(AWAY_MESSAGE);
+      pauses = timer.mock.calls.map((args) => args[1]);
+    } finally {
+      timer.mockRestore();
+    }
+    // 40, 80, 160, 320, then 320 until the 1.5 seconds run out (how many depends on the clock).
+    expect(pauses.slice(0, 5)).toEqual([40, 80, 160, 320, 320]);
+    expect(pauses.slice(5).every((p) => p === 320)).toBe(true);
+    expect(pauses.reduce((a, b) => (a as number) + (b as number), 0)).toBeLessThanOrEqual(1500);
+    // One look before the first pause and one after each, never sooner than the pause.
+    expect(looks).toHaveLength(pauses.length + 1);
+    looks.slice(1).forEach((t, i) => expect(t - looks[i], `look ${i + 1}`).toBeGreaterThanOrEqual((pauses[i] as number) - 2));
+  });
+
+  it('while Ironbooks answered only a short while ago, it is not started (an update may still be installing); after that it is', async () => {
+    const before = await stub();
+    let started = 0;
+    try {
+      writeEndpoint(before.port);
+      const c = client({ startApp: () => void started++, startPollMs: 10, startWaitMs: 60, reconnectWaitMs: 100, restartGraceMs: 600, ...quick });
+      await c.get('/api/accounts');
+      await before.close();
+      fs.rmSync(endpointFile(), { force: true });
+      // Gone just after it answered: looked for, not started, and the agent is told to wait.
+      expect((await failure(c.get('/api/accounts'))).message).toBe(AWAY_MESSAGE);
+      expect((await failure(c.get('/api/accounts'))).message).toBe(AWAY_MESSAGE);
+      expect(started).toBe(0);
+      // Silent for longer than that: started (it does not come up here, so the agent is told why).
+      await new Promise((r) => setTimeout(r, 650));
+      expect((await failure(c.get('/api/accounts'))).message).toBe(NOT_STARTED_MESSAGE);
+      expect(started).toBe(1);
+    } finally {
+      await before.close();
+    }
+  });
+
+  it('a connector that answered long ago starts Ironbooks at once, without first looking for it (the hidden copy closes itself when idle)', async () => {
+    const before = await stub();
+    let started = 0;
+    try {
+      writeEndpoint(before.port);
+      const c = client({ startApp: () => void started++, startPollMs: 10, startWaitMs: 60, reconnectWaitMs: 5000, restartGraceMs: 100, ...quick });
+      await c.get('/api/accounts');
+      await before.close();
+      fs.rmSync(endpointFile(), { force: true });
+      await new Promise((r) => setTimeout(r, 150));
+      const t = Date.now();
+      expect((await failure(c.get('/api/accounts'))).message).toBe(NOT_STARTED_MESSAGE);
+      expect(started).toBe(1);
+      // No 5-second search first.
+      expect(Date.now() - t).toBeLessThan(2000);
+    } finally {
+      await before.close();
+    }
+  });
+
+  it('a connector Ironbooks never answered does not wait: it says at once that Ironbooks is not ready', async () => {
+    const c = client({ startApp: null, reconnectWaitMs: 5000, ...quick });
+    const t = Date.now();
+    expect((await failure(c.get('/api/accounts'))).message).toBe(NOT_CONNECTED_MESSAGE);
+    expect(Date.now() - t).toBeLessThan(1000);
+  });
+
+  it('a change whose answer was lost is never sent again by looking for Ironbooks', async () => {
+    let posts = 0;
+    const dropper = http.createServer((req, res) => {
+      const url = new URL(req.url ?? '/', 'http://x');
+      const port = (dropper.address() as AddressInfo).port;
+      if (url.pathname === '/api/agent/hello') {
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ proof: expectedProof(CHECK, url.searchParams.get('nonce'), port, url.searchParams.get('tag')) }));
+        return;
+      }
+      if (req.method === 'POST') {
+        posts++;
+        req.socket.destroy();
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ ok: true }));
+    });
+    await new Promise<void>((resolve) => dropper.listen(0, HOST, resolve));
+    try {
+      writeEndpoint((dropper.address() as AddressInfo).port);
+      const c = client({ startApp: null, reconnectWaitMs: 2000, ...quick });
+      await c.get('/api/accounts');
+      expect((await failure(c.act({ action: 'enter_journal_entry', input: {}, requestId: 'r-lost' }))).message).toBe(LOST_ANSWER_MESSAGE);
+      expect(posts).toBe(1);
+    } finally {
+      dropper.closeAllConnections();
+      await new Promise<void>((resolve) => dropper.close(() => resolve()));
+    }
+  });
+});
+
+describe('a long wait for a person', () => {
+  it('goes out on its own connection, proved the same way, and does not hold up the other requests', async () => {
+    const seen: Array<{ path: string; auth?: string; socket: object }> = [];
+    let release: () => void = () => undefined;
+    const waiting = new Promise<void>((r) => (release = r));
+    const server = http.createServer((req, res) => {
+      const url = new URL(req.url ?? '/', 'http://x');
+      seen.push({ path: url.pathname, auth: req.headers.authorization, socket: req.socket });
+      const port = (server.address() as AddressInfo).port;
+      if (url.pathname === '/api/agent/hello') {
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ proof: expectedProof(CHECK, url.searchParams.get('nonce'), port, url.searchParams.get('tag')) }));
+        return;
+      }
+      if (url.pathname.startsWith('/api/agent/requests/')) {
+        expect(url.searchParams.get('wait')).toBe('50');
+        void waiting.then(() => res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ request: { id: 'r', status: 'approved' } })));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ accounts: [] }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, HOST, resolve));
+    try {
+      writeEndpoint((server.address() as AddressInfo).port);
+      const c = client({ startApp: null });
+      const decision = c.get('/api/agent/requests/r-1', { wait: 50 }, { wait: true });
+      // While the wait is open, other requests still go through.
+      expect(await c.get('/api/accounts')).toEqual({ accounts: [] });
+      expect(await c.act({ action: 'list_my_proposals', input: {} })).toEqual({ accounts: [] });
+      release();
+      expect(await decision).toEqual({ request: { id: 'r', status: 'approved' } });
+      // Two connections, each proved before it carried the token.
+      const hellos = seen.filter((s) => s.path === '/api/agent/hello');
+      const asks = seen.filter((s) => s.path !== '/api/agent/hello');
+      expect(hellos).toHaveLength(2);
+      expect(hellos.every((h) => h.auth === undefined)).toBe(true);
+      expect(new Set(hellos.map((h) => h.socket)).size).toBe(2);
+      for (const a of asks) {
+        expect(a.auth).toBe(`Bearer ${TOKEN}`);
+        expect(hellos.some((h) => h.socket === a.socket), a.path).toBe(true);
+      }
+    } finally {
+      release();
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });
 });

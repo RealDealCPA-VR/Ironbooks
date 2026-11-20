@@ -7,8 +7,11 @@
  *  - Page paths: PAGE_AREAS prefix → needs 'view' of that area; unlisted pages are open.
  *  - No request scope (vitest, scripts, background jobs) → nothing to enforce.
  *  - Request scope but no stamp (middleware didn't run) → only an Admin passes.
+ *  - An agent's request the bridge runs in-process (lib/serviceScope.ts): the stamps are the
+ *    scope's own path and method, read through requestHeaders(), never those of the request the
+ *    bridge happens to run in.
  */
-import { headers } from 'next/headers';
+import { requestHeaders } from '@/lib/serviceScope';
 import { ServiceError } from '@/lib/services/_base';
 import { permissionDenied } from '@/lib/services/access';
 import { canActivity, canSomeActivity, canWholeArea, type EffectiveAccess } from './model';
@@ -27,11 +30,14 @@ export interface RequestInfo {
   method: string;
 }
 
-/** Path/method of the current request, or null outside a request scope. */
+/**
+ * Path/method of the current request (inside an agent's service scope, the scope's own), or null
+ * outside a request scope.
+ */
 export async function currentRequestInfo(): Promise<RequestInfo | null> {
-  let h: Headers;
+  let h: { get(name: string): string | null };
   try {
-    h = (await headers()) as unknown as Headers;
+    h = await requestHeaders();
   } catch {
     return null; // not inside a request (tests, scripts)
   }

@@ -19,6 +19,25 @@
  * runs. The policy already asks for a bulk request with no count (lib/agent/policy.ts, decide), and
  * a capped grant never covers one; these entries also set alwaysAsk so the card does not offer a
  * standing grant that could never apply.
+ *
+ * Amounts (two-person approval, D8, and a grant's maxAmount), the same rule in every bucket:
+ * amountField names the money the route's ANSWER carries (lib/agent/facts.ts takes the larger of
+ * the body's and the answer's figure), and a '*' path adds up one figure per row. Entering, changing
+ * and voiding a check, deposit or transfer names the amount its answer carries (expense.total, a
+ * deposit's total, a transfer's amount); a void answers with the record, whose amount stays as it
+ * was. A request with no amount counts as over every amount limit (policy.ts needsTwoPerson,
+ * grantCovers) until its dry run. After it the bridge (lib/agent/bridge.ts factsFor) takes the
+ * larger of that figure and the largest SINGLE ledger entry the run posted (with no amountField,
+ * the entry alone). A journal entry's answer has its
+ * debit and credit lines but no total, so the journal entry routes set no amountField: each posts
+ * one entry, and that entry is its true size. The bulk bank feed routes (bulk, bulk-accept,
+ * bank-rules/run) and recurring/run post one entry per line but answer no amounts, so after the dry
+ * run they are judged by their largest single line; they always ask, and the card's ledger preview
+ * lists every entry.
+ *
+ * `id` names an operation where the id rule (registry.ts operationIdFor) would give the neutral
+ * ".post", with a short verb; the real lists whose records live at another address also get
+ * ".list" and ".create" (bank-accounts.list, bank-accounts.create).
  */
 import type { ClassificationMap } from '../types';
 
@@ -26,12 +45,14 @@ export const BANKING_CLASSES: ClassificationMap = {
   // Bank accounts: the link between a real bank or card account and its GL account.
   'GET /api/bank-accounts': {
     class: 'read',
+    id: 'bank-accounts.list',
     describe: 'List bank and credit card accounts',
     reveal: 'account_numbers',
     sensitiveFields: ['*.accountNumber'],
   },
   'POST /api/bank-accounts': {
     class: 'enter',
+    id: 'bank-accounts.create',
     describe: 'Link bank account {bankName} to GL account {accountId}',
     // The body carries the full account number the agent typed; the answer is masked.
     sensitiveFields: ['accountNumber'],
@@ -141,6 +162,7 @@ export const BANKING_CLASSES: ClassificationMap = {
   },
   'POST /api/bank-rules/offers': {
     class: 'enter',
+    id: 'bank-rules.offers.answer',
     describe: 'Answer the suggested bank rule for {pattern} ({action})',
     why: 'accept saves a learned rule, and mode auto makes it post bank lines later without review, so it always asks like making a rule. dismiss saves a "never ask again" note.',
     alwaysAsk: true,
@@ -153,10 +175,12 @@ export const BANKING_CLASSES: ClassificationMap = {
   },
   'GET /api/rules': {
     class: 'read',
+    id: 'rules.list',
     describe: 'List categorization rules',
   },
   'POST /api/rules': {
     class: 'enter',
+    id: 'rules.create',
     describe: 'Add categorization rule {name}',
   },
 
@@ -198,6 +222,7 @@ export const BANKING_CLASSES: ClassificationMap = {
     class: 'enter',
     describe: 'Write a {method} expense dated {date} from account {paymentAccountId}',
     confirmFlags: ['allowDuplicateNumber'],
+    amountField: 'expense.total',
   },
   'GET /api/expenses/[id]': {
     class: 'read',
@@ -207,11 +232,13 @@ export const BANKING_CLASSES: ClassificationMap = {
     class: 'change',
     describe: 'Change check or expense {id}',
     confirmFlags: ['allowDuplicateNumber', 'allowReconciledEdit'],
+    amountField: 'expense.total',
   },
   'DELETE /api/expenses/[id]': {
     class: 'change',
     describe: 'Void check or expense {id}',
-    why: 'Voids, does not delete: the check stays in the books with its entry reversed.',
+    why: 'Voids, does not delete: the check stays in the books with its entry reversed. The answer is the voided check with its total as it was.',
+    amountField: 'expense.total',
   },
   'POST /api/expenses/[id]/print': {
     class: 'print',
@@ -246,10 +273,12 @@ export const BANKING_CLASSES: ClassificationMap = {
   // Print Checks queue: checks to print, a print run, and "Did the checks print OK?".
   'GET /api/print-queue': {
     class: 'read',
+    id: 'print-queue.list',
     describe: 'List checks waiting to print',
   },
   'POST /api/print-queue': {
     class: 'print',
+    id: 'print-queue.mark-printed',
     describe: 'Record {source} {id} as printed with check number {checkNumber}',
     why: 'Marks one queued check printed and stamps its number on the check and its entry.',
     confirmFlags: ['allowDuplicateNumber'],
@@ -260,6 +289,7 @@ export const BANKING_CLASSES: ClassificationMap = {
   },
   'POST /api/print-queue/paychecks': {
     class: 'bulk',
+    id: 'print-queue.paychecks.add',
     describe: 'Put paychecks in the check print queue',
     why: 'Sets the "to print" flag on every listed paycheck in one request (a change to each paycheck; closed periods are checked). Nothing prints.',
     countField: 'paycheckIds',
@@ -270,6 +300,7 @@ export const BANKING_CLASSES: ClassificationMap = {
   },
   'POST /api/print-queue/refunds': {
     class: 'enter',
+    id: 'print-queue.refunds.add',
     describe: 'Put customer refund {entryId} in the check print queue',
     why: 'Adds a check document for a refund that is already posted. No new ledger entry.',
   },
@@ -300,6 +331,7 @@ export const BANKING_CLASSES: ClassificationMap = {
   'POST /api/deposits': {
     class: 'enter',
     describe: 'Make a deposit to account {depositAccountId} dated {date}',
+    amountField: 'total',
   },
   'GET /api/deposits/[id]': {
     class: 'read',
@@ -309,11 +341,13 @@ export const BANKING_CLASSES: ClassificationMap = {
     class: 'change',
     describe: 'Change deposit {id}',
     confirmFlags: ['allowReconciledEdit'],
+    amountField: 'total',
   },
   'DELETE /api/deposits/[id]': {
     class: 'change',
     describe: 'Void deposit {id}',
-    why: 'Voids, does not delete: the deposit stays with its entry reversed, and its payments go back to Undeposited Funds.',
+    why: 'Voids, does not delete: the deposit stays with its entry reversed, and its payments go back to Undeposited Funds. The answer is the voided deposit with its total as it was.',
+    amountField: 'total',
   },
   'GET /api/deposits/undeposited': {
     class: 'read',
@@ -343,7 +377,8 @@ export const BANKING_CLASSES: ClassificationMap = {
   'DELETE /api/transfers/[id]': {
     class: 'change',
     describe: 'Void transfer {id}',
-    why: 'Voids, does not delete: the transfer stays with its entry reversed.',
+    why: 'Voids, does not delete: the transfer stays with its entry reversed. The answer is the voided transfer with its amount as it was.',
+    amountField: 'amount',
   },
 
   // General journal entries.
@@ -367,7 +402,7 @@ export const BANKING_CLASSES: ClassificationMap = {
   'DELETE /api/journal-entries/[id]': {
     class: 'change',
     describe: 'Void journal entry {id}',
-    why: 'Voids, does not delete: the entry stays with its amounts reversed. Voiding a depreciation entry also takes that period off the fixed asset (its schedule row is removed and its accumulated depreciation lowered); the period can be posted again.',
+    why: 'Voids, does not delete: the entry stays with its amounts reversed. Voiding a depreciation entry also takes that period off the fixed asset (its schedule row is removed and its accumulated depreciation lowered); the period can be posted again. No amountField: the answer is the entry row with no total, so the amount is unknown until the ledger preview shows it and counts as over every amount limit.',
   },
   'GET /api/journal-entries/[id]/history': {
     class: 'read',

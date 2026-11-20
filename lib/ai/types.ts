@@ -27,6 +27,12 @@ export interface ChatOptions {
   maxTokens?: number;
   /** Abort signal (the router wires per-attempt timeouts through this). */
   signal?: AbortSignal;
+  /**
+   * What this call sends, in plain words that read after "for": "sending the bank statement to an
+   * AI model to read it". An agent's preview and audit trail show it (lib/ai/outbound.ts). The
+   * router fills in its task's purpose when the caller gives none.
+   */
+  purpose?: string;
 }
 
 export interface ChatResult {
@@ -53,6 +59,11 @@ export interface AiProvider {
   readonly kind: ProviderKind;
   /** 'local' providers may receive unredacted data; 'cloud' ones never do. */
   readonly locality: Locality;
+  /**
+   * The computer its calls reach ("api.openai.com", "127.0.0.1:11434"). Set by the provider
+   * factories, which send every call through the effects outbox (lib/ai/outbound.ts).
+   */
+  readonly host?: string;
   chat(messages: ChatMessage[], opts?: ChatOptions): Promise<ChatResult>;
   listModels(opts?: { signal?: AbortSignal }): Promise<ModelInfo[]>;
   health(opts?: { signal?: AbortSignal }): Promise<HealthResult>;

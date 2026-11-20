@@ -10,9 +10,20 @@
  *
  * Redaction invariant: a 'cloud' provider never sees a message that has not passed through a
  * Redactor. If the caller supplies no company-aware redactor, a pattern-only one is used.
+ *
+ * Effects outbox (lib/ai/outbound.ts): every call names its purpose, the caller's own
+ * (ChatOptions.purpose) or its task's, which the providers hand to the outbox. In an agent's
+ * preview the first provider's call is not made and the outbox stops the work there
+ * (EffectNotRunInPreview): it is thrown on at once, with no retry, since the real run would contact
+ * that one first. The providers the real run would fall back to when that one does not answer are
+ * recorded too (previewFallbacks), so the approval card names every computer the run could contact.
+ * The daily cloud-call limit is checked in a preview as in the real run (beforeCloudCall), so a
+ * preview does not show a cloud call the real run would refuse.
  */
 import type { ZodType, ZodTypeDef } from 'zod';
+import { currentEffectsMode } from '@/lib/effects';
 import { extractJson } from './json';
+import { AI_CALL_PURPOSES, AI_TASK_PURPOSES, isNotRunInPreview, outboundCall, purposeOf } from './outbound';
 import { Redactor } from './redact';
 import {
   AiError,
@@ -45,7 +56,9 @@ export interface RouterConfig {
   sleep?: (ms: number) => Promise<void>;
   /**
    * Runs before every cloud call (the company's daily cloud-call limit, lib/services/aiSettings.ts
-   * noteCloudCall). Throwing an AiError skips that provider like any other failure.
+   * noteCloudCall). Throwing an AiError skips that provider like any other failure. Also run in an
+   * agent's preview, so the preview stops where the real run would: the bridge previews inside a
+   * transaction it rolls back, so the call it counts there is not kept.
    */
   beforeCloudCall?: (p: AiProvider) => Promise<void>;
 }
@@ -123,7 +136,7 @@ export class AiRouter {
   ): Promise<{ content: string; model: string }> {
     const retries = this.cfg.retries ?? 1;
     const sleep = this.cfg.sleep ?? defaultSleep;
-    if (p.locality === 'cloud' && this.cfg.beforeCloudCall) await this.cfg.beforeCloudCall(p);
+    if (p.locality === 'cloud' && this.cfg.beforeCloudCall) await this.beforeCloudCall(p, this.cfg.beforeCloudCall);
     let lastErr: unknown;
     for (let attempt = 0; attempt <= retries; attempt++) {
       const ac = new AbortController();
@@ -141,6 +154,8 @@ export class AiRouter {
         const res = await Promise.race([p.chat(messages, { ...opts, signal: ac.signal }), timedOut]);
         return { content: res.content, model: res.model };
       } catch (err) {
+        // An agent's preview: nothing was sent, and trying again would not send it either.
+        if (isNotRunInPreview(err)) throw err;
         lastErr =
           ac.signal.aborted && !opts.signal?.aborted
             ? new AiError('TIMEOUT', `${p.id} timed out after ${this.timeoutFor(p)}ms.`)
@@ -156,6 +171,47 @@ export class AiRouter {
     throw lastErr;
   }
 
+  /**
+   * The daily cloud-call limit, before a cloud call. In an agent's preview it is checked too, so a
+   * preview refuses (or moves on to the next provider) exactly where the real run would. Counting
+   * the call is harmless there: the bridge previews inside a transaction it rolls back. A preview
+   * on a read-only handle cannot count it at all; only the limit's own refusal (an AiError) counts
+   * then, and the outbox still stops the call itself.
+   */
+  private async beforeCloudCall(p: AiProvider, hook: (p: AiProvider) => Promise<void>): Promise<void> {
+    try {
+      await hook(p);
+    } catch (err) {
+      if (currentEffectsMode() !== 'capture' || err instanceof AiError) throw err;
+    }
+  }
+
+  /**
+   * In an agent's preview, after the first provider's call was stopped: record a call to each
+   * provider the real run would try next if that one did not answer (a local server, then perhaps
+   * a cloud one), so the approval card names every computer the run could contact. None is called:
+   * the outbox only records in a preview. A computer already named is not named twice.
+   */
+  private async previewFallbacks(tried: AiProvider, rest: AiProvider[], opts: ChatOptions): Promise<void> {
+    if (currentEffectsMode() !== 'capture') return;
+    const purpose = purposeOf(opts, AI_CALL_PURPOSES.chat);
+    const named = new Set([hostName(tried)]);
+    let before = hostName(tried);
+    for (const p of rest) {
+      const host = hostName(p);
+      if (named.has(host)) continue;
+      named.add(host);
+      try {
+        await outboundCall(`${purpose}, if ${before} does not answer`, host, () =>
+          Promise.reject(new Error('A preview does not contact other computers.')),
+        );
+      } catch (err) {
+        if (!isNotRunInPreview(err)) throw err;
+      }
+      before = host;
+    }
+  }
+
   private async redactorFor(p: AiProvider): Promise<Redactor | null> {
     if (p.locality !== 'cloud') return null;
     // Cloud calls are ALWAYS redacted — fall back to pattern-only redaction.
@@ -163,11 +219,12 @@ export class AiRouter {
   }
 
   /** Plain chat: returns the first successful provider's text (restored if redacted). */
-  async chat(task: AiTask, messages: ChatMessage[], opts: ChatOptions = {}): Promise<RoutedChatResult> {
+  async chat(task: AiTask, messages: ChatMessage[], options: ChatOptions = {}): Promise<RoutedChatResult> {
     const providers = this.candidates(task);
     if (providers.length === 0) throw new AiError('UNAVAILABLE', this.unavailableReason(task)!);
+    const opts = withPurpose(task, options);
     const attempts: Attempt[] = [];
-    for (const p of providers) {
+    for (const [i, p] of providers.entries()) {
       try {
         const redactor = await this.redactorFor(p);
         const wire = redactor ? messages.map((m) => ({ ...m, content: redactor.redact(m.content) })) : messages;
@@ -182,6 +239,11 @@ export class AiRouter {
           attempts,
         };
       } catch (err) {
+        // An agent's preview stops at the first call it would make; the ones after it are only named.
+        if (isNotRunInPreview(err)) {
+          await this.previewFallbacks(p, providers.slice(i + 1), opts);
+          throw err;
+        }
         attempts.push({ providerId: p.id, locality: p.locality, ok: false, error: errMsg(err) });
         if (opts.signal?.aborted) break;
       }
@@ -198,13 +260,14 @@ export class AiRouter {
     task: AiTask,
     messages: ChatMessage[],
     schema: ZodType<T, ZodTypeDef, unknown>,
-    opts: ChatOptions = {},
+    options: ChatOptions = {},
   ): Promise<RoutedJsonResult<T>> {
     const providers = this.candidates(task);
     if (providers.length === 0) throw new AiError('UNAVAILABLE', this.unavailableReason(task)!);
+    const opts = withPurpose(task, options);
     const attempts: Attempt[] = [];
 
-    for (const p of providers) {
+    for (const [i, p] of providers.entries()) {
       try {
         const redactor = await this.redactorFor(p);
         const wire = redactor ? messages.map((m) => ({ ...m, content: redactor.redact(m.content) })) : messages;
@@ -232,6 +295,11 @@ export class AiRouter {
         }
         throw new AiError('BAD_OUTPUT', `Invalid structured output after repair: ${parsed2.error}`);
       } catch (err) {
+        // An agent's preview stops at the first call it would make; the ones after it are only named.
+        if (isNotRunInPreview(err)) {
+          await this.previewFallbacks(p, providers.slice(i + 1), opts);
+          throw err;
+        }
         attempts.push({ providerId: p.id, locality: p.locality, ok: false, error: errMsg(err) });
         if (opts.signal?.aborted) break;
       }
@@ -242,6 +310,16 @@ export class AiRouter {
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** The computer a provider's calls reach, for a preview; its name when it does not say. */
+function hostName(p: AiProvider): string {
+  return p.host?.trim() || `the AI provider "${p.id}"`;
+}
+
+/** The options with a purpose for the effects outbox: the caller's own, else the task's. */
+function withPurpose(task: AiTask, opts: ChatOptions): ChatOptions {
+  return { ...opts, purpose: purposeOf(opts, AI_TASK_PURPOSES[task]) };
 }
 
 function parseAndValidate<T>(

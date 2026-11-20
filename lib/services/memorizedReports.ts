@@ -5,14 +5,19 @@
  * a local folder; the desktop shell's timer calls runDueSchedules), optionally emailed to the
  * schedule's recipients (QB "Send report as e-mail") through lib/services/email.ts.
  *
+ * A scheduled run's files and emails go through the effects outbox (lib/effects.ts): saved and
+ * sent at once for the timer and for a person, only recorded in an agent's preview, and done once
+ * the work is saved in an agent's real run. A schedule an agent set up or changed (or whose report
+ * an agent changed) does not run until a person has saved its recipients again (runDueSchedules).
+ *
  * Config shape for standard reports: { params: { from, to, accountId, … }, display: { … } }.
  * Report builder ("custom") reports keep their own config shape.
  */
-import fs from 'node:fs';
 import path from 'node:path';
-import { and, asc, eq, inArray, lte } from 'drizzle-orm';
-import { memorizedReportGroups, memorizedReports, reportSchedules } from '@/lib/db/schema';
+import { and, asc, eq, inArray, isNotNull, isNull, lte, or, sql } from 'drizzle-orm';
+import { auditLogs, memorizedReportGroups, memorizedReports, reportSchedules } from '@/lib/db/schema';
 import { resolveDataDir } from '@/lib/db';
+import { effects, type EffectStatus } from '@/lib/effects';
 import { buildXlsx, buildXlsxWorkbook } from '@/lib/export/xlsx';
 import { localDateISO } from '@/lib/dates';
 import { reportToCsv, reportToTable, type StdReport } from '@/lib/reports/types';
@@ -454,8 +459,18 @@ function localMidnight(day: string): Date {
   return d.getDate() === Number(m[3]) && d.getMonth() === Number(m[2]) - 1 ? d : new Date(NaN);
 }
 
+/**
+ * A name made safe for a file or folder. Invisible formatting characters (a right-to-left mark, a
+ * zero-width space) are left out and control characters replaced: the effects outbox refuses a
+ * file name holding them, because the name saved would not read as the name shown.
+ */
 function safeSegment(s: string, fallback: string): string {
-  const out = s.replace(/[\\/:*?"<>|\u0000-\u001f]/g, '-').replace(/\.{2,}/g, '.').trim().slice(0, 80);
+  const out = s
+    .replace(/\p{Cf}/gu, '')
+    .replace(/[\\/:*?"<>|\u0000-\u001f\u007f-\u009f]/g, '-')
+    .replace(/\.{2,}/g, '.')
+    .trim()
+    .slice(0, 80);
   return out && out !== '.' ? out : fallback;
 }
 
@@ -487,24 +502,130 @@ export function normalizeRecipients(input: string | null | undefined): string | 
 }
 
 /**
- * Write a file so a reader never sees half of it: into a temporary file next to it, then renamed
- * over the old one. A write that fails (disk full, the folder went away) leaves the previous
- * export as it was and no temporary file behind.
+ * Save one export file through the effects outbox (lib/effects.ts effects.writeFile), which creates
+ * the folder and writes so a reader never sees half a file: a temporary file next to it, renamed
+ * over the old one, and a failed write leaves the previous export as it was. Saved at once outside
+ * an agent's work ('done'); only recorded in an agent's preview ('previewed'); saved after the work
+ * is saved in an agent's real run ('queued').
  */
-function writeFileAtomic(file: string, data: string | Buffer): void {
-  const tmp = `${file}.${process.pid}.${Date.now().toString(36)}.tmp`;
-  try {
-    if (typeof data === 'string') fs.writeFileSync(tmp, data, 'utf8');
-    else fs.writeFileSync(tmp, data);
-    fs.renameSync(tmp, file);
-  } catch (err) {
-    try {
-      fs.rmSync(tmp, { force: true });
-    } catch {
-      /* the temporary file could not be removed either: nothing more to do */
-    }
-    throw err;
+async function saveExport(dir: string, name: string, bytes: string | Uint8Array): Promise<{ file: string; status: EffectStatus }> {
+  const out = await effects.writeFile({ dir, name, bytes });
+  return { file: out.path, status: out.status };
+}
+
+/**
+ * Why a schedule an agent set up or changed does not run yet. A schedule runs unattended, unmasked,
+ * and emails whoever is on it, with the full access of the person recorded as its creator, not the
+ * agent's limits. So what it runs and who it emails must have been looked at by a person since the
+ * agent last touched it. The Scheduled Reports page shows both; saving the recipients is the
+ * deliberate step that counts (pausing and resuming do not).
+ */
+export const AGENT_SCHEDULE_HELD_MESSAGE =
+  'Waiting for a person: an agent set up or changed this schedule or a report it runs. Under Scheduled Reports, check the report and who it emails, then open its email recipients (the envelope button) and choose Save to let it run. It stays due until then.';
+
+/** The latest time per entity id, from rows of (id, createdAt). */
+function latestById(rows: Array<{ id: string; at: Date }>): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const r of rows) {
+    const t = new Date(r.at).getTime();
+    if (!Number.isNaN(t) && t > (out.get(r.id) ?? -Infinity)) out.set(r.id, t);
   }
+  return out;
+}
+
+/**
+ * The schedules among `schedules` that wait for a person: an agent changed them, or what they run,
+ * after the last time a person confirmed them. The schedule table records no agent, so the audit
+ * trail decides, by time:
+ *  - an agent's change: the schedule's 'create' row or one of its edits (updateReportSchedule: rows
+ *    carrying `frequency`; the rows a run writes, ran / held, do not), or a 'create' / 'update' row
+ *    of its memorized report, its group or any report now in its group, naming an agent. Approved
+ *    or not: an approval let the agent make the change, not the schedule run on its own later.
+ *  - a person's confirmation: a person (no agent on the row) creating the schedule, or saving its
+ *    recipients (updateReportSchedule marks that row `recipientsConfirmed`). Pausing, resuming or
+ *    renaming it is not one.
+ * A schedule waits when its latest agent change is not older than its latest confirmation. Two at
+ * the same moment count as waiting: when unsure, it waits.
+ */
+async function schedulesWaitingForAPerson(
+  ctx: ServiceContext,
+  schedules: Array<{ id: string; memorizedReportId: string | null; groupId: string | null }>,
+): Promise<Set<string>> {
+  const waiting = new Set<string>();
+  if (!schedules.length) return waiting;
+  const ids = schedules.map((s) => s.id);
+  const groupIds = [...new Set(schedules.map((s) => s.groupId).filter((g): g is string => !!g))];
+  const grouped = groupIds.length
+    ? await ctx.db
+        .select({ id: memorizedReports.id, groupId: memorizedReports.groupId })
+        .from(memorizedReports)
+        .where(and(eq(memorizedReports.companyId, ctx.companyId), inArray(memorizedReports.groupId, groupIds)))
+    : [];
+  const runs = new Map<string, string[]>();
+  for (const s of schedules) {
+    const parts: string[] = [];
+    if (s.memorizedReportId) parts.push(s.memorizedReportId);
+    if (s.groupId) {
+      parts.push(s.groupId);
+      for (const r of grouped) if (r.groupId === s.groupId) parts.push(r.id);
+    }
+    runs.set(s.id, parts);
+  }
+  const contentIds = [...new Set([...runs.values()].flat())];
+
+  // One query after another: this also runs inside a transaction (updateReportSchedule).
+  const agentEdits = await ctx.db
+    .select({ id: auditLogs.entityId, at: auditLogs.createdAt })
+    .from(auditLogs)
+    .where(
+      and(
+        eq(auditLogs.companyId, ctx.companyId),
+        eq(auditLogs.entityType, 'report_schedule'),
+        inArray(auditLogs.entityId, ids),
+        isNotNull(auditLogs.agentId),
+        or(eq(auditLogs.action, 'create'), and(eq(auditLogs.action, 'update'), sql`${auditLogs.newValues} ->> 'frequency' is not null`)),
+      ),
+    );
+  const contentEdits = contentIds.length
+    ? await ctx.db
+        .select({ id: auditLogs.entityId, at: auditLogs.createdAt })
+        .from(auditLogs)
+        .where(
+          and(
+            eq(auditLogs.companyId, ctx.companyId),
+            inArray(auditLogs.entityType, ['memorized_report', 'memorized_report_group']),
+            inArray(auditLogs.action, ['create', 'update']),
+            inArray(auditLogs.entityId, contentIds),
+            isNotNull(auditLogs.agentId),
+          ),
+        )
+    : [];
+  const confirmations = await ctx.db
+    .select({ id: auditLogs.entityId, at: auditLogs.createdAt })
+    .from(auditLogs)
+    .where(
+      and(
+        eq(auditLogs.companyId, ctx.companyId),
+        eq(auditLogs.entityType, 'report_schedule'),
+        inArray(auditLogs.entityId, ids),
+        isNull(auditLogs.agentId),
+        isNotNull(auditLogs.userId),
+        or(
+          eq(auditLogs.action, 'create'),
+          and(eq(auditLogs.action, 'update'), sql`(${auditLogs.newValues} ->> 'recipientsConfirmed') = 'true'`),
+        ),
+      ),
+    );
+  const agentAt = latestById(agentEdits);
+  const contentAt = latestById(contentEdits);
+  const confirmedAt = latestById(confirmations);
+  for (const s of schedules) {
+    let changed = agentAt.get(s.id) ?? -Infinity;
+    for (const part of runs.get(s.id) ?? []) changed = Math.max(changed, contentAt.get(part) ?? -Infinity);
+    if (changed === -Infinity) continue;
+    if (changed >= (confirmedAt.get(s.id) ?? -Infinity)) waiting.add(s.id);
+  }
+  return waiting;
 }
 
 /** Email wording of a scheduled report (Send Forms "report" template when the company has one). */
@@ -634,7 +755,24 @@ export async function updateReportSchedule(
   const frequency = patch.frequency ?? before.frequency;
   const anchorDay =
     frequency === before.frequency && before.anchorDay ? before.anchorDay : new Date(before.nextRunAt).getDate();
+  // A person saving the recipients (the page's recipients Save) has looked at who the schedule
+  // emails: that confirms it, and lets one an agent set up or changed run (runDueSchedules). Pausing
+  // or resuming it does not, and nothing an agent does ever confirms.
+  const confirms = !ctx.agent && !!ctx.userId && patch.emailTo !== undefined;
   return inTransaction(ctx, async (tx) => {
+    let createdBy = before.createdBy;
+    // Checked in the transaction that confirms, so an agent's change made meanwhile counts too.
+    if (confirms && (await schedulesWaitingForAPerson(tx, [before])).has(id)) {
+      // Letting it run is letting it export every report it runs, unattended: only someone who
+      // may view them all may do that, as when adding recipients.
+      for (const t of await scheduleReportTypes(tx, before)) {
+        const area = typeof t === 'string' ? areaForReportType(t) : undefined;
+        if (area) requireReportView(ctx, t, area);
+      }
+      // Made under an agent's standing permission, it has no creator, and a schedule without one
+      // runs with the timer's full access. It runs with this person's access from now on.
+      createdBy ??= ctx.userId;
+    }
     const [row] = await tx.db
       .update(reportSchedules)
       .set({
@@ -644,15 +782,25 @@ export async function updateReportSchedule(
         isActive: patch.isActive ?? before.isActive,
         format: patch.format ?? before.format,
         ...(emailTo !== undefined ? { emailTo } : {}),
+        ...(createdBy !== before.createdBy ? { createdBy } : {}),
       })
       .where(eq(reportSchedules.id, id))
       .returning();
+    // Every edit row carries `frequency` (runDueSchedules tells an edit from a run's row by it);
+    // a person's recipients save also carries `recipientsConfirmed`.
     await writeAudit(tx, {
       action: 'update',
       entityType: 'report_schedule',
       entityId: id,
       oldValues: { name: before.name, frequency: before.frequency, isActive: before.isActive, emailTo: before.emailTo },
-      newValues: { name: row.name, frequency: row.frequency, isActive: row.isActive, emailTo: row.emailTo },
+      newValues: {
+        name: row.name,
+        frequency: row.frequency,
+        isActive: row.isActive,
+        emailTo: row.emailTo,
+        ...(confirms ? { recipientsConfirmed: true } : {}),
+        ...(createdBy !== before.createdBy ? { createdBy } : {}),
+      },
     });
     return row;
   });
@@ -705,6 +853,18 @@ export const SCHEDULE_HELD_MESSAGE =
  * from, and it runs with nobody at the keyboard. It is not run and stays due (nextRunAt unchanged),
  * "held" is recorded once (not rewritten every time the timer asks), and the first run after an
  * Admin here allows the file runs it like any other. Schedules that only save files run as before.
+ *
+ * A schedule an agent set up or changed, or whose report or group an agent changed, is held the
+ * same way until a person has saved its recipients since (schedulesWaitingForAPerson,
+ * AGENT_SCHEDULE_HELD_MESSAGE): it would otherwise run unattended, unmasked, and email, with the
+ * full access of whoever is recorded as its creator rather than the agent's own limits. The
+ * schedule table has no column for the agent, so the audit trail decides. One an agent made under
+ * standing permission has no creator; the person who lets it run becomes its creator, so it never
+ * runs with the timer's full access.
+ *
+ * Files and emails go through the effects outbox (saveExport, sendMail): in an agent's preview
+ * nothing is saved or sent and the result says what would be; in an agent's real run they are
+ * done once its work is saved, and the result says what will be.
  */
 export async function runDueSchedules(
   ctx: ServiceContext,
@@ -720,8 +880,22 @@ export async function runDueSchedules(
     .where(and(eq(reportSchedules.companyId, ctx.companyId), eq(reportSchedules.isActive, true), lte(reportSchedules.nextRunAt, now)));
   const results: ScheduleRunResult[] = [];
   const creatorAccess = new Map<string, EffectiveAccess | null>();
+  const waitingForAPerson = await schedulesWaitingForAPerson(ctx, due);
   let heldHere: boolean | undefined;
   for (const s of due) {
+    if (waitingForAPerson.has(s.id)) {
+      if (s.lastStatus !== 'held' || s.lastMessage !== AGENT_SCHEDULE_HELD_MESSAGE) {
+        await inTransaction(ctx, async (tx) => {
+          await tx.db
+            .update(reportSchedules)
+            .set({ lastRunAt: now, lastStatus: 'held', lastMessage: AGENT_SCHEDULE_HELD_MESSAGE })
+            .where(eq(reportSchedules.id, s.id));
+          await writeAudit(tx, { action: 'update', entityType: 'report_schedule', entityId: s.id, newValues: { held: now, reason: AGENT_SCHEDULE_HELD_MESSAGE } });
+        });
+      }
+      results.push({ scheduleId: s.id, name: s.name, status: 'held', files: [], message: AGENT_SCHEDULE_HELD_MESSAGE });
+      continue;
+    }
     if (ctx.access && !canRunReportTypes(ctx.access, await scheduleReportTypes(ctx, s))) {
       results.push({
         scheduleId: s.id,
@@ -750,6 +924,11 @@ export async function runDueSchedules(
     let reportNames: string[] = [];
     let status: ScheduleRunResult['status'] = 'ok';
     let message: string | undefined;
+    /**
+     * What happened to the files (and so to the email, in the same scope): saved now ('done'), only
+     * recorded in an agent's preview ('previewed'), or waiting for its work to be saved ('queued').
+     */
+    let outcome: EffectStatus = 'done';
     let runCtx: ServiceContext = ctx;
     try {
       if (!ctx.access && s.createdBy) {
@@ -768,17 +947,18 @@ export async function runDueSchedules(
       const ok = processed.filter((p) => p.report);
       const failed = processed.filter((p) => p.error);
       if (processed.length === 0) throw new Error('The memorized report or group no longer exists.');
+      // The folder is created by the save itself (effects.writeFile), so a preview creates none.
       const dir = path.join(root, safeSegment(s.folder ?? '', 'Scheduled'));
-      fs.mkdirSync(dir, { recursive: true });
       // The run's local calendar day (the UTC day is tomorrow in US evenings).
       const stamp = localDateISO(now);
       reportNames = ok.map((p) => p.name);
       if (s.format === 'xlsx' && ok.length) {
-        const file = path.join(dir, `${safeSegment(s.name, 'Reports')} ${stamp}.xlsx`);
+        const name = `${safeSegment(s.name, 'Reports')} ${stamp}.xlsx`;
         const content = ok.length === 1 ? buildXlsx({ sheetName: ok[0].report!.title.slice(0, 28), title: ok[0].report!.title, subtitle: ok[0].report!.subtitle, ...reportToTable(ok[0].report!) }) : reportsToWorkbook(ok.map((p) => p.report!));
-        writeFileAtomic(file, content);
-        files.push(file);
-        attachments.push({ filename: path.basename(file), content: Buffer.from(content), contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+        const saved = await saveExport(dir, name, content);
+        if (saved.status !== 'done') outcome = saved.status;
+        files.push(saved.file);
+        attachments.push({ filename: name, content: Buffer.from(content), contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
       } else {
         // One file per report, never two with the same name: reports named alike (or alike once
         // made file-safe — "A/R" and "A:R") overwrote each other's export. Windows names are
@@ -789,11 +969,12 @@ export async function runDueSchedules(
           let name = base;
           for (let i = 2; used.has(name.toLowerCase()); i++) name = `${base} (${i})`;
           used.add(name.toLowerCase());
-          const file = path.join(dir, `${name}.csv`);
+          const fileName = `${name}.csv`;
           const content = '﻿' + reportToCsv(p.report!);
-          writeFileAtomic(file, content);
-          files.push(file);
-          attachments.push({ filename: path.basename(file), content: Buffer.from(content, 'utf8'), contentType: 'text/csv; charset=utf-8' });
+          const saved = await saveExport(dir, fileName, content);
+          if (saved.status !== 'done') outcome = saved.status;
+          files.push(saved.file);
+          attachments.push({ filename: fileName, content: Buffer.from(content, 'utf8'), contentType: 'text/csv; charset=utf-8' });
         }
       }
       if (failed.length) {
@@ -819,19 +1000,28 @@ export async function runDueSchedules(
     let next = nextRunAfter(s.nextRunAt, freq, s.anchorDay);
     let guard = 0;
     while (next <= now && guard++ < 5000) next = nextRunAfter(next, freq, s.anchorDay);
+    // In an agent's work nothing was saved or sent yet: say what the run would do (a preview) or
+    // will do once the work is saved (a real run, where it can still fail then).
+    const done = !files.length
+      ? null
+      : outcome === 'previewed'
+        ? `Would save ${files.length} file(s)${emailed ? ` and email them to ${s.emailTo}` : ''}`
+        : outcome === 'queued'
+          ? `Will save ${files.length} file(s)${emailed ? ` and email them to ${s.emailTo}` : ''} once this work is saved`
+          : `Saved ${files.length} file(s)${emailed ? ` and emailed to ${s.emailTo}` : ''}`;
     await inTransaction(ctx, async (tx) => {
       await tx.db
         .update(reportSchedules)
         .set({
           lastRunAt: now,
           lastStatus: status,
-          lastMessage: message ?? (files.length ? `Saved ${files.length} file(s)${emailed ? ` and emailed to ${s.emailTo}` : ''}` : null),
+          lastMessage: message ?? done,
           nextRunAt: next,
         })
         .where(eq(reportSchedules.id, s.id));
       await writeAudit(tx, { action: 'update', entityType: 'report_schedule', entityId: s.id, newValues: { ran: now, status, files: files.map((f) => path.basename(f)), ...(emailed ? { emailedTo: s.emailTo } : {}) } });
     });
-    results.push({ scheduleId: s.id, name: s.name, status, files, message });
+    results.push({ scheduleId: s.id, name: s.name, status, files, message: message ?? (outcome !== 'done' && done ? done : undefined) });
   }
   return results;
 }

@@ -334,6 +334,10 @@ export interface ApprovalNeeds {
   hostOnly: boolean;
   /** The approver needs this flag themselves. */
   flag: 'sensitivePayroll' | 'fullAccountNumbers' | 'closedPeriod' | null;
+  /** Every flag the approver needs themselves (`flag` is the first of these, kept for older callers). */
+  flags?: Array<'sensitivePayroll' | 'fullAccountNumbers' | 'closedPeriod'>;
+  /** Standing permission for this request may only be given by an Admin (outside sends, D5). */
+  grantAdminOnly?: boolean;
   /** Secrets the approver types on the card. */
   secrets: SecretKind[];
   /** Two different people must approve. */

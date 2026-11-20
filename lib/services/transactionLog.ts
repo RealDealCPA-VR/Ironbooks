@@ -7,7 +7,16 @@
  *
  * Record shape (one JSON object per line):
  *   { seq, ts, userId, userName, companyId, action, entityType, entityId, summary, data,
- *     prevHash, hash }
+ *     [agentId, approvedBy, agentRequestId, agentGrantId,] prevHash, hash }
+ *
+ *  - The bracketed fields come with agent full access (plan §7.3), each only when it has a value.
+ *    `agentId` is on an agent's changes. The other three are on every change that ran under an
+ *    agent's permission request or standing permission: an agent's change, and also a person's
+ *    decision on one of its requests (agentRequests.ts auditDecision), whose record names the
+ *    request it decided. Any other change by a person is exactly what it always was. They are part
+ *    of the record's body and so inside its hash, like every other field: who approved a change
+ *    is as much a part of it as what changed. Records written before them simply lack them; their
+ *    hashes and the verification are unchanged.
  *
  *  - `seq` is 1-based and gap-free; seq 1 is a `log_started` genesis record.
  *  - `hash` = SHA-256 of the record's own JSON text WITHOUT the trailing `hash` field
@@ -30,11 +39,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
-import { eq, sql } from 'drizzle-orm';
+import { and, eq, inArray, sql } from 'drizzle-orm';
 import type { DB } from '@/lib/db';
-import { journalEntries, transactionLogAnchor, users } from '@/lib/db/schema';
+import { agentGrants, companies, journalEntries, transactionLogAnchor, users } from '@/lib/db/schema';
 import { afterCommit, dataDirOf, rootDbOf } from '@/lib/db/txHooks';
 import { formatCurrency, Money } from '@/lib/money';
+import { localDateTime } from '@/lib/reports/dates';
 
 /** File name of the running transaction log inside a company data directory. */
 export const TRANSACTION_LOG_FILE = 'transactions.bktlg';
@@ -55,8 +65,29 @@ export interface TransactionLogRecord {
   /** Plain-language one-liner, e.g. 'Created invoice #1001 "Acme" for $500.00'. */
   summary: string;
   data: unknown;
+  /** The agent that made the change (agents.id). Only on an agent's records. */
+  agentId?: string;
+  /** The person who approved this very change. Only when one did. */
+  approvedBy?: string;
+  /** The agent's permission request it ran under, or that a person decided (agent_permission_requests.id). */
+  agentRequestId?: string;
+  /** The standing permission it ran under, or that a person's decision gave (agent_grants.id). */
+  agentGrantId?: string;
   prevHash: string;
   hash: string;
+}
+
+/**
+ * What a change ran under (ServiceContext.approval): on an agent's run, set by the route bridge,
+ * the person who approved it and the request or standing permission it ran under; on a person's
+ * decision about an agent's request, the request decided (and any standing permission it gave).
+ * Stored on the audit row (audit_logs.approved_by / agent_request_id / agent_grant_id) and on the
+ * log record.
+ */
+export interface ChangeApproval {
+  approvedBy: string | null;
+  requestId: string | null;
+  grantId: string | null;
 }
 
 /** A change to be logged (seq/ts/hashes are assigned at append time). */
@@ -69,11 +100,18 @@ export interface TransactionLogChange {
   summary?: string;
   data?: unknown;
   /**
-   * The agent behind the change (lib/services/_base.ts writeAudit): named in the record's existing
-   * `userName`, followed by the person who approved it when there is one. The record format is
-   * unchanged.
+   * The agent behind the change (lib/services/_base.ts writeAudit), as agentLabel() words it:
+   * named in the record's existing `userName`, followed by how the change was allowed
+   * (agentActorName).
    */
   actorName?: string;
+  /** The agent's id, recorded on the record (`agentId`). */
+  agentId?: string | null;
+  /**
+   * What the change ran under; recorded on the record. On an agent's change (`actorName` set) it is
+   * also named in `userName`.
+   */
+  approval?: ChangeApproval | null;
 }
 
 type PendingRecord = Omit<TransactionLogRecord, 'seq' | 'ts' | 'prevHash' | 'hash'>;
@@ -242,6 +280,138 @@ async function resolveUserName(db: DB, userId: string | null): Promise<string | 
 }
 
 // ---------------------------------------------------------------------------
+// How an agent's change is named (plan §7.3). The audit trail (auditTrail.ts) uses the same
+// functions, so both records always say the same thing.
+// ---------------------------------------------------------------------------
+
+/** "<Agent> (agent)": how the records name an agent. */
+export function agentLabel(agentName: string): string {
+  return `${agentName} (agent)`;
+}
+
+/** The standing permission a change ran under: who gave it and until when (already worded). */
+export interface StandingPermissionWords {
+  /** The person who gave it; null when that is no longer on file. */
+  givenBy: string | null;
+  /** When it ends, on the company's clock ("2026-11-20 17:00"); null when not on file. */
+  until: string | null;
+}
+
+/** Said of a person no longer on file (their user was removed, or this is a copy without them). */
+export const REMOVED_PERSON = 'a removed user';
+
+/**
+ * The full actor of an agent's change, from `actor` (agentLabel's words):
+ *  - "<Agent> (agent), approved by <person>" when a person approved this very change;
+ *  - "<Agent> (agent), under permission from <person> until <time>" when it ran under standing
+ *    permission, or "<Agent> (agent), under standing permission" when that is no longer on file;
+ *  - "<Agent> (agent)" when it ran on the agent's own policy.
+ * A direct approval wins over a grant: a person said yes to this change itself.
+ */
+export function agentActorName(
+  actor: string,
+  how: { approvedBy?: string | null; grant?: StandingPermissionWords | null } = {},
+): string {
+  if (how.approvedBy) return `${actor}, approved by ${how.approvedBy}`;
+  if (how.grant) {
+    const { givenBy, until } = how.grant;
+    if (givenBy && until) return `${actor}, under permission from ${givenBy} until ${until}`;
+    if (givenBy) return `${actor}, under permission from ${givenBy}`;
+    return until ? `${actor}, under standing permission until ${until}` : `${actor}, under standing permission`;
+  }
+  return actor;
+}
+
+/** The company's Preferences time zone, or null for this computer's clock (as resolveCompanyPreferences does). */
+async function companyTimeZone(db: DB, companyId: string): Promise<string | null> {
+  const [row] = await db.select({ settings: companies.settings }).from(companies).where(eq(companies.id, companyId));
+  const tz = (row?.settings as { timezone?: unknown } | null)?.timezone;
+  return typeof tz === 'string' && tz.trim() ? tz : null;
+}
+
+/**
+ * Who gave each standing permission and until when, worded for agentActorName, by grant id.
+ * A grant that is not on file (or belongs to another company) is left out of the map: the caller
+ * then says "under standing permission". Grants never travel with a copy of the company, so in a
+ * restored copy every one is missing. A grant still on file whose giver was removed says so
+ * ("under permission from a removed user until ..."), as an approval by a removed person does: a
+ * person did give it.
+ */
+export async function standingPermissionWords(
+  db: DB,
+  companyId: string,
+  grantIds: readonly string[],
+): Promise<Map<string, StandingPermissionWords>> {
+  const out = new Map<string, StandingPermissionWords>();
+  const ids = [...new Set(grantIds.filter(Boolean))];
+  if (!ids.length) return out;
+  const rows = await db
+    .select({ id: agentGrants.id, expiresAt: agentGrants.expiresAt, givenById: agentGrants.givenBy, name: users.name, email: users.email })
+    .from(agentGrants)
+    .leftJoin(users, eq(agentGrants.givenBy, users.id))
+    .where(and(eq(agentGrants.companyId, companyId), inArray(agentGrants.id, ids)));
+  if (!rows.length) return out;
+  const tz = await companyTimeZone(db, companyId);
+  for (const r of rows) {
+    const givenBy = r.name || r.email || (r.givenById ? REMOVED_PERSON : null);
+    out.set(r.id, { givenBy, until: localDateTime(r.expiresAt, tz) || null });
+  }
+  return out;
+}
+
+// A run under one standing permission can write hundreds of records, each naming the same grant:
+// it is worded once and reused, not looked up twice a record. Its words never change on their own
+// (a grant's giver and end are fixed; taking it back only sets revoked_at). A renamed person, a new
+// company time zone or a grant given or taken back clears the cache (logTransaction), and an entry
+// is never used after a minute, so a change made some other way shows soon after. The audit trail
+// reads the grants afresh each time (standingPermissionWords).
+const GRANT_WORDS_TTL_MS = 60_000;
+const GRANT_WORDS_MAX = 500;
+const grantWordsAtWrite = new Map<string, { words: StandingPermissionWords; at: number }>();
+
+/** Forget every cached standing-permission wording (they are cheap to word again). */
+export function forgetStandingPermissionWords(): void {
+  grantWordsAtWrite.clear();
+}
+
+/** One grant's words for a record about to be logged, from the cache when fresh. */
+async function grantWordsForLog(db: DB, dir: string, companyId: string, grantId: string): Promise<StandingPermissionWords | undefined> {
+  const key = `${dir}\u0000${companyId}\u0000${grantId}`;
+  const now = Date.now();
+  const hit = grantWordsAtWrite.get(key);
+  if (hit && now - hit.at < GRANT_WORDS_TTL_MS) return hit.words;
+  const words = (await standingPermissionWords(db, companyId, [grantId])).get(grantId);
+  if (!words) {
+    // Not on file: never kept, so a grant that appears later is named at once.
+    grantWordsAtWrite.delete(key);
+    return undefined;
+  }
+  if (grantWordsAtWrite.size >= GRANT_WORDS_MAX) grantWordsAtWrite.clear();
+  grantWordsAtWrite.set(key, { words, at: now });
+  return words;
+}
+
+/** The full actor name of an agent's change at the time it is logged (see agentActorName). */
+async function agentActorAtWrite(
+  db: DB,
+  dir: string,
+  change: TransactionLogChange & { actorName: string },
+  person: string | null,
+): Promise<string> {
+  const ap = change.approval;
+  if (ap?.approvedBy) {
+    return agentActorName(change.actorName, { approvedBy: (await resolveUserName(db, ap.approvedBy)) ?? REMOVED_PERSON });
+  }
+  if (ap?.grantId) {
+    const words = change.companyId ? await grantWordsForLog(db, dir, change.companyId, ap.grantId) : undefined;
+    return agentActorName(change.actorName, { grant: words ?? { givenBy: null, until: null } });
+  }
+  // Before agent full access a person approved an agent's proposal in their own context: the
+  // person in `userId` is the approver.
+  return agentActorName(change.actorName, { approvedBy: person });
+}
+
+// ---------------------------------------------------------------------------
 // Append (chain head cached per file; re-read when the file changes underneath us,
 // e.g. after a restore swapped the data directory)
 // ---------------------------------------------------------------------------
@@ -374,11 +544,13 @@ export async function logTransaction(db: DB, change: TransactionLogChange): Prom
   const dir = dataDirOf(db);
   if (!dir) return;
   const person = await resolveUserName(db, change.userId);
-  // An agent's change names the agent; a person who approved it is named after it.
+  // An agent's change names the agent and how it was allowed (approved by a person, or under
+  // standing permission).
   const userName = change.actorName
-    ? (person ? `${change.actorName}, approved by ${person}` : change.actorName).slice(0, 200)
+    ? (await agentActorAtWrite(db, dir, { ...change, actorName: change.actorName }, person)).slice(0, 200)
     : person;
   const data = toJsonSafe(change.data);
+  const ap = change.approval;
   const record: PendingRecord = {
     userId: change.userId ?? null,
     userName,
@@ -388,8 +560,19 @@ export async function logTransaction(db: DB, change: TransactionLogChange): Prom
     entityId: change.entityId ?? null,
     summary: change.summary ?? describeChange(change.action, change.entityType, data),
     data,
+    // Agent full access: each only present when set. agentId on an agent's change; the approval ids
+    // whenever the change ran under an agent's request or grant, a person's decision on one
+    // included. Any other change keeps its old shape. Inside the hash like every field (header).
+    ...(change.agentId ? { agentId: change.agentId } : {}),
+    ...(ap?.approvedBy ? { approvedBy: ap.approvedBy } : {}),
+    ...(ap?.requestId ? { agentRequestId: ap.requestId } : {}),
+    ...(ap?.grantId ? { agentGrantId: ap.grantId } : {}),
   };
   if (change.entityType === 'user' && change.entityId) forgetUserName(change.entityId);
+  // A grant's words name its giver on the company's clock (see grantWordsAtWrite).
+  if (change.entityType === 'user' || change.entityType === 'company' || change.entityType === 'agent_grant') {
+    forgetStandingPermissionWords();
+  }
   const root = rootDbOf(db) as DB | null;
   await afterCommit(db, async () => {
     const written = appendTransactionLog(dir, [record]);
@@ -546,6 +729,8 @@ export interface TransactionLogFilter {
   entityType?: string;
   action?: string;
   entityId?: string;
+  /** Only one agent's changes (the record's `agentId`). */
+  agentId?: string;
   search?: string;
   /** Include the log_started/system records (default true). */
   includeSystem?: boolean;
@@ -594,6 +779,7 @@ function matchRecords(scoped: TransactionLogRecord[], filter: TransactionLogFilt
     if (filter.entityType && r.entityType !== filter.entityType) return false;
     if (filter.action && r.action !== filter.action) return false;
     if (filter.entityId && r.entityId !== filter.entityId) return false;
+    if (filter.agentId && r.agentId !== filter.agentId) return false;
     if (filter.includeSystem === false && r.entityType === 'transaction_log') return false;
     if (q && !`${r.summary} ${r.userName ?? ''} ${r.entityType} ${r.entityId ?? ''}`.toLowerCase().includes(q)) {
       return false;

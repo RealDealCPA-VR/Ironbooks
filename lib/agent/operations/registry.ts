@@ -9,6 +9,10 @@
  *  - routes.generated.ts (scripts/agent-registry.mjs): what each handler reads and answers.
  *  - classes.ts: the hand-written risk class and wording. It has the last word.
  *
+ * Then the operations that are not API routes (shell.ts, plan §5.5): what the desktop shell or the
+ * server itself carries out once a person approves. They are kind 'shell', share the id space with
+ * the routes and are found by id and by search only, never by a route or a request path.
+ *
  * Fail closed: a route + method with no classification is `classified: false`, class 'admin'
  * (never Allow, only an Admin may approve) and described as "Use {method} {route}".
  * test/agentRegistry.test.ts fails while any exists.
@@ -26,18 +30,23 @@ import {
   type MethodRules,
 } from '@/lib/permissions/routes';
 import { activityForRoute } from '@/lib/permissions/routeActivities';
+import type { ShellOperationDef } from '../contract';
 import { OPERATION_CLASSES } from './classes';
 import { GENERATED_ROUTES, type GeneratedRoute } from './routes.generated';
+import { SHELL_OPERATIONS } from './shell';
 import {
+  isRiskClass,
   operationKey,
   type Availability,
   type BodyKind,
   type ClassificationMap,
   type DryRunKind,
+  type EffectKind,
   type Operation,
   type OperationClassification,
   type OperationKey,
   type RiskClass,
+  type SecretKind,
 } from './types';
 
 // ---------------------------------------------------------------------------
@@ -160,6 +169,8 @@ export interface RegistrySources {
   permissions: Record<string, MethodRules>;
   generated: Record<string, GeneratedRoute>;
   classes: ClassificationMap;
+  /** The operations that are not API routes (shell.ts). Left out: none. */
+  shell?: readonly ShellOperationDef[];
 }
 
 /** Two or more operations that ended up with the same id (the registry refuses to run then). */
@@ -243,8 +254,55 @@ function makeOperation(
 }
 
 /**
+ * An operation that is not an API route (shell.ts, plan §5.5). The desktop shell or the server
+ * carries it out, and only with a person's approval ticket, so it always asks (even where the policy
+ * says Allow, and a grant never covers it) and has no dry run (it acts outside the database). It has
+ * no route rule: its "route" is the flow's name, which no request path can reach, so
+ * operationForRoute, operationForPath and loadRouteHandler never hand one out.
+ */
+function makeShellOperation(def: ShellOperationDef): Operation {
+  // Fail closed on a definition whose class is not one we know: treat it as unclassified (admin).
+  const known = isRiskClass(def.class);
+  return Object.freeze({
+    id: def.id,
+    kind: 'shell' as const,
+    route: def.flow,
+    method: 'POST' as const,
+    params: frozen<string>([]),
+    rule: null,
+    area: def.area ?? null,
+    action: null,
+    activity: null,
+    classified: known,
+    class: known ? def.class : 'admin',
+    describe: def.describe,
+    availability: 'agent' as const,
+    why: def.why || null,
+    dryRun: 'none' as const,
+    body: 'json' as const,
+    output: 'json' as const,
+    confirmFlags: frozen<string>([]),
+    sensitiveFields: frozen<string>([]),
+    reveal: null,
+    hostOnly: def.hostOnly === true,
+    fileAdmin: def.fileAdmin === true,
+    needsSecret: frozen<SecretKind>(def.needsSecret),
+    producesSecret: frozen<SecretKind>([]),
+    effects: frozen<EffectKind>([]),
+    countField: null,
+    amountField: null,
+    alwaysAsk: true,
+    bodySchema: null,
+  });
+}
+
+/**
  * Every route + method of the route map as an operation, in route then method order, with the id
- * rule applied (operationIdFor) and the classification's own ids last. Pure: same input, same out.
+ * rule applied (operationIdFor) and the classification's own ids last; then the shell operations
+ * with the ids their definitions give. Pure: same input, same out.
+ *
+ * A shell id that is also a route's id (or another shell operation's) is reported as a collision,
+ * never resolved: the registry refuses to run until one of them is renamed.
  */
 export function buildOperations(src: RegistrySources): BuiltRegistry {
   const entries: Array<{ method: HttpMethod; pattern: string; ctx: IdContext; override?: string }> = [];
@@ -268,7 +326,11 @@ export function buildOperations(src: RegistrySources): BuiltRegistry {
     }
   });
 
-  const operations = entries.map((e, i) => makeOperation(ids[i], e.method, e.pattern, src));
+  // Shell ids take no part in step 3: they are written by hand, and a clash is reported below.
+  const operations = [
+    ...entries.map((e, i) => makeOperation(ids[i], e.method, e.pattern, src)),
+    ...(src.shell ?? []).map(makeShellOperation),
+  ];
 
   const byId = new Map<string, OperationKey[]>();
   for (const op of operations) {
@@ -282,9 +344,6 @@ export function buildOperations(src: RegistrySources): BuiltRegistry {
     .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   return { operations, collisions };
 }
-
-// Phase 6 adds the desktop-shell operations (kind 'shell') from their own file; they join the list
-// built below and share the id space.
 
 interface Registry {
   operations: Operation[];
@@ -301,8 +360,10 @@ function load(): Registry {
     permissions: API_ROUTE_PERMISSIONS,
     generated: GENERATED_ROUTES,
     classes: OPERATION_CLASSES,
+    shell: SHELL_OPERATIONS,
   });
   const byId = new Map<string, Operation>();
+  // Routes only: a shell operation's "route" is a flow name, which must never match a request.
   const byKey = new Map<string, Operation>();
   for (const op of built.operations) {
     if (!byId.has(op.id)) byId.set(op.id, op);

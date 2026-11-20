@@ -11,7 +11,12 @@
  *  - Signing in, unlocking the file and a person's own two-step sign-in are 'person_only': they ARE
  *    a person acting as themselves. The desktop shell's own calls (internal token) are marked the
  *    same way: an agent cannot ask for them; its way is the shell operation (plan 5.5).
- *  - Making or removing agents and working in a practice copy are on the hard floor (plan 4.6).
+ *  - Making, changing, pausing or removing agents, their policies and standing permissions, answering
+ *    permission requests (the approval center) and working in a practice copy are on the hard floor
+ *    (plan 4.6, D9): even looking is a person's, in their own window. An agent reads its OWN requests
+ *    at /api/agent/requests, class read.
+ *  - Where the generated id names a route badly (a GET that downloads, a POST that restores or
+ *    signs everyone out), the entry gives a better `id`.
  *  - Routes that refuse a request from another computer with the host-only test (lib/net/hostOnly.ts,
  *    or the same originFromHeaders test written out in the route) are hostOnly, so a person can only
  *    approve them at the host's own window: the bridge's own request would otherwise pass that test.
@@ -87,10 +92,11 @@ export const ADMIN_CLASSES: ClassificationMap = {
   },
 
   // ---- Company file password ----
-  'GET /api/file-lock': { class: 'read', describe: 'Show whether the company file has a password' },
+  'GET /api/file-lock': { class: 'read', describe: 'Show whether the company file has a password', id: 'file-lock.status' },
   'POST /api/file-lock': {
     class: 'admin',
     describe: 'Set or remove the company file password ({action})',
+    id: 'file-lock.change',
     why: 'The file password locks every company in the file. The new and current passwords are typed by the approving file Admin, never by the agent.',
     fileAdmin: true,
     needsSecret: ['file_password'],
@@ -98,10 +104,11 @@ export const ADMIN_CLASSES: ClassificationMap = {
   },
 
   // ---- File protection (encrypted company file) ----
-  'GET /api/file-protection': { class: 'read', describe: 'Show who can open the protected company file' },
+  'GET /api/file-protection': { class: 'read', describe: 'Show who can open the protected company file', id: 'file-protection.status' },
   'POST /api/file-protection': {
     class: 'secret',
     describe: 'Protect the company file with passwords',
+    id: 'file-protection.protect',
     why: "Encrypts the whole file and answers its recovery key once: shown to the approver only. Needs the approving file Admin's OWN sign-in password, typed again and checked against the user id the request runs as (getSessionGate), so it must run as the approver. The contract has no kind for that password; file_password is the nearest. Refused from another computer, so host-only. Writes the protection marker on disk, so no dry run.",
     hostOnly: true,
     fileAdmin: true,
@@ -157,6 +164,7 @@ export const ADMIN_CLASSES: ClassificationMap = {
   'POST /api/sessions': {
     class: 'admin',
     describe: 'Sign out every signed-in session of this company',
+    id: 'sessions.sign-out-all',
     why: 'Body { action: "sign-out-others" }. It keeps only the session the request runs in, and a bridged call has none, so every session of the company ends, the approving person\'s included (unless the bridge passes the approver\'s session id). Also releases a single-user hold one of them had.',
   },
   'DELETE /api/sessions/[id]': {
@@ -167,11 +175,13 @@ export const ADMIN_CLASSES: ClassificationMap = {
   'GET /api/single-user': {
     class: 'read',
     describe: 'Show whether the company is in single-user mode',
+    id: 'single-user.status',
     why: "Reads only. It releases a single-user hold whose session has ended (sessions.ts getSingleUserMode), the same as the agent door's single-user check (lib/agentContext.ts) does for this company on every agent request just before, so nothing is left to release; on a read-only handle it would be refused, never hidden.",
   },
   'POST /api/single-user': {
     class: 'admin',
     describe: 'Turn single-user mode on or off (on: {enabled})',
+    id: 'single-user.switch',
     why: 'Single-user mode keeps everyone else out of the company. Agents cannot work while it is on.',
   },
 
@@ -298,6 +308,17 @@ export const ADMIN_CLASSES: ClassificationMap = {
 
   // ---- The agent's own door (/api/agent/*) ----
   'GET /api/agent/whoami': { class: 'read', describe: 'Show who this agent is and which books these are' },
+  // The agent's OWN permission requests: the handlers refuse a person and drop any other agent's.
+  'GET /api/agent/requests': {
+    class: 'read',
+    describe: 'List my requests to people and their answers',
+    id: 'agent.requests.list',
+  },
+  'GET /api/agent/requests/[id]': {
+    class: 'read',
+    describe: 'Show my request {id} and its answer',
+    why: '?wait= makes it a long poll: it answers when a person has decided, or after at most WAIT_MAX_SECONDS (lib/agent/contract.ts). Run by the route bridge it never waits.',
+  },
   // The connector calls it directly before it shows its token; answers from memory.
   'GET /api/agent/hello': { class: 'read', describe: 'Check that this is the Ironbooks the connector expects' },
   'POST /api/agent/actions': {
@@ -341,11 +362,99 @@ export const ADMIN_CLASSES: ClassificationMap = {
     why: 'Agents never change or remove agents (plan 4.6, D9). A person does it in two clicks in the Agents tab.',
     hostOnly: true,
   },
+  'GET /api/agents/[id]': {
+    class: 'read',
+    describe: 'Show agent {id} with its roles and permissions',
+    availability: 'hard_floor',
+    why: "Agents never manage agents (plan 4.6, D9): the detail page is where a person decides what an agent may do, so even reading it is a person's, in their own window. An agent reads its own permissions with get_my_permissions.",
+  },
+  'PATCH /api/agents/[id]': {
+    class: 'admin',
+    describe: 'Change what agent {id} may do: preset, Allow / Ask / Never, limits and folders',
+    availability: 'hard_floor',
+    why: 'Agents never change their own or another agent\'s permissions (plan 4.6, D9): a prompt-injected agent would ask to widen itself until someone clicks yes. A person does it in the Agents tab, at the computer that holds the company file (the folders are folders of that computer).',
+    hostOnly: true,
+  },
+  'POST /api/agents/[id]/pause': {
+    class: 'admin',
+    describe: 'Pause or resume agent {id} (paused: {paused})',
+    availability: 'hard_floor',
+    why: 'Pausing and resuming agents stays with people (plan 4.6, D9): an agent could otherwise resume itself or stop another.',
+  },
+  'POST /api/agents/pause-all': {
+    class: 'admin',
+    describe: 'Pause or resume every agent of this company (paused: {paused})',
+    availability: 'hard_floor',
+    why: 'The kill switch (the Integrated Applications switch, one click away) stays with people in both directions (plan 4.6).',
+  },
+  'GET /api/agents/[id]/grants': {
+    class: 'read',
+    describe: 'List the standing permissions of agent {id}',
+    availability: 'hard_floor',
+    why: "Agents never manage agents' standing permissions (plan 4.6, D9); this list is the person's, with Revoke beside each one. An agent reads its own live grants with get_my_permissions.",
+  },
+  'GET /api/agents/[id]/activity': {
+    class: 'read',
+    describe: 'Show what agent {id} ran and asked for',
+    availability: 'hard_floor',
+    why: "Part of a person watching over agents (plan 7.1, 4.6): one agent's record is not another agent's to read.",
+  },
+
+  // ---- Answering agents: the approval center (plan 7.2). All on the hard floor (plan 4.6) ----
+  // An approval only ever comes from a signed-in person's window, never from a request that
+  // carries an agent token; the handlers refuse an agent's context before anything else.
+  'GET /api/agent-requests': {
+    class: 'read',
+    describe: 'List the requests agents are waiting on',
+    id: 'agent-requests.list',
+    availability: 'hard_floor',
+    why: "The approval center is a person's: it shows every agent's requests and who may approve them. An agent lists its own at GET /api/agent/requests.",
+  },
+  'GET /api/agent-requests/count': {
+    class: 'read',
+    describe: 'Count the agent requests waiting for my answer',
+    availability: 'hard_floor',
+    why: "The title bar's badge for the signed-in person (plan 7.2). An agent has no requests to answer.",
+  },
+  'GET /api/agent-requests/[id]': {
+    class: 'read',
+    describe: 'Show agent request {id} with its preview',
+    availability: 'hard_floor',
+    why: "The approval card is a person's. An agent reads its own request at GET /api/agent/requests/[id].",
+  },
+  'POST /api/agent-requests/[id]/approve': {
+    class: 'admin',
+    describe: 'Approve agent request {id}',
+    availability: 'hard_floor',
+    why: 'Approving is what a person does in their own window (plan 4.5, 4.6): an agent that could approve would approve itself. The body carries the secrets the approver typed on the card, and the answer secrets the run produced: both for that person only.',
+    sensitiveFields: ['secrets.*', 'produced.*.value'],
+  },
+  'POST /api/agent-requests/[id]/deny': {
+    class: 'admin',
+    describe: 'Deny agent request {id}',
+    availability: 'hard_floor',
+    why: 'Answering a request is a person\'s (plan 4.6): an agent never approves, denies or alters a permission request.',
+  },
+  'POST /api/agent-requests/batch-approve': {
+    class: 'admin',
+    describe: 'Approve several agent requests of the same kind at once',
+    availability: 'hard_floor',
+    why: 'Approving is what a person does in their own window (plan 4.5, 4.6). Each request is still approved and reported on its own.',
+    sensitiveFields: ['results.*.produced.*.value'],
+  },
+  'DELETE /api/agent-grants/[id]': {
+    class: 'admin',
+    describe: 'Take back standing permission {id}',
+    id: 'agent-grants.revoke',
+    availability: 'hard_floor',
+    why: "Agents never change standing permissions, their own or another agent's (plan 4.6, D9). Taking one back ends nothing for good: a person can give it again.",
+  },
 
   // ---- Backup and restore of the whole company file ----
   'GET /api/backup': {
     class: 'file',
     describe: 'Download a backup of the whole company file',
+    id: 'backup.download',
     why: 'Not a pure read: a copy of every company and every login in the file, nothing masked (full SSNs and account numbers), recorded in the backup history on disk. The service reads the files on disk, so no dry run.',
     fileAdmin: true,
     output: 'file',
@@ -354,6 +463,7 @@ export const ADMIN_CLASSES: ClassificationMap = {
   'POST /api/backup': {
     class: 'file',
     describe: 'Restore the whole company file from an uploaded backup',
+    id: 'backup.restore',
     why: 'Replaces every company in the file (and revokes every agent). Closes the database and swaps the folder, so no dry run. A backup from another protected file needs its user name and password or recovery key, typed by the approver.',
     fileAdmin: true,
     body: 'bytes',
@@ -364,6 +474,7 @@ export const ADMIN_CLASSES: ClassificationMap = {
   'GET /api/backup/company': {
     class: 'file',
     describe: "Download a backup of one company's books (company {companyId})",
+    id: 'backup.company.download',
     why: "Not a pure read: a copy of one company's books, recorded in the backup history on disk. ?companyId= can name ANOTHER company in the file (this one when left out); the route checks the access of the user id it runs as, in that company (requireAccessInCompany), not the agent's role. SSNs and tax IDs, and bank and account numbers, are masked unless that same access holds the matching flags, so the masked copy is the ordinary one and a reveal is asked for. The contract takes one reveal kind, so it names SSNs; a run whose access holds both flags unmasks account numbers too. Reads attachment files on disk, so no dry run.",
     output: 'file',
     dryRun: 'none',
@@ -373,6 +484,7 @@ export const ADMIN_CLASSES: ClassificationMap = {
   'POST /api/backup/company': {
     class: 'file',
     describe: 'Restore a company backup as a new company {name}',
+    id: 'backup.company.restore',
     why: 'Adds a whole new company to the file. Makes a safety copy and copies attachment files on disk first, so no dry run. A backup from another protected file needs its credentials, typed by the approver.',
     body: 'bytes',
     dryRun: 'none',

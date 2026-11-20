@@ -10,19 +10,28 @@ import { hasAuthorization, isAgentActionRequest } from '@/lib/net/agentToken';
  * verified in the Node runtime by lib/auth). Unauthenticated page requests are redirected to /login.
  *
  * Every request that continues (API and pages) is stamped with its pathname + method
- * (ROUTE_PATH_HEADER / ROUTE_METHOD_HEADER, overwriting any client-supplied value). getServerContext
- * reads the stamp to enforce the declarative permission map in lib/permissions/routes.ts — the
- * full session/permission checks live server-side.
+ * (ROUTE_PATH_HEADER / ROUTE_METHOD_HEADER, overwriting any client-supplied value), and loses any
+ * agent-scope origin label it sent. getServerContext reads the stamp to enforce the declarative
+ * permission map in lib/permissions/routes.ts — the full session/permission checks live server-side.
  */
 // '/unlock' must be public: it renders before login (the file-password gate below skips it),
 // so the session gate must never bounce it to /login — that would loop on a fresh install.
 const PUBLIC_PREFIXES = ['/login', '/signup', '/onboarding', '/reset-password', '/unlock'];
+
+/**
+ * The origin label of an agent's request the bridge runs in-process (lib/serviceScope.ts
+ * SERVICE_ORIGIN_HEADER, spelled out here because that module is not edge-safe). Only such a
+ * scope may carry it, so a request that sends it has it removed, the way the route stamps are
+ * overwritten: nothing past this point can mistake a request for an agent's scope by it.
+ */
+const SERVICE_ORIGIN_HEADER = 'x-bka-origin';
 
 /** Continue, stamping the request with its (server-observed) path + method. */
 function pass(req: NextRequest) {
   const h = new Headers(req.headers);
   h.set(ROUTE_PATH_HEADER, req.nextUrl.pathname);
   h.set(ROUTE_METHOD_HEADER, req.method);
+  h.delete(SERVICE_ORIGIN_HEADER);
   return NextResponse.next({ request: { headers: h } });
 }
 

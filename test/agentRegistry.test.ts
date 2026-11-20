@@ -15,7 +15,8 @@ import { OPERATION_CLASSES } from '@/lib/agent/operations/classes';
 import { CLASS_BUCKET_NAMES, bucketOfRoute } from '@/lib/agent/operations/classes/buckets';
 import { GENERATED_ROUTES } from '@/lib/agent/operations/routes.generated';
 import { ROUTE_LOADERS } from '@/lib/agent/operations/loaders.generated';
-import { allOperations, idCollisions } from '@/lib/agent/operations/registry';
+import { allOperations, idCollisions, operationById, operationForRoute } from '@/lib/agent/operations/registry';
+import { SHELL_OPERATIONS } from '@/lib/agent/operations/shell';
 import { operationKey } from '@/lib/agent/operations/types';
 
 const root = path.resolve(__dirname, '..');
@@ -65,9 +66,12 @@ describe('agent operation registry: completeness', () => {
   });
 
   it('pins every operation id (a changed id is a breaking change)', async () => {
-    const lines = allOperations().map((o) => `${o.method} ${o.route} -> ${o.id}`);
+    const lines = allOperations().map((o) =>
+      o.kind === 'shell' ? `SHELL ${o.route} -> ${o.id}` : `${o.method} ${o.route} -> ${o.id}`,
+    );
     const text = [
       '# Agent operation ids, one line per API route + method: METHOD route -> id.',
+      '# Then one line per desktop-shell or server operation (lib/agent/operations/shell.ts): SHELL flow -> id.',
       '# Pinned by test/agentRegistry.test.ts. Standing permissions, stored permission requests and',
       '# MCP clients name operations by these ids, so changing a line breaks them.',
       "# Keep an old id: give the route's classification id: '<old id>' (lib/agent/operations/classes).",
@@ -149,10 +153,30 @@ describe('agent operation registry: completeness', () => {
       collisions.map((c) => `${c.id}: ${c.keys.join(' | ')}`),
       'These operations share an id. Give one of each its own "id" in lib/agent/operations/classes/<bucket>.ts',
     ).toEqual([]);
+    const routeShape = /^[a-z0-9]+(?:-[a-z0-9]+)*(?:\.[a-z0-9]+(?:-[a-z0-9]+)*)*$/;
+    // Shell ids are written by hand in shell.ts with the names plan §5.5 gives them, some of which
+    // join words the camelCase way (shell.company.saveCopyAs); still dotted words, no spaces.
+    const shellShape = /^[a-z][a-zA-Z0-9]*(?:-[a-z0-9]+)*(?:\.[a-z][a-zA-Z0-9]*(?:-[a-z0-9]+)*)+$/;
     const badShape = allOperations()
-      .map((o) => o.id)
-      .filter((id) => !/^[a-z0-9]+(?:-[a-z0-9]+)*(?:\.[a-z0-9]+(?:-[a-z0-9]+)*)*$/.test(id));
-    expect(badShape, 'ids are lower-case words with hyphens, joined by dots').toEqual([]);
+      .filter((o) => !(o.kind === 'shell' ? shellShape : routeShape).test(o.id))
+      .map((o) => o.id);
+    expect(badShape, 'ids are lower-case words with hyphens (shell ids may be camelCase words), joined by dots').toEqual([]);
+  });
+
+  it('has every shell operation of lib/agent/operations/shell.ts, classified, and out of reach of any route', () => {
+    const shell = allOperations().filter((o) => o.kind === 'shell');
+    expect(shell.map((o) => o.id), 'the shell operations are exactly the definitions, in order').toEqual(
+      SHELL_OPERATIONS.map((d) => d.id),
+    );
+    const problems: string[] = [];
+    for (const def of SHELL_OPERATIONS) {
+      const op = operationById(def.id);
+      if (!op || op.kind !== 'shell') problems.push(`${def.id}: not a shell operation in the registry`);
+      else if (!op.classified) problems.push(`${def.id}: class "${String(def.class)}" is not a risk class`);
+      else if (!op.alwaysAsk || op.dryRun !== 'none' || op.rule !== null) problems.push(`${def.id}: must always ask, with no dry run and no route rule`);
+      if (operationForRoute('POST', def.flow)) problems.push(`${def.id}: its flow name "${def.flow}" is also a route`);
+    }
+    expect(problems).toEqual([]);
   });
 
   it('has up-to-date generated files (scripts/agent-registry.mjs --check)', () => {
@@ -211,8 +235,9 @@ describe('agent operation registry: completeness', () => {
     expect(stale, 'classification keys that are not in lib/permissions/routes.ts (a typo leaves the real route unclassified)').toEqual([]);
   });
 
-  // Expected to fail until the ten classification files (lib/agent/operations/classes/*.ts) are
-  // complete. Unclassified operations run as class 'admin' (always ask an Admin) meanwhile.
+  // Every route is classified today. A new route fails this until its bucket's file
+  // (lib/agent/operations/classes/<bucket>.ts) names it; until then it runs as class 'admin'
+  // (always ask an Admin).
   it('classifies every operation', () => {
     const missing = allOperations().filter((o) => o.kind === 'route' && !o.classified);
     const groups = new Map<string, string[]>();

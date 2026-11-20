@@ -31,6 +31,7 @@ import { migrateStoredSecrets, needsMoveHere, openStoredSecret, readVaultSecret,
 import { assertOutboundAllowed } from '@/lib/net/guard';
 import { classifyHost, isPrivateClass, normalizeHost, parseIPv4, parseIPv6 } from '@/lib/net/cidr';
 import { canActivity } from '@/lib/permissions/model';
+import { effects } from '@/lib/effects';
 import { type ServiceContext, ServiceError, inTransaction, validation, writeAudit } from './_base';
 import { requireActivity } from './access';
 import { assertNotSandbox } from './sandboxState';
@@ -615,6 +616,12 @@ export interface TestEmailResult {
   message: string;
   to: string;
   from: string;
+  /**
+   * True only when the test email was handed to the mail server now. False when it failed, and in
+   * an agent's work, where the effects outbox only records it (a preview) or sends it once the
+   * work is saved; `message` then says it WOULD be sent, or WILL be.
+   */
+  sent: boolean;
 }
 
 /**
@@ -624,6 +631,13 @@ export interface TestEmailResult {
  * must be typed: a draft must never send the company's password to another server). Without a
  * draft the saved settings are tested and the result is remembered. Someone without the set-up
  * right can test the saved settings, sent only to the address they sign in with.
+ *
+ * The email goes through the effects outbox (lib/effects.ts) like every other email
+ * (lib/services/email.ts sendMail): a person's test is sent at once, exactly as before. In an
+ * agent's preview it is only recorded, and the answer says the test WOULD be sent; in an agent's
+ * real run it is sent once the work is saved, and the answer says it WILL be. Neither is
+ * remembered as the last test's result: no test has happened yet. The checks before the send
+ * (network policy, encryption) run in every case, so a preview fails where the test would.
  */
 export async function sendTestEmail(
   ctx: ServiceContext,
@@ -669,27 +683,46 @@ export async function sendTestEmail(
   if (!to) to = sender.userEmail || sender.from.address;
   if (!EMAIL_RE.test(to)) throw validation('Enter the address to send the test email to.');
 
+  const server: MailConfig = cfg;
+  const from = sender.from.address;
   let result: TestEmailResult;
   try {
-    await assertMailServerAllowed(ctx, cfg);
-    const transport = mailTransport.create(transportOptions(cfg));
-    await transport.sendMail({
-      from: sender.from.name ? { name: sender.from.name, address: sender.from.address } : sender.from.address,
-      to,
-      ...(sender.replyTo ? { replyTo: sender.replyTo } : {}),
-      subject: 'Ironbooks test email',
-      text: [
-        'This is a test email from Ironbooks.',
-        '',
-        `It was sent through ${cfg.host} (port ${cfg.port}) from ${sender.from.address}.`,
-        'If you can read it, your customers will receive the forms you email.',
-      ].join('\n'),
-    });
-    result = { ok: true, message: `Test email sent to ${to}. Check that it arrived (and is not in the spam folder).`, to, from: sender.from.address };
+    await assertMailServerAllowed(ctx, server);
+    const options = transportOptions(server);
+    const out = await effects.email(
+      {
+        from: sender.from.name ? { name: sender.from.name, address: sender.from.address } : sender.from.address,
+        to,
+        ...(sender.replyTo ? { replyTo: sender.replyTo } : {}),
+        subject: 'Ironbooks test email',
+        text: [
+          'This is a test email from Ironbooks.',
+          '',
+          `It was sent through ${server.host} (port ${server.port}) from ${from}.`,
+          'If you can read it, your customers will receive the forms you email.',
+        ].join('\n'),
+      },
+      async (message) => {
+        const transport = mailTransport.create(options);
+        try {
+          return await transport.sendMail(message);
+        } catch (err) {
+          // Plain words also when an agent's queued test fails after its work was saved.
+          throw new ServiceError('VALIDATION', explainMailError(err, { host: server.host, port: server.port, fromEmail: from }));
+        }
+      },
+    );
+    const message = out.sent
+      ? `Test email sent to ${to}. Check that it arrived (and is not in the spam folder).`
+      : out.status === 'previewed'
+        ? `A test email would be sent to ${to} through ${server.host} (port ${server.port}). Nothing is sent in a preview.`
+        : `A test email will be sent to ${to} through ${server.host} (port ${server.port}) once this work is saved. Then check that it arrived (and is not in the spam folder).`;
+    result = { ok: true, message, to, from, sent: out.sent };
   } catch (err) {
-    result = { ok: false, message: explainMailError(err, { host: cfg.host, port: cfg.port, fromEmail: sender.from.address }), to, from: sender.from.address };
+    result = { ok: false, message: explainMailError(err, { host: server.host, port: server.port, fromEmail: from }), to, from, sent: false };
   }
-  if (!input.draft && cfg.source === 'file') {
+  // A test only recorded or queued has not happened: the last result stays as it was.
+  if (!input.draft && server.source === 'file' && (result.sent || !result.ok)) {
     await ctx.db
       .update(companyEmailSettings)
       .set({ lastTestAt: new Date(), lastTestOk: result.ok, lastTestMessage: result.message })

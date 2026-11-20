@@ -1,14 +1,17 @@
 /**
- * Agent full access: the operation registry's own rules (ids, defaults, lookups, search). The
- * completeness checks over every route live in test/agentRegistry.test.ts.
+ * Agent full access: the operation registry's own rules (ids, defaults, lookups, search, the shell
+ * operations). The completeness checks over every route live in test/agentRegistry.test.ts.
  */
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { API_ROUTE_PERMISSIONS, type HttpMethod, type MethodRules } from '@/lib/permissions/routes';
 import { activityForRoute } from '@/lib/permissions/routeActivities';
+import type { ShellOperationDef } from '../contract';
 import { OPERATION_CLASSES } from './classes';
+import { bucketOfRoute } from './classes/buckets';
 import { GENERATED_ROUTES, type GeneratedRoute } from './routes.generated';
+import { SHELL_OPERATIONS } from './shell';
 import {
   FIND_DEFAULT_LIMIT,
   allOperations,
@@ -43,10 +46,34 @@ function shuffled<T>(list: readonly T[], seed: number): T[] {
   return out;
 }
 
-function sources(permissions: Record<string, MethodRules>, classes: ClassificationMap = {}): RegistrySources {
+function sources(
+  permissions: Record<string, MethodRules>,
+  classes: ClassificationMap = {},
+  shell?: readonly ShellOperationDef[],
+): RegistrySources {
   const generated: Record<string, GeneratedRoute> = {};
   for (const p of Object.keys(permissions)) if (GENERATED_ROUTES[p]) generated[p] = GENERATED_ROUTES[p];
-  return { permissions, generated, classes };
+  return { permissions, generated, classes, ...(shell ? { shell } : {}) };
+}
+
+/** A shell operation definition as shell.ts would list it. */
+function shellDef(over: Partial<ShellOperationDef> = {}): ShellOperationDef {
+  return {
+    id: 'shell.company.switch',
+    runner: 'electron',
+    flow: 'switchCompanyFlow',
+    class: 'file',
+    area: null,
+    describe: 'Switch to company file {path}',
+    why: 'Ironbooks closes this company file and opens another one.',
+    input: { path: { type: 'path', required: true, describe: 'The company file to open' } },
+    questions: [],
+    needsSecret: ['file_password'],
+    hostOnly: true,
+    fileAdmin: true,
+    restarts: true,
+    ...over,
+  };
 }
 
 describe('operation ids', () => {
@@ -165,7 +192,7 @@ describe('operation ids', () => {
     for (const seed of [1, 7, 2026]) {
       const permissions = Object.fromEntries(shuffled(Object.entries(API_ROUTE_PERMISSIONS), seed));
       const classes = Object.fromEntries(shuffled(Object.entries(OPERATION_CLASSES), seed + 1));
-      const built = buildOperations({ permissions, generated: GENERATED_ROUTES, classes });
+      const built = buildOperations({ permissions, generated: GENERATED_ROUTES, classes, shell: SHELL_OPERATIONS });
       expect(built.collisions).toEqual([]);
       expect(named(built.operations)).toEqual(real);
     }
@@ -173,6 +200,34 @@ describe('operation ids', () => {
     expect(operationById('invoices.email')?.route).toBe('/api/invoices/[id]/email');
     expect(operationById('bank-transactions.by-id.matches')?.route).toBe('/api/bank-transactions/[id]/matches');
     expect(operationById('bank-transactions.matches')?.route).toBe('/api/bank-transactions/matches');
+  });
+
+  it('never leave the neutral ".post" on a route a classification file names (admin.ts names its own)', () => {
+    // "post" claims nothing: every such route gets a verb from its classification (id).
+    const neutral = allOperations()
+      .filter((o) => o.kind === 'route' && /\.post$/.test(o.id))
+      .filter((o) => bucketOfRoute(o.route) !== 'admin')
+      .map((o) => `${o.id} = POST ${o.route}`);
+    expect(neutral).toEqual([]);
+  });
+
+  it('name what a route does where the rule would mislead', () => {
+    const at = (method: HttpMethod, pattern: string) => operationForRoute(method, pattern)?.id;
+    // A real list whose records live at another address: list and create.
+    expect(at('GET', '/api/bank-accounts')).toBe('bank-accounts.list');
+    expect(at('POST', '/api/bank-accounts')).toBe('bank-accounts.create');
+    // A collection POST that does not create one: the scan of possible errors.
+    expect(realId('POST', '/api/errors')).toBe('errors.create');
+    expect(at('POST', '/api/errors')).toBe('errors.scan');
+    // A GET whose last word is a verb only shows; the POST does it.
+    expect(at('GET', '/api/sales-tax/pay')).toBe('sales-tax.due');
+    // Not "sales-tax.pay": that was the GET's id, and an old read's id never comes to name a payment.
+    expect(at('POST', '/api/sales-tax/pay')).toBe('sales-tax.payments.create');
+    expect(operationById('sales-tax.pay')).toBeNull();
+    expect(at('GET', '/api/pay-liabilities')).toBe('pay-liabilities.due');
+    expect(at('POST', '/api/pay-liabilities')).toBe('pay-liabilities.pay');
+    // The route's own word "post", next to the neutral one.
+    expect(at('POST', '/api/invoices/[id]/post')).toBe('invoices.post-draft');
   });
 });
 
@@ -316,6 +371,150 @@ describe('findOperations', () => {
     for (const op of findOperations({ method: 'DELETE', limit: 200 })) expect(op.method).toBe('DELETE');
     const cls = allOperations()[0].class;
     for (const op of findOperations({ class: cls, limit: 200 })) expect(op.class).toBe(cls);
+  });
+});
+
+describe('shell operations', () => {
+  const perms: Record<string, MethodRules> = {
+    '/api/invoices': { GET: { area: 'customers', action: 'view' }, POST: { area: 'customers', action: 'create' } },
+    '/api/invoices/[id]': { GET: { area: 'customers', action: 'view' } },
+  };
+  const save = shellDef({
+    id: 'files.save',
+    runner: 'server',
+    flow: 'saveStagedFile',
+    class: 'file',
+    area: 'banking',
+    describe: 'Save staged file {fileId} to {folder}',
+    needsSecret: [],
+    hostOnly: false,
+    fileAdmin: false,
+    restarts: false,
+  });
+
+  afterEach(() => {
+    vi.doUnmock('./shell');
+    vi.resetModules();
+  });
+
+  it('join the route operations as kind "shell", after them, with what the definition says', () => {
+    const built = buildOperations(sources(perms, {}, [shellDef(), save]));
+    expect(built.collisions).toEqual([]);
+    expect(built.operations.map((o) => `${o.kind} ${o.id}`)).toEqual([
+      'route invoices.list',
+      'route invoices.create',
+      'route invoices.get',
+      'shell shell.company.switch',
+      'shell files.save',
+    ]);
+    const op = built.operations.find((o) => o.id === 'shell.company.switch')!;
+    expect(op).toEqual({
+      id: 'shell.company.switch',
+      kind: 'shell',
+      route: 'switchCompanyFlow',
+      method: 'POST',
+      params: [],
+      rule: null,
+      area: null,
+      action: null,
+      activity: null,
+      classified: true,
+      class: 'file',
+      describe: 'Switch to company file {path}',
+      availability: 'agent',
+      why: 'Ironbooks closes this company file and opens another one.',
+      dryRun: 'none',
+      body: 'json',
+      output: 'json',
+      confirmFlags: [],
+      sensitiveFields: [],
+      reveal: null,
+      hostOnly: true,
+      fileAdmin: true,
+      needsSecret: ['file_password'],
+      producesSecret: [],
+      effects: [],
+      countField: null,
+      amountField: null,
+      alwaysAsk: true,
+      bodySchema: null,
+    });
+    // An Allow policy or a grant never runs one: it always asks.
+    expect(built.operations.find((o) => o.id === 'files.save')).toMatchObject({
+      kind: 'shell',
+      route: 'saveStagedFile',
+      area: 'banking',
+      hostOnly: false,
+      fileAdmin: false,
+      needsSecret: [],
+      alwaysAsk: true,
+    });
+    expect(Object.isFrozen(op)).toBe(true);
+    expect(Object.isFrozen(op.needsSecret)).toBe(true);
+  });
+
+  it('do not share the definition list (a later change to it changes no operation)', () => {
+    const def = shellDef();
+    const op = buildOperations(sources({}, {}, [def])).operations[0];
+    (def.needsSecret as string[]).push('backup_password');
+    expect(op.needsSecret).toEqual(['file_password']);
+  });
+
+  it('fail closed on a definition whose class is not a risk class', () => {
+    const bad = shellDef({ class: 'whatever' as never });
+    const op = buildOperations(sources({}, {}, [bad])).operations[0];
+    expect(op).toMatchObject({ classified: false, class: 'admin', alwaysAsk: true });
+  });
+
+  it('report an id that is also a route\'s, or another shell operation\'s, as a collision', () => {
+    const clash = buildOperations(sources(perms, {}, [shellDef({ id: 'invoices.create' })]));
+    expect(clash.collisions).toEqual([{ id: 'invoices.create', keys: ['POST /api/invoices', 'POST switchCompanyFlow'] }]);
+    const twice = buildOperations(sources(perms, {}, [shellDef(), shellDef({ flow: 'otherFlow' })]));
+    expect(twice.collisions).toEqual([{ id: 'shell.company.switch', keys: ['POST switchCompanyFlow', 'POST otherFlow'] }]);
+    // A clash with a route's derived id is never resolved by renaming the route ("by-<param>").
+    const derived = buildOperations(sources(perms, {}, [shellDef({ id: 'invoices.get' })]));
+    expect(derived.collisions.map((c) => c.id)).toEqual(['invoices.get']);
+  });
+
+  it('are found by id and by search, never by route, by path or as a handler', async () => {
+    vi.resetModules();
+    vi.doMock('./shell', () => ({ SHELL_OPERATIONS: [shellDef(), save] }));
+    const reg = await import('./registry');
+    const op = reg.operationById('shell.company.switch')!;
+    expect(op).toMatchObject({ kind: 'shell', route: 'switchCompanyFlow' });
+    expect(reg.allOperations().filter((o) => o.kind === 'shell').map((o) => o.id)).toEqual(['shell.company.switch', 'files.save']);
+    expect(reg.findOperations({ query: 'shell.company.switch' })[0].id).toBe('shell.company.switch');
+    expect(reg.findOperations({ query: 'staged file' }).map((o) => o.id)).toContain('files.save');
+    expect(reg.findOperations({ class: 'file', limit: 200 }).map((o) => o.id)).toContain('files.save');
+    // Its "route" is a flow name: no route lookup, no request path and no handler reaches it.
+    expect(reg.operationForRoute('POST', 'switchCompanyFlow')).toBeNull();
+    expect(reg.operationForPath('POST', 'switchCompanyFlow')).toBeNull();
+    expect(reg.operationForPath('POST', '/api/switchCompanyFlow')).toBeNull();
+    await expect(reg.loadRouteHandler(op)).rejects.toThrow(/not an API route/);
+    await expect(reg.loadRouteHandler({ ...op, kind: 'route' })).rejects.toThrow(/not the registered operation/);
+    // The routes are as before.
+    expect(reg.operationById('invoices.email')?.kind).toBe('route');
+    expect(reg.idCollisions()).toEqual([]);
+  });
+
+  it('stop the registry when a shell id clashes with a route', async () => {
+    vi.resetModules();
+    vi.doMock('./shell', () => ({ SHELL_OPERATIONS: [shellDef({ id: 'invoices.email' })] }));
+    const reg = await import('./registry');
+    expect(reg.idCollisions()).toEqual([
+      { id: 'invoices.email', keys: ['POST /api/invoices/[id]/email', 'POST switchCompanyFlow'] },
+    ]);
+    expect(() => reg.operationById('invoices.email')).toThrow(/share an id/);
+    expect(() => reg.allOperations()).toThrow(/share an id/);
+  });
+
+  it('in the real registry, are exactly the definitions of shell.ts', () => {
+    const shell = allOperations().filter((o) => o.kind === 'shell');
+    expect(shell.map((o) => o.id)).toEqual(SHELL_OPERATIONS.map((d) => d.id));
+    for (const def of SHELL_OPERATIONS) {
+      expect(operationById(def.id)).toMatchObject({ kind: 'shell', route: def.flow, rule: null, alwaysAsk: true, dryRun: 'none' });
+      expect(operationForRoute('POST', def.flow)).toBeNull();
+    }
   });
 });
 

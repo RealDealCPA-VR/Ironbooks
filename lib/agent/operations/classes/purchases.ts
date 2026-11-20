@@ -1,6 +1,18 @@
 /**
  * Agent full access: classification of the "purchases" routes (classes/buckets.ts lists the segments).
  * One entry per route + method, keyed "METHOD /api/pattern". Checked by classes/purchases.test.ts.
+ *
+ * Amounts (two-person approval, D8, and a grant's maxAmount), the same rule in every bucket:
+ * amountField names the money the route's ANSWER carries (lib/agent/facts.ts takes the larger of
+ * the body's and the answer's figure, so a typed figure the route ignores cannot lower it). Where the
+ * answer lists one figure per row (a batch count's applied[].glAmount), a '*' path adds them up.
+ * A request with no amount counts as over every amount limit until its dry run. After it the bridge
+ * (lib/agent/bridge.ts factsFor) takes the larger of that figure and the largest SINGLE ledger entry
+ * the run posted (with no amountField, the entry alone), which is only the largest row of a request
+ * that posts an entry per row.
+ *
+ * `id` names an operation where the id rule (registry.ts operationIdFor) would give the neutral
+ * ".post", with a short verb: vendors.bulk.save, inventory.adjust, fifo.adjust.
  */
 import type { ClassificationMap } from '../types';
 
@@ -74,6 +86,7 @@ export const PURCHASES_CLASSES: ClassificationMap = {
   },
   'POST /api/vendors/bulk': {
     class: 'bulk',
+    id: 'vendors.bulk.save',
     describe: 'Add or change several vendors at once',
     countField: 'rows',
     dryRun: 'preview',
@@ -120,7 +133,9 @@ export const PURCHASES_CLASSES: ClassificationMap = {
       'Classed by its riskiest part. One Pay Bills save (payBillsWithCredits) can also apply vendor credits ' +
       'and General Journal credits to existing bills, which is a change, and a save with credits only ' +
       'makes no payment at all (payment is null, so there is no amount and the two-person rule treats ' +
-      'it as above the limit).',
+      'it as above the limit). The amount is the cash paid only: credits applied in the same save are ' +
+      'reported apart in the answer (creditsApplied) and are not counted, so the approval card and the ' +
+      'ledger preview are where a large credit shows.',
     confirmFlags: ['allowDuplicateNumber'],
     amountField: 'payment.amount',
   },
@@ -143,6 +158,7 @@ export const PURCHASES_CLASSES: ClassificationMap = {
   },
   'POST /api/bill-payments/journal-items': {
     class: 'change',
+    id: 'bill-payments.journal-items.apply',
     describe: 'Apply or remove a General Journal vendor credit ({action})',
     why: 'Applies a General Journal credit to a bill or amount owed, or takes one off: applying credits is a change.',
     amountField: 'amount',
@@ -285,6 +301,7 @@ export const PURCHASES_CLASSES: ClassificationMap = {
   'GET /api/inventory': { class: 'read', describe: 'Show the inventory valuation' },
   'POST /api/inventory': {
     class: 'enter',
+    id: 'inventory.adjust',
     describe: 'Adjust the quantity of item {itemId} ({action})',
     amountField: 'glAmount',
   },
@@ -292,9 +309,12 @@ export const PURCHASES_CLASSES: ClassificationMap = {
     class: 'bulk',
     describe: 'Record a physical count of several items on {date}',
     why:
-      'Posts one quantity adjustment per counted item. There is no single posted amount: each counted ' +
-      'item has its own glAmount under applied in the answer, so no amountField is set.',
+      'Posts one quantity adjustment per counted item, each its own ledger entry. The amount is the size of ' +
+      'all of them together: each counted item has its own glAmount under applied in the answer, and ' +
+      'applied.*.glAmount adds them up (shrinkage and overage both count by size). Without it the bridge ' +
+      'would judge the count by its largest single adjustment.',
     countField: 'counts',
+    amountField: 'applied.*.glAmount',
   },
   'GET /api/inventory/center': { class: 'read', describe: 'List items in the Inventory Center' },
   'GET /api/inventory/center/[id]': { class: 'read', describe: 'Show inventory item {id}' },
@@ -324,7 +344,8 @@ export const PURCHASES_CLASSES: ClassificationMap = {
   'GET /api/inventory/worksheet': {
     class: 'read',
     describe: 'Show the physical inventory worksheet',
-    why: '?format=csv answers the same worksheet as a CSV file (text/csv, a download) instead of JSON.',
+    why: '?format=csv answers the same worksheet as a CSV file (text/csv, a download) instead of JSON, so the output is marked "file": a caller must go by the answer\'s content type, never parse it as JSON unseen.',
+    output: 'file',
   },
 
   // Inventory sites, bins and per-site reorder points (Advanced Inventory).
@@ -408,6 +429,7 @@ export const PURCHASES_CLASSES: ClassificationMap = {
   'GET /api/fifo': { class: 'read', describe: 'Show the FIFO inventory valuation' },
   'POST /api/fifo': {
     class: 'enter',
+    id: 'fifo.adjust',
     describe: 'Receive or use stock of item {itemId} at FIFO cost ({action})',
     amountField: 'glAmount',
   },

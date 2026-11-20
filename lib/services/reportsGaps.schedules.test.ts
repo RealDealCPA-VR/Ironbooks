@@ -135,13 +135,15 @@ describe('export files are replaced atomically (leftover)', () => {
     fs.writeFileSync(file, 'LAST GOOD EXPORT');
     // Same day again: the run writes the same file name; the disk fills up half-way through.
     await db.update(reportSchedules).set({ nextRunAt: d('2026-03-01') }).where(eq(reportSchedules.companyId, ctx.companyId));
-    const real = fs.writeFileSync;
-    const spy = vi.spyOn(fs, 'writeFileSync').mockImplementation(((p: fs.PathOrFileDescriptor, data: string | NodeJS.ArrayBufferView, ...rest: unknown[]) => {
+    // Exports are saved through the effects outbox (lib/effects.ts effects.writeFile), which writes
+    // with fs.promises: the disk fills up there.
+    const real = fs.promises.writeFile;
+    const spy = vi.spyOn(fs.promises, 'writeFile').mockImplementation((async (p: fs.PathLike, data: string | NodeJS.ArrayBufferView, ...rest: unknown[]) => {
       // Only the export folder runs out of space (the company file's own log keeps working).
-      if (!String(p).startsWith(OUT)) return (real as (...a: unknown[]) => void)(p, data, ...rest);
-      real(p, typeof data === 'string' ? data.slice(0, 5) : 'PART');
+      if (!String(p).startsWith(OUT)) return (real as (...a: unknown[]) => Promise<void>)(p, data, ...rest);
+      await real(p, typeof data === 'string' ? data.slice(0, 5) : 'PART');
       throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' });
-    }) as typeof fs.writeFileSync);
+    }) as typeof fs.promises.writeFile);
     try {
       const [second] = await runDueSchedules(ctx, { now: d('2026-03-01'), outDir: OUT });
       expect(second.status).toBe('failed');

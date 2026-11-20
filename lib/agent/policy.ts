@@ -182,7 +182,10 @@ export function canBeAllowed(cls: RiskClass): boolean {
  * the preset's value. (Kept here because the shared types only have the resolved AgentPolicy.)
  */
 export interface PolicyLimits {
-  /** null: bulk requests are not capped (only while bulk is not allowed; see resolvePolicy). */
+  /**
+   * Most records one request may change. It holds for every request that reports a count, bulk or
+   * not (see decide). null: not capped (only while bulk is not allowed; see resolvePolicy).
+   */
   bulkCap?: number | null;
   /** Decimal text, or null for off. */
   twoPersonOver?: string | null;
@@ -418,14 +421,27 @@ export function classRank(cls: RiskClass): number {
 }
 
 /**
- * Classes whose requests land in the books, so the closing date applies. `prepare` is left out:
- * it never reaches the books (plan 4.2), and a person may stage old statement lines or tick an old
- * reconciliation without the closed-period right, so an agent with the same role may too.
+ * Classes whose requests can land in the books, so the closing date applies to them. Not only the
+ * everyday writing classes: an operation is classed by its riskiest effect, so some that write are
+ * filed elsewhere. Income Tracker's convert enters invoices but is `outside`, confirming printed
+ * checks writes check numbers but is `print`, and a settings or company-file change can carry a
+ * date too. `admin` and `secret` stay in because an operation nobody classified is judged as
+ * `admin`, and it may write anything (fail closed).
+ *
+ * Left out: the two read classes, and `prepare`, which never reaches the books (plan 4.2). A person
+ * may stage old statement lines or tick an old reconciliation without the closed-period right, so
+ * an agent with the same role may too.
  */
-const CLOSING_DATE_CLASSES: readonly RiskClass[] = ['enter', 'change', 'bulk', 'remove'];
+const CLOSING_DATE_CLASSES: readonly RiskClass[] = RISK_CLASSES.filter(
+  (c) => c !== 'read' && c !== 'read_sensitive' && c !== 'prepare',
+);
 
-/** Classes where a reconciled-edit or ledger-rewrite flag makes the request closed-period work. */
-const HISTORY_FLAG_CLASSES: readonly RiskClass[] = ['prepare', ...CLOSING_DATE_CLASSES];
+/**
+ * Classes where a reconciled-edit or ledger-rewrite flag makes the request closed-period work. Only
+ * the everyday writing classes: on the others the flag already keeps a grant from covering the
+ * request (grantCovers), and their setting can never be Allow.
+ */
+const HISTORY_FLAG_CLASSES: readonly RiskClass[] = ['prepare', 'enter', 'change', 'bulk', 'remove'];
 
 /** Warning flags that rewrite reconciled or posted history: always a person's question (plan 5.6). */
 export const PERIOD_CONFIRM_FLAGS: readonly string[] = ['allowReconciledEdit', 'allowLedgerRewrite'];
@@ -499,7 +515,7 @@ function closingDateWork(operation: Pick<Operation, 'classified' | 'class'>, fac
   return baseClass(operation) === 'period' || closedPeriodWrite(operation, facts);
 }
 
-/** A book-writing request dated on or before the closing date. */
+/** A request that can write to the books, dated on or before the closing date (any class in CLOSING_DATE_CLASSES). */
 function closedPeriodWrite(operation: Pick<Operation, 'classified' | 'class'>, facts: RequestFacts): boolean {
   return CLOSING_DATE_CLASSES.includes(baseClass(operation)) && closedPeriodAsked(facts);
 }
@@ -534,7 +550,7 @@ export function roleProblem(access: EffectiveAccess, operation: Operation): stri
   const rule = operation.rule;
   if (rule === 'public' || rule === 'self' || rule === 'member') return null;
   if (rule && typeof rule === 'object') return checkRight(access, rule.area, rule.action, operation.activity);
-  if (operation.kind === 'route') {
+  if (routeWithoutRule(operation)) {
     // A route with no entry in the permission map is denied to everyone, an Admin too.
     return 'a permission rule, and Ironbooks has none for this request';
   }
@@ -544,19 +560,31 @@ export function roleProblem(access: EffectiveAccess, operation: Operation): stri
   return access.isAdmin ? null : 'the Admin role';
 }
 
+/**
+ * A route the permission map has no rule for. roleProblem refuses it for every role, an Admin too,
+ * so decide tells the agent to ask a person rather than to ask for a role change that cannot help.
+ */
+function routeWithoutRule(operation: Pick<Operation, 'rule' | 'kind'>): boolean {
+  const rule = operation.rule;
+  if (rule === 'public' || rule === 'self' || rule === 'member') return false;
+  if (rule && typeof rule === 'object') return false;
+  return operation.kind === 'route';
+}
+
 /** Whether the agent's role allows the operation at all (see roleProblem). */
 export function roleAllows(access: EffectiveAccess, operation: Operation): boolean {
   return roleProblem(access, operation) === null;
 }
 
 /**
- * The role flags a request needs on top of the route's right, as a person would: entering or
- * changing on or before the closing date needs "Modify transactions on or before the closing date"
- * (without it a person cannot use the closing-date password either), and unmasking needs the
- * matching View flag. Moving the closing date itself needs only the route's right, as for a person.
- * The plan moves these flags from the agent clamp into the classes; the role is still the ceiling,
- * so an agent whose role lacks the flag is refused instead of asking for something its role could
- * never run.
+ * The role flags a request needs on top of the route's right, as a person would: anything that can
+ * write to the books dated on or before the closing date needs "Modify transactions on or before
+ * the closing date" (without it a person cannot use the closing-date password either), whatever
+ * class the operation is filed under, and unmasking needs the matching View flag. Moving the
+ * closing date itself needs only the route's right, as for a person, unless the request is itself
+ * dated on or before the closing date. The plan moves these flags from the agent clamp into the
+ * classes; the role is still the ceiling, so an agent whose role lacks the flag is refused instead
+ * of asking for something its role could never run.
  */
 export function flagsNeeded(operation: Pick<Operation, 'classified' | 'class' | 'reveal'>, facts: RequestFacts): Flag[] {
   const out: Flag[] = [];
@@ -700,8 +728,8 @@ export function minutesToEndOfDay(now: string, utcOffsetMinutes: number): number
 
 /**
  * Classes whose standing window only an Admin may give: D5 lets an Admin give a short window for
- * a batch of outside sends (month-end statements). ApprovalNeeds has no field for this, so the
- * approval center asks `grantNeedsAdmin` before offering the window to anyone else.
+ * a batch of outside sends (month-end statements). approvalNeeds reports it as `grantAdminOnly`,
+ * and the approval center can also ask `grantNeedsAdmin` directly.
  */
 export const ADMIN_GRANT_CLASSES: readonly RiskClass[] = ['outside'];
 
@@ -717,18 +745,47 @@ export function grantNeedsAdmin(operation: Pick<Operation, 'classified' | 'class
 const GRANTABLE_STRICTNESS = { yes: 0, capped: 1, short: 2, no: 3 } as const;
 type Grantable = keyof typeof GRANTABLE_STRICTNESS;
 
+/** The two classes that only read. A read never needs two people, whatever amount it names. */
+const READ_CLASSES: readonly RiskClass[] = ['read', 'read_sensitive'];
+
 /**
- * Whether the amount is above the agent's two-person threshold. An amount that cannot be read is
- * treated as above it, and so is a missing one when the operation has an amount (`amountField`):
- * the caller could not read it, so nobody can show it is below the threshold.
+ * Classes that change the books whether or not the operation names its amount: with a two-person
+ * threshold set, a request of one of these whose amount is not known counts as above it (D8).
+ */
+const TWO_PERSON_BOOK_CLASSES: readonly RiskClass[] = ['enter', 'change', 'bulk', 'remove', 'period'];
+
+/**
+ * Whether the request needs two different people (D8): a threshold is set and the amount is above
+ * it, compared as decimals by size. Reads never do. When nobody can show the amount is below the
+ * threshold, it counts as above it:
+ *  - an amount that cannot be read;
+ *  - no amount, on a request that changes the books (enter, change, bulk, remove, period, a
+ *    request raised to period by its closing date), or on any other operation that has an amount
+ *    (`amountField`: an outside send or a print run that pays or posts money);
+ *  - no amount, and the caller did not say what the operation is, or nobody classified it.
+ * The caller (lib/agent/operate.ts) decides a second time with the facts of the dry run. That
+ * second decision clears this rule only when the dry run reports an amount. Today it often does
+ * not: an operation with no `amountField` (a new customer, a memo edit, a list delete, a new
+ * closing date) whose dry run posts nothing to the ledger still has no amount, so with any
+ * threshold set it needs two people. That fails closed; the fix belongs to whoever builds the
+ * facts (report "0.00" when a dry run posted nothing), not to this rule.
  */
 export function needsTwoPerson(
   policy: Pick<AgentPolicy, 'twoPersonOver'>,
-  facts: Pick<RequestFacts, 'amount'>,
-  operation?: Pick<Operation, 'amountField'> | null,
+  facts: Pick<RequestFacts, 'amount'> & Partial<RequestFacts>,
+  operation?: (Pick<Operation, 'amountField'> & Partial<Pick<Operation, 'classified' | 'class'>>) | null,
 ): boolean {
   if (policy.twoPersonOver === null || policy.twoPersonOver === undefined) return false;
-  if (facts.amount === null || facts.amount === undefined) return Boolean(operation?.amountField);
+  // Every class the request falls under, or null when that cannot be told.
+  const classes =
+    operation && operation.classified === true && isRiskClass(operation.class)
+      ? requestClasses({ classified: true, class: operation.class }, facts as RequestFacts)
+      : null;
+  if (classes && classes.every((c) => READ_CLASSES.includes(c))) return false;
+  if (facts.amount === null || facts.amount === undefined) {
+    if (!classes) return true;
+    return classes.some((c) => TWO_PERSON_BOOK_CLASSES.includes(c)) || Boolean(operation?.amountField);
+  }
   const limit = parseDecimal(policy.twoPersonOver) ?? new Decimal(0);
   const amount = parseDecimal(facts.amount);
   if (!amount) return true;
@@ -737,22 +794,103 @@ export function needsTwoPerson(
 
 type ApproverFlag = NonNullable<ApprovalNeeds['flag']>;
 
+/** The reveal kinds the engine knows; any other value still asks, but only an Admin may approve it. */
+const KNOWN_REVEALS: readonly string[] = ['ssn', 'account_numbers', 'payroll'];
+
 /**
- * Every flag the approver needs themselves: the closed-period right for closing-date work, and the
- * matching View flag for a reveal. ApprovalNeeds holds only one, so `decide` refuses a request that
- * needs two (the agent splits it) rather than let an approver with only one of them approve both.
+ * Field names that lib/permissions/mask.ts masks, spelled as it spells them, by the View flag that
+ * shows them in full (its SSN_KEYS and ACCOUNT_KEYS, which it does not export). A listed field is
+ * compared on the last part of its dotted path, ignoring case. policy.test.ts masks each name with
+ * only its flag and with only the other one, so a name mask.ts stops masking, or one filed under
+ * the wrong flag, fails there instead of asking the wrong person to approve a protected read.
  */
-function approverFlags(operation: Operation, cls: RiskClass, facts: RequestFacts): ApproverFlag[] {
-  const out: ApproverFlag[] = [];
-  if (cls === 'period' && closingDateWork(operation, facts)) out.push('closedPeriod');
-  const revealFlag = revealFlagFor(operation, facts);
-  if (revealFlag) out.push(revealFlag);
-  return out;
+export const FIELD_FLAGS: Readonly<Record<string, ApproverFlag>> = Object.freeze({
+  ssn: 'sensitivePayroll',
+  employeeSsn: 'sensitivePayroll',
+  taxId: 'sensitivePayroll',
+  accountNumber: 'fullAccountNumbers',
+  routingNumber: 'fullAccountNumbers',
+  bankAccountNumber: 'fullAccountNumbers',
+});
+
+const FIELD_FLAGS_BY_LOWER_NAME: ReadonlyMap<string, ApproverFlag> = new Map(
+  Object.entries(FIELD_FLAGS).map(([name, flag]) => [name.toLowerCase(), flag]),
+);
+
+function fieldFlag(path: unknown): ApproverFlag | null {
+  if (typeof path !== 'string') return null;
+  const last = (path.split('.').pop() ?? '').trim().toLowerCase();
+  return FIELD_FLAGS_BY_LOWER_NAME.get(last) ?? null;
+}
+
+/** Areas whose protected data is payroll data when nothing else names what it is. */
+const PAYROLL_AREAS: readonly Area[] = ['payroll', 'reports_payroll'];
+
+/** The View flag for a reveal kind (as revealFlagFor reads it: anything but account numbers is payroll). */
+function revealKindFlag(kind: NonNullable<Operation['reveal']>): ApproverFlag {
+  return kind === 'account_numbers' ? 'fullAccountNumbers' : 'sensitivePayroll';
+}
+
+/**
+ * The View flags whoever approves must hold for the protected data a request would show, and
+ * whether the kind of data cannot be told (then only an Admin may approve). Null when the request
+ * shows no protected data.
+ *
+ *  - A reveal on an operation that names what it reveals unmasks only that kind: its flag.
+ *  - A `read_sensitive` operation shows its protected data with or without a reveal, so the
+ *    approver needs the flag of everything it shows: the kind it names, and every sensitive field
+ *    it lists (SSNs and tax IDs: "View sensitive payroll data"; account and routing numbers: "View
+ *    full bank / account numbers"). The same goes for a reveal on an operation that names nothing.
+ *  - When neither names a kind, a protected read in payroll (or the payroll reports) is payroll
+ *    data. Otherwise, or when a listed field is not one of those, the kind cannot be told, and an
+ *    Admin approves.
+ */
+function protectedDataRights(
+  operation: Pick<Operation, 'classified' | 'class' | 'reveal' | 'sensitiveFields' | 'area'>,
+  facts: RequestFacts,
+): { flags: ApproverFlag[]; unknown: boolean } | null {
+  const own = baseClass(operation);
+  const revealing = revealAsked(facts);
+  if (!revealing && own !== 'read_sensitive') return null;
+
+  const kind = operation.reveal ?? null;
+  const knownKind = kind !== null && KNOWN_REVEALS.includes(kind);
+  if (own !== 'read_sensitive' && kind) return { flags: [revealKindFlag(kind)], unknown: !knownKind };
+
+  const flags: ApproverFlag[] = [];
+  const add = (f: ApproverFlag) => {
+    if (!flags.includes(f)) flags.push(f);
+  };
+  let unknown = kind !== null && !knownKind;
+  if (kind) add(revealKindFlag(kind));
+  const fields: unknown[] = Array.isArray(operation.sensitiveFields) ? operation.sensitiveFields : [];
+  for (const path of fields) {
+    const f = fieldFlag(path);
+    if (f) add(f);
+    else unknown = true;
+  }
+  if (flags.length === 0 && operation.area !== null && PAYROLL_AREAS.includes(operation.area)) add('sensitivePayroll');
+  if (flags.length === 0) unknown = true;
+  return { flags, unknown };
+}
+
+/**
+ * Every flag the approver needs themselves, in the order the card shows them: the closed-period
+ * right for closing-date work, then the View flags for protected data. `admin` is set when the
+ * kind of protected data cannot be told.
+ */
+function approverRights(operation: Operation, facts: RequestFacts): { flags: ApproverFlag[]; admin: boolean } {
+  const flags: ApproverFlag[] = [];
+  if (closingDateWork(operation, facts)) flags.push('closedPeriod');
+  const data = protectedDataRights(operation, facts);
+  for (const f of data?.flags ?? []) if (!flags.includes(f)) flags.push(f);
+  return { flags, admin: data?.unknown === true };
 }
 
 /**
  * Who must approve a request, what they type, and whether they may give standing permission.
- * `flag` holds one flag; a request that needs two is refused by `decide` before it is ever asked.
+ * `flags` holds every flag the approver needs themselves (a request dated in a closed period that
+ * also reveals SSNs needs both); `flag` is the first of them, for callers that read only one.
  */
 export function approvalNeeds(
   operation: Operation,
@@ -762,11 +900,10 @@ export function approvalNeeds(
 ): ApprovalNeeds {
   const own = baseClass(operation);
   const closing = closingDateWork(operation, facts);
-
-  const flag: ApprovalNeeds['flag'] = approverFlags(operation, cls, facts)[0] ?? null;
+  const rights = approverRights(operation, facts);
 
   const secrets: SecretKind[] = [...(operation.needsSecret ?? [])];
-  if (cls === 'period' && closing && !secrets.includes('closing_password')) secrets.push('closing_password');
+  if (closing && !secrets.includes('closing_password')) secrets.push('closing_password');
 
   // The strictest over every class the request falls under, not only the class it is judged
   // under: a reveal on an outside send is still judged as outside, but a reveal is one at a time (D6).
@@ -777,10 +914,13 @@ export function approvalNeeds(
   if (revealAsked(facts) || operation.alwaysAsk || !operation.classified) grantable = 'no';
 
   return {
-    admin: ADMIN_APPROVAL_CLASSES.includes(cls) || ADMIN_APPROVAL_CLASSES.includes(own) || !operation.classified,
+    admin:
+      ADMIN_APPROVAL_CLASSES.includes(cls) || ADMIN_APPROVAL_CLASSES.includes(own) || !operation.classified || rights.admin,
     fileAdmin: operation.fileAdmin === true,
     hostOnly: operation.hostOnly === true,
-    flag,
+    flag: rights.flags[0] ?? null,
+    flags: rights.flags,
+    grantAdminOnly: grantNeedsAdmin(operation, facts),
     secrets,
     twoPerson: needsTwoPerson(policy, facts, operation),
     grantable,
@@ -809,17 +949,26 @@ const CLASS_DOING: Record<RiskClass, string> = {
   secret: 'handle passwords and keys',
 };
 
+// Every refusal says what the agent can do instead: ask a person to do it, ask an Admin to change
+// the role or the agent's settings, split the work, or send the request without the part refused.
 const ROLE_HINT = "Ask an Admin to change this agent's role.";
-const AGENTS_TAB = 'An Admin can change this in Users & Roles > Agents.';
+// A route with no permission rule is refused to every role, an Admin too: a role change cannot help.
+const NO_RULE =
+  'No role can allow this request, not even Admin, because Ironbooks has no permission rule for it. Ask a person to do it in Ironbooks.';
+const NEVER_HINT = "Ask a person to do it instead, or ask an Admin to change this agent's settings in Users & Roles > Agents.";
 const PAUSED =
-  'This agent is paused, so it cannot do anything right now. A person can turn it back on in Users & Roles > Agents.';
-const PERSON_ONLY = 'Only a person can do this, signed in as themselves. It is not something an agent can ask for.';
-const HARD_FLOOR = "Agents can never do this, even with a person's approval. A person can do it in Ironbooks.";
+  'This agent is paused, so it cannot do anything right now. Ask a person to turn it back on in Users & Roles > Agents, then try again.';
+const PERSON_ONLY =
+  'Only a person can do this, signed in as themselves, so it is not something an agent can ask for. Ask a person to do it in Ironbooks.';
+const HARD_FLOOR = "Agents can never do this, even with a person's approval. Ask a person to do it in Ironbooks.";
 
-const TWO_APPROVER_FLAGS =
-  'This request asks to see protected data and to work on or before the closing date at once, and ' +
-  'those are approved by different rights. Send it without asking to see the full values, then ask ' +
-  'for them in a separate request.';
+/** What the agent can do when its role lacks a flag the request needs. */
+const FLAG_HINT: Record<Flag, string> = {
+  closedPeriod:
+    "Ask a person who may change entries on or before the closing date to do it, or ask an Admin to change this agent's role.",
+  sensitivePayroll: "Send the request again without asking to see the full values, or ask an Admin to change this agent's role.",
+  fullAccountNumbers: "Send the request again without asking to see the full values, or ask an Admin to change this agent's role.",
+};
 
 /** A count that can be checked against a cap: a whole number, zero or more. */
 function isCount(n: unknown): n is number {
@@ -845,10 +994,12 @@ function refuse(code: RefusalCode, message: string, cls: RiskClass): PolicyDecis
 
 /**
  * Decide one request: refuse, run (now, or under a grant) or ask a person. In order:
- * paused agent; not open to agents (person only, hard floor); the role; the policy for every class
- * the request falls under (the area's setting first); the bulk cap; a request that would need two
- * approver flags; then Allow runs (bulk work only when its count is known and within the cap), and
- * Ask runs under a live grant that covers it or becomes a permission request.
+ * paused agent; not open to agents (person only, hard floor); the role, with the flags the request
+ * needs; the policy for every class the request falls under (the area's setting first); the count
+ * cap; then Allow runs (bulk work only when its count is known and within the cap, and nothing
+ * that needs two people), and Ask runs under a live grant that covers it or becomes a permission
+ * request. A request that needs more than one approver flag is asked with all of them
+ * (`needs.flags`), never refused for it.
  */
 export function decide(input: PolicyInput): PolicyDecision {
   const { access, policy, operation, facts, grants, now } = input;
@@ -860,10 +1011,13 @@ export function decide(input: PolicyInput): PolicyDecision {
   if (operation.availability !== 'agent') return refuse('hard_floor', HARD_FLOOR, cls);
 
   const missing = roleProblem(access, operation);
-  if (missing) return refuse('role', `Your role does not allow this: it needs ${missing}. ${ROLE_HINT}`, cls);
+  if (missing) {
+    if (routeWithoutRule(operation)) return refuse('role', NO_RULE, cls);
+    return refuse('role', `Your role does not allow this: it needs ${missing}. ${ROLE_HINT}`, cls);
+  }
   for (const flag of flagsNeeded(operation, facts)) {
     if (!access.flags?.[flag]) {
-      return refuse('role', `Your role does not allow this: it needs "${flagLabel(flag)}". ${ROLE_HINT}`, cls);
+      return refuse('role', `Your role does not allow this: it needs "${flagLabel(flag)}". ${FLAG_HINT[flag] ?? ROLE_HINT}`, cls);
     }
   }
 
@@ -879,20 +1033,21 @@ export function decide(input: PolicyInput): PolicyDecision {
   if (setting === 'never') {
     const c = neverClass ?? cls;
     const inArea = operation.area && policy.areas?.[operation.area]?.[c] !== undefined ? ` in ${areaLabel(operation.area)}` : '';
-    return refuse('never', `An Admin has not allowed agents to ${CLASS_DOING[c]}${inArea}. ${AGENTS_TAB}`, cls);
+    return refuse('never', `An Admin has not allowed agents to ${CLASS_DOING[c]}${inArea}. ${NEVER_HINT}`, cls);
   }
 
-  // The bulk cap holds whatever the setting, under a grant too: the person splits the work. A
-  // count that was given but is not a whole number of records is above any cap.
+  // The count cap. It holds for EVERY operation whose request reports a count, not only class
+  // `bulk` (the stricter reading of "most records one request may change"): a batch void filed
+  // under `remove`, a queue of sends under `outside` or a print-queue confirm under `print` changes
+  // as many records as a bulk request does. It holds whatever the setting, under a grant too: the
+  // agent splits the work. A count that was given but is not a whole number of records is above any
+  // cap. A request with no count is not refused here; bulk work then asks (below).
   const cap = policy.bulkCap;
   const count: unknown = facts.count;
   const countGiven = count !== null && count !== undefined;
   if (typeof cap === 'number' && countGiven && !(isCount(count) && count <= cap)) {
     return refuse('bulk_cap', bulkCapMessage(count, cap), cls);
   }
-
-  // A request that needs two approver flags cannot be asked as one question (see approverFlags).
-  if (approverFlags(operation, cls, facts).length > 1) return refuse('never', TWO_APPROVER_FLAGS, cls);
 
   // Bulk work runs without a person only when its size is known to be within a cap (plan 4.2:
   // "Yes, with a per-agent count cap"). An unknown count (a request over every waiting line, a

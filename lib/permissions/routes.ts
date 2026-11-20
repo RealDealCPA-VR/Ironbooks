@@ -203,9 +203,29 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   // Agent access (AGENT_ACCESS.md): an Admin lets an AI agent read the books. Admin only (service),
   // and made or removed only on the computer that holds the company file (the routes).
   '/api/agents': r('users', 'GET POST'),
-  '/api/agents/[id]': r('users', 'DELETE:modify'),
+  '/api/agents/[id]': r('users', 'GET PATCH DELETE:modify'),
+  // Agent full access (plan 7.1): pause one agent or every agent (the Integrated Applications
+  // switch, one click away), its standing permissions and what it did. Never an agent's (handlers).
+  '/api/agents/[id]/pause': r('users', 'POST:modify'),
+  '/api/agents/pause-all': r('users', 'POST:modify'),
+  '/api/agents/[id]/grants': r('users', 'GET'),
+  '/api/agents/[id]/activity': r('users', 'GET'),
+  // The approval center (plan 7.2): who may approve, deny or take back standing permission is
+  // decided per request by the services (the approver must be allowed the operation itself), so
+  // any member reaches the routes. Never an agent: the handlers refuse a context that has one.
+  '/api/agent-requests': kind('member', 'GET'),
+  '/api/agent-requests/count': kind('member', 'GET'),
+  '/api/agent-requests/batch-approve': kind('member', 'POST'),
+  '/api/agent-requests/[id]': kind('member', 'GET'),
+  '/api/agent-requests/[id]/approve': kind('member', 'POST'),
+  '/api/agent-requests/[id]/deny': kind('member', 'POST'),
+  '/api/agent-grants/[id]': kind('member', 'DELETE'),
   // For the agent itself: who it is here and which books these are (a chosen set of facts).
   '/api/agent/whoami': kind('member', 'GET'),
+  // For the agent itself: its own permission requests, and one of them with a long poll for the
+  // answer. The handlers refuse a person and only ever answer the agent's own requests.
+  '/api/agent/requests': kind('member', 'GET'),
+  '/api/agent/requests/[id]': kind('member', 'GET'),
   // The one route an agent's changes go through. Each action is checked against the route a
   // person would use for the same thing, and against the agent's mode (lib/agent/actions.ts).
   '/api/agent/actions': kind('member', 'POST'),

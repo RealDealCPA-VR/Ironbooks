@@ -43,8 +43,8 @@ export const CLASS_BUCKETS = {
   ],
   admin: [
     'users', 'roles', 'file-lock', 'file-protection', 'unlock', 'sessions', 'single-user', 'auth',
-    'device-security', 'handshake', 'agent', 'agents', 'backup', 'backups', 'condense', 'integrity', 'portable',
-    'company-file', 'companies', 'sandbox',
+    'device-security', 'handshake', 'agent', 'agents', 'agent-requests', 'agent-grants', 'backup', 'backups',
+    'condense', 'integrity', 'portable', 'company-file', 'companies', 'sandbox',
   ],
 } as const;
 

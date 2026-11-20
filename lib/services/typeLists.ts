@@ -9,6 +9,7 @@
 import { and, asc, eq } from 'drizzle-orm';
 import { customerTypes, jobTypes, vendorTypes, vendors } from '@/lib/db/schema';
 import { type ServiceContext, inTransaction, notFound, validation, writeAudit } from './_base';
+import { maskForContext } from './access';
 import { assertListDeleteAllowed } from './accountantCopy/guard';
 import { findReferences } from './lists/references';
 
@@ -167,7 +168,11 @@ export async function assertTypeAssignable(
   if (!row.isActive) throw validation(`That ${TYPE_LABEL[kind].toLowerCase()} is inactive. Pick an active one, or make it active on the Lists page.`);
 }
 
-/** Assign (or clear, with null) a vendor's type. */
+/**
+ * Assign (or clear, with null) a vendor's type. Answers the vendor masked like every other vendor
+ * read (lib/services/vendors.ts): the row holds the tax ID (a sole proprietor's SSN) and the
+ * account number, which a caller without the matching right sees as the last 4 digits only.
+ */
 export async function assignVendorType(ctx: ServiceContext, vendorId: string, vendorTypeId: string | null) {
   const [before] = await ctx.db
     .select()
@@ -188,6 +193,6 @@ export async function assignVendorType(ctx: ServiceContext, vendorId: string, ve
       oldValues: { vendorTypeId: before.vendorTypeId },
       newValues: { vendorTypeId },
     });
-    return row;
+    return maskForContext(ctx, row);
   });
 }

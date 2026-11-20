@@ -1,32 +1,64 @@
 'use client';
 /**
- * Users & Roles > Agents (AGENT_ACCESS.md): let an AI agent read this company's books.
+ * Users & Roles > Agents (AGENT_ACCESS.md; full access plan 7.1): let an AI agent work in this
+ * company's books.
  *
- * An Admin gives the agent a name, the same kind of role a person has (never Admin) and a mode,
- * and gets an access token ONCE, with the settings to paste into Claude Code or Claude Desktop.
- * The list shows each agent's role, mode and last use, and Remove takes its access away at once.
+ * An Admin gives the agent a name, the same kind of role a person has (Admin included, D1, with a
+ * plain warning) and a preset (what it may do without asking; "Ask for every change" unless
+ * another is chosen, D2), and gets an access token ONCE, with the settings to paste into Claude
+ * Code or Claude Desktop. The list shows each agent's role, preset and last use; opening one shows
+ * its detail page (app/users/agents/AgentDetailView.tsx): the policy grid, limits, standing
+ * permissions, activity, Pause and Remove. Remove takes its access away at once.
  *
- * Agents are made and removed only on the computer that holds the company file; on another
- * computer this tab is a read-only list. The rules are enforced in lib/services/agents.ts and
- * lib/agentContext.ts; this component only presents them.
+ * The role is the most an agent can ever ask for and the preset what it may do unasked, so the tab
+ * says plainly what each choice means for safety (plan 11.1).
+ *
+ * Agents are made, changed and removed only on the computer that holds the company file; on another
+ * computer this tab lists, and an agent can still be paused from there. The rules are enforced in
+ * lib/services/agents.ts, agentPolicies.ts and lib/agentContext.ts; this component only presents them.
  */
 import { useCallback, useEffect, useState } from 'react';
-import { Bot, Copy, Plus, Trash2 } from 'lucide-react';
+import { Bot, Copy, Plus, Settings2, Trash2 } from 'lucide-react';
 import { Badge, Button, Card, ConfirmDialog, Input, Label, Modal, PageSkeleton, Table, Td, Th, Tr, toast } from '@/components/ui';
 import { api } from '@/lib/client';
-import { AGENT_MODES, AGENT_MODE_LABELS, type AgentMode } from '@/lib/permissions/agentAccess';
+import type { AgentMode } from '@/lib/permissions/agentAccess';
+import { ADMIN_ROLE_KEY } from '@/lib/permissions/model';
+import type { AgentPreset } from '@/lib/agent/operations/types';
+import AgentDetailView from './agents/AgentDetailView';
+import PresetChoice from './agents/PresetChoice';
+import {
+  ADMIN_ROLE_WARNING,
+  ALL_PAUSED_NOTE,
+  ALL_PAUSED_TITLE,
+  NEW_AGENT_PRESET,
+  ROLE_AND_PRESET_NOTE,
+  ROLE_HELP,
+  presetLabelOf,
+  presetSummary,
+  when,
+} from './agents/words';
 
 interface Agent {
   id: string;
   name: string;
   roleNames: string[];
+  /** What it may do without asking. An older server lists only the mode. */
+  preset?: AgentPreset;
   mode: AgentMode;
+  /** ISO time a person paused it, or null. */
+  pausedAt?: string | null;
   tokenPrefix: string;
   createdAt: string;
   createdByName: string | null;
   lastUsedAt: string | null;
   status: 'active' | 'revoked';
   unattended?: boolean;
+  /**
+   * How many Allow / Ask / Never changes it has from its preset (stored overrides), so the list
+   * never shows an adjusted agent as its plain preset. Left out by a server that does not send it
+   * yet: the list then shows the preset's name, and the detail page the count.
+   */
+  overrideCount?: number;
 }
 interface Connection {
   command: string;
@@ -42,13 +74,6 @@ interface RoleOption {
   builtin: boolean;
 }
 
-const MODE_HELP: Record<AgentMode, string> = {
-  read_only: 'Looks at lists, registers and reports. Changes nothing.',
-  propose:
-    'Drafts transactions. Each one waits for a person to approve it (Ask AI > Waiting for your approval) before anything is entered. It may bring in bank statement lines and tick off a reconciliation it started, since neither changes the books; finishing one waits for approval.',
-  post: 'Enters, edits and voids transactions itself, within its role. Never on or before the closing date, and never deletes.',
-};
-
 /** The one switch that lets an agent work with nobody at the computer. Off unless ticked. */
 export const UNATTENDED_LABEL = 'May work while nobody is signed in';
 /** Shown instead of the switch's help when this company file has passwords. */
@@ -59,7 +84,7 @@ export const UNATTENDED_HELP =
 
 /** What holds for every agent, whatever it may do. */
 export const MODES_NOTE =
-  'Whatever an agent may do, everything it enters is listed under its name, and it can be removed at any time.';
+  'Whatever an agent may do, everything it enters is listed under its name, and it can be paused or removed at any time.';
 /** The words of lib/net/hostOnly.ts HOST_ONLY_MESSAGE (a server module this page cannot import). */
 const HOST_ONLY_MESSAGE = 'This can only be changed on the computer that holds the company file.';
 export const AGENT_PRIVACY_NOTE =
@@ -69,10 +94,20 @@ function errMsg(e: unknown) {
   return e instanceof Error ? e.message : 'Something went wrong';
 }
 
-function when(iso: string | null) {
-  if (!iso) return 'Never';
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? 'Never' : d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+/**
+ * Whether Integrated Applications is off for the company, which pauses every agent. The list route
+ * says so once it sends `allPaused`; until then the title bar's count route does (AgentRequestCount).
+ * Unknown (the count could not be read) shows the agents' own state, as before, and the detail page
+ * still says it from the agent's own detail.
+ */
+async function readAllPaused(fromList: unknown): Promise<boolean> {
+  if (typeof fromList === 'boolean') return fromList;
+  try {
+    const c = await api.get<{ allPaused?: unknown }>('/api/agent-requests/count');
+    return c?.allPaused === true;
+  } catch {
+    return false;
+  }
 }
 
 const quote = (s: string) => (/[\s"]/.test(s) ? `"${s.replace(/"/g, '\\"')}"` : s);
@@ -126,15 +161,16 @@ function NewAgent({
 }) {
   const [name, setName] = useState('');
   const [roleKeys, setRoleKeys] = useState<string[]>([]);
-  const [mode, setMode] = useState<AgentMode>('read_only');
+  const [preset, setPreset] = useState<AgentPreset>(NEW_AGENT_PRESET);
   const [unattended, setUnattended] = useState(false);
   const [busy, setBusy] = useState(false);
+  const withAdmin = roleKeys.includes(ADMIN_ROLE_KEY);
 
   async function save() {
     setBusy(true);
     try {
       const alone = unattended && unattendedPossible;
-      const made = await api.post<{ token: string; connection: Connection | null }>('/api/agents', { name, roleKeys, mode, unattended: alone });
+      const made = await api.post<{ token: string; connection: Connection | null }>('/api/agents', { name, roleKeys, preset, unattended: alone });
       onMade(made.token, made.connection, name.trim(), alone);
     } catch (e) {
       toast(errMsg(e), 'danger');
@@ -185,26 +221,21 @@ function NewAgent({
               </label>
             ))}
           </div>
-          <p className="mt-1 text-xs text-navy/50">
-            An agent sees what a person with this role sees. It can never be an Admin, and never reaches Users &amp; Roles, backups, full
-            Social Security numbers or full account numbers.
-          </p>
+          <p className="mt-1 text-xs text-navy/50">{ROLE_HELP}</p>
+          {withAdmin && (
+            <p className="mt-2 rounded-lg bg-amber-50 p-3 text-xs text-amber-900" role="note" data-admin-warning="">
+              {ADMIN_ROLE_WARNING}
+            </p>
+          )}
         </div>
         <div>
-          <Label>What it may do</Label>
-          <div className="space-y-1" role="radiogroup" aria-label="What the agent may do">
-            {AGENT_MODES.map((m) => (
-              <label key={m} className="flex cursor-pointer items-start gap-2 rounded p-1.5 hover:bg-electric/5">
-                <input type="radio" name="ag-mode" className="mt-1" checked={mode === m} onChange={() => setMode(m)} />
-                <span>
-                  <span className="text-sm font-semibold text-navy">{AGENT_MODE_LABELS[m]}</span>
-                  <span className="block text-xs text-navy/50">{MODE_HELP[m]}</span>
-                </span>
-              </label>
-            ))}
-          </div>
-          <p className="mt-1 text-xs text-navy/50">{MODES_NOTE}</p>
+          <Label>What it may do without asking</Label>
+          <PresetChoice value={preset} onChange={setPreset} name="ag-preset" />
+          <p className="mt-1 text-xs text-navy/50">
+            You can change this, and each kind of work one by one, at any time: open the agent from the list. {MODES_NOTE}
+          </p>
         </div>
+        <p className="text-xs text-navy/60">{ROLE_AND_PRESET_NOTE}</p>
         <div>
           <Label>When it may work</Label>
           <label className={`flex items-start gap-2 rounded p-1.5 ${unattendedPossible ? 'cursor-pointer hover:bg-electric/5' : 'opacity-70'}`}>
@@ -280,19 +311,24 @@ export default function AgentsTab({ roles }: { roles: RoleOption[] }) {
   const [agents, setAgents] = useState<Agent[] | null>(null);
   const [hostOnly, setHostOnly] = useState(false);
   const [unattendedPossible, setUnattendedPossible] = useState(true);
+  /** Integrated Applications is off: every agent is paused, whatever its own switch says. */
+  const [allPaused, setAllPaused] = useState(false);
   const [error, setError] = useState('');
   const [adding, setAdding] = useState(false);
   const [made, setMade] = useState<{ name: string; token: string; connection: Connection | null; unattended: boolean } | null>(null);
-  const [removing, setRemoving] = useState<Agent | null>(null);
+  const [removing, setRemoving] = useState<{ id: string; name: string } | null>(null);
   const [busy, setBusy] = useState(false);
+  /** The agent whose detail page is open, or null for the list. */
+  const [openId, setOpenId] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
-      const res = await api.get<{ agents: Agent[]; hostOnly: boolean; unattendedPossible?: boolean }>('/api/agents');
+      const res = await api.get<{ agents: Agent[]; hostOnly: boolean; unattendedPossible?: boolean; allPaused?: boolean }>('/api/agents');
       setAgents(res.agents);
       setHostOnly(Boolean(res.hostOnly));
       setUnattendedPossible(res.unattendedPossible !== false);
       setError('');
+      setAllPaused(res.agents.length > 0 ? await readAllPaused(res.allPaused) : false);
     } catch (e) {
       setError(errMsg(e));
       setAgents([]);
@@ -309,6 +345,7 @@ export default function AgentsTab({ roles }: { roles: RoleOption[] }) {
       await api.del(`/api/agents/${removing.id}`);
       toast(`${removing.name} no longer has access.`, 'success');
       setRemoving(null);
+      if (openId === removing.id) setOpenId(null);
       await load();
     } catch (e) {
       toast(errMsg(e), 'danger');
@@ -318,7 +355,37 @@ export default function AgentsTab({ roles }: { roles: RoleOption[] }) {
   }
 
   if (agents === null) return <PageSkeleton />;
-  const agentRoles = roles.filter((r) => r.key !== 'admin');
+
+  const removeDialog = (
+    <ConfirmDialog
+      open={!!removing}
+      title="Remove agent"
+      message={`${removing?.name} will stop working at once. What it did stays in the audit trail under its name.`}
+      confirmLabel="Remove"
+      tone="danger"
+      loading={busy}
+      onConfirm={remove}
+      onClose={() => setRemoving(null)}
+    />
+  );
+
+  if (openId) {
+    return (
+      <>
+        <AgentDetailView
+          key={openId}
+          agentId={openId}
+          hostOnly={hostOnly}
+          onBack={() => {
+            setOpenId(null);
+            load();
+          }}
+          onRemove={setRemoving}
+        />
+        {removeDialog}
+      </>
+    );
+  }
 
   return (
     <div className="space-y-4">
@@ -330,6 +397,7 @@ export default function AgentsTab({ roles }: { roles: RoleOption[] }) {
               An agent is an AI assistant you let work in these books, the way you would add a bookkeeper: with a name and a role. It connects
               through Ironbooks on this computer only, and everything it does is listed under its name.
             </p>
+            <p className="mt-1 text-xs text-navy/50">{ROLE_AND_PRESET_NOTE}</p>
             <p className="mt-1 text-xs text-navy/50">{MODES_NOTE}</p>
           </div>
           {!hostOnly && (
@@ -339,6 +407,11 @@ export default function AgentsTab({ roles }: { roles: RoleOption[] }) {
           )}
         </div>
         {hostOnly && <p className="mt-3 text-sm text-amber-700">{HOST_ONLY_MESSAGE}</p>}
+        {allPaused && (
+          <p className="mt-3 rounded-lg bg-amber-50 p-3 text-sm text-amber-900" data-all-paused="">
+            {ALL_PAUSED_NOTE}
+          </p>
+        )}
       </Card>
       {error && <Card className="p-4 text-sm text-red-600">{error}</Card>}
       {agents.length === 0 ? (
@@ -360,7 +433,14 @@ export default function AgentsTab({ roles }: { roles: RoleOption[] }) {
             {agents.map((a) => (
               <Tr key={a.id} className={a.status === 'active' ? '' : 'opacity-60'}>
                 <Td>
-                  <span className="font-semibold">{a.name}</span>
+                  <button
+                    type="button"
+                    className="text-left font-semibold text-navy hover:text-electric hover:underline"
+                    onClick={() => setOpenId(a.id)}
+                    title="Open this agent's settings"
+                  >
+                    {a.name}
+                  </button>
                   <span className="block text-xs text-navy/40">
                     Made {when(a.createdAt)}
                     {a.createdByName ? ` by ${a.createdByName}` : ''}
@@ -372,13 +452,29 @@ export default function AgentsTab({ roles }: { roles: RoleOption[] }) {
                   </div>
                 </Td>
                 <Td>
-                  {AGENT_MODE_LABELS[a.mode] ?? a.mode}
+                  {presetSummary(presetLabelOf(a), a.overrideCount) || a.mode}
                   {a.unattended && unattendedPossible && <span className="block text-xs text-navy/50">Also while nobody is signed in</span>}
                 </Td>
                 <Td className="font-mono text-xs">{a.tokenPrefix}…</Td>
                 <Td className="text-sm">{when(a.lastUsedAt)}</Td>
-                <Td>{a.status === 'active' ? <Badge tone="success">Active</Badge> : <Badge tone="void">Removed</Badge>}</Td>
+                <Td>
+                  {a.status !== 'active' ? (
+                    <Badge tone="void">Removed</Badge>
+                  ) : a.pausedAt ? (
+                    <Badge tone="warning">Paused</Badge>
+                  ) : allPaused ? (
+                    <span title={ALL_PAUSED_TITLE}>
+                      <Badge tone="warning">Paused</Badge>
+                      <span className="block text-xs text-navy/50">All agents</span>
+                    </span>
+                  ) : (
+                    <Badge tone="success">Active</Badge>
+                  )}
+                </Td>
                 <Td className="text-right whitespace-nowrap">
+                  <Button size="sm" variant="ghost" onClick={() => setOpenId(a.id)} title="Open this agent's settings" aria-label={`Open ${a.name}`}>
+                    <Settings2 className="h-4 w-4" />
+                  </Button>
                   {a.status === 'active' && !hostOnly && (
                     <Button size="sm" variant="ghost" onClick={() => setRemoving(a)} title="Remove this agent's access">
                       <Trash2 className="h-4 w-4" />
@@ -392,7 +488,7 @@ export default function AgentsTab({ roles }: { roles: RoleOption[] }) {
       )}
       {adding && (
         <NewAgent
-          roles={agentRoles}
+          roles={roles}
           unattendedPossible={unattendedPossible}
           onClose={() => setAdding(false)}
           onMade={(token, connection, name, unattended) => {
@@ -403,16 +499,7 @@ export default function AgentsTab({ roles }: { roles: RoleOption[] }) {
         />
       )}
       {made && <TokenOnce name={made.name} token={made.token} connection={made.connection} unattended={made.unattended} onClose={() => setMade(null)} />}
-      <ConfirmDialog
-        open={!!removing}
-        title="Remove agent"
-        message={`${removing?.name} will stop working at once. What it did stays in the audit trail under its name.`}
-        confirmLabel="Remove"
-        tone="danger"
-        loading={busy}
-        onConfirm={remove}
-        onClose={() => setRemoving(null)}
-      />
+      {removeDialog}
     </div>
   );
 }

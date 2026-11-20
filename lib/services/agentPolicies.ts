@@ -1,41 +1,928 @@
 /**
- * Agent full access: An agent's policy as stored: preset, overrides, limits, pause (plan §4.1, §7.1).
- * STUB: the signatures are the contract (lib/agent/contract.ts); the bodies are still to be written.
+ * Agent full access: an agent's policy as stored, and the Agents tab's view of one agent (plan
+ * §4.1, §4.2, §4.6, §7.1, §12; contract §6 and §11).
+ *
+ * What an agent may do without asking is its preset (agents.preset) with an Admin's adjustments
+ * on top (agent_policies: one Allow / Ask / Never per class, everywhere or within one area), and
+ * the limits kept on the agents row: the bulk cap, the two-person amount, how long a request
+ * waits, the folders it may use, the email notice and whether it is paused. lib/agent/policy.ts
+ * turns those into one AgentPolicy (resolvePolicy); this module reads and writes them.
+ *
+ * Who may do what here:
+ *  - Reading an agent's policy or ceiling for a decision (loadAgentPolicy, agentCeiling) is
+ *    plumbing for the agent's door, the bridge and the approval center: any context of the
+ *    company may, except that an agent only ever reads its own.
+ *  - The Agents tab's screens (getAgentPolicyView, getAgentDetail, listAgentActivity) are for a
+ *    person who may see Users & Roles.
+ *  - Changing anything (saveAgentPolicy, pauseAgent, pauseAllAgents) is for a person signed in to
+ *    Ironbooks whose own access may modify Users & Roles. A context that carries an agent, and any
+ *    work running inside an agent's bridged run (lib/serviceScope.ts), is refused whatever else it
+ *    holds: an agent never changes an agent, its own settings included (plan 4.6, D9).
+ *  - As for people (lib/services/users.ts), a person who is not an Admin may not change the
+ *    settings of, or turn back on, an agent whose access reaches beyond their own. Anyone who may
+ *    manage agents may pause one: stopping is never held back.
+ *
+ * Every change is one transaction and one audit row naming what changed, with the person as the
+ * one who did it. "Pause all agents" is the company's Integrated Applications switch and goes
+ * through the same code path as Preferences (lib/services/company.ts updateCompany).
  */
-import type { ServiceContext } from './_base';
-import type { AgentActivityRow, AgentDetail } from '@/lib/agent/contract';
-import type { AgentCeiling, GetAgentPolicyView, LoadAgentPolicy, PauseAgent, PauseAllAgents, SaveAgentPolicy } from '@/lib/agent/contract';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import Decimal from 'decimal.js';
+import { and, desc, eq, inArray, sql } from 'drizzle-orm';
+import { resolveDataDir } from '@/lib/db';
+import { agentGrants, agentPermissionRequests, agentPolicies, agents, auditLogs, companies, users } from '@/lib/db/schema';
+import { AREA_KEYS, areaLabel, canActivity, isSubset, legacyRoleFor, type Area, type EffectiveAccess } from '@/lib/permissions/model';
+import { includesAdminRole } from '@/lib/permissions/agentAccess';
+import {
+  DEFAULT_BULK_CAP,
+  canBeAllowed,
+  isAgentPreset,
+  isPaused,
+  isPolicySetting,
+  policyProblems,
+  resolvePolicy,
+  type PolicyLimits,
+} from '@/lib/agent/policy';
+import {
+  ADMIN_APPROVAL_CLASSES,
+  NEVER_ALLOW_CLASSES,
+  REQUEST_STATUSES,
+  RISK_CLASSES,
+  RISK_CLASS_LABELS,
+  isRiskClass,
+  type AgentPreset,
+  type PolicyOverride,
+  type PolicySetting,
+  type RequestStatus,
+  type RiskClass,
+} from '@/lib/agent/operations/types';
+import type {
+  AgentActivityRow,
+  AgentCeiling,
+  AgentDetail,
+  AgentPolicyInput,
+  AgentPolicyView,
+  GetAgentPolicyView,
+  LoadAgentPolicy,
+  PauseAgent,
+  PauseAllAgents,
+  SaveAgentPolicy,
+} from '@/lib/agent/contract';
+import { allowedFolder, stagedFilesRoot } from '@/lib/agent/files';
+import { endpointDir } from '@/lib/agent/endpointFile';
+// The scope module, not lib/context.ts: it holds no database or service imports, so the agent's
+// door can import this module without a cycle through lib/context.ts.
+import { inServiceScope } from '@/lib/serviceScope';
+import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
+import { listRoleDefinitions, permissionDenied, resolveAccess } from './access';
+import { agentAccess, agentsBlockedFor, lastUsedOf, modeForPreset, presetOfRow } from './agents';
+import { backupFoldersHere, preOpFolder } from './backupHistory';
+import { updateCompany } from './company';
 
-export const loadAgentPolicy: LoadAgentPolicy = async () => {
-  throw new Error('loadAgentPolicy is not built yet.');
-};
+type AgentRow = typeof agents.$inferSelect;
 
-export const getAgentPolicyView: GetAgentPolicyView = async () => {
-  throw new Error('getAgentPolicyView is not built yet.');
-};
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const WIN = process.platform === 'win32';
 
-export const saveAgentPolicy: SaveAgentPolicy = async () => {
-  throw new Error('saveAgentPolicy is not built yet.');
-};
+/** The Users & Roles activity the agents routes are mapped to (lib/permissions/routeActivities.ts). */
+const MANAGE_AGENTS = 'users.users';
 
-export const pauseAgent: PauseAgent = async () => {
-  throw new Error('pauseAgent is not built yet.');
-};
+/** Largest bulk cap, longest wait, most folders, largest two-person amount (decimal(15, 2)). */
+const BULK_CAP_MAX = 100_000;
+const EXPIRY_DAYS_MAX = 365;
+const FOLDERS_MAX = 50;
+const TWO_PERSON_MAX = new Decimal('9999999999999.99');
+/** One override per class, everywhere and in each area. */
+const OVERRIDES_MAX = RISK_CLASSES.length * (AREA_KEYS.length + 1);
+/** Most rows the activity list shows (plan 7.1). */
+const ACTIVITY_MAX = 200;
 
-export const pauseAllAgents: PauseAllAgents = async () => {
-  throw new Error('pauseAllAgents is not built yet.');
-};
+const AGENT_NEVER =
+  "An agent can never change an agent's settings, its own included. A person can do it in Users & Roles > Agents.";
+const AGENT_NO_VIEW =
+  'An agent cannot open the Agents tab. It can read its own permissions with get_my_permissions.';
+const SIGN_IN_FIRST = 'Only a person signed in to Ironbooks can change what an agent may do.';
+const NO_ACCESS = 'You do not have access to this company.';
+const REMOVED = 'This agent has been removed, so its settings can no longer be changed.';
+const MORE_THAN_YOU_SETTINGS =
+  'Only an Admin can change the settings of an agent that has more access than you. You can still pause it.';
+const MORE_THAN_YOU_RESUME = 'Only an Admin can turn back on an agent that has more access than you.';
+const ADMIN_AGENT_SETTINGS =
+  'Only an Admin can change the settings of an agent that holds the Admin role. You can still pause it.';
+const ADMIN_AGENT_RESUME = 'Only an Admin can turn back on an agent that holds the Admin role.';
+const PAUSE_ALL_FOR_ADMIN =
+  'Only an Admin can pause or resume every agent at once. You can pause one agent at a time in Users & Roles > Agents.';
+const PRESET_CHOICE =
+  'Choose what the agent may do: Read only, Ask for every change, Trusted bookkeeper or Full, with asks.';
+const SAY_PAUSED = 'Say whether to pause (true) or turn back on (false).';
 
-export const agentCeiling: AgentCeiling = async () => {
-  throw new Error('agentCeiling is not built yet.');
-};
+// ---------------------------------------------------------------------------
+// Who may do what
+// ---------------------------------------------------------------------------
 
-/** The Agents tab's detail page. */
-export async function getAgentDetail(_ctx: ServiceContext, _agentId: string): Promise<AgentDetail> {
-  throw new Error('getAgentDetail is not built yet.');
+/** An agent's own context, or work inside an agent's bridged run, whatever context it was handed. */
+function refuseAgents(ctx: ServiceContext, message: string): void {
+  if (ctx.agent || inServiceScope()) throw new ServiceError('FORBIDDEN', message);
 }
 
-/** Its last operations and requests, newest first (at most 200). */
-export async function listAgentActivity(_ctx: ServiceContext, _agentId: string, _limit = 200): Promise<AgentActivityRow[]> {
-  throw new Error('listAgentActivity is not built yet.');
+/** The person's own access: the request's, or read from the company file for a context built without it. */
+async function accessOfPerson(ctx: ServiceContext, userId: string): Promise<EffectiveAccess> {
+  if (ctx.access) return ctx.access;
+  const r = await resolveAccess(ctx.db, ctx.companyId, userId);
+  if (!r.member || !r.active) throw new ServiceError('FORBIDDEN', NO_ACCESS);
+  return r.access;
 }
+
+/**
+ * The access of the person changing an agent's settings: signed in (a user id: a trusted context
+ * with nobody behind it changes nothing here), not an agent, and allowed to modify Users & Roles.
+ */
+async function personWhoManagesAgents(ctx: ServiceContext): Promise<EffectiveAccess> {
+  refuseAgents(ctx, AGENT_NEVER);
+  if (typeof ctx.userId !== 'string' || !ctx.userId) throw new ServiceError('FORBIDDEN', SIGN_IN_FIRST);
+  const access = await accessOfPerson(ctx, ctx.userId);
+  if (!canActivity(access, MANAGE_AGENTS, 'modify')) throw permissionDenied('users', 'modify', MANAGE_AGENTS);
+  return access;
+}
+
+/** The Agents tab's screens: a person who may see Users & Roles. A trusted internal context passes. */
+async function assertMaySeeAgents(ctx: ServiceContext): Promise<void> {
+  refuseAgents(ctx, AGENT_NO_VIEW);
+  if (!ctx.access && !ctx.userId) return;
+  const access = await accessOfPerson(ctx, ctx.userId ?? '');
+  if (!canActivity(access, MANAGE_AGENTS, 'view')) throw permissionDenied('users', 'view', MANAGE_AGENTS);
+}
+
+/**
+ * A person who is not an Admin may change only an agent whose ceiling is within their own access,
+ * and never one that holds the Admin role (as lib/services/users.ts holds user managers).
+ */
+async function assertWithinYourAccess(
+  ctx: ServiceContext,
+  person: EffectiveAccess,
+  row: AgentRow,
+  messages: { admin: string; more: string },
+): Promise<void> {
+  if (person.isAdmin) return;
+  const roleKeys = roleKeysOf(row);
+  if (includesAdminRole(roleKeys)) throw new ServiceError('FORBIDDEN', messages.admin);
+  const ceiling = await agentAccess(ctx.db, { companyId: ctx.companyId, roleKeys });
+  if (ceiling.isAdmin || !isSubset(ceiling, person)) throw new ServiceError('FORBIDDEN', messages.more);
+}
+
+/**
+ * Whether this person may use "Pause all agents" (the title bar asks, AgentRequestCount.canPauseAll):
+ * a person who may manage agents and is an Admin, since the switch is the company's Integrated
+ * Applications setting, which only an Admin changes. False for an agent and on any doubt.
+ */
+export async function mayPauseAllAgents(ctx: ServiceContext): Promise<boolean> {
+  try {
+    return (await personWhoManagesAgents(ctx)).isAdmin;
+  } catch {
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Reading
+// ---------------------------------------------------------------------------
+
+function roleKeysOf(row: AgentRow): string[] {
+  return Array.isArray(row.roleKeys) ? row.roleKeys.filter((k): k is string => typeof k === 'string' && k !== '') : [];
+}
+
+/** The agent in this company, removed or not, or null. */
+async function agentRowFor(ctx: ServiceContext, agentId: string): Promise<AgentRow | null> {
+  if (typeof agentId !== 'string' || !UUID_RE.test(agentId)) return null;
+  const [row] = await ctx.db.select().from(agents).where(and(eq(agents.id, agentId), eq(agents.companyId, ctx.companyId)));
+  return row ?? null;
+}
+
+/**
+ * The agent a decision is about: in this company and not removed. An agent's own context only
+ * ever finds itself: another agent is "not found", the same answer as one that does not exist.
+ */
+async function liveAgent(ctx: ServiceContext, agentId: string): Promise<AgentRow> {
+  if (ctx.agent && ctx.agent.id !== agentId) throw notFound('Agent');
+  const row = await agentRowFor(ctx, agentId);
+  if (!row || row.revokedAt) throw notFound('Agent');
+  return row;
+}
+
+const isArea = (v: unknown): v is Area => typeof v === 'string' && (AREA_KEYS as string[]).includes(v);
+
+/** An override the engine understands (a stored row that is not one is ignored by it, never loosened). */
+function understood(o: PolicyOverride): boolean {
+  return isRiskClass(o.class) && (o.area === null || isArea(o.area)) && isPolicySetting(o.setting);
+}
+
+/** Classes in the grid's order, the class everywhere before its areas. */
+function sortOverrides(list: PolicyOverride[]): PolicyOverride[] {
+  const rank = (o: PolicyOverride) => (RISK_CLASSES as readonly string[]).indexOf(o.class);
+  return [...list].sort((a, b) => rank(a) - rank(b) || (a.area ?? '').localeCompare(b.area ?? ''));
+}
+
+/** The agent's stored overrides, as stored: resolvePolicy reads them strictly. */
+async function storedOverrides(ctx: ServiceContext, agentId: string): Promise<PolicyOverride[]> {
+  const rows = await ctx.db
+    .select({ class: agentPolicies.class, area: agentPolicies.area, setting: agentPolicies.setting })
+    .from(agentPolicies)
+    .where(and(eq(agentPolicies.agentId, agentId), eq(agentPolicies.companyId, ctx.companyId)));
+  return sortOverrides(
+    rows.map((r) => ({ class: r.class as RiskClass, area: (r.area ?? null) as Area | null, setting: r.setting as PolicySetting })),
+  );
+}
+
+/** The limits on the agents row, as the engine takes them. */
+function limitsOf(row: AgentRow): PolicyLimits {
+  return {
+    bulkCap: row.bulkCap ?? null,
+    twoPersonOver: row.twoPersonOver ?? null,
+    requestExpiryDays: row.requestExpiryDays,
+    folders: Array.isArray(row.folders) ? row.folders : [],
+    notifyEmail: row.notifyEmail === true,
+    pausedAt: row.pausedAt ?? null,
+  };
+}
+
+/**
+ * When Integrated Applications was switched off for the company ("Don't allow any applications"),
+ * or null while applications are allowed. The same test the agent's door makes (agentsBlockedFor
+ * in ./agents).
+ *
+ * The time is that of the company save that switched it: Preferences and "Pause all agents" both
+ * go through updateCompany, whose audit row holds what the save set and what it was before. Not the
+ * company's last change (companies.updated_at), which any later Preferences save moves. A file with
+ * no such row (switched by an older version, or by hand) falls back to that last change.
+ */
+async function appsBlockedSince(ctx: ServiceContext): Promise<string | null> {
+  const [c] = await ctx.db
+    .select({ settings: companies.settings, updatedAt: companies.updatedAt })
+    .from(companies)
+    .where(eq(companies.id, ctx.companyId));
+  const s = c?.settings && typeof c.settings === 'object' ? (c.settings as Record<string, unknown>) : null;
+  if (s?.integratedAppsBlocked !== true) return null;
+  const [switched] = await ctx.db
+    .select({ at: auditLogs.createdAt })
+    .from(auditLogs)
+    .where(
+      and(
+        eq(auditLogs.companyId, ctx.companyId),
+        eq(auditLogs.entityType, 'company'),
+        eq(auditLogs.entityId, ctx.companyId),
+        sql`${auditLogs.newValues} -> 'settings' -> 'integratedAppsBlocked' = 'true'::jsonb`,
+        sql`coalesce(${auditLogs.oldValues} -> 'settings' -> 'integratedAppsBlocked', 'false'::jsonb) <> 'true'::jsonb`,
+      ),
+    )
+    .orderBy(desc(auditLogs.createdAt))
+    .limit(1);
+  return (switched?.at ?? c?.updatedAt ?? new Date()).toISOString();
+}
+
+/**
+ * An agent's policy for a decision: its preset, its stored overrides and the limits on its row,
+ * through resolvePolicy. While the company's Integrated Applications switch is off every agent is
+ * paused, so the policy says paused then too: an approval given meanwhile must not run either.
+ * Unknown, removed, or (for an agent's context) another agent: NOT_FOUND.
+ */
+export const loadAgentPolicy: LoadAgentPolicy = async (ctx, agentId) => {
+  const row = await liveAgent(ctx, agentId);
+  const limits = limitsOf(row);
+  if (!isPaused(limits.pausedAt)) {
+    const blockedAt = await appsBlockedSince(ctx);
+    if (blockedAt) limits.pausedAt = blockedAt;
+  }
+  return resolvePolicy(row.preset as AgentPreset, await storedOverrides(ctx, row.id), limits);
+};
+
+/**
+ * Locked cells of the policy grid, with the reason in plain words: the classes that can never be
+ * Allow (plan 4.2), and who approves them instead.
+ */
+function lockedCells(): AgentPolicyView['locked'] {
+  return NEVER_ALLOW_CLASSES.filter((cls) => !canBeAllowed(cls)).map((cls) => ({
+    class: cls,
+    setting: 'allow' as const,
+    reason: ADMIN_APPROVAL_CLASSES.includes(cls)
+      ? `"${RISK_CLASS_LABELS[cls]}" can never be Allow for an agent: only an Admin can approve this work.`
+      : `"${RISK_CLASS_LABELS[cls]}" can never be Allow for an agent: a person approves this work.`,
+  }));
+}
+
+/** The grid's view of a stored policy (a removed agent's too, shown as it was). */
+async function policyViewOf(ctx: ServiceContext, row: AgentRow): Promise<AgentPolicyView> {
+  const stored = await storedOverrides(ctx, row.id);
+  const policy = resolvePolicy(row.preset as AgentPreset, stored, limitsOf(row));
+  return { agentId: row.id, preset: policy.preset, overrides: stored.filter(understood), policy, locked: lockedCells() };
+}
+
+/** The policy grid of one agent: its preset, its stored overrides, the policy they make and the locked cells. */
+export const getAgentPolicyView: GetAgentPolicyView = async (ctx, agentId) => {
+  await assertMaySeeAgents(ctx);
+  const row = await agentRowFor(ctx, agentId);
+  if (!row) throw notFound('Agent');
+  return policyViewOf(ctx, row);
+};
+
+/**
+ * The agent's ceiling: the access of its roles through the agent limits (agentAccess in ./agents,
+ * clampForAgent), the role word a context built for it needs (as lib/agent/actions.ts writeContext
+ * derives it) and the names of its roles that still exist.
+ */
+export const agentCeiling: AgentCeiling = async (ctx, agentId) => {
+  const row = await liveAgent(ctx, agentId);
+  const roleKeys = roleKeysOf(row);
+  const access = await agentAccess(ctx.db, { companyId: ctx.companyId, roleKeys });
+  return { access, role: legacyRoleFor(access, false), roleNames: await roleNamesOf(ctx, roleKeys) };
+};
+
+async function roleNamesOf(ctx: ServiceContext, roleKeys: string[]): Promise<string[]> {
+  const names = new Map((await listRoleDefinitions(ctx.db, ctx.companyId)).map((r) => [r.key, r.name]));
+  return roleKeys.map((k) => names.get(k)).filter((n): n is string => Boolean(n));
+}
+
+/** The Agents tab's detail page (GET /api/agents/[id]). A removed agent is shown as it was. */
+export async function getAgentDetail(ctx: ServiceContext, agentId: string): Promise<AgentDetail> {
+  await assertMaySeeAgents(ctx);
+  const row = await agentRowFor(ctx, agentId);
+  if (!row) throw notFound('Agent');
+  const roleKeys = roleKeysOf(row);
+  const lastUsed = lastUsedOf(row);
+  return {
+    id: row.id,
+    name: row.name,
+    roleKeys,
+    roleNames: await roleNamesOf(ctx, roleKeys),
+    unattended: row.unattended === true,
+    createdAt: row.createdAt.toISOString(),
+    lastUsedAt: lastUsed ? lastUsed.toISOString() : null,
+    revokedAt: row.revokedAt ? row.revokedAt.toISOString() : null,
+    paused: isPaused(row.pausedAt),
+    policy: await policyViewOf(ctx, row),
+    allPaused: await agentsBlockedFor(ctx.db, ctx.companyId),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Activity
+// ---------------------------------------------------------------------------
+
+const AUDIT_VERB: Record<string, string> = {
+  create: 'Added',
+  update: 'Changed',
+  delete: 'Deleted',
+  void: 'Voided',
+  llm_correction: 'Corrected',
+};
+
+/** "Added invoice", "Changed bank rule": the audit row in plain words (its values stay in the audit trail). */
+function auditSummary(action: string, entityType: string): string {
+  const what = entityType.replace(/[_-]+/g, ' ').trim() || 'record';
+  return `${AUDIT_VERB[action] ?? 'Changed'} ${what}`;
+}
+
+/** Statuses where the decider said yes (a failed request failed after it was approved). */
+const APPROVED: readonly string[] = ['approved', 'executed', 'failed'];
+
+function requestStatusOf(v: string): RequestStatus {
+  return (REQUEST_STATUSES as readonly string[]).includes(v) ? (v as RequestStatus) : 'failed';
+}
+
+function both(a: string | null, b: string | null): string | null {
+  if (a && b && a !== b) return `${a} and ${b}`;
+  return a ?? b;
+}
+
+/**
+ * The agent's last operations (audit rows carrying its id) and requests, newest first, at most
+ * 200, each with who approved it: the approver of a run, the person who gave the standing
+ * permission it ran under, or the people who approved a request.
+ */
+export async function listAgentActivity(ctx: ServiceContext, agentId: string, limit = ACTIVITY_MAX): Promise<AgentActivityRow[]> {
+  await assertMaySeeAgents(ctx);
+  const row = await agentRowFor(ctx, agentId);
+  if (!row) throw notFound('Agent');
+  const n = Number.isInteger(limit) ? Math.min(Math.max(limit, 1), ACTIVITY_MAX) : ACTIVITY_MAX;
+
+  const audits = await ctx.db
+    .select({
+      id: auditLogs.id,
+      at: auditLogs.createdAt,
+      action: auditLogs.action,
+      entityType: auditLogs.entityType,
+      approvedBy: auditLogs.approvedBy,
+      requestId: auditLogs.agentRequestId,
+      grantId: auditLogs.agentGrantId,
+    })
+    .from(auditLogs)
+    .where(and(eq(auditLogs.companyId, ctx.companyId), eq(auditLogs.agentId, row.id)))
+    .orderBy(desc(auditLogs.createdAt))
+    .limit(n);
+
+  const requests = await ctx.db
+    .select({
+      id: agentPermissionRequests.id,
+      at: agentPermissionRequests.createdAt,
+      operation: agentPermissionRequests.operation,
+      class: agentPermissionRequests.class,
+      summary: agentPermissionRequests.summary,
+      status: agentPermissionRequests.status,
+      decidedBy: agentPermissionRequests.decidedBy,
+      secondApprover: agentPermissionRequests.secondApprover,
+    })
+    .from(agentPermissionRequests)
+    .where(and(eq(agentPermissionRequests.companyId, ctx.companyId), eq(agentPermissionRequests.agentId, row.id)))
+    .orderBy(desc(agentPermissionRequests.createdAt))
+    .limit(n);
+
+  // The request and the grant an operation ran under, for its operation id, class and approver.
+  const reqIds = [...new Set(audits.map((a) => a.requestId).filter((id): id is string => !!id))];
+  const linked = new Map<string, { operation: string; class: string }>();
+  for (const r of requests) linked.set(r.id, { operation: r.operation, class: r.class });
+  const missing = reqIds.filter((id) => !linked.has(id));
+  if (missing.length) {
+    const more = await ctx.db
+      .select({ id: agentPermissionRequests.id, operation: agentPermissionRequests.operation, class: agentPermissionRequests.class })
+      .from(agentPermissionRequests)
+      .where(and(eq(agentPermissionRequests.companyId, ctx.companyId), inArray(agentPermissionRequests.id, missing)));
+    for (const r of more) linked.set(r.id, { operation: r.operation, class: r.class });
+  }
+  const grantIds = [...new Set(audits.map((a) => a.grantId).filter((id): id is string => !!id))];
+  const givers = new Map<string, string>();
+  if (grantIds.length) {
+    const rows = await ctx.db
+      .select({ id: agentGrants.id, givenBy: agentGrants.givenBy })
+      .from(agentGrants)
+      .where(and(eq(agentGrants.companyId, ctx.companyId), inArray(agentGrants.id, grantIds)));
+    for (const g of rows) givers.set(g.id, g.givenBy);
+  }
+
+  const people = await peopleNames(ctx, [
+    ...audits.map((a) => a.approvedBy),
+    ...[...givers.values()],
+    ...requests.flatMap((r) => [r.decidedBy, r.secondApprover]),
+  ]);
+  const nameOf = (id: string | null | undefined) => (id ? people.get(id) ?? null : null);
+
+  const out: Array<AgentActivityRow & { sortAt: number }> = [];
+  for (const a of audits) {
+    const req = a.requestId ? linked.get(a.requestId) : undefined;
+    out.push({
+      sortAt: a.at.getTime(),
+      at: a.at.toISOString(),
+      kind: 'operation',
+      operation: req?.operation ?? `${a.entityType}.${a.action}`,
+      summary: auditSummary(a.action, a.entityType),
+      class: req && isRiskClass(req.class) ? req.class : null,
+      status: 'done',
+      approvedByName: nameOf(a.approvedBy) ?? nameOf(a.grantId ? givers.get(a.grantId) : null),
+      auditId: a.id,
+      requestId: a.requestId ?? null,
+    });
+  }
+  for (const r of requests) {
+    const status = requestStatusOf(r.status);
+    out.push({
+      sortAt: r.at.getTime(),
+      at: r.at.toISOString(),
+      kind: 'request',
+      operation: r.operation,
+      summary: r.summary,
+      class: isRiskClass(r.class) ? r.class : null,
+      status,
+      approvedByName: APPROVED.includes(status) ? both(nameOf(r.decidedBy), nameOf(r.secondApprover)) : null,
+      auditId: null,
+      requestId: r.id,
+    });
+  }
+  out.sort((x, y) => y.sortAt - x.sortAt || (x.kind === y.kind ? 0 : x.kind === 'request' ? 1 : -1));
+  return out.slice(0, n).map(({ sortAt: _sortAt, ...rest }) => rest);
+}
+
+async function peopleNames(ctx: ServiceContext, ids: Array<string | null | undefined>): Promise<Map<string, string>> {
+  const wanted = [...new Set(ids.filter((id): id is string => typeof id === 'string' && UUID_RE.test(id)))];
+  if (!wanted.length) return new Map();
+  const rows = await ctx.db.select({ id: users.id, name: users.name }).from(users).where(inArray(users.id, wanted));
+  return new Map(rows.map((r) => [r.id, r.name]));
+}
+
+// ---------------------------------------------------------------------------
+// Saving
+// ---------------------------------------------------------------------------
+
+/** What a save asked for, checked and in stored form. Left out: unchanged. */
+interface AskedPolicy {
+  preset?: AgentPreset;
+  overrides?: PolicyOverride[];
+  bulkCap?: number | null;
+  twoPersonOver?: string | null;
+  requestExpiryDays?: number;
+  folders?: string[];
+  notifyEmail?: boolean;
+}
+
+/** A value from the input, shortened and on one line, for a message. */
+function shown(v: unknown, max = 60): string {
+  const s = String(v).replace(/[\p{Cc}\p{Cf}]/gu, ' ').trim();
+  return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+}
+
+function cellWords(cls: RiskClass, area: Area | null): string {
+  return area ? `"${RISK_CLASS_LABELS[cls]}" in ${areaLabel(area)}` : `"${RISK_CLASS_LABELS[cls]}"`;
+}
+
+/** Decimal text with two places, or null for "off". Throws when it is not an amount. */
+function readAmount(v: unknown): string | null {
+  if (v === null || (typeof v === 'string' && v.trim() === '')) return null;
+  const bad = () =>
+    validation('The amount above which two people must approve must be an amount like 5000.00, or empty to turn it off.');
+  if (typeof v !== 'string' && typeof v !== 'number') throw bad();
+  let d: Decimal;
+  try {
+    d = new Decimal(typeof v === 'string' ? v.trim() : v);
+  } catch {
+    throw bad();
+  }
+  if (!d.isFinite() || d.isNegative() || d.decimalPlaces() > 2 || d.greaterThan(TWO_PERSON_MAX)) throw bad();
+  return d.toFixed(2);
+}
+
+/** Check the shape of a save. Every refusal says what to change; nothing is guessed. */
+function readPolicyInput(input: AgentPolicyInput): AskedPolicy {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw validation('Nothing to save was sent.');
+  const out: AskedPolicy = {};
+
+  if (input.preset !== undefined) {
+    if (!isAgentPreset(input.preset)) throw validation(PRESET_CHOICE);
+    out.preset = input.preset;
+  }
+
+  if (input.overrides !== undefined) {
+    if (!Array.isArray(input.overrides)) throw validation('The Allow, Ask and Never settings must be sent as a list.');
+    if (input.overrides.length > OVERRIDES_MAX) {
+      throw validation(`At most ${OVERRIDES_MAX} settings can be saved: one per kind of work, everywhere and in each area.`);
+    }
+    const seen = new Set<string>();
+    const list: PolicyOverride[] = [];
+    for (const raw of input.overrides as unknown[]) {
+      const o = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : null;
+      if (!o) throw validation('One of the Allow, Ask and Never settings is empty. Remove it and save again.');
+      const cls = o.class;
+      if (!isRiskClass(cls)) throw validation(`One of the settings names a kind of work Ironbooks does not know ("${shown(cls)}").`);
+      const area = o.area === undefined || o.area === null ? null : o.area;
+      if (area !== null && !isArea(area)) {
+        throw validation(`The setting for "${RISK_CLASS_LABELS[cls]}" names an area Ironbooks does not know ("${shown(area)}").`);
+      }
+      const where = cellWords(cls, area);
+      if (!isPolicySetting(o.setting)) throw validation(`${where} must be Allow, Ask or Never.`);
+      if (o.setting === 'allow' && !canBeAllowed(cls)) throw validation(`${where} can never be Allow for an agent. Set it to Ask or Never.`);
+      const key = `${cls}|${area ?? ''}`;
+      if (seen.has(key)) throw validation(`${where} is set twice. Keep one setting for it.`);
+      seen.add(key);
+      list.push({ class: cls, area, setting: o.setting });
+    }
+    out.overrides = sortOverrides(list);
+  }
+
+  if (input.bulkCap !== undefined) {
+    const v = input.bulkCap;
+    if (v !== null && !(typeof v === 'number' && Number.isInteger(v) && v >= 1 && v <= BULK_CAP_MAX)) {
+      throw validation(
+        `The most records one request may change must be a whole number from 1 to ${BULK_CAP_MAX.toLocaleString('en-US')}, or empty for no limit.`,
+      );
+    }
+    out.bulkCap = v;
+  }
+
+  if (input.twoPersonOver !== undefined) out.twoPersonOver = readAmount(input.twoPersonOver);
+
+  if (input.requestExpiryDays !== undefined) {
+    const v = input.requestExpiryDays;
+    if (!(typeof v === 'number' && Number.isInteger(v) && v >= 1 && v <= EXPIRY_DAYS_MAX)) {
+      throw validation(`Days a request waits for an answer must be a whole number from 1 to ${EXPIRY_DAYS_MAX}.`);
+    }
+    out.requestExpiryDays = v;
+  }
+
+  if (input.folders !== undefined) {
+    if (!Array.isArray(input.folders) || input.folders.some((f) => typeof f !== 'string')) {
+      throw validation('The folders must be sent as a list of folder paths.');
+    }
+    if (input.folders.length > FOLDERS_MAX) throw validation(`An agent can have at most ${FOLDERS_MAX} folders.`);
+    if (input.folders.some((f) => f.trim() === '')) throw validation('One of the folders is empty. Remove it or type its full path.');
+    out.folders = input.folders.map((f) => f.trim());
+  }
+
+  if (input.notifyEmail !== undefined) {
+    if (typeof input.notifyEmail !== 'boolean') throw validation('The email notice must be on or off (true or false).');
+    out.notifyEmail = input.notifyEmail;
+  }
+  return out;
+}
+
+const EXAMPLE_FOLDER = WIN ? 'C:\\Users\\you\\Documents\\Receipts' : '/Users/you/Documents/Receipts';
+
+/** A full path: a drive letter or a network share on Windows, a path from the root elsewhere. */
+function looksAbsolute(p: string): boolean {
+  return WIN ? /^[A-Za-z]:[\\/]/.test(p) || /^[\\/]{2}[^\\/]/.test(p) : path.isAbsolute(p);
+}
+
+function samePathKey(p: string): string {
+  const r = path.resolve(p);
+  return WIN ? r.toLowerCase() : r;
+}
+
+/** `child` is `parent` or inside it. */
+function within(child: string, parent: string): boolean {
+  const c = samePathKey(child);
+  const p = samePathKey(parent);
+  return c === p || c.startsWith(p.endsWith(path.sep) ? p : p + path.sep);
+}
+
+/** Each path as written and, where it exists, with links resolved. */
+function withLinks(list: string[]): string[] {
+  const out = [...list];
+  for (const p of list) {
+    try {
+      out.push(fs.realpathSync.native(p));
+    } catch {
+      /* not there (yet): the path as written is checked */
+    }
+  }
+  return out;
+}
+
+/**
+ * Where the books themselves are: the database folder, the open company file's working folder
+ * and the company file. An agent's folder may be none of them, inside none of them and hold none
+ * of them: reading there would hand it the whole database unmasked, and saving there could damage
+ * the books.
+ */
+function booksPlaces(): string[] {
+  const out = [resolveDataDir()];
+  const state = process.env.BKA_COMPANY_STATE;
+  if (state) out.push(path.dirname(path.resolve(state)));
+  const file = process.env.BKA_COMPANY_FILE;
+  if (file) out.push(path.resolve(file));
+  return withLinks(out);
+}
+
+/**
+ * The names Ironbooks' settings folder has had (electron/main.js): the product name, the package
+ * name a development run uses, and the two names from before the rename.
+ */
+const APP_FOLDER_NAMES = ['Ironbooks', 'ironbooks', 'BookKeeper AI', 'bookkeeper-ai'];
+
+/**
+ * Ironbooks' own folders on this computer: where agents' staged files are kept (lib/agent/files.ts,
+ * every agent's, reports included), the agent connection files (lib/agent/endpointFile.ts), the
+ * desktop app's settings folder (its userData: older companies' folders, quit-time backups, the
+ * sealed device secret), its local folder (working copies of company files, sandboxes) and the
+ * backup folders this computer writes to. Each holds a copy of the books, another agent's files or
+ * the app's own state, so an agent's folder may be none of them, inside none of them and hold none
+ * of them, as for the books.
+ */
+function ironbooksPlaces(): string[] {
+  const env = process.env;
+  const home = os.homedir();
+  const out: string[] = [];
+  const staged = stagedFilesRoot();
+  if (staged) out.push(staged);
+  out.push(endpointDir());
+  if (env.IRONBOOKS_USER_DATA) out.push(path.resolve(env.IRONBOOKS_USER_DATA));
+  if (env.BKA_SANDBOX_ROOT) out.push(path.resolve(env.BKA_SANDBOX_ROOT));
+  // Where Electron keeps the settings folder (app.getPath('appData')), and the local folder beside it.
+  let settingsParent: string;
+  if (WIN) {
+    out.push(path.join(env.LOCALAPPDATA || path.join(home, 'AppData', 'Local'), 'Ironbooks'));
+    settingsParent = env.APPDATA || path.join(home, 'AppData', 'Roaming');
+  } else if (process.platform === 'darwin') {
+    settingsParent = path.join(home, 'Library', 'Application Support');
+  } else {
+    out.push(path.join(env.XDG_STATE_HOME || path.join(home, '.local', 'state'), 'ironbooks'));
+    out.push(path.join(home, '.ironbooks'));
+    settingsParent = env.XDG_CONFIG_HOME || path.join(home, '.config');
+  }
+  for (const name of APP_FOLDER_NAMES) out.push(path.join(settingsParent, name));
+  out.push(...backupFoldersHere(), preOpFolder());
+  return withLinks(out);
+}
+
+/**
+ * The folders as they will be used: full paths of folders that exist on this computer, links
+ * resolved the way the save check resolves them (allowedFolder in lib/agent/files.ts), each once.
+ */
+async function checkFolders(list: string[]): Promise<string[]> {
+  const books = booksPlaces();
+  const own = ironbooksPlaces();
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const typed of list) {
+    if (!looksAbsolute(typed)) {
+      throw validation(`"${shown(typed, 200)}" is not a full folder path. Type the whole path, like ${EXAMPLE_FOLDER}.`);
+    }
+    const real = await allowedFolder([typed], typed);
+    if (!real) {
+      throw validation(`The folder "${shown(typed, 200)}" was not found on this computer. Check the path, or make the folder first.`);
+    }
+    if (books.some((b) => within(real, b) || within(b, real))) {
+      throw validation(
+        `The folder "${shown(typed, 200)}" holds the company file or its working data, or is inside them. Choose another folder for the agent.`,
+      );
+    }
+    if (own.some((b) => within(real, b) || within(b, real))) {
+      throw validation(
+        `The folder "${shown(typed, 200)}" is one of the folders Ironbooks keeps its own data in (settings, working copies, backups or agents' files), or is inside or holds one. Choose another folder for the agent.`,
+      );
+    }
+    const key = samePathKey(real);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(real);
+  }
+  return out;
+}
+
+/** Whether a policy lets bulk work run unasked anywhere (and so must have a count cap). */
+function allowsBulk(preset: AgentPreset, overrides: PolicyOverride[]): boolean {
+  const probe = resolvePolicy(preset, overrides, { bulkCap: DEFAULT_BULK_CAP });
+  return probe.classes.bulk === 'allow' || AREA_KEYS.some((a) => probe.areas[a]?.bulk === 'allow');
+}
+
+function overridesKey(list: PolicyOverride[]): string {
+  return JSON.stringify(sortOverrides(list).map((o) => [o.class, o.area ?? null, o.setting]));
+}
+
+/**
+ * Save an agent's policy: its preset, its overrides (replacing every stored one when sent) and its
+ * limits. Checked against the policy engine's own rules and refused, with what to change, at the
+ * first problem: nothing is saved in a form the engine would read differently. The older mode is
+ * kept in step with the preset. One transaction, one audit row naming what changed.
+ */
+export const saveAgentPolicy: SaveAgentPolicy = async (ctx, agentId, input) => {
+  const person = await personWhoManagesAgents(ctx);
+  const before = await agentRowFor(ctx, agentId);
+  if (!before) throw notFound('Agent');
+  if (before.revokedAt) throw validation(REMOVED);
+  await assertWithinYourAccess(ctx, person, before, { admin: ADMIN_AGENT_SETTINGS, more: MORE_THAN_YOU_SETTINGS });
+  const asked = readPolicyInput(input);
+  // On the disk, so outside the transaction.
+  const folders = asked.folders === undefined ? undefined : await checkFolders(asked.folders);
+
+  await inTransaction(ctx, async (tx) => {
+    const row = await agentRowFor(tx, agentId);
+    if (!row) throw notFound('Agent');
+    if (row.revokedAt) throw validation(REMOVED);
+    const stored = await storedOverrides(tx, row.id);
+
+    const preset = asked.preset ?? presetOfRow(row);
+    const overrides = asked.overrides ?? stored.filter(understood);
+    let bulkCap = asked.bulkCap !== undefined ? asked.bulkCap : (row.bulkCap ?? null);
+    // Bulk work may run unasked only within a count cap (plan 4.2). A save that allows it and says
+    // nothing about the cap gets the usual one, the same the engine would use, written down.
+    const bulkAllowed = allowsBulk(preset, overrides);
+    if (bulkAllowed && bulkCap === null) {
+      if (asked.bulkCap === null) {
+        throw validation(
+          `"${RISK_CLASS_LABELS.bulk}" is set to Allow, so it needs a limit on the records one request may change (${DEFAULT_BULK_CAP} is usual).`,
+        );
+      }
+      bulkCap = DEFAULT_BULK_CAP;
+    }
+    const next = {
+      preset,
+      mode: modeForPreset(preset),
+      bulkCap,
+      twoPersonOver: asked.twoPersonOver !== undefined ? asked.twoPersonOver : readStoredAmount(row.twoPersonOver),
+      requestExpiryDays: asked.requestExpiryDays ?? row.requestExpiryDays,
+      folders: folders ?? (Array.isArray(row.folders) ? row.folders : []),
+      notifyEmail: asked.notifyEmail ?? row.notifyEmail === true,
+    };
+
+    // The engine's own rules have the last word (pause is not part of a save: it is left out).
+    // What this save sent was checked above, so what can still fail here is what it keeps from
+    // the stored policy: a row or a limit a hand-edited file holds. Nothing is saved over it.
+    const problems = policyProblems(preset, overrides, {
+      bulkCap: next.bulkCap,
+      twoPersonOver: next.twoPersonOver,
+      requestExpiryDays: next.requestExpiryDays,
+      folders: next.folders,
+      notifyEmail: next.notifyEmail,
+    });
+    if (problems.length) throw validation(`${problems[0]} Fix this setting and save again.`);
+
+    const prev = {
+      preset: row.preset,
+      mode: row.mode,
+      bulkCap: row.bulkCap ?? null,
+      twoPersonOver: readStoredAmount(row.twoPersonOver),
+      requestExpiryDays: row.requestExpiryDays,
+      folders: Array.isArray(row.folders) ? row.folders : [],
+      notifyEmail: row.notifyEmail === true,
+    };
+    const changed = (Object.keys(next) as Array<keyof typeof next>).filter((k) => JSON.stringify(next[k]) !== JSON.stringify(prev[k]));
+    const overridesChanged = asked.overrides !== undefined && overridesKey(asked.overrides) !== overridesKey(stored);
+    if (!changed.length && !overridesChanged) return;
+
+    if (changed.length) {
+      await tx.db
+        .update(agents)
+        .set({
+          preset: next.preset,
+          mode: next.mode,
+          bulkCap: next.bulkCap,
+          twoPersonOver: next.twoPersonOver,
+          requestExpiryDays: next.requestExpiryDays,
+          folders: next.folders,
+          notifyEmail: next.notifyEmail,
+        })
+        .where(and(eq(agents.id, row.id), eq(agents.companyId, tx.companyId)));
+    }
+    if (overridesChanged) {
+      await tx.db.delete(agentPolicies).where(and(eq(agentPolicies.agentId, row.id), eq(agentPolicies.companyId, tx.companyId)));
+      if (asked.overrides!.length) {
+        await tx.db
+          .insert(agentPolicies)
+          .values(asked.overrides!.map((o) => ({ companyId: tx.companyId, agentId: row.id, class: o.class, area: o.area, setting: o.setting })));
+      }
+    }
+
+    const pick = (from: Record<string, unknown>) => Object.fromEntries(changed.map((k) => [k, from[k]]));
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'agent',
+      entityId: row.id,
+      oldValues: { name: row.name, ...pick(prev), ...(overridesChanged ? { overrides: stored } : {}) },
+      newValues: { name: row.name, ...pick(next), ...(overridesChanged ? { overrides: asked.overrides } : {}) },
+    });
+  });
+
+  const saved = await agentRowFor(ctx, agentId);
+  if (!saved) throw notFound('Agent');
+  return policyViewOf(ctx, saved);
+};
+
+/** A stored two-person amount in the form a save writes (two places), or null. */
+function readStoredAmount(v: string | null): string | null {
+  if (v === null || v === undefined) return null;
+  try {
+    const d = new Decimal(v);
+    return d.isFinite() ? d.toFixed(2) : v;
+  } catch {
+    return v;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Pause
+// ---------------------------------------------------------------------------
+
+/**
+ * Pause one agent, or turn it back on. A paused agent is refused everything until a person turns
+ * it back on; its token and settings stay. Pausing is open to everyone who may manage agents;
+ * turning back on follows the same rule as changing its settings. Already so: nothing is written.
+ */
+export const pauseAgent: PauseAgent = async (ctx, agentId, paused) => {
+  const person = await personWhoManagesAgents(ctx);
+  if (typeof paused !== 'boolean') throw validation(SAY_PAUSED);
+  await inTransaction(ctx, async (tx) => {
+    const row = await agentRowFor(tx, agentId);
+    if (!row) throw notFound('Agent');
+    if (row.revokedAt) throw validation(REMOVED);
+    const was = isPaused(row.pausedAt);
+    if (was === paused) return;
+    if (!paused) await assertWithinYourAccess(tx, person, row, { admin: ADMIN_AGENT_RESUME, more: MORE_THAN_YOU_RESUME });
+    await tx.db
+      .update(agents)
+      .set({ pausedAt: paused ? new Date() : null })
+      .where(and(eq(agents.id, row.id), eq(agents.companyId, tx.companyId)));
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'agent',
+      entityId: row.id,
+      oldValues: { name: row.name, paused: was },
+      newValues: { name: row.name, paused },
+    });
+  });
+};
+
+/**
+ * "Pause all agents": the company's Integrated Applications switch ("Don't allow any applications
+ * to access this company file"), changed through the same code path as Preferences
+ * (updateCompany), which audits it and holds it to an Admin. While it is on, every agent of the
+ * company is refused (lib/agentContext.ts) and every policy reads as paused (loadAgentPolicy). It
+ * also keeps the employee portal and phone receipts out, as it always has.
+ *
+ * So it is for an Admin who may manage agents, not for every user manager: the switch is the same
+ * one Preferences holds to an Admin, and a second way to it must not be wider. A manager who is not
+ * an Admin pauses one agent at a time (pauseAgent); mayPauseAllAgents tells the title bar which.
+ */
+export const pauseAllAgents: PauseAllAgents = async (ctx, paused) => {
+  const person = await personWhoManagesAgents(ctx);
+  if (typeof paused !== 'boolean') throw validation(SAY_PAUSED);
+  if (!person.isAdmin) throw new ServiceError('FORBIDDEN', PAUSE_ALL_FOR_ADMIN);
+  if ((await agentsBlockedFor(ctx.db, ctx.companyId)) === paused) return;
+  await updateCompany(ctx, { settings: { integratedAppsBlocked: paused } });
+};

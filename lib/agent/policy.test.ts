@@ -3,6 +3,8 @@
  * Most tests walk every combination of the inputs that matter instead of picking examples, so a
  * rule that holds here holds for every class, preset, role, setting, grant and request fact.
  */
+import fs from 'node:fs';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   ACTIONS,
@@ -18,6 +20,7 @@ import {
 } from '@/lib/permissions/model';
 import { API_ROUTE_PERMISSIONS, apiActivityFor, apiRuleFor, matchRoutePattern, type HttpMethod } from '@/lib/permissions/routes';
 import { assertRule } from '@/lib/permissions/enforce';
+import { isMaskedValue, isSensitiveKey, maskSensitive } from '@/lib/permissions/mask';
 import {
   ADMIN_APPROVAL_CLASSES,
   AGENT_PRESETS,
@@ -38,20 +41,24 @@ import {
 } from './operations/types';
 import {
   DEFAULT_BULK_CAP,
+  FIELD_FLAGS,
   PRESET_DEFAULTS,
   approvalNeeds,
   baseClass,
   classRank,
   decide,
   effectiveClass,
+  flagsNeeded,
   grantCovers,
   grantNeedsAdmin,
   isPaused,
   maxGrantMinutes,
   minutesToEndOfDay,
+  needsTwoPerson,
   policyProblems,
   presetBulkCap,
   presetForMode,
+  requestClasses,
   resolvePolicy,
   roleAllows,
   roleProblem,
@@ -446,7 +453,9 @@ describe('decision matrix', () => {
               expect(d.outcome, label).toBe('ask');
               if (d.outcome !== 'ask') continue;
               expect(d.needs.grantable, label).toBe(GRANTABLE[cls]);
-              expect(d.needs.admin, label).toBe(ADMIN_APPROVAL_CLASSES.includes(cls));
+              // A protected read that names no kind of data (no reveal, no sensitive field, not in
+              // payroll) cannot be told apart, so an Admin approves it.
+              expect(d.needs.admin, label).toBe(ADMIN_APPROVAL_CLASSES.includes(cls) || cls === 'read_sensitive');
               expect(d.needs.twoPerson, label).toBe(false);
             }
           }
@@ -454,6 +463,114 @@ describe('decision matrix', () => {
       }
     }
     expect(cases).toBe(ROLES.length * ACTIONS.length * RISK_CLASSES.length * POLICY_SETTINGS.length * GRANTS.length);
+  });
+
+  // Every preset, every class, every setting (and the preset's own), with and without a live grant,
+  // for an operation open to agents, a person-only one and one on the hard floor.
+  const AVAILABILITIES = ['agent', 'person_only', 'hard_floor'] as const;
+  const SETTINGS_OR_PRESET = ['preset', ...POLICY_SETTINGS] as const;
+
+  it('class x setting x preset x grant: refuse / run / ask exactly as section 4.1', () => {
+    let cases = 0;
+    for (const preset of AGENT_PRESETS) {
+      for (const cls of RISK_CLASSES) {
+        for (const setting of SETTINGS_OR_PRESET) {
+          for (const withGrant of [false, true]) {
+            for (const availability of AVAILABILITIES) {
+              // A protected read names what it shows, so its approver needs only the View flag.
+              const operation = op({ id: 'px.op', class: cls, availability, reveal: cls === 'read_sensitive' ? 'ssn' : null });
+              const rows: PolicyOverride[] = setting === 'preset' ? [] : [{ class: cls, area: null, setting }];
+              const policy = resolvePolicy(preset, rows);
+              const grants = withGrant ? [grant({ id: 'g-px', operation: 'px.op', constraints: { maxCount: 10 } })] : [];
+              const d = run({ access: ADMIN, policy, operation, facts: F, grants });
+              const label = `${preset} ${cls} ${setting} grant=${withGrant} ${availability}`;
+              cases++;
+
+              expect(d.effectiveClass, label).toBe(cls);
+              if (availability !== 'agent') {
+                expect(d, label).toMatchObject({ outcome: 'refuse', code: availability });
+                continue;
+              }
+              const stored: PolicySetting = setting === 'preset' ? PRESET_DEFAULTS[preset][cls] : setting;
+              const coerced: PolicySetting = stored === 'allow' && NEVER_ALLOW_CLASSES.includes(cls) ? 'ask' : stored;
+              if (coerced === 'never') {
+                expect(d, label).toMatchObject({ outcome: 'refuse', code: 'never' });
+                continue;
+              }
+              if (coerced === 'allow') {
+                expect(d, label).toEqual({ outcome: 'run', effectiveClass: cls, grantId: null });
+                continue;
+              }
+              if (withGrant && GRANTABLE[cls] !== 'no') {
+                expect(d, label).toEqual({ outcome: 'run', effectiveClass: cls, grantId: 'g-px' });
+                continue;
+              }
+              expect(d.outcome, label).toBe('ask');
+              if (d.outcome !== 'ask') continue;
+              expect(d.needs, label).toMatchObject({
+                grantable: GRANTABLE[cls],
+                admin: ADMIN_APPROVAL_CLASSES.includes(cls),
+                twoPerson: false,
+                flag: cls === 'period' ? 'closedPeriod' : cls === 'read_sensitive' ? 'sensitivePayroll' : null,
+              });
+            }
+          }
+        }
+      }
+    }
+    expect(cases).toBe(AGENT_PRESETS.length * RISK_CLASSES.length * SETTINGS_OR_PRESET.length * 2 * AVAILABILITIES.length);
+  });
+
+  it('no combination runs a person-only or hard-floor operation, or a never-Allow class without a person', () => {
+    const accesses = [ADMIN, ACCOUNTANT, custom({}, { closedPeriod: true, sensitivePayroll: true, fullAccountNumbers: true })];
+    let ran = 0;
+    let checked = 0;
+    for (const preset of AGENT_PRESETS) {
+      for (const setting of SETTINGS_OR_PRESET) {
+        const policy = setting === 'preset' ? resolvePolicy(preset, [], { twoPersonOver: '1000' }) : everywhere(setting, preset);
+        for (const cls of RISK_CLASSES) {
+          for (const availability of AVAILABILITIES) {
+            for (const reveal of [null, 'ssn', 'account_numbers'] as const) {
+              const operation = op({ id: 'inv.op', class: cls, availability, reveal, amountField: 'total' });
+              for (const withGrant of [false, true]) {
+                const grants = withGrant
+                  ? [grant({ id: 'g-inv', operation: 'inv.op', constraints: {} }), grant({ id: 'g-inv-cap', operation: 'inv.op', constraints: { maxCount: 100_000 } })]
+                  : [];
+                for (const access of accesses) {
+                  for (const [fname, f] of FACT_VARIANTS) {
+                    const d = run({ access, policy, operation, facts: f, grants });
+                    const label = `${preset} ${setting} ${cls} ${availability} ${reveal} grant=${withGrant} ${fname}`;
+                    checked++;
+                    if (availability !== 'agent') {
+                      expect(d, label).toMatchObject({ outcome: 'refuse', code: availability });
+                      continue;
+                    }
+                    if (d.outcome !== 'run') continue;
+                    ran++;
+                    // Whatever ran either needed no person (every class it falls under may be Allow),
+                    // or ran under a grant for its own class, which a person gave.
+                    if (NEVER_ALLOW_CLASSES.includes(d.effectiveClass)) {
+                      expect(d.grantId, label).not.toBeNull();
+                      expect(GRANTABLE[d.effectiveClass], label).not.toBe('no');
+                    }
+                    if (d.grantId === null) {
+                      expect(NEVER_ALLOW_CLASSES.includes(d.effectiveClass), label).toBe(false);
+                      // A reveal, or a dated write in a closed period, always has a person in it.
+                      expect(f.reveal, label).toBe(false);
+                      if (!['read', 'read_sensitive', 'prepare'].includes(cls)) expect(f.closedPeriod, label).toBe(false);
+                    } else {
+                      expect(d.effectiveClass, label).toBe(cls);
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    expect(checked).toBeGreaterThan(50_000);
+    expect(ran).toBeGreaterThan(1000);
   });
 
   it('area overrides are matched to the operation area', () => {
@@ -469,7 +586,8 @@ describe('decision matrix', () => {
     expect(refused).toMatchObject({ outcome: 'refuse', code: 'never' });
     if (refused.outcome === 'refuse') {
       expect(refused.message).toBe(
-        'An Admin has not allowed agents to enter new records in Employees & Payroll. An Admin can change this in Users & Roles > Agents.',
+        'An Admin has not allowed agents to enter new records in Employees & Payroll. Ask a person to do it instead, ' +
+          "or ask an Admin to change this agent's settings in Users & Roles > Agents.",
       );
     }
     expect(run({ policy, operation: customers }).outcome).toBe('ask');
@@ -526,10 +644,10 @@ describe('the hard floor and person-only operations', () => {
     const person = run({ operation: op({ availability: 'person_only' }) });
     const floor = run({ operation: op({ availability: 'hard_floor' }) });
     expect(person.outcome === 'refuse' && person.message).toBe(
-      'Only a person can do this, signed in as themselves. It is not something an agent can ask for.',
+      'Only a person can do this, signed in as themselves, so it is not something an agent can ask for. Ask a person to do it in Ironbooks.',
     );
     expect(floor.outcome === 'refuse' && floor.message).toBe(
-      "Agents can never do this, even with a person's approval. A person can do it in Ironbooks.",
+      "Agents can never do this, even with a person's approval. Ask a person to do it in Ironbooks.",
     );
   });
 });
@@ -696,6 +814,25 @@ describe('the role (the ceiling)', () => {
     expect(roleAllows(VIEW_ONLY, op({ rule: 'member' }))).toBe(true);
   });
 
+  it('a route with no rule tells the agent to ask a person, not to ask for a role change that cannot help', () => {
+    const NO_RULE =
+      'No role can allow this request, not even Admin, because Ironbooks has no permission rule for it. Ask a person to do it in Ironbooks.';
+    for (const access of [ADMIN, BOOKKEEPER, ACCOUNTANT, PAYROLL, VIEW_ONLY]) {
+      for (const preset of AGENT_PRESETS) {
+        for (const cls of RISK_CLASSES) {
+          const d = run({ access, policy: resolvePolicy(preset, []), operation: op({ class: cls, rule: null, kind: 'route' }) });
+          expect(d, `${cls} ${preset}`).toMatchObject({ outcome: 'refuse', code: 'role', message: NO_RULE });
+        }
+      }
+    }
+    // A desktop action with no rule is a role question: an Admin role would pass it.
+    const shell = run({ access: BOOKKEEPER, operation: op({ rule: null, kind: 'shell', area: null, action: null }) });
+    expect(shell).toMatchObject({ outcome: 'refuse', code: 'role' });
+    expect(shell.outcome === 'refuse' && shell.message).toBe(
+      "Your role does not allow this: it needs the Admin role. Ask an Admin to change this agent's role.",
+    );
+  });
+
   it('is the same check a person meets for every mapped route and method', () => {
     const accesses: EffectiveAccess[] = [
       ...BUILTIN_ROLES.map((r) => unionRoles([r])),
@@ -802,14 +939,22 @@ describe('effectiveClass', () => {
     expect(e('change', { confirm: ['allowLedgerRewrite'] })).toBe('period');
     expect(e('enter', { confirm: ['allowReconciledEdit'] })).toBe('period');
     expect(e('remove', { confirm: ['allowReconciledEdit'] })).toBe('period');
-    for (const w of ['enter', 'change', 'bulk', 'remove'] as RiskClass[]) {
+    // Any class that can write to the books, the ones filed by their riskiest effect included
+    // (Income Tracker convert is outside, a print-queue confirm is print): judged as period, or
+    // under its own class where that is stricter still.
+    for (const w of ['enter', 'change', 'bulk', 'remove', 'outside', 'print'] as RiskClass[]) {
       expect(e(w, { closedPeriod: true })).toBe('period');
+    }
+    for (const w of ['settings', 'admin', 'file', 'secret'] as RiskClass[]) {
+      expect(e(w, { closedPeriod: true })).toBe(w);
+      expect(requestClasses(op({ class: w }), facts({ closedPeriod: true }))).toEqual([w, 'period']);
     }
     // Not book-writing: the closing date does not apply. Prepare work never reaches the books.
     expect(e('prepare', { closedPeriod: true })).toBe('prepare');
     expect(e('prepare', { confirm: ['allowReconciledEdit'] })).toBe('period');
     expect(e('read', { closedPeriod: true })).toBe('read');
-    expect(e('outside', { closedPeriod: true })).toBe('outside');
+    expect(e('read_sensitive', { closedPeriod: true })).toBe('read_sensitive');
+    // A reconciled-edit flag only raises the everyday writing classes (a grant never covers a flagged request anyway).
     expect(e('print', { confirm: ['allowReconciledEdit'] })).toBe('print');
     // Already stricter: unchanged.
     expect(e('secret', { reveal: true, closedPeriod: true })).toBe('secret');
@@ -978,7 +1123,8 @@ describe('two-person approval (D8)', () => {
 
   it('applies strictly above the amount, compared as decimals', () => {
     const at = (amount: string | null) => approvalNeeds(op(), 'enter', facts({ amount }), policy).twoPerson;
-    expect(at(null)).toBe(false);
+    // Entering changes the books: with no amount nobody can show it is below the threshold.
+    expect(at(null)).toBe(true);
     expect(at('999.99')).toBe(false);
     expect(at('1000')).toBe(false);
     expect(at('1000.00')).toBe(false);
@@ -1010,12 +1156,82 @@ describe('two-person approval (D8)', () => {
     expect(approvalNeeds(withAmount, 'enter', facts({ amount: '10' }), policy).twoPerson).toBe(false);
     // No threshold set: nothing to compare against.
     expect(approvalNeeds(withAmount, 'enter', facts({ amount: null }), resolvePolicy('trusted_bookkeeper', [])).twoPerson).toBe(false);
-    // An operation without an amount is not held back by the threshold.
-    expect(approvalNeeds(op(), 'enter', facts({ amount: null }), policy).twoPerson).toBe(false);
     const d = run({ policy, operation: withAmount, facts: facts({ amount: null }) });
     expect(d).toMatchObject({ outcome: 'ask' });
     if (d.outcome === 'ask') expect(d.needs.twoPerson).toBe(true);
-    expect(run({ policy, operation: op(), facts: facts({ amount: null }) })).toMatchObject({ outcome: 'run' });
+    // With the dry run's amount (the caller decides again), a small one runs under Allow.
+    expect(run({ policy, operation: withAmount, facts: facts({ amount: '10' }) })).toMatchObject({ outcome: 'run' });
+  });
+
+  it('a missing amount counts as above the threshold for every class that changes the books (D8)', () => {
+    // Per class: [no amountField, with amountField] when the amount is not known.
+    const WANT: Record<RiskClass, [boolean, boolean]> = {
+      read: [false, false],
+      read_sensitive: [false, false],
+      prepare: [false, true],
+      enter: [true, true],
+      change: [true, true],
+      bulk: [true, true],
+      remove: [true, true],
+      period: [true, true],
+      outside: [false, true],
+      print: [false, true],
+      settings: [false, true],
+      admin: [false, true],
+      file: [false, true],
+      secret: [false, true],
+    };
+    for (const cls of RISK_CLASSES) {
+      for (const [i, amountField] of [null, 'total'].entries()) {
+        const o = op({ class: cls, amountField });
+        const label = `${cls} amountField=${amountField}`;
+        expect(needsTwoPerson(policy, facts({ amount: null }), o), label).toBe(WANT[cls][i]);
+        expect(approvalNeeds(o, effectiveClass(o, facts()), facts(), policy).twoPerson, label).toBe(WANT[cls][i]);
+        // A known amount at or below the threshold never needs two people; above it, all but reads do.
+        expect(needsTwoPerson(policy, facts({ amount: '1000' }), o), label).toBe(false);
+        expect(needsTwoPerson(policy, facts({ amount: '1000.01' }), o), label).toBe(cls !== 'read' && cls !== 'read_sensitive');
+        // No threshold: never.
+        expect(needsTwoPerson(resolvePolicy('trusted_bookkeeper', []), facts({ amount: null }), o), label).toBe(false);
+      }
+    }
+    // A closed-period date makes an outside or print request one that changes the books.
+    for (const cls of ['outside', 'print'] as RiskClass[]) {
+      expect(needsTwoPerson(policy, facts({ amount: null, closedPeriod: true }), op({ class: cls }))).toBe(true);
+    }
+    // A reveal on a read is still a read.
+    expect(needsTwoPerson(policy, facts({ amount: '5000', reveal: true }), op({ class: 'read' }))).toBe(false);
+    // Nobody classified it, or the caller did not say what it is: it cannot be shown to be a read.
+    expect(needsTwoPerson(policy, facts({ amount: null }), op({ class: 'read', classified: false }))).toBe(true);
+    expect(needsTwoPerson(policy, facts({ amount: null }), { amountField: null })).toBe(true);
+    expect(needsTwoPerson(policy, facts({ amount: null }))).toBe(true);
+    expect(needsTwoPerson(policy, facts({ amount: null }), null)).toBe(true);
+  });
+
+  it('under Allow, an unknown amount asks two people; reads still run; a grant does not answer it', () => {
+    const trusted = resolvePolicy('trusted_bookkeeper', [], { twoPersonOver: '1000' });
+    const enterAsk = run({ policy: trusted, operation: op(), facts: facts({ amount: null }) });
+    expect(enterAsk).toMatchObject({ outcome: 'ask', effectiveClass: 'enter' });
+    if (enterAsk.outcome === 'ask') expect(enterAsk.needs.twoPerson).toBe(true);
+    const read = op({ id: 'invoices.list', class: 'read', rule: { area: 'customers', action: 'view' }, action: 'view' });
+    expect(run({ policy: trusted, operation: read, facts: facts({ amount: null }) })).toMatchObject({ outcome: 'run' });
+    expect(run({ policy: trusted, operation: read, facts: facts({ amount: '999999' }) })).toMatchObject({ outcome: 'run' });
+    const asking = resolvePolicy('ask_every_change', [], { twoPersonOver: '1000' });
+    const d = run({ policy: asking, operation: op(), facts: facts({ amount: null }), grants: [grant({ constraints: {} })] });
+    expect(d).toMatchObject({ outcome: 'ask' });
+    if (d.outcome === 'ask') expect(d.needs.twoPerson).toBe(true);
+  });
+
+  it('the second decision clears it only when the dry run reports an amount: "0.00" for work that moves no money', () => {
+    // A new customer has no amount field. With no amount it needs two people; once the dry run
+    // reports that nothing was posted ("0.00"), it runs under Allow, even with a threshold of zero.
+    for (const over of ['1000', '0']) {
+      const trusted = resolvePolicy('trusted_bookkeeper', [], { twoPersonOver: over });
+      const newCustomer = op({ id: 'customers.create', class: 'enter', amountField: null });
+      const before = run({ policy: trusted, operation: newCustomer, facts: facts({ amount: null }) });
+      expect(before, over).toMatchObject({ outcome: 'ask' });
+      if (before.outcome === 'ask') expect(before.needs.twoPerson, over).toBe(true);
+      expect(run({ policy: trusted, operation: newCustomer, facts: facts({ amount: '0.00' }) }), over).toMatchObject({ outcome: 'run' });
+    }
   });
 });
 
@@ -1170,7 +1386,8 @@ describe('approvalNeeds', () => {
   it('Admin for the Admin-only classes and for unclassified operations; file Admin and host-only from the operation', () => {
     for (const cls of RISK_CLASSES) {
       const n = approvalNeeds(op({ class: cls }), cls, facts(), policy);
-      expect(n.admin, cls).toBe(ADMIN_APPROVAL_CLASSES.includes(cls));
+      // A protected read that names no kind of data (op() is in Customers, with no sensitive field) asks an Admin.
+      expect(n.admin, cls).toBe(ADMIN_APPROVAL_CLASSES.includes(cls) || cls === 'read_sensitive');
       expect(n.grantable, cls).toBe(GRANTABLE[cls]);
       // Only the closed-period class needs a flag and a password by itself (moving the closing date).
       const period = cls === 'period';
@@ -1178,6 +1395,7 @@ describe('approvalNeeds', () => {
         fileAdmin: false,
         hostOnly: false,
         flag: period ? 'closedPeriod' : null,
+        flags: period ? ['closedPeriod'] : [],
         secrets: period ? ['closing_password'] : [],
         twoPerson: false,
       });
@@ -1243,7 +1461,7 @@ describe('approvalNeeds', () => {
     expect(approvalNeeds(send, 'outside', f, policy)).toMatchObject({ flag: 'sensitivePayroll', grantable: 'no' });
   });
 
-  it('a request that needs two approver flags is refused with a way forward, never asked as one', () => {
+  it('a request that needs two approver flags is asked with both, never refused for it', () => {
     const payrollChange = op({
       id: 'payroll.adjust',
       class: 'change',
@@ -1256,21 +1474,40 @@ describe('approvalNeeds', () => {
     for (const preset of AGENT_PRESETS) {
       for (const s of POLICY_SETTINGS) {
         const d = run({ access: ADMIN, policy: everywhere(s, preset), operation: payrollChange, facts: both, grants: [grant({ operation: 'payroll.adjust' })] });
-        expect(d, `${preset} ${s}`).toMatchObject({ outcome: 'refuse', code: 'never' });
-        if (s !== 'never' && d.outcome === 'refuse') {
-          expect(d.message).toBe(
-            'This request asks to see protected data and to work on or before the closing date at once, and those are ' +
-              'approved by different rights. Send it without asking to see the full values, then ask for them in a separate request.',
-          );
+        const label = `${preset} ${s}`;
+        if (s === 'never') {
+          expect(d, label).toMatchObject({ outcome: 'refuse', code: 'never' });
+          continue;
+        }
+        // Allow or Ask: a reveal and a closed date are never Allow, and no grant covers either.
+        expect(d, label).toMatchObject({ outcome: 'ask', effectiveClass: 'period' });
+        if (d.outcome === 'ask') {
+          expect(d.needs.flags, label).toEqual(['closedPeriod', 'sensitivePayroll']);
+          expect(d.needs.flag, label).toBe('closedPeriod');
+          expect(d.needs.secrets, label).toEqual(['closing_password']);
+          expect(d.needs.grantable, label).toBe('no');
         }
       }
     }
-    // Each half on its own is asked, with its own flag.
+    // The role needs both rights too: missing either one is refused, and the refusal says what to do instead.
     const allowAll = everywhere('allow', 'full_with_asks');
+    const noView = run({ access: ACCOUNTANT, policy: allowAll, operation: payrollChange, facts: both });
+    expect(noView).toMatchObject({ outcome: 'refuse', code: 'role' });
+    expect(noView.outcome === 'refuse' && noView.message).toBe(
+      'Your role does not allow this: it needs "View sensitive payroll data (full SSNs)". Send the request again ' +
+        "without asking to see the full values, or ask an Admin to change this agent's role.",
+    );
+    const noClosed = run({ access: PAYROLL, policy: allowAll, operation: payrollChange, facts: both });
+    expect(noClosed).toMatchObject({ outcome: 'refuse', code: 'role' });
+    expect(noClosed.outcome === 'refuse' && noClosed.message).toBe(
+      'Your role does not allow this: it needs "Modify transactions on or before the closing date". Ask a person who may ' +
+        "change entries on or before the closing date to do it, or ask an Admin to change this agent's role.",
+    );
+    // Each half on its own is asked, with its own flag.
     const closedOnly = run({ access: ADMIN, policy: allowAll, operation: payrollChange, facts: facts({ closedPeriod: true }) });
-    expect(closedOnly.outcome === 'ask' && closedOnly.needs.flag).toBe('closedPeriod');
+    expect(closedOnly.outcome === 'ask' && closedOnly.needs.flags).toEqual(['closedPeriod']);
     const revealOnly = run({ access: ADMIN, policy: allowAll, operation: payrollChange, facts: facts({ reveal: true }) });
-    expect(revealOnly.outcome === 'ask' && revealOnly.needs.flag).toBe('sensitivePayroll');
+    expect(revealOnly.outcome === 'ask' && revealOnly.needs.flags).toEqual(['sensitivePayroll']);
     // A reconciled edit with a reveal needs only the View flag: the closing-date right is not involved.
     const reconciled = run({
       access: ADMIN,
@@ -1279,7 +1516,41 @@ describe('approvalNeeds', () => {
       facts: facts({ reveal: true, confirm: ['allowReconciledEdit'] }),
     });
     expect(reconciled).toMatchObject({ outcome: 'ask', effectiveClass: 'period' });
-    if (reconciled.outcome === 'ask') expect(reconciled.needs.flag).toBe('sensitivePayroll');
+    if (reconciled.outcome === 'ask') expect(reconciled.needs).toMatchObject({ flag: 'sensitivePayroll', flags: ['sensitivePayroll'] });
+  });
+
+  it('flag is always the first of flags, for every class and request fact', () => {
+    for (const cls of RISK_CLASSES) {
+      for (const reveal of [null, 'ssn', 'account_numbers', 'payroll'] as const) {
+        for (const [name, f] of FACT_VARIANTS) {
+          const o = op({ class: cls, reveal, sensitiveFields: ['accountNumber'] });
+          const n = approvalNeeds(o, effectiveClass(o, f), f, policy);
+          const label = `${cls} ${reveal} ${name}`;
+          expect(Array.isArray(n.flags), label).toBe(true);
+          expect(n.flag, label).toBe(n.flags?.[0] ?? null);
+          expect(new Set(n.flags).size, label).toBe(n.flags?.length);
+          // The closing-date password goes with the closed-period right, and only with it (no operation secrets here).
+          expect(n.secrets.includes('closing_password'), label).toBe(n.flags?.includes('closedPeriod'));
+        }
+      }
+    }
+  });
+
+  it('grantAdminOnly is grantNeedsAdmin, for every class and request fact (D5)', () => {
+    for (const cls of RISK_CLASSES) {
+      for (const classified of [true, false]) {
+        for (const [name, f] of FACT_VARIANTS) {
+          const o = op({ class: cls, classified, reveal: 'ssn' });
+          expect(approvalNeeds(o, effectiveClass(o, f), f, policy).grantAdminOnly, `${cls} ${classified} ${name}`).toBe(
+            grantNeedsAdmin(o, f),
+          );
+        }
+      }
+    }
+    const send = run({ access: ADMIN, policy, operation: op({ id: 'invoices.email', class: 'outside' }) });
+    expect(send.outcome === 'ask' && send.needs).toMatchObject({ grantable: 'short', grantAdminOnly: true, admin: false });
+    const enter = run({ access: ADMIN, policy, operation: op() });
+    expect(enter.outcome === 'ask' && enter.needs).toMatchObject({ grantable: 'yes', grantAdminOnly: false });
   });
 
   it('only an Admin may give the short window for outside sends (D5)', () => {
@@ -1288,6 +1559,249 @@ describe('approvalNeeds', () => {
     expect(grantNeedsAdmin(op({ class: 'enter' }), facts())).toBe(false);
     expect(grantNeedsAdmin(op({ class: 'bulk' }), facts())).toBe(false);
     expect(grantNeedsAdmin(op({ classified: false, class: 'enter' }), facts())).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Closed periods, protected reads, the count cap, refusal wording
+// ---------------------------------------------------------------------------
+
+/** Classes that can write to the books, so the closing date applies (everything but reads and prepare). */
+const BOOK_CLASSES: readonly RiskClass[] = RISK_CLASSES.filter((c) => c !== 'read' && c !== 'read_sensitive' && c !== 'prepare');
+
+describe('closed periods: any class that can write to the books', () => {
+  const closed = facts({ closedPeriod: true, date: '2025-12-31' });
+  const allowAll = everywhere('allow', 'full_with_asks');
+
+  it('needs the closed-period right of the role and of the approver, and the closing-date password', () => {
+    for (const cls of RISK_CLASSES) {
+      const o = op({ id: 'cp.op', class: cls });
+      const writes = BOOK_CLASSES.includes(cls);
+      expect(flagsNeeded(o, closed).includes('closedPeriod'), cls).toBe(writes);
+
+      // A Bookkeeper may create in Customers & Receivables but not work in a closed period.
+      const bk = run({ access: BOOKKEEPER, policy: allowAll, operation: o, facts: closed });
+      if (writes) {
+        expect(bk, cls).toMatchObject({ outcome: 'refuse', code: 'role' });
+        expect(bk.outcome === 'refuse' && bk.message, cls).toContain('Modify transactions on or before the closing date');
+      } else {
+        expect(bk.outcome === 'refuse' ? bk.code : null, cls).toBeNull();
+      }
+
+      // An Accountant has the right: asked, with the right and the password on the card, one at a time.
+      const acc = run({ access: ACCOUNTANT, policy: allowAll, operation: o, facts: closed });
+      if (!writes) continue;
+      expect(acc, cls).toMatchObject({ outcome: 'ask', effectiveClass: classRank(cls) > classRank('period') ? cls : 'period' });
+      if (acc.outcome === 'ask') {
+        expect(acc.needs.flags, cls).toEqual(['closedPeriod']);
+        expect(acc.needs.secrets, cls).toEqual(['closing_password']);
+        expect(acc.needs.grantable, cls).toBe('no');
+        expect(acc.needs.admin, cls).toBe(ADMIN_APPROVAL_CLASSES.includes(cls));
+      }
+    }
+  });
+
+  it('an outside or print request in a closed period is held by the closed-period setting too', () => {
+    const policy = resolvePolicy('full_with_asks', [{ class: 'period', area: null, setting: 'never' }]);
+    for (const cls of ['outside', 'print', 'settings', 'file'] as RiskClass[]) {
+      const o = op({ id: 'cp.op', class: cls });
+      expect(run({ access: ADMIN, policy, operation: o }).outcome, cls).toBe('ask');
+      const d = run({ access: ADMIN, policy, operation: o, facts: closed });
+      expect(d, cls).toMatchObject({ outcome: 'refuse', code: 'never' });
+      expect(d.outcome === 'refuse' && d.message, cls).toContain('work on or before the closing date');
+    }
+  });
+
+  it('a short window given for outside sends does not cover one dated in a closed period', () => {
+    const send = op({ id: 'income.convert', class: 'outside' });
+    const g = [grant({ operation: 'income.convert', constraints: {} })];
+    const policy = resolvePolicy('full_with_asks', []);
+    expect(run({ access: ADMIN, policy, operation: send, grants: g })).toMatchObject({ outcome: 'run', grantId: 'g1' });
+    expect(run({ access: ADMIN, policy, operation: send, grants: g, facts: closed })).toMatchObject({
+      outcome: 'ask',
+      effectiveClass: 'period',
+    });
+  });
+});
+
+describe('protected reads (read_sensitive) without a reveal', () => {
+  const policy = resolvePolicy('ask_every_change', []);
+  const sensitive = (over: Partial<Operation>) =>
+    op({ id: 'rs.op', class: 'read_sensitive', rule: { area: 'payroll', action: 'view' }, area: 'customers', action: 'view', ...over });
+  const needs = (o: Operation, f: RequestFacts = facts()) => approvalNeeds(o, effectiveClass(o, f), f, policy);
+
+  const CASES: Array<[string, Partial<Operation>, string[], boolean]> = [
+    // [name, operation, flags the approver needs, Admin needed]
+    ['state wage worksheet (account number field, in payroll)', { area: 'payroll', sensitiveFields: ['accountNumber'] }, ['fullAccountNumbers'], false],
+    ['1099 e-file (reveals SSNs)', { area: 'reports_purchases', reveal: 'ssn' }, ['sensitivePayroll'], false],
+    ['reveals payroll', { reveal: 'payroll' }, ['sensitivePayroll'], false],
+    ['reveals account numbers', { reveal: 'account_numbers' }, ['fullAccountNumbers'], false],
+    ['SSN and tax ID fields in lists', { sensitiveFields: ['employees.*.ssn', 'vendors.*.taxId'] }, ['sensitivePayroll'], false],
+    ['an SSN and a bank account field', { sensitiveFields: ['ssn', 'bankAccountNumber'] }, ['sensitivePayroll', 'fullAccountNumbers'], false],
+    ['reveals SSNs, also shows account numbers', { reveal: 'ssn', sensitiveFields: ['routingNumber'] }, ['sensitivePayroll', 'fullAccountNumbers'], false],
+    ['field names in another case', { sensitiveFields: ['ROUTINGNUMBER', 'EmployeeSsn'] }, ['fullAccountNumbers', 'sensitivePayroll'], false],
+    ['payroll area, nothing named', { area: 'payroll' }, ['sensitivePayroll'], false],
+    ['payroll reports, nothing named', { area: 'reports_payroll' }, ['sensitivePayroll'], false],
+    ['a desktop action with no area, nothing named', { area: null }, [], true],
+    ['nothing named, not payroll', {}, [], true],
+    ['a field that is not one the app masks', { sensitiveFields: ['checks.*.memo'] }, [], true],
+    ['one field told, one not', { sensitiveFields: ['accountNumber', 'notes'] }, ['fullAccountNumbers'], true],
+    ['a field ending in a wildcard', { area: 'payroll', sensitiveFields: ['employees.*'] }, ['sensitivePayroll'], true],
+    ['a reveal kind the engine does not know', { reveal: 'tax_ids' as Operation['reveal'] }, ['sensitivePayroll'], true],
+  ];
+
+  it.each(CASES)('%s', (_name, over, flags, admin) => {
+    const o = sensitive(over);
+    const n = needs(o);
+    expect(n.flags).toEqual(flags);
+    expect(n.flag).toBe(flags[0] ?? null);
+    expect(n.admin).toBe(admin);
+    expect(n.grantable).toBe('no');
+    // decide asks with the same needs: under every preset that does not refuse it, never runs.
+    for (const preset of AGENT_PRESETS) {
+      const d = run({ access: ADMIN, policy: resolvePolicy(preset, []), operation: o, grants: [grant({ operation: 'rs.op' })] });
+      if (preset === 'read_only') expect(d).toMatchObject({ outcome: 'refuse', code: 'never' });
+      else expect(d.outcome === 'ask' && d.needs).toMatchObject({ flags, admin });
+    }
+  });
+
+  it('every field name the engine knows is masked by lib/permissions/mask.ts, and its flag is the one that unmasks it', () => {
+    const OTHER = { sensitivePayroll: 'fullAccountNumbers', fullAccountNumbers: 'sensitivePayroll' } as const;
+    const withOnly = (flag: string) =>
+      ({ flags: { sensitivePayroll: false, fullAccountNumbers: false, closedPeriod: false, [flag]: true } }) as Pick<EffectiveAccess, 'flags'>;
+    const entries = Object.entries(FIELD_FLAGS);
+    expect(entries.length).toBeGreaterThan(0);
+    for (const [name, flag] of entries) {
+      expect(['sensitivePayroll', 'fullAccountNumbers'], name).toContain(flag);
+      expect(isSensitiveKey(name), name).toBe(true);
+      const row = { [name]: '123456789' };
+      // With only its own flag the field is shown in full; with only the other flag it stays masked.
+      expect(maskSensitive(row, withOnly(flag))[name], `${name} with ${flag}`).toBe('123456789');
+      const other = OTHER[flag as keyof typeof OTHER];
+      const hidden = maskSensitive(row, withOnly(other))[name];
+      expect(isMaskedValue(hidden), `${name} with only ${other}`).toBe(true);
+      expect(isMaskedValue(maskSensitive(row, withOnly('closedPeriod'))[name]), `${name} with neither`).toBe(true);
+    }
+    expect(isSensitiveKey('memo')).toBe(false);
+    // The table is frozen: nothing at run time can file a field under another flag.
+    expect(Object.isFrozen(FIELD_FLAGS)).toBe(true);
+  });
+
+  it('every key mask.ts masks is one the engine knows, under the same flag', () => {
+    // mask.ts does not export its key sets, so they are read from its source.
+    const src = fs.readFileSync(path.join(__dirname, '..', 'permissions', 'mask.ts'), 'utf8');
+    const keysOf = (set: string): string[] => {
+      const m = new RegExp(`const ${set} = new Set\\(\\[([^\\]]*)\\]\\)`).exec(src);
+      expect(m, `${set} in mask.ts`).not.toBeNull();
+      return [...(m?.[1] ?? '').matchAll(/'([^']+)'/g)].map((x) => x[1]);
+    };
+    const ssnKeys = keysOf('SSN_KEYS');
+    const accountKeys = keysOf('ACCOUNT_KEYS');
+    expect(ssnKeys.length).toBeGreaterThan(0);
+    expect(accountKeys.length).toBeGreaterThan(0);
+    for (const k of ssnKeys) expect(FIELD_FLAGS[k], k).toBe('sensitivePayroll');
+    for (const k of accountKeys) expect(FIELD_FLAGS[k], k).toBe('fullAccountNumbers');
+    expect(Object.keys(FIELD_FLAGS).sort()).toEqual([...ssnKeys, ...accountKeys].sort());
+  });
+
+  it('a listed field is matched on the last part of its path, ignoring case', () => {
+    for (const [name, flag] of Object.entries(FIELD_FLAGS)) {
+      for (const field of [name, name.toUpperCase(), name.toLowerCase(), `rows.*.${name}`, ` ${name} `]) {
+        expect(needs(sensitive({ area: 'customers', sensitiveFields: [field] })), field).toMatchObject({ flags: [flag], admin: false });
+      }
+    }
+    // A name that only contains a known one is not it.
+    expect(needs(sensitive({ area: 'customers', sensitiveFields: ['ssnLast4'] }))).toMatchObject({ flags: [], admin: true });
+  });
+
+  it('a read that is not protected needs no View flag, whatever fields it masks', () => {
+    const o = op({ class: 'read', area: 'payroll', sensitiveFields: ['ssn', 'accountNumber'] });
+    expect(needs(o)).toMatchObject({ flags: [], flag: null, admin: false });
+  });
+
+  it('a reveal on an operation that names its kind needs only that kind; one that names nothing goes by its fields', () => {
+    const r = facts({ reveal: true });
+    expect(needs(op({ class: 'read', reveal: 'ssn', sensitiveFields: ['accountNumber'] }), r)).toMatchObject({
+      flags: ['sensitivePayroll'],
+      admin: false,
+    });
+    expect(needs(op({ class: 'read', reveal: null, sensitiveFields: ['accountNumber'] }), r)).toMatchObject({
+      flags: ['fullAccountNumbers'],
+      admin: false,
+    });
+    expect(needs(op({ class: 'read', reveal: null }), r)).toMatchObject({ flags: [], admin: true });
+    expect(needs(op({ class: 'read', reveal: null, area: 'payroll' }), r)).toMatchObject({ flags: ['sensitivePayroll'], admin: false });
+    // A protected read with a reveal still needs everything it shows.
+    expect(needs(sensitive({ reveal: 'ssn', sensitiveFields: ['accountNumber'] }), r)).toMatchObject({
+      flags: ['sensitivePayroll', 'fullAccountNumbers'],
+      admin: false,
+    });
+  });
+
+  it('in a closed period the closed-period right comes first (a protected read never writes, so it is not added)', () => {
+    const o = sensitive({ area: 'payroll', sensitiveFields: ['accountNumber'] });
+    expect(needs(o, facts({ closedPeriod: true }))).toMatchObject({ flags: ['fullAccountNumbers'], secrets: [] });
+    const write = op({ class: 'change', reveal: 'account_numbers' });
+    expect(needs(write, facts({ closedPeriod: true, reveal: true }))).toMatchObject({
+      flag: 'closedPeriod',
+      flags: ['closedPeriod', 'fullAccountNumbers'],
+    });
+  });
+});
+
+describe('the count cap holds for every operation that reports a count', () => {
+  it('not only bulk work: every class, under Allow, Ask and a grant', () => {
+    const policy: AgentPolicy = { ...everywhere('allow', 'full_with_asks'), bulkCap: 10 };
+    for (const cls of RISK_CLASSES) {
+      const o = op({ id: 'cap.op', class: cls });
+      const g = [grant({ operation: 'cap.op', constraints: { maxCount: 1000 } })];
+      const over = run({ access: ADMIN, policy, operation: o, facts: facts({ count: 11 }), grants: g });
+      expect(over, cls).toMatchObject({ outcome: 'refuse', code: 'bulk_cap' });
+      expect(over.outcome === 'refuse' && over.message, cls).toBe(
+        'This would change 11 records, more than this agent may change in one request (10). Split it into smaller requests, or ask an Admin to raise the limit.',
+      );
+      const within = run({ access: ADMIN, policy, operation: o, facts: facts({ count: 10 }), grants: g });
+      expect(within.outcome === 'refuse' ? within.code : null, cls).toBeNull();
+    }
+  });
+});
+
+describe('every refusal says what the agent can do instead', () => {
+  const NEXT_STEP = /(Ask a person|ask a person|Ask an Admin|ask an Admin|Split it into smaller requests|Send the request again)/;
+
+  it('for every code, role, preset, setting, class and request fact', () => {
+    const accesses = [ADMIN, BOOKKEEPER, VIEW_ONLY, ACCOUNTANT, PAYROLL];
+    const policies: AgentPolicy[] = [{ ...resolvePolicy('full_with_asks', []), pausedAt: EARLIER }];
+    for (const preset of AGENT_PRESETS) {
+      policies.push(resolvePolicy(preset, [], { bulkCap: 10 }));
+      for (const s of POLICY_SETTINGS) policies.push(everywhere(s, preset));
+      policies.push(resolvePolicy(preset, [{ class: 'enter', area: 'customers', setting: 'never' }]));
+    }
+    const messages = new Map<string, string>();
+    const codes = new Set<string>();
+    for (const cls of RISK_CLASSES) {
+      for (const availability of ['agent', 'person_only', 'hard_floor'] as const) {
+        for (const rule of [{ area: 'customers' as Area, action: 'create' as Action }, null]) {
+          const operation = op({ id: 'msg.op', class: cls, availability, rule, reveal: 'account_numbers' });
+          for (const policy of policies) {
+            for (const access of accesses) {
+              for (const [, f] of FACT_VARIANTS) {
+                const d = run({ access, policy, operation, facts: f });
+                if (d.outcome !== 'refuse') continue;
+                codes.add(d.code);
+                messages.set(d.message, d.code);
+              }
+            }
+          }
+        }
+      }
+    }
+    expect([...codes].sort()).toEqual(['bulk_cap', 'hard_floor', 'never', 'paused', 'person_only', 'role']);
+    for (const [message, code] of messages) {
+      expect(message, code).toMatch(NEXT_STEP);
+      // Plain words: no class ids, no empty values.
+      expect(message, code).not.toMatch(/_|undefined|null|NaN|\[object/);
+    }
   });
 });
 

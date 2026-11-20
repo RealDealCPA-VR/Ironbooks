@@ -6,13 +6,23 @@
  *
  * What is proved:
  *  - a good token gives the agent's own context: its company, no user id, the view-only role, a
- *    read-only database handle, never Admin;
+ *    read-only database handle, its preset, and its roles' access with every View flag and the
+ *    closed-period right off, without Users & Roles and File Utilities, and never Admin;
+ *  - the preset and the pause are read from the agent's row when the agents service does not
+ *    hand them over (an older build of it), and a pause still holds;
  *  - a wrong or removed token is refused, and a request with an Authorization header NEVER falls
  *    through to a sign-in cookie it carries or to the first-run fallback;
  *  - an agent is never the app window (remote trust even with the launch pass), so host-only
  *    settings stay closed to it;
- *  - nothing but the listed read routes, GET only; not through the multi-user proxy, not from a
- *    browser, not before a person signed in, not in a practice copy, not in single-user mode;
+ *  - its own request reaches only the door (POST /api/agent/actions), its own reads, and GETs the
+ *    registry classes as plain reads open to agents; every other method and every GET classed
+ *    file, outside, read_sensitive, person_only, hard_floor or left unclassified is refused;
+ *  - not through the multi-user proxy, not from a browser, not before a person signed in, not in a
+ *    practice copy, not in single-user mode, not while paused;
+ *  - an agent may hold the Admin role (D1), but its own requests never reach Users & Roles or the
+ *    agents, never act as an Admin, never list Users & Roles entries of the audit trail, and a
+ *    direct read never shows a full SSN, whatever its role;
+ *  - the agents routes refuse an agent in their own handler too, not only at the way in;
  *  - the same permission map as a person with that role;
  *  - people's requests are untouched.
  */
@@ -28,6 +38,45 @@ vi.mock('next/headers', () => ({
   headers: async () => new Headers([...h.headers.entries()]),
 }));
 
+/**
+ * The real registry, except that a path listed in `probe.unclassified` is answered as if its GET
+ * had no hand-written classification. Every route is classified today, so this is the only way to
+ * see what the way in does with one that is not.
+ */
+const probe = vi.hoisted(() => ({ unclassified: new Set<string>() }));
+vi.mock('@/lib/agent/operations/registry', async (importOriginal) => {
+  const real = await importOriginal<typeof import('@/lib/agent/operations/registry')>();
+  return {
+    ...real,
+    operationForPath: (method: string, pathname: string) => {
+      const found = real.operationForPath(method, pathname);
+      if (!found || !probe.unclassified.has(pathname)) return found;
+      return { ...found, operation: { ...found.operation, classified: false, class: 'admin' as const } };
+    },
+  };
+});
+
+/**
+ * The real agents service, except that while `older.find` is set, findAgentByToken answers the
+ * way a build from before presets and pausing did: without `preset` and `pausedAt`. That is the
+ * only way to see the way in read them from the agent's row itself (presetAndPause).
+ */
+const older = vi.hoisted(() => ({ find: false }));
+vi.mock('@/lib/services/agents', async (importOriginal) => {
+  const real = await importOriginal<typeof import('@/lib/services/agents')>();
+  return {
+    ...real,
+    findAgentByToken: async (...args: Parameters<typeof real.findAgentByToken>) => {
+      const found = await real.findAgentByToken(...args);
+      if (!found || !older.find) return found;
+      const rest: Record<string, unknown> = { ...found };
+      delete rest.preset;
+      delete rest.pausedAt;
+      return rest as unknown as typeof found;
+    },
+  };
+});
+
 const ROOT = path.resolve(process.cwd(), '.bookkeeper-data', 'test-agent-context');
 const TEST_DIR = path.join(ROOT, 'data');
 const ENDPOINTS = path.join(ROOT, 'endpoints');
@@ -40,13 +89,27 @@ delete process.env.PORT;
 
 import { getDb, closeDb, type DB } from '@/lib/db';
 import { isReadOnlyDb } from '@/lib/db/readOnly';
-import { companies, users } from '@/lib/db/schema';
+import { agents, companies, users } from '@/lib/db/schema';
 import { createSessionToken, SESSION_COOKIE } from '@/lib/auth';
 import { COMPANY_COOKIE, getServerContext, getSessionGate } from '@/lib/context';
-import { AGENT_AUTH_MESSAGE, AGENT_HOST_ONLY_MESSAGE, AGENT_NOT_AVAILABLE_MESSAGE, AGENT_NOT_READY_MESSAGE, AGENT_SANDBOX_MESSAGE } from '@/lib/agentContext';
+import {
+  AGENT_AUTH_MESSAGE,
+  AGENT_HOST_ONLY_MESSAGE,
+  AGENT_NOT_AVAILABLE_MESSAGE,
+  AGENT_NOT_READY_MESSAGE,
+  AGENT_PAUSED_MESSAGE,
+  AGENT_SANDBOX_MESSAGE,
+  agentRequestAllowed,
+  agentUseDoorMessage,
+} from '@/lib/agentContext';
 import { ROUTE_METHOD_HEADER, ROUTE_PATH_HEADER } from '@/lib/permissions/routes';
-import { AGENT_READ_ROUTES } from '@/lib/permissions/agentAccess';
-import { fullAccess } from '@/lib/permissions/model';
+import { AGENT_ACTION_ROUTE, AGENT_DOOR_ONLY_AREAS, AGENT_OWN_ROUTES } from '@/lib/permissions/agentAccess';
+import { builtinRole, fullAccess, unionRoles, withoutAreas } from '@/lib/permissions/model';
+import { canSeeAuditEntry, seesWholeLog } from '@/lib/services/auditVisibility';
+import { DEFAULT_PRESET } from '@/lib/agent/policy';
+import { allOperations, operationForPath, operationForRoute } from '@/lib/agent/operations/registry';
+import { createVendor } from '@/lib/services/vendors';
+import { GET as vendorGET } from '@/app/api/vendors/[id]/route';
 import { UNVERIFIED_LOCAL_ADDR, getRequestOrigin, originFromHeaders } from '@/lib/net/requestInfo';
 import { isRemoteRequest } from '@/lib/net/hostOnly';
 import { endpointDir, helloMessage, resetAgentEndpointState } from '@/lib/agent/endpointFile';
@@ -64,6 +127,10 @@ import { DELETE as agentDELETE } from '@/app/api/agents/[id]/route';
 import { PUT as policyPUT } from '@/app/api/network-policy/route';
 import { PUT as aiSettingsPUT } from '@/app/api/ai/settings/route';
 import { PUT as emailPUT } from '@/app/api/email/settings/route';
+
+const ID = '11111111-2222-4333-8444-555555555555';
+/** A concrete path for a route pattern ("/api/invoices/[id]" -> "/api/invoices/1111…"). */
+const concrete = (pattern: string) => pattern.replace(/\[\.\.\.[^\]]+\]/g, 'a/b').replace(/\[[^\]]+\]/g, ID);
 
 let db: DB;
 let companyId: string;
@@ -170,9 +237,11 @@ describe('after a person signed in', () => {
     expect(ctx.companyId).toBe(companyId);
     expect(ctx.userId).toBeNull();
     expect(ctx.sessionId).toBeUndefined();
-    expect(ctx.agent).toEqual({ id: agentId, name: 'Reader', mode: 'post', onBehalfOf: ownerId });
-    // Even in Post mode, the context a request arrives with only reads. A change is made by the
-    // action runner alone (lib/agent/actions.ts), for one action.
+    // The preset is the one stored on the agent's row (changed on purpose: the context now names it).
+    const [row] = await db.select({ preset: agents.preset }).from(agents).where(eq(agents.id, agentId));
+    expect(ctx.agent).toEqual({ id: agentId, name: 'Reader', mode: 'post', preset: row.preset, onBehalfOf: ownerId });
+    // Even in Post mode, the context a request arrives with only reads. A change is made through
+    // the door alone (POST /api/agent/actions), for one run.
     expect(ctx.readOnly).toBe(true);
     expect(ctx.role).toBe('viewer');
     expect(isReadOnlyDb(ctx.db)).toBe(true);
@@ -180,8 +249,12 @@ describe('after a person signed in', () => {
     // Always both: their absence would mean "trusted" to the services.
     expect(ctx.access).toBeDefined();
     expect(ctx.access!.isAdmin).toBe(false);
-    expect(ctx.access!.permissions.users).toEqual([]);
-    expect(ctx.access!.permissions.file_utilities).toEqual([]);
+    // The Bookkeeper role's access, masked and without Users & Roles and File Utilities
+    // (agentDirectAccess). The clamp keeps those areas now, for the door; a direct request, which
+    // nobody is asked about, leaves them out.
+    const bookkeeper = withoutAreas(unionRoles([builtinRole('bookkeeper')!]), AGENT_DOOR_ONLY_AREAS);
+    expect(ctx.access!.permissions).toEqual(bookkeeper.permissions);
+    expect(ctx.access!.activities).toEqual(bookkeeper.activities);
     expect(ctx.access!.flags).toEqual({ sensitivePayroll: false, fullAccountNumbers: false, closedPeriod: false });
   });
 
@@ -234,53 +307,104 @@ describe('after a person signed in', () => {
     expect((await getServerContext()).agent?.id).toBe(agentId);
   });
 
-  it('only reads: every other method is refused, except a POST to the one action route', async () => {
-    for (const method of ['POST', 'PUT', 'PATCH', 'DELETE']) {
+  it('every method but GET is refused, except a POST to the one door', async () => {
+    // Changed on purpose: HEAD is refused now too ("every non-GET except the door"). No agent
+    // needs it, and it runs the GET handler anyway.
+    for (const method of ['PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']) {
       request(method, '/api/accounts', { token });
       await refusedWith(getServerContext(), AGENT_NOT_AVAILABLE_MESSAGE);
     }
-    for (const method of ['PUT', 'PATCH', 'DELETE', 'GET']) {
-      request(method, '/api/agent/actions', { token });
+    // The app's own save routes, also those the Bookkeeper role could use as a person. One open to
+    // agents is refused with what to ask for through the door instead; the hard floor is simply
+    // not available.
+    for (const [method, routePath, id] of [
+      ['POST', '/api/accounts', 'accounts.create'],
+      ['POST', '/api/invoices', 'invoices.create'],
+      ['PATCH', `/api/invoices/${ID}`, 'invoices.update'],
+      ['DELETE', `/api/invoices/${ID}`, 'invoices.delete'],
+      ['POST', '/api/bills', 'bills.create'],
+      ['PUT', '/api/network-policy', 'network-policy.replace'],
+      ['POST', '/api/users', 'users.create'],
+    ]) {
+      expect(operationForPath(method, routePath)?.operation).toMatchObject({ id, availability: 'agent' });
+      request(method, routePath, { token });
+      await refusedWith(getServerContext(), agentUseDoorMessage(id));
+    }
+    expect(agentUseDoorMessage('invoices.create')).toBe(
+      'Ask for this through run_operation with operation "invoices.create". Ironbooks then runs it, asks a person to approve it, or refuses it, as this agent\'s settings say.',
+    );
+    for (const [method, routePath] of [
+      ['POST', '/api/agents'],
+      ['DELETE', `/api/agents/${agentId}`],
+      ['POST', `/api/agents/${agentId}/pause`],
+      ['POST', '/api/agents/pause-all'],
+      ['POST', `/api/agent-requests/${ID}/approve`],
+      ['POST', `/api/agent-requests/${ID}/deny`],
+      ['DELETE', `/api/agent-grants/${ID}`],
+    ]) {
+      request(method, routePath, { token });
       await refusedWith(getServerContext(), AGENT_NOT_AVAILABLE_MESSAGE);
     }
-    // The action route gives the same read-only context; the runner decides what may change.
-    request('POST', '/api/agent/actions', { token });
+    for (const method of ['PUT', 'PATCH', 'DELETE', 'GET', 'HEAD']) {
+      request(method, AGENT_ACTION_ROUTE, { token });
+      await refusedWith(getServerContext(), AGENT_NOT_AVAILABLE_MESSAGE);
+    }
+    // The door gives the same read-only context; what it may change is decided behind it.
+    request('POST', AGENT_ACTION_ROUTE, { token });
     const actionCtx = await getServerContext();
     expect(actionCtx.readOnly).toBe(true);
     expect(actionCtx.role).toBe('viewer');
     expect(isReadOnlyDb(actionCtx.db)).toBe(true);
-    request('HEAD', '/api/accounts', { token });
+    // Over the whole registry: no route that changes something is open to a direct request.
+    for (const op of allOperations()) {
+      if (op.kind !== 'route' || op.method === 'GET') continue;
+      const allowed = agentRequestAllowed(concrete(op.route), op.method);
+      expect(allowed, `${op.method} ${op.route}`).toBe(op.method === 'POST' && op.route === AGENT_ACTION_ROUTE);
+    }
+  });
+
+  it('a GET classed read is allowed; one classed anything else, or left unclassified, is refused', async () => {
+    // Changed on purpose: the old fixed list of 38 reads is gone. Any GET the registry classes as a
+    // plain read open to agents is reachable within the role, the company and the audit trail
+    // among them; everything else goes through the door.
+    const cases: Array<[string, string, string]> = [
+      ['/api/accounts', 'read', 'agent'],
+      ['/api/company', 'read', 'agent'],
+      ['/api/audit-trail', 'read', 'agent'],
+      ['/api/backup', 'file', 'agent'],
+      ['/api/network-policy', 'outside', 'agent'],
+      ['/api/bank-transactions/suggestions', 'outside', 'agent'],
+      ['/api/payroll/state-wage-worksheet', 'read_sensitive', 'agent'],
+      ['/api/reports/1099-xml', 'read_sensitive', 'agent'],
+      ['/api/auth/me', 'read', 'person_only'],
+      ['/api/handshake', 'read', 'person_only'],
+      ['/api/agents', 'read', 'hard_floor'],
+      ['/api/agent-requests', 'read', 'hard_floor'],
+    ];
+    for (const [routePath, cls, availability] of cases) {
+      // The registry still files each one where this test expects it.
+      const op = operationForRoute('GET', routePath);
+      expect(op, routePath).toMatchObject({ classified: true, class: cls, availability });
+      request('GET', routePath, { token });
+      if (cls === 'read' && availability === 'agent') expect((await getServerContext()).agent?.id, routePath).toBe(agentId);
+      else if (availability === 'agent') await refusedWith(getServerContext(), agentUseDoorMessage(op!.id));
+      else await refusedWith(getServerContext(), AGENT_NOT_AVAILABLE_MESSAGE);
+    }
+    // A GET with no hand-written classification is refused, even on a route that is a plain read:
+    // it goes through the door, where it is class admin and a person is asked.
+    probe.unclassified.add('/api/accounts');
+    try {
+      request('GET', '/api/accounts', { token });
+      await refusedWith(getServerContext(), agentUseDoorMessage('accounts.list'));
+    } finally {
+      probe.unclassified.delete('/api/accounts');
+    }
+    request('GET', '/api/accounts', { token });
     expect((await getServerContext()).agent?.id).toBe(agentId);
   });
 
-  it('only the listed routes: everything else is refused, whatever the role would allow', async () => {
-    for (const routePath of [
-      '/api/users',
-      '/api/agents',
-      `/api/agents/${agentId}`,
-      '/api/roles',
-      '/api/backup',
-      '/api/backups',
-      '/api/company',
-      '/api/preferences',
-      '/api/network-policy',
-      '/api/ai/settings',
-      '/api/attachments/11111111-2222-4333-8444-555555555555',
-      '/api/reports/summary/profit-loss',
-      '/api/reports/profit-loss',
-      '/api/bank-transactions/suggestions',
-      '/api/sessions',
-      '/api/audit-trail',
-      '/api/estimates',
-      '/api/payroll/paychecks',
-      '/api/bank-rules',
-      '/api/reconciliations/11111111-2222-4333-8444-555555555555/report',
-      '/api/no-such-route',
-      '/api',
-      '/dashboard',
-      '/users',
-      '/',
-    ]) {
+  it('nothing that is not a mapped API route, and nothing without the stamp', async () => {
+    for (const routePath of ['/api/no-such-route', '/api', '/dashboard', '/users', '/', '/api/accounts/../users', '/api//accounts']) {
       request('GET', routePath, { token });
       await refusedWith(getServerContext(), AGENT_NOT_AVAILABLE_MESSAGE);
     }
@@ -291,9 +415,159 @@ describe('after a person signed in', () => {
     await refusedWith(getServerContext(), AGENT_NOT_AVAILABLE_MESSAGE);
   });
 
-  it('every listed route is a mapped API route', async () => {
+  it("the agent's own reads are mapped API routes it may reach", async () => {
     const { API_ROUTE_PERMISSIONS } = await import('@/lib/permissions/routes');
-    for (const p of AGENT_READ_ROUTES) expect(API_ROUTE_PERMISSIONS[p]?.GET, p).toBeDefined();
+    for (const p of AGENT_OWN_ROUTES) {
+      expect(API_ROUTE_PERMISSIONS[p]?.GET, p).toBe('member');
+      expect(agentRequestAllowed(concrete(p), 'GET'), p).toBe(true);
+    }
+    request('GET', '/api/agent/whoami', { token });
+    expect((await getServerContext()).agent?.id).toBe(agentId);
+  });
+
+  it('a paused agent is refused everything until a person resumes it', async () => {
+    const paused = await createAgent(admin, { name: 'Paused', roleKeys: ['bookkeeper'], mode: 'post' });
+    try {
+      request('GET', '/api/accounts', { token: paused.token });
+      expect((await getServerContext()).agent?.name).toBe('Paused');
+      await db.update(agents).set({ pausedAt: new Date() }).where(eq(agents.id, paused.agent.id));
+      for (const [method, routePath] of [['GET', '/api/accounts'], ['GET', '/api/agent/whoami'], ['POST', AGENT_ACTION_ROUTE]]) {
+        request(method, routePath, { token: paused.token });
+        const err = await refusedWith(getServerContext(), AGENT_PAUSED_MESSAGE);
+        expect(err.details).toMatchObject({ agent: true, paused: true });
+      }
+      expect(AGENT_PAUSED_MESSAGE).toMatch(/Users & Roles > Agents/);
+      // Other agents work on.
+      request('GET', '/api/accounts', { token });
+      expect((await getServerContext()).agent?.id).toBe(agentId);
+      // Resumed: back to work.
+      await db.update(agents).set({ pausedAt: null }).where(eq(agents.id, paused.agent.id));
+      request('GET', '/api/accounts', { token: paused.token });
+      expect((await getServerContext()).agent?.name).toBe('Paused');
+    } finally {
+      await revokeAgent(admin, paused.agent.id);
+    }
+  });
+
+  it("reads the pause and the preset from the agent's row when the agents service does not hand them over", async () => {
+    const made = await createAgent(admin, { name: 'Older build', roleKeys: ['bookkeeper'], mode: 'post' });
+    older.find = true;
+    try {
+      // The service answers without them; the way in reads the row.
+      const [row] = await db.select({ preset: agents.preset }).from(agents).where(eq(agents.id, made.agent.id));
+      request('GET', '/api/accounts', { token: made.token });
+      expect((await getServerContext()).agent).toMatchObject({ name: 'Older build', preset: row.preset });
+      // A pause on the row still refuses everything: the switch never fails open.
+      await db.update(agents).set({ pausedAt: new Date() }).where(eq(agents.id, made.agent.id));
+      for (const [method, routePath] of [['GET', '/api/accounts'], ['POST', AGENT_ACTION_ROUTE]]) {
+        request(method, routePath, { token: made.token });
+        const err = await refusedWith(getServerContext(), AGENT_PAUSED_MESSAGE);
+        expect(err.details).toMatchObject({ agent: true, paused: true });
+      }
+      // A preset Ironbooks does not know is read as the default, as the policy engine reads it.
+      await db.update(agents).set({ pausedAt: null, preset: 'not_a_preset' }).where(eq(agents.id, made.agent.id));
+      request('GET', '/api/accounts', { token: made.token });
+      expect((await getServerContext()).agent).toMatchObject({ name: 'Older build', preset: DEFAULT_PRESET });
+    } finally {
+      older.find = false;
+      await revokeAgent(admin, made.agent.id);
+    }
+  });
+
+  it('the context never carries a View flag or the closed-period right, whatever the role', async () => {
+    // Full Access holds all three flags and is not Admin.
+    expect(builtinRole('full_access')!.flags).toEqual({ sensitivePayroll: true, fullAccountNumbers: true, closedPeriod: true });
+    const full = await createAgent(admin, { name: 'Full access', roleKeys: ['full_access'], mode: 'read_only' });
+    try {
+      const vendor = await createVendor(admin, { displayName: 'Masked Vendor Co', taxId: '123-45-6789', accountNumber: '9876543210' });
+      for (const [method, routePath] of [['GET', '/api/accounts'], ['GET', `/api/vendors/${vendor.id}`], ['POST', AGENT_ACTION_ROUTE]]) {
+        request(method, routePath, { token: full.token });
+        const ctx = await getServerContext();
+        expect(ctx.access!.flags, routePath).toEqual({ sensitivePayroll: false, fullAccountNumbers: false, closedPeriod: false });
+        expect(ctx.closingDateOverride).toBe(false);
+      }
+      // A direct read of the vendor: the tax id and the account number come back masked.
+      request('GET', `/api/vendors/${vendor.id}`, { token: full.token });
+      const res = await vendorGET(new NextRequest(`http://localhost:45123/api/vendors/${vendor.id}`, { headers: { authorization: `Bearer ${full.token}` } }), {
+        params: Promise.resolve({ id: vendor.id }),
+      });
+      expect(res.status).toBe(200);
+      const text = await res.text();
+      expect(text).not.toContain('123-45-6789');
+      expect(text).not.toContain('9876543210');
+      expect(JSON.parse(text).taxId).toMatch(/6789$/);
+    } finally {
+      await revokeAgent(admin, full.agent.id);
+    }
+  });
+
+  it('an agent may hold the Admin role, but its own requests never reach Users & Roles or the agents', async () => {
+    // Made the way D1 allows, through the real agents service: the Admin role as its ceiling.
+    const boss = await createAgent(admin, { name: 'Admin agent', roleKeys: ['admin'], mode: 'read_only' });
+    try {
+      request('GET', '/api/accounts', { token: boss.token });
+      const ctx = await getServerContext();
+      expect(ctx.agent?.name).toBe('Admin agent');
+      expect(ctx.access!.roleKeys).toEqual(['admin']);
+      // Changed on purpose: its own request never acts as an Admin (agentDirectAccess). Admin is
+      // its ceiling at the door, where the policy decides; here nobody is asked. So it does not see
+      // the whole audit trail the way an Admin does, and has no Users & Roles or File Utilities.
+      expect(ctx.access!.isAdmin).toBe(false);
+      expect(ctx.access!.permissions.users).toEqual([]);
+      expect(ctx.access!.permissions.file_utilities).toEqual([]);
+      expect(ctx.access!.permissions.banking).toEqual(fullAccess().permissions.banking);
+      expect(seesWholeLog(ctx.access)).toBe(false);
+      for (const kind of ['user', 'role', 'agent', 'password_policy', 'company_restore', 'sandbox']) {
+        expect(canSeeAuditEntry(ctx.access, kind, null, null), kind).toBe(false);
+      }
+      expect(canSeeAuditEntry(ctx.access, 'customer', null, null)).toBe(true);
+      // Still read-only, still masked.
+      expect(ctx.readOnly).toBe(true);
+      expect(ctx.role).toBe('viewer');
+      expect(isReadOnlyDb(ctx.db)).toBe(true);
+      expect(ctx.access!.flags).toEqual({ sensitivePayroll: false, fullAccountNumbers: false, closedPeriod: false });
+      // Users & Roles (and File Utilities): even the GETs the registry classes 'read' are refused
+      // here and named as door operations. Behind the door they are judged by that class, so today
+      // they run without asking (a known gap, pinned in lib/permissions/agentAccess.test.ts and
+      // handed to the registry's owner); this test proves only the direct refusal.
+      for (const routePath of [
+        '/api/users',
+        `/api/users/${ownerId}`,
+        '/api/users/password-policy',
+        '/api/users/permissions-report',
+        '/api/roles',
+        `/api/roles/${ID}`,
+        '/api/backups',
+      ]) {
+        expect(operationForPath('GET', routePath)?.operation.class, routePath).toBe('read');
+        request('GET', routePath, { token: boss.token });
+        await refusedWith(getServerContext(), /^Ask for this through run_operation/);
+      }
+      request('POST', '/api/users', { token: boss.token });
+      await refusedWith(getServerContext(), agentUseDoorMessage('users.create'));
+      // The agents and their approvals: the hard floor, not even through the door.
+      for (const [method, routePath] of [
+        ['GET', '/api/agents'],
+        ['GET', `/api/agents/${agentId}`],
+        ['GET', `/api/agents/${agentId}/grants`],
+        ['GET', '/api/agent-requests'],
+        ['GET', '/api/agent-requests/count'],
+        ['POST', '/api/agents'],
+        ['DELETE', `/api/agents/${agentId}`],
+        ['POST', '/api/agents/pause-all'],
+      ]) {
+        request(method, routePath, { token: boss.token });
+        await refusedWith(getServerContext(), AGENT_NOT_AVAILABLE_MESSAGE);
+      }
+      // The agents route itself refuses it too. The stamp names a read the agent may make, so the
+      // way in lets it through and the handler's own guard is what answers.
+      request('GET', '/api/accounts', { token: boss.token });
+      const res = await agentsGET(new NextRequest('http://localhost:45123/api/agents', { headers: { authorization: `Bearer ${boss.token}` } }));
+      expect(res.status).toBe(403);
+      expect((await res.json()).details).toEqual({ personOnly: true });
+    } finally {
+      await revokeAgent(admin, boss.agent.id);
+    }
   });
 
   it('the same permission map as a person with that role', async () => {
@@ -431,16 +705,33 @@ describe('an agent is never the app window', () => {
 
   it('cannot make, list or remove agents', async () => {
     const headers = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
-    request('GET', '/api/agents', { token });
-    expect((await agentsGET(new NextRequest('http://localhost:45123/api/agents', { headers }))).status).toBe(403);
-    request('POST', '/api/agents', { token });
-    const post = await agentsPOST(new NextRequest('http://localhost:45123/api/agents', { method: 'POST', headers, body: JSON.stringify({ name: 'Child', roleKeys: ['view_only'], mode: 'read_only' }) }));
-    expect(post.status).toBe(403);
-    request('DELETE', `/api/agents/${agentId}`, { token });
-    const del = await agentDELETE(new NextRequest(`http://localhost:45123/api/agents/${agentId}`, { method: 'DELETE', headers }), { params: Promise.resolve({ id: agentId }) });
-    expect(del.status).toBe(403);
+    // Stamped the real way, the way in refuses each one.
+    for (const [method, routePath] of [['GET', '/api/agents'], ['POST', '/api/agents'], ['DELETE', `/api/agents/${agentId}`]]) {
+      request(method, routePath, { token });
+      await refusedWith(getServerContext(), AGENT_NOT_AVAILABLE_MESSAGE);
+    }
+    // Stamped as a read the agent may make (as if the way in had let it pass), each handler's own
+    // guard refuses it: the 403 is the handler's, not the way in's.
+    for (const [method, stamp] of [['GET', '/api/accounts'], ['POST', AGENT_ACTION_ROUTE]]) {
+      request(method, stamp, { token });
+      const list = await agentsGET(new NextRequest('http://localhost:45123/api/agents', { headers }));
+      expect(list.status, stamp).toBe(403);
+      expect((await list.json()).details, stamp).toEqual({ personOnly: true });
+      request(method, stamp, { token });
+      const post = await agentsPOST(new NextRequest('http://localhost:45123/api/agents', { method: 'POST', headers, body: JSON.stringify({ name: 'Child', roleKeys: ['view_only'], mode: 'read_only' }) }));
+      expect(post.status, stamp).toBe(403);
+      expect((await post.json()).details, stamp).toEqual({ personOnly: true });
+      request(method, stamp, { token });
+      const del = await agentDELETE(new NextRequest(`http://localhost:45123/api/agents/${agentId}`, { method: 'DELETE', headers }), { params: Promise.resolve({ id: agentId }) });
+      expect(del.status, stamp).toBe(403);
+      expect((await del.json()).details, stamp).toEqual({ personOnly: true });
+    }
     request('GET', '/api/accounts', { token });
     expect((await getServerContext()).agent?.id).toBe(agentId);
+    // Nothing was made, and the agent was not removed.
+    expect(await db.select({ id: agents.id }).from(agents).where(eq(agents.name, 'Child'))).toEqual([]);
+    const [self] = await db.select({ revokedAt: agents.revokedAt }).from(agents).where(eq(agents.id, agentId));
+    expect(self.revokedAt).toBeNull();
   });
 });
 

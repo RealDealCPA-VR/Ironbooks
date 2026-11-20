@@ -27,6 +27,7 @@ import {
 } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
 import { type ServiceContext, notFound, validation, writeAudit } from './_base';
+import { maskForContext } from './access';
 import { employeeWorkState, getEmployee, paycheckCountsCondition } from './payroll';
 import { FUTA_NET_RATE, FUTA_WAGE_BASE, futaCreditReductionFor, ssWageBaseFor } from './payrollTax';
 import {
@@ -2270,7 +2271,9 @@ export async function stateWageWorksheet(
     t.st = t.st.plus(a.st);
   }
   out.sort((a, b) => a.employeeName.localeCompare(b.employeeName));
-  return {
+  // The employer's state unemployment account number is masked to the last 4 digits for a caller
+  // without "view full account numbers", as the payroll state settings list masks it.
+  return maskForContext(ctx, {
     state,
     year: input.year,
     quarter: input.quarter,
@@ -2288,7 +2291,7 @@ export async function stateWageWorksheet(
       stateWithheld: toAmountString(t.st),
       suiCalculated: toAmountString(Money.round2(t.tx.times(rate))),
     },
-  };
+  });
 }
 
 export interface WorkersCompSummaryRow {

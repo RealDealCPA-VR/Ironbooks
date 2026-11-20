@@ -10,6 +10,12 @@
  * (payment_checks): payee, check number or "To be printed" (Print Checks queue), memo, a bank
  * pay-from account, voidable, one check per tax agency when several agencies are paid at once.
  * The journal entry stays the ledger record (sales tax: sourceRef "tax_agency:<agencyId>").
+ *
+ * A check memo left blank is the payee's full account number ("Acct # …"), stored on the check and
+ * printed as such. It lives on the check only: the journal entry's lines get "Sales tax — <agency>"
+ * instead, because the journal, the reports and the assistant answer line memos as they are. The
+ * payment checks this service answers with pass the memo through checkMemoFor, so a caller without
+ * "view full account numbers" sees only its last 4 digits (plan 5.9, D6).
  */
 import { systemAccountIdByCodeOrNull } from './accountRoles';
 import { and, desc, eq, inArray, ne, sql } from 'drizzle-orm';
@@ -29,7 +35,9 @@ import {
   vendors,
 } from '@/lib/db/schema';
 import { Money, toAmountString } from '@/lib/money';
+import { maskAccountNumber } from '@/lib/permissions/mask';
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
+import { hasFlag } from './access';
 import { assertNotControlAccount, postJournalEntry, voidJournalEntry } from './posting';
 import { allocateCheckNumber } from './checkNumbers';
 import { assertClosedPeriodEdit } from './postedEdit';
@@ -192,6 +200,39 @@ export type PaymentCheckKind = 'sales_tax' | 'payroll_liability' | 'customer_ref
 type PaymentCheckRow = typeof paymentChecks.$inferSelect;
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** "Acct # 000123456789", in any case and spacing: everything after the "#" is the number. */
+const ACCOUNT_MEMO_RE = /(\bacct\s*#\s*)(\S[\s\S]*)$/i;
+
+/** What maskAccountNumber itself writes ("••••6789", "••••"): text already masked, left as is. */
+const OWN_MASK_RE = /^••••\S{0,4}$/;
+
+/**
+ * A check memo as this caller may see it. QB prints the payee's account number on the memo line
+ * when the memo is blank ("Acct # 000123456789", built here and in printQueue.ts), and that text is
+ * what the check stores. mask.ts masks account numbers by field name; a memo is free text, so
+ * without this the full number reaches anyone who can list the checks. A caller without "view full
+ * account numbers" sees "Acct # ••••6789".
+ * Only answers go through this. The stored memo and the printed check keep the full number,
+ * because the payee needs it to apply the payment. Trusted contexts (no `access`) see it as stored.
+ * Everything after "Acct #" is masked, since an account number can hold spaces or run onto the
+ * next line and we cannot tell where it ends. That errs on the safe side for typed memos too: a
+ * caller without the right sees "Ref acct #5 of 12 invoices" as "Ref acct #••••ices". Text is
+ * left alone only when it is exactly what the mask writes; a "*" or "•" anywhere else (a typed
+ * "*rush*", an imported number) does not make the rest safe to show.
+ */
+export function checkMemoFor(ctx: Pick<ServiceContext, 'access'>, memo: string | null): string | null {
+  if (!memo || hasFlag(ctx, 'fullAccountNumbers')) return memo;
+  const m = ACCOUNT_MEMO_RE.exec(memo);
+  if (!m || OWN_MASK_RE.test(m[2].trim())) return memo;
+  return `${memo.slice(0, m.index)}${m[1]}${maskAccountNumber(m[2]) ?? '••••'}`;
+}
+
+/** A payment check as this caller may see it: the account number in its memo masked (checkMemoFor). */
+function paymentCheckFor<T extends { memo: string | null }>(ctx: Pick<ServiceContext, 'access'>, row: T): T {
+  const memo = checkMemoFor(ctx, row.memo);
+  return memo === row.memo ? row : { ...row, memo };
+}
 
 /**
  * A payment amount typed on these forms: a plain-language VALIDATION for text that is not a number
@@ -417,6 +458,8 @@ export async function paySalesTaxAgencies(
       });
       if (reference && number) number = followingNumber(reference);
       const payee = vendorPayee(r.vendor, r.agency.name);
+      // The check's memo: stored and printed in full (the agency applies the payment by it); the
+      // answers about the check mask it (checkMemoFor).
       const memo = input.memo?.trim() || (r.vendor.accountNumber ? `Acct # ${r.vendor.accountNumber}` : null);
       const entry = await postJournalEntry(tx, {
         date: input.date,
@@ -424,7 +467,10 @@ export async function paySalesTaxAgencies(
         reference,
         sourceRef: `tax_agency:${r.agency.id}`,
         lines: [
-          { accountId: salesTaxPayableId, debit: r.amount, memo: memo ?? `Sales tax — ${r.agency.name}` },
+          // Not the account-number memo: the journal entry, the General Ledger, the transaction
+          // reports and the assistant answer line memos as they are, unmasked. The printed voucher
+          // still shows the check's memo for this line (checkPrintData in printQueue.ts).
+          { accountId: salesTaxPayableId, debit: r.amount, memo: input.memo?.trim() || `Sales tax — ${r.agency.name}` },
           { accountId: input.paymentAccountId, credit: r.amount, memo: `Sales Tax Payment — ${payee}` },
         ],
       });
@@ -449,7 +495,8 @@ export async function paySalesTaxAgencies(
           newValues: { action: 'sales_tax_paid', dueThrough: input.dueThrough, agencyId: r.agency.id },
         });
       }
-      checks.push({ ...row, entryId: entry.id });
+      // The check stores (and prints) the full number; the answer shows it as the caller may see it.
+      checks.push({ ...paymentCheckFor(ctx, row), entryId: entry.id });
       total = total.plus(Money.of(r.amount));
     }
     return { checks, total: toAmountString(total) };
@@ -554,13 +601,14 @@ export async function listPaymentChecks(
     .where(and(...conds))
     .orderBy(desc(paymentChecks.date), desc(paymentChecks.createdAt));
   return rows.map((r) => ({
-    ...r.c,
+    ...paymentCheckFor(ctx, r.c),
     paymentAccountName: r.acctName ?? null,
     isVoid: Boolean(r.c.voidedAt) || r.entryStatus === 'void',
   }));
 }
 
-export async function getPaymentCheck(ctx: ServiceContext, id: string): Promise<PaymentCheckRow> {
+/** The check as stored (full memo), for this module's own work. Answers use getPaymentCheck. */
+async function loadPaymentCheck(ctx: ServiceContext, id: string): Promise<PaymentCheckRow> {
   if (!UUID_RE.test(id)) throw notFound('Check');
   const [row] = await ctx.db
     .select()
@@ -570,15 +618,19 @@ export async function getPaymentCheck(ctx: ServiceContext, id: string): Promise<
   return row;
 }
 
+export async function getPaymentCheck(ctx: ServiceContext, id: string): Promise<PaymentCheckRow> {
+  return paymentCheckFor(ctx, await loadPaymentCheck(ctx, id));
+}
+
 /**
  * Void a Sales Tax Payment / Liability / refund check (QB Void Check): the journal entry is voided
  * (the liability is owed again and the bank gets the money back; a voided customer refund gives the
  * customer the credit back) and the check keeps its number, marked void.
  */
 export async function voidPaymentCheck(ctx: ServiceContext, id: string): Promise<PaymentCheckRow> {
-  const check = await getPaymentCheck(ctx, id);
-  if (check.voidedAt) return check;
-  return inTransaction(ctx, async (tx) => {
+  const check = await loadPaymentCheck(ctx, id);
+  if (check.voidedAt) return paymentCheckFor(ctx, check);
+  const voided = await inTransaction(ctx, async (tx) => {
     if (check.postedEntryId) {
       const [entry] = await tx.db
         .select({ status: journalEntries.status })
@@ -600,6 +652,7 @@ export async function voidPaymentCheck(ctx: ServiceContext, id: string): Promise
     });
     return updated;
   });
+  return paymentCheckFor(ctx, voided);
 }
 
 /** Stamp the check number on a queued payment check (and its journal entry reference). */
@@ -608,14 +661,14 @@ export async function markPaymentCheckPrinted(
   input: { id: string; checkNumber?: string; allowDuplicateNumber?: boolean },
 ): Promise<PaymentCheckRow> {
   // Load, number and stamp in one transaction (two checks printed at once get different numbers).
-  return inTransaction(ctx, (tx) => markPaymentCheckPrintedInTx(tx, input));
+  return paymentCheckFor(ctx, await inTransaction(ctx, (tx) => markPaymentCheckPrintedInTx(tx, input)));
 }
 
 async function markPaymentCheckPrintedInTx(
   ctx: ServiceContext,
   input: { id: string; checkNumber?: string; allowDuplicateNumber?: boolean },
 ): Promise<PaymentCheckRow> {
-  const check = await getPaymentCheck(ctx, input.id);
+  const check = await loadPaymentCheck(ctx, input.id);
   if (check.voidedAt) throw new ServiceError('CONFLICT', 'This check is void and cannot be printed.');
   if (check.postedEntryId) {
     // The journal entry may have been voided another way (Void journal entry, Batch Void).
@@ -667,7 +720,7 @@ export async function queueCustomerRefundCheck(
 ): Promise<PaymentCheckRow> {
   // "Already has a check" is checked in the same transaction as the insert, so a double-submit
   // cannot queue two checks for one refund.
-  return inTransaction(ctx, (tx) => queueCustomerRefundCheckInTx(tx, input));
+  return paymentCheckFor(ctx, await inTransaction(ctx, (tx) => queueCustomerRefundCheckInTx(tx, input)));
 }
 
 async function queueCustomerRefundCheckInTx(

@@ -27,6 +27,8 @@ import { NoAccess, pageBlocked, useActivityButtons } from './ActivityGuard';
 import AccountantCopyBanner from './AccountantCopyBanner';
 import PreferenceBehaviors from './PreferenceBehaviors';
 import AttentionBadge from './AttentionBadge'; // team home: count on the "Needs attention" link
+// agent full access: count on the "Agent requests" link, shown while the company has an agent
+import AgentRequestsBadge, { AGENT_REQUESTS_HREF, useAgentRequestCount } from './AgentRequestsBadge';
 import UndoToast from './UndoToast';
 import ReceiptDropZone from './ReceiptDropZone'; // receipt capture: drop a receipt anywhere
 import { BackupIndicator, BackupWarningBanner } from './BackupStatus'; // team backups
@@ -46,6 +48,11 @@ import { railClasses, railKey } from '@/lib/navRail';
 
 // Routes that render without the app chrome (full-screen).
 const BARE = ['/login', '/signup', '/onboarding', '/reset-password', '/portal', '/unlock', '/m', '/change-password'];
+
+/** A page shown without the app's menus (sign-in and the like): the title bar leaves out the agent items too. */
+export function isBarePath(pathname: string): boolean {
+  return BARE.some((p) => pathname === p || pathname.startsWith(p + '/'));
+}
 
 interface CompanyRow {
   id: string;
@@ -644,6 +651,7 @@ function NavItems({
                     <Icon className={`h-[17px] w-[17px] shrink-0 ${active ? '' : 'text-electric/80'}`} />
                     <span className={rc('hidden lg:inline-block text-sm')}>{menuLabel(nav, qbNames)}</span>
                     {nav.path === '/attention' && <AttentionBadge />}
+                    {nav.path === AGENT_REQUESTS_HREF && <AgentRequestsBadge />}
                   </Link>
                 );
               })}
@@ -657,7 +665,7 @@ function NavItems({
 
 export default function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname() || '';
-  const bare = BARE.some((p) => pathname === p || pathname.startsWith(p + '/'));
+  const bare = isBarePath(pathname);
   const [company, setCompany] = React.useState<CompanyRow | null>(null);
   // Users & Roles: hide sidebar entries the user's roles can't use (cosmetic; server enforces).
   const { me } = useMe(!bare);
@@ -665,14 +673,18 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   // units of measure) drop out of the sidebar like QB's menus, their pages show a plain
   // 'turned off' message, and the server refuses their saves (lib/featureGate.ts).
   const prefs = usePreferences(!bare);
+  // Agent full access: "Agent requests" is on the menu (and found by search) only while the
+  // company has an agent; the same poll as its count bubble and the title bar.
+  const hasAgents = (useAgentRequestCount(!bare)?.agents ?? 0) > 0;
   const hiddenPaths = React.useMemo(
     () =>
       new Set([
         ...featureHiddenPaths(prefs.company),
         // gapsb A2: Currencies is hidden while Multiple Currencies is off.
         ...(prefs.loaded ? multiCurrencyHiddenPaths(prefs.company) : []),
+        ...(hasAgents ? [] : [AGENT_REQUESTS_HREF]),
       ]),
-    [prefs.company, prefs.loaded],
+    [prefs.company, prefs.loaded, hasAgents],
   );
   // Menu style (My Preferences > General > Menu style, or the switch in the sidebar). The last
   // choice is cached locally so the menu doesn't flicker while preferences load.

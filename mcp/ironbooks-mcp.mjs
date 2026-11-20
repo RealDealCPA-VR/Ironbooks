@@ -5,8 +5,12 @@
  * A client such as Claude Code or Claude Desktop starts this script and talks to it on its
  * standard input and output. The script reads the books through the Ironbooks app running on this
  * computer, with the access token an Ironbooks Admin made for the agent (AGENT_ACCESS.md). It
- * opens no port and reaches nothing but 127.0.0.1. What the agent may do (read, propose, enter)
- * is decided by Ironbooks, not here.
+ * opens no port and reaches nothing but 127.0.0.1. What the agent may do (run on its own, ask a
+ * person, or not at all) is decided by Ironbooks, by the agent's role and policy, not here.
+ *
+ * Besides its tools it serves the guide for the agent (resource ironbooks://guide, prompt
+ * ironbooks_guide), the agent's requests and staged files as resources, and a notice when a
+ * request it waited for is decided.
  *
  * Run it with Node 18 or newer:        node mcp/ironbooks-mcp.mjs
  * or with the installed app's program: Ironbooks.exe <resources>\mcp\ironbooks-mcp.mjs
@@ -18,14 +22,18 @@
 import path from 'node:path';
 import { IronbooksClient } from './client.mjs';
 import { createServer, serve } from './protocol.mjs';
-import { INSTRUCTIONS, TOOLS } from './tools.mjs';
+import { INSTRUCTIONS, PROMPTS, RESOURCES, TOOLS } from './tools.mjs';
 
-export const SERVER_INFO = { name: 'ironbooks', version: '1.0.0' };
+export const SERVER_INFO = { name: 'ironbooks', version: '1.1.0' };
+
+/** The server as shipped: the tools, the guide (resource and prompt), the agent's requests and files. */
+export function createIronbooksServer(client) {
+  return createServer({ tools: TOOLS, client, serverInfo: SERVER_INFO, instructions: INSTRUCTIONS, resources: RESOURCES, prompts: PROMPTS });
+}
 
 export function main(io = { input: process.stdin, output: process.stdout }) {
   const client = new IronbooksClient();
-  const server = createServer({ tools: TOOLS, client, serverInfo: SERVER_INFO, instructions: INSTRUCTIONS });
-  return serve(server, io).finally(() => client.close());
+  return serve(createIronbooksServer(client), io).finally(() => client.close());
 }
 
 // Started as a program (not imported by a test): the script named on the command line is this one.

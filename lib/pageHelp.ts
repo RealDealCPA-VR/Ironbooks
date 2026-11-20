@@ -32,6 +32,12 @@ export const PAGE_HELP: Record<string, PageHelpEntry> = {
     first: 'Use the button on each line (Sort it, Send reminder, Pay, Done). Not now? Choose Later to snooze or dismiss it.',
     qb: 'Company Snapshot / Reminders',
   },
+  // Agent full access (plan §7.2): the approval center, on the menu while the company has an agent.
+  '/agent-requests': {
+    title: 'Agent requests',
+    what: 'Changes your connected AI agents asked to make that wait for a person to approve, each with what it would do to your books.',
+    first: 'Open a request to see what it would change, then choose Approve once or Deny.',
+  },
   '/todos': {
     title: 'To Do list',
     what: 'Calls, emails, meetings and tasks you want to remember, optionally about a customer, vendor, employee or lead. They also show on the Calendar and in Reminders.',

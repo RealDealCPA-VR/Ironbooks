@@ -15,7 +15,7 @@ import type { DB } from '@/lib/db';
 import { auditLogs } from '@/lib/db/schema';
 import { ServiceError, type ServiceErrorFix } from './errors';
 import { MoneyParseError } from '@/lib/money';
-import { logTransaction } from './transactionLog';
+import { agentLabel, logTransaction } from './transactionLog';
 import { auditBackstop } from './accountantCopy/guard';
 import type { EffectiveAccess } from '@/lib/permissions/model';
 
@@ -67,9 +67,11 @@ export interface ServiceContext {
     onBehalfOf?: string | null;
   };
   /**
-   * Agent full access: set by the route bridge (lib/agent/bridge.ts) on an agent's run. `writeAudit`
-   * records it on every audit row (audit_logs.approved_by / agent_request_id / agent_grant_id): the
-   * person who approved the change, and the request or standing permission it ran under.
+   * Agent full access: set by the route bridge (lib/agent/bridge.ts) on an agent's run, and by the
+   * approval center (lib/services/agentRequests.ts) on a person's decision about an agent's request.
+   * `writeAudit` records it on every audit row (audit_logs.approved_by / agent_request_id /
+   * agent_grant_id): the person who approved the change, and the request or standing permission it
+   * ran under (or, on a decision, the request decided and any standing permission it gave).
    */
   approval?: { approvedBy: string | null; requestId: string | null; grantId: string | null };
   /**
@@ -140,6 +142,11 @@ export async function writeAudit(
 ): Promise<void> {
   assertNotViewer(ctx); // RBAC: viewers cannot mutate (see assertNotViewer above)
   await auditBackstop(ctx, params); // Accountant's Copy: no list deletes (accountantCopy/guard.ts)
+  // Agent full access (plan §7.3): what the change ran under, on every row written with it. Set on
+  // an agent's run (the route bridge) and on a person's decision about an agent's request (the
+  // approval center names the request decided). Absent for any other change by a person, so those
+  // rows are as they always were.
+  const approval = ctx.approval ?? null;
   await ctx.db.insert(auditLogs).values({
     companyId: ctx.companyId,
     userId: ctx.userId,
@@ -150,12 +157,17 @@ export async function writeAudit(
     newValues: params.newValues ?? null,
     llmReasoning: params.llmReasoning ?? null,
     agentId: ctx.agent?.id ?? null,
+    approvedBy: approval?.approvedBy ?? null,
+    agentRequestId: approval?.requestId ?? null,
+    agentGrantId: approval?.grantId ?? null,
   });
   await logTransaction(ctx.db, {
     companyId: ctx.companyId,
     userId: ctx.userId,
-    // The log names the agent (and the person who approved it, when one did).
-    ...(ctx.agent ? { actorName: `${ctx.agent.name} (agent)` } : {}),
+    // On an agent's change the log names the agent and how it was allowed (approved by a person, or
+    // under standing permission). Either way it records the same ids as the audit row.
+    ...(ctx.agent ? { actorName: agentLabel(ctx.agent.name), agentId: ctx.agent.id } : {}),
+    ...(approval ? { approval } : {}),
     action: params.action,
     entityType: params.entityType,
     entityId: params.entityId,

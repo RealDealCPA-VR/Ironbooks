@@ -67,8 +67,12 @@ const selfSignedCert = require('./selfSignedCert');
 const hostingCore = require('./hostingCore');
 const hosting = require('./hosting');
 const security = require('./security');
-const { promptForHost } = require('./connectPrompt');
-const { promptForFilePassword } = require('./passwordPrompt');
+// Agent full access (electron/agentShell.js): while a flow runs for an approved agent request, these
+// two prompts take their answer from the request instead of opening. At every other moment they
+// open for the person exactly as before.
+const agentShell = require('./agentShell');
+const promptForHost = agentShell.scriptedPrompt('host', require('./connectPrompt').promptForHost);
+const promptForFilePassword = agentShell.scriptedPrompt('password', require('./passwordPrompt').promptForFilePassword);
 const fileCrypto = require('./fileCrypto');
 const { pruneLegacyAutoBackups } = require('./legacyBackups');
 const localServer = require('./localServer');
@@ -273,6 +277,11 @@ const agentServiceSince = Date.now();
     else tellPerson(title, content);
   };
 }
+// Agent full access (electron/agentShell.js): while a flow runs for an approved agent request, its
+// message boxes, file pickers and error boxes take their answers from the request and nothing
+// opens. At every other moment each call goes on unchanged to what is above (the person, or the
+// quiet answers while hidden).
+agentShell.scriptDialogs(dialog);
 
 /** Close again: a start for an agent that cannot serve one (the reason goes to the log only). */
 function quitAgentService(why) {
@@ -1919,6 +1928,14 @@ async function startNextServer() {
         // chooses another one (Back Up & Restore page).
         BKA_BACKUP_DIR: backupsDir(),
         BKA_BACKUP_INTERVAL_HOURS: legacyBackupIntervalEnv(),
+        // Agent full access (electron/agentShell.js): where this shell takes approved agent requests
+        // it alone can carry out, and this launch's key for their approval tickets. Only the
+        // company server is told, by environment like the internal token, never on the command line.
+        BKA_AGENT_SHELL: agentShellEnv().endpoint,
+        BKA_AGENT_SHELL_KEY: agentShellEnv().key,
+        // Documents as this shell knows it (OneDrive can move it): files.save checks the same
+        // Documents\Ironbooks folders agents may use as the shell does.
+        BKA_AGENT_DOCUMENTS: agentShellDocuments(),
         ELECTRON_RUN_AS_NODE: '1',
         // Local-only: no Next.js telemetry (it is build/CLI-time, but make sure).
         NEXT_TELEMETRY_DISABLED: '1',
@@ -2543,6 +2560,11 @@ async function startScratchServer(dataDir) {
           // Never behind the multi-user proxy: a request claiming a teammate's address is a program
           // on this computer (lib/net/requestInfo.ts).
           BKA_PROXY_SECRET: hosting.proxySecret(),
+          // No agent works in a scratch server: never the agent endpoint, nor one planted in this
+          // computer's environment.
+          BKA_AGENT_SHELL: '',
+          BKA_AGENT_SHELL_KEY: '',
+          BKA_AGENT_DOCUMENTS: '',
           ELECTRON_RUN_AS_NODE: '1',
           NEXT_TELEMETRY_DISABLED: '1',
         },
@@ -4197,6 +4219,246 @@ ipcMain.handle('app:quitAndInstall', async (e) => {
     app.quit();
   });
   return true;
+});
+
+// ---------------------------------------------------------------------------
+// Agent full access: what only this window can do, for an approved agent request
+// (electron/agentShell.js, plan 5.5). A person approves the request in their own window; the
+// company server then hands it here over a private local endpoint, with a one-time approval ticket
+// only that server can make. Each operation runs the flow the File menu runs, its questions
+// answered from the approval card instead of on screen. Nothing here runs without such a request.
+// ---------------------------------------------------------------------------
+
+/** Folders an agent's paths may be in without the Admin naming them (agentShell.defaultFolders). */
+function agentShellFolders() {
+  return agentShell.defaultFolders({ companyFile: openFile ? openFile.path : null, documents: app.getPath('documents') });
+}
+
+/** Documents as this shell knows it, for the company server's folder check of files.save ('' when unknown). */
+function agentShellDocuments() {
+  try {
+    return app.getPath('documents');
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * The company file (or older company folder) the restart a flow asked for opens: not always the
+ * one asked for ("Save a Copy and Open It" opens a copy in Documents). Null when none is named.
+ */
+function agentShellOpening() {
+  const next = configAfterClose || {};
+  if (typeof next.companyFile === 'string' && next.companyFile) return next.companyFile;
+  return typeof next.dataDir === 'string' && next.dataDir ? next.dataDir : null;
+}
+
+/**
+ * A flow that restarts Ironbooks into another company file (or into none): done when it asked for
+ * the restart. Some ask on the next turn of the event loop, so this waits one.
+ */
+async function agentShellRestartFlow(run, result = {}) {
+  const before = relaunchAfterQuit;
+  await run();
+  await new Promise((r) => setImmediate(r));
+  const restarting = !before && relaunchAfterQuit;
+  const opened = restarting ? agentShellOpening() : null;
+  return { done: restarting, restarting, result: opened ? { ...result, opened } : result };
+}
+
+/** A restore that writes a new company file at `target`: done when the file is there (it may also restart into it). */
+async function agentShellNewFileFlow(run, target) {
+  const file = agentShell.companyFilePath(target);
+  const before = relaunchAfterQuit;
+  await run();
+  await new Promise((r) => setImmediate(r));
+  const restarting = !before && relaunchAfterQuit;
+  const opened = restarting ? agentShellOpening() : null;
+  return { done: fs.existsSync(file), restarting, result: opened ? { file, opened } : { file } };
+}
+
+const AGENT_SHELL_FLOWS = {
+  'shell.company.new': ({ input }) => agentShellRestartFlow(() => createCompanyFlow(), { file: agentShell.companyFilePath(input.file) }),
+  'shell.company.open': ({ input }) => {
+    if (!/\.ironbooks$/i.test(input.file)) {
+      throw new Error("Choose a company file (.ironbooks). A backup, a portable company file and an Accountant's Copy each have a request of their own.");
+    }
+    return agentShellRestartFlow(() => openCompanyFlow(), { file: input.file });
+  },
+  'shell.company.switch': ({ input }) => {
+    // As File > Recent Companies: only a company file on that list.
+    if (!recentCompanyDirs().some((d) => samePath(d, input.file))) {
+      throw new Error('That company file is not in Recent Companies. Ask to open it instead (shell.company.open).');
+    }
+    return agentShellRestartFlow(() => openCompany(input.file), { file: input.file });
+  },
+  'shell.company.close': () => agentShellRestartFlow(() => closeCompanyFlow()),
+  'shell.company.saveCopyAs': async ({ input }) => {
+    const file = agentShell.companyFilePath(input.file);
+    // The save replaces a file that is there; an agent's request never does (agentShell.js checks too).
+    if (fs.existsSync(file)) throw new Error(`There is already a file at "${file}". Choose a new name: Ironbooks never replaces a file for an agent.`);
+    await saveCopyAsFlow();
+    return { done: fs.existsSync(file), result: { file } };
+  },
+  'shell.portable.open': ({ input }) => {
+    if (!/\.bkp$/i.test(input.file)) throw new Error('Choose a portable company file (.bkp).');
+    return agentShellNewFileFlow(() => openPortableFlow(input.file), input.target);
+  },
+  'shell.accountantCopy.open': ({ input }) => {
+    if (!/\.ibac$/i.test(input.file)) throw new Error("Choose an Accountant's Copy transfer file (.ibac).");
+    return agentShellNewFileFlow(() => openAccountantCopyFlow(input.file), input.target);
+  },
+  'shell.backup.restoreAsNew': ({ input }) => {
+    if (!/\.bka$/i.test(input.file)) throw new Error('Choose a backup file (.bka).');
+    return agentShellNewFileFlow(() => restoreBackupAsNewFileFlow(input.file), input.target);
+  },
+  'shell.sandbox.enter': async () => {
+    if (sandboxActive()) throw new Error('A practice copy is already open.');
+    if (!serverUrl || remoteHostOrigin || startScreenMode || !mainWindow || mainWindow.isDestroyed()) {
+      throw new Error('A practice copy can only be made of a company file open in this window.');
+    }
+    // As File > Try It on a Copy: the window makes the copy with the signed-in person's own rights,
+    // then restarts into it. Answered with what is known: restarting once the window asked for
+    // the restart, otherwise only that the window was asked (it says on screen if the copy fails).
+    mainWindow.webContents.send('menu', 'sandbox-start');
+    const before = relaunchAfterQuit;
+    const restarting = () => !before && relaunchAfterQuit;
+    for (let waited = 0; waited < 60_000 && !restarting(); waited += 250) await new Promise((r) => setTimeout(r, 250));
+    if (restarting()) return { done: true, restarting: true, result: { entered: true } };
+    return {
+      done: true,
+      restarting: false,
+      result: { asked: 'The Ironbooks window was asked to make the practice copy and has not finished yet. It restarts into the copy once it is made, or says on screen why it could not.' },
+    };
+  },
+  'shell.sandbox.leave': async () => {
+    const sb = sandboxActive();
+    if (!sb || sb.kind !== 'sandbox') throw new Error('Ironbooks is not in a practice copy.');
+    // The person at the window chooses: discard the copy, or keep it as a training file.
+    navigate('/sandbox');
+    return { done: true, restarting: false, result: { page: '/sandbox' } };
+  },
+  'shell.hosting.start': async ({ input }) => {
+    let st;
+    if (input.network === 'office') {
+      if (!openFile) throw new Error('Multi-user mode on the office network needs a company file open in this window.');
+      st = await switchToMultiUserFlow();
+    } else {
+      st = await setHosting(true);
+    }
+    if (!st.hosting && st.error) throw new Error(st.error);
+    return { done: st.hosting, result: { hosting: st.hosting, network: st.lan ? 'office' : 'tailnet', urls: st.urls, connectionCode: st.connectionCode } };
+  },
+  'shell.hosting.stop': async () => {
+    const st = await switchToSingleUserFlow();
+    return { done: !st.hosting, result: { hosting: st.hosting } };
+  },
+  'shell.hosting.connect': () => agentShellRestartFlow(() => openOnHostFlow()),
+  'shell.hosting.disconnect': () => {
+    if (!remoteHostOrigin) throw new Error('This computer is not connected to a host.');
+    return agentShellRestartFlow(() => disconnectFromHost());
+  },
+  'shell.update.install': async () => {
+    if (sandboxActive()) throw new Error('Updates are not installed from a practice copy. A person leaves the sandbox first.');
+    if (autoUpdater && updateState.state === 'ready') {
+      // As "Restart & install now": a form with typed work is asked about first.
+      if (mainWindow && !mainWindow.isDestroyed() && !(await confirmCloseOverUnsavedWork(mainWindow))) return { done: false };
+      const version = updateState.version || null;
+      setImmediate(() => {
+        installAfterClose = true;
+        app.quit();
+      });
+      return { done: true, restarting: true, result: { installing: version } };
+    }
+    if (autoUpdater && ['available', 'error'].includes(updateState.state)) {
+      // As "Download & install": the download first; installing is asked for once it is ready.
+      const policy = await updatesAllowed();
+      if (!policy.allowed) throw new Error(policy.reason);
+      const version = updateState.version || null;
+      setUpdateState({ state: 'downloading', version: updateState.version, percent: 0 });
+      autoUpdater.downloadUpdate().catch((err) => {
+        if (updateState.state === 'downloading') {
+          setUpdateState({ state: 'error', version: updateState.version, message: String(err?.message || err) });
+        }
+      });
+      return { done: true, result: { downloading: version, next: 'Ask again to install it once it has downloaded.' } };
+    }
+    throw new Error(
+      updateState.state === 'downloading'
+        ? 'The update is still downloading. Ask again once it is ready.'
+        : 'There is no update waiting. Help > Check for Updates looks for one.',
+    );
+  },
+  'shell.ollama.install': async () => {
+    if (ollamaInstalling) throw new Error('Ollama is already being installed.');
+    if (!mainWindow || mainWindow.isDestroyed()) throw new Error('The Ironbooks window is not open.');
+    // Claimed before the flow, as the AI page's button does.
+    ollamaInstalling = true;
+    const run = installOllamaFlow({ sender: mainWindow.webContents }).finally(() => {
+      ollamaInstalling = false;
+      ollamaAbort = null;
+    });
+    run.catch(() => {});
+    // About 1 GB outlasts the approval: answer once the download has started (or failed early).
+    const early = await Promise.race([run, new Promise((r) => setTimeout(() => r(null), 20_000))]);
+    if (!early) return { done: true, result: { started: true, progress: 'AI & Automation shows how far the download is.' } };
+    if (early.ok) return { done: true, result: { installed: Boolean(early.done) } };
+    if (early.cancelled) return { done: false };
+    throw new Error(early.error || 'Ollama could not be installed.');
+  },
+  'shell.print.file': async ({ input, file }) => ({
+    done: true,
+    result: await agentShell.printPdf({ BrowserWindow, bytes: file.bytes, printer: input.printer || null, copies: input.copies ?? 1 }),
+  }),
+};
+
+let agentShellEndpoint = null;
+/**
+ * The endpoint, opened once, as the company server's environment gets it: { endpoint, key }. If it
+ * cannot be opened the server is told nothing (agents then hear that this needs the desktop app);
+ * the server itself starts as always.
+ */
+function agentShellEnv() {
+  if (!agentShellEndpoint) {
+    const flows = {};
+    for (const [id, flow] of Object.entries(AGENT_SHELL_FLOWS)) {
+      flows[id] = (args) => {
+        if (closingInProgress || quittingAfterBackup) throw new Error('Ironbooks is closing. Ask again once it has started again.');
+        return flow(args);
+      };
+    }
+    try {
+      agentShellEndpoint = agentShell.openEndpoint({ flows, folders: agentShellFolders, log: (m) => console.log(`[agent-shell] ${m}`) });
+    } catch (err) {
+      console.error('[agent-shell] could not open the endpoint for agent requests:', err?.message || err);
+      agentShellEndpoint = { env: { endpoint: '', key: '' }, close: () => Promise.resolve() };
+    }
+  }
+  return agentShellEndpoint.env;
+}
+
+app.on('will-quit', () => {
+  if (agentShellEndpoint) agentShellEndpoint.close().catch(() => {});
+});
+
+// The desktop notice when an agent asks while the window is not in front (lib/desktop/agentNotice.ts,
+// plan 7.2): title and body only; clicking it brings the window forward on the approval center.
+// Never while the app runs hidden for an agent.
+ipcMain.handle('agent:notice', (e, notice) => {
+  if (!fromLocalApp(e) || agentServiceHidden) return false;
+  return agentShell.showNotice({
+    Notification: require('electron').Notification,
+    win: mainWindow,
+    notice,
+    open: (route) => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        if (mainWindow.isMinimized()) mainWindow.restore();
+        mainWindow.show();
+        mainWindow.focus();
+      }
+      navigate(route);
+    },
+  });
 });
 
 app.whenReady().then(async () => {

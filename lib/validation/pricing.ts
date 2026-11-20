@@ -12,25 +12,35 @@ const zRounding = z.enum(ROUNDING_MODES);
 
 // ---- Pricing -----------------------------------------------------------------
 
+/** POST /api/pricing/quote — looks prices up only; nothing is saved (the document re-prices on save). */
 export const quoteSchema = z.object({
-  customerId: zUuid.nullish(),
-  date: zDate,
-  classId: zUuid.nullish(),
-  salesRepId: zUuid.nullish(),
-  jobId: zUuid.nullish(),
+  customerId: zUuid.nullish().describe('Id of the customer the document is for (customer list); their price level and type pick the rules.'),
+  date: zDate.describe('Date of the document, YYYY-MM-DD; price rules with start and end dates use it.'),
+  classId: zUuid.nullish().describe('Id of the class of the document (class list), for price rules limited to classes.'),
+  salesRepId: zUuid.nullish().describe('Id of the sales rep of the document (sales rep list), for price rules limited to sales reps.'),
+  jobId: zUuid.nullish().describe('Id of the Customer:Job of the document (job list), for price rules limited to jobs.'),
   /** A foreign-currency document: quotes come back in its currency (its rate, else the list's). */
-  currency: z.string().trim().max(3).nullish(),
-  exchangeRate: z.union([z.string(), z.number()]).nullish(),
+  currency: z
+    .string()
+    .trim()
+    .max(3)
+    .nullish()
+    .describe("3-letter currency code of the document such as \"EUR\"; prices come back in it; leave out for the home currency."),
+  exchangeRate: z
+    .union([z.string(), z.number()])
+    .nullish()
+    .describe('Home-currency units per 1 unit of the document currency, as decimal text such as "1.10"; leave out for the currency list\'s rate.'),
   lines: z
     .array(
       z.object({
-        itemId: zUuid,
-        quantity: zDecimal,
-        classId: zUuid.nullish(),
-        jobId: zUuid.nullish(),
+        itemId: zUuid.describe('Id of the item to price (item list).'),
+        quantity: zDecimal.describe('Quantity on the line as decimal text, such as "2"; quantity-break rules use it.'),
+        classId: zUuid.nullish().describe("Id of the line's class (class list); leave out to use the document's class."),
+        jobId: zUuid.nullish().describe("Id of the line's Customer:Job (job list); leave out to use the document's job."),
       }),
     )
-    .max(500, 'At most 500 lines per quote.'),
+    .max(500, 'At most 500 lines per quote.')
+    .describe('The lines to price, at most 500.'),
 });
 
 export const pricingSettingsSchema = z.object({
@@ -104,39 +114,62 @@ export const vendorTypeAssignSchema = z.object({
 // ---- Fulfillment -------------------------------------------------------------
 
 export const fulfillmentSelectionSchema = z.object({
-  salesOrderId: zUuid,
-  lines: z.array(z.object({ lineId: zUuid, quantity: zDecimal })).nullish(),
+  salesOrderId: zUuid.describe('Id of an open sales order (sales order list) to invoice.'),
+  lines: z
+    .array(
+      z.object({
+        lineId: zUuid.describe('Id of a line of that sales order.'),
+        quantity: zDecimal.describe(
+          'Quantity of that line to invoice now, as decimal text such as "2"; at most what is still open on the line and, for stock items, what is in stock.',
+        ),
+      }),
+    )
+    .nullish()
+    .describe("The lines and quantities to invoice; leave out to invoice what each line can ship from stock."),
 });
 
+/** POST /api/fulfillment — one invoice per selected sales order (lib/services/fulfillment.ts). */
 export const batchInvoiceSchema = z.object({
-  date: zDate.nullish(),
-  selections: zLines(fulfillmentSelectionSchema),
+  date: zDate.nullish().describe('Date of the invoices, YYYY-MM-DD; leave out for today.'),
+  selections: zLines(fulfillmentSelectionSchema).describe('The sales orders to invoice, one invoice each; at least one.'),
 });
 
 // ---- Receiving ---------------------------------------------------------------
 
 export const receivingSettingsSchema = z.object({
-  enhancedReceiving: z.boolean().optional(),
-  varianceMode: z.enum(['inventory', 'ppv']).optional(),
-  ppvAccountId: zUuid.nullish(),
+  enhancedReceiving: z
+    .boolean()
+    .optional()
+    .describe('True turns on enhanced receiving, where receiving items and billing for them are separate steps.'),
+  varianceMode: z
+    .enum(['inventory', 'ppv'])
+    .optional()
+    .describe("Where a bill's price difference from the receipt cost goes: into the item's cost (inventory) or a purchase price variance account (ppv)."),
+  ppvAccountId: zUuid.nullish().describe('Id of the purchase price variance expense account (chart of accounts) used with ppv.'),
 });
 
 export const receiptBillSchema = z.object({
   /** true = compute variances + the journal entry without saving. */
-  preview: z.boolean().optional(),
-  vendorId: zUuid,
-  billNumber: z.string().nullish(),
-  date: zDate,
-  dueDate: zDate.nullish(),
-  memo: z.string().nullish(),
+  preview: z.boolean().optional().describe('True works out the variances and the entry and shows them without saving anything.'),
+  vendorId: zUuid.describe('Id of the vendor whose received items are billed (vendor list).'),
+  billNumber: z.string().nullish().describe("The vendor's own bill number."),
+  date: zDate.describe('Bill date, YYYY-MM-DD.'),
+  dueDate: zDate.nullish().describe('Date the bill is due, YYYY-MM-DD.'),
+  memo: z.string().nullish().describe('Internal note saved with the bill.'),
   /** The user confirmed QB's "this vendor already has a bill with that reference number" warning. */
-  allowDuplicateNumber: z.boolean().optional(),
+  allowDuplicateNumber: z
+    .boolean()
+    .optional()
+    .describe('Send true only after the app warned that this vendor already has a bill with this number, to save it anyway.'),
   lines: zLines(
     z.object({
-      receiptLineId: zUuid,
-      quantity: zDecimal,
-      unitCost: zDecimal,
-      closeLine: z.boolean().optional(),
+      receiptLineId: zUuid.describe('Id of the open item receipt line being billed.'),
+      quantity: zDecimal.describe('Quantity the vendor bills as decimal text, at most what is still open on the line; may be "0" with closeLine.'),
+      unitCost: zDecimal.describe("The vendor's cost per unit on the bill, as decimal text such as \"12.50\"."),
+      closeLine: z
+        .boolean()
+        .optional()
+        .describe('True writes off any quantity left unbilled on the receipt line, because the vendor will never bill it.'),
     }),
-  ),
+  ).describe('The received lines billed; at least one.'),
 });

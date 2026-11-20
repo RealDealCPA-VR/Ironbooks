@@ -9,9 +9,13 @@ import { ServiceError } from '@/lib/services/errors';
 // ---------------------------------------------------------------------------
 // Shared field helpers
 // ---------------------------------------------------------------------------
+//
+// Each helper carries a .describe() text: agents read it in the JSON Schema of describe_operation
+// (plan §6.3), and a field that says nothing more specific still tells them the format. A field's
+// own .describe() replaces it. Descriptions never change what a schema accepts.
 
 /** UUID string (all entity ids in the app are uuids). */
-export const zUuid = z.string().uuid('must be a valid id (uuid)');
+export const zUuid = z.string().uuid('must be a valid id (uuid)').describe('Id (a uuid) of an existing record.');
 
 const MONEY_RE = /^-?\d+(\.\d{1,2})?$/;
 const DECIMAL_RE = /^-?\d+(\.\d+)?$/;
@@ -32,12 +36,15 @@ export const zMoney = z
         message: `"${v}" is not a valid money amount (decimal, max 2 decimal places)`,
       });
     }
-  });
+  })
+  .describe('Amount as decimal text with at most 2 decimal places, such as "125.00".');
 
 /** Money amount that must be strictly greater than zero. */
-export const zMoneyPositive = zMoney.refine((v) => Number(v) > 0, {
-  message: 'must be greater than zero',
-});
+export const zMoneyPositive = zMoney
+  .refine((v) => Number(v) > 0, {
+    message: 'must be greater than zero',
+  })
+  .describe('Amount above zero as decimal text with at most 2 decimal places, such as "125.00".');
 
 /** Decimal of any precision (quantities, rates, exchange rates). */
 export const zDecimal = z
@@ -51,12 +58,15 @@ export const zDecimal = z
         message: `"${v}" is not a valid decimal value`,
       });
     }
-  });
+  })
+  .describe('Number as decimal text, such as "2" or "1.5".');
 
 /** Decimal that must be strictly greater than zero. */
-export const zDecimalPositive = zDecimal.refine((v) => Number(v) > 0, {
-  message: 'must be greater than zero',
-});
+export const zDecimalPositive = zDecimal
+  .refine((v) => Number(v) > 0, {
+    message: 'must be greater than zero',
+  })
+  .describe('Number above zero as decimal text, such as "2" or "1.5".');
 
 /**
  * User-typed document number (alphanumeric, e.g. "INV-1001"; QB "Invoice #"). Blank / null =
@@ -66,7 +76,8 @@ export const zDecimalPositive = zDecimal.refine((v) => Number(v) > 0, {
 export const zDocNumber = z
   .string({ invalid_type_error: 'must be text' })
   .max(50, 'can be at most 50 characters')
-  .nullish();
+  .nullish()
+  .describe('Document number such as "INV-1001", at most 50 characters; leave it out or blank to use the next number.');
 
 /** Earliest / latest calendar year a document or posting date may carry. */
 export const MIN_DATE_YEAR = 1900;
@@ -109,7 +120,8 @@ export const zDate = z
       return z.NEVER;
     }
     return d;
-  });
+  })
+  .describe('Date as YYYY-MM-DD.');
 
 /**
  * Optional date query parameter (`?from=2026-01-01`) for GET routes: undefined when absent or
@@ -147,7 +159,8 @@ export function zLines<T extends z.ZodTypeAny>(line: T) {
       required_error: 'lines are required',
       invalid_type_error: 'lines must be an array',
     })
-    .min(1, 'At least one line is required.');
+    .min(1, 'At least one line is required.')
+    .describe('The lines of the document; at least one.');
 }
 
 // ---------------------------------------------------------------------------

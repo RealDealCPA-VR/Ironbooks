@@ -1,0 +1,426 @@
+'use client';
+/**
+ * Agent requests: the approval center (plan 7.2, AGENT_ACCESS.md "Full access").
+ *
+ * When an agent's permissions say "Ask" for something it wants to do, the request waits here for a
+ * person. The list shows each one in plain words: the agent, what the request does (built by
+ * Ironbooks from the operation, never from the agent's text), its kind of work, amount, age, what
+ * approving it needs and its status. Rows this person cannot approve stay listed, greyed, with the
+ * reason. Opening a row shows the card (RequestCard.tsx): the agent's reason in its own words, what
+ * Ironbooks worked out it would do, and Approve once, Approve similar… and Deny.
+ *
+ * Approving several at once is offered only for new entries and changes of the same kind of work
+ * that Ironbooks could try ahead of time (plan 11.2: a prompt-injected agent's many asks must not
+ * be one click away); the confirmation lists every one, and each is approved and reported on its
+ * own. What is chosen is checked again against the list as it now stands, every time it changes.
+ *
+ * Who may approve what is decided by the server (lib/services/agentRequests.ts, through
+ * GET /api/agent-requests and the routes beside it); this page only presents it. A link may add
+ * ?id=<request> to open that request's card at once (the title-bar badge and the desktop notice
+ * open the list itself).
+ */
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import Link from 'next/link';
+import { Bot, RefreshCw } from 'lucide-react';
+import { Badge, Button, Card, Label, Modal, PageHeader, PageSkeleton, Select, Table, Td, Th, Tr, toast } from '@/components/ui';
+import { api } from '@/lib/client';
+import { RISK_CLASSES, RISK_CLASS_LABELS, type RiskClass } from '@/lib/agent/operations/types';
+import type { AgentRequestForPerson, ApproveResult } from '@/lib/agent/contract';
+import RequestCard from './RequestCard';
+import { NeedsChips } from './Preview';
+import ProducedSecrets from './ProducedSecrets';
+import { requestsChanged } from './notify';
+import {
+  BATCH_MAX,
+  STATUS_FILTERS,
+  STATUS_LABELS,
+  STATUS_TONES,
+  ageText,
+  amountText,
+  batchBlock,
+  batchChoice,
+  isWaiting,
+  plain,
+  type StatusFilter,
+} from './words';
+
+function errMsg(e: unknown) {
+  return e instanceof Error ? e.message : 'Something went wrong';
+}
+
+/** How one request of a batch went, in a few words. */
+function batchOutcome(r: ApproveResult): string {
+  switch (r.status) {
+    case 'executed':
+      return 'Done.';
+    case 'failed':
+      return `Did not go through. ${plain(r.request.error) || 'Nothing was changed.'}`;
+    case 'needs_second_approver':
+      return 'Recorded. A second person must also approve it.';
+    case 'stale':
+      return 'Not done: the books changed since the agent asked. Open it to see what would happen now.';
+  }
+}
+
+export default function AgentRequestsPage() {
+  const [status, setStatus] = useState<StatusFilter>('pending');
+  const [requests, setRequests] = useState<AgentRequestForPerson[] | null>(null);
+  const [error, setError] = useState('');
+  const [agentFilter, setAgentFilter] = useState('');
+  const [classFilter, setClassFilter] = useState<RiskClass | ''>('');
+  const [selected, setSelected] = useState<string[]>([]);
+  const [openId, setOpenId] = useState<string | null>(null);
+  // Requests an approval here was told the books changed for (the list has no other way to know).
+  // Only for the list's mark: a card never starts from it (RequestCard.tsx), so a later Approve is
+  // always checked against the books again.
+  const [staleIds, setStaleIds] = useState<string[]>([]);
+  const [confirming, setConfirming] = useState(false);
+  const [batchBusy, setBatchBusy] = useState(false);
+  // What a batch approval did. Held only while its dialog is open: it can carry produced secrets.
+  const [batchResults, setBatchResults] = useState<ApproveResult[] | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const res = await api.get<{ requests: AgentRequestForPerson[] }>(`/api/agent-requests?status=${encodeURIComponent(status)}`);
+      setRequests(Array.isArray(res?.requests) ? res.requests : []);
+      setError('');
+    } catch (e) {
+      setError(errMsg(e));
+      setRequests([]);
+    }
+  }, [status]);
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  // A link that names one request (?id=) opens its card at once.
+  useEffect(() => {
+    const id = new URLSearchParams(window.location.search).get('id');
+    if (id) setOpenId(id);
+  }, []);
+
+  /** A request changed on its card (or in a batch): show it as it now stands. */
+  const changed = useCallback((r: AgentRequestForPerson, stale: boolean) => {
+    setRequests((prev) => (prev ? prev.map((x) => (x.id === r.id ? r : x)) : prev));
+    setStaleIds((prev) => {
+      if (stale) return prev.includes(r.id) ? prev : [...prev, r.id];
+      return isWaiting(r.status) ? prev : prev.filter((x) => x !== r.id);
+    });
+    if (r.status !== 'pending' || !r.canApprove) setSelected((prev) => prev.filter((x) => x !== r.id));
+  }, []);
+
+  // Every agent seen since the page opened, so a chosen agent stays in the filter when another
+  // status has no request of theirs.
+  const [agentNames, setAgentNames] = useState<Record<string, string>>({});
+  useEffect(() => {
+    if (!requests?.length) return;
+    setAgentNames((prev) => {
+      const missing = requests.filter((r) => prev[r.agentId] === undefined);
+      if (missing.length === 0) return prev;
+      const next = { ...prev };
+      for (const r of missing) next[r.agentId] = plain(r.agentName);
+      return next;
+    });
+  }, [requests]);
+  const agents = useMemo(() => Object.entries(agentNames).sort((a, b) => a[1].localeCompare(b[1])), [agentNames]);
+
+  const shown = (requests ?? []).filter((r) => (!agentFilter || r.agentId === agentFilter) && (!classFilter || r.class === classFilter));
+  // What is chosen, checked again against the list as it stands now: only these are listed and sent.
+  const chosen = batchChoice(requests ?? [], selected);
+  const chosenOperation = chosen[0]?.operation ?? null;
+
+  // A chosen request that no longer qualifies (answered meanwhile, moved to a stricter kind of
+  // work by "the books changed", gone after Refresh) drops out of the choice.
+  useEffect(() => {
+    if (!requests) return;
+    setSelected((prev) => {
+      const keep = batchChoice(requests, prev).map((r) => r.id);
+      return keep.length === prev.length ? prev : keep;
+    });
+  }, [requests]);
+
+  function toggle(r: AgentRequestForPerson, on: boolean) {
+    setSelected((prev) => {
+      if (!on) return prev.filter((x) => x !== r.id);
+      if (prev.includes(r.id) || prev.length >= BATCH_MAX) return prev;
+      return [...prev, r.id];
+    });
+  }
+
+  async function approveChosen() {
+    const ids = chosen.map((r) => r.id);
+    if (ids.length === 0) return;
+    setBatchBusy(true);
+    try {
+      const res = await api.post<{ results: ApproveResult[] }>('/api/agent-requests/batch-approve', { ids }, { noUndo: true });
+      const results = Array.isArray(res?.results) ? res.results : [];
+      for (const r of results) changed(r.request, r.status === 'stale');
+      requestsChanged();
+      setSelected([]);
+      setConfirming(false);
+      setBatchResults(results);
+      const done = results.filter((r) => r.status === 'executed').length;
+      toast(done === results.length ? `${done} done.` : `${done} of ${results.length} done. See what happened to the others.`, done === results.length ? 'success' : 'info');
+    } catch (e) {
+      toast(errMsg(e), 'danger');
+    } finally {
+      setBatchBusy(false);
+    }
+  }
+
+  const openRequest = openId ? ((requests ?? []).find((r) => r.id === openId) ?? null) : null;
+
+  return (
+    <main className="min-h-screen bg-offwhite p-8 font-sans">
+      <PageHeader
+        title="Agent requests"
+        icon={Bot}
+        action={
+          <Button variant="secondary" onClick={() => load()} title="Look for new requests">
+            <RefreshCw className="h-4 w-4" aria-hidden="true" /> Refresh
+          </Button>
+        }
+      />
+      <Card className="mb-4 p-4 text-sm text-navy/70">
+        <p>
+          An agent asks here before it does something its permissions do not let it do on its own. Open a request to see what it would do, worked
+          out by Ironbooks, before you approve or deny it.
+        </p>
+        <p className="mt-1 text-xs text-navy/50">
+          The agent&apos;s reason is shown in quotes. It is the agent&apos;s explanation, not a fact Ironbooks has checked. What an agent may do
+          without asking is set in{' '}
+          <Link href="/users" className="text-electric underline">
+            Users &amp; Roles &gt; Agents
+          </Link>
+          .
+        </p>
+      </Card>
+
+      <div className="mb-4 flex flex-wrap items-end gap-3">
+        <div className="w-56">
+          <Label htmlFor="ar-status">Status</Label>
+          <Select
+            id="ar-status"
+            value={status}
+            onChange={(e) => {
+              setStatus(e.target.value as StatusFilter);
+              setSelected([]);
+            }}
+          >
+            {STATUS_FILTERS.map((s) => (
+              <option key={s.value} value={s.value}>
+                {s.label}
+              </option>
+            ))}
+          </Select>
+        </div>
+        <div className="w-56">
+          <Label htmlFor="ar-agent">Agent</Label>
+          <Select id="ar-agent" value={agentFilter} onChange={(e) => setAgentFilter(e.target.value)}>
+            <option value="">All agents</option>
+            {agents.map(([id, name]) => (
+              <option key={id} value={id}>
+                {name}
+              </option>
+            ))}
+          </Select>
+        </div>
+        <div className="w-56">
+          <Label htmlFor="ar-class">Kind of work</Label>
+          <Select id="ar-class" value={classFilter} onChange={(e) => setClassFilter(e.target.value as RiskClass | '')}>
+            <option value="">All kinds</option>
+            {RISK_CLASSES.map((c) => (
+              <option key={c} value={c}>
+                {RISK_CLASS_LABELS[c]}
+              </option>
+            ))}
+          </Select>
+        </div>
+        {chosen.length > 0 && (
+          <div className="ml-auto flex items-center gap-2">
+            <Button variant="ghost" onClick={() => setSelected([])}>
+              Clear
+            </Button>
+            <Button onClick={() => setConfirming(true)}>Approve chosen ({chosen.length})…</Button>
+          </div>
+        )}
+      </div>
+
+      {error && <Card className="mb-4 p-4 text-sm text-red-600">{error}</Card>}
+
+      {requests === null ? (
+        <PageSkeleton />
+      ) : shown.length === 0 ? (
+        !error && (
+          <Card className="p-6 text-center text-sm text-navy/50">
+            {status === 'pending' && !agentFilter && !classFilter
+              ? 'Nothing is waiting for you. When an agent asks to do something that needs a person, it shows up here.'
+              : 'No requests match.'}
+          </Card>
+        )
+      ) : (
+        <Card className="p-0">
+          <Table>
+            <thead>
+              <tr>
+                <Th className="w-10">
+                  <span className="sr-only">Choose to approve together</span>
+                </Th>
+                <Th>Agent</Th>
+                <Th>Request</Th>
+                <Th>Kind of work</Th>
+                <Th numeric>Amount</Th>
+                <Th>Asked</Th>
+                <Th>Status</Th>
+                <Th className="text-right">
+                  <span className="sr-only">Open</span>
+                </Th>
+              </tr>
+            </thead>
+            <tbody>
+              {shown.map((r) => {
+                const isChosen = chosen.some((c) => c.id === r.id);
+                const block = isChosen
+                  ? null
+                  : (batchBlock(r, chosenOperation) ??
+                    (chosen.length >= BATCH_MAX ? `At most ${BATCH_MAX} requests can be approved together.` : null));
+                const summary = plain(r.summary);
+                const waiting = isWaiting(r.status);
+                const isStale = staleIds.includes(r.id) && waiting;
+                const whyId = `ar-why-${r.id}`;
+                // While some are chosen, say on screen why this one cannot join them (its own reason
+                // is already shown when this person cannot approve it at all).
+                const showWhy = block !== null && chosen.length > 0 && waiting && r.canApprove;
+                return (
+                  <Tr
+                    key={r.id}
+                    data-list-label={`${plain(r.agentName)} ${summary}`}
+                    data-request-row={r.id}
+                    // Greyed: still waiting, but for someone else to answer.
+                    className={waiting && !r.canApprove ? 'opacity-60' : ''}
+                  >
+                    <Td className="w-10">
+                      {/* Not `disabled`: a disabled box cannot take the keyboard's focus, and its reason would never be heard. */}
+                      <input
+                        type="checkbox"
+                        aria-label={`Choose to approve together: ${summary}`}
+                        aria-disabled={block !== null ? true : undefined}
+                        aria-describedby={block !== null ? whyId : undefined}
+                        title={block ?? 'Choose to approve together'}
+                        className={block !== null ? 'cursor-not-allowed opacity-40' : undefined}
+                        checked={isChosen}
+                        onChange={(e) => {
+                          if (block !== null) {
+                            toast(block, 'info');
+                            return;
+                          }
+                          toggle(r, e.target.checked);
+                        }}
+                      />
+                    </Td>
+                    <Td>
+                      <span className="font-semibold">{plain(r.agentName)}</span>
+                    </Td>
+                    <Td>
+                      <span className="block break-words">{summary}</span>
+                      <NeedsChips needs={r.needs} />
+                      {isStale && <span className="mt-1 block text-xs font-semibold text-amber-700">The books changed since the agent asked</span>}
+                      {!r.canApprove && waiting && (
+                        <span className="mt-1 block text-xs text-navy/60">{plain(r.cannotApproveWhy) || 'You cannot approve this one.'}</span>
+                      )}
+                      {block !== null && (
+                        <span id={whyId} data-batch-why="" className={showWhy ? 'mt-1 block text-xs text-navy/60' : 'sr-only'}>
+                          {showWhy ? 'Not with the chosen ones: ' : 'Cannot be chosen to approve together: '}
+                          {block}
+                        </span>
+                      )}
+                    </Td>
+                    <Td>
+                      <Badge tone="info">{RISK_CLASS_LABELS[r.class] ?? plain(r.class)}</Badge>
+                    </Td>
+                    <Td numeric>{amountText(r.amount)}</Td>
+                    <Td className="whitespace-nowrap text-sm" title={new Date(r.createdAt).toLocaleString()}>
+                      {ageText(r.createdAt)}
+                    </Td>
+                    <Td>
+                      <Badge tone={STATUS_TONES[r.status] ?? 'neutral'}>{STATUS_LABELS[r.status] ?? plain(r.status)}</Badge>
+                    </Td>
+                    <Td className="text-right">
+                      <Button size="sm" variant="ghost" onClick={() => setOpenId(r.id)} title="Open this request">
+                        Open
+                      </Button>
+                    </Td>
+                  </Tr>
+                );
+              })}
+            </tbody>
+          </Table>
+        </Card>
+      )}
+
+      {openId && (
+        <RequestCard key={openId} id={openId} initial={openRequest} onClose={() => setOpenId(null)} onChanged={changed} />
+      )}
+
+      <Modal
+        open={confirming}
+        onClose={() => setConfirming(false)}
+        title={`Approve ${chosen.length} ${chosen.length === 1 ? 'request' : 'requests'}`}
+        size="lg"
+        confirmChanges={false}
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setConfirming(false)}>
+              Cancel
+            </Button>
+            <Button loading={batchBusy} disabled={chosen.length === 0} onClick={approveChosen}>
+              Approve all {chosen.length}
+            </Button>
+          </>
+        }
+      >
+        <p className="text-sm text-navy/70">
+          Each one is approved and carried out on its own, as if you approved it from its card. Read the list: approving many at once is where
+          mistakes slip through.
+        </p>
+        <ul className="mt-3 max-h-80 space-y-1 overflow-y-auto" data-batch-list="">
+          {chosen.map((r) => (
+            <li key={r.id} className="rounded-lg border border-slate-200 px-3 py-2 text-sm text-navy">
+              <span className="font-semibold">{plain(r.agentName)}</span>: {plain(r.summary)}
+              {r.amount ? <span className="ml-2 tabular-nums text-navy/70">{amountText(r.amount)}</span> : null}
+            </li>
+          ))}
+        </ul>
+      </Modal>
+
+      {batchResults && (
+        <Modal
+          open
+          onClose={() => setBatchResults(null)}
+          title="What happened"
+          size="lg"
+          confirmChanges={false}
+          footer={
+            <Button variant="secondary" onClick={() => setBatchResults(null)}>
+              Close
+            </Button>
+          }
+        >
+          <ul className="space-y-2">
+            {batchResults.map((r, i) => (
+              <li key={`${r.request.id}-${i}`} className="rounded-lg border border-slate-200 px-3 py-2 text-sm text-navy">
+                <div>{plain(r.request.summary)}</div>
+                <div className={r.status === 'executed' ? 'text-emerald' : r.status === 'failed' ? 'text-red-600' : 'text-amber-700'}>{batchOutcome(r)}</div>
+                {r.produced?.length ? (
+                  <div className="mt-2">
+                    <ProducedSecrets produced={r.produced} />
+                  </div>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+        </Modal>
+      )}
+    </main>
+  );
+}

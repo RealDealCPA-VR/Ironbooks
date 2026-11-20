@@ -239,6 +239,55 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
       PUT: { bodySchema: '@/lib/validation/accounts#incomeTaxFormSchema', querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
     },
   },
+  '/api/agent-grants/[id]': {
+    file: 'app/api/agent-grants/[id]/route.ts',
+    params: ['id'],
+    methods: {
+      DELETE: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
+    },
+  },
+  '/api/agent-requests': {
+    file: 'app/api/agent-requests/route.ts',
+    params: [],
+    methods: {
+      GET: { bodySchema: null, querySchema: '@/lib/validation/agentAccess#personRequestListQuerySchema', body: 'none', output: 'json', serverContext: true, sessionGate: false },
+    },
+  },
+  '/api/agent-requests/[id]': {
+    file: 'app/api/agent-requests/[id]/route.ts',
+    params: ['id'],
+    methods: {
+      GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
+    },
+  },
+  '/api/agent-requests/[id]/approve': {
+    file: 'app/api/agent-requests/[id]/approve/route.ts',
+    params: ['id'],
+    methods: {
+      POST: { bodySchema: '@/lib/validation/agentAccess#approveRequestSchema', querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+    },
+  },
+  '/api/agent-requests/[id]/deny': {
+    file: 'app/api/agent-requests/[id]/deny/route.ts',
+    params: ['id'],
+    methods: {
+      POST: { bodySchema: '@/lib/validation/agentAccess#denyRequestSchema', querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+    },
+  },
+  '/api/agent-requests/batch-approve': {
+    file: 'app/api/agent-requests/batch-approve/route.ts',
+    params: [],
+    methods: {
+      POST: { bodySchema: '@/lib/validation/agentAccess#batchApproveSchema', querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+    },
+  },
+  '/api/agent-requests/count': {
+    file: 'app/api/agent-requests/count/route.ts',
+    params: [],
+    methods: {
+      GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
+    },
+  },
   '/api/agent/actions': {
     file: 'app/api/agent/actions/route.ts',
     params: [],
@@ -251,6 +300,20 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     params: [],
     methods: {
       GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: false, sessionGate: false },
+    },
+  },
+  '/api/agent/requests': {
+    file: 'app/api/agent/requests/route.ts',
+    params: [],
+    methods: {
+      GET: { bodySchema: null, querySchema: '@/lib/validation/agentAccess#agentRequestListQuerySchema', body: 'none', output: 'json', serverContext: true, sessionGate: false },
+    },
+  },
+  '/api/agent/requests/[id]': {
+    file: 'app/api/agent/requests/[id]/route.ts',
+    params: ['id'],
+    methods: {
+      GET: { bodySchema: null, querySchema: '@/lib/validation/agentAccess#agentRequestWaitQuerySchema', body: 'none', output: 'json', serverContext: true, sessionGate: false },
     },
   },
   '/api/agent/service': {
@@ -280,7 +343,37 @@ export const GENERATED_ROUTES: Record<string, GeneratedRoute> = {
     file: 'app/api/agents/[id]/route.ts',
     params: ['id'],
     methods: {
+      GET: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
+      PATCH: { bodySchema: '@/lib/validation/agentAccess#agentPolicySchema', querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
       DELETE: { bodySchema: null, querySchema: null, body: 'none', output: 'json', serverContext: true, sessionGate: false },
+    },
+  },
+  '/api/agents/[id]/activity': {
+    file: 'app/api/agents/[id]/activity/route.ts',
+    params: ['id'],
+    methods: {
+      GET: { bodySchema: null, querySchema: '@/lib/validation/agentAccess#agentActivityQuerySchema', body: 'none', output: 'json', serverContext: true, sessionGate: false },
+    },
+  },
+  '/api/agents/[id]/grants': {
+    file: 'app/api/agents/[id]/grants/route.ts',
+    params: ['id'],
+    methods: {
+      GET: { bodySchema: null, querySchema: '@/lib/validation/agentAccess#agentGrantsQuerySchema', body: 'none', output: 'json', serverContext: true, sessionGate: false },
+    },
+  },
+  '/api/agents/[id]/pause': {
+    file: 'app/api/agents/[id]/pause/route.ts',
+    params: ['id'],
+    methods: {
+      POST: { bodySchema: '@/lib/validation/agentAccess#pauseAgentsSchema', querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
+    },
+  },
+  '/api/agents/pause-all': {
+    file: 'app/api/agents/pause-all/route.ts',
+    params: [],
+    methods: {
+      POST: { bodySchema: '@/lib/validation/agentAccess#pauseAgentsSchema', querySchema: null, body: 'json', output: 'json', serverContext: true, sessionGate: false },
     },
   },
   '/api/ai/assistant': {

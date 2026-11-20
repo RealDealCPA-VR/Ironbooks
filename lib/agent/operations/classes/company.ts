@@ -1,6 +1,30 @@
 /**
  * Agent full access: classification of the "company" routes (classes/buckets.ts lists the segments).
  * One entry per route + method, keyed "METHOD /api/pattern". Checked by classes/company.test.ts.
+ *
+ * The cross-bucket rule for lookups (the same in documents.ts for the AI and receipt settings): a
+ * GET that can look up a *.ts.net address in DNS or refresh the tailnet trust is 'outside', not
+ * 'read', even when that lookup is its only side effect and it happens only when such an address is
+ * set up. GET /api/network-policy is one; GET /api/network-policy/check makes no lookup and stays
+ * 'read'.
+ *
+ * Closed periods: the Accountant Center's batch routes (batch enter, batch void and restore,
+ * reclassify) carry their dates on each row or on the transactions they name, not in one body date
+ * field, so the run-time closed-period check (RequestFacts.date, closedPeriod) cannot see them. The
+ * services check every row themselves and refuse one dated on or before the closing date unless the
+ * closing-date password comes with the request. These entries name no needsSecret, so the approver
+ * is never asked for that password and such a row is refused, never posted.
+ *
+ * Amounts, the same rule in every bucket (see sales.ts or payroll.ts): amountField names the money
+ * the route's ANSWER carries. Write-off answers the total of every invoice it writes off. Batch
+ * enter, batch void and restore and reclassify answer no amounts and set no amountField, so before
+ * the dry run they count as over every amount limit, and after it the bridge (lib/agent/bridge.ts
+ * factsFor) judges them by the largest SINGLE ledger entry the run posted, not the total. Their bulk
+ * cap limits how many records, not how much money.
+ *
+ * `id` names an operation where the id rule (registry.ts operationIdFor) would give the neutral
+ * ".post", with a short verb: a tool that works on the rows picked from its list applies
+ * (accountant.reclassify.apply), a door whose body names the action runs it.
  */
 import type { ClassificationMap } from '../types';
 
@@ -45,6 +69,7 @@ export const COMPANY_CLASSES: ClassificationMap = {
   },
   'POST /api/company/setup-interview': {
     class: 'settings',
+    id: 'company.setup-interview.apply',
     describe: 'Apply the setup interview answers to the company',
     why:
       'Saves company preferences and switches features on or off (lib/services/setupInterview.ts), and in the ' +
@@ -135,7 +160,8 @@ export const COMPANY_CLASSES: ClassificationMap = {
     describe: 'Batch enter {type} transactions',
     why:
       'Creates many transactions in one request (up to 1,000 rows). Its own preview: validateOnly: true runs ' +
-      'every row and rolls everything back.',
+      'every row and rolls everything back. Each row has its own date, so the closed-period check cannot ' +
+      'see them; a row dated on or before the closing date is refused by the service.',
     countField: 'rows',
     dryRun: 'preview',
   },
@@ -145,16 +171,21 @@ export const COMPANY_CLASSES: ClassificationMap = {
   },
   'POST /api/accountant/batch-void': {
     class: 'remove',
+    id: 'accountant.batch-void.apply',
     describe: 'Batch void or delete the selected transactions (action: {action}; empty means void)',
     why:
       'Voids or deletes up to 500 transactions at once, and voids the sales tax corrections that depended on ' +
-      'them. Voids cannot be taken back.',
+      'them. Voids cannot be taken back. The dates are on the transactions named, so the closed-period check ' +
+      'cannot see them; one dated on or before the closing date is refused by the void services.',
     countField: 'keys',
   },
   'POST /api/accountant/batch-void/restore': {
     class: 'bulk',
     describe: 'Restore the selected deleted transactions',
-    why: 'Re-creates up to 500 deleted transactions through their normal create services in one request.',
+    why:
+      'Re-creates up to 500 deleted transactions through their normal create services in one request. The ' +
+      'dates are on the transactions named, so the closed-period check cannot see them; one dated on or ' +
+      'before the closing date is refused by the create services.',
     countField: 'ids',
   },
   'GET /api/accountant/reclassify': {
@@ -163,8 +194,12 @@ export const COMPANY_CLASSES: ClassificationMap = {
   },
   'POST /api/accountant/reclassify': {
     class: 'bulk',
+    id: 'accountant.reclassify.apply',
     describe: 'Move the selected ledger lines to account {newAccountId} or class {newClassId}',
-    why: 'Rewrites the account or class of up to 2,000 posted lines in place, and of their source documents.',
+    why:
+      'Rewrites the account or class of up to 2,000 posted lines in place, and of their source documents. The ' +
+      'dates are on the lines named, so the closed-period check cannot see them; the service checks each ' +
+      'entry and refuses one dated on or before the closing date.',
     countField: 'lineIds',
   },
   'GET /api/accountant/write-off': {
@@ -173,9 +208,13 @@ export const COMPANY_CLASSES: ClassificationMap = {
   },
   'POST /api/accountant/write-off': {
     class: 'bulk',
+    id: 'accountant.write-off.apply',
     describe: 'Write off the selected invoices as bad debt on {date}',
-    why: 'Writes off up to 500 invoices in one request.',
+    why:
+      'Writes off up to 500 invoices in one request, one credit memo each. The amount is the answer\'s total ' +
+      '(lib/services/accountant/writeOff.ts writeOffInvoices adds up every write-off), not one credit memo\'s.',
     countField: 'invoiceIds',
+    amountField: 'total',
   },
   'GET /api/accountant/working-trial-balance': {
     class: 'read',
@@ -188,6 +227,7 @@ export const COMPANY_CLASSES: ClassificationMap = {
   },
   'POST /api/accountant/working-trial-balance': {
     class: 'enter',
+    id: 'accountant.working-trial-balance.adjust',
     describe: 'Post an adjusting journal entry dated {date}: {description}',
   },
   'GET /api/accountant/list-changes': {
@@ -196,6 +236,7 @@ export const COMPANY_CLASSES: ClassificationMap = {
   },
   'POST /api/accountant/list-changes': {
     class: 'bulk',
+    id: 'accountant.list-changes.review',
     describe: 'Mark the selected list changes as reviewed or not reviewed',
     why:
       "Marks up to 5,000 list changes reviewed in one request. Marking reviewed is the reviewer's sign-off and " +
@@ -210,6 +251,7 @@ export const COMPANY_CLASSES: ClassificationMap = {
   },
   'POST /api/accountant/client-data-review': {
     class: 'change',
+    id: 'accountant.client-data-review.run',
     describe: 'Client Data Review: {action}',
     why:
       'One route for several fixes: apply_customer_credit and apply_vendor_credit apply credits, ' +
@@ -260,6 +302,7 @@ export const COMPANY_CLASSES: ClassificationMap = {
   },
   'POST /api/accountant/sales-tax/fix': {
     class: 'change',
+    id: 'accountant.sales-tax.fix.run',
     describe: 'Fix incorrectly recorded sales tax: {action}',
     why:
       'Corrects existing records: link or unlink a ledger line to an agency, post a correcting entry that moves ' +
@@ -273,6 +316,7 @@ export const COMPANY_CLASSES: ClassificationMap = {
   },
   'POST /api/accountant-copy': {
     class: 'file',
+    id: 'accountant-copy.create',
     describe: "Create the Accountant's Copy transfer file (dividing date {dividingDate}), or save the one that is out again",
     why:
       "Locks the books on or before the dividing date and answers with the transfer file: a copy of the whole " +
@@ -315,6 +359,7 @@ export const COMPANY_CLASSES: ClassificationMap = {
   },
   'POST /api/accountant-copy/changes': {
     class: 'file',
+    id: 'accountant-copy.changes.export',
     describe: "Make the accountant's changes file for the client",
     why:
       "Part of the Accountant's Copy: answers with the .ibcx changes file and records that it was exported " +

@@ -207,6 +207,7 @@ export const REPORT_CATALOG: CatalogEntry[] = [
   { key: 'voided-deleted-summary', title: 'Voided/Deleted Transactions Summary', description: 'Every transaction voided or deleted, who did it and when.', group: 'Accountant & Taxes', area: 'reports_financial', controls: ['optionalRange'] },
   { key: 'voided-deleted-detail', title: 'Voided/Deleted Transactions Detail', description: 'The same list with the original values of each transaction.', group: 'Accountant & Taxes', area: 'reports_financial', controls: ['optionalRange'] },
   { key: 'closing-date-exceptions', title: 'Closing Date Exception Report', description: 'Changes made on or before the closing date with the closing date password.', group: 'Accountant & Taxes', area: 'closing', controls: ['optionalRange'] },
+  { key: 'agent-activity', title: 'Agent Activity', description: 'Every request an agent made for approval, who decided and what became of it.', group: 'Accountant & Taxes', area: 'reports_financial', controls: ['optionalRange'] },
 
   // ---- Multiple companies ----
   { key: 'combined-trial-balance', title: 'Combined Trial Balance', description: 'Trial balance for every company in this file side by side.', group: 'Multiple Companies', area: 'reports_financial', controls: ['asOf'] },
@@ -295,7 +296,7 @@ export const REPORT_FAMILIES: string[][] = [
   ['inventory-valuation-summary', 'inventory-valuation-detail', 'inventory-stock-status-by-item', 'inventory-stock-status-by-vendor', 'physical-inventory-worksheet'],
   ['quantity-on-hand-by-site', 'inventory-stock-status-by-site', 'inventory-reorder-by-site', 'serial-lot-in-stock', 'transactions-by-serial-lot'],
   ['check-detail', 'deposit-detail', 'missing-checks'],
-  ['voided-deleted-summary', 'voided-deleted-detail', 'closing-date-exceptions'],
+  ['voided-deleted-summary', 'voided-deleted-detail', 'closing-date-exceptions', 'agent-activity'],
   ['sales-tax-liability', 'sales-tax-revenue-summary'],
   ['sales-by-rep-summary', 'sales-by-rep-detail'],
   ['cash-flow-forecast', 'statement-of-cash-flows'],

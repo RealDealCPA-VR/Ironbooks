@@ -27,6 +27,10 @@ import path from 'node:path';
 import { asc } from 'drizzle-orm';
 import { getDb, resolveDataDir, sealedMode, withDamagedFileAccess } from '@/lib/db';
 import { companies } from '@/lib/db/schema';
+// From the scope module itself, not lib/context.ts: that one brings the whole request layer
+// (sessions, next/navigation, services), which a low-level service has no use for.
+import { outsideServiceScope } from '@/lib/serviceScope';
+import { outsideEffects } from '@/lib/effects';
 import { ServiceError } from './errors';
 import { createBackup, writeFileDurablyAs } from './backup';
 import { protectionForDir } from './fileProtection';
@@ -284,12 +288,21 @@ export function startBackupScheduler(
       console.error('[backup] scheduled backup failed:', err instanceof Error ? err.message : err);
     }
   };
-  s.timer = setInterval(tick, SCHEDULER_TICK_MS);
-  s.timer.unref?.();
-  s.timerDir = dir;
-  // First check shortly after start, so a backup that came due while the app was closed runs now.
-  s.kickoff = setTimeout(tick, 15_000);
-  s.kickoff.unref?.();
+  // The timers outlive the request that starts them (the first GET /api/backups, the sidebar's
+  // status check), and async work carries the scope it was started in. Started outside any agent
+  // scope and outside the effects outbox, every later tick is the app's own work, exactly as when
+  // a person's request starts them, and never counts as an agent's request long finished
+  // (lib/serviceScope.ts outsideServiceScope, lib/effects.ts outsideEffects).
+  outsideServiceScope(() =>
+    outsideEffects(() => {
+      s.timer = setInterval(tick, SCHEDULER_TICK_MS);
+      s.timer.unref?.();
+      s.timerDir = dir;
+      // First check shortly after start, so a backup that came due while the app was closed runs now.
+      s.kickoff = setTimeout(tick, 15_000);
+      s.kickoff.unref?.();
+    }),
+  );
 }
 
 /**

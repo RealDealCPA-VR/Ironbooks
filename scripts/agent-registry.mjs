@@ -2,7 +2,7 @@
 /**
  * Agent full access: writes the generated half of the operation registry (plan §5.1).
  *
- *   node scripts/agent-registry.mjs           write the two files below
+ *   node scripts/agent-registry.mjs           write the three files below
  *   node scripts/agent-registry.mjs --check   exit 1 when the files on disk are out of date
  *
  * It walks app/api/**\/route.ts, reads each file with the TypeScript parser (nothing is run or
@@ -15,6 +15,11 @@
  *  - lib/agent/operations/loaders.generated.ts: SERVER ONLY. A static import map
  *    pattern -> () => import('@/app/api/.../route'), so the bundler includes every handler the
  *    route bridge may run.
+ *  - lib/agent/operations/schemas.generated.ts: SERVER ONLY. A static import map from every zod
+ *    schema reference the registry knows ("@/lib/validation/x#name": the body and query schemas
+ *    read above, and the `bodySchema` the classification files name, read the same way) to a
+ *    loader of that schema. describe_operation turns them into JSON Schema
+ *    (lib/agent/operations/schemas.ts); written out so the bundler includes each one.
  *
  * What it reports are HINTS read from the source. The hand-written classification
  * (lib/agent/operations/classes/*.ts) has the last word: it can name a body schema, a body kind or
@@ -32,8 +37,11 @@ import ts from 'typescript';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const API_DIR = path.join(ROOT, 'app', 'api');
 const OUT_DIR = path.join(ROOT, 'lib', 'agent', 'operations');
+/** The hand-written classification, one file per area (their `bodySchema` names join the schema map). */
+const CLASSES_DIR = path.join(OUT_DIR, 'classes');
 export const ROUTES_FILE = path.join(OUT_DIR, 'routes.generated.ts');
 export const LOADERS_FILE = path.join(OUT_DIR, 'loaders.generated.ts');
+export const SCHEMAS_FILE = path.join(OUT_DIR, 'schemas.generated.ts');
 
 /** The methods routes.ts maps, in the order they are written out. */
 const METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'];
@@ -475,9 +483,112 @@ export function renderLoaders(routes) {
   return lines.join('\n');
 }
 
+// ---------------------------------------------------------------------------
+// Schema references
+// ---------------------------------------------------------------------------
+
+/**
+ * A schema reference the map can hold: an app module ("@/…", no "..") and an export name. The name
+ * is written into the generated file as code (`m.<name>`), so anything else is refused, never
+ * written.
+ */
+const SCHEMA_REF = /^@\/(?!.*\.\.)[A-Za-z0-9_\-./[\]()]+#[A-Za-z_$][A-Za-z0-9_$]*$/;
+
+/**
+ * Every `bodySchema: '…'` of the classification files (lib/agent/operations/classes/*.ts), read
+ * with the TypeScript parser like the routes. A bodySchema written as anything but plain text
+ * cannot be read without running the file, so it stops the generator rather than being left out.
+ */
+export function classificationSchemaRefs() {
+  const refs = [];
+  const files = fs
+    .readdirSync(CLASSES_DIR)
+    .filter((f) => /\.ts$/.test(f) && !/\.test\.ts$/.test(f))
+    .sort();
+  for (const name of files) {
+    const abs = path.join(CLASSES_DIR, name);
+    const sf = ts.createSourceFile(abs, fs.readFileSync(abs, 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+    const visit = (n) => {
+      if (
+        ts.isPropertyAssignment(n) &&
+        (ts.isIdentifier(n.name) || ts.isStringLiteral(n.name)) &&
+        n.name.text === 'bodySchema'
+      ) {
+        const init = n.initializer;
+        if (ts.isStringLiteral(init) || ts.isNoSubstitutionTemplateLiteral(init)) {
+          refs.push(init.text);
+        } else {
+          const { line } = sf.getLineAndCharacterOfPosition(n.getStart(sf));
+          const rel = path.relative(ROOT, abs).replace(/\\/g, '/');
+          throw new Error(
+            `${rel}:${line + 1}: write bodySchema as plain text ('@/lib/validation/x#name'), so the ` +
+              'generator can read it without running the file.',
+          );
+        }
+      }
+      ts.forEachChild(n, visit);
+    };
+    visit(sf);
+  }
+  return refs;
+}
+
+/**
+ * The schema references of the routes (body, query and candidate body schemas) and of the
+ * classification, each once, sorted. Throws on one that is not a plain "@/module#export".
+ */
+export function schemaRefs(routes, classificationRefs = classificationSchemaRefs()) {
+  const refs = new Set(classificationRefs);
+  for (const r of routes) {
+    for (const meta of Object.values(r.methods)) {
+      if (meta.bodySchema) refs.add(meta.bodySchema);
+      if (meta.querySchema) refs.add(meta.querySchema);
+      for (const c of meta.bodySchemaCandidates ?? []) refs.add(c);
+    }
+  }
+  const bad = [...refs].filter((ref) => !SCHEMA_REF.test(ref));
+  if (bad.length) {
+    throw new Error(
+      `These schema references are not "@/<module>#<export name>": ${bad.join(', ')}. ` +
+        'Fix the bodySchema in lib/agent/operations/classes, or import the schema from a module under the project root.',
+    );
+  }
+  return [...refs].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+}
+
+export function renderSchemas(refs) {
+  const lines = [
+    HEADER,
+    '/**',
+    ' * Agent full access: SERVER ONLY. One loader per zod schema the operation registry names',
+    ' * ("@/lib/validation/x#name": the body and query schemas read from the route files, and the',
+    " * classification's own bodySchema), written out as a static import so the bundler includes each",
+    ' * one. Nothing is loaded until a loader is called; lib/agent/operations/schemas.ts imports this',
+    ' * lazily and turns the schema into JSON Schema for describe_operation.',
+    ' */',
+    '',
+    'export const SCHEMA_LOADERS: Record<string, () => Promise<unknown>> = {',
+  ];
+  for (const ref of refs) {
+    const [mod, name] = ref.split('#');
+    lines.push(`  ${q(ref)}: () => import(${q(mod)}).then((m) => m.${name}),`);
+  }
+  lines.push('};', '');
+  return lines.join('\n');
+}
+
 export function generate() {
   const routes = collect();
-  return { routes, files: { [ROUTES_FILE]: renderRoutes(routes), [LOADERS_FILE]: renderLoaders(routes) } };
+  const schemas = schemaRefs(routes);
+  return {
+    routes,
+    schemas,
+    files: {
+      [ROUTES_FILE]: renderRoutes(routes),
+      [LOADERS_FILE]: renderLoaders(routes),
+      [SCHEMAS_FILE]: renderSchemas(schemas),
+    },
+  };
 }
 
 function readOrNull(file) {
@@ -490,8 +601,17 @@ function readOrNull(file) {
 
 function main(argv) {
   const check = argv.includes('--check');
-  const { routes, files } = generate();
+  let generated;
+  try {
+    generated = generate();
+  } catch (err) {
+    // A bodySchema the reader cannot use: say which and where, without a stack trace.
+    console.error(`agent-registry: ${err instanceof Error ? err.message : String(err)}`);
+    return 1;
+  }
+  const { routes, schemas, files } = generated;
   const methodCount = routes.reduce((n, r) => n + Object.keys(r.methods).length, 0);
+  const counts = `${routes.length} routes, ${methodCount} handlers, ${schemas.length} schemas`;
   const other = routes.filter((r) => r.other.length).map((r) => `${r.other.join(' ')} ${r.pattern}`);
   if (other.length) {
     console.warn(
@@ -507,19 +627,18 @@ function main(argv) {
     if (stale.length) {
       console.error(
         `agent-registry: out of date: ${stale.join(', ')}\n` +
-          'The API routes changed since these files were written. Run `npm run agent:registry` and commit the result.',
+          'The API routes, or a bodySchema in lib/agent/operations/classes, changed since these files were written. ' +
+          'Run `npm run agent:registry` and commit the result.',
       );
       return 1;
     }
-    console.log(`agent-registry: up to date (${routes.length} routes, ${methodCount} handlers).`);
+    console.log(`agent-registry: up to date (${counts}).`);
     return 0;
   }
   for (const [file, text] of Object.entries(files)) {
     if (readOrNull(file) !== text) fs.writeFileSync(file, text, 'utf8');
   }
-  console.log(
-    `agent-registry: ${stale.length ? `wrote ${stale.join(', ')}` : 'no changes'} (${routes.length} routes, ${methodCount} handlers).`,
-  );
+  console.log(`agent-registry: ${stale.length ? `wrote ${stale.join(', ')}` : 'no changes'} (${counts}).`);
   return 0;
 }
 

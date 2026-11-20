@@ -1,17 +1,1102 @@
 /**
- * Agent full access: What an agent may never supply, and what is hidden from it (plan §4.6, §5.8, §5.9).
- * STUB: the signatures are the contract (lib/agent/contract.ts); the bodies are still to be written.
+ * Agent full access: what an agent may never supply, and what is hidden from it (plan §4.6, §5.8,
+ * §5.9 and §11.2).
+ *
+ *  - guardInput: takes out of an agent's input everything only a person may give (passwords, keys,
+ *    the Integrated Applications switch, "save the copy without a password") and refuses what an
+ *    agent may never ask for, even with approval: an operation that is not an agent's, the hard
+ *    floor reached through a body field, a "yes, I am sure" flag no warning of the route names, a
+ *    reveal where nothing is masked, and a path value that is not a plain id.
+ *  - applySecrets: puts what the approving person typed on the card exactly where the route reads
+ *    it (a header or a body field). The agent never sees it and it is never stored.
+ *  - redactAnswer: takes every secret the route produced out of the answer (the approver sees it
+ *    once, on their own screen) and masks protected values unless a person approved a reveal.
+ *
+ * Pure: no database, no Node, no Next, so the door, the bridge, the request store and the pages can
+ * all use it. The tables below are keyed by operation ("METHOD /api/pattern"); each entry was read
+ * off the route handler it names, and guards.test.ts holds them against the registry. Fail closed:
+ * a field name that holds a secret is removed from every operation's input, listed or not.
  */
-import type { ApplySecrets, GuardInput, RedactAnswer } from './contract';
+import { maskAccountNumber, maskSsn, stripSecrets } from '@/lib/permissions/mask';
+import type { ApplySecrets, GuardInput, OperationInput, ProducedSecret, RedactAnswer } from './contract';
+import type { Operation, SecretKind } from './operations/types';
 
-export const guardInput: GuardInput = () => {
-  throw new Error('guardInput is not built yet.');
+// ---------------------------------------------------------------------------
+// Names the routes read
+// ---------------------------------------------------------------------------
+
+/** lib/context.ts CLOSING_PASSWORD_HEADER: unlocks dates on or before the closing date for one request. */
+export const CLOSING_PASSWORD_HEADER = 'x-closing-password';
+/** lib/net/archiveCredentials.ts LOGIN_HEADER: the user name that opens a backup sealed with another file's key. */
+export const ARCHIVE_LOGIN_HEADER = 'x-ironbooks-login';
+/**
+ * lib/net/archiveCredentials.ts PASSWORD_HEADER, base64url of the UTF-8 bytes: that user's password,
+ * and also the password of a portable file or an Accountant's Copy transfer file being opened.
+ */
+export const ARCHIVE_PASSWORD_HEADER = 'x-ironbooks-password';
+/** lib/net/archiveCredentials.ts RECOVERY_KEY_HEADER. */
+export const ARCHIVE_RECOVERY_KEY_HEADER = 'x-ironbooks-recovery-key';
+/** Every header applySecrets can hand back. The bridge must let exactly these into a service scope. */
+export const SECRET_HEADERS: readonly string[] = Object.freeze([
+  CLOSING_PASSWORD_HEADER,
+  ARCHIVE_LOGIN_HEADER,
+  ARCHIVE_PASSWORD_HEADER,
+  ARCHIVE_RECOVERY_KEY_HEADER,
+]);
+
+/** What a produced secret reads as in the agent's answer. */
+export const PRODUCED_SECRET_TEXT = 'Shown to the person who approved';
+/** What a masked value reads as when no part of it may show (a password, a whole memo). */
+export const MASKED_TEXT = '••••';
+
+// ---------------------------------------------------------------------------
+// What an agent never supplies
+// ---------------------------------------------------------------------------
+
+/**
+ * Field names that hold a secret wherever they appear, for every operation: an agent that supplied
+ * one would know a password a person relies on (or could sign in with it), so they are removed from
+ * bodies and queries at any depth. The app's own stored-secret names (lib/permissions/mask.ts
+ * SECRET_KEYS) are here too: a hash never comes from outside.
+ */
+const SECRET_FIELD_NAMES: ReadonlySet<string> = new Set([
+  'password',
+  'currentPassword',
+  'newPassword',
+  'filePassword',
+  'apiKey',
+  'recoveryKey',
+  'totp',
+  'challengeAnswer',
+  'passwordHash',
+  'portalPasswordHash',
+  'closingDatePasswordHash',
+  'challengeAnswerHash',
+  'totpSecret',
+  'resetToken',
+  'apiKeyEnc',
+  'tokenHash',
+]);
+
+/**
+ * Field names only a person may set, wherever they appear. integratedAppsBlocked is the switch that
+ * shuts every agent out (the hard floor, plan §4.6). allowEmployeePortal and allowPhoneReceipts
+ * decide who reaches the company file from outside it, and only an Admin may change them
+ * (lib/services/company.ts updateCompany).
+ */
+const PERSON_ONLY_FIELD_NAMES: ReadonlySet<string> = new Set(['integratedAppsBlocked', 'allowEmployeePortal', 'allowPhoneReceipts']);
+
+/**
+ * Per operation, body fields only a person may set (dotted). `protect` on a copy of the company
+ * file: { protect: false } answers a copy with every user's password hash and no password on it,
+ * so an agent's copy is always protected with the password the approver types. `allowCloud` on an
+ * AI test turns cloud AI on in Privacy & Network and keeps it on (lib/services/aiSettings.ts).
+ */
+const PERSON_ONLY_FIELDS: Readonly<Record<string, readonly string[]>> = {
+  'PATCH /api/company': ['settings.integratedAppsBlocked', 'settings.allowEmployeePortal', 'settings.allowPhoneReceipts'],
+  'POST /api/accountant-copy': ['protect'],
+  'POST /api/period-copy': ['protect'],
+  'POST /api/portable': ['protect'],
+  'POST /api/ai/test': ['allowCloud'],
 };
 
-export const applySecrets: ApplySecrets = () => {
-  throw new Error('applySecrets is not built yet.');
+/**
+ * "Yes, I am sure" flags the routes accept after a 409 warning (plan §5.6). A flag in the body that
+ * the operation does not list is taken out: the policy could not see it, and an unlisted
+ * allowLedgerRewrite would otherwise ride along on an ordinary change. A listed one counts as sent
+ * in `confirm`, so the policy treats the request as confirmed whichever way it arrived.
+ */
+const CONFIRM_FLAG_NAMES: ReadonlySet<string> = new Set([
+  'allowDuplicateNumber',
+  'allowReconciledEdit',
+  'overrideCreditLimit',
+  'allowOverBilling',
+  'allowUnnamedControl',
+  'allowDuplicate',
+  'allowLedgerRewrite',
+  'allowInactive',
+  'allowDeposited',
+  'allowZero',
+  'removeFromDeposit',
+  'acceptVariance',
+  'acceptExistingEntries',
+  'acknowledgeDifference',
+  'confirmReconciledRepost',
+]);
+
+// ---------------------------------------------------------------------------
+// Where each secret goes (checked against every handler named)
+// ---------------------------------------------------------------------------
+
+type SecretPlace =
+  /** A body field. `inside`: only when that object is already in the body (a draft being tested). */
+  | { to: 'body'; path: string; inside?: string }
+  /** POST /api/file-lock: `password` to set, `currentPassword` to change or remove (by body.action). */
+  | { to: 'file_lock' }
+  /** x-ironbooks-login + x-ironbooks-password, or x-ironbooks-recovery-key. */
+  | { to: 'archive_headers' }
+  /** x-ironbooks-password alone: the password of a portable or transfer file being opened. */
+  | { to: 'file_password_header' };
+
+interface SecretRoute {
+  /** Body fields the route reads a secret from (dotted, * for any). What the agent put there goes. */
+  fields: readonly string[];
+  /** Where each kind the approver types is put. closing_password also always goes in its header. */
+  place: Partial<Record<SecretKind, SecretPlace>>;
+}
+
+const body = (path: string): SecretPlace => ({ to: 'body', path });
+const FILE_PROTECTION: SecretRoute = { fields: ['password'], place: { file_password: body('password') } };
+const COPY_PASSWORD: SecretRoute = { fields: ['password'], place: { backup_password: body('password') } };
+const OPEN_COPY: SecretRoute = { fields: [], place: { backup_password: { to: 'file_password_header' } } };
+const ARCHIVE: SecretRoute = { fields: [], place: { archive_credentials: { to: 'archive_headers' } } };
+const CLOSING_BODY: SecretRoute = { fields: ['password', 'currentPassword'], place: { closing_password: body('currentPassword') } };
+
+/**
+ * Keyed "METHOD /api/pattern". Read off each handler:
+ *  - users (POST), users/[id]/reset-password: zod `password` (and `currentPassword` for your own).
+ *  - file-lock: body.password (set) and body.currentPassword (change or remove).
+ *  - file-protection, /file-key, /recovery-key: body.password, the approving file Admin's own.
+ *  - employees/[id]/portal-password: body.password.
+ *  - email/settings PUT: emailSetupSchema `password`; email/test: `draft.password` (only a draft
+ *    carries one: without a draft the saved settings are tested).
+ *  - ai/settings PUT: providers[].apiKey; ai/test: apiKey. No secret kind exists for an AI key, so
+ *    an agent's key is only ever removed; a person types keys in AI settings.
+ *  - portable, accountant-copy, period-copy (POST): body.password protects the copy.
+ *  - portable/restore, accountant-copy/open: filePasswordFrom(x-ironbooks-password).
+ *  - backup, backup/company, backups/preview, backups/restore, condense/archives (POST):
+ *    archiveCredentialsFrom(the x-ironbooks-* headers).
+ *  - company/closing-date PATCH, month-end-close/close: body.currentPassword is the closing-date
+ *    password in force; body.password would SET a new one, which only a person does in Ironbooks.
+ *  - year-end-close, accountant-copy/changes/import: the x-closing-password header only.
+ */
+const SECRET_ROUTES: Readonly<Record<string, SecretRoute>> = {
+  'POST /api/users': { fields: ['password'], place: { new_user_password: body('password') } },
+  'POST /api/users/[id]/reset-password': { fields: ['password', 'currentPassword'], place: { new_user_password: body('password') } },
+  'POST /api/file-lock': { fields: ['password', 'currentPassword', 'newPassword'], place: { file_password: { to: 'file_lock' } } },
+  'POST /api/file-protection': FILE_PROTECTION,
+  'POST /api/file-protection/file-key': FILE_PROTECTION,
+  'POST /api/file-protection/recovery-key': FILE_PROTECTION,
+  'POST /api/employees/[id]/portal-password': { fields: ['password'], place: { portal_password: body('password') } },
+  'PUT /api/email/settings': { fields: ['password'], place: { mail_password: body('password') } },
+  'POST /api/email/test': { fields: ['draft.password'], place: { mail_password: { to: 'body', path: 'draft.password', inside: 'draft' } } },
+  'PUT /api/ai/settings': { fields: ['providers.*.apiKey'], place: {} },
+  'POST /api/ai/test': { fields: ['apiKey'], place: {} },
+  'POST /api/portable': COPY_PASSWORD,
+  'POST /api/accountant-copy': COPY_PASSWORD,
+  'POST /api/period-copy': COPY_PASSWORD,
+  'POST /api/portable/restore': OPEN_COPY,
+  'POST /api/accountant-copy/open': OPEN_COPY,
+  'POST /api/backup': ARCHIVE,
+  'POST /api/backup/company': ARCHIVE,
+  'POST /api/backups/preview': ARCHIVE,
+  'POST /api/backups/restore': ARCHIVE,
+  'POST /api/condense/archives': ARCHIVE,
+  'PATCH /api/company/closing-date': CLOSING_BODY,
+  'POST /api/month-end-close/close': CLOSING_BODY,
+  'POST /api/year-end-close': { fields: [], place: {} },
+  'POST /api/accountant-copy/changes/import': { fields: [], place: {} },
 };
 
-export const redactAnswer: RedactAnswer = () => {
-  throw new Error('redactAnswer is not built yet.');
+/** Where a produced secret sits in the route's answer, and how the approver's screen names it. */
+const PRODUCED_PLACES: Readonly<Record<string, Partial<Record<SecretKind, { paths: readonly string[]; label: string }>>>> = {
+  // { ok, recoveryKey, status }: the key that opens the protected file, in this answer only, once.
+  'POST /api/file-protection': { recovery_key: { paths: ['recoveryKey'], label: 'Recovery key for the company file' } },
+  'POST /api/file-protection/recovery-key': { recovery_key: { paths: ['recoveryKey'], label: 'New recovery key for the company file' } },
+  // { id, token, expiresAt, ... } (lib/services/receipts.ts createUploadToken): the token IS the link.
+  'POST /api/receipts/upload-links': { capability_link: { paths: ['token'], label: 'Phone upload link for receipts' } },
 };
+
+/** For an operation the table does not name: the answer fields each kind could sit in, at any depth. */
+const PRODUCED_FALLBACK_NAMES: Readonly<Record<SecretKind, readonly string[]>> = {
+  closing_password: ['password'],
+  file_password: ['password'],
+  backup_password: ['password'],
+  archive_credentials: ['password', 'recoveryKey'],
+  new_user_password: ['temporaryPassword', 'tempPassword', 'password'],
+  mail_password: ['password'],
+  portal_password: ['temporaryPassword', 'password'],
+  recovery_key: ['recoveryKey', 'recoveryCodes'],
+  file_key: ['fileKey'],
+  capability_link: ['token', 'url', 'link'],
+};
+
+const PRODUCED_LABELS: Readonly<Record<SecretKind, string>> = {
+  closing_password: 'Closing-date password',
+  file_password: 'Company file password',
+  backup_password: 'Password of the copy',
+  archive_credentials: 'Sign-in for the backup',
+  new_user_password: 'Temporary password for the new user',
+  mail_password: 'Mail server password',
+  portal_password: 'Employee portal password',
+  recovery_key: 'Recovery key for the company file',
+  file_key: 'File key for the company file',
+  capability_link: 'Link that lets someone in without signing in',
+};
+
+// ---------------------------------------------------------------------------
+// Small helpers on plain JSON
+// ---------------------------------------------------------------------------
+
+type Container = Record<string, unknown> | unknown[];
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  if (v === null || typeof v !== 'object' || Array.isArray(v)) return false;
+  const proto = Object.getPrototypeOf(v);
+  return proto === Object.prototype || proto === null;
+}
+
+function hasOwn(o: object, k: string): boolean {
+  return Object.prototype.hasOwnProperty.call(o, k);
+}
+
+/** Sets an own property, "__proto__" included (a plain assignment would change the prototype). */
+function setOwn(o: Container, k: string, v: unknown): void {
+  if (Array.isArray(o) && /^\d+$/.test(k)) {
+    o[Number(k)] = v;
+    return;
+  }
+  Object.defineProperty(o, k, { value: v, enumerable: true, writable: true, configurable: true });
+}
+
+/** A deep copy of arrays and plain objects; anything else (a Date, bytes) is kept as it is. */
+function clone<T>(v: T): T {
+  if (Array.isArray(v)) return v.map((x) => clone(x)) as T;
+  if (isPlainObject(v)) {
+    const out: Record<string, unknown> = {};
+    for (const k of Object.keys(v)) setOwn(out, k, clone(v[k]));
+    return out as T;
+  }
+  return v;
+}
+
+function childKeys(node: unknown): string[] {
+  if (Array.isArray(node)) return node.map((_, i) => String(i));
+  if (isPlainObject(node)) return Object.keys(node);
+  return [];
+}
+
+export interface PathPlace {
+  parent: Container;
+  key: string;
+  /** The concrete dotted path ("providers.0.apiKey"). */
+  path: string;
+  value: unknown;
+}
+
+/** Every place a dotted path ('lines.*.accountId', * for any index or key) names in `root`. */
+export function placesAt(root: unknown, path: string): PathPlace[] {
+  const segs = path.split('.').filter((s) => s !== '');
+  const out: PathPlace[] = [];
+  if (segs.length === 0) return out;
+  const walk = (node: unknown, i: number, trail: string[]) => {
+    if (!Array.isArray(node) && !isPlainObject(node)) return;
+    const keys = segs[i] === '*' ? childKeys(node) : [segs[i]];
+    for (const k of keys) {
+      if (!hasOwn(node, k)) continue;
+      const child = (node as Record<string, unknown>)[k];
+      const p = [...trail, k];
+      if (i === segs.length - 1) out.push({ parent: node as Container, key: k, path: p.join('.'), value: child });
+      else walk(child, i + 1, p);
+    }
+  };
+  walk(root, 0, []);
+  return out;
+}
+
+/** The values a dotted path names in `root` (see placesAt). */
+export function valuesAt(root: unknown, path: string): unknown[] {
+  return placesAt(root, path).map((p) => p.value);
+}
+
+/** Whether a concrete dotted path is named by a pattern with * for any one segment. */
+function pathMatches(pattern: string, concrete: string): boolean {
+  const a = pattern.split('.');
+  const b = concrete.split('.');
+  return a.length === b.length && a.every((s, i) => s === '*' || s === b[i]);
+}
+
+function removeAt(root: unknown, path: string, stripped: string[], prefix: string): void {
+  for (const p of placesAt(root, path)) {
+    if (Array.isArray(p.parent)) continue; // a field, never an element of a list
+    delete p.parent[p.key];
+    stripped.push(`${prefix}${p.path}`);
+  }
+}
+
+/**
+ * Walk every object in `root` and drop each own key `drop` says to drop, at any depth. Returns
+ * nothing; the dropped paths go to `stripped` with `prefix`.
+ */
+function dropKeysDeep(root: unknown, drop: (key: string, path: string, value: unknown) => boolean, stripped: string[], prefix: string): void {
+  const walk = (node: unknown, trail: string[]) => {
+    if (Array.isArray(node)) {
+      node.forEach((x, i) => walk(x, [...trail, String(i)]));
+      return;
+    }
+    if (!isPlainObject(node)) return;
+    for (const k of Object.keys(node)) {
+      const p = [...trail, k];
+      if (drop(k, p.join('.'), node[k])) {
+        delete node[k];
+        stripped.push(`${prefix}${p.join('.')}`);
+      } else walk(node[k], p);
+    }
+  };
+  walk(root, []);
+}
+
+function routeKey(operation: Pick<Operation, 'method' | 'route'>): string {
+  return `${operation.method} ${operation.route}`;
+}
+
+function listOf(v: unknown): readonly string[] {
+  return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
+}
+
+// ---------------------------------------------------------------------------
+// guardInput
+// ---------------------------------------------------------------------------
+
+const REFUSE = {
+  notAnObject: 'The request could not be read. Send params, query and body as one object.',
+  hardFloor:
+    "Agents can never do this, even with a person's approval. Ask a person to do it in Ironbooks if it is needed.",
+  personOnly:
+    'This is something a person does for themselves in Ironbooks, so an agent cannot ask for it. Ask a person to do it.',
+  auditHistory:
+    'Removing entries from the audit trail can never be done by an agent, even with approval: the audit trail is what makes agent work answerable. Ask a person to run this repair in Ironbooks.',
+  confirmShape: 'Confirmation flags must be a list of flag names, such as ["allowDuplicateNumber"].',
+  revealNothing: 'Nothing in this answer is masked, so there is nothing to reveal. Send it again without reveal.',
+  revealOnApproval:
+    "This operation's protected data is shown only once a person approves the request, so there is no separate reveal to ask for. Send it again without reveal.",
+  revealNever:
+    'This operation has no reveal: its protected values stay masked for agents. Send it again without reveal, or ask a person to look them up in Ironbooks.',
+  bulkAcceptBoth:
+    'Send either a list of items or allHighConfidence, not both: with both, every waiting line would be posted, not only the listed ones.',
+};
+
+function unknownFlag(flag: string, listed: readonly string[]): string {
+  const shown = cleanText(flag, 60);
+  return listed.length > 0
+    ? `"${shown}" is not a confirmation this operation accepts. Send only a flag its warning named: ${listed.join(', ')}.`
+    : `"${shown}" is not a confirmation this operation accepts; it accepts none. Send it again without confirm.`;
+}
+
+/** Why a path parameter cannot be used, or null when it is a plain id. */
+function paramProblem(name: string, value: unknown): string | null {
+  if (value === undefined || value === null || value === '') {
+    return `This needs the ${name} of the record in params. Send it again with params.${name}.`;
+  }
+  if (typeof value !== 'string') return `params.${name} must be text, such as the record's id.`;
+  // A slash or "..", raw or encoded, would point the request at another route; "?" and "#" would
+  // cut the path short. An id never holds any of them, nor a control character.
+  if (/[\/\\?#%]|\.\.|[\u0000-\u001f\u007f]/.test(value)) {
+    return `The value of params.${name} cannot be used in a web address: it holds a slash, a backslash, "..", "?", "#", "%" or a control character. Send the record's id as Ironbooks shows it.`;
+  }
+  return null;
+}
+
+/**
+ * Strip what an agent may never supply, without deciding anything else. Shared by guardInput,
+ * applySecrets and maskInput, so a secret the agent sent is gone whichever of them runs first.
+ * Returns the cleaned copy; listed confirmation flags found in the body are added to `confirm`.
+ */
+function stripInput(operation: Operation, input: OperationInput, stripped: string[]): OperationInput {
+  const out: OperationInput = {};
+  const key = routeKey(operation);
+  const declared = listOf(operation.params);
+
+  if (input.params !== undefined) {
+    const params: Record<string, string> = {};
+    if (isPlainObject(input.params)) {
+      for (const [k, v] of Object.entries(input.params)) {
+        // Only the route's own parameters: anything else would only ever show on the card.
+        if (declared.includes(k)) setOwn(params, k, v as string);
+        else stripped.push(`params.${k}`);
+      }
+    }
+    out.params = params;
+  }
+
+  if (input.query !== undefined) {
+    const query: Record<string, string | string[]> = {};
+    if (isPlainObject(input.query)) {
+      for (const [k, v] of Object.entries(input.query)) {
+        if (SECRET_FIELD_NAMES.has(k) || PERSON_ONLY_FIELD_NAMES.has(k)) stripped.push(`query.${k}`);
+        else setOwn(query, k, clone(v) as string | string[]);
+      }
+    }
+    out.query = query;
+  }
+
+  const listedFlags = listOf(operation.confirmFlags);
+  const confirm: string[] = [...new Set(listOf(input.confirm))];
+
+  if (input.body !== undefined) {
+    const b = clone(input.body);
+    const route = SECRET_ROUTES[key];
+    for (const f of route?.fields ?? []) removeAt(b, f, stripped, 'body.');
+    for (const f of PERSON_ONLY_FIELDS[key] ?? []) removeAt(b, f, stripped, 'body.');
+    dropKeysDeep(b, (k) => SECRET_FIELD_NAMES.has(k) || PERSON_ONLY_FIELD_NAMES.has(k), stripped, 'body.');
+    dropKeysDeep(
+      b,
+      (k, p, v) => {
+        if (!CONFIRM_FLAG_NAMES.has(k)) return false;
+        const listed = listedFlags.find((f) => pathMatches(f, p));
+        if (listed === undefined) return true;
+        if (v === true && !confirm.includes(listed)) confirm.push(listed);
+        return false;
+      },
+      stripped,
+      'body.',
+    );
+    out.body = b;
+  }
+
+  if (input.confirm !== undefined || confirm.length > 0) out.confirm = confirm;
+  if (input.reveal !== undefined) out.reveal = input.reveal === true;
+  return out;
+}
+
+/** The first refusal that applies, or null. Order: the biggest reason first. */
+function refusalOf(operation: Operation, raw: OperationInput, cleaned: OperationInput): string | null {
+  if (operation.availability === 'hard_floor') return REFUSE.hardFloor;
+  if (operation.availability !== 'agent') return REFUSE.personOnly;
+
+  const key = routeKey(operation);
+  // Rebuild Data's "orphaned_audit_refs" deletes audit trail rows: the hard floor (plan §4.6).
+  if (key === 'POST /api/import/rebuild') {
+    const actions = [
+      ...valuesAt(cleaned.body, 'action'),
+      ...(isPlainObject(cleaned.query) ? [cleaned.query.action].flat() : []),
+    ];
+    if (actions.some((a) => typeof a === 'string' && a.trim().toLowerCase() === 'orphaned_audit_refs')) return REFUSE.auditHistory;
+  }
+  // bulkAcceptSchema's allHighConfidence form drops a list sent with it, so a list of 1 could post
+  // every waiting line. Refusing the mix lets the list's length stand as the count.
+  if (key === 'POST /api/bank-transactions/bulk-accept' && isPlainObject(cleaned.body)) {
+    const b = cleaned.body;
+    if (b.allHighConfidence !== undefined && b.allHighConfidence !== false && b.items !== undefined) return REFUSE.bulkAcceptBoth;
+  }
+
+  if (raw.params !== undefined && !isPlainObject(raw.params)) return REFUSE.notAnObject;
+  if (raw.query !== undefined && !isPlainObject(raw.query)) return REFUSE.notAnObject;
+  for (const name of listOf(operation.params)) {
+    const problem = paramProblem(name, cleaned.params?.[name]);
+    if (problem) return problem;
+  }
+
+  if (raw.confirm !== undefined && (!Array.isArray(raw.confirm) || raw.confirm.some((f) => typeof f !== 'string'))) {
+    return REFUSE.confirmShape;
+  }
+  const listed = listOf(operation.confirmFlags);
+  for (const flag of cleaned.confirm ?? []) {
+    if (!listed.includes(flag)) return unknownFlag(flag, listed);
+  }
+
+  if (raw.reveal === true && !operation.reveal) {
+    // A read_sensitive operation's fields are masked until a person approves the run, which then
+    // shows them (redactAnswer with reveal); other operations that list fields keep them masked.
+    if (listOf(operation.sensitiveFields).length === 0) return REFUSE.revealNothing;
+    return operation.class === 'read_sensitive' ? REFUSE.revealOnApproval : REFUSE.revealNever;
+  }
+  return null;
+}
+
+/**
+ * Remove what an agent may never supply and refuse what it may never ask. The input that comes
+ * back is always the cleaned one, refused or not, so not even a refusal's record keeps a secret.
+ */
+export const guardInput: GuardInput = (operation, input) => {
+  const stripped: string[] = [];
+  if (!isPlainObject(input)) return { input: {}, refused: REFUSE.notAnObject, stripped };
+  const cleaned = stripInput(operation, input, stripped);
+  return { input: cleaned, refused: refusalOf(operation, input, cleaned), stripped: [...new Set(stripped)] };
+};
+
+// ---------------------------------------------------------------------------
+// applySecrets
+// ---------------------------------------------------------------------------
+
+/**
+ * Starts every value encodeSecretParts makes. A NUL character cannot be typed into a password
+ * field, so no password a person typed starts with it: a typed "{...}" password stays a password.
+ */
+export const SECRET_PARTS_MARKER = '\u0000ironbooks-secret-parts:';
+
+export interface SecretParts {
+  login?: string;
+  password?: string;
+  currentPassword?: string;
+  recoveryKey?: string;
+}
+
+/**
+ * A secret made of parts, typed as one value on the card: archive credentials (a user name and
+ * password, or a recovery key) and, for the file password, the current one beside the new one.
+ * The approval card sends `encodeSecretParts({ login, password })` as that kind's value in
+ * ApproveInput.secrets (contract.ts has one text per kind, so the parts travel in one text). A
+ * plain value is the recovery key (archive credentials) or the one password the action needs (the
+ * file password). Any other kind given an encoded value counts as missing.
+ */
+export function encodeSecretParts(parts: { login?: string | null; password?: string | null; currentPassword?: string | null; recoveryKey?: string | null }): string {
+  const out: Record<string, string> = {};
+  for (const k of ['login', 'password', 'currentPassword', 'recoveryKey'] as const) {
+    const v = parts[k];
+    if (typeof v === 'string' && v !== '') out[k] = v;
+  }
+  return `${SECRET_PARTS_MARKER}${JSON.stringify(out)}`;
+}
+
+type ReadParts = { kind: 'plain' } | { kind: 'parts'; parts: SecretParts } | { kind: 'bad' };
+
+/** A plain typed value, the parts encodeSecretParts made, or text that starts like parts and is not. */
+function secretParts(value: string): ReadParts {
+  if (!value.startsWith(SECRET_PARTS_MARKER)) return { kind: 'plain' };
+  try {
+    const p: unknown = JSON.parse(value.slice(SECRET_PARTS_MARKER.length));
+    if (!isPlainObject(p)) return { kind: 'bad' };
+    const out: SecretParts = {};
+    for (const k of ['login', 'password', 'currentPassword', 'recoveryKey'] as const) {
+      const v = p[k];
+      if (typeof v === 'string' && v !== '') out[k] = v;
+    }
+    return Object.keys(out).length > 0 ? { kind: 'parts', parts: out } : { kind: 'bad' };
+  } catch {
+    return { kind: 'bad' };
+  }
+}
+
+/** A value a header can carry as it is (no line breaks, nothing past Latin-1, no outer spaces). */
+function headerSafe(v: string): boolean {
+  return v !== '' && v === v.trim() && /^[ -~\u0080-ÿ\t]*$/.test(v);
+}
+
+/** base64url of the UTF-8 bytes, as lib/net/archiveCredentials.ts decodes it (any character survives). */
+function base64url(text: string): string {
+  const bytes = new TextEncoder().encode(text);
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function bodyObject(input: OperationInput): Record<string, unknown> | null {
+  if (input.body === undefined || input.body === null) input.body = {};
+  return isPlainObject(input.body) ? input.body : null;
+}
+
+/** Put one secret where it goes. False when it could not be used (then it counts as missing). */
+function place(spot: SecretPlace, value: string, input: OperationInput, headers: Record<string, string>): boolean {
+  const read = secretParts(value);
+  if (read.kind === 'bad') return false;
+  const parts = read.kind === 'parts' ? read.parts : null;
+  switch (spot.to) {
+    case 'body': {
+      // One password goes here: parts meant for another kind are not one.
+      if (parts) return false;
+      const b = bodyObject(input);
+      if (!b) return false;
+      const segs = spot.path.split('.');
+      let parent: Record<string, unknown> = b;
+      if (spot.inside !== undefined) {
+        // Only into an object the request already has: a test without a draft tests the saved set-up.
+        const inner = b[spot.inside];
+        if (!isPlainObject(inner)) return true;
+        parent = inner;
+        segs.shift();
+      }
+      for (let i = 0; i < segs.length - 1; i++) {
+        const next = parent[segs[i]];
+        if (!isPlainObject(next)) setOwn(parent, segs[i], {});
+        parent = parent[segs[i]] as Record<string, unknown>;
+      }
+      setOwn(parent, segs[segs.length - 1], value);
+      return true;
+    }
+    case 'file_lock': {
+      const b = bodyObject(input);
+      if (!b) return false;
+      if (b.action === 'remove') {
+        const current = parts ? (parts.currentPassword ?? parts.password) : value;
+        if (!current) return false;
+        setOwn(b, 'currentPassword', current);
+        return true;
+      }
+      const next = parts ? parts.password : value;
+      if (!next) return false;
+      setOwn(b, 'password', next);
+      if (parts?.currentPassword) setOwn(b, 'currentPassword', parts.currentPassword);
+      return true;
+    }
+    case 'archive_headers': {
+      const given: SecretParts = parts ?? { recoveryKey: value };
+      let used = false;
+      const key = given.recoveryKey?.trim();
+      if (key && headerSafe(key)) {
+        headers[ARCHIVE_RECOVERY_KEY_HEADER] = key;
+        used = true;
+      }
+      const login = given.login?.trim();
+      if (login && headerSafe(login) && given.password) {
+        headers[ARCHIVE_LOGIN_HEADER] = login;
+        headers[ARCHIVE_PASSWORD_HEADER] = base64url(given.password);
+        used = true;
+      }
+      return used;
+    }
+    case 'file_password_header':
+      if (parts) return false;
+      headers[ARCHIVE_PASSWORD_HEADER] = base64url(value);
+      return true;
+  }
+}
+
+/**
+ * Put the approver's secrets where the route reads them. Whatever the agent sent in those places
+ * is removed first. A kind the operation has no place for is not used (a shell operation passes
+ * its secrets itself). `missing`: kinds the operation needs that were not given, or could not be
+ * used as given (a closing-date password with a line break cannot travel in a header). Many are
+ * optional to the route (a backup that is not sealed with another key needs no credentials), so
+ * `missing` says what was not supplied, not that the run will fail.
+ */
+export const applySecrets: ApplySecrets = (operation, input, secrets) => {
+  const out = stripInput(operation, isPlainObject(input) ? input : {}, []);
+  const headers: Record<string, string> = {};
+  const used = new Set<SecretKind>();
+  const given: Partial<Record<SecretKind, string>> = isPlainObject(secrets) ? secrets : {};
+  const route = SECRET_ROUTES[routeKey(operation)];
+
+  for (const kind of Object.keys(given) as SecretKind[]) {
+    const value = given[kind];
+    if (typeof value !== 'string' || value === '') continue;
+    let ok = true;
+    let placed = false;
+    if (kind === 'closing_password') {
+      // Any write can need it (a date in a closed period), not only the ones that list it.
+      placed = true;
+      if (headerSafe(value)) headers[CLOSING_PASSWORD_HEADER] = value;
+      else ok = false;
+    }
+    const spot = route?.place[kind];
+    if (spot) {
+      placed = true;
+      ok = place(spot, value, out, headers) && ok;
+    }
+    if (placed && ok) used.add(kind);
+  }
+
+  const needed = listOf(operation.needsSecret) as SecretKind[];
+  const missing = needed.filter((k) => {
+    if (used.has(k)) return false;
+    const v = given[k];
+    const supplied = typeof v === 'string' && v !== '';
+    const hasPlace = k === 'closing_password' || Boolean(route?.place[k]);
+    // Given, with nowhere to go on a route: not missing (a shell flow takes its secrets itself).
+    return !(supplied && !hasPlace);
+  });
+  return { input: out, headers, missing };
+};
+
+// ---------------------------------------------------------------------------
+// redactAnswer and masking
+// ---------------------------------------------------------------------------
+
+/** lib/permissions/mask.ts SSN_KEYS and ACCOUNT_KEYS (the field names the app masks for people). */
+const SSN_KEYS: ReadonlySet<string> = new Set(['ssn', 'employeeSsn', 'taxId']);
+const ACCOUNT_KEYS: ReadonlySet<string> = new Set(['accountNumber', 'routingNumber', 'bankAccountNumber']);
+/** Sensitive-field names that are secrets, never protected data: no reveal ever shows them. */
+const SECRET_ANSWER_NAMES: ReadonlySet<string> = new Set([
+  ...SECRET_FIELD_NAMES,
+  'token',
+  'secret',
+  'otpauthUrl',
+  'recoveryCodes',
+  'answer',
+  'fileKey',
+  'temporaryPassword',
+  'tempPassword',
+]);
+/**
+ * Answer fields masked in every answer, listed by the operation or not, reveal or not: the names in
+ * SECRET_ANSWER_NAMES that only ever hold a secret. Not 'token' (also a word for harmless things,
+ * such as a page cursor) nor 'answer' (an AI answer is the point of the call): those are masked
+ * where an operation lists them, and a produced link is found by its operation's own entry.
+ */
+const ALWAYS_SECRET_NAMES: ReadonlySet<string> = new Set([...SECRET_ANSWER_NAMES].filter((k) => k !== 'token' && k !== 'answer'));
+
+type DataKind = 'ssn' | 'account' | 'other' | 'secret';
+
+/** What a sensitive field holds, from its last name: what decides whether a reveal shows it. */
+function fieldKind(path: string): DataKind {
+  const last = path.split('.').pop() ?? '';
+  if (SECRET_ANSWER_NAMES.has(last)) return 'secret';
+  if (SSN_KEYS.has(last)) return 'ssn';
+  // A memo is protected for the account number the app writes into it ("Acct # …").
+  if (ACCOUNT_KEYS.has(last) || /memo$/i.test(last)) return 'account';
+  return 'other';
+}
+
+/**
+ * The kinds of protected data a reveal shows. A reveal on an operation that names what it reveals
+ * shows that kind (policy.ts asks the approver for that flag alone). A read_sensitive operation
+ * also shows every field it lists (the approver held each one's flag), and so does a reveal on an
+ * operation that names nothing (only an Admin approves those). Secrets are never a kind a reveal shows.
+ */
+function revealedKinds(operation: Operation, reveal: boolean): ReadonlySet<DataKind> {
+  const kinds = new Set<DataKind>();
+  if (!reveal) return kinds;
+  kinds.add('other');
+  const named = operation.reveal ?? null;
+  if (named === 'account_numbers') kinds.add('account');
+  else if (named === 'ssn' || named === 'payroll') kinds.add('ssn');
+  else if (named !== null) {
+    kinds.add('ssn');
+    kinds.add('account');
+  }
+  if (operation.class === 'read_sensitive' || named === null) {
+    for (const p of listOf(operation.sensitiveFields)) {
+      const k = fieldKind(p);
+      if (k !== 'secret') kinds.add(k);
+    }
+  }
+  if (named === null && !kinds.has('ssn') && !kinds.has('account')) {
+    kinds.add('ssn');
+    kinds.add('account');
+  }
+  return kinds;
+}
+
+/** One masked value: SSNs and account numbers keep their last 4, anything else shows nothing. */
+function maskValue(key: string, value: unknown): unknown {
+  if (value === null || value === undefined || typeof value === 'boolean' || value === PRODUCED_SECRET_TEXT) return value;
+  if (SSN_KEYS.has(key) && (typeof value === 'string' || typeof value === 'number')) return maskSsn(value);
+  if (ACCOUNT_KEYS.has(key) && (typeof value === 'string' || typeof value === 'number')) return maskAccountNumber(value);
+  if (value === '') return value;
+  return MASKED_TEXT;
+}
+
+/**
+ * The label before an account number in text: "Acct #", "Account No.", "A/C Number:" and the like,
+ * also inside a word ("BankAcct#"). "No" and "Number" only as words of their own ("Acct Now" is not one).
+ */
+const ACCT_LABEL = /(?:Acct|Account|A\/C)s?\.?\s*(?:#|No(?![a-z])\.?|Number(?![a-z]))\s*:?\s*/gi;
+
+/**
+ * "Acct # 000123456789" shows as "Acct # ••••6789". It is the memo the print queue and liability
+ * checks write when a check's memo is blank (lib/services/printQueue.ts, liabilityPayments.ts),
+ * with the payee's full account number. That number is free text of up to 100 characters (a
+ * vendor's accountNumber: "#12345678", "(0001234567)", "1234 - 5678", "12_34567890", "1234,5678",
+ * even a line break), so nobody can tell where it ends. As liabilityPayments.ts checkMemoFor does
+ * for people, everything after the label to the end of the text is masked, keeping its last 4
+ * characters that are not spaces: no punctuation inside the number can end the mask early. That
+ * errs on the safe side: "Paid Acct # 1234, thanks" shows as "Paid Acct # ••••anks".
+ * That is for a label with "#" ("Acct #" is the app's own). The longer labels ("Account number",
+ * "Account No.") also start the app's own sentences about chart-of-accounts numbers, which are not
+ * protected ("Account number 1000 is already used, so …"), so after them only the number itself
+ * is masked: the words that follow the label up to the last one holding a digit, stopping at the
+ * first ordinary word (one with a small letter and no digit). "1234 5678", "AB-12 CD-34" and
+ * "SMITH 0012" are numbers of several words; "Account number must be unique" holds none.
+ */
+export function maskAccountsInText(text: string): string {
+  const label = new RegExp(ACCT_LABEL.source, ACCT_LABEL.flags);
+  let out = '';
+  let from = 0;
+  for (let m = label.exec(text); m !== null; m = label.exec(text)) {
+    const end = m.index + m[0].length;
+    const rest = text.slice(end);
+    if (rest.trim() === '') break;
+    if (m[0].includes('#')) return `${out}${text.slice(from, end)}${maskAccountNumber(rest) ?? MASKED_TEXT}`;
+    const n = numberAtStart(rest);
+    // A sentence that only starts like a label: a real one may still follow ("…; Acct # SMITHJ").
+    if (n === 0) continue;
+    out += `${text.slice(from, end)}${maskAccountNumber(rest.slice(0, n)) ?? MASKED_TEXT}`;
+    from = end + n;
+    label.lastIndex = from;
+  }
+  return `${out}${text.slice(from)}`;
+}
+
+/**
+ * How long the account number at the start of `rest` is (after a longer label): the words up to
+ * the last one holding a digit, before the first ordinary word. Sentence punctuation after it
+ * stays outside. 0 when no word there holds a digit.
+ */
+function numberAtStart(rest: string): number {
+  const word = /\S+/g;
+  let end = 0;
+  for (let m = word.exec(rest); m !== null; m = word.exec(rest)) {
+    if (/\d/.test(m[0])) end = m.index + m[0].length;
+    else if (/\p{Ll}/u.test(m[0])) break;
+  }
+  if (end === 0) return 0;
+  return rest.slice(0, end).replace(/[.,;:!?]+$/, '').length;
+}
+
+/**
+ * Mask protected values in `value` (an answer, or the body or query of a stored request), in place:
+ *  1. the operation's sensitive fields, unless a reveal shows their kind (secrets never);
+ *  2. SSNs, tax IDs and account numbers anywhere, unless a reveal shows their kind (D6: one reveal
+ *     at a time, whatever the agent's role allows);
+ *  3. secret field names anywhere, always;
+ *  4. "Acct # <number>" inside any text, unless account numbers are revealed.
+ */
+function maskInPlace(operation: Operation, root: unknown, shown: ReadonlySet<DataKind>): unknown {
+  for (const path of listOf(operation.sensitiveFields)) {
+    const kind = fieldKind(path);
+    if (kind !== 'secret' && shown.has(kind)) continue;
+    for (const p of placesAt(root, path)) {
+      if (p.value === PRODUCED_SECRET_TEXT) continue;
+      setOwn(p.parent, p.key, maskValue(p.key, p.value));
+    }
+  }
+  const walk = (node: unknown): unknown => {
+    if (typeof node === 'string') return shown.has('account') ? node : maskAccountsInText(node);
+    if (Array.isArray(node)) {
+      for (let i = 0; i < node.length; i++) node[i] = walk(node[i]);
+      return node;
+    }
+    if (!isPlainObject(node)) return node;
+    for (const k of Object.keys(node)) {
+      const v = node[k];
+      if (ALWAYS_SECRET_NAMES.has(k)) setOwn(node, k, maskValue(k, v));
+      else if (SSN_KEYS.has(k) && !shown.has('ssn')) setOwn(node, k, maskValue(k, v));
+      else if (ACCOUNT_KEYS.has(k) && !shown.has('account')) setOwn(node, k, maskValue(k, v));
+      else setOwn(node, k, walk(v));
+    }
+    return node;
+  };
+  return walk(root);
+}
+
+/**
+ * The operation's protected values masked in a copy of `value`, as an answer is (see redactAnswer).
+ * For the request store, logs and previews: a reveal the person approved shows what it reveals.
+ */
+export function maskSensitiveFields(operation: Operation, value: unknown, opts: { reveal: boolean }): unknown {
+  return maskInPlace(operation, stripSecrets(clone(value)), revealedKinds(operation, opts.reveal === true));
+}
+
+/**
+ * An agent's input as a request stores and shows it: everything guardInput strips is gone, and
+ * protected values in the body and query are masked (the agent typed them; nobody else needs to
+ * read them back from a request).
+ */
+export function maskInput(operation: Operation, input: OperationInput, opts: { reveal: boolean } = { reveal: false }): OperationInput {
+  const out = stripInput(operation, isPlainObject(input) ? input : {}, []);
+  const shown = revealedKinds(operation, opts.reveal === true);
+  if (out.body !== undefined) out.body = maskInPlace(operation, out.body, shown);
+  if (out.query !== undefined) out.query = maskInPlace(operation, out.query, shown) as Record<string, string | string[]>;
+  return out;
+}
+
+function producedText(v: unknown): string | null {
+  if (typeof v === 'string') return v === '' ? null : v;
+  if (typeof v === 'number' || typeof v === 'bigint') return String(v);
+  if (Array.isArray(v)) {
+    const items = v.filter((x) => typeof x === 'string' || typeof x === 'number').map(String);
+    return items.length > 0 ? items.join('\n') : null;
+  }
+  if (isPlainObject(v)) return JSON.stringify(v);
+  return null;
+}
+
+/** Every place an own key named one of `names` sits, at any depth. */
+function placesNamed(root: unknown, names: readonly string[]): PathPlace[] {
+  const out: PathPlace[] = [];
+  const walk = (node: unknown, trail: string[]) => {
+    if (Array.isArray(node)) {
+      node.forEach((x, i) => walk(x, [...trail, String(i)]));
+      return;
+    }
+    if (!isPlainObject(node)) return;
+    for (const k of Object.keys(node)) {
+      const p = [...trail, k];
+      if (names.includes(k)) out.push({ parent: node, key: k, path: p.join('.'), value: node[k] });
+      else walk(node[k], p);
+    }
+  };
+  walk(root, []);
+  return out;
+}
+
+/** Replace every produced value wherever it still appears (inside a link, a message, a key). */
+function scrubProduced(root: unknown, values: readonly string[]): unknown {
+  if (values.length === 0) return root;
+  const scrub = (s: string): string => {
+    let out = s;
+    for (const v of values) {
+      if (out === v) return PRODUCED_SECRET_TEXT;
+      // A short value inside other text could be anything; a key, token or password is long.
+      if (v.length >= 6 && out.includes(v)) out = out.split(v).join(PRODUCED_SECRET_TEXT);
+    }
+    return out;
+  };
+  const walk = (node: unknown): unknown => {
+    if (typeof node === 'string') return scrub(node);
+    if (Array.isArray(node)) return node.map(walk);
+    if (!isPlainObject(node)) return node;
+    const out: Record<string, unknown> = {};
+    for (const k of Object.keys(node)) setOwn(out, scrub(k), walk(node[k]));
+    return out;
+  };
+  return walk(root);
+}
+
+/**
+ * The answer as the agent may read it: every secret the operation produced is replaced with
+ * "Shown to the person who approved" (and handed back in `produced`, for the approver's screen
+ * only, never stored), stored-secret fields are dropped, and protected values are masked unless a
+ * person approved a reveal of them. For an approved read_sensitive run pass reveal: true: the
+ * approver held the flags of what it shows.
+ */
+function holdsProduced(v: unknown): boolean {
+  return v !== null && v !== undefined && v !== '' && v !== PRODUCED_SECRET_TEXT;
+}
+
+/**
+ * Every text inside a produced value long enough to be a secret (a link object found by name also
+ * holds an id and a count), to find it again wherever else it was copied.
+ */
+function leafTexts(v: unknown, out: string[]): void {
+  if (typeof v === 'string') {
+    if (v.length >= 6) out.push(v);
+  } else if (Array.isArray(v)) v.forEach((x) => leafTexts(x, out));
+  else if (isPlainObject(v)) Object.values(v).forEach((x) => leafTexts(x, out));
+}
+
+export const redactAnswer: RedactAnswer = (operation, answer, opts) => {
+  let out: unknown = stripSecrets(clone(answer));
+  const produced: ProducedSecret[] = [];
+  const found: string[] = [];
+  const key = routeKey(operation);
+
+  for (const kind of listOf(operation.producesSecret) as SecretKind[]) {
+    const known = PRODUCED_PLACES[key]?.[kind];
+    let places = known ? known.paths.flatMap((p) => placesAt(out, p)).filter((p) => holdsProduced(p.value)) : [];
+    // Not where the table says (the route's answer changed shape, or the table does not know the
+    // operation): look for the kind's own names anywhere, so the secret still never reaches the agent.
+    if (places.length === 0) places = placesNamed(out, PRODUCED_FALLBACK_NAMES[kind] ?? []).filter((p) => holdsProduced(p.value));
+    for (const p of places) {
+      const text = producedText(p.value);
+      if (text !== null) produced.push({ kind, label: known?.label ?? PRODUCED_LABELS[kind] ?? 'Secret', value: text });
+      leafTexts(p.value, found);
+      setOwn(p.parent, p.key, PRODUCED_SECRET_TEXT);
+    }
+  }
+
+  out = maskInPlace(operation, out, revealedKinds(operation, opts?.reveal === true));
+  out = scrubProduced(
+    out,
+    [...new Set([...produced.flatMap((s) => [s.value, ...s.value.split('\n')]), ...found])].filter((v) => v !== ''),
+  );
+  return { answer: out, produced };
+};
+
+// ---------------------------------------------------------------------------
+// For describe.ts and the tests
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether a dotted path of this operation's input or answer holds something never shown as it is:
+ * 'secret' (a password, a key: nothing of it shows), a kind of protected data (masked), or null.
+ */
+export function protectedKindOf(operation: Operation, path: string): 'secret' | 'ssn' | 'account' | 'other' | null {
+  const last = path.split('.').pop() ?? '';
+  if (SECRET_FIELD_NAMES.has(last) || SECRET_ANSWER_NAMES.has(last)) return 'secret';
+  const route = SECRET_ROUTES[routeKey(operation)];
+  if (route?.fields.some((f) => pathMatches(f, path))) return 'secret';
+  for (const f of listOf(operation.sensitiveFields)) {
+    if (pathMatches(f, path) || (f.startsWith('*.') && pathMatches(f.slice(2), path))) return fieldKind(f);
+  }
+  if (SSN_KEYS.has(last)) return 'ssn';
+  if (ACCOUNT_KEYS.has(last)) return 'account';
+  return null;
+}
+
+/**
+ * A protected value as describe shows it: an SSN or account number keeps its last 4 (what anyone
+ * without the View flag sees in the app); a secret, a memo or anything else shows nothing of itself.
+ */
+export function maskedForDisplay(path: string, kind: 'secret' | 'ssn' | 'account' | 'other', value: unknown): string {
+  const scalar = typeof value === 'string' || typeof value === 'number';
+  if (kind === 'ssn' && scalar) return maskSsn(value) ?? '';
+  const last = path.split('.').pop() ?? '';
+  if (kind === 'account' && scalar && !/memo$/i.test(last)) return maskAccountNumber(value) ?? '';
+  return MASKED_TEXT;
+}
+
+/**
+ * A character class of code point ranges, built from numbers: these characters must never sit in
+ * the source as themselves (a direction mark in source text is itself a way to hide code).
+ */
+function charClass(ranges: ReadonlyArray<readonly [number, number]>, flags: string): RegExp {
+  // \u{…} with the u flag, so code points past U+FFFF (the tag characters) are one character each.
+  const u = (n: number) => `\\u{${n.toString(16)}}`;
+  return new RegExp(`[${ranges.map(([a, b]) => (a === b ? u(a) : `${u(a)}-${u(b)}`)).join('')}]+`, `${flags}u`);
+}
+
+/** CR, LF, tab, vertical tab, form feed, NEL, line and paragraph separators. */
+const LINE_BREAKS = charClass([[0x09, 0x0d], [0x85, 0x85], [0x2028, 0x2029]], 'g');
+/**
+ * Characters that show as nothing, or change how what follows them shows:
+ *  - control characters, the soft hyphen, the combining grapheme joiner;
+ *  - zero-width spaces and joiners, word joiner and invisible operators, the byte-order mark;
+ *  - every direction mark, embedding, override and isolate (U+061C, U+200E, U+200F,
+ *    U+202A-U+202E, U+2066-U+2069) and the old format controls beside them (U+206A-U+206F);
+ *  - blank fillers that look like spaces or nothing (Hangul U+115F, U+1160, U+3164, U+FFA0; Khmer
+ *    U+17B4, U+17B5; Mongolian U+180B-U+180F), variation selectors (U+FE00-U+FE0F,
+ *    U+E0100-U+E01EF), interlinear annotation marks (U+FFF9-U+FFFB), musical format controls;
+ *  - the tag characters U+E0000-U+E007F: invisible on screen, but a model reads them as text, so
+ *    they could carry instructions to the agent inside a summary.
+ */
+const INVISIBLE = charClass(
+  [
+    [0x00, 0x1f],
+    [0x7f, 0x9f],
+    [0xad, 0xad],
+    [0x034f, 0x034f],
+    [0x061c, 0x061c],
+    [0x115f, 0x1160],
+    [0x17b4, 0x17b5],
+    [0x180b, 0x180f],
+    [0x200b, 0x200f],
+    [0x202a, 0x202e],
+    [0x2060, 0x206f],
+    [0x3164, 0x3164],
+    [0xfe00, 0xfe0f],
+    [0xfeff, 0xfeff],
+    [0xffa0, 0xffa0],
+    [0xfff9, 0xfffb],
+    [0x1d173, 0x1d17a],
+    [0xe0000, 0xe007f],
+    [0xe0100, 0xe01ef],
+  ],
+  'g',
+);
+
+/**
+ * Text as it may show on a card or in a message: line breaks become spaces; control characters
+ * and invisible marks are removed (direction marks such as U+202E would show "fdp.exe" as "exe.pdf");
+ * spaces are collapsed; cut to `max` characters with "…".
+ */
+export function cleanText(value: string, max: number): string {
+  const flat = value
+    .replace(LINE_BREAKS, ' ')
+    .replace(INVISIBLE, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+  const chars = Array.from(flat);
+  return chars.length > max ? `${chars.slice(0, max - 1).join('').trimEnd()}…` : flat;
+}
+
+/** The secret routes table's keys and where each kind goes: for guards.test.ts only. */
+export const SECRET_ROUTE_TABLE: Readonly<Record<string, { fields: readonly string[]; kinds: readonly SecretKind[] }>> = Object.freeze(
+  Object.fromEntries(
+    Object.entries(SECRET_ROUTES).map(([k, r]) => [k, { fields: r.fields, kinds: Object.keys(r.place) as SecretKind[] }]),
+  ),
+);
+/** The produced-secret table's keys and kinds: for guards.test.ts only. */
+export const PRODUCED_SECRET_TABLE: Readonly<Record<string, readonly SecretKind[]>> = Object.freeze(
+  Object.fromEntries(Object.entries(PRODUCED_PLACES).map(([k, r]) => [k, Object.keys(r) as SecretKind[]])),
+);

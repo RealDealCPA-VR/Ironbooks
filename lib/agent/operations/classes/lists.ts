@@ -1,6 +1,9 @@
 /**
  * Agent full access: classification of the "lists" routes (classes/buckets.ts lists the segments).
  * One entry per route + method, keyed "METHOD /api/pattern". Checked by classes/lists.test.ts.
+ *
+ * `id` names an operation where the id rule (registry.ts operationIdFor) would give the neutral
+ * ".post", with a short verb: currencies.save (adds or updates), cleanup.run, items.bulk.save.
  */
 import type { ClassificationMap } from '../types';
 
@@ -60,7 +63,8 @@ export const LISTS_CLASSES: ClassificationMap = {
   },
   'PATCH /api/lists/[list]/[id]': {
     class: 'settings',
-    describe: 'Change entry {id} of the {list} list',
+    describe:
+      'Change entry {id} of the {list} list (on the sales tax codes list, making a code taxable or not re-flags every item and customer that uses it)',
     why: 'Set by the sales tax codes list, the only place tax codes are edited: it is sales tax setup (the service asks for the sales tax codes right, like PATCH /api/tax-rates/[id]), and a code made taxable or non-taxable re-flags every item and customer using it in the same request, which decides the tax on every sale entered afterwards. One class covers every list, so it is the stronger one; an edit of an ordinary entry (ship via, terms ...) would be "change". A renamed terms entry also renames the terms text on its vendors and customers.',
     sensitiveFields: ['accountNumber'],
   },
@@ -98,9 +102,10 @@ export const LISTS_CLASSES: ClassificationMap = {
   },
 
   // Currencies and exchange rates; FX gain/loss entries and Home Currency Adjustments.
-  'GET /api/currencies': { class: 'read', describe: 'List currencies and their exchange rates' },
+  'GET /api/currencies': { class: 'read', id: 'currencies.list', describe: 'List currencies and their exchange rates' },
   'POST /api/currencies': {
     class: 'settings',
+    id: 'currencies.save',
     describe: 'Add or update currency {code} at rate {rateToBase} (make it the home currency: {isBase})',
     why: 'Exchange-rate setup: the rate is the default every new document in that currency books at. isBase: true changes the home currency instead: every other rate is rebased onto it, and when the old home currency is the only other one listed it is taken off the list. Like sales tax rates, this is setup, not entry.',
   },
@@ -112,7 +117,8 @@ export const LISTS_CLASSES: ClassificationMap = {
   'GET /api/currencies/home-currency-adjustment': { class: 'read', describe: 'List home currency adjustments' },
   'POST /api/currencies/home-currency-adjustment': {
     class: 'settings',
-    describe: 'Post a home currency adjustment dated {date} at rates {rates}',
+    describe:
+      'Post a home currency adjustment dated {date} at rates {rates}, and save those rates as the currency list\'s default rates unless updateCurrencyList is false (updateCurrencyList: {updateCurrencyList})',
     why: 'Exchange-rate setup as well as an entry: unless updateCurrencyList is false it saves the rates sent to the currency list, the default every new foreign-currency document books at (what POST /api/currencies does, also "settings"). In the same request it posts one adjusting entry that permanently revalues every foreign-currency bank and card account at those rates (plus a next-day reversal for A/R, A/P and loans), and voids the exchange gain or loss entries of loan payments that were voided elsewhere. preview: true only computes it.',
     dryRun: 'preview',
   },
@@ -222,6 +228,7 @@ export const LISTS_CLASSES: ClassificationMap = {
   'GET /api/cleanup': { class: 'read', describe: 'Preview the unused inactive list entries Clean Up would delete' },
   'POST /api/cleanup': {
     class: 'remove',
+    id: 'cleanup.run',
     describe: 'Delete unused inactive list entries',
     why: 'Deletes many list entries for good in one request. ids limits it to entries picked from the preview (GET /api/cleanup); without ids every eligible entry of the named lists (all lists when none are named) is deleted.',
     countField: 'ids',
@@ -246,6 +253,7 @@ export const LISTS_CLASSES: ClassificationMap = {
   'GET /api/items/bulk': { class: 'read', describe: 'List items as Add/Edit Multiple rows' },
   'POST /api/items/bulk': {
     class: 'bulk',
+    id: 'items.bulk.save',
     describe: 'Add or change items in bulk',
     why: 'Add/Edit Multiple: one request saves every row (new items, edits of existing ones, opening stock posted to the ledger), all or nothing. dryRun: true only checks the rows.',
     countField: 'rows',

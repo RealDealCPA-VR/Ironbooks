@@ -50,10 +50,11 @@ describe('Simple mode menu', () => {
     expect((PREFERENCE_FIELDS as Record<string, unknown>).navMode).toBeTruthy();
   });
 
-  it('shows 15-21 everyday tasks (Registers included) grouped like the QuickBooks Home page', () => {
+  it('shows 15-22 everyday tasks (Registers included) grouped like the QuickBooks Home page', () => {
     const all = links(simpleNavGroups);
     expect(all.length).toBeGreaterThanOrEqual(15);
-    expect(all.length).toBeLessThanOrEqual(21);
+    // 22: Agent requests, which the sidebar shows only while the company has an agent.
+    expect(all.length).toBeLessThanOrEqual(22);
     const byGroup = Object.fromEntries(simpleNavGroups.map((g) => [g.heading, g.links.map((l) => l.label)]));
     expect(byGroup.Customers).toEqual(['Create Invoice', 'Receive Payment', 'Customers']);
     expect(byGroup.Vendors).toEqual(['Enter Bill', 'Pay Bills', 'Vendors']);

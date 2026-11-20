@@ -21,7 +21,7 @@
  * undoing a reconciliation go to a person for approval in Propose mode.
  */
 import { ToolError } from './protocol.mjs';
-import { camelize, shapeAnswer, shapeRecord } from './write-tools.mjs';
+import { camelize, settle, shapeRecord } from './write-tools.mjs';
 
 const DATE = { type: 'string', pattern: '^\\d{4}-\\d{2}-\\d{2}$', patternHint: 'must be a date as YYYY-MM-DD' };
 const ID = { type: 'string', pattern: '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$', patternHint: 'must be an id returned by another tool' };
@@ -40,14 +40,13 @@ function schema(properties, required = []) {
 }
 const readSchema = (properties, required = []) => ({ type: 'object', properties, required, additionalProperties: false });
 
-async function send(client, action, input, args) {
+/** Send one step. `fields`: the tool's own field names, so a warning can say which sends its confirmation. */
+async function send(client, action, input, args, fields) {
   if (args.dry_run !== true && !args.request_id) {
     throw new ToolError('Give a request_id (your own name for this one change), or set dry_run to true to only check it.');
   }
-  const answer = shapeAnswer(await client.act({ action, input, ...(args.dry_run === true ? { dryRun: true } : { requestId: args.request_id }) }));
-  // A step that only prepares work posts nothing: say so in its own words.
-  if (answer.outcome === 'done') answer.said = 'Done. Nothing was posted to the ledger.';
-  return answer;
+  // A step that only prepares work posts nothing: its answer ('done') says so in its own words.
+  return settle(await client.act({ action, input, ...(args.dry_run === true ? { dryRun: true } : { requestId: args.request_id }) }), { fields });
 }
 
 function tool({ name, title, description, action, properties, required, destructive = false }) {
@@ -60,7 +59,7 @@ function tool({ name, title, description, action, properties, required, destruct
     inputSchema: schema(properties, required),
     handler: (args, client) => {
       const { dry_run: _d, request_id: _r, ...rest } = args;
-      return send(client, action, camelize(rest), args);
+      return send(client, action, camelize(rest), args, Object.keys(properties));
     },
   };
 }
@@ -216,6 +215,7 @@ const WRITES = [
           ...(a.acknowledge_difference ? { acknowledgeDifference: true } : {}), ...(a.filename ? { filename: a.filename } : {}), rows: a.lines,
         },
         a,
+        ['acknowledge_difference'],
       ),
   },
   tool({

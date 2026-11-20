@@ -38,6 +38,10 @@ import format from '@/electron/companyFileFormat';
 import lockFormat from '@/electron/companyLock';
 import { closeDb, firstOpenWalPosition, getDb, holdDbOpen, isDbOpen, openDbDamage, resolveDataDir, withDamagedFileAccess, type DB } from '@/lib/db';
 import { sealedMode } from '@/lib/db/sealed';
+// From the scope module itself, not lib/context.ts: that one brings the whole request layer
+// (sessions, next/navigation, services), which a low-level service has no use for.
+import { outsideServiceScope } from '@/lib/serviceScope';
+import { outsideEffects } from '@/lib/effects';
 import { currentFingerprint } from './backupFingerprint';
 import { BACKUP_HISTORY_FILE } from './backupHistory';
 import { isRestoreInProgress, whenRestoreDone } from './restoreState';
@@ -844,14 +848,26 @@ export async function autosaveTick(now = Date.now()): Promise<'idle' | 'waiting'
   }
 }
 
-/** Start the autosave timer (once per process; no-op when the open file is a folder). */
+/**
+ * Start the autosave timer (once per process; no-op when the open file is a folder).
+ *
+ * The timer outlives the request that starts it (GET /api/company-file/status, a failed close),
+ * and async work carries the scope it was started in. It is started outside any agent scope and
+ * outside the effects outbox, so every later save is the app's own work, exactly as when a
+ * person's request starts it, and never counts as an agent's request long finished
+ * (lib/serviceScope.ts outsideServiceScope, lib/effects.ts outsideEffects).
+ */
 export function ensureAutosave(): void {
   const s = state();
   if (!s || s.timer || s.closed) return;
-  s.timer = setInterval(() => {
-    autosaveTick().catch((err) => console.warn('[company-file] autosave check failed:', err));
-  }, AUTOSAVE_TICK_MS);
-  s.timer.unref?.();
+  outsideServiceScope(() =>
+    outsideEffects(() => {
+      s.timer = setInterval(() => {
+        autosaveTick().catch((err) => console.warn('[company-file] autosave check failed:', err));
+      }, AUTOSAVE_TICK_MS);
+      s.timer.unref?.();
+    }),
+  );
 }
 
 /**

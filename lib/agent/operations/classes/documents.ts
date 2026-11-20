@@ -16,6 +16,18 @@
  *
  * Where one route does two things of different risk (an action field, an opt-in flag), the entry
  * takes the stricter class until the bridge can split it per request; the "why" says so.
+ *
+ * The cross-bucket rule for lookups (the same in company.ts for GET /api/network-policy): a GET that
+ * can look up a *.ts.net address in DNS or refresh the tailnet trust is 'outside', not 'read', even
+ * when that lookup is its only side effect and it happens only when such an address is set up. A
+ * name lookup leaves this computer and the trust it refreshes steers later outbound checks. Loading
+ * the AI settings (lib/services/aiSettings.ts loadSettings) does that lookup for every *.ts.net AI
+ * server, so every GET that loads them is 'outside' with no dry run (a rolled-back preview would
+ * still look the names up). A GET with another, lighter side effect too takes the stricter class.
+ *
+ * `id` names an operation where the id rule (registry.ts operationIdFor) would give the neutral
+ * ".post" or a word that misleads, with a short verb: POST /api/errors scans (errors.scan), it does
+ * not create an error; a door whose body names the action runs it (ai.bank-suggestions.run).
  */
 import type { ClassificationMap } from '../types';
 
@@ -75,9 +87,11 @@ export const DOCUMENTS_CLASSES: ClassificationMap = {
     amountField: 'total',
   },
   'GET /api/receipts/settings': {
-    class: 'read',
-    describe: 'Show receipt reading settings',
-    why: 'A read in normal running. It loads the AI settings (lib/services/aiSettings.ts loadSettings), which on a company file saved by an older version moves its saved AI keys once (a database write), and looks up *.ts.net addresses in DNS.',
+    class: 'outside',
+    describe: 'Show receipt reading settings (looks up any *.ts.net AI server address in DNS)',
+    why: 'Not a pure read. It loads the AI settings (lib/services/aiSettings.ts loadSettings), which looks up every *.ts.net AI server address in DNS and refreshes the tailnet trust later outbound checks rely on: the same rule as GET /api/network-policy, so it is "outside". On a company file saved by an older version it also moves the saved AI keys once (a database write). A rolled-back preview would still make the lookups, so there is no dry run.',
+    effects: ['network'],
+    dryRun: 'none',
   },
   'PUT /api/receipts/settings': {
     class: 'settings',
@@ -227,12 +241,15 @@ export const DOCUMENTS_CLASSES: ClassificationMap = {
     why: 'Sends the question, and the report figures the assistant reads, to the company\'s AI (a cloud AI when the company allows it). It may also save proposed entries for approval. The answer is JSON, but with ?stream=1 it is a stream of JSON lines (application/x-ndjson), so the output kind depends on the request.',
   },
   'GET /api/ai/bank-suggestions': {
-    class: 'prepare',
-    describe: 'Suggest accounts for the bank feed lines of {bankAccountId}',
-    why: 'Brings the learned categorizer up to date first, which saves its model (derived data, never the ledger). A read must not write at all.',
+    class: 'outside',
+    describe: 'Suggest accounts for the bank feed lines of {bankAccountId} from the learned model (looks up any *.ts.net AI server address in DNS)',
+    why: 'Sends no bank line anywhere: the suggestions come from the learned model on this computer. But it loads the AI settings (lib/services/aiSettings.ts loadSettings), which looks up every *.ts.net AI server address in DNS and refreshes the tailnet trust, so by the rule in this file\'s header it is "outside" (stricter than the "prepare" its other write would need: it brings the learned categorizer up to date first, which saves its model, derived data, never the ledger). A rolled-back preview would still make the lookups, so there is no dry run.',
+    effects: ['network'],
+    dryRun: 'none',
   },
   'POST /api/ai/bank-suggestions': {
     class: 'outside',
+    id: 'ai.bank-suggestions.run',
     describe: 'Bank feed AI: {action} (auto-apply posts every feed line of account {bankAccountId} the learned model is sure of; llm sends feed line {bankTransactionId} to the AI)',
     effects: ['network'],
     dryRun: 'none',
@@ -241,6 +258,7 @@ export const DOCUMENTS_CLASSES: ClassificationMap = {
   'GET /api/ai/categorizer': { class: 'read', describe: 'Show the learned categorizer status' },
   'POST /api/ai/categorizer': {
     class: 'prepare',
+    id: 'ai.categorizer.retrain',
     describe: 'Retrain the learned categorizer',
     why: 'Rebuilds the learned model from the books (derived data); nothing in the ledger changes.',
   },
@@ -252,6 +270,7 @@ export const DOCUMENTS_CLASSES: ClassificationMap = {
   },
   'POST /api/ai/chatgpt': {
     class: 'outside',
+    id: 'ai.chatgpt.sign-in',
     describe: 'ChatGPT sign-in: {action}',
     availability: 'person_only',
     effects: ['network'],
@@ -261,6 +280,7 @@ export const DOCUMENTS_CLASSES: ClassificationMap = {
   'GET /api/ai/posts': { class: 'read', describe: 'List what the AI posted' },
   'POST /api/ai/posts': {
     class: 'change',
+    id: 'ai.posts.undo',
     describe: 'Undo AI post {id}',
     why: 'Undo is Bank Review\'s Unmatch: it voids the entry the AI posted.',
   },
@@ -289,20 +309,30 @@ export const DOCUMENTS_CLASSES: ClassificationMap = {
   'GET /api/ai/recurring': { class: 'read', describe: 'List suggested recurring bills and expenses' },
   'POST /api/ai/recurring': {
     class: 'enter',
-    describe: 'Memorize {docType} {sourceDocId} as recurring {frequency}',
+    id: 'ai.recurring.memorize',
+    describe:
+      'Memorize {docType} {sourceDocId} as recurring {frequency} from {nextRunDate}; enter automatically: {autoEnter} (true posts it on its own schedule with nobody reviewing it; otherwise only a reminder)',
+    why: 'Makes a memorized transaction (lib/services/aiRecurring.ts memorizeSuggestion). With autoEnter: true it is set to post on its own schedule, standing automation like a bank rule set to "Add automatically", so making one always asks; without it the template only reminds.',
     alwaysAsk: true,
   },
   'GET /api/ai/settings': {
-    class: 'read',
-    describe: 'Show AI settings',
-    why: 'A read in normal running. lib/services/aiSettings.ts loadSettings moves saved AI keys once on a company file saved by an older version (a database write) and looks up *.ts.net addresses in DNS.',
+    class: 'outside',
+    describe: 'Show AI settings (looks up any *.ts.net AI server address in DNS)',
+    why: 'Not a pure read. lib/services/aiSettings.ts loadSettings looks up every *.ts.net AI server address in DNS and refreshes the tailnet trust later outbound checks rely on: the same rule as GET /api/network-policy, so it is "outside". On a company file saved by an older version it also moves the saved AI keys once (a database write). A rolled-back preview would still make the lookups, so there is no dry run.',
+    effects: ['network'],
+    dryRun: 'none',
   },
   'PUT /api/ai/settings': {
     class: 'settings',
-    describe: 'Change AI settings',
+    // The card line is cut at 200 characters (lib/agent/describe.ts) and a placeholder cannot name
+    // a list's items, so the AI servers, their addresses and the cloud-or-local choice per task
+    // (providers, taskPolicies) are named as changing and shown by the preview, whose record diff
+    // lists them old and new (the ai_settings audit row). A "(label: )" left empty is removed.
+    describe:
+      'Change AI settings: AI servers, addresses, cloud use per task (see preview) (cloud AI on: {cloudEnabled}) (cloud calls a day: {cloudDailyCap}) (bank auto-post: {autoApplyEnabled}) (confidence: {autoApplyThreshold}) (AI suggestions: {llmSuggestEnabled})',
     hostOnly: true,
     sensitiveFields: ['providers.*.apiKey'],
-    why: 'Company AI settings. Adding an AI, changing its address or turning cloud AI on is refused away from the computer that holds the company file; turning cloud AI on also changes Privacy & Network. providers[].apiKey is a typed secret, but there is no secret kind for an AI key yet, so it is only masked here: an agent should not be the one sending it.',
+    why: 'Company AI settings. A save can point an AI at a new server address, add one, or send a task (bank line suggestions, the assistant, error correction) to cloud AI while the cloud switch stays as it was; the preview shows each AI server and each task\'s choice before and after. Adding an AI, changing its address or turning cloud AI on is refused away from the computer that holds the company file. Turning cloud AI on also opens Privacy & Network to cloud AI. bank auto-post is "post bank lines automatically" at that confidence. providers[].apiKey is a typed secret, but there is no secret kind for an AI key yet, so it is only masked here: an agent should not be the one sending it.',
   },
   'GET /api/ai/tailnet': {
     class: 'outside',
@@ -326,6 +356,8 @@ export const DOCUMENTS_CLASSES: ClassificationMap = {
   'GET /api/errors': { class: 'read', describe: 'List possible bookkeeping errors found' },
   'POST /api/errors': {
     class: 'prepare',
+    // The id rule gives "errors.create", but nothing is created by hand: it runs the scan.
+    id: 'errors.scan',
     describe: 'Scan the books for possible errors',
     body: 'none',
     why: 'Saves the new findings to the list of possible errors; nothing in the books changes.',
@@ -388,6 +420,7 @@ export const DOCUMENTS_CLASSES: ClassificationMap = {
   'GET /api/import/rebuild': { class: 'read', describe: 'Preview Rebuild Data {action}' },
   'POST /api/import/rebuild': {
     class: 'file',
+    id: 'import.rebuild.run',
     describe: 'Run Rebuild Data {action}',
     why: 'A file utility (Rebuild Data) that rewrites saved balances across the books; Owner or Admin only, with nobody else working in the company. GET /api/import/rebuild is its preview. The action "orphaned_audit_refs" deletes audit trail rows, which is on the hard floor: the bridge must refuse that action for agents.',
   },
@@ -401,6 +434,7 @@ export const DOCUMENTS_CLASSES: ClassificationMap = {
   'GET /api/qb-import/gl': { class: 'read', describe: 'List past QuickBooks general ledger imports' },
   'POST /api/qb-import/gl': {
     class: 'file',
+    id: 'qb-import.gl.run',
     describe: 'QuickBooks general ledger import: {action}',
     dryRun: 'preview',
     confirmFlags: ['acceptVariance', 'acceptExistingEntries'],
@@ -409,6 +443,7 @@ export const DOCUMENTS_CLASSES: ClassificationMap = {
   'GET /api/qb-import/open-items': { class: 'read', describe: 'Compare A/R and A/P with their aging' },
   'POST /api/qb-import/open-items': {
     class: 'file',
+    id: 'qb-import.open-items.run',
     describe: 'QuickBooks open invoices and bills: {action}',
     dryRun: 'preview',
     why: 'QuickBooks cutover: action "import" creates the open invoices, credit memos, bills and vendor credits. Action "preview" is its own preview and saves nothing.',

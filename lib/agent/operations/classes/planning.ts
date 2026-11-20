@@ -1,14 +1,27 @@
 /**
  * Agent full access: classification of the "planning" routes (classes/buckets.ts lists the segments).
  * One entry per route + method, keyed "METHOD /api/pattern". Checked by classes/planning.test.ts.
+ *
+ * Sales tax items are 'settings' while payroll items stay 'change' with alwaysAsk (payroll.ts): a
+ * sales tax item's rate is what every later sale charges, while a payroll item's rate is not what
+ * paychecks use (the tax tables and state settings are, and those are 'settings' too). What a
+ * payroll item does steer (tax tracking, pre-tax treatment, posting accounts) is asked every time.
+ *
+ * `id` names an operation where the id rule (registry.ts operationIdFor) would give the neutral
+ * ".post" or a word that misleads: GET /api/sales-tax/pay only shows what is due (sales-tax.due),
+ * its POST writes the Sales Tax Payment checks (sales-tax.payments.create, beside the list of those
+ * checks, sales-tax.payments). The POST never takes "sales-tax.pay": that was the GET's id before,
+ * and an id that once named a read must never come to name a payment (a stored request or grant
+ * under the old id would then point at the payment).
  */
 import type { ClassificationMap } from '../types';
 
 export const PLANNING_CLASSES: ClassificationMap = {
   // Sales tax agencies: who the tax is paid to. Adding one is sales tax setup (plan section 8).
-  'GET /api/tax-agencies': { class: 'read', describe: 'List sales tax agencies' },
+  'GET /api/tax-agencies': { class: 'read', id: 'tax-agencies.list', describe: 'List sales tax agencies' },
   'POST /api/tax-agencies': {
     class: 'settings',
+    id: 'tax-agencies.create',
     describe: 'Add sales tax agency {name}',
     why: 'Sales tax setup: the agency is what sales tax items report to and what Pay Sales Tax pays (plan section 8 puts agencies under settings).',
   },
@@ -33,11 +46,12 @@ export const PLANNING_CLASSES: ClassificationMap = {
   },
 
   // Pay Sales Tax and the Sales Tax Payment checks it writes.
-  'GET /api/sales-tax/pay': { class: 'read', describe: 'Show the sales tax due to each agency' },
+  'GET /api/sales-tax/pay': { class: 'read', id: 'sales-tax.due', describe: 'Show the sales tax due to each agency' },
   // A check's memo defaults to "Acct # <the agency vendor's account number>" in full, which the
   // vendor screens mask; sensitiveFields keeps it out of previews, stored requests and logs.
   'POST /api/sales-tax/pay': {
     class: 'enter',
+    id: 'sales-tax.payments.create',
     describe: 'Pay {total} of sales tax to the agencies picked, from account {paymentAccountId} on {date}',
     why: 'Writes one Sales Tax Payment check per agency picked, in one transaction, and adds and links a vendor for an agency that has none yet. Kept as entry, not bulk: it is one payment run on one screen (plan section 8: enter (pay)). The amount is the answer\'s total (the sum of payments[].amount), so until the preview has run it counts as over any limit.',
     confirmFlags: ['allowDuplicateNumber'],
