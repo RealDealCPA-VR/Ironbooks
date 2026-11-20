@@ -14,6 +14,11 @@
  *
  * Without any eligible model the assistant still works in an offline, keyword-driven mode
  * that runs the same tools and formats their results deterministically.
+ *
+ * "How do I…?" / "Where do I…?" questions are answered from the product knowledge base
+ * (lib/kb): the help_search tool returns the matching how-to articles and screens, and the
+ * reply carries `links` into the app. Any link a model writes that is not a real screen this
+ * person may open is turned back into plain text, so an answer never points at a dead page.
  */
 import { and, desc, eq, gte, ilike, inArray, lte, or, sql } from 'drizzle-orm';
 import { z } from 'zod';
@@ -31,6 +36,8 @@ import { buildRouter, type BuildRouterOptions } from './aiSettings';
 import { companyToday } from './preferences';
 import { AiError } from '@/lib/ai/types';
 import { canRef, type AccessRef } from '@/lib/permissions/model';
+import { pageAccessFor } from '@/lib/permissions/routes';
+import { KB_CONFIDENT, basePath, isKnownRoute, linksOf, looksLikeHowTo, searchKb, type KbLink } from '@/lib/kb';
 import { requirePermission } from './access';
 
 // ---------------------------------------------------------------------------
@@ -62,14 +69,24 @@ interface ToolDef {
    * route): A/R aging is Reports — Customers & Sales, A/P aging Reports — Vendors & Purchases, the
    * rest Reports — Financial. The assistant route only checks Reports — Financial.
    * prefsperms: the report's own activity (Company & Financial, Customers & Receivables, …).
+   * Omitted for help_search: the product guide holds no company data.
    */
-  area: AccessRef;
+  area?: AccessRef;
   args: z.ZodType<Record<string, unknown>, z.ZodTypeDef, unknown>;
   argsHelp: string;
   run(ctx: ServiceContext, args: Record<string, unknown>): Promise<unknown>;
 }
 
 export const TOOLS: Record<string, ToolDef> = {
+  help_search: {
+    description:
+      'Search the built-in Ironbooks guide for HOW or WHERE to do something in the app, or what a term means. Returns step-by-step guides, the screens to open (as in-app links) and glossary terms. It has no company data.',
+    argsHelp: '{"query": "what the person wants to do, in plain words"}',
+    args: z.object({ query: z.string().trim().min(1).max(300) }),
+    async run(ctx, a) {
+      return helpLookup(ctx, a.query as string);
+    },
+  },
   profit_and_loss: {
     area: 'reports_financial.company',
     description: 'Profit & Loss (income, expenses, net income) for a date range.',
@@ -316,10 +333,134 @@ export async function runTool(ctx: ServiceContext, name: string, rawArgs: unknow
   const tool = TOOLS[name];
   if (!tool) throw validation(`Unknown tool "${name}".`);
   // Same right as the report itself (e.g. A/R aging needs Reports — Customers & Sales).
-  requirePermission(ctx, tool.area, 'view');
+  if (tool.area) requirePermission(ctx, tool.area, 'view');
   const parsed = tool.args.safeParse(rawArgs ?? {});
   if (!parsed.success) throw validation(`Invalid arguments for ${name}: ${parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ')}`);
   return tool.run(ctx, parsed.data);
+}
+
+// ---------------------------------------------------------------------------
+// Product help (lib/kb)
+// ---------------------------------------------------------------------------
+
+/** May this person open the page? Same rule as the menus (lib/permissions/pageAccess.ts). */
+export function canOpenPage(ctx: Pick<ServiceContext, 'access'>, path: string): boolean {
+  if (!ctx.access) return true;
+  const need = pageAccessFor(basePath(path));
+  if (!need) return true;
+  const refs: AccessRef[] = need.activities?.length ? need.activities : need.areas;
+  return refs.length === 0 || refs.some((r) => canRef(ctx.access, r, 'view'));
+}
+
+const mdLink = (l: KbLink) => `[${l.label}](${l.href})`;
+
+export interface HelpResult {
+  /** How-to guides, best first. `score` 100+ = the question itself; 60+ = a confident match. */
+  guides: { id: string; title: string; answer: string; steps: string[]; open?: string; notes?: string[]; score: number; links: KbLink[] }[];
+  /** Screens whose name matches, as in-app links. */
+  screens: { name: string; link: string; menu: string | null; about?: string }[];
+  terms: { term: string; meaning: string; link: string }[];
+}
+
+/**
+ * Look a question up in the product guide. Links to pages this person's role may not open are
+ * left out (the step's words stay), so the answer only offers places they can actually go.
+ */
+export function helpLookup(ctx: Pick<ServiceContext, 'access'>, query: string): HelpResult {
+  const canOpen = (path: string) => canOpenPage(ctx, path);
+  const r = searchKb(query, { canOpen });
+  return {
+    guides: r.articles.map(({ article: a, score }) => {
+      const open = a.go && canOpen(a.go.href) ? a.go : undefined;
+      return {
+        id: a.id,
+        title: a.title,
+        answer: a.summary,
+        steps: a.steps.map((s, i) => `${i + 1}. ${s.text}${s.link && canOpen(s.link.href) ? ` ${mdLink(s.link)}` : ''}`),
+        ...(open ? { open: mdLink(open) } : {}),
+        ...(a.notes?.length ? { notes: a.notes } : {}),
+        score,
+        links: linksOf(a).filter((l) => canOpen(l.href)),
+      };
+    }),
+    screens: r.screens.map((s) => ({ name: s.label, link: mdLink({ label: s.label, href: s.href }), menu: s.menu, ...(s.what ? { about: s.what } : {}) })),
+    terms: r.terms.map((t) => ({ term: t.term, meaning: t.short, link: mdLink({ label: 'Glossary', href: t.href }) })),
+  };
+}
+
+const MD_LINK = /\[([^\]\n]{1,80})\]\((\/[^)\s]*)\)/g;
+
+/**
+ * Keep only in-app links that are real screens this person may open; any other `[label](/path)`
+ * a model wrote becomes its plain label.
+ */
+export function keepKnownLinks(answer: string, canOpen: (path: string) => boolean): string {
+  return answer.replace(MD_LINK, (whole, label: string, href: string) => (isKnownRoute(href) && canOpen(href) ? whole : label));
+}
+
+/**
+ * The "take me there" links for a reply: the links the answer itself uses, then screens it names,
+ * and — when it names none — where the best-matching guide sends you. At most four.
+ */
+export function replyLinks(answer: string, help: HelpResult[]): KbLink[] {
+  const out: KbLink[] = [];
+  const push = (l: KbLink) => {
+    if (out.length < 4 && !out.some((x) => x.href === l.href)) out.push(l);
+  };
+  for (const m of answer.matchAll(MD_LINK)) push({ label: m[1], href: m[2] });
+  const fromMd = (md: string): KbLink | null => {
+    const m = /^\[([^\]]+)\]\(([^)]+)\)$/.exec(md);
+    return m ? { label: m[1], href: m[2] } : null;
+  };
+  const candidates: KbLink[] = help.flatMap((h) => [
+    ...h.guides.flatMap((g) => g.links),
+    ...h.screens.map((s) => fromMd(s.link)).filter((l): l is KbLink => l !== null),
+  ]);
+  const lower = answer.toLowerCase();
+  for (const l of candidates) if (l.label.length >= 4 && lower.includes(l.label.toLowerCase())) push(l);
+  if (out.length === 0) {
+    const top = help.flatMap((h) => h.guides).sort((a, b) => b.score - a.score)[0];
+    if (top && top.score >= KB_CONFIDENT) top.links.slice(0, 3).forEach(push);
+  }
+  return out;
+}
+
+/** Numbers that appear in guide text ("0.00", "30"), so they are not flagged as unverified. */
+function helpNumbers(help: HelpResult[]): string[] {
+  return help.length ? [...JSON.stringify(help).matchAll(/\d[\d,]*(?:\.\d+)?/g)].map((m) => m[0]) : [];
+}
+
+/**
+ * A guide lookup written out as the answer (no model needed): the best guide when it scores at
+ * least `minScore`, else a glossary term, else (only when `orScreens`) the screens that match.
+ * Null when the guide has nothing to offer.
+ */
+function helpAnswer(help: HelpResult, minScore: number, orScreens: boolean): string | null {
+  const g = help.guides[0];
+  if (g && g.score >= minScore) {
+    const more = help.guides.slice(1).filter((x) => x.score >= KB_CONFIDENT).map((x) => x.title);
+    return [
+      g.title,
+      g.answer,
+      '',
+      ...g.steps,
+      ...(g.notes?.length ? ['', ...g.notes.map((n) => `Good to know: ${n}`)] : []),
+      ...(more.length ? ['', `Related: ${more.join(' · ')}`] : []),
+      '',
+      '[help_search]',
+    ].join('\n');
+  }
+  if (help.terms.length) {
+    return help.terms.map((t) => `${t.term}: ${t.meaning} ${t.link}`).join('\n\n') + '\n\n[help_search]';
+  }
+  if (orScreens && help.screens.length) {
+    return (
+      'I do not have a step-by-step guide for that, but these screens look right:\n' +
+      help.screens.map((s) => `- ${s.link}${s.about ? `: ${s.about}` : ''}`).join('\n') +
+      '\n\n[help_search]'
+    );
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1111,6 +1252,8 @@ export interface AssistantReply {
   proposals: ProposalView[];
   /** Money figures in the answer that do not appear in any tool result. */
   unverifiedNumbers: string[];
+  /** Screens the answer sends the person to (real pages their role may open), at most four. */
+  links: KbLink[];
   mode: 'llm' | 'offline';
   providerId?: string;
   redacted?: boolean;
@@ -1147,12 +1290,14 @@ const stepJsonSchema = {
 function systemPrompt(today: string, ctx: Pick<ServiceContext, 'access'>): string {
   // Only the tools this person may use (the others would only answer "no permission").
   const tools = Object.entries(TOOLS)
-    .filter(([, t]) => !ctx.access || canRef(ctx.access, t.area, 'view'))
+    .filter(([, t]) => !t.area || !ctx.access || canRef(ctx.access, t.area, 'view'))
     .map(([name, t]) => `- ${name}: ${t.description} Args: ${t.argsHelp}`)
     .join('\n');
   return `You are the bookkeeping assistant inside Ironbooks, a double-entry accounting app. Today is ${today}.
 
-You answer questions about THIS company's books using ONLY these read-only tools (computed locally from the ledger):
+You answer two kinds of question, using ONLY these read-only tools:
+- about THIS company's books (the report tools, computed locally from the ledger);
+- about HOW or WHERE to do something in Ironbooks, or what a term means (help_search, the built-in guide).
 ${tools}
 
 Protocol — every reply is ONE JSON object, nothing else:
@@ -1163,6 +1308,8 @@ After each tool call you receive a message starting with TOOL_RESULT.
 Rules:
 - Never invent or estimate numbers. Every figure in your answer must appear in a TOOL_RESULT; cite the tool in brackets, e.g. "Net income was $4,210.00 [profit_and_loss]".
 - If the tools cannot answer, say so.
+- HOW-TO questions ("how do I…", "where do I…", "can I…", "what does … mean"): use help_search (a HELP_GUIDE block may already be attached to the question — then do not call it again). Answer from the guide only: short numbered steps in the guide's own words, and copy its in-app links exactly as written, e.g. [Reconcile](/reconcile). Never invent a link, a menu or a button name; if the guide does not cover it, say so and suggest the closest screen it returned. End with [help_search].
+- A question can need both: e.g. "why is my bank balance off?" — give the figure from a report tool, then the guide's steps to fix it.
 - You cannot change any data. If the user asks you to record something (e.g. a journal entry), call list_accounts first, then answer with an explanation AND a "proposal" field:
   {"action":"answer","answer":"...","proposal":{"type":"journal_entry","date":"YYYY-MM-DD","description":"...","lines":[{"accountCode":"6000","debit":"100.00"},{"accountCode":"1000","credit":"100.00"}]}}
 - To record a VENDOR BILL (money owed to a vendor, paid later), propose a bill instead of a journal entry — the vendor's name exactly as the user gave it, expense account codes from list_accounts, positive amounts:
@@ -1229,12 +1376,23 @@ export async function ask(
     return { ...reply, notice: router.unavailableReason('assistant') ?? undefined };
   }
 
+  const toolCalls: ToolCallRecord[] = [];
+  // A how-to question gets the guide's answer attached up front, so even a small local model
+  // that would not think to call help_search answers from the guide (and with real links).
+  let attached = '';
+  if (looksLikeHowTo(question)) {
+    const help = helpLookup(ctx, question);
+    if (help.guides.length || help.screens.length || help.terms.length) {
+      opts.onStep?.({ tool: 'help_search', args: { query: question } });
+      toolCalls.push({ tool: 'help_search', args: { query: question }, result: help });
+      attached = `\n\nHELP_GUIDE (from Ironbooks' built-in guide; use it if this is a how-to question): ${JSON.stringify(help)}`;
+    }
+  }
   const convo = [
     { role: 'system' as const, content: systemPrompt(today, ctx) },
     ...history.slice(-10).map((t) => ({ role: t.role, content: t.content.slice(0, 4000) })),
-    { role: 'user' as const, content: question },
+    { role: 'user' as const, content: question + attached },
   ];
-  const toolCalls: ToolCallRecord[] = [];
   let providerId: string | undefined;
   let redacted = false;
 
@@ -1266,7 +1424,7 @@ export async function ask(
         continue;
       }
 
-      let answer = (s.answer ?? '').trim();
+      let answer = keepKnownLinks((s.answer ?? '').trim(), (p) => canOpenPage(ctx, p));
       const proposals: ProposalView[] = [];
       if (s.proposal !== undefined && s.proposal !== null && ctx.role === 'viewer') {
         answer += '\n\n(Your role is view-only, so the proposed entry was not saved for approval.)';
@@ -1278,11 +1436,13 @@ export async function ask(
         }
       }
       const results = toolCalls.map((c) => c.result).filter((r) => r !== undefined);
+      const help = toolCalls.filter((c) => c.tool === 'help_search' && c.result).map((c) => c.result as HelpResult);
       return {
         answer,
         toolCalls,
         proposals,
-        unverifiedNumbers: findUnverifiedNumbers(answer, results, [proposals.map((p) => p.payload), question]),
+        unverifiedNumbers: findUnverifiedNumbers(answer, results, [proposals.map((p) => p.payload), question, helpNumbers(help)]),
+        links: replyLinks(answer, help),
         mode: 'llm',
         providerId,
         redacted,
@@ -1338,7 +1498,7 @@ async function offlineAnswer(ctx: ServiceContext, q: string, today: Date): Promi
   } catch (err) {
     // A question about a report this member may not open: say so instead of failing the request.
     if (err instanceof ServiceError && err.code === 'FORBIDDEN') {
-      return { answer: err.message, toolCalls: [], proposals: [], unverifiedNumbers: [], mode: 'offline' };
+      return { answer: err.message, toolCalls: [], proposals: [], unverifiedNumbers: [], links: [], mode: 'offline' };
     }
     throw err;
   }
@@ -1354,6 +1514,25 @@ async function offlineAnswerInner(ctx: ServiceContext, q: string, today: Date): 
   };
   const fc = (v: string) => formatCurrency(v);
   let answer: string;
+
+  // "How do I…?" / "Where do I…?": the built-in guide answers, with links into the app.
+  const helpReply = (minScore: number, orScreens: boolean): AssistantReply | null => {
+    const help = helpLookup(ctx, q);
+    const text = helpAnswer(help, minScore, orScreens);
+    if (!text) return null;
+    return {
+      answer: text,
+      toolCalls: [{ tool: 'help_search', args: { query: q }, result: help }],
+      proposals: [],
+      unverifiedNumbers: [],
+      links: replyLinks(text, [help]),
+      mode: 'offline',
+    };
+  };
+  if (looksLikeHowTo(q)) {
+    const reply = helpReply(KB_CONFIDENT, false);
+    if (reply) return reply;
+  }
 
   if (/cash ?flow|statement of cash/.test(t)) {
     const p = periodFromText(t, today);
@@ -1385,14 +1564,14 @@ async function offlineAnswerInner(ctx: ServiceContext, q: string, today: Date): 
     const r = (await call('ar_aging', {})) as { customers: { name: string; total: string }[]; totals: { total: string; current: string } };
     const top = r.customers.slice(0, 5).map((c) => `${c.name} ${fc(c.total)}`).join(', ');
     answer = `Customers owe ${fc(r.totals.total)} in total (${fc(r.totals.current)} not yet due) [ar_aging].${top ? ` Largest balances: ${top}.` : ''}`;
-  } else if (/payable|\bap\b|we owe|bills (due|outstanding)|unpaid bills/.test(t)) {
+  } else if (/payable|\bap\b|we owe|bills (due|outstanding)|unpaid bills|overdue bills|bills? (are |that are |is )?(overdue|past due|late)/.test(t)) {
     const r = (await call('ap_aging', {})) as { vendors: { name: string; total: string }[]; totals: { total: string; current: string } };
     const top = r.vendors.slice(0, 5).map((c) => `${c.name} ${fc(c.total)}`).join(', ');
     answer = `You owe vendors ${fc(r.totals.total)} in total (${fc(r.totals.current)} not yet due) [ap_aging].${top ? ` Largest: ${top}.` : ''}`;
   } else if (/balance sheet|assets|liabilit|equity|net worth/.test(t)) {
     const r = (await call('balance_sheet', { asOf: iso(today) })) as { totalAssets: string; totalLiabilities: string; totalEquity: string };
     answer = `As of ${iso(today)}: total assets ${fc(r.totalAssets)}, total liabilities ${fc(r.totalLiabilities)}, total equity ${fc(r.totalEquity)} [balance_sheet].`;
-  } else if (/profit|loss|p&l|p ?and ?l|net income|revenue|income|sales|expenses|spend/.test(t)) {
+  } else if (/profit|loss|p&l|p ?and ?l|net income|revenue|income|sales|expenses|spend|how (did|are|is) (we|i|the business|business) (do|doing)/.test(t)) {
     const p = periodFromText(t, today);
     const r = (await call('profit_and_loss', { from: p.from, to: p.to })) as {
       totalIncome: string; totalExpenses: string; netIncome: string; expenses: { name: string; amount: string }[];
@@ -1413,13 +1592,18 @@ async function offlineAnswerInner(ctx: ServiceContext, q: string, today: Date): 
     const r = (await call('search_transactions', { query: words.slice(0, 3).join(' ') || undefined, limit: 10 })) as {
       entries: { entryNumber: number; date: string; description: string; lines: { debit: string | null }[] }[];
     };
+    if (!r.entries.length) {
+      // Nothing in the books matches: it may have been a question about the app itself.
+      const reply = helpReply(KB_CONFIDENT, true);
+      if (reply) return reply;
+    }
     answer = r.entries.length
       ? `Found ${r.entries.length} matching transaction(s) [search_transactions]: ` +
         r.entries
           .slice(0, 10)
           .map((e) => `#${e.entryNumber} ${e.date} ${e.description} (${fc(toAmountString(Money.add(...e.lines.map((l) => l.debit))))})`)
           .join('; ') + '.'
-      : 'I could not find matching transactions. Try asking about profit & loss, balance sheet, receivables, payables, or cash balances.';
+      : 'I could not find matching transactions. Try asking about profit & loss, balance sheet, receivables, payables, or cash balances — or how to do something, such as "How do I reconcile?".';
   }
-  return { answer, toolCalls, proposals: [], unverifiedNumbers: [], mode: 'offline' };
+  return { answer, toolCalls, proposals: [], unverifiedNumbers: [], links: [], mode: 'offline' };
 }

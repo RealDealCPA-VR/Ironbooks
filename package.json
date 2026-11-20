@@ -24,6 +24,7 @@
     "test:e2e:multiuser": "node --experimental-websocket scripts/e2e-multiuser.mjs",
     "test:crawl": "node scripts/crawl.mjs",
     "typecheck": "tsc --noEmit",
+    "docs": "tsx scripts/gen-docs.ts",
     "electron:dev": "electron .",
     "desktop": "concurrently -k -s first -n NEXT,APP -c blue,green \"next dev\" \"wait-on tcp:127.0.0.1:3000 && electron .\"",
     "make-dev-shortcut": "powershell -ExecutionPolicy Bypass -File scripts/make-dev-shortcut.ps1",

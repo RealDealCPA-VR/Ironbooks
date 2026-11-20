@@ -308,7 +308,7 @@ export function linkHref(l: NavLink): string {
 }
 
 /** `qb` notes that are not a screen name QuickBooks shows in its menus. */
-const QB_NOT_A_MENU_NAME = new Set([
+export const QB_NOT_A_MENU_NAME = new Set([
   'Lists menu',
   'Company Snapshot alerts',
   'AI settings',
