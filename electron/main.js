@@ -255,8 +255,14 @@ async function clearLaunchPassCookie() {
 }
 
 // --- single instance lock ---
-if (!app.requestSingleInstanceLock()) {
-  app.quit();
+// A second launch has already handed its command line (a file to open) to the running app through
+// 'second-instance' by the time the lock is refused. It must then leave at once: app.quit() let it
+// carry on — whenReady still ran createWindow() while it quit (an "Ironbooks could not start" box
+// next to the open window) and before-quit ran the quit-time backup and company-file close. app.exit
+// skips before-quit; the checks of gotSingleInstanceLock below keep startup work out even so.
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.exit(0);
 }
 
 // ---------------------------------------------------------------------------
@@ -521,6 +527,7 @@ function saveConfig(patch) {
 const knownFiles = require('./knownFiles');
 
 function noteFilesKnownBeforeApprovals() {
+  if (!gotSingleInstanceLock) return; // a second launch: the running app owns config.json
   let cfg = {};
   try {
     if (fs.existsSync(configPath())) cfg = JSON.parse(fs.readFileSync(configPath(), 'utf8'));
@@ -4043,6 +4050,7 @@ ipcMain.handle('app:quitAndInstall', async (e) => {
 });
 
 app.whenReady().then(async () => {
+  if (!gotSingleInstanceLock) return; // a second launch (see the lock)
   // Before any window exists: navigation/new-window guards, renderer request filter, no
   // permission prompts, no spellcheck downloads (electron/security.js).
   security.install({
@@ -4084,6 +4092,8 @@ app.on('before-quit', (event) => {
   // company file into itself and release its lock, then re-enter quit with the flag set. Data
   // safety: a rotating local auto-backup means a bad restore / disk hiccup never costs more than
   // one session, and the company file on the server is complete when the app is gone.
+  // A second launch (no single-instance lock) has no company file open and no servers to stop.
+  if (!gotSingleInstanceLock) return;
   if (!quittingAfterBackup) {
     event.preventDefault();
     // A quit request while the save is running: that save finishes the quit (a relaunch or next
