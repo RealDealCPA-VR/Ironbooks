@@ -89,7 +89,10 @@ export function appStartCommand(env = process.env, facts = {}) {
   return { command: facts.execPath ?? process.execPath, args: [START_FLAG] };
 }
 
-/** The environment Ironbooks is started with: this one, without the connector's own settings. */
+/**
+ * The environment Ironbooks is started with: this one, without the connector's own settings.
+ * @param {Record<string, string | undefined>} [env]
+ */
 export function appStartEnv(env = process.env) {
   const out = { ...env };
   for (const k of ['ELECTRON_RUN_AS_NODE', TOKEN_ENV, TOKEN_FILE_ENV, START_ENV, ENDPOINT_DIR_ENV]) delete out[k];
