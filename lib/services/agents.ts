@@ -35,6 +35,7 @@ import { endpointPublished, personSignedIn, publishEndpoint, withdrawEndpoint } 
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
 import { definitionsFor, listRoleDefinitions } from './access';
 import { SIMPLE_LIST_KEYS, ensureSeeded } from './lists/simpleLists';
+import { getFileLockStatus } from './fileLock';
 
 export { AGENT_MODES, type AgentMode };
 
@@ -59,12 +60,16 @@ export interface AgentView {
   lastUsedAt: string | null;
   revokedAt: string | null;
   status: 'active' | 'revoked';
+  /** May work while nobody is signed in (never in a file with passwords or a file password). */
+  unattended: boolean;
 }
 
 export interface CreateAgentInput {
   name: string;
   roleKeys: string[];
   mode: AgentMode;
+  /** May work while Ironbooks has the file open but nobody is signed in. Off unless asked for. */
+  unattended?: boolean;
 }
 
 type AgentRow = typeof agents.$inferSelect;
@@ -138,6 +143,7 @@ function toView(row: AgentRow, roleNames: Map<string, string>, createdByName: st
     lastUsedAt: lastUsed ? lastUsed.toISOString() : null,
     revokedAt: row.revokedAt ? row.revokedAt.toISOString() : null,
     status: row.revokedAt ? 'revoked' : 'active',
+    unattended: row.unattended === true,
   };
 }
 
@@ -188,13 +194,14 @@ export async function createAgent(ctx: ServiceContext, input: CreateAgentInput):
         tokenPrefix: token.slice(0, 18),
         keyId: digest.keyId,
         createdBy: tx.userId,
+        unattended: input.unattended === true,
       })
       .returning();
     await writeAudit(tx, {
       action: 'create',
       entityType: 'agent',
       entityId: created.id,
-      newValues: { name, roleKeys, mode: input.mode, tokenPrefix: created.tokenPrefix },
+      newValues: { name, roleKeys, mode: input.mode, tokenPrefix: created.tokenPrefix, unattended: created.unattended },
     });
     return created;
   });
@@ -261,6 +268,10 @@ export interface ActiveAgent {
   name: string;
   roleKeys: string[];
   mode: AgentMode;
+  /** The Admin who let the agent in: the person answerable for what it enters. */
+  createdBy: string | null;
+  /** May work while the file is open but nobody is signed in. */
+  unattended: boolean;
 }
 
 /**
@@ -282,6 +293,8 @@ export async function findAgentByToken(db: DB, token: string): Promise<ActiveAge
     name: row.name,
     roleKeys: Array.isArray(row.roleKeys) ? row.roleKeys : [],
     mode: isAgentMode(row.mode) ? row.mode : 'read_only',
+    createdBy: row.createdBy ?? null,
+    unattended: row.unattended === true,
   };
 }
 
@@ -333,9 +346,28 @@ export async function syncAgentEndpoint(db: DB): Promise<boolean> {
     if (endpointPublished(tag)) withdrawEndpoint(tag);
     return false;
   }
-  // Nothing is published before a person has signed in to this file in this run.
-  if (!personSignedIn(resolveDataDir())) return false;
+  // Nothing is published before a person has signed in to this file in this run, unless an Admin
+  // allowed an agent to work unattended (and then never past a company-file password).
+  if (!personSignedIn(resolveDataDir()) && !(await unattendedAgentsReady(db))) return false;
   return publishEndpoint(tag);
+}
+
+/**
+ * How many agents may work in this file right now with nobody signed in: active agents an Admin
+ * allowed to work unattended, in a file without a company-file password. (A file protected with
+ * passwords is not open at all before a person signs in, so this is never asked of one.)
+ */
+export async function unattendedAgentsReady(db: DB): Promise<number> {
+  if ((await getFileLockStatus(db)).enabled) return 0;
+  const rows = await db.select({ id: agents.id }).from(agents).where(and(isNull(agents.revokedAt), eq(agents.unattended, true)));
+  return rows.length;
+}
+
+/** When any agent last worked in this run of the app (in memory), or null. */
+export function lastAgentUse(): Date | null {
+  let latest: Date | null = null;
+  for (const d of lastUsed.values()) if (!latest || d > latest) latest = d;
+  return latest;
 }
 
 /** Agents by id, for screens that name who did something (id → name). */

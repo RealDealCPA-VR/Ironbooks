@@ -26,6 +26,7 @@ interface Agent {
   createdByName: string | null;
   lastUsedAt: string | null;
   status: 'active' | 'revoked';
+  unattended?: boolean;
 }
 interface Connection {
   command: string;
@@ -43,13 +44,22 @@ interface RoleOption {
 
 const MODE_HELP: Record<AgentMode, string> = {
   read_only: 'Looks at lists, registers and reports. Changes nothing.',
-  propose: 'Will draft transactions for a person to approve.',
-  post: 'Will enter transactions itself, within its role.',
+  propose:
+    'Drafts transactions. Each one waits for a person to approve it (Ask AI > Waiting for your approval) before anything is entered. It may bring in bank statement lines and tick off a reconciliation it started, since neither changes the books; finishing one waits for approval.',
+  post: 'Enters, edits and voids transactions itself, within its role. Never on or before the closing date, and never deletes.',
 };
 
-/** Shown under Propose and Post until agents can enter transactions. */
-export const MODES_LATER_NOTE =
-  'In this version every agent only reads. Propose and Post take effect when entering transactions is added.';
+/** The one switch that lets an agent work with nobody at the computer. Off unless ticked. */
+export const UNATTENDED_LABEL = 'May work while nobody is signed in';
+/** Shown instead of the switch's help when this company file has passwords. */
+export const UNATTENDED_NOT_HERE =
+  'Not for this company file: it has passwords, so only a person signing in opens it. The agent works while Ironbooks is open and someone has signed in.';
+export const UNATTENDED_HELP =
+  'Off: the agent works only while this company file is open in Ironbooks and someone has signed in. On: when Ironbooks is closed, it opens this company file by itself with no window, for as long as the agent is working, and closes it again. Anyone who opens Ironbooks or asks for the file from another computer gets it at once. It never does this for a company file with passwords.';
+
+/** What holds for every agent, whatever it may do. */
+export const MODES_NOTE =
+  'Whatever an agent may do, everything it enters is listed under its name, and it can be removed at any time.';
 /** The words of lib/net/hostOnly.ts HOST_ONLY_MESSAGE (a server module this page cannot import). */
 const HOST_ONLY_MESSAGE = 'This can only be changed on the computer that holds the company file.';
 export const AGENT_PRIVACY_NOTE =
@@ -103,17 +113,29 @@ function CopyBlock({ label, text, what }: { label: string; text: string; what: s
   );
 }
 
-function NewAgent({ roles, onClose, onMade }: { roles: RoleOption[]; onClose: () => void; onMade: (token: string, connection: Connection | null, name: string) => void }) {
+function NewAgent({
+  roles,
+  unattendedPossible,
+  onClose,
+  onMade,
+}: {
+  roles: RoleOption[];
+  unattendedPossible: boolean;
+  onClose: () => void;
+  onMade: (token: string, connection: Connection | null, name: string, unattended: boolean) => void;
+}) {
   const [name, setName] = useState('');
   const [roleKeys, setRoleKeys] = useState<string[]>([]);
   const [mode, setMode] = useState<AgentMode>('read_only');
+  const [unattended, setUnattended] = useState(false);
   const [busy, setBusy] = useState(false);
 
   async function save() {
     setBusy(true);
     try {
-      const made = await api.post<{ token: string; connection: Connection | null }>('/api/agents', { name, roleKeys, mode });
-      onMade(made.token, made.connection, name.trim());
+      const alone = unattended && unattendedPossible;
+      const made = await api.post<{ token: string; connection: Connection | null }>('/api/agents', { name, roleKeys, mode, unattended: alone });
+      onMade(made.token, made.connection, name.trim(), alone);
     } catch (e) {
       toast(errMsg(e), 'danger');
     } finally {
@@ -181,7 +203,23 @@ function NewAgent({ roles, onClose, onMade }: { roles: RoleOption[]; onClose: ()
               </label>
             ))}
           </div>
-          <p className="mt-1 text-xs text-navy/50">{MODES_LATER_NOTE}</p>
+          <p className="mt-1 text-xs text-navy/50">{MODES_NOTE}</p>
+        </div>
+        <div>
+          <Label>When it may work</Label>
+          <label className={`flex items-start gap-2 rounded p-1.5 ${unattendedPossible ? 'cursor-pointer hover:bg-electric/5' : 'opacity-70'}`}>
+            <input
+              type="checkbox"
+              className="mt-1"
+              checked={unattended && unattendedPossible}
+              disabled={!unattendedPossible}
+              onChange={(e) => setUnattended(e.target.checked)}
+            />
+            <span>
+              <span className="text-sm font-semibold text-navy">{UNATTENDED_LABEL}</span>
+              <span className="block text-xs text-navy/50">{unattendedPossible ? UNATTENDED_HELP : UNATTENDED_NOT_HERE}</span>
+            </span>
+          </label>
         </div>
         <p className="rounded-lg bg-amber-50 p-3 text-xs text-amber-900">{AGENT_PRIVACY_NOTE}</p>
       </div>
@@ -189,7 +227,19 @@ function NewAgent({ roles, onClose, onMade }: { roles: RoleOption[]; onClose: ()
   );
 }
 
-function TokenOnce({ name, token, connection, onClose }: { name: string; token: string; connection: Connection | null; onClose: () => void }) {
+function TokenOnce({
+  name,
+  token,
+  connection,
+  unattended,
+  onClose,
+}: {
+  name: string;
+  token: string;
+  connection: Connection | null;
+  unattended: boolean;
+  onClose: () => void;
+}) {
   return (
     <Modal
       open
@@ -217,8 +267,9 @@ function TokenOnce({ name, token, connection, onClose }: { name: string; token: 
           <p className="text-sm text-navy/60">The connector that ships with Ironbooks was not found on this computer. See AGENT_ACCESS.md.</p>
         )}
         <p className="text-xs text-navy/50">
-          The agent works while this company file is open in Ironbooks on this computer and someone has signed in. Keep the token like a
-          password.
+          {unattended
+            ? 'The agent works while this company file is open in Ironbooks on this computer, and when Ironbooks is closed it opens the file by itself for as long as the agent is working. Keep the token like a password.'
+            : 'The agent works while this company file is open in Ironbooks on this computer and someone has signed in. Keep the token like a password.'}
         </p>
       </div>
     </Modal>
@@ -228,17 +279,19 @@ function TokenOnce({ name, token, connection, onClose }: { name: string; token: 
 export default function AgentsTab({ roles }: { roles: RoleOption[] }) {
   const [agents, setAgents] = useState<Agent[] | null>(null);
   const [hostOnly, setHostOnly] = useState(false);
+  const [unattendedPossible, setUnattendedPossible] = useState(true);
   const [error, setError] = useState('');
   const [adding, setAdding] = useState(false);
-  const [made, setMade] = useState<{ name: string; token: string; connection: Connection | null } | null>(null);
+  const [made, setMade] = useState<{ name: string; token: string; connection: Connection | null; unattended: boolean } | null>(null);
   const [removing, setRemoving] = useState<Agent | null>(null);
   const [busy, setBusy] = useState(false);
 
   const load = useCallback(async () => {
     try {
-      const res = await api.get<{ agents: Agent[]; hostOnly: boolean }>('/api/agents');
+      const res = await api.get<{ agents: Agent[]; hostOnly: boolean; unattendedPossible?: boolean }>('/api/agents');
       setAgents(res.agents);
       setHostOnly(Boolean(res.hostOnly));
+      setUnattendedPossible(res.unattendedPossible !== false);
       setError('');
     } catch (e) {
       setError(errMsg(e));
@@ -274,10 +327,10 @@ export default function AgentsTab({ roles }: { roles: RoleOption[] }) {
           <Bot className="mt-0.5 h-5 w-5 text-electric" />
           <div className="min-w-0 flex-1 text-sm text-navy/70">
             <p>
-              An agent is an AI assistant you let read these books, the way you would add a bookkeeper: with a name and a role. It connects
+              An agent is an AI assistant you let work in these books, the way you would add a bookkeeper: with a name and a role. It connects
               through Ironbooks on this computer only, and everything it does is listed under its name.
             </p>
-            <p className="mt-1 text-xs text-navy/50">{MODES_LATER_NOTE}</p>
+            <p className="mt-1 text-xs text-navy/50">{MODES_NOTE}</p>
           </div>
           {!hostOnly && (
             <Button onClick={() => setAdding(true)}>
@@ -318,7 +371,10 @@ export default function AgentsTab({ roles }: { roles: RoleOption[] }) {
                     {a.roleNames.length ? a.roleNames.map((r) => <Badge key={r}>{r}</Badge>) : <span className="text-xs text-navy/40">Role removed</span>}
                   </div>
                 </Td>
-                <Td>{AGENT_MODE_LABELS[a.mode] ?? a.mode}</Td>
+                <Td>
+                  {AGENT_MODE_LABELS[a.mode] ?? a.mode}
+                  {a.unattended && unattendedPossible && <span className="block text-xs text-navy/50">Also while nobody is signed in</span>}
+                </Td>
                 <Td className="font-mono text-xs">{a.tokenPrefix}…</Td>
                 <Td className="text-sm">{when(a.lastUsedAt)}</Td>
                 <Td>{a.status === 'active' ? <Badge tone="success">Active</Badge> : <Badge tone="void">Removed</Badge>}</Td>
@@ -337,15 +393,16 @@ export default function AgentsTab({ roles }: { roles: RoleOption[] }) {
       {adding && (
         <NewAgent
           roles={agentRoles}
+          unattendedPossible={unattendedPossible}
           onClose={() => setAdding(false)}
-          onMade={(token, connection, name) => {
+          onMade={(token, connection, name, unattended) => {
             setAdding(false);
-            setMade({ name, token, connection });
+            setMade({ name, token, connection, unattended });
             load();
           }}
         />
       )}
-      {made && <TokenOnce name={made.name} token={made.token} connection={made.connection} onClose={() => setMade(null)} />}
+      {made && <TokenOnce name={made.name} token={made.token} connection={made.connection} unattended={made.unattended} onClose={() => setMade(null)} />}
       <ConfirmDialog
         open={!!removing}
         title="Remove agent"

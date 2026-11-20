@@ -18,8 +18,9 @@ import { stripSecrets } from '@/lib/permissions/mask';
 import { auditVisibilitySql, canSeeAuditEntry } from './auditVisibility';
 
 /** How the Audit Trail names an agent (the transaction log uses the same words, _base.ts writeAudit). */
-function agentActor(name: string | null | undefined): string | null {
-  return name ? `${name} (agent)` : null;
+function actorLabel(person: string | null | undefined, agent: string | null | undefined): string | null {
+  if (!agent) return person ?? null;
+  return person ? `${agent} (agent), approved by ${person}` : `${agent} (agent)`;
 }
 
 export interface AuditLogRow {
@@ -95,7 +96,7 @@ export async function listAuditLogs(
       entityType: r.entityType,
       entityId: r.entityId,
       actorId: r.actorId ?? null,
-      actorName: r.actorName ?? agentActor(r.agentName),
+      actorName: actorLabel(r.actorName, r.agentName),
       createdAt: r.createdAt.toISOString(),
     })),
     total,
@@ -133,7 +134,7 @@ export async function getAuditLog(ctx: ServiceContext, id: string): Promise<Audi
     entityType: row.entityType,
     entityId: row.entityId,
     actorId: row.actorId ?? null,
-    actorName: row.actorName ?? agentActor(row.agentName),
+    actorName: actorLabel(row.actorName, row.agentName),
     createdAt: row.createdAt.toISOString(),
     // Snapshots can hold SSNs, tax IDs and account numbers -- mask per the caller's flags.
     // ... and never the password hashes older builds wrote into settings snapshots, whoever asks

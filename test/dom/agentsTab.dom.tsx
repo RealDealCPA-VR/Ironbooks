@@ -33,7 +33,7 @@ domTest('the list shows each agent, its role and last use, and never a token', a
   check(text.includes('by Pat Owner'), 'who made it is shown');
   check(text.includes('ibka_0123abcd_Tabc…'), 'the start of the token tells agents apart');
   check(text.includes('Old helper') && text.includes('Removed') && text.includes('Role removed'), 'a removed agent stays listed as removed');
-  check(text.includes('In this version every agent only reads'), 'the page says every agent only reads for now');
+  check(text.includes('everything it enters is listed under its name'), 'the page says what holds for every agent');
   check(!text.includes(TOKEN), 'no token on the page');
   equal($$('button[title="Remove this agent\'s access"]').length, 1, 'only an active agent can be removed');
   check(button(/New agent/), 'New agent is offered on this computer');
@@ -72,17 +72,84 @@ domTest('New agent: name, role (never Admin) and mode are sent, and the token is
   await click(button('Make agent', d), 'Make agent');
 
   const once = await until(() => (textOf(dialog()).includes('is ready') ? dialog() : null), 'the token dialog');
-  equal(JSON.stringify(calls.find((c) => c.method === 'POST')?.body), JSON.stringify({ name: 'Month-end helper', roleKeys: ['bookkeeper'], mode: 'read_only' }), 'what was sent');
+  equal(JSON.stringify(calls.find((c) => c.method === 'POST')?.body), JSON.stringify({ name: 'Month-end helper', roleKeys: ['bookkeeper'], mode: 'read_only', unattended: false }), 'what was sent');
   const shown = textOf(once);
   check(shown.includes(TOKEN), 'the token is shown');
   check(shown.includes('It is shown only now.'), 'the dialog says it is shown only now');
   check(shown.includes(`claude mcp add ironbooks --env IRONBOOKS_AGENT_TOKEN=${TOKEN} --env ELECTRON_RUN_AS_NODE=1 -- C:\\Apps\\Ironbooks\\Ironbooks.exe C:\\Apps\\Ironbooks\\resources\\mcp\\ironbooks-mcp.mjs`), `the Claude Code command: ${shown}`);
   check(shown.includes('"mcpServers"') && shown.includes('"ELECTRON_RUN_AS_NODE": "1"'), 'the Claude Desktop settings');
+  check(!shown.includes('IRONBOOKS_AGENT_START'), 'nothing that starts Ironbooks by itself, unless asked for');
+  check(shown.includes('and someone has signed in'), 'it says the agent works while someone is signed in');
 
   await click(button('I have copied it', once), 'I have copied it');
   await until(() => !dialog(), 'the dialog to close');
   await until(() => textOf().includes('Month-end helper'), 'the new agent in the list');
   check(!textOf().includes(TOKEN), 'the token is gone from the page for good');
+  await unmount();
+});
+
+domTest('working while nobody is signed in is off unless ticked, and says what it means', async () => {
+  const NIGHT = { ...READER, id: 'a2', name: 'Night closer', mode: 'post', unattended: true };
+  const STARTS = { ...CONNECTION, env: { ...CONNECTION.env, IRONBOOKS_AGENT_START: '1' } };
+  let made = false;
+  const calls = stubFetch({
+    'GET /api/agents': () => ({ agents: made ? [READER, NIGHT] : [READER], hostOnly: false, connection: CONNECTION }),
+    'POST /api/agents': () => {
+      made = true;
+      return reply(201, { agent: NIGHT, token: TOKEN, connection: STARTS });
+    },
+  });
+  await mount(page());
+  await until(() => textOf().includes('Month-end helper'), 'the agents');
+  check(!textOf().includes('Also while nobody is signed in'), 'an agent without it is not marked');
+
+  await click(button(/New agent/), 'New agent');
+  const d = await until(dialog, 'the New agent dialog');
+  const box = $$<HTMLInputElement>('input[type="checkbox"]', d).find((c) => textOf(c.closest('label')).startsWith('May work while nobody is signed in')) ?? null;
+  check(box && !box.checked, 'the switch is there and off');
+  const help = textOf(box?.closest('label') ?? null);
+  check(help.includes('opens this company file by itself with no window'), `it says what it does: ${help}`);
+  check(help.includes('gets it at once'), 'it says people come first');
+  check(help.includes('never does this for a company file with passwords'), 'it says where it never applies');
+
+  await focus($('#ag-name', d), 'the name field');
+  await typeText('Night closer');
+  await click($$<HTMLInputElement>('input[type="checkbox"]', d).find((c) => textOf(c.closest('label')).startsWith('Bookkeeper')) ?? null, 'the Bookkeeper role');
+  await click(box, 'the switch');
+  await click(button('Make agent', d), 'Make agent');
+
+  const once = await until(() => (textOf(dialog()).includes('is ready') ? dialog() : null), 'the token dialog');
+  equal(JSON.stringify(calls.find((c) => c.method === 'POST')?.body), JSON.stringify({ name: 'Night closer', roleKeys: ['bookkeeper'], mode: 'read_only', unattended: true }), 'what was sent');
+  const shown = textOf(once);
+  check(shown.includes('--env IRONBOOKS_AGENT_START=1'), `the Claude Code command lets the connector start Ironbooks: ${shown}`);
+  check(shown.includes('"IRONBOOKS_AGENT_START": "1"'), 'so do the Claude Desktop settings');
+  check(shown.includes('it opens the file by itself for as long as the agent is working'), 'the dialog says so');
+  await click(button('I have copied it', once), 'I have copied it');
+  await until(() => textOf().includes('Night closer'), 'the new agent in the list');
+  check(textOf().includes('Also while nobody is signed in'), 'the list marks it');
+  await unmount();
+});
+
+domTest('a company file with passwords: the switch is not offered, and the tab says why', async () => {
+  const NIGHT = { ...READER, id: 'a2', name: 'Night closer', mode: 'post', unattended: true };
+  const calls = stubFetch({
+    'GET /api/agents': { agents: [NIGHT], hostOnly: false, connection: CONNECTION, unattendedPossible: false },
+    'POST /api/agents': reply(201, { agent: READER, token: TOKEN, connection: CONNECTION }),
+  });
+  await mount(page());
+  await until(() => textOf().includes('Night closer'), 'the agents');
+  check(!textOf().includes('Also while nobody is signed in'), 'no agent is shown as working alone in a file only a person can open');
+  await click(button(/New agent/), 'New agent');
+  const d = await until(dialog, 'the New agent dialog');
+  const box = $$<HTMLInputElement>('input[type="checkbox"]', d).find((c) => textOf(c.closest('label')).startsWith('May work while nobody is signed in')) ?? null;
+  check(box && box.disabled && !box.checked, 'the switch is there, off, and cannot be ticked');
+  check(textOf(box?.closest('label') ?? null).includes('it has passwords, so only a person signing in opens it'), 'it says why');
+  await focus($('#ag-name', d), 'the name field');
+  await typeText('Helper');
+  await click($$<HTMLInputElement>('input[type="checkbox"]', d).find((c) => textOf(c.closest('label')).startsWith('Bookkeeper')) ?? null, 'the Bookkeeper role');
+  await click(button('Make agent', d), 'Make agent');
+  await until(() => (textOf(dialog()).includes('is ready') ? dialog() : null), 'the token dialog');
+  equal(JSON.stringify(calls.find((c) => c.method === 'POST')?.body), JSON.stringify({ name: 'Helper', roleKeys: ['bookkeeper'], mode: 'read_only', unattended: false }), 'what was sent');
   await unmount();
 });
 

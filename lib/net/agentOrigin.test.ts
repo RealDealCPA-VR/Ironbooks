@@ -12,7 +12,7 @@ import { NextRequest } from 'next/server';
 import { middleware } from '@/middleware';
 import { ROUTE_METHOD_HEADER, ROUTE_PATH_HEADER } from '@/lib/permissions/headers';
 import { API_ROUTE_PERMISSIONS } from '@/lib/permissions/routes';
-import { AGENT_DENIED_AREAS, AGENT_READ_ROUTES, agentMayWrite, agentRouteAllowed, clampForAgent, AGENT_MODES } from '@/lib/permissions/agentAccess';
+import { AGENT_ACTION_ROUTE, AGENT_DENIED_AREAS, AGENT_READ_ROUTES, agentMayPropose, agentMayWrite, agentRouteAllowed, clampForAgent, AGENT_MODES } from '@/lib/permissions/agentAccess';
 import { fullAccess } from '@/lib/permissions/model';
 import { AGENT_TOKEN_RE, bearerAgentToken, hasAuthorization, tokenFileTag } from './agentToken';
 
@@ -44,6 +44,12 @@ describe('middleware and the Authorization header', () => {
         expect(res.status, `${method} ${JSON.stringify(headers)}`).toBe(403);
         expect((await res.json()).error).toBe('This is not available to agents.');
       }
+    }
+    // The one exception: a POST to the action route. Nothing else on that route, and no look-alike.
+    expect(continued(send('POST', AGENT_ACTION_ROUTE, AUTH))).toBe(true);
+    for (const method of ['PUT', 'PATCH', 'DELETE']) expect(send(method, AGENT_ACTION_ROUTE, AUTH).status, method).toBe(403);
+    for (const p of ['/api/agent/actions/', '/api/agent/actions/x', '/api/agent/Actions', '/api/agent/actionsx', '/api/agents']) {
+      expect(send('POST', p, AUTH).status, p).toBe(403);
     }
     // Sign-in, unlock and reset take no Authorization header at all.
     for (const p of ['/api/auth/login', '/api/unlock', '/api/auth/request-reset', '/api/portal/login']) {
@@ -118,12 +124,15 @@ describe('what an agent may reach', () => {
   });
 
   it('nothing else: the list is closed', () => {
-    const allowed = new Set(AGENT_READ_ROUTES);
+    expect(agentRouteAllowed(AGENT_ACTION_ROUTE, 'POST')).toBe(true);
+    for (const m of ['GET', 'PUT', 'PATCH', 'DELETE']) expect(agentRouteAllowed(AGENT_ACTION_ROUTE, m), m).toBe(false);
+    const allowed = new Set<string>([...AGENT_READ_ROUTES, AGENT_ACTION_ROUTE]);
     const others = Object.keys(API_ROUTE_PERMISSIONS).filter((p) => !allowed.has(p));
     expect(others.length).toBeGreaterThan(400);
     for (const p of others) {
       const concrete = p.replace(/\[\.\.\.[^\]]+\]/g, 'a/b').replace(/\[[^\]]+\]/g, 'x1');
       expect(agentRouteAllowed(concrete, 'GET'), p).toBe(false);
+      expect(agentRouteAllowed(concrete, 'POST'), p).toBe(false);
     }
     for (const p of [null, undefined, '', '/', '/dashboard', '/api', '/apix/accounts', '/api/accounts/../users', '/api/accounts/x/y/z']) {
       expect(agentRouteAllowed(p, 'GET'), String(p)).toBe(false);
@@ -138,7 +147,7 @@ describe('what an agent may reach', () => {
     }
   });
 
-  it('an Admin-wide access is cut down for an agent, and no mode writes yet', () => {
+  it('an Admin-wide access is cut down for an agent, and the mode decides what happens to a change', () => {
     const access = clampForAgent(fullAccess());
     expect(access.isAdmin).toBe(false);
     expect(access.roleKeys).toEqual([]);
@@ -147,6 +156,7 @@ describe('what an agent may reach', () => {
     expect(access.permissions.banking.length).toBeGreaterThan(0);
     // The original is not changed.
     expect(fullAccess().isAdmin).toBe(true);
-    for (const mode of AGENT_MODES) expect(agentMayWrite(mode)).toBe(false);
+    // Only Post enters changes itself; Propose asks; Read only neither.
+    expect(AGENT_MODES.map((m) => [m, agentMayWrite(m), agentMayPropose(m)])).toEqual([['read_only', false, false], ['propose', false, true], ['post', true, true]]);
   });
 });

@@ -1,6 +1,6 @@
 /**
  * GET  /api/agents — the company's agents (AGENT_ACCESS.md): name, roles, mode, last use.
- * POST /api/agents — make an agent: { name, roleKeys[], mode }. Answers the access token ONCE,
+ * POST /api/agents — make an agent: { name, roleKeys[], mode, unattended? }. Answers the access token ONCE,
  *                    with the settings a connector needs on this computer.
  *
  * For an Admin (checked in lib/services/agents.ts; the route map asks for Users & Roles). Making
@@ -11,11 +11,13 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getServerContext } from '@/lib/context';
 import { createAgent, listAgents } from '@/lib/services/agents';
-import { agentConnection } from '@/lib/agent/connection';
+import { agentConnection, forUnattended } from '@/lib/agent/connection';
 import { hostOnlyResponse, isRemoteRequest, HOST_ONLY_ACTION_MESSAGE } from '@/lib/net/hostOnly';
 import { routeError, requireJsonObject } from '@/lib/routeErrors';
 import { zodErrorBody } from '@/lib/validation/helpers';
 import { createAgentSchema } from '@/lib/validation/agents';
+import { getFileLockStatus } from '@/lib/services/fileLock';
+import { isMarkedProtected } from '@/lib/services/fileProtection';
 
 export const dynamic = 'force-dynamic';
 const NO_STORE = { 'Cache-Control': 'no-store' };
@@ -24,9 +26,12 @@ export async function GET(req: NextRequest) {
   try {
     const ctx = await getServerContext();
     const hostOnly = isRemoteRequest(req);
+    // A company file with passwords is opened only by a person's sign-in, so "may work while
+    // nobody is signed in" can do nothing for it. The tab says so instead of offering it.
+    const unattendedPossible = !isMarkedProtected() && !(await getFileLockStatus(ctx.db)).enabled;
     return NextResponse.json(
       // Where the connector lives on this computer is told only at this computer.
-      { agents: await listAgents(ctx), hostOnly, connection: hostOnly ? null : agentConnection() },
+      { agents: await listAgents(ctx), hostOnly, connection: hostOnly ? null : agentConnection(), unattendedPossible },
       { headers: NO_STORE },
     );
   } catch (err) {
@@ -41,7 +46,8 @@ export async function POST(req: NextRequest) {
     const parsed = createAgentSchema.safeParse(await requireJsonObject(req));
     if (!parsed.success) return NextResponse.json(zodErrorBody(parsed.error), { status: 400 });
     const { agent, token } = await createAgent(ctx, parsed.data);
-    return NextResponse.json({ agent, token, connection: agentConnection() }, { status: 201, headers: NO_STORE });
+    const connection = agent.unattended ? forUnattended(agentConnection()) : agentConnection();
+    return NextResponse.json({ agent, token, connection }, { status: 201, headers: NO_STORE });
   } catch (err) {
     return routeError(err, 'agents/route');
   }

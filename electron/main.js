@@ -74,6 +74,7 @@ const { pruneLegacyAutoBackups } = require('./legacyBackups');
 const localServer = require('./localServer');
 const saveTypes = require('./saveTypes');
 const deviceVault = require('./deviceVault');
+const agentService = require('./agentService');
 
 const isDev = !app.isPackaged;
 // Window / taskbar icon. The packaged Windows .exe already embeds build/icon.ico, but dev runs
@@ -106,7 +107,8 @@ const scratchChildren = new Set();
  * sandbox and handing the file over all came back to it.
  */
 function relaunchArgs() {
-  return process.argv.slice(1).filter((a) => !/\.(ironbooks|bka|bkp|ibac|ibcx)$/i.test(String(a)));
+  // …and without the agent-service flag: a relaunch is always a normal start, with its window.
+  return agentService.withoutFlag(process.argv.slice(1)).filter((a) => !/\.(ironbooks|bka|bkp|ibac|ibcx)$/i.test(String(a)));
 }
 /**
  * Config for the next launch (which company file, or No Company Open), written only once the
@@ -252,6 +254,99 @@ function sandboxRecordFor(dataDir) {
 /** Client mode: no pass of ours on the window, not even one left from an earlier launch. */
 async function clearLaunchPassCookie() {
   await session.defaultSession.cookies.remove('http://localhost/', localServer.LAUNCH_PASS_COOKIE).catch(() => {});
+}
+
+// --- agent service (electron/agentService.js, AGENT_ACCESS.md) ---
+// Started with `--agent-service` by an agent's connector while Ironbooks was closed: everything
+// starts as usual, but the window stays hidden until a person starts Ironbooks. While it is
+// hidden nobody is there to answer a question, so every question gets the answer that changes
+// nothing, and a start that would need a person closes again. Without the flag none of this runs.
+let agentServiceHidden = agentService.isAgentServiceLaunch(process.argv);
+let agentServiceTimer = null;
+const agentServiceSince = Date.now();
+{
+  const askPerson = dialog.showMessageBox.bind(dialog);
+  const tellPerson = dialog.showErrorBox.bind(dialog);
+  dialog.showMessageBox = (...args) => (agentServiceHidden ? Promise.resolve(agentService.quietDialogAnswer(args)) : askPerson(...args));
+  dialog.showErrorBox = (title, content) => {
+    if (agentServiceHidden) console.error(`[agent-service] ${title}: ${content}`);
+    else tellPerson(title, content);
+  };
+}
+
+/** Close again: a start for an agent that cannot serve one (the reason goes to the log only). */
+function quitAgentService(why) {
+  console.error(`[agent-service] closing: ${why}`);
+  app.quit();
+}
+
+/**
+ * The file is open and the server is up, with no window showing. Ask the server whether any agent
+ * may work with nobody signed in; if not, close again. Then watch for a quiet while and close.
+ */
+async function startAgentService(url) {
+  let answer = null;
+  try {
+    const res = await shellFetch(url, '/api/agent/service', { method: 'POST', signal: AbortSignal.timeout(60_000) });
+    answer = await res.json();
+  } catch (err) {
+    answer = { ok: false, reason: String((err && err.message) || err) };
+  }
+  if (!agentServiceHidden) return; // a person opened the window meanwhile: a normal session now
+  if (!answer || answer.ok !== true) {
+    quitAgentService(`no agent may work unattended in this company file (${(answer && answer.reason) || 'no answer'})`);
+    return;
+  }
+  agentServiceTimer = setInterval(async () => {
+    if (!agentServiceHidden) return;
+    let lastAgentUse = null;
+    try {
+      const res = await shellFetch(url, '/api/agent/service', { signal: AbortSignal.timeout(15_000) });
+      lastAgentUse = (await res.json()).lastAgentUse || null;
+    } catch {
+      /* the next check asks again */
+    }
+    if (agentServiceHidden && agentService.idleTooLong({ now: Date.now(), since: agentServiceSince, lastAgentUse })) {
+      quitAgentService('no agent has worked for a while');
+    }
+  }, agentService.POLL_MS);
+  agentServiceTimer.unref?.();
+}
+
+/**
+ * A person started Ironbooks while it was running for an agent: show the window and carry on as a
+ * normal session (the person signs in as usual). What a normal start does once its window is up,
+ * and was held back while nobody was there, happens now.
+ */
+function revealAgentServiceWindow() {
+  if (!agentServiceHidden) return;
+  // Already saving and closing: let that finish, then start again as a normal, visible app.
+  if (closingInProgress || quittingAfterBackup) {
+    if (quittingAfterBackup) app.relaunch({ args: relaunchArgs() });
+    else relaunchAfterQuit = true;
+    return;
+  }
+  agentServiceHidden = false;
+  if (agentServiceTimer) clearInterval(agentServiceTimer);
+  agentServiceTimer = null;
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    if (loadWindowState()?.maximized) mainWindow.maximize();
+    mainWindow.show();
+    mainWindow.focus();
+  }
+  if (openFile) {
+    openFile.appUser = lastUserFor(openFile.path);
+    lockHeartbeat().catch(() => {});
+    noteRecoveredWork();
+  }
+  if (serverUrl) {
+    runDueRecurring(serverUrl);
+    if (!sandboxActive()) {
+      scheduleBackgroundJobs(serverUrl);
+      if (hostingConfig().enabled) setHosting(true, { quiet: true });
+    }
+  }
+  checkForUpdates();
 }
 
 // --- single instance lock ---
@@ -1036,7 +1131,8 @@ async function openSingleFileForLaunch(filePath) {
     });
     return false;
   }
-  const info = { appVersion: app.getVersion(), appUser: lastUserFor(filePath) };
+  // Started for an agent with no window: the lock says so, instead of naming the last person.
+  const info = { appVersion: app.getVersion(), appUser: agentServiceHidden ? agentService.LOCK_USER : lastUserFor(filePath) };
   let res;
   try {
     res = companyLock.acquire(filePath, info);
@@ -1131,6 +1227,11 @@ async function lockHeartbeat() {
 }
 
 async function showLockLost(holder) {
+  // Running for an agent with nobody there: the file is someone else's now. Close.
+  if (agentServiceHidden) {
+    quitAgentService('the company file was opened on another computer');
+    return;
+  }
   if (lockLostNoticeShown || !mainWindow) return;
   lockLostNoticeShown = true;
   const name = companyFile.locationName(openFile ? openFile.path : '');
@@ -1180,6 +1281,13 @@ async function serviceAccessRequests() {
   const req = companyLock.pendingRequests(openFile.lock).find((r) => !answeredRequests.has(r.id));
   if (!req) return;
   answeredRequests.add(req.id);
+  // Running for an agent with nobody at this computer: the person asking gets the file at once
+  // (Hand It Over). Quitting saves the books into the company file and releases it.
+  if (agentServiceHidden) {
+    companyLock.respond(openFile.lock, req.id, { decision: 'handoff' });
+    quitAgentService('another computer asked for the company file');
+    return;
+  }
   // Already letting people on the network join without asking: answer at once.
   const owner = openFile.lock.owner || {};
   if (hostingState && hostingState.lan && owner.joinPolicy === 'open') {
@@ -1497,6 +1605,12 @@ async function closeOpenCompanyFile() {
         return true;
       }
       companyLock.release(openFile.lock);
+      return true;
+    }
+    if (agentServiceHidden) {
+      // Nobody to ask: close anyway. The changes stay on this computer and the lock is left as
+      // "unsaved" (it goes stale), so whoever opens the file next is warned.
+      companyLock.heartbeat(openFile.lock, { unsavedSince: new Date().toISOString() });
       return true;
     }
     const { response } = await dialog.showMessageBox(parentWindow(), {
@@ -1819,6 +1933,10 @@ async function startNextServer() {
       if (serverProcess !== started || quittingAfterBackup) return; // stopped on purpose
       serverProcess = null;
       console.error(`[server] stopped unexpectedly (code ${code}, signal ${signal}).`);
+      if (agentServiceHidden) {
+        quitAgentService('the server stopped');
+        return;
+      }
       if (mainWindow && !mainWindow.isDestroyed()) {
         dialog.showErrorBox(
           'Ironbooks stopped working',
@@ -3107,6 +3225,15 @@ function installPinnedCertificate(origin, pin) {
 }
 
 async function createWindow() {
+  // Started for an agent with no window (electron/agentService.js): only when the company file
+  // would open by itself. Anything a person would have to decide closes the app again.
+  if (agentServiceHidden) {
+    const why = agentService.headlessBlocker(loadConfig(), { firstRun: isFirstRun(), dataDirEnv: Boolean(process.env.BKA_DATA_DIR), fileArgument: Boolean(pendingCompanyPath) });
+    if (why) {
+      quitAgentService(why);
+      return;
+    }
+  }
   // A company file the OS asked us to open (double-click, Open with) wins over the last one used.
   if (pendingCompanyPath) {
     // Opened from an email attachment, a read-only file or a cloud-sync folder: ask first.
@@ -3145,6 +3272,12 @@ async function createWindow() {
     const cfg = loadConfig();
     if (!process.env.BKA_DATA_DIR && typeof cfg.companyFile === 'string' && cfg.companyFile && !cfg.sandbox) {
       const opened = await openSingleFileForLaunch(cfg.companyFile);
+      if (!opened && agentServiceHidden) {
+        // In use elsewhere, missing, or something to sort out first: that is for a person.
+        pendingAccessRequest = null;
+        quitAgentService('the company file could not be opened without asking a person');
+        return;
+      }
       if (!opened) {
         await createStartWindow();
         deliverPendingFilesToStartScreen();
@@ -3181,6 +3314,8 @@ async function createWindow() {
     minHeight: 700,
     title: 'Ironbooks',
     icon: APP_ICON,
+    // Started for an agent: the window exists but is not shown until a person starts Ironbooks.
+    show: !agentServiceHidden,
     ...windowTheme.frameOptions(process.platform, nativeTheme.shouldUseDarkColors),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -3195,7 +3330,8 @@ async function createWindow() {
       navigateOnDragDrop: false,
     },
   });
-  if (state?.maximized) mainWindow.maximize();
+  // (maximize() would also show a hidden window)
+  if (state?.maximized && !agentServiceHidden) mainWindow.maximize();
   trackWindowState(mainWindow);
   // Closing the window with a company file open: keep it on screen while the file is saved into
   // the company file (before-quit), so any question about that save has a window to appear on.
@@ -3302,7 +3438,13 @@ async function createWindow() {
   buildMenu();
   if (openFile) {
     startLockMaintenance();
-    noteRecoveredWork();
+    if (!agentServiceHidden) noteRecoveredWork();
+  }
+  if (agentServiceHidden) {
+    // Nobody is there: no recurring entries, schedules or multi-user hosting are started. They
+    // start when a person opens the window (revealAgentServiceWindow).
+    await startAgentService(url);
+    return;
   }
   runDueRecurring(url);
   if (!inSandbox) {
@@ -3842,6 +3984,18 @@ ipcMain.handle('hosting:disconnect', (e) => {
 // After the Privacy & Network settings change, re-read what the window may load.
 
 app.on('second-instance', (_event, rawArgv, workingDirectory) => {
+  // An agent's connector looking for the app: it is already running (with or without a window).
+  // Nothing to show, and the person at the screen is not interrupted. The server is asked once
+  // more whether an agent may work with nobody signed in (the app may be sitting at its sign-in
+  // screen); it decides, and answers no for a file with passwords.
+  if (agentService.isAgentServiceLaunch(rawArgv)) {
+    if (serverUrl && openFile && !remoteHostOrigin) {
+      shellFetch(serverUrl, '/api/agent/service', { method: 'POST', signal: AbortSignal.timeout(60_000) }).catch(() => {});
+    }
+    return;
+  }
+  // A person started Ironbooks while it was running for an agent: show them the window.
+  revealAgentServiceWindow();
   // A relative file argument ("Ironbooks.exe Books.ironbooks" from a shortcut or a terminal) is
   // relative to THAT launch's folder, not this instance's.
   const argv = (rawArgv || []).map((a) =>
@@ -3978,6 +4132,9 @@ async function checkForUpdates({ manual = false } = {}) {
     if (manual) updateDialog('Update checks are paused in the sandbox.', 'Leave the sandbox to check for updates.');
     return;
   }
+  // Started for an agent with no window: nothing is downloaded or installed with nobody there
+  // (checked when a person opens the window).
+  if (agentServiceHidden) return;
   // Already found / downloading / staged: just show the banner again.
   if (['available', 'downloading', 'ready'].includes(updateState.state)) {
     if (manual) mainWindow?.webContents.send('update', { ...updateState, reshow: true });
@@ -4074,6 +4231,7 @@ app.on('window-all-closed', () => {
 });
 
 app.on('activate', () => {
+  revealAgentServiceWindow();
   if (BrowserWindow.getAllWindows().length === 0 && !serverProcess) {
     createWindow().catch((err) => console.error('[startup] could not reopen the window:', err));
   }

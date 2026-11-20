@@ -15,6 +15,8 @@ describe('the Agents tab', () => {
     expectAllPassed(await runDomFile('test/dom/agentsTab.dom.tsx'), [
       'the list shows each agent, its role and last use, and never a token',
       'New agent: name, role (never Admin) and mode are sent, and the token is shown once',
+      'working while nobody is signed in is off unless ticked, and says what it means',
+      'a company file with passwords: the switch is not offered, and the tab says why',
       'a refusal from the server is said in its own words, and the dialog stays',
       'Remove asks first, then takes the access away',
       'on another computer the tab only lists',

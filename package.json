@@ -22,6 +22,7 @@
     "test:e2e:desktop": "node --experimental-websocket scripts/e2e-desktop.mjs",
     "test:e2e:keyboard": "node --experimental-websocket scripts/e2e-keyboard.mjs",
     "test:e2e:multiuser": "node --experimental-websocket scripts/e2e-multiuser.mjs",
+    "test:e2e:agent": "node --experimental-websocket scripts/e2e-agent.mjs",
     "test:crawl": "node scripts/crawl.mjs",
     "typecheck": "tsc --noEmit",
     "electron:dev": "electron .",

@@ -16,8 +16,13 @@ import {
   HOST,
   IronbooksClient,
   IronbooksError,
+  LOST_ANSWER_MESSAGE,
   NOT_CONNECTED_MESSAGE,
+  NOT_STARTED_MESSAGE,
   NO_TOKEN_MESSAGE,
+  START_ENV,
+  appStartCommand,
+  appStartEnv,
   endpointDir,
   expectedProof,
   loadToken,
@@ -291,6 +296,134 @@ describe('the connector and the app agree', () => {
       else process.env.IRONBOOKS_AGENT_ENDPOINT_DIR = before.dir;
       if (before.port === undefined) delete process.env.PORT;
       else process.env.PORT = before.port;
+    }
+  });
+});
+
+describe('starting Ironbooks when it is closed', () => {
+  const installed = {
+    execPath: 'C:\\Program Files\\Ironbooks\\Ironbooks.exe',
+    scriptDir: 'C:\\Program Files\\Ironbooks\\resources\\mcp',
+    electron: '41.0.0',
+    exists: (p: string) => p.replace(/\\/g, '/').endsWith('/resources/app'),
+  };
+  /** A stand-in for starting the app: counts, and (optionally) "comes up" a moment later. */
+  function starter(comesUpOn?: () => number) {
+    const s = { started: 0, start: () => undefined as void };
+    s.start = () => {
+      s.started++;
+      if (comesUpOn) setTimeout(() => writeEndpoint(comesUpOn()), 60);
+    };
+    return s;
+  }
+
+  it('only when the settings ask for it, and only from the connector inside an installed Ironbooks', () => {
+    expect(START_ENV).toBe('IRONBOOKS_AGENT_START');
+    expect(appStartCommand({ [START_ENV]: '1' }, installed)).toEqual({ command: installed.execPath, args: ['--agent-service'] });
+    // Not asked for: never.
+    expect(appStartCommand({}, installed)).toBeNull();
+    expect(appStartCommand({ [START_ENV]: 'true' }, installed)).toBeNull();
+    expect(appStartCommand({ [START_ENV]: '0' }, installed)).toBeNull();
+    // Run by plain Node (a source checkout): there is no app to start.
+    expect(appStartCommand({ [START_ENV]: '1' }, { ...installed, electron: undefined })).toBeNull();
+    // A copy of the script somewhere else, or no app beside it: never.
+    expect(appStartCommand({ [START_ENV]: '1' }, { ...installed, scriptDir: 'C:\\Users\\me\\Downloads\\mcp', exists: () => false })).toBeNull();
+    expect(appStartCommand({ [START_ENV]: '1' }, { ...installed, scriptDir: 'C:\\Program Files\\Ironbooks\\resources\\other' })).toBeNull();
+    // Under the test runner (plain Node) the real thing is off too.
+    expect(appStartCommand({ [START_ENV]: '1' })).toBeNull();
+  });
+
+  it('the command is never taken from the environment', () => {
+    const cmd = appStartCommand({ [START_ENV]: '1', IRONBOOKS_APP: 'C:\\other.exe', IRONBOOKS_URL: 'http://example.com' }, installed);
+    expect(cmd).toEqual({ command: installed.execPath, args: ['--agent-service'] });
+  });
+
+  it('Ironbooks is started without the token and without the settings meant for the connector', () => {
+    const env = appStartEnv({ PATH: 'x', ELECTRON_RUN_AS_NODE: '1', IRONBOOKS_AGENT_TOKEN: TOKEN, IRONBOOKS_AGENT_TOKEN_FILE: 'C:\\t.txt', [START_ENV]: '1', IRONBOOKS_AGENT_ENDPOINT_DIR: DIR });
+    expect(env).toEqual({ PATH: 'x' });
+  });
+
+  it('a connector that may not start it behaves exactly as before', async () => {
+    const c = client({ startApp: null });
+    expect((await failure(c.get('/api/accounts'))).message).toBe(NOT_CONNECTED_MESSAGE);
+    expect(app.seen).toEqual([]);
+  });
+
+  it('starts it once, waits for it to open the company file, proves it, then sends', async () => {
+    const s = starter(() => app.port);
+    const c = client({ startApp: s.start, startPollMs: 20, startWaitMs: 4000 });
+    app.reply = { status: 200, body: JSON.stringify({ accounts: [] }) };
+    expect(await c.get('/api/accounts')).toEqual({ accounts: [] });
+    expect(s.started).toBe(1);
+    // Proof first, then the token on that connection, as always.
+    expect(app.seen.map((r) => r.url.split('?')[0])).toEqual(['/api/agent/hello', '/api/accounts']);
+    expect(app.seen[0].auth).toBeUndefined();
+    expect(app.seen[1].socket).toBe(app.seen[0].socket);
+    // Running now: the next request starts nothing.
+    await c.get('/api/accounts');
+    expect(s.started).toBe(1);
+  });
+
+  it('a leftover endpoint file from a run that is gone is no obstacle, and never gets the token', async () => {
+    const dead = await stub();
+    const deadPort = dead.port;
+    await dead.close();
+    writeEndpoint(deadPort);
+    const s = starter(() => app.port);
+    const c = client({ startApp: s.start, startPollMs: 20, startWaitMs: 4000 });
+    expect(await c.act({ action: 'enter_journal_entry', input: {}, requestId: 'r-1' })).toEqual({ ok: true });
+    expect(s.started).toBe(1);
+    expect(app.seen.filter((r) => r.auth !== undefined)).toHaveLength(1);
+  });
+
+  it('when Ironbooks does not come up, the agent is told why in plain words, and it is not started over and over', async () => {
+    const s = starter();
+    const c = client({ startApp: s.start, startPollMs: 10, startWaitMs: 80, startEveryMs: 60_000 });
+    const first = await failure(c.get('/api/accounts'));
+    expect(first.message).toBe(NOT_STARTED_MESSAGE);
+    expect(first.message).not.toContain(TOKEN);
+    expect((await failure(c.get('/api/accounts'))).message).toBe(NOT_STARTED_MESSAGE);
+    expect((await failure(c.act({ action: 'x' }))).message).toBe(NOT_STARTED_MESSAGE);
+    expect(s.started).toBe(1);
+    expect(app.seen).toEqual([]);
+  });
+
+  it('a program on the port that cannot prove itself is never sent the token, started or not', async () => {
+    writeEndpoint(app.port);
+    app.check = 'cd'.repeat(32);
+    const s = starter();
+    const c = client({ startApp: s.start, startPollMs: 10, startWaitMs: 80 });
+    expect((await failure(c.get('/api/accounts'))).message).toBe(NOT_STARTED_MESSAGE);
+    expect(s.started).toBe(1);
+    expect(tokenSeen()).toBe(false);
+  });
+
+  it('a change whose answer was lost is never sent again by starting the app', async () => {
+    const s = starter(() => app.port);
+    let got = 0;
+    // Proves itself, takes the change, then drops the connection without answering.
+    const dropper = http.createServer((req, res) => {
+      const url = new URL(req.url ?? '/', 'http://x');
+      if (url.pathname === '/api/agent/hello') {
+        const port = (dropper.address() as AddressInfo).port;
+        res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ proof: expectedProof(CHECK, url.searchParams.get('nonce'), port, url.searchParams.get('tag')) }));
+        return;
+      }
+      got++;
+      req.socket.destroy();
+    });
+    await new Promise<void>((resolve) => dropper.listen(0, HOST, resolve));
+    try {
+      writeEndpoint((dropper.address() as AddressInfo).port);
+      const c = client({ startApp: s.start, startPollMs: 10, startWaitMs: 80 });
+      const err = await failure(c.act({ action: 'enter_journal_entry', input: {}, requestId: 'r-2' }));
+      expect(err.message).toBe(LOST_ANSWER_MESSAGE);
+      expect(got).toBe(1);
+      expect(s.started).toBe(0);
+      expect(app.seen).toEqual([]);
+    } finally {
+      dropper.closeAllConnections();
+      await new Promise<void>((resolve) => dropper.close(() => resolve()));
     }
   });
 });

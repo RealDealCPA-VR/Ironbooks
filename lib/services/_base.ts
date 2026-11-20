@@ -53,7 +53,17 @@ export interface ServiceContext {
    * (`userId` is then null). `writeAudit` records it, so the audit trail and the transaction log
    * name the agent.
    */
-  agent?: { id: string; name: string; mode: 'read_only' | 'propose' | 'post' };
+  agent?: {
+    id: string;
+    name: string;
+    mode: 'read_only' | 'propose' | 'post';
+    /**
+     * The person answerable for what the agent enters: the Admin who let it in, or the person who
+     * approved its proposal. Fills the few "entered by" columns that must name a person
+     * (journal_entries.created_by …); the agent itself is recorded next to it (agent_id).
+     */
+    onBehalfOf?: string | null;
+  };
   /**
    * True for a context that must not change the books: `db` is then a read-only handle
    * (lib/db/readOnly.ts) and services that would save defaults on a first read skip that.
@@ -136,7 +146,7 @@ export async function writeAudit(
   await logTransaction(ctx.db, {
     companyId: ctx.companyId,
     userId: ctx.userId,
-    // An agent has no user id; the log names it instead (lib/services/agents.ts agentActorName).
+    // The log names the agent (and the person who approved it, when one did).
     ...(ctx.agent ? { actorName: `${ctx.agent.name} (agent)` } : {}),
     action: params.action,
     entityType: params.entityType,

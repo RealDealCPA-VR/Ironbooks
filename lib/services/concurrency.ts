@@ -21,6 +21,7 @@
  */
 import { and, desc, eq } from 'drizzle-orm';
 import {
+  agents,
   accounts,
   auditLogs,
   billPayments,
@@ -150,14 +151,17 @@ async function loadVersion(ctx: ServiceContext, entity: VersionedEntity, id: str
  */
 async function lastChangedBy(ctx: ServiceContext, entity: VersionedEntity, id: string): Promise<string | null> {
   const [row] = await ctx.db
-    .select({ userName: users.name })
+    .select({ userName: users.name, agentName: agents.name })
     .from(auditLogs)
     .leftJoin(users, eq(users.id, auditLogs.userId))
+    .leftJoin(agents, eq(agents.id, auditLogs.agentId))
     .where(
       and(eq(auditLogs.companyId, ctx.companyId), eq(auditLogs.entityId, id), eq(auditLogs.entityType, entity)),
     )
     .orderBy(desc(auditLogs.createdAt))
     .limit(1);
+  // A change an agent made is named as the agent's (AGENT_ACCESS.md).
+  if (row?.agentName) return `${row.agentName} (agent)`;
   return row?.userName ?? null;
 }
 

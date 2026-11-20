@@ -383,7 +383,7 @@ async function trimCopy(db: DB, companyId: string, to: string): Promise<TrimCoun
       );
       await tx.exec('DELETE FROM receipt_scans');
     }
-    for (const t of ['undo_actions', 'receipt_upload_tokens', 'agents', 'attention_item_states', 'backup_log']) {
+    for (const t of ['undo_actions', 'receipt_upload_tokens', 'agents', 'agent_requests', 'attention_item_states', 'backup_log']) {
       if (cols.has(t)) await tx.exec(`DELETE FROM ${qi(t)}`);
     }
     // Month-end close reviews of months after the period.

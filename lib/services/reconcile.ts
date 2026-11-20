@@ -317,7 +317,8 @@ async function startReconciliationInTx(
         statementDate: statementDate,
         statementBalance: statementBalance,
         status: 'in_progress',
-        createdBy: tx.userId ?? '00000000-0000-0000-0000-000000000000',
+        createdBy: tx.userId ?? tx.agent?.onBehalfOf ?? '00000000-0000-0000-0000-000000000000',
+        agentId: tx.agent?.id ?? null,
       })
       .returning();
 

@@ -376,6 +376,7 @@ const OUTSIDER_VIEWS: Record<string, DumpView> = {
   user_sessions: { none: true },
   receipt_upload_tokens: { none: true },
   agents: { none: true },
+  agent_requests: { none: true },
   password_history: { none: true },
   file_secrets: { none: true },
   file_key_slots: { none: true },

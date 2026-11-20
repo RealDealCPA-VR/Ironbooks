@@ -12,6 +12,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 export const AGENT_TOKEN_ENV = 'IRONBOOKS_AGENT_TOKEN';
+/** Lets the connector start Ironbooks when it is closed (mcp/client.mjs START_ENV). */
+export const AGENT_START_ENV = 'IRONBOOKS_AGENT_START';
 export const MCP_SCRIPT = 'ironbooks-mcp.mjs';
 
 export interface AgentConnection {
@@ -31,6 +33,16 @@ function exists(p: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * The settings for an agent an Admin allowed to work while nobody is signed in: the same command,
+ * plus the switch that lets the connector start Ironbooks when it is closed. Only the installed
+ * app can be started that way; a source checkout's settings are left as they are.
+ */
+export function forUnattended(c: AgentConnection | null): AgentConnection | null {
+  if (!c || !c.installed) return c;
+  return { ...c, env: { ...c.env, [AGENT_START_ENV]: '1' } };
 }
 
 export function agentConnection(

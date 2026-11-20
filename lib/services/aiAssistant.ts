@@ -19,6 +19,8 @@ import { and, desc, eq, gte, ilike, inArray, lte, or, sql } from 'drizzle-orm';
 import { z } from 'zod';
 import { accounts, aiProposals, customers, invoices, items, journalEntries, journalEntryLines, vendors } from '@/lib/db/schema';
 import { Money, toAmountString, formatCurrency } from '@/lib/money';
+import { AGENT_PROPOSAL_KIND, runApprovedAgentAction } from '@/lib/agent/actions';
+import '@/lib/agent/catalog';
 import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
 import { balanceSheet, profitAndLoss, trialBalance } from './reports';
 import { apAging, arAging, cashFlow, expensesByVendor, openInvoices, salesByCustomer } from './reportsExtra';
@@ -998,6 +1000,25 @@ export async function approveProposal(ctx: ServiceContext, id: string): Promise<
         oldValues: { status: 'pending' },
         newValues: { status: 'approved', invoiceId: inv.id },
         llmReasoning: (row.payload as { rationale?: string | null }).rationale ?? 'Approved assistant invoice proposal.',
+      });
+      return toView(updated);
+    }
+    if (row.kind === AGENT_PROPOSAL_KIND) {
+      // A change an outside agent proposed (lib/agent/actions.ts): entered now under the
+      // approving person's own permissions, recorded as proposed by the agent and approved by them.
+      const done = await runApprovedAgentAction(tx, row.payload);
+      const [updated] = await tx.db
+        .update(aiProposals)
+        .set({ status: 'approved', resultRef: done.resultRef, decidedBy: tx.userId, decidedAt: new Date() })
+        .where(eq(aiProposals.id, id))
+        .returning();
+      await writeAudit(tx, {
+        action: 'update',
+        entityType: 'ai_proposal',
+        entityId: id,
+        oldValues: { status: 'pending' },
+        newValues: { status: 'approved', result: done.result },
+        llmReasoning: (row.payload as { rationale?: string | null }).rationale ?? 'Approved a proposal made by an agent.',
       });
       return toView(updated);
     }

@@ -952,7 +952,7 @@ export async function importTransactions(
       })(),
       fileType: fileTypeForDb as never,
       status: 'processing',
-      uploadedBy: ctx.userId ?? '00000000-0000-0000-0000-000000000000',
+      uploadedBy: ctx.userId ?? ctx.agent?.onBehalfOf ?? '00000000-0000-0000-0000-000000000000',
     })
     .returning();
 

@@ -124,6 +124,8 @@ export const journalEntries = pgTable('journal_entries', {
   /** QB "Adjusting Entry" checkbox (accountant adjustments); wave2 foundation. */
   isAdjusting: boolean('is_adjusting').notNull().default(false),
   createdBy: uuid('created_by').references(() => users.id).notNull(),
+  /** The agent behind the entry (agents.id, drizzle/0096), next to the person answerable in createdBy. No FK. */
+  agentId: uuid('agent_id'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
   voidedAt: timestamp('voided_at'),
@@ -180,6 +182,8 @@ export const reconciliations = pgTable('reconciliations', {
   reconciledBalance: decimal('reconciled_balance', { precision: 15, scale: 2 }),
   status: varchar('status', { length: 50 }).notNull().default('in_progress'),
   createdBy: uuid('created_by').references(() => users.id).notNull(),
+  /** The agent that started it (agents.id, drizzle/0096). No FK. */
+  agentId: uuid('agent_id'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   completedAt: timestamp('completed_at'),
 });
@@ -1909,6 +1913,8 @@ export const aiProposals = pgTable('ai_proposals', {
   error: text('error'),
   decidedBy: uuid('decided_by').references(() => users.id),
   decidedAt: timestamp('decided_at'),
+  /** The outside agent that proposed it (agents.id, drizzle/0096); null for the built-in assistant. No FK. */
+  agentId: uuid('agent_id'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -3111,4 +3117,24 @@ export const agents = pgTable('agents', {
   lastUsedAt: timestamp('last_used_at'),
   revokedAt: timestamp('revoked_at'),
   revokedBy: uuid('revoked_by'),
+  /** May work while the file is open but nobody is signed in (drizzle/0096). Off unless an Admin turns it on. */
+  unattended: boolean('unattended').notNull().default(false),
+});
+
+/**
+ * 0096 agent access: a change an agent asked for under a request id (lib/agent/actions.ts). The
+ * same id asked again answers with the stored `result` instead of entering the change twice; the
+ * same id with different input is refused (`inputHash`). `outcome`: 'posted' | 'proposed'.
+ * Never travels with a copy of the company.
+ */
+export const agentRequests = pgTable('agent_requests', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  agentId: uuid('agent_id').notNull(),
+  requestKey: varchar('request_key', { length: 120 }).notNull(),
+  action: varchar('action', { length: 60 }).notNull(),
+  inputHash: varchar('input_hash', { length: 64 }).notNull(),
+  outcome: varchar('outcome', { length: 16 }).notNull(),
+  result: jsonb('result'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
 });

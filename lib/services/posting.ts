@@ -426,7 +426,9 @@ export async function postJournalEntry(ctx: ServiceContext, input: PostJournalEn
         status,
         sourceRef: input.sourceRef ?? null,
         isAdjusting: input.isAdjusting ?? false,
-        createdBy: tx.userId ?? '00000000-0000-0000-0000-000000000000',
+        // An agent's entry names the person answerable for it, and the agent itself (agentId).
+        createdBy: tx.userId ?? tx.agent?.onBehalfOf ?? '00000000-0000-0000-0000-000000000000',
+        agentId: tx.agent?.id ?? null,
       })
       .returning();
 

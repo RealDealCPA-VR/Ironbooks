@@ -186,15 +186,37 @@ describe('the shipped server', () => {
   it('names itself and describes its tools for an agent', () => {
     expect(SERVER_INFO.name).toBe('ironbooks');
     expect(INSTRUCTIONS).toMatch(/get_company_info/);
-    expect(INSTRUCTIONS).toMatch(/Nothing here can change the books/);
+    expect(INSTRUCTIONS).toMatch(/dry_run/);
+    expect(INSTRUCTIONS).toMatch(/SAME request_id/);
+    expect(INSTRUCTIONS).toMatch(/Nothing is ever deleted/);
     const names = TOOLS.map((t) => t.name);
     expect(new Set(names).size).toBe(names.length);
-    for (const t of TOOLS) {
+    for (const t of TOOLS as Array<Msg>) {
       expect(t.name, t.name).toMatch(/^[a-z][a-z0-9_]{2,40}$/);
       expect(t.description.length, t.name).toBeGreaterThan(60);
       expect(t.inputSchema, t.name).toMatchObject({ type: 'object', additionalProperties: false });
-      // No tool offers to change anything.
-      expect(t.name).not.toMatch(/^(create|add|update|delete|void|post|pay|set|edit|remove)_/);
+      // A tool whose name says it changes something is marked as one, takes a dry run and a
+      // request id; a tool that only looks takes neither. Nothing offers to delete.
+      const changing = /^(enter|add|edit|void|deactivate|pay|write|make|transfer|receive|import|categorize|match|unmatch|exclude|start|mark|update|finish|cancel|undo)_/.test(t.name);
+      expect(t.changes === true, t.name).toBe(changing);
+      expect('dry_run' in t.inputSchema.properties, t.name).toBe(changing);
+      expect('request_id' in t.inputSchema.properties, t.name).toBe(changing);
+      expect(t.name).not.toMatch(/^(delete|remove|drop|purge)_/);
     }
+  });
+
+  it('marks the tools that change the books, and the ones that void', async () => {
+    const s = createServer({ tools: TOOLS, client: {}, serverInfo: SERVER_INFO });
+    const listed = ((await s.handle({ jsonrpc: '2.0', id: 1, method: 'tools/list' })) as Msg).result.tools as Msg[];
+    const hint = (name: string) => listed.find((t) => t.name === name)!.annotations;
+    expect(hint('report_trial_balance')).toMatchObject({ readOnlyHint: true, destructiveHint: false });
+    expect(hint('get_transaction')).toMatchObject({ readOnlyHint: true, destructiveHint: false });
+    expect(hint('enter_invoice')).toMatchObject({ readOnlyHint: false, destructiveHint: false, idempotentHint: true });
+    expect(hint('void_transaction')).toMatchObject({ readOnlyHint: false, destructiveHint: true });
+    expect(hint('deactivate_list_entry')).toMatchObject({ readOnlyHint: false, destructiveHint: true });
+    expect(hint('import_statement_lines')).toMatchObject({ readOnlyHint: false, destructiveHint: false });
+    expect(hint('undo_last_reconciliation')).toMatchObject({ readOnlyHint: false, destructiveHint: true });
+    expect(hint('get_bank_feed')).toMatchObject({ readOnlyHint: true });
+    expect(listed.filter((t) => !t.annotations.readOnlyHint).length).toBe(30);
   });
 });

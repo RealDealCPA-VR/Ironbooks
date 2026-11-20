@@ -1209,6 +1209,7 @@ export const COMPANY_BACKUP_EXCLUDED_TABLES: Record<string, string> = {
   backup_log: 'backup history of the source machine',
   receipt_upload_tokens: 'short-lived phone-upload tokens; must not be replayable elsewhere',
   agents: 'agent access is given on one computer for one company file; a restored company starts with none',
+  agent_requests: 'the record of what each agent already asked for; it belongs to agents that do not travel',
   accountant_copies: "Accountant's Copy transfer state belongs to the source file",
   ai_settings:
     "AI provider config holds API keys and the ChatGPT sign-in, sealed for the computer that entered them (device secret, lib/ai/keyVault.ts \"v3:\") or, in a file protected with passwords, with the source company file's own key (file_secrets); either way bound to the source company's id, and a per-company restore makes a new company (and does not carry file_secrets)",

@@ -5,7 +5,8 @@
  * A client such as Claude Code or Claude Desktop starts this script and talks to it on its
  * standard input and output. The script reads the books through the Ironbooks app running on this
  * computer, with the access token an Ironbooks Admin made for the agent (AGENT_ACCESS.md). It
- * opens no port, reaches nothing but 127.0.0.1, and can only read.
+ * opens no port and reaches nothing but 127.0.0.1. What the agent may do (read, propose, enter)
+ * is decided by Ironbooks, not here.
  *
  * Run it with Node 18 or newer:        node mcp/ironbooks-mcp.mjs
  * or with the installed app's program: Ironbooks.exe <resources>\mcp\ironbooks-mcp.mjs

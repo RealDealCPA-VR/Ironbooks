@@ -43,3 +43,11 @@ export function bearerAgentToken(h: HeaderSource): string | null {
 export function tokenFileTag(token: string): string | null {
   return AGENT_TOKEN_RE.exec(token)?.[1] ?? null;
 }
+
+/** The one route through which an agent asks for a change, a dry run, or a guarded read. */
+export const AGENT_ACTION_ROUTE = '/api/agent/actions';
+
+/** True for the one non-read request an agent may make: POST to the action route. */
+export function isAgentActionRequest(path: string | null | undefined, method: string | null | undefined): boolean {
+  return path === AGENT_ACTION_ROUTE && typeof method === 'string' && method.toUpperCase() === 'POST';
+}

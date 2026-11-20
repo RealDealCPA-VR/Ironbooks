@@ -51,7 +51,7 @@ export default function AiActivityCard({ a }: { a: AiActivity }) {
       tone: 'electric',
     });
   }
-  if (a.pendingProposals > 0) rows.push({ href: '/dashboard?assistant=1', n: a.pendingProposals, text: 'entries the assistant drafted, waiting for your approval (Ask AI)', tone: 'electric' });
+  if (a.pendingProposals > 0) rows.push({ href: '/dashboard?assistant=1', n: a.pendingProposals, text: 'entries the assistant or an agent drafted, waiting for your approval (Ask AI)', tone: 'electric' });
   if (a.ruleOffers > 0) rows.push({ href: '/bank-rules', n: a.ruleOffers, text: 'learned payee rules ready to turn on', tone: 'electric' });
   return (
     <Card className="mt-8 max-w-3xl p-6">

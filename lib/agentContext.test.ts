@@ -170,8 +170,9 @@ describe('after a person signed in', () => {
     expect(ctx.companyId).toBe(companyId);
     expect(ctx.userId).toBeNull();
     expect(ctx.sessionId).toBeUndefined();
-    expect(ctx.agent).toEqual({ id: agentId, name: 'Reader', mode: 'post' });
-    // Post mode is stored, but in this version every agent only reads.
+    expect(ctx.agent).toEqual({ id: agentId, name: 'Reader', mode: 'post', onBehalfOf: ownerId });
+    // Even in Post mode, the context a request arrives with only reads. A change is made by the
+    // action runner alone (lib/agent/actions.ts), for one action.
     expect(ctx.readOnly).toBe(true);
     expect(ctx.role).toBe('viewer');
     expect(isReadOnlyDb(ctx.db)).toBe(true);
@@ -233,11 +234,21 @@ describe('after a person signed in', () => {
     expect((await getServerContext()).agent?.id).toBe(agentId);
   });
 
-  it('only reads: every other method is refused', async () => {
+  it('only reads: every other method is refused, except a POST to the one action route', async () => {
     for (const method of ['POST', 'PUT', 'PATCH', 'DELETE']) {
       request(method, '/api/accounts', { token });
       await refusedWith(getServerContext(), AGENT_NOT_AVAILABLE_MESSAGE);
     }
+    for (const method of ['PUT', 'PATCH', 'DELETE', 'GET']) {
+      request(method, '/api/agent/actions', { token });
+      await refusedWith(getServerContext(), AGENT_NOT_AVAILABLE_MESSAGE);
+    }
+    // The action route gives the same read-only context; the runner decides what may change.
+    request('POST', '/api/agent/actions', { token });
+    const actionCtx = await getServerContext();
+    expect(actionCtx.readOnly).toBe(true);
+    expect(actionCtx.role).toBe('viewer');
+    expect(isReadOnlyDb(actionCtx.db)).toBe(true);
     request('HEAD', '/api/accounts', { token });
     expect((await getServerContext()).agent?.id).toBe(agentId);
   });
@@ -260,7 +271,10 @@ describe('after a person signed in', () => {
       '/api/bank-transactions/suggestions',
       '/api/sessions',
       '/api/audit-trail',
-      '/api/invoices',
+      '/api/estimates',
+      '/api/payroll/paychecks',
+      '/api/bank-rules',
+      '/api/reconciliations/11111111-2222-4333-8444-555555555555/report',
       '/api/no-such-route',
       '/api',
       '/dashboard',
@@ -523,7 +537,7 @@ describe('finding the app', () => {
     const res = await whoamiGET();
     expect(res.status).toBe(200);
     const info = await res.json();
-    expect(info.agent).toEqual({ name: 'Reader', mode: 'post', modeLabel: 'Post', canChangeBooks: false, roles: ['Bookkeeper'] });
+    expect(info.agent).toEqual({ name: 'Reader', mode: 'post', modeLabel: 'Post', canChangeBooks: true, canProposeChanges: true, roles: ['Bookkeeper'] });
     expect(info.company).toMatchObject({ name: 'Agent Context Co', fiscalYearEnd: '12-31', reportBasis: 'accrual', closingDate: null });
     expect(info.company.today).toMatch(/^\d{4}-\d{2}-\d{2}$/);
     expect(info.company).not.toHaveProperty('settings');

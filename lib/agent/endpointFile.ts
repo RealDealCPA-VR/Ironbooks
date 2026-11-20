@@ -89,6 +89,15 @@ export function notePersonSignedIn(dataDir: string, hostHeader?: string | null):
   return true;
 }
 
+/**
+ * The port a request from the desktop shell itself arrived on (app/api/agent/service: the shell
+ * started the app for an agent, so no person's request has shown the port yet).
+ */
+export function noteServerPort(hostHeader?: string | null): void {
+  const port = portFromHost(hostHeader);
+  if (port) state.seenPort = port;
+}
+
 /** Has a person signed in to this data folder during this run of the app? */
 export function personSignedIn(dataDir: string): boolean {
   return state.signedIn.has(dataDir);

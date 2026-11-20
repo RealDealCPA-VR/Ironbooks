@@ -206,9 +206,15 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
   '/api/agents/[id]': r('users', 'DELETE:modify'),
   // For the agent itself: who it is here and which books these are (a chosen set of facts).
   '/api/agent/whoami': kind('member', 'GET'),
+  // The one route an agent's changes go through. Each action is checked against the route a
+  // person would use for the same thing, and against the agent's mode (lib/agent/actions.ts).
+  '/api/agent/actions': kind('member', 'POST'),
   // The connector's check that it is talking to this Ironbooks before it shows its token
   // (lib/agent/endpointFile.ts); answers from memory, never opens the company file.
   '/api/agent/hello': kind('public', 'GET'),
+  // The desktop shell's own calls when it was started for an agent with no window showing
+  // (internal token checked in the handler, so 'public' here, like closing the company file).
+  '/api/agent/service': kind('public', 'GET POST'),
   '/api/users/[id]': r('users', 'GET PATCH'),
   '/api/users/[id]/reset-password': r('users', 'POST:modify'),
   '/api/users/password-policy': r('users', 'GET PUT:modify'), // gapsb K: Admin-only save (requireFileAdmin)

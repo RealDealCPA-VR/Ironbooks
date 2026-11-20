@@ -17,7 +17,11 @@ export const ERR_INVALID_PARAMS = -32602;
 
 /**
  * @typedef {{ name: string, title?: string, description: string, inputSchema: object,
+ *   changes?: boolean, destructive?: boolean,
  *   handler: (args: Record<string, any>, client: any) => Promise<unknown> }} Tool
+ *
+ * `changes`: the tool can change the books (every such change can be dry-run and repeated safely
+ * with its request id). `destructive`: it voids or makes something inactive.
  */
 
 /** A tool failure the agent should read as a plain message (not a protocol error). */
@@ -29,41 +33,86 @@ function isObject(v) {
 }
 
 /**
- * Check tool arguments against the tool's input schema: the small subset of JSON Schema the tools
- * use (object with typed properties, `required`, `enum`, no unknown properties). Returns the
- * first problem in plain words, or null.
+ * Check one value against the small subset of JSON Schema the tools use: strings (enum, pattern,
+ * maxLength), integers and numbers (minimum, maximum), booleans, arrays (items, minItems,
+ * maxItems) and objects (properties, required, no unknown properties unless the schema allows
+ * them). Returns the first problem in plain words, or null.
+ * @param {any} s  the schema
+ * @param {unknown} v  the value
+ * @param {string} name  how to call the value in a message
+ * @returns {string | null}
+ */
+function valueProblem(s, v, name) {
+  if (s.type === 'string') {
+    if (typeof v !== 'string') return `${name} must be text.`;
+    if (s.enum && !s.enum.includes(v)) return `${name} must be one of: ${s.enum.join(', ')}.`;
+    if (s.pattern && !new RegExp(s.pattern).test(v)) return `${name} ${s.patternHint ?? 'is not in the expected form'}.`;
+    if (typeof s.maxLength === 'number' && v.length > s.maxLength) return `${name} is too long.`;
+    return null;
+  }
+  if (s.type === 'integer' || s.type === 'number') {
+    if (typeof v !== 'number' || !Number.isFinite(v) || (s.type === 'integer' && !Number.isInteger(v))) {
+      return `${name} must be a ${s.type === 'integer' ? 'whole number' : 'number'}.`;
+    }
+    if (typeof s.minimum === 'number' && v < s.minimum) return `${name} must be at least ${s.minimum}.`;
+    if (typeof s.maximum === 'number' && v > s.maximum) return `${name} must be at most ${s.maximum}.`;
+    return null;
+  }
+  if (s.type === 'boolean') return typeof v === 'boolean' ? null : `${name} must be true or false.`;
+  if (s.type === 'array') {
+    if (!Array.isArray(v)) return `${name} must be a list.`;
+    if (typeof s.minItems === 'number' && v.length < s.minItems) return `${name} needs at least ${s.minItems} ${s.minItems === 1 ? 'entry' : 'entries'}.`;
+    if (typeof s.maxItems === 'number' && v.length > s.maxItems) return `${name} can have at most ${s.maxItems} entries.`;
+    if (s.items) {
+      for (let i = 0; i < v.length; i++) {
+        const p = valueProblem(s.items, v[i], `${name}[${i + 1}]`);
+        if (p) return p;
+      }
+    }
+    return null;
+  }
+  if (s.type === 'object') return objectProblem(s, v, name);
+  return null;
+}
+
+/**
+ * @param {any} schema
+ * @param {unknown} value
+ * @param {string} [name]  empty for the arguments themselves
+ * @returns {string | null}
+ */
+function objectProblem(schema, value, name = '') {
+  if (!isObject(value)) return name ? `${name} must be an object.` : 'The arguments must be an object.';
+  const obj = /** @type {Record<string, unknown>} */ (value);
+  const props = schema.properties ?? {};
+  const label = (/** @type {string} */ key) => (name ? `${name}.${key}` : `"${key}"`);
+  if (schema.additionalProperties !== true) {
+    for (const key of Object.keys(obj)) {
+      if (!Object.prototype.hasOwnProperty.call(props, key)) return name ? `${name} has an unknown field "${key}".` : `Unknown argument "${key}".`;
+    }
+  }
+  for (const key of schema.required ?? []) {
+    const v = obj[key];
+    if (v === undefined || v === null || v === '') return `${label(key)} is required.`;
+  }
+  for (const [key, spec] of Object.entries(props)) {
+    const v = obj[key];
+    if (v === undefined || v === null) continue;
+    const p = valueProblem(spec, v, label(key));
+    if (p) return p;
+  }
+  return null;
+}
+
+/**
+ * Check tool arguments against the tool's input schema. Returns the first problem in plain words,
+ * or null. Ironbooks checks everything again itself; this only gives the agent an answer sooner.
  * @param {any} schema
  * @param {unknown} args
  * @returns {string | null}
  */
 export function argumentProblem(schema, args) {
-  if (!isObject(args)) return 'The arguments must be an object.';
-  const props = schema.properties ?? {};
-  for (const key of Object.keys(/** @type {object} */ (args))) {
-    if (!Object.prototype.hasOwnProperty.call(props, key)) return `Unknown argument "${key}".`;
-  }
-  for (const key of schema.required ?? []) {
-    const v = /** @type {Record<string, unknown>} */ (args)[key];
-    if (v === undefined || v === null || v === '') return `"${key}" is required.`;
-  }
-  for (const [key, spec] of Object.entries(props)) {
-    const v = /** @type {Record<string, unknown>} */ (args)[key];
-    if (v === undefined || v === null) continue;
-    const s = /** @type {any} */ (spec);
-    if (s.type === 'string') {
-      if (typeof v !== 'string') return `"${key}" must be text.`;
-      if (s.enum && !s.enum.includes(v)) return `"${key}" must be one of: ${s.enum.join(', ')}.`;
-      if (s.pattern && !new RegExp(s.pattern).test(v)) return `"${key}" ${s.patternHint ?? 'is not in the expected form'}.`;
-      if (typeof s.maxLength === 'number' && v.length > s.maxLength) return `"${key}" is too long.`;
-    } else if (s.type === 'integer') {
-      if (typeof v !== 'number' || !Number.isInteger(v)) return `"${key}" must be a whole number.`;
-      if (typeof s.minimum === 'number' && v < s.minimum) return `"${key}" must be at least ${s.minimum}.`;
-      if (typeof s.maximum === 'number' && v > s.maximum) return `"${key}" must be at most ${s.maximum}.`;
-    } else if (s.type === 'boolean') {
-      if (typeof v !== 'boolean') return `"${key}" must be true or false.`;
-    }
-  }
-  return null;
+  return objectProblem(schema, args);
 }
 
 /**
@@ -108,7 +157,7 @@ export function createServer(opts) {
           ...(t.title ? { title: t.title } : {}),
           description: t.description,
           inputSchema: t.inputSchema,
-          annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false, ...(t.title ? { title: t.title } : {}) },
+          annotations: { readOnlyHint: t.changes !== true, destructiveHint: t.destructive === true, idempotentHint: true, openWorldHint: false, ...(t.title ? { title: t.title } : {}) },
         })),
       });
     }

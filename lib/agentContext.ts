@@ -13,12 +13,14 @@
  *
  *  1. It must be a program on the computer that holds the company file: not through the
  *     multi-user proxy, not from a web page.
- *  2. The route must be on the agent list and the method a read (lib/permissions/agentAccess.ts),
- *     judged on the path and method middleware stamped. No stamp, no access.
+ *  2. The route must be on the agent list (lib/permissions/agentAccess.ts): a read, or a POST to
+ *     the one action route. Judged on the path and method middleware stamped. No stamp, no access.
  *  3. A person must have signed in to this company file during this run of the app, and the file
  *     must not be a practice copy. This is what makes the file password, a file protected with
  *     passwords and a plain file behave the same for agents: the books are open because a person
- *     opened them.
+ *     opened them. The one exception is an agent an Admin allowed to work unattended: it may work
+ *     in a file that is open with nobody signed in, but never in one with a company-file password
+ *     or one protected with passwords (those are only ever opened by a person).
  *  4. The token must belong to an agent that still has access.
  *  5. The agent's company must be usable (not archived) and applications must be allowed
  *     (Preferences > Integrated Applications).
@@ -26,9 +28,10 @@
  *  7. The agent's access is its roles' access with the agent limits, checked against the same
  *     route map as a person's, then the feature and Accountant's Copy gates.
  *
- * The context it returns can only read: a read-only database handle (lib/db/readOnly.ts), the
- * view-only role, no user id, no closing-date override. It always carries both `role` and
- * `access`; their absence means "trusted" elsewhere.
+ * The context it returns can only read, whatever the agent's mode: a read-only database handle
+ * (lib/db/readOnly.ts), the view-only role, no user id, no closing-date override. It always carries
+ * both `role` and `access`; their absence means "trusted" elsewhere. Changes go through the action
+ * runner (lib/agent/actions.ts), which alone makes a context that can write.
  */
 import { eq } from 'drizzle-orm';
 import { getDb, resolveDataDir, sealedMode } from '@/lib/db';
@@ -37,13 +40,14 @@ import { companies } from '@/lib/db/schema';
 import { isArchivedSettings } from '@/lib/auth';
 import { bearerAgentToken } from '@/lib/net/agentToken';
 import { ROUTE_METHOD_HEADER, ROUTE_PATH_HEADER } from '@/lib/permissions/headers';
-import { agentMayWrite, agentRouteAllowed } from '@/lib/permissions/agentAccess';
+import { agentRouteAllowed } from '@/lib/permissions/agentAccess';
 import { authorizeRequest } from '@/lib/permissions/enforce';
 import { enforceFeatureGate } from '@/lib/featureGate';
 import { enforceAccountantCopyGate } from '@/lib/services/accountantCopy/routeGate';
 import { personSignedIn } from '@/lib/agent/endpointFile';
 import { AGENTS_BLOCKED_MESSAGE, agentAccess, findAgentByToken, touchAgent } from '@/lib/services/agents';
 import { assertSessionAllowed } from '@/lib/services/sessions';
+import { getFileLockStatus } from '@/lib/services/fileLock';
 import { isSandboxActive } from '@/lib/services/sandboxState';
 import { ServiceError, type ServiceContext } from '@/lib/services/_base';
 
@@ -75,15 +79,21 @@ export async function getAgentContext(h: HeaderSource): Promise<ServiceContext> 
   const method = h.get(ROUTE_METHOD_HEADER);
   if (!path || !method || !agentRouteAllowed(path, method)) refuse(AGENT_NOT_AVAILABLE_MESSAGE);
 
-  // (3) The books are open because a person opened them.
+  // (3) The books are open because a person opened them. A file protected with passwords is not
+  // open at all until someone signs in, and the database is not touched before that.
   if (sealedMode() !== null) refuse(AGENT_NOT_READY_MESSAGE, { notReady: true });
   if (isSandboxActive()) refuse(AGENT_SANDBOX_MESSAGE);
-  if (!personSignedIn(resolveDataDir())) refuse(AGENT_NOT_READY_MESSAGE, { notReady: true });
+  const signedIn = personSignedIn(resolveDataDir());
 
   // (4) The agent.
   const db = await getDb();
   const agent = await findAgentByToken(db, token);
-  if (!agent) refuse(AGENT_AUTH_MESSAGE);
+  if (!agent) refuse(signedIn ? AGENT_AUTH_MESSAGE : AGENT_NOT_READY_MESSAGE, signedIn ? undefined : { notReady: true });
+  // Nobody has signed in during this run: only an agent an Admin allowed to work unattended goes
+  // on, and never past a company-file password, which only a person can enter.
+  if (!signedIn) {
+    if (!agent.unattended || (await getFileLockStatus(db)).enabled) refuse(AGENT_NOT_READY_MESSAGE, { notReady: true });
+  }
 
   // (5) Its company.
   const [company] = await db.select({ settings: companies.settings }).from(companies).where(eq(companies.id, agent.companyId));
@@ -103,15 +113,16 @@ export async function getAgentContext(h: HeaderSource): Promise<ServiceContext> 
 
   await touchAgent(db, agent.id);
 
-  const mayWrite = agentMayWrite(agent.mode);
+  // Always read-only, whatever the mode. A change is made only by the action runner
+  // (lib/agent/actions.ts), which builds a context that can write for that one action.
   return {
-    db: mayWrite ? db : readOnlyDb(db),
+    db: readOnlyDb(db),
     companyId: agent.companyId,
     userId: null,
-    role: mayWrite ? 'accountant' : 'viewer',
+    role: 'viewer',
     closingDateOverride: false,
     access,
-    agent: { id: agent.id, name: agent.name, mode: agent.mode },
-    readOnly: !mayWrite,
+    agent: { id: agent.id, name: agent.name, mode: agent.mode, onBehalfOf: agent.createdBy },
+    readOnly: true,
   };
 }

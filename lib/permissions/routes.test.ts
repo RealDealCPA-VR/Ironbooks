@@ -147,6 +147,8 @@ describe('API permission map coverage', () => {
         // An agent's connector checks it is talking to this Ironbooks: a keyed hash of its own
         // nonce, answered from memory, nothing from the file (lib/agent/endpointFile.ts).
         '/api/agent/hello',
+        // The shell, started for an agent with no window: internal token only (checked in the handler).
+        '/api/agent/service',
         '/api/auth/2fa/disable',
         '/api/auth/2fa/enable',
         '/api/auth/2fa/recovery-codes', // prefsperms: own recovery codes (new ones need a current code)

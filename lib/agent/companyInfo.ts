@@ -7,7 +7,7 @@
  */
 import { resolveCompanyPreferences } from '@/lib/preferences';
 import { APP_VERSION } from '@/lib/appVersion';
-import { AGENT_MODE_LABELS, agentMayWrite } from '@/lib/permissions/agentAccess';
+import { AGENT_MODE_LABELS, agentMayPropose, agentMayWrite } from '@/lib/permissions/agentAccess';
 import { type ServiceContext, notFound } from '@/lib/services/_base';
 import { listRoleDefinitions } from '@/lib/services/access';
 import { getCompany } from '@/lib/services/company';
@@ -19,8 +19,10 @@ export interface AgentCompanyInfo {
     name: string;
     mode: string;
     modeLabel: string;
-    /** False while this version lets every agent only read. */
+    /** Post: the agent enters changes itself. */
     canChangeBooks: boolean;
+    /** Propose or Post: the agent may ask for changes (entered at once, or after a person approves). */
+    canProposeChanges: boolean;
     roles: string[];
   };
   company: {
@@ -65,6 +67,7 @@ export async function agentCompanyInfo(ctx: ServiceContext): Promise<AgentCompan
           mode: ctx.agent.mode,
           modeLabel: AGENT_MODE_LABELS[ctx.agent.mode],
           canChangeBooks: agentMayWrite(ctx.agent.mode),
+          canProposeChanges: agentMayPropose(ctx.agent.mode),
           roles,
         }
       : null,

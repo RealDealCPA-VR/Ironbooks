@@ -3,7 +3,7 @@ import type { NextRequest } from 'next/server';
 import { ROUTE_METHOD_HEADER, ROUTE_PATH_HEADER } from '@/lib/permissions/headers';
 import { isMobileReceiptPage } from '@/lib/receipts/mobilePath';
 import { isLoopbackHostHeader, isProxiedRequest } from '@/lib/net/loopbackHost';
-import { hasAuthorization } from '@/lib/net/agentToken';
+import { hasAuthorization, isAgentActionRequest } from '@/lib/net/agentToken';
 
 /**
  * Route protection. Edge-safe: only checks for the presence of the session cookie (signature is
@@ -56,11 +56,13 @@ export function middleware(req: NextRequest) {
   }
 
   // Agents (AGENT_ACCESS.md) present an Authorization header; the app's own window and the shell
-  // never send one. Such a request may only read the API: no pages, and nothing but GET / HEAD.
+  // never send one. Such a request may only read the API (GET / HEAD), or POST to the one route
+  // that takes an agent's changes: no pages, and none of the app's own save routes.
   // Which routes, and whether the token is any good, is decided in lib/agentContext.ts.
   const isApi = pathname === '/api' || pathname.startsWith('/api/');
-  if (hasAuthorization(req.headers) && (!isApi || (req.method !== 'GET' && req.method !== 'HEAD'))) {
-    return refuse('This is not available to agents.');
+  if (hasAuthorization(req.headers)) {
+    const read = req.method === 'GET' || req.method === 'HEAD';
+    if (!isApi || !(read || isAgentActionRequest(pathname, req.method))) return refuse('This is not available to agents.');
   }
 
   // API routes: no redirects (handlers answer with JSON 401/403); just stamp for getServerContext.

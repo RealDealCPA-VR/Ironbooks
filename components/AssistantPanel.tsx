@@ -28,7 +28,8 @@ interface Proposal {
   kind: string;
   summary: string;
   status: string;
-  payload: { date: string; description: string; lines: ProposalLine[]; totalDebit: string };
+  /** `agent` is set when an outside agent proposed it (kind 'agent_action', lib/agent/actions.ts). */
+  payload: { date: string; description: string; lines?: ProposalLine[]; totalDebit: string; agent?: { name?: string } | null };
   resultRef: string | null;
 }
 
@@ -186,7 +187,9 @@ function ProposalCard({ p, onChange }: { p: Proposal; onChange: (p: Proposal) =>
       onChange(r.proposal);
       toast(
         action === 'approve'
-          ? p.kind === 'bill'
+          ? p.kind === 'agent_action'
+            ? 'Entered.'
+            : p.kind === 'bill'
             ? 'Bill entered.'
             : p.kind === 'invoice'
               ? 'Invoice created.'
@@ -206,14 +209,25 @@ function ProposalCard({ p, onChange }: { p: Proposal; onChange: (p: Proposal) =>
     <div className="mt-2 rounded-xl border border-gold/40 bg-gold/5 p-3 text-xs">
       <div className="flex items-center justify-between gap-2 mb-2">
         <span className="font-semibold text-navy">
-          {p.kind === 'bill' ? 'Proposed bill' : p.kind === 'invoice' ? 'Proposed invoice' : p.kind === 'payment' ? 'Proposed payment' : 'Proposed journal entry'} ·{' '}
-          {p.payload.date}
+          {p.kind === 'agent_action'
+            ? `Proposed by ${p.payload.agent?.name ? `the agent ${p.payload.agent.name}` : 'an agent'}`
+            : p.kind === 'bill'
+              ? 'Proposed bill'
+              : p.kind === 'invoice'
+                ? 'Proposed invoice'
+                : p.kind === 'payment'
+                  ? 'Proposed payment'
+                  : 'Proposed journal entry'}{' '}
+          · {p.payload.date}
         </span>
         <Badge tone={p.status === 'approved' ? 'success' : p.status === 'rejected' ? 'neutral' : 'warning'}>
           {p.status === 'pending' ? 'Needs your approval' : p.status}
         </Badge>
       </div>
       <div className="text-navy/70 mb-2">{p.payload.description}</div>
+      {(p.payload.lines ?? []).length === 0 ? (
+        <div className="text-navy/50">This does not post to the ledger by itself (a list entry, or a change that leaves the amounts as they are).</div>
+      ) : (
       <table className="w-full">
         <thead>
           <tr className="text-navy/40">
@@ -223,7 +237,7 @@ function ProposalCard({ p, onChange }: { p: Proposal; onChange: (p: Proposal) =>
           </tr>
         </thead>
         <tbody>
-          {p.payload.lines.map((l, i) => (
+          {(p.payload.lines ?? []).map((l, i) => (
             <tr key={i} className="text-navy">
               <td>
                 {l.accountCode} {l.accountName}
@@ -235,6 +249,7 @@ function ProposalCard({ p, onChange }: { p: Proposal; onChange: (p: Proposal) =>
           ))}
         </tbody>
       </table>
+      )}
       {p.status === 'pending' ? (
         <div className="mt-3 flex gap-2 justify-end">
           <Button size="sm" variant="secondary" loading={busy === 'reject'} disabled={!!busy} onClick={() => act('reject')}>
@@ -243,6 +258,13 @@ function ProposalCard({ p, onChange }: { p: Proposal; onChange: (p: Proposal) =>
           <Button size="sm" loading={busy === 'approve'} disabled={!!busy} onClick={() => act('approve')}>
             Approve &amp; post
           </Button>
+        </div>
+      ) : p.status === 'approved' && p.kind === 'agent_action' ? (
+        <div className="mt-2 text-emerald font-semibold">
+          Entered.{' '}
+          <Link href="/audit-trail" className="underline">
+            View in the Audit Trail
+          </Link>
         </div>
       ) : p.status === 'approved' && p.resultRef ? (
         <div className="mt-2 text-emerald font-semibold">
