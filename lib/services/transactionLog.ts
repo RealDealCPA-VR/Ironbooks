@@ -68,6 +68,11 @@ export interface TransactionLogChange {
   entityId: string | null;
   summary?: string;
   data?: unknown;
+  /**
+   * Who to name when there is no user id: an agent (lib/services/_base.ts writeAudit). Written
+   * into the record's existing `userName`; the record format is unchanged.
+   */
+  actorName?: string;
 }
 
 type PendingRecord = Omit<TransactionLogRecord, 'seq' | 'ts' | 'prevHash' | 'hash'>;
@@ -367,7 +372,7 @@ export function resetTransactionLogCache(dataDir: string): void {
 export async function logTransaction(db: DB, change: TransactionLogChange): Promise<void> {
   const dir = dataDirOf(db);
   if (!dir) return;
-  const userName = await resolveUserName(db, change.userId);
+  const userName = (await resolveUserName(db, change.userId)) ?? (change.actorName ? change.actorName.slice(0, 200) : null);
   const data = toJsonSafe(change.data);
   const record: PendingRecord = {
     userId: change.userId ?? null,

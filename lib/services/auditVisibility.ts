@@ -141,6 +141,7 @@ export const AUDIT_ENTITY_REFS: Record<string, AccessRef> = {
   user_company: 'users.users',
   user_session: 'users.users',
   user_preferences: 'users.users',
+  agent: 'users.users',
   role: 'users.roles',
   password_policy: 'users.password_rules',
   company_file: 'users.file_password',

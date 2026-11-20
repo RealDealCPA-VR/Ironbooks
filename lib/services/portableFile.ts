@@ -338,7 +338,7 @@ const ACTIVE_USER_SQL = `(EXISTS (SELECT 1 FROM "user_companies" uc WHERE uc."us
  *     the client's second factor itself), challenge questions and answers, password-reset tokens,
  *     challenge lockout counters, employees' portal passwords, and the sealed AI provider keys and
  *     mail password (ciphertext of the client's keys, useless to the recipient);
- *   - left out: sign-in sessions, phone receipt-upload tokens, earlier password hashes, the file's
+ *   - left out: sign-in sessions, phone receipt-upload tokens, agents, earlier password hashes, the file's
  *     own secrets, and the key slots of this file's key (a copy of a protected file carries its own
  *     re-wrapped ones instead: createPortableCompanyFile).
  * The owner's own backups and portable file are not changed by this. Importing the accountant's
@@ -375,6 +375,7 @@ const OUTSIDER_VIEWS: Record<string, DumpView> = {
   company_email_settings: { columns: { password_enc: 'NULL' } },
   user_sessions: { none: true },
   receipt_upload_tokens: { none: true },
+  agents: { none: true },
   password_history: { none: true },
   file_secrets: { none: true },
   file_key_slots: { none: true },
@@ -930,6 +931,15 @@ export async function restorePortableCompanyFile(
     await client.exec(
       `UPDATE user_sessions SET ended_at = now(), end_reason = 'expired' WHERE ended_at IS NULL;
        DELETE FROM single_user_mode;`,
+    );
+    // Agent access is given at one computer to the books as they are (lib/services/agents.ts): a
+    // restored copy starts with none.
+    await client.exec(
+      `DO $$ BEGIN
+         IF to_regclass('agents') IS NOT NULL THEN
+           UPDATE agents SET revoked_at = now() WHERE revoked_at IS NULL;
+         END IF;
+       END $$;`,
     );
 
     // Make the folder a self-describing desktop company file.

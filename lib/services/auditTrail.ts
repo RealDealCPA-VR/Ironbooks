@@ -11,11 +11,16 @@
  * of the total as well; one asked for by id is "not found", like an entry of another company.
  */
 import { and, asc, desc, eq, gte, lte, sql } from 'drizzle-orm';
-import { auditLogs, users } from '@/lib/db/schema';
+import { agents, auditLogs, users } from '@/lib/db/schema';
 import { type ServiceContext, notFound } from './_base';
 import { maskForContext } from './access';
 import { stripSecrets } from '@/lib/permissions/mask';
 import { auditVisibilitySql, canSeeAuditEntry } from './auditVisibility';
+
+/** How the Audit Trail names an agent (the transaction log uses the same words, _base.ts writeAudit). */
+function agentActor(name: string | null | undefined): string | null {
+  return name ? `${name} (agent)` : null;
+}
 
 export interface AuditLogRow {
   id: string;
@@ -72,10 +77,12 @@ export async function listAuditLogs(
       entityId: auditLogs.entityId,
       actorId: auditLogs.userId,
       actorName: users.name,
+      agentName: agents.name,
       createdAt: auditLogs.createdAt,
     })
     .from(auditLogs)
     .leftJoin(users, eq(auditLogs.userId, users.id))
+    .leftJoin(agents, eq(auditLogs.agentId, agents.id))
     .where(where)
     .orderBy(desc(auditLogs.createdAt), asc(auditLogs.id))
     .limit(limit)
@@ -88,7 +95,7 @@ export async function listAuditLogs(
       entityType: r.entityType,
       entityId: r.entityId,
       actorId: r.actorId ?? null,
-      actorName: r.actorName ?? null,
+      actorName: r.actorName ?? agentActor(r.agentName),
       createdAt: r.createdAt.toISOString(),
     })),
     total,
@@ -105,6 +112,7 @@ export async function getAuditLog(ctx: ServiceContext, id: string): Promise<Audi
       entityId: auditLogs.entityId,
       actorId: auditLogs.userId,
       actorName: users.name,
+      agentName: agents.name,
       createdAt: auditLogs.createdAt,
       oldValues: auditLogs.oldValues,
       newValues: auditLogs.newValues,
@@ -112,6 +120,7 @@ export async function getAuditLog(ctx: ServiceContext, id: string): Promise<Audi
     })
     .from(auditLogs)
     .leftJoin(users, eq(auditLogs.userId, users.id))
+    .leftJoin(agents, eq(auditLogs.agentId, agents.id))
     .where(and(eq(auditLogs.id, id), eq(auditLogs.companyId, ctx.companyId)));
 
   if (!row) throw notFound('Audit log entry');
@@ -124,7 +133,7 @@ export async function getAuditLog(ctx: ServiceContext, id: string): Promise<Audi
     entityType: row.entityType,
     entityId: row.entityId,
     actorId: row.actorId ?? null,
-    actorName: row.actorName ?? null,
+    actorName: row.actorName ?? agentActor(row.agentName),
     createdAt: row.createdAt.toISOString(),
     // Snapshots can hold SSNs, tax IDs and account numbers -- mask per the caller's flags.
     // ... and never the password hashes older builds wrote into settings snapshots, whoever asks

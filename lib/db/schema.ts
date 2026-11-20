@@ -281,6 +281,8 @@ export const auditLogs = pgTable('audit_logs', {
   oldValues: jsonb('old_values'),
   newValues: jsonb('new_values'),
   llmReasoning: text('llm_reasoning'),
+  /** The agent behind the change (agents.id, drizzle/0095), next to a null userId. No FK. */
+  agentId: uuid('agent_id'),
   createdAt: timestamp('created_at').defaultNow().notNull(),
 });
 
@@ -3083,4 +3085,30 @@ export const companyEmailSettings = pgTable('company_email_settings', {
   updatedBy: uuid('updated_by').references(() => users.id),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
+/**
+ * 0095 agent access: an AI agent an Admin let into ONE company (lib/services/agents.ts,
+ * AGENT_ACCESS.md). Not a user: no password, no sign-in, no seat. `roleKeys` are the same role
+ * keys people have (built-in keys or company_roles ids), never Admin. Only a digest of the access
+ * token is kept (`tokenHash`; `keyId` names the device secret that keyed it, null when the digest
+ * is unkeyed), so the token is shown once and a copy of the file carries nothing that works on
+ * another computer. Never travels in per-company backups, portable files or period copies.
+ */
+export const agents = pgTable('agents', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  companyId: uuid('company_id').references(() => companies.id).notNull(),
+  name: varchar('name', { length: 100 }).notNull(),
+  roleKeys: jsonb('role_keys').$type<string[]>().notNull().default([]),
+  /** 'read_only' | 'propose' | 'post' (every agent only reads until write tools ship). */
+  mode: varchar('mode', { length: 16 }).notNull().default('read_only'),
+  tokenHash: varchar('token_hash', { length: 64 }).notNull().unique(),
+  /** The first characters of the token, for the Agents list only. */
+  tokenPrefix: varchar('token_prefix', { length: 24 }).notNull(),
+  keyId: varchar('key_id', { length: 32 }),
+  createdBy: uuid('created_by'),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  lastUsedAt: timestamp('last_used_at'),
+  revokedAt: timestamp('revoked_at'),
+  revokedBy: uuid('revoked_by'),
 });

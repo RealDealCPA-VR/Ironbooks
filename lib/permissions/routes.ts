@@ -200,6 +200,15 @@ export const API_ROUTE_PERMISSIONS: Record<string, MethodRules> = {
 
   // ---- Users & Roles ----
   '/api/users': r('users', 'GET POST'),
+  // Agent access (AGENT_ACCESS.md): an Admin lets an AI agent read the books. Admin only (service),
+  // and made or removed only on the computer that holds the company file (the routes).
+  '/api/agents': r('users', 'GET POST'),
+  '/api/agents/[id]': r('users', 'DELETE:modify'),
+  // For the agent itself: who it is here and which books these are (a chosen set of facts).
+  '/api/agent/whoami': kind('member', 'GET'),
+  // The connector's check that it is talking to this Ironbooks before it shows its token
+  // (lib/agent/endpointFile.ts); answers from memory, never opens the company file.
+  '/api/agent/hello': kind('public', 'GET'),
   '/api/users/[id]': r('users', 'GET PATCH'),
   '/api/users/[id]/reset-password': r('users', 'POST:modify'),
   '/api/users/password-policy': r('users', 'GET PUT:modify'), // gapsb K: Admin-only save (requireFileAdmin)

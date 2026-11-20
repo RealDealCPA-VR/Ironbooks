@@ -526,6 +526,13 @@
       "when": 1781400094000,
       "tag": "0094_signin_hardening",
       "breakpoints": true
+    },
+    {
+      "idx": 95,
+      "version": "7",
+      "when": 1781400095000,
+      "tag": "0095_agent_access",
+      "breakpoints": true
     }
   ]
 }

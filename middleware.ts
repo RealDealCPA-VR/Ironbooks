@@ -3,6 +3,7 @@ import type { NextRequest } from 'next/server';
 import { ROUTE_METHOD_HEADER, ROUTE_PATH_HEADER } from '@/lib/permissions/headers';
 import { isMobileReceiptPage } from '@/lib/receipts/mobilePath';
 import { isLoopbackHostHeader, isProxiedRequest } from '@/lib/net/loopbackHost';
+import { hasAuthorization } from '@/lib/net/agentToken';
 
 /**
  * Route protection. Edge-safe: only checks for the presence of the session cookie (signature is
@@ -54,8 +55,16 @@ export function middleware(req: NextRequest) {
     return refuse('This address is not the Ironbooks app on this computer.');
   }
 
+  // Agents (AGENT_ACCESS.md) present an Authorization header; the app's own window and the shell
+  // never send one. Such a request may only read the API: no pages, and nothing but GET / HEAD.
+  // Which routes, and whether the token is any good, is decided in lib/agentContext.ts.
+  const isApi = pathname === '/api' || pathname.startsWith('/api/');
+  if (hasAuthorization(req.headers) && (!isApi || (req.method !== 'GET' && req.method !== 'HEAD'))) {
+    return refuse('This is not available to agents.');
+  }
+
   // API routes: no redirects (handlers answer with JSON 401/403); just stamp for getServerContext.
-  if (pathname === '/api' || pathname.startsWith('/api/')) {
+  if (isApi) {
     // CSRF: SameSite=Lax cookies still go along with a POST from ANOTHER port on localhost (another
     // local tool's web page) — same site, different origin. The app's own pages are same-origin;
     // non-browser callers (the desktop shell) send no Sec-Fetch-Site at all.

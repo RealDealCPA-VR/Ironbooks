@@ -304,6 +304,9 @@ function assertSalesTaxCodeRight(ctx: ServiceContext, key: SimpleListKey, action
 export async function ensureSeeded(ctx: ServiceContext, key: SimpleListKey): Promise<void> {
   const def = DEFS[key];
   if (!def.seed?.length) return;
+  // A context that only reads (an agent) never saves the defaults; they are put in when the
+  // agent is made (lib/services/agents.ts), and otherwise the list reads as it is.
+  if (ctx.readOnly) return;
   const markerId = `${ctx.companyId}:${key}`;
   const [done] = await ctx.db.select({ id: listSeeds.id }).from(listSeeds).where(eq(listSeeds.id, markerId));
   if (done) return;

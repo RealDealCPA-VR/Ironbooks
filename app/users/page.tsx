@@ -8,6 +8,7 @@
  * Enterprise's Area and Activity tree (each activity None / Full / Partial: View, Create, Modify,
  * Delete, Print, View Balance; app/users/ActivityMatrix.tsx) and the sensitive-data flags, delete.
  * View Permissions (/users/permissions) prints the role and user permission reports.
+ * Agents tab (Admins): AI agents let in to read the books (app/users/AgentsTab.tsx, AGENT_ACCESS.md).
  *
  * All rules (last active Admin, no privilege escalation, audit) are enforced server-side in
  * lib/services/users.ts; this page only presents them.
@@ -36,6 +37,7 @@ import type { Action, Area, Flag, PermissionGrant, PermissionSet, RoleFlags } fr
 import ActivityMatrix, { type ActivityGrant, type CatalogActivity } from './ActivityMatrix';
 import { PasswordRulesHint, meetsPolicy, usePasswordPolicy } from '@/components/PasswordRules';
 import PasswordPolicyEditor from './PasswordPolicyEditor';
+import AgentsTab from './AgentsTab';
 import { NEEDS_SLOT_TEXT, ProtectionUsersNotice, useProtectionStatus } from '@/components/FileProtectionCard';
 
 interface CompanyUser {
@@ -77,7 +79,7 @@ function errMsg(e: unknown) {
 }
 
 export default function UsersAndRolesPage() {
-  const [tab, setTab] = useState<'users' | 'roles' | 'passwords'>('users');
+  const [tab, setTab] = useState<'users' | 'roles' | 'passwords' | 'agents'>('users');
   // gapsb K: the password-rules editor is for Admins only (the server checks too).
   const [isAdmin, setIsAdmin] = useState(false);
   const [meId, setMeId] = useState<string | null>(null);
@@ -121,7 +123,7 @@ export default function UsersAndRolesPage() {
       {/* filecrypto: users whose password does not open the protected company file yet. */}
       <ProtectionUsersNotice />
       <div className="mb-4 flex flex-wrap items-center gap-2" role="tablist">
-        {(isAdmin ? (['users', 'roles', 'passwords'] as const) : (['users', 'roles'] as const)).map((t) => (
+        {(isAdmin ? (['users', 'roles', 'passwords', 'agents'] as const) : (['users', 'roles'] as const)).map((t) => (
           <button
             key={t}
             role="tab"
@@ -131,7 +133,7 @@ export default function UsersAndRolesPage() {
               tab === t ? 'bg-electric text-white' : 'bg-white text-navy hover:bg-electric/5'
             }`}
           >
-            {t === 'users' ? 'Users' : t === 'roles' ? 'Roles' : 'Password rules'}
+            {t === 'users' ? 'Users' : t === 'roles' ? 'Roles' : t === 'agents' ? 'Agents' : 'Password rules'}
           </button>
         ))}
         {/* QB Enterprise Users and Roles > View Permissions (role / user permission reports). */}
@@ -149,6 +151,9 @@ export default function UsersAndRolesPage() {
       )}
       {tab === 'passwords' && isAdmin ? (
         <PasswordPolicyEditor />
+      ) : tab === 'agents' && isAdmin ? (
+        // AI agents an Admin lets read these books (AGENT_ACCESS.md); made on this computer only.
+        <AgentsTab roles={roles} />
       ) : users === null || !catalog ? (
         error ? null : <PageSkeleton />
       ) : tab === 'users' ? (

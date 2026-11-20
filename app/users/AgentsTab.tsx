@@ -1,0 +1,361 @@
+'use client';
+/**
+ * Users & Roles > Agents (AGENT_ACCESS.md): let an AI agent read this company's books.
+ *
+ * An Admin gives the agent a name, the same kind of role a person has (never Admin) and a mode,
+ * and gets an access token ONCE, with the settings to paste into Claude Code or Claude Desktop.
+ * The list shows each agent's role, mode and last use, and Remove takes its access away at once.
+ *
+ * Agents are made and removed only on the computer that holds the company file; on another
+ * computer this tab is a read-only list. The rules are enforced in lib/services/agents.ts and
+ * lib/agentContext.ts; this component only presents them.
+ */
+import { useCallback, useEffect, useState } from 'react';
+import { Bot, Copy, Plus, Trash2 } from 'lucide-react';
+import { Badge, Button, Card, ConfirmDialog, Input, Label, Modal, PageSkeleton, Table, Td, Th, Tr, toast } from '@/components/ui';
+import { api } from '@/lib/client';
+import { AGENT_MODES, AGENT_MODE_LABELS, type AgentMode } from '@/lib/permissions/agentAccess';
+
+interface Agent {
+  id: string;
+  name: string;
+  roleNames: string[];
+  mode: AgentMode;
+  tokenPrefix: string;
+  createdAt: string;
+  createdByName: string | null;
+  lastUsedAt: string | null;
+  status: 'active' | 'revoked';
+}
+interface Connection {
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  tokenEnv: string;
+  installed: boolean;
+}
+interface RoleOption {
+  key: string;
+  name: string;
+  description: string;
+  builtin: boolean;
+}
+
+const MODE_HELP: Record<AgentMode, string> = {
+  read_only: 'Looks at lists, registers and reports. Changes nothing.',
+  propose: 'Will draft transactions for a person to approve.',
+  post: 'Will enter transactions itself, within its role.',
+};
+
+/** Shown under Propose and Post until agents can enter transactions. */
+export const MODES_LATER_NOTE =
+  'In this version every agent only reads. Propose and Post take effect when entering transactions is added.';
+/** The words of lib/net/hostOnly.ts HOST_ONLY_MESSAGE (a server module this page cannot import). */
+const HOST_ONLY_MESSAGE = 'This can only be changed on the computer that holds the company file.';
+export const AGENT_PRIVACY_NOTE =
+  'What an agent reads is sent to the AI service that runs it, as it is. With an AI model on your own computer or network, nothing leaves.';
+
+function errMsg(e: unknown) {
+  return e instanceof Error ? e.message : 'Something went wrong';
+}
+
+function when(iso: string | null) {
+  if (!iso) return 'Never';
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? 'Never' : d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+}
+
+const quote = (s: string) => (/[\s"]/.test(s) ? `"${s.replace(/"/g, '\\"')}"` : s);
+
+/** The command that adds the connector to Claude Code. */
+export function claudeCodeCommand(c: Connection, token: string): string {
+  const env = [`--env ${c.tokenEnv}=${token}`, ...Object.entries(c.env).map(([k, v]) => `--env ${k}=${v}`)].join(' ');
+  return `claude mcp add ironbooks ${env} -- ${[c.command, ...c.args].map(quote).join(' ')}`;
+}
+
+/** The entry for Claude Desktop's configuration file. */
+export function claudeDesktopConfig(c: Connection, token: string): string {
+  return JSON.stringify({ mcpServers: { ironbooks: { command: c.command, args: c.args, env: { [c.tokenEnv]: token, ...c.env } } } }, null, 2);
+}
+
+async function copy(text: string, what: string) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(`${what} copied.`, 'success');
+  } catch {
+    toast('Could not copy. Select the text and copy it yourself.', 'danger');
+  }
+}
+
+function CopyBlock({ label, text, what }: { label: string; text: string; what: string }) {
+  return (
+    <div>
+      <div className="mb-1 flex items-center justify-between">
+        <Label>{label}</Label>
+        <Button size="sm" variant="ghost" onClick={() => copy(text, what)}>
+          <Copy className="mr-1 h-4 w-4" /> Copy
+        </Button>
+      </div>
+      <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-all rounded-lg border border-slate-200 bg-slate-50 p-3 font-mono text-xs text-navy">
+        {text}
+      </pre>
+    </div>
+  );
+}
+
+function NewAgent({ roles, onClose, onMade }: { roles: RoleOption[]; onClose: () => void; onMade: (token: string, connection: Connection | null, name: string) => void }) {
+  const [name, setName] = useState('');
+  const [roleKeys, setRoleKeys] = useState<string[]>([]);
+  const [mode, setMode] = useState<AgentMode>('read_only');
+  const [busy, setBusy] = useState(false);
+
+  async function save() {
+    setBusy(true);
+    try {
+      const made = await api.post<{ token: string; connection: Connection | null }>('/api/agents', { name, roleKeys, mode });
+      onMade(made.token, made.connection, name.trim());
+    } catch (e) {
+      toast(errMsg(e), 'danger');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal
+      open
+      onClose={onClose}
+      title="New agent"
+      size="lg"
+      footer={
+        <>
+          <Button variant="secondary" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button onClick={save} loading={busy} disabled={!name.trim() || roleKeys.length === 0} data-shortcut="save">
+            Make agent
+          </Button>
+        </>
+      }
+    >
+      <div className="space-y-4">
+        <div>
+          <Label htmlFor="ag-name">Name</Label>
+          <Input id="ag-name" value={name} onChange={(e) => setName(e.target.value)} maxLength={100} placeholder="Month-end assistant" />
+          <p className="mt-1 text-xs text-navy/50">Shown in the audit trail next to anything the agent does.</p>
+        </div>
+        <div>
+          <Label>Role</Label>
+          <div className="grid max-h-56 grid-cols-1 gap-1 overflow-y-auto rounded-lg border border-slate-200 p-2 sm:grid-cols-2">
+            {roles.map((r) => (
+              <label key={r.key} className="flex cursor-pointer items-start gap-2 rounded p-1.5 hover:bg-electric/5">
+                <input
+                  type="checkbox"
+                  className="mt-1"
+                  checked={roleKeys.includes(r.key)}
+                  onChange={(e) => setRoleKeys(e.target.checked ? [...roleKeys, r.key] : roleKeys.filter((k) => k !== r.key))}
+                />
+                <span>
+                  <span className="text-sm font-semibold text-navy">{r.name}</span>
+                  {!r.builtin && <span className="ml-1 text-xs text-navy/40">(custom)</span>}
+                  <span className="block text-xs text-navy/50">{r.description}</span>
+                </span>
+              </label>
+            ))}
+          </div>
+          <p className="mt-1 text-xs text-navy/50">
+            An agent sees what a person with this role sees. It can never be an Admin, and never reaches Users &amp; Roles, backups, full
+            Social Security numbers or full account numbers.
+          </p>
+        </div>
+        <div>
+          <Label>What it may do</Label>
+          <div className="space-y-1" role="radiogroup" aria-label="What the agent may do">
+            {AGENT_MODES.map((m) => (
+              <label key={m} className="flex cursor-pointer items-start gap-2 rounded p-1.5 hover:bg-electric/5">
+                <input type="radio" name="ag-mode" className="mt-1" checked={mode === m} onChange={() => setMode(m)} />
+                <span>
+                  <span className="text-sm font-semibold text-navy">{AGENT_MODE_LABELS[m]}</span>
+                  <span className="block text-xs text-navy/50">{MODE_HELP[m]}</span>
+                </span>
+              </label>
+            ))}
+          </div>
+          <p className="mt-1 text-xs text-navy/50">{MODES_LATER_NOTE}</p>
+        </div>
+        <p className="rounded-lg bg-amber-50 p-3 text-xs text-amber-900">{AGENT_PRIVACY_NOTE}</p>
+      </div>
+    </Modal>
+  );
+}
+
+function TokenOnce({ name, token, connection, onClose }: { name: string; token: string; connection: Connection | null; onClose: () => void }) {
+  return (
+    <Modal
+      open
+      onClose={onClose}
+      title={`${name} is ready`}
+      size="lg"
+      footer={
+        <Button onClick={onClose} data-shortcut="save">
+          I have copied it
+        </Button>
+      }
+    >
+      <div className="space-y-4">
+        <p className="text-sm text-navy">
+          This is the agent&apos;s access token. <strong>It is shown only now.</strong> Ironbooks keeps no copy it could show again; if it is
+          lost, remove the agent and make a new one.
+        </p>
+        <CopyBlock label="Access token" text={token} what="Token" />
+        {connection ? (
+          <>
+            <CopyBlock label="Claude Code: run this once in a terminal" text={claudeCodeCommand(connection, token)} what="Command" />
+            <CopyBlock label="Claude Desktop: add this to its configuration file" text={claudeDesktopConfig(connection, token)} what="Configuration" />
+          </>
+        ) : (
+          <p className="text-sm text-navy/60">The connector that ships with Ironbooks was not found on this computer. See AGENT_ACCESS.md.</p>
+        )}
+        <p className="text-xs text-navy/50">
+          The agent works while this company file is open in Ironbooks on this computer and someone has signed in. Keep the token like a
+          password.
+        </p>
+      </div>
+    </Modal>
+  );
+}
+
+export default function AgentsTab({ roles }: { roles: RoleOption[] }) {
+  const [agents, setAgents] = useState<Agent[] | null>(null);
+  const [hostOnly, setHostOnly] = useState(false);
+  const [error, setError] = useState('');
+  const [adding, setAdding] = useState(false);
+  const [made, setMade] = useState<{ name: string; token: string; connection: Connection | null } | null>(null);
+  const [removing, setRemoving] = useState<Agent | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      const res = await api.get<{ agents: Agent[]; hostOnly: boolean }>('/api/agents');
+      setAgents(res.agents);
+      setHostOnly(Boolean(res.hostOnly));
+      setError('');
+    } catch (e) {
+      setError(errMsg(e));
+      setAgents([]);
+    }
+  }, []);
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  async function remove() {
+    if (!removing) return;
+    setBusy(true);
+    try {
+      await api.del(`/api/agents/${removing.id}`);
+      toast(`${removing.name} no longer has access.`, 'success');
+      setRemoving(null);
+      await load();
+    } catch (e) {
+      toast(errMsg(e), 'danger');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (agents === null) return <PageSkeleton />;
+  const agentRoles = roles.filter((r) => r.key !== 'admin');
+
+  return (
+    <div className="space-y-4">
+      <Card className="p-4">
+        <div className="flex flex-wrap items-start gap-3">
+          <Bot className="mt-0.5 h-5 w-5 text-electric" />
+          <div className="min-w-0 flex-1 text-sm text-navy/70">
+            <p>
+              An agent is an AI assistant you let read these books, the way you would add a bookkeeper: with a name and a role. It connects
+              through Ironbooks on this computer only, and everything it does is listed under its name.
+            </p>
+            <p className="mt-1 text-xs text-navy/50">{MODES_LATER_NOTE}</p>
+          </div>
+          {!hostOnly && (
+            <Button onClick={() => setAdding(true)}>
+              <Plus className="mr-1 h-4 w-4" /> New agent
+            </Button>
+          )}
+        </div>
+        {hostOnly && <p className="mt-3 text-sm text-amber-700">{HOST_ONLY_MESSAGE}</p>}
+      </Card>
+      {error && <Card className="p-4 text-sm text-red-600">{error}</Card>}
+      {agents.length === 0 ? (
+        !error && <Card className="p-6 text-center text-sm text-navy/50">No agents. Nothing outside Ironbooks can read this company.</Card>
+      ) : (
+        <Table>
+          <thead>
+            <tr>
+              <Th>Name</Th>
+              <Th>Role</Th>
+              <Th>May</Th>
+              <Th>Token</Th>
+              <Th>Last used</Th>
+              <Th>Status</Th>
+              <Th className="text-right">Actions</Th>
+            </tr>
+          </thead>
+          <tbody>
+            {agents.map((a) => (
+              <Tr key={a.id} className={a.status === 'active' ? '' : 'opacity-60'}>
+                <Td>
+                  <span className="font-semibold">{a.name}</span>
+                  <span className="block text-xs text-navy/40">
+                    Made {when(a.createdAt)}
+                    {a.createdByName ? ` by ${a.createdByName}` : ''}
+                  </span>
+                </Td>
+                <Td>
+                  <div className="flex flex-wrap gap-1">
+                    {a.roleNames.length ? a.roleNames.map((r) => <Badge key={r}>{r}</Badge>) : <span className="text-xs text-navy/40">Role removed</span>}
+                  </div>
+                </Td>
+                <Td>{AGENT_MODE_LABELS[a.mode] ?? a.mode}</Td>
+                <Td className="font-mono text-xs">{a.tokenPrefix}…</Td>
+                <Td className="text-sm">{when(a.lastUsedAt)}</Td>
+                <Td>{a.status === 'active' ? <Badge tone="success">Active</Badge> : <Badge tone="void">Removed</Badge>}</Td>
+                <Td className="text-right whitespace-nowrap">
+                  {a.status === 'active' && !hostOnly && (
+                    <Button size="sm" variant="ghost" onClick={() => setRemoving(a)} title="Remove this agent's access">
+                      <Trash2 className="h-4 w-4" />
+                    </Button>
+                  )}
+                </Td>
+              </Tr>
+            ))}
+          </tbody>
+        </Table>
+      )}
+      {adding && (
+        <NewAgent
+          roles={agentRoles}
+          onClose={() => setAdding(false)}
+          onMade={(token, connection, name) => {
+            setAdding(false);
+            setMade({ name, token, connection });
+            load();
+          }}
+        />
+      )}
+      {made && <TokenOnce name={made.name} token={made.token} connection={made.connection} onClose={() => setMade(null)} />}
+      <ConfirmDialog
+        open={!!removing}
+        title="Remove agent"
+        message={`${removing?.name} will stop working at once. What it did stays in the audit trail under its name.`}
+        confirmLabel="Remove"
+        tone="danger"
+        loading={busy}
+        onConfirm={remove}
+        onClose={() => setRemoving(null)}
+      />
+    </div>
+  );
+}

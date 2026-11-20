@@ -167,6 +167,13 @@
       {
         "from": "drizzle",
         "to": "app/drizzle"
+      },
+      {
+        "from": "mcp",
+        "to": "mcp",
+        "filter": [
+          "*.mjs"
+        ]
       }
     ],
     "win": {

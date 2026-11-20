@@ -661,7 +661,7 @@ export const PREFERENCE_CATEGORIES: Array<{
     my: [],
     notes: {
       company:
-        'Ironbooks has no add-on programs that connect to the company file the way QuickBooks SDK applications do, so there is no certificate list. These are the ways something other than Ironbooks\' own screens can reach this file. Cloud AI and email are controlled under Privacy & Network; other computers on your network under Multi-user.',
+        'These are the ways something other than Ironbooks\' own screens can reach this file. AI agents an Admin lets in (Users & Roles > Agents) are stopped by the first switch too; each one is listed there and can be removed. Cloud AI and email are controlled under Privacy & Network; other computers on your network under Multi-user.',
     },
   },
   {

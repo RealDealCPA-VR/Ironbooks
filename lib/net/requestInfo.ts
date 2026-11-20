@@ -24,6 +24,7 @@
 import { headers } from 'next/headers';
 import { carriesLaunchPass } from '@/lib/net/launchPass';
 import { carriesProxySecret } from '@/lib/net/loopbackHost';
+import { hasAuthorization } from '@/lib/net/agentToken';
 
 export const REMOTE_ADDR_HEADER = 'x-bka-remote-addr';
 
@@ -65,7 +66,11 @@ export function originFromHeaders(h: HeaderSource): RequestOrigin {
       userAgent,
     };
   }
-  if (!carriesLaunchPass(h)) {
+  // An Authorization header marks an agent (lib/net/agentToken.ts), never the app: the window and
+  // the shell do not send one. Remote-level trust under the same address as any other program on
+  // this computer, even if the launch pass came along, so host-only settings stay closed to it and
+  // it gets no sign-in attempt counters of its own.
+  if (hasAuthorization(h) || !carriesLaunchPass(h)) {
     return { remote: true, addr: UNVERIFIED_LOCAL_ADDR, https: false, userAgent };
   }
   return { remote: false, addr: 'local', https: false, userAgent };

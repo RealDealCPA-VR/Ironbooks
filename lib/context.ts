@@ -10,7 +10,11 @@
 import { cookies, headers } from 'next/headers';
 import { redirect } from 'next/navigation';
 import { and, eq } from 'drizzle-orm';
-import { getDb, LedgerDamagedError, type DB } from '@/lib/db';
+import { getDb, LedgerDamagedError, resolveDataDir, type DB } from '@/lib/db';
+import { getAgentContext } from '@/lib/agentContext';
+import { hasAuthorization } from '@/lib/net/agentToken';
+import { notePersonSignedIn } from '@/lib/agent/endpointFile';
+import { syncAgentEndpoint } from '@/lib/services/agents';
 import { ensureDevCompany, verifyClosingDatePassword } from '@/lib/services/company';
 import { getFileLockStatus } from '@/lib/services/fileLock';
 import { resolveAccess, PERMISSION_DENIED_PREFIX } from '@/lib/services/access';
@@ -175,7 +179,42 @@ export interface SessionGateOptions {
  * Per-company authorization (e.g. rename needs company:modify) stays with the handler, which
  * resolves the caller's effective permissions in the company named by the URL.
  */
+/**
+ * The request's headers when it carries an Authorization header (an agent, AGENT_ACCESS.md), else
+ * null. The app's own window and the desktop shell never send one.
+ */
+async function authorizationRequestHeaders(): Promise<{ get(name: string): string | null } | null> {
+  try {
+    const h = await headers();
+    return hasAuthorization(h) ? h : null;
+  } catch {
+    return null; // not inside a request (tests, scripts)
+  }
+}
+
+/**
+ * A person's verified sign-in reached this company file: agents may work from now on in this run
+ * (lib/agentContext.ts), and the first time, the file's agent endpoint is published if it has
+ * agents (lib/services/agents.ts). Never fails the request.
+ */
+async function notePersonAtWork(db: DB): Promise<void> {
+  try {
+    let host: string | null = null;
+    try {
+      host = (await headers()).get('host');
+    } catch {
+      /* not inside a request */
+    }
+    if (notePersonSignedIn(resolveDataDir(), host)) await syncAgentEndpoint(db);
+  } catch {
+    /* agent access is an extra; a person's request never depends on it */
+  }
+}
+
 export async function getSessionGate(opts: SessionGateOptions = {}): Promise<SessionGate> {
+  // 'self' routes act on a person's own account: never for an agent, and never on the cookies a
+  // request with an Authorization header carries.
+  if (await authorizationRequestHeaders()) throw new ServiceError('FORBIDDEN', 'Authentication required.');
   await enforceSelfRoute();
   const db = await getDb();
   await assertFileUnlocked(db);
@@ -199,6 +238,10 @@ export async function getSessionGate(opts: SessionGateOptions = {}): Promise<Ses
 export async function getServerContext(): Promise<ServiceContext> {
   // PDFs printed from a sandbox / training file are stamped (lib/pdf/sandboxStamp.ts).
   ensureSandboxEnvSynced();
+  // A request with an Authorization header is an agent (AGENT_ACCESS.md) or nothing: it gets the
+  // agent's own, read-only context and never falls through to the cookie session below.
+  const agentHeaders = await authorizationRequestHeaders();
+  if (agentHeaders) return getAgentContext(agentHeaders);
   const db = await getDb();
 
   await assertFileUnlocked(db);
@@ -260,6 +303,7 @@ export async function getServerContext(): Promise<ServiceContext> {
       // modifying transactions on/before the closing date (QB Enterprise parity).
       const closingDateOverride =
         access.flags.closedPeriod && (await resolveClosingDateOverride(db, companyId, userId));
+      await notePersonAtWork(db);
       return { db, companyId, userId, role, closingDateOverride, access, sessionId: session?.sessionId };
     }
   }

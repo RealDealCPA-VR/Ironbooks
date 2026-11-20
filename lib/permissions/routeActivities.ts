@@ -70,6 +70,7 @@ export const ROUTE_ACTIVITIES: Record<string, ActivityRef> = {
 
   // ---- Users & Roles ----
   '/api/users': 'users.users',
+  '/api/agents': 'users.users',
   '/api/users/password-policy': 'users.password_rules',
   '/api/users/permissions-report': 'users.permission_reports',
   '/api/roles': 'users.roles',

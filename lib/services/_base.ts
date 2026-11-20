@@ -48,6 +48,17 @@ export interface ServiceContext {
    * (lib/permissions/routes.ts). Absent = trusted internal context — no restriction.
    */
   access?: EffectiveAccess;
+  /**
+   * Agent access (lib/agentContext.ts): the agent making this request, in place of a person
+   * (`userId` is then null). `writeAudit` records it, so the audit trail and the transaction log
+   * name the agent.
+   */
+  agent?: { id: string; name: string; mode: 'read_only' | 'propose' | 'post' };
+  /**
+   * True for a context that must not change the books: `db` is then a read-only handle
+   * (lib/db/readOnly.ts) and services that would save defaults on a first read skip that.
+   */
+  readOnly?: boolean;
 }
 
 export { ServiceError, type ServiceErrorCode, type ServiceErrorFix } from './errors';
@@ -120,10 +131,13 @@ export async function writeAudit(
     oldValues: params.oldValues ?? null,
     newValues: params.newValues ?? null,
     llmReasoning: params.llmReasoning ?? null,
+    agentId: ctx.agent?.id ?? null,
   });
   await logTransaction(ctx.db, {
     companyId: ctx.companyId,
     userId: ctx.userId,
+    // An agent has no user id; the log names it instead (lib/services/agents.ts agentActorName).
+    ...(ctx.agent ? { actorName: `${ctx.agent.name} (agent)` } : {}),
     action: params.action,
     entityType: params.entityType,
     entityId: params.entityId,

@@ -94,6 +94,7 @@ const SECRET_KEYS = new Set([
   'totpSecret',
   'resetToken',
   'apiKeyEnc',
+  'tokenHash', // agents and phone receipt links: the digest of an access token
 ]);
 
 /** True for a field name stripSecrets removes. */

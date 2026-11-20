@@ -1,0 +1,347 @@
+/**
+ * Agent access (AGENT_ACCESS.md): an Admin lets an AI agent into ONE company of this file.
+ *
+ * An agent is not a user. It has no password and cannot sign in; it is never counted where people
+ * are counted (seats, the last-Admin rule, password reset, file protection); and a service that
+ * re-checks access from a user id finds none and refuses. It has:
+ *
+ *  - a name, shown wherever its work is listed;
+ *  - the role keys an Admin gave it: the same roles people have, never Admin. Its access is those
+ *    roles' access with the agent limits on top (lib/permissions/agentAccess.ts);
+ *  - a mode (Read only / Propose / Post). In this version every mode only reads;
+ *  - an access token, shown ONCE when the agent is made. Only a digest is stored.
+ *
+ * The digest is keyed with this computer's device secret when it has one (the secret that seals
+ * saved AI and mail keys, lib/ai/keyVault.ts) and always includes the company file's id. A copy of
+ * the file on another computer, or a file someone sends you with agents already in it, therefore
+ * holds no agent that works: on a computer with a device secret only digests keyed by THAT secret
+ * are accepted.
+ *
+ * Making and removing agents is for an Admin, at the computer that holds the company file (the
+ * routes refuse other computers), and both are written to the audit trail with the Admin as the
+ * one who did it. Restoring a backup removes every agent's access (revokeAllAgents), so a token
+ * that was taken away cannot come back with an older copy of the books.
+ */
+import { createHash, createHmac, randomBytes } from 'node:crypto';
+import { and, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
+import { resolveDataDir, type DB } from '@/lib/db';
+import { agents, companies, users } from '@/lib/db/schema';
+import { companyFileId } from '@/lib/auth';
+import { deviceKey } from '@/lib/ai/keyVault';
+import { AGENT_TOKEN_RE } from '@/lib/net/agentToken';
+import { unionRoles, type EffectiveAccess } from '@/lib/permissions/model';
+import { AGENT_MODES, clampForAgent, includesAdminRole, isAgentMode, type AgentMode } from '@/lib/permissions/agentAccess';
+import { endpointPublished, personSignedIn, publishEndpoint, withdrawEndpoint } from '@/lib/agent/endpointFile';
+import { type ServiceContext, ServiceError, inTransaction, notFound, validation, writeAudit } from './_base';
+import { definitionsFor, listRoleDefinitions } from './access';
+import { SIMPLE_LIST_KEYS, ensureSeeded } from './lists/simpleLists';
+
+export { AGENT_MODES, type AgentMode };
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const TOKEN_LABEL = 'ironbooks/agent-token';
+const TAG_LABEL = 'ironbooks/agent-file-tag';
+
+export const AGENTS_BLOCKED_MESSAGE =
+  'Applications are not allowed to access this company file (Preferences > Integrated Applications).';
+
+export interface AgentView {
+  id: string;
+  name: string;
+  roleKeys: string[];
+  /** Role names for display; a role that no longer exists is left out. */
+  roleNames: string[];
+  mode: AgentMode;
+  /** The first characters of the token, to tell agents apart. Never the token. */
+  tokenPrefix: string;
+  createdAt: string;
+  createdByName: string | null;
+  lastUsedAt: string | null;
+  revokedAt: string | null;
+  status: 'active' | 'revoked';
+}
+
+export interface CreateAgentInput {
+  name: string;
+  roleKeys: string[];
+  mode: AgentMode;
+}
+
+type AgentRow = typeof agents.$inferSelect;
+
+// ---------------------------------------------------------------------------
+// Token
+// ---------------------------------------------------------------------------
+
+/** The public 8-character tag naming this company file inside a token (not a secret). */
+export function agentFileTag(fileId: string = companyFileId()): string {
+  return createHash('sha256').update(`${TAG_LABEL}\n${fileId}`).digest('hex').slice(0, 8);
+}
+
+interface TokenDigest {
+  hash: string;
+  /** The device secret's id when the digest is keyed with it, else null. */
+  keyId: string | null;
+}
+
+/**
+ * The stored form of a token on THIS computer: keyed with the device secret when there is one,
+ * a plain SHA-256 otherwise (no desktop shell: `next dev`, tests). Always bound to the file id.
+ */
+export function agentTokenDigest(token: string, fileId: string = companyFileId()): TokenDigest {
+  const text = `${TOKEN_LABEL}\n${fileId}\n${token}`;
+  const dk = deviceKey();
+  if (dk) return { hash: createHmac('sha256', Buffer.from(dk.secret, 'hex')).update(text).digest('hex'), keyId: dk.keyId };
+  return { hash: createHash('sha256').update(text).digest('hex'), keyId: null };
+}
+
+function newToken(): string {
+  return `ibka_${agentFileTag()}_${randomBytes(32).toString('base64url')}`;
+}
+
+// ---------------------------------------------------------------------------
+// Guards
+// ---------------------------------------------------------------------------
+
+function assertAdminPerson(ctx: ServiceContext, what: string): void {
+  // An agent never manages agents (it cannot reach these routes either).
+  if (ctx.agent) throw new ServiceError('FORBIDDEN', `${what} is for an Admin.`);
+  // No `access` = trusted internal context (tests, system jobs), as everywhere else.
+  if (ctx.access && !ctx.access.isAdmin) throw new ServiceError('FORBIDDEN', `${what} is for an Admin.`);
+}
+
+function applicationsBlocked(settings: unknown): boolean {
+  return Boolean(settings && typeof settings === 'object' && (settings as { integratedAppsBlocked?: unknown }).integratedAppsBlocked === true);
+}
+
+/** True when Preferences > Integrated Applications lets nothing but people reach this company. */
+export async function agentsBlockedFor(db: DB, companyId: string): Promise<boolean> {
+  const [c] = await db.select({ settings: companies.settings }).from(companies).where(eq(companies.id, companyId));
+  return applicationsBlocked(c?.settings);
+}
+
+// ---------------------------------------------------------------------------
+// Create / list / revoke
+// ---------------------------------------------------------------------------
+
+function toView(row: AgentRow, roleNames: Map<string, string>, createdByName: string | null, lastUsed: Date | null): AgentView {
+  const keys = Array.isArray(row.roleKeys) ? row.roleKeys : [];
+  return {
+    id: row.id,
+    name: row.name,
+    roleKeys: keys,
+    roleNames: keys.map((k) => roleNames.get(k)).filter((n): n is string => Boolean(n)),
+    mode: isAgentMode(row.mode) ? row.mode : 'read_only',
+    tokenPrefix: row.tokenPrefix,
+    createdAt: row.createdAt.toISOString(),
+    createdByName,
+    lastUsedAt: lastUsed ? lastUsed.toISOString() : null,
+    revokedAt: row.revokedAt ? row.revokedAt.toISOString() : null,
+    status: row.revokedAt ? 'revoked' : 'active',
+  };
+}
+
+async function roleNameMap(db: DB, companyId: string): Promise<Map<string, string>> {
+  return new Map((await listRoleDefinitions(db, companyId)).map((r) => [r.key, r.name]));
+}
+
+/**
+ * Make an agent. Returns its view and the token: the only time the token exists outside the
+ * caller's hands. Nothing derived from it but the digest is stored or logged.
+ */
+export async function createAgent(ctx: ServiceContext, input: CreateAgentInput): Promise<{ agent: AgentView; token: string }> {
+  assertAdminPerson(ctx, 'Adding an agent');
+  if (await agentsBlockedFor(ctx.db, ctx.companyId)) throw new ServiceError('FORBIDDEN', AGENTS_BLOCKED_MESSAGE);
+
+  const name = typeof input.name === 'string' ? input.name.trim() : '';
+  if (!name) throw validation('Give the agent a name.');
+  if (name.length > 100) throw validation('The name can be at most 100 characters.');
+  if (!isAgentMode(input.mode)) throw validation('Choose Read only, Propose or Post.');
+
+  const roleKeys = [...new Set((Array.isArray(input.roleKeys) ? input.roleKeys : []).filter((k) => typeof k === 'string' && k))];
+  if (!roleKeys.length) throw validation('Choose at least one role for the agent.');
+  if (includesAdminRole(roleKeys)) throw validation('An agent cannot be an Admin. Choose another role.');
+  const names = await roleNameMap(ctx.db, ctx.companyId);
+  const unknown = roleKeys.filter((k) => !names.has(k));
+  if (unknown.length) throw validation('One of the chosen roles does not exist in this company.');
+
+  // The defaults of the simple lists (terms, payment methods…) are saved the first time a list is
+  // opened. An agent only reads, so they are put in now, under the Admin.
+  for (const key of SIMPLE_LIST_KEYS) await ensureSeeded(ctx, key);
+
+  const token = newToken();
+  const digest = agentTokenDigest(token);
+  const row = await inTransaction(ctx, async (tx) => {
+    const [taken] = await tx.db
+      .select({ id: agents.id })
+      .from(agents)
+      .where(and(eq(agents.companyId, tx.companyId), isNull(agents.revokedAt), sql`lower(${agents.name}) = ${name.toLowerCase()}`));
+    if (taken) throw new ServiceError('CONFLICT', `There is already an agent named "${name}".`);
+    const [created] = await tx.db
+      .insert(agents)
+      .values({
+        companyId: tx.companyId,
+        name,
+        roleKeys,
+        mode: input.mode,
+        tokenHash: digest.hash,
+        tokenPrefix: token.slice(0, 18),
+        keyId: digest.keyId,
+        createdBy: tx.userId,
+      })
+      .returning();
+    await writeAudit(tx, {
+      action: 'create',
+      entityType: 'agent',
+      entityId: created.id,
+      newValues: { name, roleKeys, mode: input.mode, tokenPrefix: created.tokenPrefix },
+    });
+    return created;
+  });
+  syncAgentEndpoint(ctx.db).catch(() => undefined);
+  return { agent: toView(row, names, null, null), token };
+}
+
+/** The company's agents, newest first. Never the digest. */
+export async function listAgents(ctx: ServiceContext): Promise<AgentView[]> {
+  assertAdminPerson(ctx, 'The list of agents');
+  const rows = await ctx.db
+    .select({ agent: agents, createdByName: users.name })
+    .from(agents)
+    .leftJoin(users, eq(users.id, agents.createdBy))
+    .where(eq(agents.companyId, ctx.companyId))
+    .orderBy(desc(agents.createdAt));
+  const names = await roleNameMap(ctx.db, ctx.companyId);
+  return rows.map((r) => toView(r.agent, names, r.createdByName ?? null, lastUsedOf(r.agent)));
+}
+
+/** Take an agent's access away. Its token stops working with the next request. */
+export async function revokeAgent(ctx: ServiceContext, id: string): Promise<AgentView> {
+  assertAdminPerson(ctx, 'Removing an agent');
+  if (typeof id !== 'string' || !UUID_RE.test(id)) throw notFound('Agent');
+  const row = await inTransaction(ctx, async (tx) => {
+    const [existing] = await tx.db.select().from(agents).where(and(eq(agents.id, id), eq(agents.companyId, tx.companyId)));
+    if (!existing) throw notFound('Agent');
+    if (existing.revokedAt) return existing;
+    const [updated] = await tx.db
+      .update(agents)
+      .set({ revokedAt: new Date(), revokedBy: tx.userId })
+      .where(eq(agents.id, id))
+      .returning();
+    await writeAudit(tx, {
+      action: 'update',
+      entityType: 'agent',
+      entityId: id,
+      oldValues: { name: existing.name, revoked: false },
+      newValues: { name: existing.name, revoked: true },
+    });
+    return updated;
+  });
+  syncAgentEndpoint(ctx.db).catch(() => undefined);
+  return toView(row, await roleNameMap(ctx.db, ctx.companyId), null, lastUsedOf(row));
+}
+
+/**
+ * Take every agent's access away, in every company of the file. Run on restored books
+ * (lib/services/backup.ts, lib/services/portableFile.ts): agent access is given at this computer
+ * to the books as they are now, and a restore must not bring back one that was removed.
+ */
+export async function revokeAllAgents(db: DB): Promise<number> {
+  const ended = await db.update(agents).set({ revokedAt: new Date() }).where(isNull(agents.revokedAt)).returning({ id: agents.id });
+  return ended.length;
+}
+
+// ---------------------------------------------------------------------------
+// Use
+// ---------------------------------------------------------------------------
+
+export interface ActiveAgent {
+  id: string;
+  companyId: string;
+  name: string;
+  roleKeys: string[];
+  mode: AgentMode;
+}
+
+/**
+ * The active agent a token belongs to, or null (unknown, removed, made on another computer, or
+ * not shaped like a token). The digest is looked up by the unique index; nothing compares the
+ * token itself.
+ */
+export async function findAgentByToken(db: DB, token: string): Promise<ActiveAgent | null> {
+  if (typeof token !== 'string' || !AGENT_TOKEN_RE.test(token)) return null;
+  const digest = agentTokenDigest(token);
+  const [row] = await db.select().from(agents).where(eq(agents.tokenHash, digest.hash));
+  if (!row || row.revokedAt) return null;
+  // The row must have been made the way this computer makes digests now: keyed by this device
+  // secret, or unkeyed where there is none. An unkeyed row is never accepted next to a device secret.
+  if ((row.keyId ?? null) !== digest.keyId) return null;
+  return {
+    id: row.id,
+    companyId: row.companyId,
+    name: row.name,
+    roleKeys: Array.isArray(row.roleKeys) ? row.roleKeys : [],
+    mode: isAgentMode(row.mode) ? row.mode : 'read_only',
+  };
+}
+
+/** An agent's access: its roles (never Admin) with the agent limits applied. */
+export async function agentAccess(db: DB, agent: Pick<ActiveAgent, 'companyId' | 'roleKeys'>): Promise<EffectiveAccess> {
+  const keys = agent.roleKeys.filter((k) => !includesAdminRole([k]));
+  return clampForAgent(unionRoles(await definitionsFor(db, agent.companyId, keys)));
+}
+
+// Last use is kept in memory and saved at most once a day: an agent reading reports must not make
+// the company file save itself over and over (the file autosaves whenever the database changes).
+const LAST_USED_SAVE_MS = 24 * 60 * 60 * 1000;
+const gl = globalThis as typeof globalThis & { __ironbooksAgentLastUsed?: Map<string, Date> };
+const lastUsed: Map<string, Date> = (gl.__ironbooksAgentLastUsed ??= new Map());
+
+function lastUsedOf(row: AgentRow): Date | null {
+  const mem = lastUsed.get(row.id) ?? null;
+  if (mem && (!row.lastUsedAt || mem > row.lastUsedAt)) return mem;
+  return row.lastUsedAt ?? null;
+}
+
+/** Note that an agent was used now. Never fails the request it is called from. */
+export async function touchAgent(db: DB, agentId: string, now: Date = new Date()): Promise<void> {
+  lastUsed.set(agentId, now);
+  try {
+    const cutoff = new Date(now.getTime() - LAST_USED_SAVE_MS);
+    await db
+      .update(agents)
+      .set({ lastUsedAt: now })
+      .where(and(eq(agents.id, agentId), sql`(${agents.lastUsedAt} IS NULL OR ${agents.lastUsedAt} < ${cutoff})`));
+  } catch {
+    /* the in-memory time is enough */
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The endpoint file
+// ---------------------------------------------------------------------------
+
+/**
+ * Publish the endpoint file while this company file has an active agent, and take it away when it
+ * has none (lib/agent/endpointFile.ts). Called after agents change and the first time a person
+ * signs in during a run.
+ */
+export async function syncAgentEndpoint(db: DB): Promise<boolean> {
+  const tag = agentFileTag();
+  const [any] = await db.select({ id: agents.id }).from(agents).where(isNull(agents.revokedAt)).limit(1);
+  if (!any) {
+    if (endpointPublished(tag)) withdrawEndpoint(tag);
+    return false;
+  }
+  // Nothing is published before a person has signed in to this file in this run.
+  if (!personSignedIn(resolveDataDir())) return false;
+  return publishEndpoint(tag);
+}
+
+/** Agents by id, for screens that name who did something (id → name). */
+export async function agentNames(db: DB, ids: string[]): Promise<Map<string, string>> {
+  const wanted = [...new Set(ids.filter((id) => UUID_RE.test(id)))];
+  if (!wanted.length) return new Map();
+  const rows = await db.select({ id: agents.id, name: agents.name }).from(agents).where(inArray(agents.id, wanted));
+  return new Map(rows.map((r) => [r.id, r.name]));
+}

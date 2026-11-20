@@ -853,6 +853,20 @@ async function restoreBackupInto(dir: string, buffer: Buffer, opts: { credential
       console.warn('[backup] post-restore Verify Data check failed (continuing):', err);
     }
 
+    // Agent access is given at this computer to the books as they are now. Restored books start
+    // with none, so an agent whose access was taken away does not come back with an older copy.
+    try {
+      const { revokeAllAgents } = await import('./agents');
+      await revokeAllAgents(await withDamagedFileAccess(() => getDb(dir)));
+    } catch (err) {
+      console.error('[backup] agent access could not be turned off in the restored books:', err);
+      await rollBack();
+      throw new ServiceError(
+        'VALIDATION',
+        'This backup was not restored because agent access in it could not be turned off. Your current company file has not been changed.',
+      );
+    }
+
     // The restored books stay protected with passwords: a protected backup's own key and slots,
     // or this file's protection copied into a backup made before it had any.
     try {
@@ -1194,6 +1208,7 @@ export const COMPANY_BACKUP_EXCLUDED_TABLES: Record<string, string> = {
   undo_actions: 'session undo stack; restored rows get new ids, so old undo actions are invalid',
   backup_log: 'backup history of the source machine',
   receipt_upload_tokens: 'short-lived phone-upload tokens; must not be replayable elsewhere',
+  agents: 'agent access is given on one computer for one company file; a restored company starts with none',
   accountant_copies: "Accountant's Copy transfer state belongs to the source file",
   ai_settings:
     "AI provider config holds API keys and the ChatGPT sign-in, sealed for the computer that entered them (device secret, lib/ai/keyVault.ts \"v3:\") or, in a file protected with passwords, with the source company file's own key (file_secrets); either way bound to the source company's id, and a per-company restore makes a new company (and does not carry file_secrets)",

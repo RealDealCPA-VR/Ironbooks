@@ -99,3 +99,12 @@ export function rootDbOf(dbOrTx: object): object | null {
 export function dataDirOf(dbOrTx: object): string | null {
   return states.get(dbOrTx)?.dir ?? null;
 }
+
+/**
+ * Give a wrapper around a handle or transaction (lib/db/readOnly.ts) the same data directory,
+ * root and commit queue, so services handed the wrapper still find the company file's side files.
+ */
+export function associateWrapper(wrapper: object, dbOrTx: object): void {
+  const state = states.get(dbOrTx);
+  if (state) states.set(wrapper, state);
+}

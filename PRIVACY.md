@@ -16,6 +16,7 @@ This document lists everything that can leave the machine, and what controls it.
 | Emailing an invoice | Only the message and PDF you send, to your SMTP server | Privacy & Network → Email |
 | Bank transactions | **Nothing.** Ironbooks never connects to your bank or a feed service; transactions come only from statement files you import. | — |
 | Vendor lookup (new vendors only) | Only the vendor's name (store numbers and long digit runs removed), to **your own** SearXNG, which searches public engines. **Off by default**; needs your OK even when SearXNG is on your tailnet; never in Offline mode. | Privacy & Network → Vendor lookup (your SearXNG) |
+| AI agents you connect (agent access) | Ironbooks sends nothing by itself. An agent an Admin lets in reads the books on this computer, and what it reads goes to the AI service that runs that agent, **not redacted**. Nothing leaves when the agent runs on a model on your own computer or network. **Off until an Admin makes an agent.** | Users & Roles → Agents; Preferences → Integrated Applications |
 | Update checks | App version and platform only (no company data); **on by default** | Privacy & Network → App updates |
 | Telemetry / analytics / crash reports | **None.** | — |
 | Web fonts / CDNs | **None.** Fonts are bundled at build time. | — |
@@ -191,6 +192,26 @@ at once (further sign-ins over the network are refused until someone logs out).
 - On another computer, **File > Open company on host…** accepts only tailnet or LAN addresses.
   The company data stays on the host. A client never backs up, hosts or updates on the host's
   behalf.
+
+## Agent access
+
+An Admin can let an AI agent read one company's books ([`AGENT_ACCESS.md`](./AGENT_ACCESS.md)).
+A company file with no agents behaves exactly as before.
+
+- The agent reaches the books through the app's own server on this computer (`127.0.0.1`). Nothing
+  new listens on the network, and an agent does not work through multi-user hosting.
+- While a company file with an agent is open and someone has signed in, Ironbooks writes one small
+  file in your own profile folder (`%LOCALAPPDATA%\Ironbooks\agent-endpoints`) so the agent's
+  connector can find the app. It holds the app's local port and a check value for that run, nothing
+  from the books, and is removed when the app closes or the last agent is removed.
+- An agent only reads in this version, and only what its role allows. It never sees full Social
+  Security numbers or full account numbers, and it cannot change where this computer connects.
+- Only a keyed digest of the agent's access token is stored, tied to this computer and this company
+  file. A copy of the file, a backup or a portable file carries no agent that works elsewhere, and
+  restoring a backup removes every agent's access.
+- **What the agent reads is sent to whatever AI service runs it, as it is.** The redaction Ironbooks
+  applies to its own cloud AI calls does not apply to an outside agent. Run the agent on a model on
+  your own computer or network to keep everything local.
 
 ## Receipts (photos and PDFs)
 
