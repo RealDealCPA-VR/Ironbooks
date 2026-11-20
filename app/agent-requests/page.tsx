@@ -59,6 +59,8 @@ function batchOutcome(r: ApproveResult): string {
       return 'Recorded. A second person must also approve it.';
     case 'stale':
       return 'Not done: the books changed since the agent asked. Open it to see what would happen now.';
+    case 'not_approved':
+      return `Not approved. ${plain(r.request.error) || 'Nothing was changed.'}`;
   }
 }
 

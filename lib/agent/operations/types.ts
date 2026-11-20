@@ -139,8 +139,10 @@ export interface OperationClassification {
   class: RiskClass;
   /**
    * One line in plain words saying what a request does, for the approval card and the answer.
-   * `{name}` placeholders are filled from route params, then query, then body, then the route's
-   * own answer: "Email invoice {number} to {to}".
+   * `{name}` placeholders are filled from route params, then the request, then the route's own
+   * answer: "Email invoice {number} to {to}". The request means the body for a route that takes
+   * one (plus only the query names that route really reads, lib/agent/describe.ts) and the query
+   * for a GET, so an agent cannot put a value on the approval line that the route will not use.
    */
   describe: string;
   /** Overrides the generated operation id ("invoices.email"). Rarely needed. */

@@ -344,6 +344,23 @@ export interface AgentRequestView {
   result: unknown;
   file: StagedFile | null;
   grantId: string | null;
+  // --- wave 3 (optional: rows and readers from before it have none of these) ---
+  /**
+   * The books changed since the preview a person was last shown (plan §7.4): `preview` is the new
+   * one, and a yes must be given again on it.
+   */
+  stale?: boolean;
+  /** The executed run posted to the ledger (the agent's 'posted') rather than only changing records ('done'). */
+  posted?: boolean;
+  /** Journal entries the executed run created, oldest first, for links from the card. */
+  entryIds?: string[];
+  /** The standing permission actually given with the approval (it may be narrower than `grantAsked`). */
+  grant?: { minutes: number; constraints: GrantConstraints; expiresAt: string } | null;
+  /**
+   * The approver asked to give standing permission with the approval and it was not given: why.
+   * The run itself still counts as executed.
+   */
+  grantError?: string | null;
 }
 
 /** What a person's window gets on top: may THIS person approve, and if not, why. */
@@ -352,6 +369,8 @@ export interface AgentRequestForPerson extends AgentRequestView {
   cannotApproveWhy: string | null;
   /** Up to how many minutes of standing permission this person may give with the approval (0 = none). */
   grantMinutesMax: number;
+  /** wave 3: a desktop operation's questions the approver answers on the card (ApproveInput.answers). */
+  questions?: FlowQuestion[];
 }
 
 export interface NewAgentRequest {
@@ -386,9 +405,11 @@ export interface ApproveResult {
   /**
    * 'executed': done. 'failed': the run failed (the request says why). 'needs_second_approver':
    * recorded, a different person must also approve. 'stale': nothing ran; `request.preview` is what
-   * would happen now and the person must approve again with acceptStale.
+   * would happen now and the person must approve again with acceptStale. 'not_approved' (wave 3,
+   * batch approval only): this one was not approved and nothing ran; `request.error` says why and
+   * the request is still waiting.
    */
-  status: 'executed' | 'failed' | 'needs_second_approver' | 'stale';
+  status: 'executed' | 'failed' | 'needs_second_approver' | 'stale' | 'not_approved';
   request: AgentRequestForPerson;
   /** Secrets the run produced: shown once on this screen. */
   produced: ProducedSecret[];
@@ -409,14 +430,25 @@ export type CancelAgentRequest = (ctx: ServiceContext, id: string) => Promise<Ag
 /** Resolves when the request is decided or the time is up (whichever is first) with its state then. */
 export type WaitForDecision = (ctx: ServiceContext, id: string, timeoutSeconds: number) => Promise<AgentRequestView>;
 
-/** `ctx` is a signed-in person's (never an agent's: refused). */
+/**
+ * `ctx` is a signed-in person's (never an agent's: refused). `atHost` (wave 3) is false for a
+ * teammate's window: a host-only request then has canApprove false. Left out, it counts as true.
+ */
 export type ListRequestsForPerson = (
   ctx: ServiceContext,
-  opts?: { status?: RequestStatus | 'all'; agentId?: string; limit?: number },
+  opts?: { status?: RequestStatus | 'all'; agentId?: string; limit?: number; atHost?: boolean },
 ) => Promise<AgentRequestForPerson[]>;
-export type RequestForPerson = (ctx: ServiceContext, id: string) => Promise<AgentRequestForPerson>;
+export type RequestForPerson = (ctx: ServiceContext, id: string, opts?: { atHost?: boolean }) => Promise<AgentRequestForPerson>;
 /** Pending requests this person could approve (the badge). 0 for an agent's context. */
 export type PendingCountForPerson = (ctx: ServiceContext) => Promise<number>;
+/**
+ * wave 3, exported as `badgeForPerson` by lib/services/agentRequests.ts: the title bar's count and
+ * its newest request from ONE scan. Zero and null for an agent's context.
+ */
+export type BadgeForPerson = (
+  ctx: ServiceContext,
+  opts: { atHost: boolean },
+) => Promise<{ pending: number; newest: { id: string; agentName: string; summary: string; createdAt: string } | null }>;
 export type ApproveAgentRequest = (ctx: ServiceContext, id: string, input: ApproveInput, opts: { atHost: boolean }) => Promise<ApproveResult>;
 export type DenyAgentRequest = (ctx: ServiceContext, id: string, note: string | null) => Promise<AgentRequestForPerson>;
 /** Same-operation enter/change requests only; each is approved on its own and reported on its own. */
@@ -622,6 +654,7 @@ export const SHELL_TICKET_SECONDS = 120;
 //   POST   /api/agent-requests/[id]/approve          ApproveInput → ApproveResult
 //   POST   /api/agent-requests/[id]/deny             { note?: string } → { request: AgentRequestForPerson }
 //   POST   /api/agent-requests/batch-approve         { ids: string[] } → { results: ApproveResult[] }
+//   GET    /api/agents                               → { agents: (AgentView & { overrideCount: number })[], allPaused: boolean }   (wave 3)
 //   GET    /api/agents/[id]                          → AgentDetail
 //   PATCH  /api/agents/[id]                          AgentPolicyInput → AgentDetail
 //   POST   /api/agents/[id]/pause                    { paused: boolean } → AgentDetail
@@ -632,7 +665,13 @@ export const SHELL_TICKET_SECONDS = 120;
 //
 // And for the agent (its token; reads only):
 //   GET    /api/agent/requests?status=               → { requests: AgentRequestView[] }
-//   GET    /api/agent/requests/[id]?wait=<seconds>   → { request: AgentRequestView }   (long-poll, ≤ WAIT_MAX_SECONDS)
+//   GET    /api/agent/requests/[id]?wait=<seconds>   → { request: AgentRequestView }   (long-poll, ≤ WAIT_MAX_SECONDS;
+//                                                       429 RATE_LIMITED with Retry-After when the agent already has 4 waits open)
+//
+// POST /api/agents, PATCH /api/agents/[id] and DELETE /api/agents/[id] are host-only (403 with
+// details { hostOnly: true } from a teammate's window). Pause, pause-all, taking back a grant,
+// approve and deny work from any signed-in person's window. The list and single-request reads pass
+// atHost so a teammate's window shows a host-only request as not approvable.
 
 export interface AgentDetail {
   id: string;
